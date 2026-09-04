@@ -8,20 +8,21 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import numpy as np
-import onnx
 import onnx_ir as ir
 import pytest
 import torch
 
 from mobius._build_context import build_context
+from mobius._builder import _cast_module_dtype
 from mobius._configs import (
     ArchitectureConfig,
     QuantizationConfig,
     QuantizedWeightFormat,
 )
 from mobius._execution_providers import EpCapabilities
-from mobius._testing import make_config
+from mobius._testing import create_test_builder, create_test_input, make_config
 from mobius._weight_utils import supported_qmoe_quantization
+from mobius.integrations._weight_loading import apply_weights
 from mobius.models.base import linear_class_for_config
 from mobius.models.gptoss import (
     GPTOSSCausalLMModel,
@@ -88,6 +89,162 @@ def _native_expert_state(layer: str = _LAYER) -> dict[str, torch.Tensor]:
         f"{layer}.router.weight": torch.randn(_E, _H),
         f"{layer}.router.bias": torch.randn(_E),
     }
+
+
+def _deterministic_checkpoint_blocks(
+    output_size: int, input_size: int, *, offset: int
+) -> torch.Tensor:
+    """Create packed checkpoint bytes without depending on the production repacker."""
+    shape = (_E, output_size, input_size // 32, 16)
+    expert = torch.arange(shape[0], dtype=torch.int64).reshape(-1, 1, 1, 1)
+    output = torch.arange(shape[1], dtype=torch.int64).reshape(1, -1, 1, 1)
+    block = torch.arange(shape[2], dtype=torch.int64).reshape(1, 1, -1, 1)
+    lane = torch.arange(shape[3], dtype=torch.int64).reshape(1, 1, 1, -1)
+    low_nibbles = (expert * 3 + output * 5 + block * 7 + lane * 11 + offset).remainder(16)
+    high_nibbles = (expert * 13 + output * 7 + block * 5 + lane * 3 + 3 * offset).remainder(16)
+    return (low_nibbles | (high_nibbles << 4)).to(torch.uint8)
+
+
+def _native_qmoe_parity_state() -> dict[str, torch.Tensor]:
+    """Create a small deterministic checkpoint-format MXFP4 MoE state."""
+    fc1_bias = (
+        torch.arange(_E * 2 * _I, dtype=torch.float32).reshape(_E, 2 * _I).remainder(17) - 8
+    ) * 0.01
+    # Exercise both sides of GPT-OSS clipping while remaining far from FP16 overflow.
+    fc1_bias[0, :2] = torch.tensor([7.25, -7.25])
+    fc1_bias[1, 2:4] = torch.tensor([7.5, 7.5])
+    fc2_bias = (
+        torch.arange(_E * _H, dtype=torch.float32).reshape(_E, _H).remainder(13) - 6
+    ) * 0.015
+    hidden_indices = torch.arange(_H, dtype=torch.float32)
+    router_weight = torch.stack(
+        [
+            (hidden_indices.remainder(9) - 4) * 0.025,
+            ((hidden_indices * 3).remainder(11) - 5) * -0.02,
+        ]
+    )
+
+    fc1_scale_shape = (_E, 2 * _I, _H // 32)
+    fc2_scale_shape = (_E, _H, _I // 32)
+    return {
+        f"{_LAYER}.experts.gate_up_proj_blocks": _deterministic_checkpoint_blocks(
+            2 * _I, _H, offset=1
+        ),
+        f"{_LAYER}.experts.gate_up_proj_scales": (
+            torch.arange(np.prod(fc1_scale_shape), dtype=torch.int64)
+            .reshape(fc1_scale_shape)
+            .remainder(3)
+            .add(122)
+            .to(torch.uint8)
+        ),
+        f"{_LAYER}.experts.down_proj_blocks": _deterministic_checkpoint_blocks(
+            _H, _I, offset=2
+        ),
+        f"{_LAYER}.experts.down_proj_scales": (
+            torch.arange(np.prod(fc2_scale_shape), dtype=torch.int64)
+            .reshape(fc2_scale_shape)
+            .remainder(3)
+            .add(120)
+            .to(torch.uint8)
+        ),
+        f"{_LAYER}.experts.gate_up_proj_bias": fc1_bias.to(torch.float16),
+        f"{_LAYER}.experts.down_proj_bias": fc2_bias.to(torch.float16),
+        f"{_LAYER}.router.weight": router_weight.to(torch.float16),
+        f"{_LAYER}.router.bias": torch.tensor([0.075, -0.05], dtype=torch.float16),
+    }
+
+
+def _decode_checkpoint_mxfp4(blocks: torch.Tensor, scale_bytes: torch.Tensor) -> np.ndarray:
+    """Decode checkpoint [E, N, K/32, 16] nibbles and E8M0 bytes directly."""
+    packed = blocks.numpy()
+    codes = np.empty((*packed.shape[:-1], 32), dtype=np.uint8)
+    codes[..., 0::2] = packed & 0x0F
+    codes[..., 1::2] = packed >> 4
+    e2m1_values = np.array(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=np.float32,
+    )
+    values = e2m1_values[codes & 0x07]
+    values = np.where(codes & 0x08, -values, values)
+    scales = np.exp2(scale_bytes.numpy().astype(np.int16) - 127).astype(np.float32)
+    return (values * scales[..., None]).reshape(blocks.shape[0], blocks.shape[1], -1)
+
+
+def _manual_gptoss_mxfp4_moe(
+    hidden_states: np.ndarray,
+    checkpoint_state: dict[str, torch.Tensor],
+    *,
+    top_k: int,
+) -> np.ndarray:
+    """Independent GPT-OSS MoE reference operating only on checkpoint tensors."""
+    fc1 = _decode_checkpoint_mxfp4(
+        checkpoint_state[f"{_LAYER}.experts.gate_up_proj_blocks"],
+        checkpoint_state[f"{_LAYER}.experts.gate_up_proj_scales"],
+    )
+    fc2 = _decode_checkpoint_mxfp4(
+        checkpoint_state[f"{_LAYER}.experts.down_proj_blocks"],
+        checkpoint_state[f"{_LAYER}.experts.down_proj_scales"],
+    )
+    fc1_bias = checkpoint_state[f"{_LAYER}.experts.gate_up_proj_bias"].float().numpy()
+    fc2_bias = checkpoint_state[f"{_LAYER}.experts.down_proj_bias"].float().numpy()
+    router_weight = checkpoint_state[f"{_LAYER}.router.weight"].float().numpy()
+    router_bias = checkpoint_state[f"{_LAYER}.router.bias"].float().numpy()
+
+    flat_hidden = hidden_states.astype(np.float32).reshape(-1, _H)
+    router_logits = flat_hidden @ router_weight.T + router_bias
+    selected_experts = np.argsort(-router_logits, axis=-1, kind="stable")[:, :top_k]
+    selected_logits = np.take_along_axis(router_logits, selected_experts, axis=-1)
+    routing_weights = np.exp(selected_logits - selected_logits.max(axis=-1, keepdims=True))
+    routing_weights /= routing_weights.sum(axis=-1, keepdims=True)
+
+    output = np.zeros_like(flat_hidden)
+    for token_index, token in enumerate(flat_hidden):
+        for route_index, expert_index in enumerate(selected_experts[token_index]):
+            fused = token @ fc1[expert_index].T + fc1_bias[expert_index]
+            # Checkpoint FC1 rows and biases are interleaved [gate_0, up_0, ...].
+            gate = np.minimum(fused[0::2], 7.0)
+            up = np.clip(fused[1::2], -7.0, 7.0)
+            activated = gate / (1.0 + np.exp(-1.702 * gate)) * (up + 1.0)
+            expert_output = activated @ fc2[expert_index].T + fc2_bias[expert_index]
+            output[token_index] += routing_weights[token_index, route_index] * expert_output
+    return output.reshape(hidden_states.shape)
+
+
+def _make_native_qmoe_parity_model(
+    checkpoint_state: dict[str, torch.Tensor], *, sequence_length: int
+) -> ir.Model:
+    """Build the production GPT-OSS MoE layer and bind preprocessed checkpoint weights."""
+    config = _gptoss_config(
+        native_mxfp4=True,
+        dtype=ir.DataType.FLOAT16,
+        num_experts_per_tok=1,
+    )
+    module = GPTOSSCausalLMModel(config)
+    processed_state = module.preprocess_weights(checkpoint_state)
+    layer = module.model.layers[0].mlp
+    _cast_module_dtype(layer, ir.DataType.FLOAT16)
+
+    builder, _, graph = create_test_builder()
+    graph.name = "gptoss_native_mxfp4_qmoe_parity"
+    graph.opset_imports["com.microsoft"] = 1
+    hidden_states = create_test_input(
+        builder,
+        "hidden_states",
+        [1, sequence_length, _H],
+        ir.DataType.FLOAT16,
+    )
+    with build_context(EpCapabilities(name="cuda"), ir.DataType.FLOAT16):
+        output = layer(builder.op, hidden_states)
+    output.name = "output"
+    graph.outputs.append(output)
+    model = ir.Model(graph, ir_version=12)
+
+    standalone_state = {
+        f"mlp.{name.removeprefix(f'{_LAYER}.')}": tensor
+        for name, tensor in processed_state.items()
+    }
+    apply_weights(model, standalone_state)
+    return model
 
 
 def _make_gqa_parity_model(*, decode: bool) -> ir.Model:
@@ -166,22 +323,29 @@ def _make_gqa_parity_model(*, decode: bool) -> ir.Model:
     return ir.Model(graph, ir_version=12)
 
 
-def _require_usable_cuda_provider(ort) -> None:
+def _require_usable_cuda_provider(ort, probe_path) -> None:
     """Skip only when a separate valid CUDA probe cannot initialize the provider."""
-    probe_input = onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1, 1])
-    probe_output = onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1, 1])
-    probe_weight = onnx.helper.make_tensor("weight", onnx.TensorProto.FLOAT, [1, 1], [1.0])
-    probe = onnx.helper.make_model(
-        onnx.helper.make_graph(
-            [onnx.helper.make_node("MatMul", ["input", "weight"], ["output"])],
-            "cuda_provider_probe",
-            [probe_input],
-            [probe_output],
-            [probe_weight],
-        ),
-        opset_imports=[onnx.helper.make_opsetid("", 13)],
-        ir_version=10,
+    probe_input = ir.Value(
+        name="input",
+        shape=ir.Shape([1, 1]),
+        type=ir.TensorType(ir.DataType.FLOAT),
     )
+    probe_output = ir.Value(
+        name="output",
+        shape=ir.Shape([1, 1]),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    probe = ir.Model(
+        ir.Graph(
+            inputs=[probe_input],
+            outputs=[probe_output],
+            nodes=[ir.Node("", "Identity", [probe_input], outputs=[probe_output])],
+            name="cuda_provider_probe",
+            opset_imports={"": 24},
+        ),
+        ir_version=12,
+    )
+    ir.save(probe, probe_path)
     provider_errors = (
         ort.capi.onnxruntime_pybind11_state.Fail,
         ort.capi.onnxruntime_pybind11_state.RuntimeException,
@@ -189,7 +353,7 @@ def _require_usable_cuda_provider(ort) -> None:
     )
     try:
         session = ort.InferenceSession(
-            probe.SerializeToString(),
+            probe_path,
             providers=["CUDAExecutionProvider"],
         )
     except provider_errors as error:
@@ -732,10 +896,10 @@ class TestGPTOSSNativeMXFP4Graph:
             assert package["model"].ir_version == 12
             output = tmp_path / name
             package.save(str(output), check_weights=False, progress_bar=False)
-            proto = onnx.load_model(output / "model.onnx", load_external_data=False)
+            loaded = ir.load(output / "model.onnx")
 
-            assert proto.ir_version == 12
-            assert {item.domain: item.version for item in proto.opset_import} == {
+            assert loaded.ir_version == 12
+            assert loaded.graph.opset_imports == {
                 "": 24,
                 "com.microsoft": 1,
             }
@@ -807,6 +971,81 @@ class TestGPTOSSNativeMXFP4Graph:
         assert not any(node.op_type == "QMoE" for node in graph)
         assert not any(node.op_type == "GroupQueryAttention" for node in graph)
 
+    @pytest.mark.parametrize("sequence_length", [3, 1], ids=["prefill", "decode"])
+    def test_cuda_native_qmoe_checkpoint_layout_matches_independent_reference(
+        self, sequence_length, tmp_path, monkeypatch
+    ):
+        """Execute the isolated production QMoE with checkpoint-format MXFP4 weights.
+
+        FP16 keeps the offline NumPy reference straightforward; this covers the
+        emitted kernel, checkpoint layout, routing, activation, and bias semantics.
+        QMoE itself has no cache state, so sequence length one is the decode regime.
+        """
+        ort = pytest.importorskip("onnxruntime")
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            pytest.skip("CUDAExecutionProvider is not available")
+        _require_usable_cuda_provider(ort, tmp_path / "cuda_provider_probe.onnx")
+
+        checkpoint_state = _native_qmoe_parity_state()
+        reference_state = {name: tensor.clone() for name, tensor in checkpoint_state.items()}
+        model = _make_native_qmoe_parity_model(
+            checkpoint_state,
+            sequence_length=sequence_length,
+        )
+        qmoe_nodes = [node for node in model.graph if node.op_type == "QMoE"]
+        assert len(qmoe_nodes) == 1
+        assert qmoe_nodes[0].domain == "com.microsoft"
+
+        model_path = tmp_path / f"native_qmoe_{sequence_length}.onnx"
+        ir.save(model, model_path)
+        # A100 uses the production dequant fallback. The QMoE constructor reads
+        # this switch during session creation, so restore it before execution.
+        try:
+            with monkeypatch.context() as env:
+                env.setenv("ORT_FP4_SM80_GEMM", "0")
+                session = ort.InferenceSession(
+                    model_path,
+                    providers=["CUDAExecutionProvider"],
+                )
+        except ort.capi.onnxruntime_pybind11_state.Fail as error:
+            message = str(error)
+            unsupported_qmoe = "QMoE" in message and any(
+                marker in message
+                for marker in ("not registered", "not compiled", "no SM80 fallback")
+            )
+            if unsupported_qmoe:
+                pytest.skip(f"Installed CUDA provider lacks FP4 QMoE support: {error}")
+            raise
+        assert session.get_providers()[0] == "CUDAExecutionProvider"
+
+        router_weight = reference_state[f"{_LAYER}.router.weight"].float().numpy()
+        router_bias = reference_state[f"{_LAYER}.router.bias"].float().numpy()
+        routing_direction = np.sign(router_weight[0] - router_weight[1]).astype(np.float16)
+        hidden_states = np.empty((1, sequence_length, _H), dtype=np.float16)
+        hidden_states[0, 0] = routing_direction * np.float16(0.25)
+        if sequence_length > 1:
+            hidden_states[0, 1] = -routing_direction * np.float16(0.25)
+        if sequence_length > 2:
+            hidden_states[0, 2:] = routing_direction * np.float16(0.125)
+        selected_experts = (
+            hidden_states.astype(np.float32).reshape(-1, _H) @ router_weight.T + router_bias
+        ).argmax(axis=-1)
+        if sequence_length > 1:
+            assert set(selected_experts) == set(range(_E))
+        (actual,) = session.run(None, {"hidden_states": hidden_states})
+        expected = _manual_gptoss_mxfp4_moe(
+            hidden_states,
+            reference_state,
+            top_k=1,
+        )
+
+        np.testing.assert_allclose(
+            actual.astype(np.float32),
+            expected,
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
     @pytest.mark.parametrize("decode", [False, True], ids=["prefill", "decode"])
     def test_cuda_gqa_kernel_matches_manual_sink_attention_with_local_window(
         self, decode, tmp_path
@@ -815,7 +1054,7 @@ class TestGPTOSSNativeMXFP4Graph:
         ort = pytest.importorskip("onnxruntime")
         if "CUDAExecutionProvider" not in ort.get_available_providers():
             pytest.skip("CUDAExecutionProvider is not available")
-        _require_usable_cuda_provider(ort)
+        _require_usable_cuda_provider(ort, tmp_path / "cuda_provider_probe.onnx")
         model_path = tmp_path / f"gqa_{'decode' if decode else 'prefill'}.onnx"
         ir.save(_make_gqa_parity_model(decode=decode), model_path)
         session = ort.InferenceSession(
