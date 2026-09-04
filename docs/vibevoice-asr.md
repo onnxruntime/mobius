@@ -68,7 +68,9 @@ ASR tokenizer's actual values for the semantic speech-start/pad/end roles and
 the pad token ID is the embedding stage's `audio_token_id`. `context_info` is
 source-provided background information/hotword text in that prompt; there is
 no separate algorithmic hotword input. `VibeVoiceASRProcessor.build_input_ids()`
-uses the compatible tokenizer's chat template to build that exact layout, and
+uses VibeVoice-ASR's fixed Qwen turn format
+`<|im_start|>{role}\n{content}<|im_end|>\n`, rather than the base tokenizer's
+native chat template, to avoid an injected default system turn.
 `parse_diarization()` normalizes source variants into `start_time`, `end_time`,
 `speaker_id`, and `text`.
 

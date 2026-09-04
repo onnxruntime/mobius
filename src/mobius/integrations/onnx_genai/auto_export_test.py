@@ -166,6 +166,7 @@ def test_vibevoice_asr_writes_processor_and_advisory_contract(monkeypatch, tmp_p
         "<|box_start|>",
         "<|object_ref_end|>",
     ]
+    assert "You are a helpful assistant." not in processor["prompt_protocol"]["chat_template"]
     assert processor["acoustic_sampling"]["noise_scale_input"] == "acoustic_noise_scale"
     assert sorted(compatibility["components"]) == [
         "acoustic_encoder",
