@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import subprocess
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -233,6 +235,14 @@ def _require_pinned_reference():
 
     if transformers.__version__ != "4.51.3":
         pytest.skip("Synthetic VibeVoice ASR parity requires transformers==4.51.3.")
+    try:
+        direct_url = metadata.distribution("vibevoice").read_text("direct_url.json")
+    except metadata.PackageNotFoundError:
+        direct_url = None
+    if direct_url is not None:
+        vcs_info = json.loads(direct_url).get("vcs_info", {})
+        if vcs_info.get("commit_id") == VIBEVOICE_ASR_SOURCE_REVISION:
+            return modeling, configuration, tokenizer
     source_root = Path(modeling.__file__).parents[2]
     source_revision = subprocess.run(
         ["git", "-C", str(source_root), "rev-parse", "HEAD"],
