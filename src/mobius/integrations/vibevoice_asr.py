@@ -27,6 +27,11 @@ _SPEECH_PAD_TOKEN = "<|box_start|>"
 _SPEECH_END_TOKEN = "<|object_ref_end|>"
 
 
+def _render_source_chat_turn(message: Mapping[str, str]) -> str:
+    """Render the fixed ASR tokenizer template without a base-Qwen default turn."""
+    return f"<|im_start|>{message['role']}\n{message['content']}<|im_end|>\n"
+
+
 @dataclass(frozen=True)
 class VibeVoiceASRBatch:
     """Normalized, right-padded 24 kHz waveforms and their sample-validity mask."""
@@ -129,14 +134,13 @@ class VibeVoiceASRProcessor:
         audio_samples: int,
         context_info: str | None = None,
     ) -> tuple[list[int], list[bool]]:
-        """Apply the source's separate system and user chat-template calls."""
+        """Apply the source's fixed ASR chat template to separate system/user turns."""
         messages = VibeVoiceASRProcessor.make_prompt(
             audio_samples=audio_samples,
             context_info=context_info,
         )
-        system_text = tokenizer.apply_chat_template([messages[0]], tokenize=False)
-        system_ids = list(tokenizer.encode(system_text))
-        user_ids = list(tokenizer.apply_chat_template([messages[1]], tokenize=True))
+        system_ids = list(tokenizer.encode(_render_source_chat_turn(messages[0])))
+        user_ids = list(tokenizer.encode(_render_source_chat_turn(messages[1])))
         input_ids = system_ids + user_ids
         speech_pad_id = tokenizer.convert_tokens_to_ids(_SPEECH_PAD_TOKEN)
         return input_ids, [token == speech_pad_id for token in input_ids]

@@ -125,18 +125,17 @@ def test_host_preserves_chunk_cache_and_uses_seeded_connector_noise():
 def test_processor_builds_source_chat_template_token_layout():
     class Tokenizer:
         def __init__(self):
-            self.messages: list[str] = []
-
-        def apply_chat_template(self, messages, *, tokenize):
-            content = messages[0]["content"]
-            self.messages.append(content)
-            if not tokenize:
-                return content
-            return [10, 11, *([42] * content.count("<|box_start|>")), 12]
+            self.encoded_texts: list[str] = []
 
         @staticmethod
-        def encode(_text):
-            return [1, 2]
+        def apply_chat_template(*args, **kwargs):
+            raise AssertionError("ASR must not use the base tokenizer's native chat template")
+
+        def encode(self, text):
+            self.encoded_texts.append(text)
+            if "<|im_start|>system\n" in text:
+                return [1, 2]
+            return [10, 11, *([42] * text.count("<|box_start|>")), 12]
 
         @staticmethod
         def convert_tokens_to_ids(token):
@@ -152,7 +151,15 @@ def test_processor_builds_source_chat_template_token_layout():
 
     assert input_ids == [1, 2, 10, 11, 42, 42, 12]
     assert acoustic_input_mask == [False, False, False, False, True, True, False]
-    assert tokenizer.messages[1].endswith(
-        "with extra info: Alice\n\nPlease transcribe it with these keys: "
-        "Start time, End time, Speaker ID, Content"
+    assert tokenizer.encoded_texts[0] == (
+        "<|im_start|>system\n"
+        "You are a helpful assistant that transcribes audio input into text output in JSON format."
+        "<|im_end|>\n"
+    )
+    assert tokenizer.encoded_texts[1] == (
+        "<|im_start|>user\n"
+        "<|object_ref_start|><|box_start|><|box_start|><|object_ref_end|>\n"
+        "This is a 0.13 seconds audio, with extra info: Alice\n\n"
+        "Please transcribe it with these keys: Start time, End time, Speaker ID, Content"
+        "<|im_end|>\n"
     )

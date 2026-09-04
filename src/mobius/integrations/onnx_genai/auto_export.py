@@ -828,6 +828,10 @@ def _write_vibevoice_asr_processor_contract(output_dir: str, config: Any) -> str
                 "You are a helpful assistant that transcribes audio input into text output "
                 "in JSON format."
             ),
+            "chat_template": (
+                "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + "
+                "message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}"
+            ),
             "speech_tokens": ["<|object_ref_start|>", "<|box_start|>", "<|object_ref_end|>"],
             "context_info": "Optional background information or hotwords inserted in the user prompt.",
             "fields": ["Start time", "End time", "Speaker ID", "Content"],
