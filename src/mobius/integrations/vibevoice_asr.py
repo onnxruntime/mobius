@@ -41,6 +41,7 @@ class VibeVoiceASRProcessor:
     normalize_audio = True
     target_dbfs = -25.0
     eps = 1e-6
+    avoid_clipping = True
 
     def prepare_audio(
         self,
@@ -109,9 +110,17 @@ class VibeVoiceASRProcessor:
             f"<|speech_start|>{'<|speech_pad|>' * audio_tokens}<|speech_end|>\n"
             f"This is a {audio_duration:.2f} seconds audio"
         )
-        if context_info:
-            request = f"{request}, with extra info: {context_info.strip()}"
-        request = f"{request}\n\nPlease transcribe it with these keys: Start time, End time, Speaker ID, Content"
+        normalized_context = context_info.strip() if context_info else ""
+        if normalized_context:
+            request = (
+                f"{request}, with extra info: {normalized_context}\n\n"
+                "Please transcribe it with these keys: Start time, End time, Speaker ID, Content"
+            )
+        else:
+            request = (
+                f"{request}, please transcribe it with these keys: "
+                "Start time, End time, Speaker ID, Content"
+            )
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": request},
@@ -181,10 +190,13 @@ class VibeVoiceASRProcessor:
         if not normalize:
             return result
         rms = float(np.sqrt(np.mean(np.square(result), dtype=np.float64)))
-        if rms <= self.eps:
-            return result
-        current_dbfs = 20.0 * np.log10(rms)
-        return result * np.float32(10.0 ** ((self.target_dbfs - current_dbfs) / 20.0))
+        current_dbfs = 20.0 * np.log10(rms + self.eps)
+        result = result * np.float32(10.0 ** ((self.target_dbfs - current_dbfs) / 20.0))
+        if self.avoid_clipping:
+            peak = float(np.max(np.abs(result)))
+            if peak > 1.0:
+                result = result / np.float32(peak)
+        return result
 
 
 class VibeVoiceASRHost:
