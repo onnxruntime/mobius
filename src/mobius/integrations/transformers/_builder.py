@@ -127,15 +127,22 @@ def _load_transformers_config(
 ) -> tuple[object | None, bool]:
     """Load a Transformers config and report whether raw JSON was required."""
     import transformers
-    from huggingface_hub import errors as hub_errors
 
     from mobius.integrations.transformers._config_resolver import _try_load_config_json
 
-    strict_validation_error = getattr(
-        hub_errors,
-        "StrictDataclassClassValidationError",
-        TypeError,
-    )
+    class _MissingStrictDataclassClassValidationError(Exception):
+        """Sentinel that cannot match errors from older Hub installations."""
+
+    try:
+        from huggingface_hub import errors as hub_errors
+    except ImportError:
+        strict_validation_error = _MissingStrictDataclassClassValidationError
+    else:
+        strict_validation_error = getattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            _MissingStrictDataclassClassValidationError,
+        )
     try:
         kwargs = {"trust_remote_code": trust_remote_code}
         if revision is not None:
