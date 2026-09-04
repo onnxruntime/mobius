@@ -318,6 +318,33 @@ class Attention(nn.Module):
             bias=config.attn_qkv_bias,
         )
 
+    def _apply_qk_norm(
+        self,
+        op: OpBuilder,
+        query_states: ir.Value,
+        key_states: ir.Value,
+    ) -> tuple[ir.Value, ir.Value]:
+        """Apply optional Q/K normalization, returning the (possibly) normed pair.
+
+        No-op when ``config.attn_qk_norm`` is False.  Shared by every
+        :class:`Attention` forward path (fused, GQA, and the manual
+        :class:`SinkAttention` path) so the normalization semantics can
+        never drift between them.
+        """
+        if self.q_norm is None or self.k_norm is None:
+            return query_states, key_states
+        if self._qk_norm_full:
+            # Apply norm on 3D tensor (across all heads)
+            return self.q_norm(op, query_states), self.k_norm(op, key_states)
+        # Apply norm per-head on 4D tensor
+        query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
+        key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+        query_states = self.q_norm(op, query_states)
+        key_states = self.k_norm(op, key_states)
+        query_states = op.Reshape(query_states, [0, 0, -1])
+        key_states = op.Reshape(key_states, [0, 0, -1])
+        return query_states, key_states
+
     def forward(
         self,
         op: OpBuilder,
@@ -331,19 +358,7 @@ class Attention(nn.Module):
         if not math.isclose(self._key_multiplier, 1.0):
             key_states = op.Mul(key_states, self._key_multiplier)
 
-        if self.q_norm is not None and self.k_norm is not None:
-            if self._qk_norm_full:
-                # Apply norm on 3D tensor (across all heads)
-                query_states = self.q_norm(op, query_states)
-                key_states = self.k_norm(op, key_states)
-            else:
-                # Apply norm per-head on 4D tensor
-                query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
-                key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
-                query_states = self.q_norm(op, query_states)
-                key_states = self.k_norm(op, key_states)
-                query_states = op.Reshape(query_states, [0, 0, -1])
-                key_states = op.Reshape(key_states, [0, 0, -1])
+        query_states, key_states = self._apply_qk_norm(op, query_states, key_states)
 
         # Direct GroupQueryAttention path: skip external RoPE, fuse everything.
         if isinstance(attention_bias, GQAContext):
@@ -478,14 +493,389 @@ class Attention(nn.Module):
         return attn_out, (present_key, present_value)
 
 
-class FusedQKVAttention(Attention):
-    """Attention whose checkpoint stores one contiguous Q/K/V projection.
+class SinkAttention(Attention):
+    """Attention with a learnable per-head sink logit in the softmax denominator.
 
-    The projection rows are ordered ``[Q | K | V]``. An optional symmetric
-    activation clamp is applied to the fused output before it is split, so
-    callers can represent architectures where clipping is part of the fused
-    projection contract rather than an independent per-projection transform.
+    An *attention sink* is one extra learnable logit per head that participates
+    in the softmax denominator but carries no value vector.  It lets a head
+    "discard" probability mass into a virtual null position, so the attention
+    output shrinks instead of being forced to sum to one over real tokens.
+
+    Implemented by appending the per-head sink as one extra column to the
+    attention scores before the softmax and then dropping that column::
+
+        combined = concat([scores, sinks], dim=-1)   # [B, H, S_q, S_kv + 1]
+        combined = combined - max(combined, dim=-1)  # numerical stability
+        probs    = softmax(combined, dim=-1)[..., :-1]
+        out      = probs @ V
+
+    This is algebraically identical to the two documented upstream forms:
+
+    * GPT-OSS ``eager_attention_forward`` concatenates the sink column exactly
+      as above.
+    * GraniteSWA ``eager_attention_forward`` instead computes an ordinary
+      softmax and rescales the output by
+      ``sigmoid(logsumexp(scores) - sink)``.  Writing ``Z = sum(exp(scores))``,
+      that factor is ``Z / (Z + exp(sink))``, which is precisely the mass this
+      implementation removes by keeping the sink column in the denominator.
+
+    Because the sink lives inside the softmax, the fused ONNX ``Attention`` and
+    ``GroupQueryAttention`` ops cannot be used: the score matrix is built
+    explicitly with MatMul/Softmax.  Consequently ``attention_bias`` must be a
+    float additive bias that already bakes in causality, any sliding window,
+    and padding (see :func:`~mobius.components._common.create_attention_bias`).
+
+    This class reproduces the GPT-OSS precision contract: the stabilised
+    softmax runs in the *compute* dtype, matching upstream's explicit
+    ``F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)``.  Models
+    whose upstream kernel forces float32 instead must use
+    :class:`Float32SinkAttention`.
+
+    Args:
+        config: Architecture configuration.
+        rms_norm_class: Norm class for optional Q/K normalization.
+        scale: Custom attention scale factor (default: ``1/sqrt(head_dim)``).
+            Granite-family models pass ``config.attention_multiplier``.
+        linear_class: Factory callable for the projection layers.
     """
+
+    #: Whether the sink softmax is evaluated in float32 regardless of the
+    #: model compute dtype.  ``False`` keeps the graph in the compute dtype
+    #: (GPT-OSS); :class:`Float32SinkAttention` flips it to ``True``.
+    upcast_sink_softmax: bool = False
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        rms_norm_class: type[nn.Module] | None = None,
+        scale: float | None = None,
+        linear_class: type | None = None,
+    ):
+        super().__init__(
+            config,
+            rms_norm_class=rms_norm_class,
+            scale=scale,
+            linear_class=linear_class,
+        )
+        if self._softcap:
+            # Softcapping would have to be applied to the score matrix *before*
+            # the sink column is concatenated (the sink itself is never capped
+            # upstream).  No sink model uses it, so refuse rather than guess.
+            raise ValueError(
+                "SinkAttention does not implement attention-logit softcapping "
+                f"(attn_logit_softcapping={self._softcap})."
+            )
+        self.num_kv_groups = self.num_attention_heads // self.num_key_value_heads
+        self._dtype = config.dtype
+
+        # Learnable sink logit: one scalar per attention head [num_heads].
+        self.sinks = nn.Parameter([self.num_attention_heads])
+
+    def _cache_key_values(
+        self, op: OpBuilder, key: ir.Value, value: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
+        """Return the KV tensors exposed as the next decode-step cache."""
+        return key, value
+
+    def _expand_kv_for_gqa(
+        self,
+        op: OpBuilder,
+        kv: ir.Value,
+        batch_1d: ir.Value,
+        kv_len_1d: ir.Value,
+    ) -> ir.Value:
+        """Expand KV from [B, kv_heads, S, d] to [B, q_heads, S, d] for GQA.
+
+        Uses unsqueeze+expand+reshape to replicate each KV head
+        ``num_kv_groups`` times consecutively: ``[kv0]*g, [kv1]*g, ...``,
+        which is what HuggingFace's ``repeat_kv`` does.
+        """
+        # [B, kv_heads, S, d] → [B, kv_heads, 1, S, d]
+        kv_5d = op.Unsqueeze(kv, [2])
+        # Expand to [B, kv_heads, num_kv_groups, S, d]
+        expand_shape = op.Concat(
+            batch_1d,
+            [self.num_key_value_heads, self.num_kv_groups],
+            kv_len_1d,
+            [self.head_dim],
+            axis=0,
+        )
+        kv_exp = op.Expand(kv_5d, expand_shape)
+        # Flatten to [B, q_heads, S, d]
+        flat_shape = op.Concat(
+            batch_1d,
+            [self.num_attention_heads],
+            kv_len_1d,
+            [self.head_dim],
+            axis=0,
+        )
+        return op.Reshape(kv_exp, flat_shape)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | GQAContext | None,
+        position_embeddings: tuple | None = None,
+        past_key_value: tuple | None = None,
+        static_cache: StaticCacheState | None = None,
+    ):
+        if isinstance(attention_bias, GQAContext):
+            raise TypeError(
+                "SinkAttention cannot emit GroupQueryAttention: the sink logit "
+                "must take part in the softmax denominator. Build this model "
+                "with a float additive attention bias instead."
+            )
+        if attention_bias is None:
+            raise ValueError(
+                "SinkAttention requires a float additive attention bias containing "
+                "the causal, padding, and optional sliding-window masks."
+            )
+        if static_cache is not None:
+            raise NotImplementedError(
+                "SinkAttention does not support the opset-24 static KV cache."
+            )
+
+        # hidden_states: [B, S, H]
+        batch_1d = op.Shape(hidden_states, start=0, end=1)  # 1-D tensor holding B
+        seq_1d = op.Shape(hidden_states, start=1, end=2)  # 1-D tensor holding S_q
+
+        # QKV projections: [B, S, heads * d]
+        query = self.q_proj(op, hidden_states)
+        key = self.k_proj(op, hidden_states)
+        value = self.v_proj(op, hidden_states)
+
+        query, key = self._apply_qk_norm(op, query, key)
+
+        # Apply RoPE on the 3D packed format [B, S, heads * d].
+        # ``position_embeddings is None`` marks a NoPE layer.
+        if position_embeddings is not None:
+            query = apply_rotary_pos_emb(
+                op,
+                x=query,
+                position_embeddings=position_embeddings,
+                num_heads=self.num_attention_heads,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                interleaved=self._rope_interleave,
+            )
+            key = apply_rotary_pos_emb(
+                op,
+                x=key,
+                position_embeddings=position_embeddings,
+                num_heads=self.num_key_value_heads,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                interleaved=self._rope_interleave,
+            )
+
+        # Reshape to 4D and transpose: [B, S, heads, d] → [B, heads, S, d]
+        query = op.Transpose(
+            op.Reshape(query, [0, 0, self.num_attention_heads, self.head_dim]),
+            perm=[0, 2, 1, 3],
+        )  # [B, q_heads, S_q, d]
+        key = op.Transpose(
+            op.Reshape(key, [0, 0, self.num_key_value_heads, self.head_dim]),
+            perm=[0, 2, 1, 3],
+        )  # [B, kv_heads, S_q, d]
+        value = op.Transpose(
+            op.Reshape(value, [0, 0, self.num_key_value_heads, self.head_dim]),
+            perm=[0, 2, 1, 3],
+        )  # [B, kv_heads, S_q, d]
+
+        # KV cache: prepend past tokens
+        if past_key_value is not None:
+            key = op.Concat(past_key_value[0], key, axis=2)  # [B, kv_heads, past+S, d]
+            value = op.Concat(past_key_value[1], value, axis=2)  # [B, kv_heads, past+S, d]
+        present_key_value = self._cache_key_values(op, key, value)
+
+        # Total KV sequence length (after cache concatenation)
+        kv_len_1d = op.Shape(key, start=2, end=3)  # [S_kv]
+
+        # GQA: expand key/value from kv_heads to q_heads
+        if self.num_kv_groups > 1:
+            key_exp = self._expand_kv_for_gqa(op, key, batch_1d, kv_len_1d)
+            value_exp = self._expand_kv_for_gqa(op, value, batch_1d, kv_len_1d)
+        else:
+            key_exp = key
+            value_exp = value
+
+        # Attention scores: [B, q_heads, S_q, d] @ [B, q_heads, d, S_kv]
+        key_t = op.Transpose(key_exp, perm=[0, 1, 3, 2])  # [B, q_heads, d, S_kv]
+        attn_scores = op.MatMul(query, key_t)  # [B, q_heads, S_q, S_kv]
+        attn_scores = op.Mul(attn_scores, self.scaling)
+
+        # Add causal + sliding-window + padding mask (float additive bias)
+        if attention_bias is not None:
+            # attention_bias: [B, 1, S_q, S_kv] — broadcasts over q_heads
+            attn_scores = op.Add(attn_scores, attention_bias)
+
+        attn_out = self._sink_weighted_sum(
+            op, attn_scores, value_exp, batch_1d=batch_1d, seq_1d=seq_1d
+        )
+
+        # Transpose and flatten heads: [B, q_heads, S_q, d] → [B, S_q, q_heads*d]
+        attn_out = op.Transpose(attn_out, perm=[0, 2, 1, 3])  # [B, S_q, q_heads, d]
+        attn_out = op.Reshape(attn_out, [0, 0, -1])  # [B, S_q, q_heads * d]
+
+        # Output projection
+        attn_out = self.o_proj(op, attn_out)
+        return attn_out, present_key_value
+
+    def _sink_weighted_sum(
+        self,
+        op: OpBuilder,
+        attn_scores: ir.Value,
+        value_exp: ir.Value,
+        *,
+        batch_1d: ir.Value,
+        seq_1d: ir.Value,
+    ) -> ir.Value:
+        """Apply this attention implementation's sink softmax and value projection."""
+        # Append the sink column: [q_heads] → [B, q_heads, S_q, 1]
+        sinks_4d = op.Reshape(self.sinks, [1, self.num_attention_heads, 1, 1])
+        expand_shape = op.Concat(
+            batch_1d,
+            [self.num_attention_heads],
+            seq_1d,
+            [1],
+            axis=0,
+        )
+        sinks_expanded = op.Expand(sinks_4d, expand_shape)  # [B, q_heads, S_q, 1]
+        # combined: [B, q_heads, S_q, S_kv + 1]
+        combined = op.Concat(attn_scores, sinks_expanded, axis=-1)
+
+        # HuggingFace's precision contract differs per model: GPT-OSS softmaxes
+        # in the compute dtype, GraniteSWA forces float32.  ``upcast_sink_softmax``
+        # selects between them; for float32 builds both are identical and the
+        # graph carries no Cast nodes at all.
+        upcast = self.upcast_sink_softmax and self._dtype != ir.DataType.FLOAT
+        if upcast:
+            combined = op.Cast(combined, to=ir.DataType.FLOAT)
+
+        # Numerical stability: subtract the per-row max before the softmax
+        row_max = op.ReduceMax(combined, [-1], keepdims=True)  # [B, q_heads, S_q, 1]
+        combined = op.Sub(combined, row_max)
+
+        # Softmax over the extended (S_kv + 1) axis
+        probs = op.Softmax(combined, axis=-1)  # [B, q_heads, S_q, S_kv + 1]
+
+        # Drop the sink column: slice axis 3 from 0 to -1 (all but the last).
+        # The removed mass is exactly the sink's share of the denominator, so
+        # the remaining probabilities sum to sigmoid(logsumexp(scores) - sink).
+        scores = op.Slice(probs, [0], [-1], [3])  # [B, q_heads, S_q, S_kv]
+        if upcast:
+            scores = op.Cast(scores, to=self._dtype)
+
+        # Weighted sum with value: [B, q_heads, S_q, d]
+        return op.MatMul(scores, value_exp)
+
+
+class Float32SinkAttention(SinkAttention):
+    """Sink attention whose sink scaling and softmax are forced to float32.
+
+    Some upstream sink kernels deliberately leave the compute dtype for the
+    softmax.  GraniteSWA's ``eager_attention_forward`` is one of them::
+
+        lse = torch.logsumexp(attn_weights, dim=-1)
+        sink_scale = (lse - sinks).to(torch.float32).sigmoid()   # forced fp32
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+
+    In the extra-column formulation, the ``logsumexp``/``sigmoid`` pair and the
+    softmax are the same reduction, so forcing that one softmax to float32
+    reproduces both upstream upcasts at once.
+
+    This is deliberately a separate class rather than a constructor flag: it is
+    a precision *contract* tied to the architecture, not a tuning knob, and
+    keeping it in the type means a model cannot silently acquire (or lose) the
+    upcast.  GPT-OSS, whose upstream kernel softmaxes in
+    ``combined_logits.dtype``, must keep using :class:`SinkAttention`.
+
+    For float32 builds this class emits exactly the same graph as
+    :class:`SinkAttention` — the upcast would be a no-op, so no Cast is added.
+    """
+
+    upcast_sink_softmax: bool = True
+
+    def _sink_weighted_sum(
+        self,
+        op: OpBuilder,
+        attn_scores: ir.Value,
+        value_exp: ir.Value,
+        *,
+        batch_1d: ir.Value,
+        seq_1d: ir.Value,
+    ) -> ir.Value:
+        """Replicate GraniteSWA's separate compute-dtype LSE and fp32 softmax."""
+        del batch_1d, seq_1d
+        # Keep logsumexp in the attention compute dtype; upstream only upcasts
+        # its sink scale after subtracting the sink logit.
+        logsumexp = op.ReduceLogSumExp(attn_scores, [-1], keepdims=True)
+        sinks = op.Reshape(self.sinks, [1, self.num_attention_heads, 1, 1])
+        sink_scale = op.Sub(logsumexp, sinks)
+        if self._dtype != ir.DataType.FLOAT:
+            sink_scale = op.Cast(sink_scale, to=ir.DataType.FLOAT)
+        sink_scale = op.Sigmoid(sink_scale)  # (B, q_heads, S_q, 1)
+
+        # GraniteSWA evaluates the token softmax in fp32, then casts its
+        # probabilities back before the value MatMul and sink multiplication.
+        softmax_input = attn_scores
+        if self._dtype != ir.DataType.FLOAT:
+            softmax_input = op.Cast(softmax_input, to=ir.DataType.FLOAT)
+        probs = op.Softmax(softmax_input, axis=-1)
+        if self._dtype != ir.DataType.FLOAT:
+            probs = op.Cast(probs, to=self._dtype)
+        attn_out = op.MatMul(probs, value_exp)  # (B, q_heads, S_q, head_dim)
+        if self._dtype != ir.DataType.FLOAT:
+            sink_scale = op.Cast(sink_scale, to=self._dtype)
+        return op.Mul(attn_out, sink_scale)
+
+
+class SlidingWindowSinkAttention(SinkAttention):
+    """Sink attention that retains only the prior local-window KV entries.
+
+    The cache contains ``sliding_window - 1`` tokens because the next query
+    contributes its own key/value. Callers must supply a matching float bias
+    whose key axis contains that retained cache plus the current query chunk.
+    """
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        rms_norm_class: type[nn.Module] | None = None,
+        scale: float | None = None,
+        linear_class: type | None = None,
+    ):
+        super().__init__(
+            config,
+            rms_norm_class=rms_norm_class,
+            scale=scale,
+            linear_class=linear_class,
+        )
+        window = config.sliding_window
+        if window is None or window <= 1:
+            raise ValueError(
+                "SlidingWindowSinkAttention requires config.sliding_window to be at least 2."
+            )
+        self._cache_length = window - 1
+
+    def _cache_key_values(
+        self, op: OpBuilder, key: ir.Value, value: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
+        # Preserve only the tokens that can participate with the following
+        # query, matching Transformers' DynamicSlidingWindowLayer contract.
+        starts = [-self._cache_length]
+        ends = [2**63 - 1]
+        return (
+            op.Slice(key, starts, ends, [2]),
+            op.Slice(value, starts, ends, [2]),
+        )
+
+
+class Float32SlidingWindowSinkAttention(SlidingWindowSinkAttention, Float32SinkAttention):
+    """Sliding-window sink attention with GraniteSWA's fp32 softmax contract."""
+
+
+class FusedQKVAttention(Attention):
+    """Attention whose checkpoint stores one contiguous Q/K/V projection."""
 
     def __init__(
         self,

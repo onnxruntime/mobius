@@ -2533,6 +2533,74 @@ class MuseGlimmerConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class GraniteSwaConfig(CausalLMConfig):
+    """Configuration for GraniteSWA (``GraniteSWAForCausalLM``).
+
+    Adds the two fields that distinguish GraniteSWA from plain Granite, on top
+    of the shared Granite scaling multipliers (``embedding_multiplier``,
+    ``attention_multiplier``, ``logits_scaling``, ``residual_multiplier``) that
+    :class:`ArchitectureConfig` already extracts:
+
+    * ``layer_types`` — per-layer ``"full_attention"`` / ``"sliding_attention"``.
+      HuggingFace defaults this to ``full_attention`` on every fourth layer
+      (``i % 4 == 0``) when the checkpoint omits it.
+    * ``layer_rope_theta`` — per-layer RoPE base frequency, where ``0`` marks a
+      NoPE layer.  HuggingFace defaults it to the global ``rope_theta`` for
+      every layer.
+
+    Both defaults are re-applied here so that a raw ``config.json`` mapping
+    (which never runs ``GraniteSWAConfig.__post_init__``) yields the same
+    architecture as a materialised HuggingFace config object.
+    """
+
+    layer_rope_theta: list[float | int] | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> GraniteSwaConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+
+        # GraniteSWA is definitionally a RoPE architecture: NoPE is expressed
+        # per layer via ``layer_rope_theta[i] == 0``, never globally.  A raw
+        # ``config.json`` mapping carries only the flat ``rope_theta: 10000``
+        # (the HF default) with no ``rope_parameters``, which the generic
+        # extractor reads as "no RoPE signal at all".  Re-assert RoPE here so
+        # the raw-JSON path builds the same graph as a materialised HF config.
+        if base.rope_type is None:
+            base = dataclasses.replace(
+                base,
+                rope_type="default",
+                rope_theta=float(getattr(config, "rope_theta", None) or 10_000.0),
+                partial_rotary_factor=1.0,
+            )
+
+        # HF ``__post_init__``: every fourth layer is full attention, rest slide.
+        layer_types = base.layer_types
+        if not layer_types:
+            layer_types = [
+                "full_attention" if index % 4 == 0 else "sliding_attention"
+                for index in range(base.num_hidden_layers)
+            ]
+
+        # HF ``__post_init__``: default to the global rope_theta on every layer.
+        # ``0`` is a real, meaningful value here (NoPE), so only a missing or
+        # empty list falls back — never a list that legitimately contains 0.
+        raw_layer_rope_theta = getattr(config, "layer_rope_theta", None)
+        if raw_layer_rope_theta:
+            layer_rope_theta: list[float | int] = list(raw_layer_rope_theta)
+        else:
+            layer_rope_theta = [base.rope_theta or 0.0] * base.num_hidden_layers
+
+        base = dataclasses.replace(
+            base,
+            layer_types=layer_types,
+            no_rope_layers=[
+                index for index, theta in enumerate(layer_rope_theta) if not theta
+            ],
+        )
+        return cls(**_shallow_fields(base), layer_rope_theta=layer_rope_theta)
+
+
+@dataclasses.dataclass
 class Lfm2Config(CausalLMConfig):
     """Configuration for LFM2's automatically adjusted feed-forward width."""
 

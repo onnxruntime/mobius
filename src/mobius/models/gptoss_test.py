@@ -7,10 +7,14 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._testing import make_config
+from mobius.components import Float32SinkAttention, SinkAttention
 from mobius.models.gptoss import GPTOSSCausalLMModel
+from mobius.tasks import get_task
 
 
 class TestGPTOSSPreprocessWeightsMXFP4:
@@ -90,3 +94,71 @@ class TestGPTOSSPreprocessWeightsMXFP4:
 
         result = model.preprocess_weights(state_dict)
         assert "model.layers.0.self_attn.q_proj.weight" in result
+
+
+class TestGPTOSSSinkSoftmaxPrecision:
+    """GPT-OSS must softmax the sink in the compute dtype, not float32.
+
+    Upstream ``gpt_oss.eager_attention_forward`` is explicit about this::
+
+        probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+
+    GraniteSWA forces float32 instead, so the two models use different
+    ``SinkAttention`` subclasses. Upcasting GPT-OSS would change f16/bf16
+    numerics and double the size of the largest score tensor, so this is a
+    regression guard, not a preference.
+    """
+
+    @staticmethod
+    def _build(dtype: ir.DataType):
+        config = make_config(
+            num_local_experts=2,
+            num_experts_per_tok=1,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=256,
+            partial_rotary_factor=1.0,
+            rope_interleave=False,
+            attn_qkv_bias=True,
+            attn_o_bias=True,
+            dtype=dtype,
+        )
+        module = GPTOSSCausalLMModel(config)
+        package = get_task("text-generation").build(module, config)
+        return config, module, package["model"].graph
+
+    def test_uses_the_compute_dtype_sink_attention(self):
+        _, module, _ = self._build(ir.DataType.FLOAT16)
+        for layer in module.model.layers:
+            assert isinstance(layer.self_attn, SinkAttention)
+            assert not isinstance(layer.self_attn, Float32SinkAttention)
+            assert layer.self_attn.upcast_sink_softmax is False
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16],
+        ids=["f32", "f16", "bf16"],
+    )
+    def test_no_cast_on_the_sink_softmax_path(self, dtype):
+        config, _, graph = self._build(dtype)
+        # GPT-OSS also has a Softmax in each MoE router; select only the
+        # attention sink softmaxes.
+        softmax_nodes = [
+            node
+            for node in graph
+            if node.op_type == "Softmax" and "self_attn" in (node.name or "")
+        ]
+        assert len(softmax_nodes) == config.num_hidden_layers
+        for softmax in softmax_nodes:
+            # Softmax <- Sub(row-max stabilise) <- Concat(scores, sinks):
+            # no Cast may sit between the sink Concat and the Softmax.
+            stabilise = softmax.inputs[0].producer()
+            assert stabilise is not None and stabilise.op_type == "Sub"
+            producer = stabilise.inputs[0].producer()
+            assert producer is not None and producer.op_type == "Concat", (
+                f"unexpected {producer.op_type if producer else None} before the "
+                f"sink softmax for dtype={dtype}; GPT-OSS must not upcast"
+            )
+            # ... and none after the sink column is dropped either.
+            (consumer, _), *_ = softmax.outputs[0].uses()
+            assert consumer.op_type == "Slice"
+            assert all(use[0].op_type != "Cast" for use in consumer.outputs[0].uses())
