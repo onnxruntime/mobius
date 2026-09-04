@@ -368,6 +368,24 @@ def test_transformers_config_forwards_only_explicit_revision(monkeypatch, revisi
     assert calls == [("unsloth/Qwen3.8-Flash-Next-FP8", expected_kwargs)]
 
 
+def test_transformers_config_accepts_hub_without_strict_validation_error(monkeypatch) -> None:
+    """Older supported huggingface_hub releases lack the optional error type."""
+    import transformers
+    from huggingface_hub import errors as hub_errors
+
+    config = SimpleNamespace(model_type="qwen2")
+    monkeypatch.delattr(hub_errors, "StrictDataclassClassValidationError", raising=False)
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config
+    )
+
+    assert transformers_builder._load_transformers_config(
+        "test/qwen2",
+        revision=None,
+        trust_remote_code=False,
+    ) == (config, False)
+
+
 def test_strip_to_text_only_drops_component_quantization() -> None:
     decoder = QuantizationConfig(
         bits=4,
