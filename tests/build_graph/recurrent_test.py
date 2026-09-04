@@ -37,7 +37,13 @@ _SSM_MODEL_PARAMS = _make_params(SSM_CONFIGS)
 class TestBuildSSMGraph:
     """Verify that SSM (Mamba/Mamba2) model types build valid ONNX graphs."""
 
+    @staticmethod
+    def _skip_phi4flash(model_type: str) -> None:
+        if model_type == "phi4flash":
+            pytest.skip("Phi-4 Flash has dedicated mixed SambaY cache tests below")
+
     def test_graph_builds_without_weights(self, model_type: str, config_overrides: dict):
+        self._skip_phi4flash(model_type)
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
         module = model_cls(config)
@@ -60,6 +66,7 @@ class TestBuildSSMGraph:
             assert f"present.{i}.ssm_state" in output_names
 
     def test_graph_has_initializers(self, model_type: str, config_overrides: dict):
+        self._skip_phi4flash(model_type)
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
         module = model_cls(config)
@@ -80,6 +87,7 @@ class TestBuildSSMGraph:
 
     def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
         """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
+        self._skip_phi4flash(model_type)
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
         module = model_cls(config)
@@ -89,6 +97,7 @@ class TestBuildSSMGraph:
 
     def test_outputs_have_shapes_and_dtypes(self, model_type: str, config_overrides: dict):
         """Verify shape inference populates all output shapes and dtypes."""
+        self._skip_phi4flash(model_type)
         config = _base_config(**config_overrides)
         model_cls = registry.get(model_type)
         module = model_cls(config)
@@ -243,6 +252,75 @@ class TestBuildMambaGraph:
         assert "model.layers.0.mixer.in_proj.weight" in result
         assert "model.layers.0.mixer.conv1d.weight" in result
         assert "model.layers.0.mixer.out_proj.weight" in result
+
+
+class TestBuildPhi4FlashGraph:
+    """Verify Phi-4 Flash's dedicated SambaY graph and 18-slot-derived cache ABI."""
+
+    def _config(self):
+        from mobius._configs import Phi4FlashConfig
+
+        return _base_config(
+            _config_cls=Phi4FlashConfig,
+            num_hidden_layers=4,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_dt_rank=4,
+            mamba_expand=2,
+            local_attention_window=8,
+            layer_norm_eps=1e-5,
+            tie_word_embeddings=True,
+        )
+
+    def _build(self):
+        config = self._config()
+        model_cls = registry.get("phi4flash")
+        return get_task("phi4flash-text-generation").build(model_cls(config), config)
+
+    def test_sambay_schedule_and_cache_io(self):
+        package = self._build()
+        model = package["model"]
+        inputs = {value.name: value for value in model.graph.inputs}
+        outputs = {value.name: value for value in model.graph.outputs}
+
+        assert "position_ids" not in inputs
+        assert set(inputs) == {
+            "input_ids",
+            "attention_mask",
+            "past_key_values.0.conv_state",
+            "past_key_values.0.ssm_state",
+            "past_key_values.1.key",
+            "past_key_values.1.value",
+            "past_key_values.2.conv_state",
+            "past_key_values.2.ssm_state",
+            "past_key_values.3.key",
+            "past_key_values.3.value",
+        }
+        assert set(outputs) == {
+            "logits",
+            "present.0.conv_state",
+            "present.0.ssm_state",
+            "present.1.key",
+            "present.1.value",
+            "present.2.conv_state",
+            "present.2.ssm_state",
+            "present.3.key",
+            "present.3.value",
+        }
+        assert inputs["past_key_values.0.conv_state"].shape[-2:] == (128, 4)
+        assert inputs["past_key_values.0.ssm_state"].shape[-2:] == (128, 8)
+        assert model.metadata_props["mobius.cache_abi"]
+
+    def test_sambay_graph_checker_and_output_metadata(self):
+        package = self._build()
+        _run_onnx_checker(package, "phi4flash")
+        _assert_outputs_have_shapes_and_dtypes(package, "phi4flash")
+
+    def test_sambay_rejects_static_cache(self):
+        from mobius.tasks import Phi4FlashCausalLMTask
+
+        with pytest.raises(ValueError, match="static/paged"):
+            Phi4FlashCausalLMTask(static_cache=True, max_seq_len=128)
 
 
 class TestBuildFalconMambaGraph:

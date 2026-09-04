@@ -153,6 +153,7 @@ __all__ = [
     "Phi3SmallCausalLMModel",
     "Phi3VModel",
     "Phi4MMCausalLMModel",
+    "Phi4FlashCausalLMModel",
     "Phi4MMMultiModalModel",
     "Phi4SigLIPModel",
     "PhiCausalLMModel",
@@ -383,6 +384,7 @@ from mobius.models.phi import (
 from mobius.models.phi3 import Phi3CausalLMModel
 from mobius.models.phi3_v import Phi3VModel
 from mobius.models.phi4_siglip import Phi4SigLIPModel
+from mobius.models.phi4flash import Phi4FlashCausalLMModel
 from mobius.models.plamo2 import Plamo2ForCausalLM
 from mobius.models.plm import PLMCausalLMModel
 from mobius.models.qwen import (

@@ -181,6 +181,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 "--static-cache cannot represent Falcon-H1's per-layer K, V, "
                 "convolution, and SSM states"
             )
+        if model_type == "phi4flash":
+            raise SystemExit(
+                "Error: --static-cache cannot represent Phi-4 Flash's heterogeneous SambaY "
+                "convolution, SSM, local-KV, and shared-global-KV state."
+            )
         if model_type == "glm_moe_dsa":
             raise ValueError(
                 "--static-cache cannot represent GLM-DSA's per-layer-varying packed DSA cache"
@@ -462,6 +467,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 raise
         model_type = hf_config.model_type
         parent_config = hf_config
+        if export_paged_attention and model_type == "phi4flash":
+            raise SystemExit(
+                "Error: --features paged-attention cannot represent Phi-4 Flash's "
+                "heterogeneous SambaY state."
+            )
         from mobius.integrations.transformers._builder import (
             _is_qwen4_exp_composite,
             _reject_unsupported_affine_qwen4,
@@ -634,6 +644,14 @@ def _save_package(
 ) -> None:
     """Save a ModelPackage to disk, applying optimizations and runtime configs."""
     runtime = getattr(args, "runtime", None)
+    if (
+        runtime == "ort-genai"
+        and getattr(getattr(pkg, "config", None), "model_type", None) == "phi4flash"
+    ):
+        raise SystemExit(
+            "Error: ORT GenAI cannot represent Phi-4 Flash's heterogeneous dynamic SambaY "
+            "cache ABI. Use the custom ONNX Runtime Session cache contract instead."
+        )
 
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
@@ -684,15 +702,18 @@ def _save_package(
             pkg,
             getattr(args, "revision", None),
         )
-        artifacts = write_ort_genai_config(
-            pkg,
-            output_dir,
-            hf_model_id=hf_model_id,
-            ep=ep,
-            local_config_dir=local_config_dir,
-            trust_remote_code=getattr(args, "trust_remote_code", False),
-            revision=runtime_revision,
-        )
+        try:
+            artifacts = write_ort_genai_config(
+                pkg,
+                output_dir,
+                hf_model_id=hf_model_id,
+                ep=ep,
+                local_config_dir=local_config_dir,
+                trust_remote_code=getattr(args, "trust_remote_code", False),
+                revision=runtime_revision,
+            )
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from error
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
     elif runtime == "onnx-genai":

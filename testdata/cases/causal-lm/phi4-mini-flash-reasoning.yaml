@@ -1,0 +1,19 @@
+model_id: "microsoft/Phi-4-mini-flash-reasoning"
+model_type: "phi4flash"
+revision: "1dff8163d28ec880ca2411c474ddc0a927792810"
+task_type: "text-generation"
+dtype: "bfloat16"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "What is the next number after 41?"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 8
+  do_sample: false
+
+notes: "Dedicated SambaY graph: stateful Mamba-1, local/global differential GQA, and YOCO shared memory/KV."
+skip_reason: "No immutable real-checkpoint golden is committed yet. Exact tiny-source L3 runs in the scoped CUDA dependency environment; L4/L5 require a checkpoint-sized CUDA golden run. ONNX Runtime GenAI cannot represent this model's heterogeneous dynamic SambaY cache ABI, and static/paged cache modes are intentionally rejected."

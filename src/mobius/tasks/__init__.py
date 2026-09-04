@@ -87,6 +87,7 @@ __all__ = [
     "OPSET_VERSION",
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
+    "Phi4FlashCausalLMTask",
     "PlamoCausalLMTask",
     "Plamo2CausalLMTask",
     "PixtralVLTask",
@@ -184,6 +185,7 @@ from mobius.tasks._mistral4_gguf import Mistral4GGUFCausalLMTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
+from mobius.tasks._phi4flash import Phi4FlashCausalLMTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._plamo import PlamoCausalLMTask
 from mobius.tasks._plamo2 import Plamo2CausalLMTask
@@ -302,6 +304,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "sensenova-u1": SenseNovaU1Task,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
+    "phi4flash-text-generation": Phi4FlashCausalLMTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
     "glmasr-speech-language": GlmAsrSpeechLanguageTask,
     "fastconformer-rnnt": RNNTTask,

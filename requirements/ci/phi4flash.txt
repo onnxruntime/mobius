@@ -1,0 +1,9 @@
+# Exact CUDA reference stack for microsoft/Phi-4-mini-flash-reasoning
+# at 1dff8163d28ec880ca2411c474ddc0a927792810. This is deliberately scoped
+# to the Phi-4 Flash parity workflow: it must not constrain public extras.
+torch==2.6.0
+transformers==4.46.1
+accelerate==1.4.0
+flash-attn==2.7.4.post1
+mamba-ssm==2.2.4
+causal-conv1d==1.5.0.post8

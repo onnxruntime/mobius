@@ -107,6 +107,7 @@ Models combining Mamba/SSM layers with transformer attention layers.
 |---|---|---|---|
 | `jamba` | `JambaCausalLMModel` | `hybrid-text-generation` | `ai21labs/Jamba-v0.1` |
 | `bamba` | `BambaCausalLMModel` | `hybrid-text-generation` | `ibm-fms/Bamba-9B` |
+| `phi4flash` | `Phi4FlashCausalLMModel` | `phi4flash-text-generation` | `microsoft/Phi-4-mini-flash-reasoning` |
 
 ## Vision-Language (Multimodal)
 

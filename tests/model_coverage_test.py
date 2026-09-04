@@ -163,6 +163,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
     "KDA/MLA state ABI; L1-L2 and synthetic GGUF execution are covered, while "
     "real-weight L4/L5 parity remains pending.",
+    "phi4flash": "Phi-4 Flash is a 3.85B trust-remote-code SambaY model whose "
+    "18-slot mixed recurrent/local/global cache requires the scoped CUDA reference "
+    "stack for L3 and cannot be driven by the generic golden runner or ORT GenAI.",
     "kimi_k3": "Registered tiny checkpoint uses selective MXFP4 compressed-tensors "
     "unsupported by the generic loader; dedicated model/GGUF tests exist, and "
     "real-weight L4/L5 awaits an unquantized or supported checkpoint.",
@@ -200,6 +203,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "plm": "L1/L2 and dedicated GGUF parity cover the architecture; reproducible L4/L5 "
     "golden data for the pinned PLM checkpoint is not yet checked in.",
     "phimoe_gguf": "GGUF-only PhiMoE routing variant — checkpoint coverage uses phimoe",
+    "Phi4FlashForCausalLM": "Architecture-string alias for phi4flash",
     "eurobert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
     "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
     "are covered by _specialized_encoders_test.py.",

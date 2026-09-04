@@ -29,6 +29,7 @@ __all__ = [
     "DeepSeekOCRCLIPEncoder",
     "DeepSeekOCRFullImageEncoder",
     "DeepSeekOCRVisionEncoder",
+    "DifferentialGQAAttention",
     "DiffusionFFN",
     "DiffusionSelfAttention",
     "Dots3NoteAudioProjector",
@@ -36,6 +37,7 @@ __all__ = [
     "DotsOCRProjector",
     "DotsVisionEncoder",
     "Embedding",
+    "FloatSwiGLU",
     "FusedQKVAttention",
     "EncoderAttention",
     "EncoderDecoderAttention",
@@ -44,6 +46,7 @@ __all__ = [
     "FusedGateUpMLP",
     "GatedDeltaNet",
     "GatedMLP",
+    "GatedMemoryMixer",
     "GatedRMSNorm",
     "KimiDeltaAttention",
     "KimiMLAAttention",
@@ -118,6 +121,7 @@ __all__ = [
     "ScaleFreeRMSNorm",
     "SelectiveScan",
     "SequenceMambaBlock",
+    "StatefulMambaBlock",
     "SequenceSelectiveScan",
     "SiLU",
     "Siglip2NaFlexVisionEmbeddings",
@@ -238,6 +242,7 @@ from mobius.components._decoder import (
     create_decoder_layer,
 )
 from mobius.components._deepseek_mla import DeepSeekMLA as DeepSeekMLA
+from mobius.components._differential_attention import DifferentialGQAAttention
 from mobius.components._diffusion import (
     AdaLayerNormOutput,
     AdaLayerNormZero,
@@ -282,9 +287,14 @@ from mobius.components._lightning_attention import (
 )
 from mobius.components._llama4_vision import Llama4VisionTower
 from mobius.components._lora import LoRALinear
+from mobius.components._mamba_block import (
+    FloatSwiGLU,
+    GatedMemoryMixer,
+    SequenceMambaBlock,
+    StatefulMambaBlock,
+)
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
-from mobius.components._mamba_block import SequenceMambaBlock
 from mobius.components._mimo_minimax_vision import (
     DualTemporalPatchEmbedding as MiMoDualTemporalPatchEmbedding,
 )
