@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
@@ -15,6 +15,9 @@ import mobius
 from mobius._configs import BaseModelConfig
 from mobius._constants import OPSET_VERSION
 from mobius._model_package import ModelPackage
+
+if TYPE_CHECKING:
+    from mobius._component_manifest import ComponentManifest
 
 
 class ComponentSpec:
@@ -158,6 +161,23 @@ class ModelTask(ABC):
     #: :meth:`_validate_components` checks that all declared attributes
     #: exist on the module before building begins.
     components: ClassVar[ComponentSpec | None] = None
+
+    def component_manifest(
+        self,
+        *,
+        module_class: type | None = None,
+        model_type: str | None = None,
+        hf_config: object | None = None,
+    ) -> ComponentManifest:
+        """Resolve canonical metadata for every component produced by this task."""
+        from mobius._component_manifest import resolve_component_manifest
+
+        return resolve_component_manifest(
+            self,
+            module_class=module_class,
+            model_type=model_type,
+            hf_config=hf_config,
+        )
 
     def _validate_components(self, module: nn.Module) -> None:
         """Validate that *module* exposes all attributes declared in :attr:`components`.
