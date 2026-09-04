@@ -88,7 +88,12 @@ class VibeVoiceASRTask(ModelTask):
             shape=[batch, 1, samples],
         )
         past = _make_conv_cache_inputs(builder, module.cache_specs, batch, config.dtype)
-        latents, present = module(builder.op, input_values, past)
+        is_final_chunk = builder.input(
+            "is_final_chunk",
+            dtype=ir.DataType.BOOL,
+            shape=[1],
+        )
+        latents, present = module(builder.op, input_values, past, is_final_chunk)
         latents.shape = ir.Shape([batch, frames, latent_size])
         builder.add_output(latents, "audio_latents")
         _register_conv_cache_outputs(builder, present)

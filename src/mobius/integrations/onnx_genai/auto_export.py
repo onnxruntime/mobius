@@ -800,6 +800,7 @@ def _write_vibevoice_asr_processor_contract(output_dir: str, config: Any) -> str
         "acoustic_tokenizer_chunk_size": int(
             getattr(config, "acoustic_tokenizer_chunk_size", 1_440_000)
         ),
+        "encoder_final_chunk_input": "is_final_chunk",
         "acoustic_sampling": {
             "noise_scale_input": "acoustic_noise_scale",
             "latent_noise_input": "acoustic_latent_noise",
@@ -807,9 +808,10 @@ def _write_vibevoice_asr_processor_contract(output_dir: str, config: Any) -> str
         },
         "host_orchestration": [
             (
-                "Split each 24 kHz waveform into chunk_samples windows and carry every "
-                "past_conv.* output into the matching input of both audio encoders; "
-                "zero-pad the terminal window to speech_tok_compress_ratio."
+                "Split each 24 kHz waveform into acoustic_tokenizer_chunk_size windows and "
+                "carry every past_conv.* output into the matching input of both audio encoders. "
+                "Pass is_final_chunk=[true] only for the terminal window; encoder stages apply "
+                "their source-defined per-layer padding, so do not pad the raw terminal waveform."
             ),
             (
                 "Concatenate encoder chunks per utterance; call connectors once with the "

@@ -160,6 +160,7 @@ def test_vibevoice_asr_writes_processor_and_advisory_contract(monkeypatch, tmp_p
     assert (
         processor["speech_tok_compress_ratio"] == package.config.acoustic_tokenizer.hop_length
     )
+    assert processor["encoder_final_chunk_input"] == "is_final_chunk"
     assert processor["acoustic_sampling"]["noise_scale_input"] == "acoustic_noise_scale"
     assert sorted(compatibility["components"]) == [
         "acoustic_encoder",

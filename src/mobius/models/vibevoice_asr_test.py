@@ -106,6 +106,10 @@ def _run_encoder_chunks(
             name,
             {
                 "input_values": input_values[:, :, start : start + chunk_samples],
+                "is_final_chunk": np.asarray(
+                    [start + chunk_samples >= input_values.shape[-1]],
+                    dtype=np.bool_,
+                ),
                 **cache,
             },
         )
@@ -116,6 +120,28 @@ def _run_encoder_chunks(
             if output.startswith("present_conv.")
         }
     return np.concatenate(latents, axis=1)
+
+
+def test_final_encoder_chunk_uses_source_per_layer_padding():
+    """A raw partial chunk emits its terminal frame only with the final-stage flag."""
+    _, module, package = _make_models()
+    feeds = {
+        "input_values": np.random.default_rng(1).standard_normal((1, 1, 5), dtype=np.float32),
+        **_empty_conv_cache(module.acoustic_encoder, batch=1),
+    }
+    incomplete = _run(
+        package,
+        "acoustic_encoder",
+        {**feeds, "is_final_chunk": np.asarray([False], dtype=np.bool_)},
+    )["audio_latents"]
+    complete = _run(
+        package,
+        "acoustic_encoder",
+        {**feeds, "is_final_chunk": np.asarray([True], dtype=np.bool_)},
+    )["audio_latents"]
+
+    assert incomplete.shape[1] == 1
+    assert complete.shape[1] == 2  # ceil(5 samples / 4x tiny-config hop)
 
 
 def test_staged_asr_matches_transformers_with_batch_chunking_and_left_padding():
