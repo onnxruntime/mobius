@@ -249,9 +249,6 @@ class TestVibeVoiceASR:
 
 def _require_pinned_reference():
     """Load the independently executable reference only from a verified local checkout."""
-    modeling = pytest.importorskip("vibevoice.modular.modeling_vibevoice_asr")
-    configuration = pytest.importorskip("vibevoice.modular.configuration_vibevoice")
-    tokenizer = pytest.importorskip("vibevoice.modular.modular_vibevoice_tokenizer")
     import transformers
 
     if transformers.__version__ != "4.51.3":
@@ -260,17 +257,33 @@ def _require_pinned_reference():
         direct_url = metadata.distribution("vibevoice").read_text("direct_url.json")
     except metadata.PackageNotFoundError:
         direct_url = None
+    source_is_pinned = False
     if direct_url is not None:
         vcs_info = json.loads(direct_url).get("vcs_info", {})
-        if vcs_info.get("commit_id") == VIBEVOICE_ASR_SOURCE_REVISION:
-            return modeling, configuration, tokenizer
+        if vcs_info.get("commit_id") != VIBEVOICE_ASR_SOURCE_REVISION:
+            pytest.skip(
+                "Synthetic VibeVoice ASR parity requires "
+                f"VibeVoice@{VIBEVOICE_ASR_SOURCE_REVISION}."
+            )
+        source_is_pinned = True
+    modeling = pytest.importorskip("vibevoice.modular.modeling_vibevoice_asr")
+    configuration = pytest.importorskip("vibevoice.modular.configuration_vibevoice")
+    tokenizer = pytest.importorskip("vibevoice.modular.modular_vibevoice_tokenizer")
+    if source_is_pinned:
+        return modeling, configuration, tokenizer
     source_root = Path(modeling.__file__).parents[2]
-    source_revision = subprocess.run(
-        ["git", "-C", str(source_root), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    try:
+        source_revision = subprocess.run(
+            ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip(
+            "Synthetic VibeVoice ASR parity requires installed VCS metadata or "
+            f"VibeVoice@{VIBEVOICE_ASR_SOURCE_REVISION} in direct_url.json."
+        )
     if source_revision != VIBEVOICE_ASR_SOURCE_REVISION:
         pytest.skip(
             "Synthetic VibeVoice ASR parity requires "

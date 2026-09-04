@@ -127,16 +127,21 @@ def _load_transformers_config(
 ) -> tuple[object | None, bool]:
     """Load a Transformers config and report whether raw JSON was required."""
     import transformers
-    from huggingface_hub.errors import StrictDataclassClassValidationError
+    from huggingface_hub import errors as hub_errors
 
     from mobius.integrations.transformers._config_resolver import _try_load_config_json
 
+    strict_validation_error = getattr(
+        hub_errors,
+        "StrictDataclassClassValidationError",
+        ValueError,
+    )
     try:
         kwargs = {"trust_remote_code": trust_remote_code}
         if revision is not None:
             kwargs["revision"] = revision
         return transformers.AutoConfig.from_pretrained(model_id, **kwargs), False
-    except (StrictDataclassClassValidationError, ValueError, KeyError, OSError):
+    except (strict_validation_error, ValueError, KeyError, OSError):
         return _try_load_config_json(model_id, revision=revision), True
 
 
