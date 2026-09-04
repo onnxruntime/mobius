@@ -20,8 +20,11 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import VibeVoiceASRConfig
 from mobius.components import Embedding
-from mobius.models.vibevoice import VibeVoiceDecoderModel, VibeVoiceMultiModalProjector
-from mobius.models.vibevoice import VibeVoiceTokenizerEncoder
+from mobius.models.vibevoice import (
+    VibeVoiceDecoderModel,
+    VibeVoiceMultiModalProjector,
+    VibeVoiceTokenizerEncoder,
+)
 
 VIBEVOICE_ASR_MODEL_ID = "microsoft/VibeVoice-ASR"
 VIBEVOICE_ASR_REVISION = "d0c9efdb8d614685062c04425d91e01b6f37d944"
@@ -171,7 +174,9 @@ class VibeVoiceASRDecoderModel(VibeVoiceDecoderModel):
         return logits, present_key_values
 
 
-def _map_original_tokenizer_encoder_key(key: str, *, source: str, destination: str) -> str | None:
+def _map_original_tokenizer_encoder_key(
+    key: str, *, source: str, destination: str
+) -> str | None:
     """Apply the upstream tokenizer-converter map to one original encoder key."""
     if not key.startswith(source):
         return None
@@ -190,7 +195,11 @@ def _map_original_tokenizer_encoder_key(key: str, *, source: str, destination: s
         if isinstance(replacement, tuple):
             target, shift = replacement
 
-            def _shift(match: re.Match[str]) -> str:
+            def _shift(
+                match: re.Match[str],
+                target: str = target,
+                shift: int = shift,
+            ) -> str:
                 return target.replace(r"\1", str(int(match.group(1)) + shift))
 
             key = re.sub(pattern, _shift, key)
@@ -228,7 +237,9 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
     def forward(self, op: OpBuilder, *args, **kwargs):
         raise NotImplementedError("VibeVoiceASRTask exports each ASR stage independently")
 
-    def preprocess_weights(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
         """Route every inference tensor and deliberately exclude unused VAE decoding."""
         routed: dict[str, torch.Tensor] = {}
         for source_key, value in state_dict.items():
@@ -254,32 +265,42 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
                 routed[f"semantic_encoder.encoder.{suffix}"] = value
             elif source_key.startswith("model.acoustic_connector."):
                 suffix = source_key.removeprefix("model.acoustic_connector.")
-                suffix = suffix.replace("fc1.", "linear_1.").replace("norm.", "act.").replace(
-                    "fc2.", "linear_2."
+                suffix = (
+                    suffix.replace("fc1.", "linear_1.")
+                    .replace("norm.", "act.")
+                    .replace("fc2.", "linear_2.")
                 )
                 routed[f"connectors.acoustic_connector.{suffix}"] = value
             elif source_key.startswith("model.semantic_connector."):
                 suffix = source_key.removeprefix("model.semantic_connector.")
-                suffix = suffix.replace("fc1.", "linear_1.").replace("norm.", "act.").replace(
-                    "fc2.", "linear_2."
+                suffix = (
+                    suffix.replace("fc1.", "linear_1.")
+                    .replace("norm.", "act.")
+                    .replace("fc2.", "linear_2.")
                 )
                 routed[f"connectors.semantic_connector.{suffix}"] = value
             elif source_key.startswith("model.multi_modal_projector.acoustic_"):
                 suffix = source_key.removeprefix("model.multi_modal_projector.acoustic_")
-                suffix = suffix.replace("linear_1.", "linear_1.").replace("norm.", "act.").replace(
-                    "linear_2.", "linear_2."
+                suffix = (
+                    suffix.replace("linear_1.", "linear_1.")
+                    .replace("norm.", "act.")
+                    .replace("linear_2.", "linear_2.")
                 )
                 routed[f"connectors.acoustic_connector.{suffix}"] = value
             elif source_key.startswith("model.multi_modal_projector.semantic_"):
                 suffix = source_key.removeprefix("model.multi_modal_projector.semantic_")
-                suffix = suffix.replace("linear_1.", "linear_1.").replace("norm.", "act.").replace(
-                    "linear_2.", "linear_2."
+                suffix = (
+                    suffix.replace("linear_1.", "linear_1.")
+                    .replace("norm.", "act.")
+                    .replace("linear_2.", "linear_2.")
                 )
                 routed[f"connectors.semantic_connector.{suffix}"] = value
             elif source_key.startswith("model.language_model.embed_tokens."):
                 suffix = source_key.removeprefix("model.language_model.embed_tokens.")
                 routed[f"embedding.embed_tokens.{suffix}"] = value
-            elif source_key.startswith(("model.language_model.layers.", "model.language_model.norm.")):
+            elif source_key.startswith(
+                ("model.language_model.layers.", "model.language_model.norm.")
+            ):
                 suffix = source_key.removeprefix("model.language_model.")
                 routed[f"decoder.{suffix}"] = value
             elif source_key == "lm_head.weight":

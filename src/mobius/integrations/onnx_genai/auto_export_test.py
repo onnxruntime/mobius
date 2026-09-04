@@ -153,11 +153,13 @@ def test_vibevoice_asr_writes_processor_and_advisory_contract(monkeypatch, tmp_p
 
     artifacts = write_onnx_genai_config(package, str(tmp_path))
 
-    processor = json.loads((tmp_path / "vibevoice_asr_processor.json").read_text())
+    processor = json.loads((tmp_path / "preprocessor_config.json").read_text())
     compatibility = json.loads((tmp_path / "runtime_compatibility.json").read_text())
-    assert artifacts["processor_contract"] == str(tmp_path / "vibevoice_asr_processor.json")
-    assert processor["sampling_rate"] == 24_000
-    assert processor["hop_length"] == package.config.acoustic_tokenizer.hop_length
+    assert artifacts["processor_contract"] == str(tmp_path / "preprocessor_config.json")
+    assert processor["target_sample_rate"] == 24_000
+    assert (
+        processor["speech_tok_compress_ratio"] == package.config.acoustic_tokenizer.hop_length
+    )
     assert processor["acoustic_sampling"]["noise_scale_input"] == "acoustic_noise_scale"
     assert sorted(compatibility["components"]) == [
         "acoustic_encoder",

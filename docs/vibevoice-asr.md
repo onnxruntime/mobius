@@ -49,7 +49,7 @@ inputs reproduce the source's acoustic sample
 deterministic under a host-provided seed.
 
 The checkpoint does not include tokenizer or processor artifacts. Export with
-`--runtime onnx-genai` writes `vibevoice_asr_processor.json`, including the
+`--runtime onnx-genai` writes `preprocessor_config.json`, including the
 24 kHz normalization (`-25 dBFS`, epsilon `1e-6`), chunk/cache procedure,
 prompt protocol, and output fields. A compatible text tokenizer must be
 provided by the host. Current ONNX Runtime GenAI does not orchestrate these
@@ -58,10 +58,14 @@ dual cached audio encoders or the source JSON protocol, so Mobius writes
 contracts—not a runnable `genai_config.json` claim.
 
 The source system prompt requests JSON records with `Start time`, `End time`,
-`Speaker ID`, and `Content`. `context_info` is source-provided background
-information/hotword text in that prompt; there is no separate algorithmic
-hotword input. `VibeVoiceASRProcessor.parse_diarization()` normalizes the
-source variants into `start_time`, `end_time`, `speaker_id`, and `text`.
+`Speaker ID`, and `Content`. It uses one `<|speech_pad|>` placeholder per
+`ceil(samples / 3200)`, enclosed by `<|speech_start|>` and
+`<|speech_end|>`, plus the two-decimal audio duration. `context_info` is
+source-provided background information/hotword text in that prompt; there is
+no separate algorithmic hotword input. `VibeVoiceASRProcessor.build_input_ids()`
+uses the compatible tokenizer's chat template to build that exact layout, and
+`parse_diarization()` normalizes source variants into `start_time`, `end_time`,
+`speaker_id`, and `text`.
 
 The decoder is ordinary causal Qwen2 with prefix-valid left padding
 (`0...0, 1...1`). Consequently, it remains eligible for normal Qwen2 GQA

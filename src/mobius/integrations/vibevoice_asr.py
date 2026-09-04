@@ -12,8 +12,10 @@ latent draws, and JSON diarization parsing.
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -37,7 +39,7 @@ class VibeVoiceASRProcessor:
     hop_length = 3_200
     chunk_samples = 1_440_000
     normalize_audio = True
-    target_dB_FS = -25.0
+    target_dbfs = -25.0
     eps = 1e-6
 
     def prepare_audio(
@@ -58,11 +60,15 @@ class VibeVoiceASRProcessor:
             elif waveforms.ndim == 2:
                 source = list(waveforms)
             else:
-                raise ValueError("waveforms array must have shape (samples,) or (batch, samples)")
+                raise ValueError(
+                    "waveforms array must have shape (samples,) or (batch, samples)"
+                )
         else:
             source = waveforms
         if not isinstance(source, list) or not source:
-            raise ValueError("waveforms must be one non-empty 1-D array or a non-empty list of them")
+            raise ValueError(
+                "waveforms must be one non-empty 1-D array or a non-empty list of them"
+            )
         normalized = [self._normalize(np.asarray(waveform), normalize) for waveform in source]
         max_samples = max(waveform.size for waveform in normalized)
         input_values = np.zeros((len(normalized), max_samples), dtype=np.float32)
@@ -73,44 +79,82 @@ class VibeVoiceASRProcessor:
         return VibeVoiceASRBatch(input_values=input_values, padding_mask=padding_mask)
 
     def iter_chunks(self, batch: VibeVoiceASRBatch) -> Iterator[VibeVoiceASRBatch]:
-        """Yield 60-second waveform windows; encoder cache bridges adjacent windows."""
+        """Yield hop-aligned 60-second windows; encoder cache bridges adjacent windows."""
         for start in range(0, batch.input_values.shape[-1], self.chunk_samples):
             stop = min(start + self.chunk_samples, batch.input_values.shape[-1])
+            input_values = batch.input_values[:, start:stop]
+            # The source processor reserves ceil(valid_samples / hop) speech
+            # placeholders. Pad only the terminal encoder window so the causal
+            # convolution emits that final partial frame as well.
+            final_padding = (-input_values.shape[-1]) % self.hop_length
+            if stop == batch.input_values.shape[-1] and final_padding:
+                input_values = np.pad(input_values, ((0, 0), (0, final_padding)))
             yield VibeVoiceASRBatch(
-                input_values=batch.input_values[:, start:stop, None].transpose(0, 2, 1),
+                input_values=input_values[:, None, :],
                 padding_mask=batch.padding_mask[:, start:stop],
             )
 
     @staticmethod
-    def make_prompt(context_info: str | None = None) -> list[dict[str, str]]:
-        """Build the source chat request; ``context_info`` is its hotword mechanism."""
+    def make_prompt(
+        *,
+        audio_samples: int,
+        context_info: str | None = None,
+    ) -> list[dict[str, str]]:
+        """Build the original duration and speech-placeholder chat content."""
+        if audio_samples <= 0:
+            raise ValueError("audio_samples must be positive")
+        audio_duration = audio_samples / VibeVoiceASRProcessor.sampling_rate
+        audio_tokens = math.ceil(audio_samples / VibeVoiceASRProcessor.hop_length)
         request = (
-            "Please transcribe the audio with the following JSON keys: Start time, End time, "
-            "Speaker ID, Content."
+            f"<|speech_start|>{'<|speech_pad|>' * audio_tokens}<|speech_end|>\n"
+            f"This is a {audio_duration:.2f} seconds audio"
         )
         if context_info:
-            request = f"{request}\nContext information: {context_info}"
+            request = f"{request}, with extra info: {context_info.strip()}"
+        request = f"{request}\n\nPlease transcribe it with these keys: Start time, End time, Speaker ID, Content"
         return [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": request},
         ]
 
     @staticmethod
+    def build_input_ids(
+        tokenizer: Any,
+        *,
+        audio_samples: int,
+        context_info: str | None = None,
+    ) -> tuple[list[int], list[bool]]:
+        """Apply the source's separate system and user chat-template calls."""
+        messages = VibeVoiceASRProcessor.make_prompt(
+            audio_samples=audio_samples,
+            context_info=context_info,
+        )
+        system_text = tokenizer.apply_chat_template([messages[0]], tokenize=False)
+        system_ids = list(tokenizer.encode(system_text))
+        user_ids = list(tokenizer.apply_chat_template([messages[1]], tokenize=True))
+        input_ids = system_ids + user_ids
+        speech_pad_id = tokenizer.convert_tokens_to_ids("<|speech_pad|>")
+        return input_ids, [token == speech_pad_id for token in input_ids]
+
+    @staticmethod
     def parse_diarization(text: str) -> list[dict[str, Any]]:
         """Parse the exact source JSON protocol into normalized diarization records."""
+        json_text = _extract_json_payload(text)
         try:
-            decoded = json.loads(text)
+            decoded = json.loads(json_text)
         except json.JSONDecodeError as error:
             raise ValueError("VibeVoice-ASR output is not valid diarization JSON") from error
         if isinstance(decoded, Mapping):
             decoded = decoded.get("segments", decoded.get("results", [decoded]))
         if not isinstance(decoded, list):
-            raise ValueError("VibeVoice-ASR diarization JSON must be an object or list of objects")
+            raise TypeError(
+                "VibeVoice-ASR diarization JSON must be an object or list of objects"
+            )
 
         records: list[dict[str, Any]] = []
         for index, record in enumerate(decoded):
             if not isinstance(record, Mapping):
-                raise ValueError(f"VibeVoice-ASR diarization record {index} is not an object")
+                raise TypeError(f"VibeVoice-ASR diarization record {index} is not an object")
             normalized = {
                 "".join(character for character in key.lower() if character.isalnum()): value
                 for key, value in record.items()
@@ -139,8 +183,8 @@ class VibeVoiceASRProcessor:
         rms = float(np.sqrt(np.mean(np.square(result), dtype=np.float64)))
         if rms <= self.eps:
             return result
-        current_dB_FS = 20.0 * np.log10(rms)
-        return result * np.float32(10.0 ** ((self.target_dB_FS - current_dB_FS) / 20.0))
+        current_dbfs = 20.0 * np.log10(rms)
+        return result * np.float32(10.0 ** ((self.target_dbfs - current_dbfs) / 20.0))
 
 
 class VibeVoiceASRHost:
@@ -169,8 +213,12 @@ class VibeVoiceASRHost:
         seed: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return flattened audio features and per-item valid frame lengths."""
-        acoustic_cache = dict(self._make_initial_conv_cache("acoustic_encoder", batch.input_values.shape[0]))
-        semantic_cache = dict(self._make_initial_conv_cache("semantic_encoder", batch.input_values.shape[0]))
+        acoustic_cache = dict(
+            self._make_initial_conv_cache("acoustic_encoder", batch.input_values.shape[0])
+        )
+        semantic_cache = dict(
+            self._make_initial_conv_cache("semantic_encoder", batch.input_values.shape[0])
+        )
         acoustic_chunks: list[np.ndarray] = []
         semantic_chunks: list[np.ndarray] = []
         for chunk in self.processor.iter_chunks(batch):
@@ -218,3 +266,27 @@ def _next_conv_cache(outputs: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]
         for name, value in outputs.items()
         if name.startswith("present_conv.")
     }
+
+
+def _extract_json_payload(text: str) -> str:
+    """Extract one source-style JSON object/list from decoded assistant text."""
+    fence = "```json"
+    if fence in text:
+        start = text.index(fence) + len(fence)
+        end = text.find("```", start)
+        if end == -1:
+            raise ValueError("VibeVoice-ASR output has an unterminated JSON code fence")
+        return text[start:end].strip()
+    starts = [index for index in (text.find("["), text.find("{")) if index >= 0]
+    if not starts:
+        return text
+    start = min(starts)
+    depth = 0
+    for index, character in enumerate(text[start:], start):
+        if character in "[{":
+            depth += 1
+        elif character in "]}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    raise ValueError("VibeVoice-ASR output has an unterminated JSON value")

@@ -211,7 +211,7 @@ def _resolve_module_class(
             "VibeVoiceForASRTraining",
         }
         unknown = set(architectures) - supported_architectures
-        if unknown or not architectures:
+        if unknown or len(architectures) != 1:
             raise ValueError(
                 "Unsupported VibeVoice architecture. Expected exactly one of "
                 f"{sorted(supported_architectures)}, got {architectures!r}."

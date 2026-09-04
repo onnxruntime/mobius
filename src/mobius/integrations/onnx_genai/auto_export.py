@@ -787,15 +787,19 @@ def _looks_like_vibevoice_asr(pkg: Any) -> bool:
 def _write_vibevoice_asr_processor_contract(output_dir: str, config: Any) -> str:
     """Materialize the source processor protocol absent from the ASR checkpoint."""
     os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, "vibevoice_asr_processor.json")
+    path = os.path.join(output_dir, "preprocessor_config.json")
     payload = {
         "processor_class": "VibeVoiceASRProcessor",
-        "sampling_rate": int(getattr(config, "sampling_rate", 24_000)),
-        "hop_length": int(getattr(config.acoustic_tokenizer, "hop_length", 3_200)),
-        "chunk_samples": int(getattr(config, "acoustic_tokenizer_chunk_size", 1_440_000)),
+        "speech_tok_compress_ratio": int(
+            getattr(config.acoustic_tokenizer, "hop_length", 3_200)
+        ),
+        "target_sample_rate": int(getattr(config, "sampling_rate", 24_000)),
         "normalize_audio": True,
         "target_dB_FS": -25.0,
         "eps": 1e-6,
+        "acoustic_tokenizer_chunk_size": int(
+            getattr(config, "acoustic_tokenizer_chunk_size", 1_440_000)
+        ),
         "acoustic_sampling": {
             "noise_scale_input": "acoustic_noise_scale",
             "latent_noise_input": "acoustic_latent_noise",
@@ -804,7 +808,8 @@ def _write_vibevoice_asr_processor_contract(output_dir: str, config: Any) -> str
         "host_orchestration": [
             (
                 "Split each 24 kHz waveform into chunk_samples windows and carry every "
-                "past_conv.* output into the matching input of both audio encoders."
+                "past_conv.* output into the matching input of both audio encoders; "
+                "zero-pad the terminal window to speech_tok_compress_ratio."
             ),
             (
                 "Concatenate encoder chunks per utterance; call connectors once with the "
@@ -821,6 +826,7 @@ def _write_vibevoice_asr_processor_contract(output_dir: str, config: Any) -> str
                 "You are a helpful assistant that transcribes audio input into text output "
                 "in JSON format."
             ),
+            "speech_tokens": ["<|speech_start|>", "<|speech_pad|>", "<|speech_end|>"],
             "context_info": "Optional background information or hotwords inserted in the user prompt.",
             "fields": ["Start time", "End time", "Speaker ID", "Content"],
         },
