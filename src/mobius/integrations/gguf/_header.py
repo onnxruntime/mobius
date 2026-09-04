@@ -299,11 +299,6 @@ def _gguf_header_info_from_header(
         for tensor_index in range(tensor_count):
             _, _, offset = read_string_span(offset)
             dimensions, offset = read_uint32(offset)
-            if dimensions > 4:
-                raise ValueError(
-                    f"{source!r} tensor {tensor_index} has {dimensions} dimensions; "
-                    "GGUF tensor metadata permits at most 4."
-                )
             offset = skip_bytes(
                 offset,
                 dimensions * 8,
