@@ -46,9 +46,12 @@ def test_processor_normalizes_pads_chunks_prompts_and_parses_diarization():
     )
     impulse = np.zeros(10_000, dtype=np.float32)
     impulse[0] = 1.0
-    assert np.abs(
-        processor.prepare_audio(impulse, sampling_rate=24_000).input_values
-    ).max() == pytest.approx(1.0)
+    peak = np.abs(processor.prepare_audio(impulse, sampling_rate=24_000).input_values).max()
+    rms = np.sqrt(np.mean(np.square(impulse), dtype=np.float64))
+    unclipped_peak = np.float32(
+        10 ** ((processor.target_dbfs - 20 * np.log10(rms + processor.eps)) / 20)
+    )
+    assert peak == pytest.approx(unclipped_peak / (unclipped_peak + processor.eps))
     assert processor.parse_diarization(
         'assistant\n[{"Start time": 0.0, "End_Time": 1.2, '
         '"Speaker ID": "S0", "Content": "hello"}]\n'
