@@ -30,6 +30,7 @@ from mobius._configs import (
     Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
+    Glm5NextConfig,
     HyV3Config,
     Jais2Config,
     KimiK3Config,
@@ -86,6 +87,8 @@ from mobius.models import (
     GemmaCausalLMModel,
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
+    Glm5NextCausalLMModel,
+    Glm5NextForConditionalGeneration,
     GlmCausalLMModel,
     GlmMoeDsaCausalLMModel,
     GlmOcrForConditionalGeneration,
@@ -767,6 +770,22 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
     # --- GLM-5.2 (MLA + DeepSeek Sparse Attention (DSA) + MoE) ---
     "glm_moe_dsa": ModelRegistration(GlmMoeDsaCausalLMModel, task="glm-moe-dsa"),
+    "glm5_next": ModelRegistration(
+        Glm5NextForConditionalGeneration,
+        task="glm5-next-vision-language",
+        config_class=Glm5NextConfig,
+        test_model_id="zai-org/GLM-5.3-Flash",
+        family="glm",
+        variant="multimodal+mhc+kda+kpool-dsa+moe",
+        test_revision="03eb5366286afd40d2221b1d9c63a6dd1ba4832e",
+    ),
+    "glm5_next_text": ModelRegistration(
+        Glm5NextCausalLMModel,
+        task="glm5-next-text-generation",
+        config_class=Glm5NextConfig,
+        family="glm",
+        variant="mhc+kda+kpool-dsa+moe",
+    ),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
     "mamba": ModelRegistration(MambaCausalLMModel),
@@ -1149,6 +1168,8 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     # text_only=True selects the same exact decoder without the vision stages.
     "qwen4_exp": "qwen4_exp_text",
     "qwen4_exp_text": "qwen4_exp_text",
+    "glm5_next": "glm5_next_text",
+    "glm5_next_text": "glm5_next_text",
 }
 
 
@@ -1302,6 +1323,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
     # --- GLM-5.2 (MLA + DSA + MoE) ---
     "glm_moe_dsa": "zai-org/GLM-5.2",
+    "glm5_next": "zai-org/GLM-5.3-Flash",
+    "glm5_next_text": "zai-org/GLM-5.3-Flash",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -1568,6 +1591,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
     "glm_moe_dsa": "glm",
+    "glm5_next": "glm",
+    "glm5_next_text": "glm",
     "olmo": "olmo",
     "olmo2": "olmo",
     "olmo3": "olmo",
@@ -1641,6 +1666,8 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v3": "mla+moe",
     "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
     "glm_moe_dsa": "mla+dsa-indexshare+full-attention-fallback+moe",
+    "glm5_next": "multimodal+mhc+kda+kpool-dsa+moe",
+    "glm5_next_text": "mhc+kda+kpool-dsa+moe",
     "phi3small": "blocksparse",
     "mamba": "ssm",
     "mamba2": "ssm",
