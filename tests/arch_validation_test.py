@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 
+import onnx_ir as ir
 import pytest
 
 from mobius._registry import registry
@@ -104,14 +105,20 @@ def _load_hf_config(model_id: str, revision: str | None = None):
     model type isn't registered in transformers.
     """
     import transformers
+    from huggingface_hub import errors as hub_errors
 
+    strict_validation_error = getattr(
+        hub_errors,
+        "StrictDataclassClassValidationError",
+        ValueError,
+    )
     try:
         return transformers.AutoConfig.from_pretrained(
             model_id,
             revision=revision,
             trust_remote_code=False,
         )
-    except (ValueError, OSError):
+    except (strict_validation_error, ValueError, OSError):
         return _try_load_config_json(model_id, revision=revision)
 
 
@@ -138,7 +145,14 @@ def _resolve_hf_config(hf_config, registration=None):
     owns_composite = (
         registration is not None and getattr(registration, "config_class", None) is not None
     )
-    if hasattr(hf_config, "talker_config"):
+    architectures = getattr(hf_config, "architectures", None) or []
+    if (
+        getattr(hf_config, "model_type", None) == "vibevoice"
+        and architectures == ["VibeVoiceForASRStreamingTraining"]
+        and hasattr(hf_config, "decoder_config")
+    ):
+        hf_config = hf_config.decoder_config
+    elif hasattr(hf_config, "talker_config"):
         talker = hf_config.talker_config
         # Qwen3-Omni talker nests the real model config under text_config
         if hasattr(talker, "text_config"):
@@ -162,7 +176,7 @@ def _resolve_hf_config(hf_config, registration=None):
     return hf_config, parent_config
 
 
-def _build_graph(model_type: str, model_id: str):
+def _build_graph(model_type: str, model_id: str, *, revision: str | None = None):
     """Download config, build ONNX graph, return ``(ModelPackage, task)``.
 
     Uses get_task().build() directly (same pattern as the L1 graph tests)
@@ -170,7 +184,10 @@ def _build_graph(model_type: str, model_id: str):
     (e.g. vision models with vocab_size=0).
     """
     registration = registry.get_registration(model_type)
-    hf_config = _load_hf_config(model_id, revision=registration.test_revision)
+    hf_config = _load_hf_config(
+        model_id,
+        revision=registration.test_revision if revision is None else revision,
+    )
     if hf_config is None:
         pytest.skip(
             f"Cannot download config for {model_id} (gated/private model or network error)"
@@ -273,6 +290,60 @@ class TestArchValidation:
                 assert output.name, f"{component_name} has an unnamed output"
 
         del pkg
+
+    @pytest.mark.parametrize(
+        ("model_id", "revision", "hidden_size", "q_heads", "kv_heads", "tied_embeddings"),
+        (
+            (
+                "microsoft/VibeVoice-ASR-Streaming-1.5B",
+                "4262d23d8a539a6530cf64fbd0b1751ef9a30853",
+                1536,
+                12,
+                2,
+                True,
+            ),
+            (
+                "microsoft/VibeVoice-ASR-Streaming-7B",
+                "60d858b518b4e19d404af3737f848fc185b30177",
+                3584,
+                28,
+                4,
+                False,
+            ),
+        ),
+    )
+    def test_vibevoice_asr_pinned_variants_build(
+        self,
+        model_id: str,
+        revision: str,
+        hidden_size: int,
+        q_heads: int,
+        kv_heads: int,
+        tied_embeddings: bool,
+    ):
+        """Build both official streaming-ASR variants from their pinned configs."""
+        pkg, task = _build_graph(
+            "VibeVoiceForASRStreamingTraining",
+            model_id,
+            revision=revision,
+        )
+
+        config = pkg.config
+        assert config.hidden_size == hidden_size
+        assert config.num_attention_heads == q_heads
+        assert config.num_key_value_heads == kv_heads
+        assert config.tie_word_embeddings is tied_embeddings
+        assert config.dtype == ir.DataType.FLOAT
+        assert config.acoustic_tokenizer.hidden_size == 64
+        assert config.semantic_tokenizer.hidden_size == 128
+        assert config.compression_ratio == 3200
+        assert config.sampling_rate == 24_000
+        assert set(pkg) == {"audio_encoder", "embedding", "decoder"}
+        assert task.model_roles == {
+            "audio_encoder": "encoder",
+            "embedding": "embedding",
+            "decoder": "decoder",
+        }
 
 
 class TestRegistryConsistency:

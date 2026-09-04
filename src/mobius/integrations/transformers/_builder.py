@@ -127,15 +127,21 @@ def _load_transformers_config(
 ) -> tuple[object | None, bool]:
     """Load a Transformers config and report whether raw JSON was required."""
     import transformers
+    from huggingface_hub import errors as hub_errors
 
     from mobius.integrations.transformers._config_resolver import _try_load_config_json
 
+    strict_validation_error = getattr(
+        hub_errors,
+        "StrictDataclassClassValidationError",
+        ValueError,
+    )
     try:
         kwargs = {"trust_remote_code": trust_remote_code}
         if revision is not None:
             kwargs["revision"] = revision
         return transformers.AutoConfig.from_pretrained(model_id, **kwargs), False
-    except (ValueError, KeyError, OSError):
+    except (strict_validation_error, ValueError, KeyError, OSError):
         return _try_load_config_json(model_id, revision=revision), True
 
 
@@ -148,7 +154,14 @@ def _select_primary_config(hf_config):
     parent_config = hf_config
     model_type = hf_config.model_type
 
-    if hasattr(hf_config, "talker_config"):
+    if model_type == "vibevoice" and hasattr(hf_config, "decoder_config"):
+        # TTS uses ``text_config`` while the distinct streaming ASR checkpoint
+        # stores its Qwen2 config under ``decoder_config``.
+        decoder = hf_config.decoder_config
+        if isinstance(decoder, dict):
+            decoder = _dict_to_pretrained_config(decoder)
+        hf_config = decoder
+    elif hasattr(hf_config, "talker_config"):
         hf_config = hf_config.talker_config
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
@@ -189,6 +202,24 @@ def _resolve_module_class(
 ) -> tuple[type[nn.Module], str | ModelTask | None, str]:
     """Resolve architecture aliases and structural fallback registrations."""
     architectures = getattr(parent_config, "architectures", None) or []
+    if model_type == "vibevoice":
+        if len(architectures) != 1:
+            raise ValueError(
+                "VibeVoice checkpoints must declare exactly one recognized architecture; "
+                "Mobius will not guess between the incompatible TTS and streaming ASR "
+                "pipelines."
+            )
+        architecture = architectures[0]
+        if architecture == "VibeVoiceForConditionalGeneration":
+            pass
+        elif architecture == "VibeVoiceForASRStreamingTraining":
+            model_type = architecture
+        else:
+            raise ValueError(
+                f"Unsupported VibeVoice architecture {architecture!r}; supported architectures "
+                "are 'VibeVoiceForConditionalGeneration' and "
+                "'VibeVoiceForASRStreamingTraining'."
+            )
     if allow_parent_architecture_override and architectures and architectures[0] in registry:
         architecture_key = architectures[0]
         model_type_class = registry.get(model_type) if model_type in registry else None
@@ -300,15 +331,17 @@ def build_transformers_model(
         _config_from_hf,
         _default_task_for_model,
     )
+    from mobius.models.vibevoice import VIBEVOICE_ASR_MODEL_REVISIONS, VIBEVOICE_REVISION
 
     detection_revision = revision
-    if model_id == "vibevoice/VibeVoice-1.5B-hf" and detection_revision is None:
-        from mobius.models.vibevoice import VIBEVOICE_REVISION
-
+    if (
+        model_id in {"vibevoice/VibeVoice-1.5B-hf", *VIBEVOICE_ASR_MODEL_REVISIONS}
+        and detection_revision is None
+    ):
         # The native conversion is the executable source of truth. Pin the
         # first config probe and every later processor/weight call together.
-        revision = VIBEVOICE_REVISION
-        detection_revision = VIBEVOICE_REVISION
+        revision = VIBEVOICE_ASR_MODEL_REVISIONS.get(model_id, VIBEVOICE_REVISION)
+        detection_revision = revision
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -525,7 +558,10 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
-        if model_type in _QWEN4_MODEL_TYPES | {"vibevoice"}:
+        if model_type in _QWEN4_MODEL_TYPES | {
+            "vibevoice",
+            "VibeVoiceForASRStreamingTraining",
+        }:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:

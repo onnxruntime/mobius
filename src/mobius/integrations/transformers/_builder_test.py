@@ -272,6 +272,46 @@ def test_vibevoice_none_revision_pins_first_config_probe(monkeypatch) -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_vibevoice_asr_none_revision_pins_first_config_probe(
+    monkeypatch, model_id, revision
+) -> None:
+    """Both official ASR variants must pin their initial config probe."""
+    calls = []
+
+    def stop_after_config(called_model_id, **kwargs):
+        calls.append((called_model_id, kwargs))
+        raise RuntimeError("stop after revision assertion")
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        stop_after_config,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after revision assertion"):
+        transformers_builder.build_transformers_model(
+            model_id,
+            load_weights=False,
+        )
+
+    assert calls == [
+        (
+            model_id,
+            {
+                "revision": revision,
+                "trust_remote_code": False,
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize("revision", [None, "feature/revision"])
 def test_transformers_config_forwards_only_explicit_revision(monkeypatch, revision) -> None:
     import transformers

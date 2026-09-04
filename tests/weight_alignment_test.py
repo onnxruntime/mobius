@@ -87,6 +87,8 @@ _FILTERING_PREPROCESS_MODELS: set[str] = {
     "opt",
     # ModernBert decoder: expects model.layers.* HF format with renames
     "modernbert-decoder",
+    # VibeVoice ASR translates its executable checkpoint hierarchy into split-stage names.
+    "VibeVoiceForASRStreamingTraining",
 }
 
 
@@ -168,6 +170,49 @@ def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
     )
 
     assert parameter_names == set(routed)
+
+
+@pytest.mark.arch_validation
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_vibevoice_asr_pinned_weight_index_routes_every_inference_tensor_once(
+    model_id, revision
+):
+    """Audit each pinned 1,177-tensor ASR checkpoint without downloading its weights."""
+    import json
+
+    from huggingface_hub import hf_hub_download
+
+    from mobius import build
+    from mobius.models.vibevoice import VibeVoiceASRForConditionalGeneration
+
+    with open(
+        hf_hub_download(
+            model_id,
+            "model.safetensors.index.json",
+            revision=revision,
+        )
+    ) as handle:
+        checkpoint_names = set(json.load(handle)["weight_map"])
+
+    package = build(model_id, revision=revision, load_weights=False)
+    module = VibeVoiceASRForConditionalGeneration(package.config)
+    routed = module.preprocess_weights({name: torch.zeros(1) for name in checkpoint_names})
+    parameter_names = _collect_parameter_names(package)
+    intentionally_unused = {
+        name
+        for name in checkpoint_names
+        if name.startswith(module.INTENTIONALLY_UNUSED_WEIGHT_PREFIXES)
+    }
+
+    assert len(checkpoint_names) == len(routed) + len(intentionally_unused)
+    assert parameter_names == set(routed)
+    assert len(intentionally_unused) == 276
 
 
 # ---------------------------------------------------------------------------

@@ -222,6 +222,7 @@ __all__ = [
     "PLMCausalLMModel",
     "TalkieForCausalLM",
     "Qwen4ExpForConditionalGeneration",
+    "VibeVoiceASRForConditionalGeneration",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -453,7 +454,10 @@ from mobius.models.unet import (
     remap_diffusers_unet_lora,
 )
 from mobius.models.vae import AutoencoderKLModel
-from mobius.models.vibevoice import VibeVoiceForConditionalGeneration
+from mobius.models.vibevoice import (
+    VibeVoiceASRForConditionalGeneration,
+    VibeVoiceForConditionalGeneration,
+)
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
