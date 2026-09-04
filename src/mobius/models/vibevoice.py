@@ -67,17 +67,24 @@ class _ConvState:
         hidden_states: ir.Value,
         *,
         index: int,
-        left_pad: int,
     ) -> ir.Value:
         past = self._past[index]
-        padded = op.Concat(past, hidden_states, axis=2)
+        return op.Concat(past, hidden_states, axis=2)
+
+    def update(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        *,
+        index: int,
+        left_pad: int,
+    ) -> None:
         self._present[index] = op.Slice(
-            padded,
+            hidden_states,
             op.Constant(value_ints=[-left_pad]),
             op.Constant(value_ints=[2**63 - 1]),
             op.Constant(value_ints=[2]),
         )
-        return padded
 
     def outputs(self) -> list[ir.Value]:
         if any(value is None for value in self._present):
@@ -158,6 +165,8 @@ class _CausalConv1d(nn.Module):
             groups=groups,
         )
         self._left_pad = (kernel_size - 1) * dilation - (stride - 1)
+        self._kernel_size = kernel_size
+        self._stride = stride
         if self._left_pad < 0:
             raise ValueError("VibeVoice causal convolution padding must be non-negative")
         self._cache_index = allocator.add(in_channels, self._left_pad)
@@ -167,6 +176,7 @@ class _CausalConv1d(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         state: _ConvState | None = None,
+        is_final_chunk: ir.Value | None = None,
     ):
         if state is None:
             hidden_states = op.Pad(
@@ -175,6 +185,42 @@ class _CausalConv1d(nn.Module):
             )
         else:
             hidden_states = state.prepend(
+                op,
+                hidden_states,
+                index=self._cache_index,
+            )
+        if is_final_chunk is not None:
+            # The original streaming tokenizer pads each convolution's own
+            # input. Padding only the raw waveform changes biased intermediate
+            # frames before later downsampling layers can see them.
+            input_length = op.Squeeze(op.Shape(hidden_states, start=2, end=3), [0])
+            numerator = op.Sub(
+                op.Add(input_length, self._left_pad),
+                self._kernel_size,
+            )
+            frame_count = op.Div(
+                op.Add(numerator, self._stride - 1),
+                self._stride,
+            )
+            ideal_length = op.Add(
+                op.Mul(frame_count, self._stride),
+                self._kernel_size - self._left_pad,
+            )
+            final_padding = op.Where(
+                is_final_chunk,
+                op.Sub(ideal_length, input_length),
+                op.Constant(value_int=0),
+            )
+            hidden_states = op.Pad(
+                hidden_states,
+                op.Concat(
+                    op.Constant(value_ints=[0, 0, 0, 0, 0]),
+                    final_padding,
+                    axis=0,
+                ),
+            )
+        if state is not None:
+            state.update(
                 op,
                 hidden_states,
                 index=self._cache_index,
@@ -210,6 +256,11 @@ class _CausalConvTranspose1d(nn.Module):
         input_length = op.Shape(hidden_states, start=2, end=3)
         if state is not None:
             hidden_states = state.prepend(
+                op,
+                hidden_states,
+                index=self._cache_index,
+            )
+            state.update(
                 op,
                 hidden_states,
                 index=self._cache_index,
@@ -278,12 +329,13 @@ class _ConvNext1dLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         state: _ConvState | None = None,
+        is_final_chunk: ir.Value | None = None,
     ):
         residual = hidden_states
         mixed = op.Transpose(hidden_states, perm=[0, 2, 1])
         mixed = self.norm(op, mixed)
         mixed = op.Transpose(mixed, perm=[0, 2, 1])
-        mixed = self.mixer(op, mixed, state)
+        mixed = self.mixer(op, mixed, state, is_final_chunk)
         mixed = op.Mul(mixed, op.Unsqueeze(self.gamma, [-1]))
         hidden_states = op.Add(residual, mixed)  # (batch, channels, frames)
 
@@ -312,10 +364,16 @@ class _EncoderStem(nn.Module):
             ]
         )
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value, state: _ConvState | None):
-        hidden_states = self.conv(op, hidden_states, state)
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        state: _ConvState | None,
+        is_final_chunk: ir.Value | None = None,
+    ):
+        hidden_states = self.conv(op, hidden_states, state, is_final_chunk)
         for block in self.stage:
-            hidden_states = block(op, hidden_states, state)
+            hidden_states = block(op, hidden_states, state, is_final_chunk)
         return hidden_states
 
 
@@ -342,10 +400,16 @@ class _EncoderLayer(nn.Module):
             ]
         )
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value, state: _ConvState | None):
-        hidden_states = self.conv(op, hidden_states, state)
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        state: _ConvState | None,
+        is_final_chunk: ir.Value | None = None,
+    ):
+        hidden_states = self.conv(op, hidden_states, state, is_final_chunk)
         for block in self.stage:
-            hidden_states = block(op, hidden_states, state)
+            hidden_states = block(op, hidden_states, state, is_final_chunk)
         return hidden_states
 
 
@@ -375,12 +439,13 @@ class VibeVoiceTokenizerEncoder(nn.Module):
         op: OpBuilder,
         input_values: ir.Value,
         past_conv_states: Sequence[ir.Value] | None = None,
+        is_final_chunk: ir.Value | None = None,
     ):
         state = _ConvState(past_conv_states) if past_conv_states is not None else None
-        hidden_states = self.stem(op, input_values, state)
+        hidden_states = self.stem(op, input_values, state, is_final_chunk)
         for layer in self.conv_layers:
-            hidden_states = layer(op, hidden_states, state)
-        hidden_states = self.head(op, hidden_states, state)
+            hidden_states = layer(op, hidden_states, state, is_final_chunk)
+        hidden_states = self.head(op, hidden_states, state, is_final_chunk)
         latents = op.Transpose(hidden_states, perm=[0, 2, 1])  # (batch, frames, latent)
         return latents, state.outputs() if state is not None else []
 

@@ -26,6 +26,7 @@ They require network access to download config.json from HuggingFace.
 
 from __future__ import annotations
 
+import builtins
 import logging
 
 import pytest
@@ -105,14 +106,48 @@ def _load_hf_config(model_id: str, revision: str | None = None):
     """
     import transformers
 
+    class _MissingStrictDataclassClassValidationError(Exception):
+        """Sentinel that cannot match errors from older Hub installations."""
+
+    try:
+        from huggingface_hub import errors as hub_errors
+    except ImportError:
+        strict_validation_error = _MissingStrictDataclassClassValidationError
+    else:
+        strict_validation_error = getattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            _MissingStrictDataclassClassValidationError,
+        )
+
     try:
         return transformers.AutoConfig.from_pretrained(
             model_id,
             revision=revision,
             trust_remote_code=False,
         )
-    except (ValueError, OSError):
+    except (ValueError, OSError, strict_validation_error):
         return _try_load_config_json(model_id, revision=revision)
+
+
+def test_load_hf_config_accepts_hub_without_errors_module(monkeypatch):
+    """Architecture validation supports older compatible Hub releases."""
+    import transformers
+
+    config = object()
+    import_module = builtins.__import__
+
+    def import_without_hub_errors(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "huggingface_hub" and "errors" in fromlist:
+            raise ImportError("No module named 'huggingface_hub.errors'")
+        return import_module(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_hub_errors)
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config
+    )
+
+    assert _load_hf_config("test/qwen2") is config
 
 
 def _resolve_hf_config(hf_config, registration=None):

@@ -47,6 +47,7 @@ from mobius._configs import (
     Plamo2Config,
     Qwen4ExpConfig,
     SenseNovaU1Config,
+    VibeVoiceASRConfig,
     VibeVoiceConfig,
     WhisperConfig,
     XverseConfig,
@@ -159,6 +160,7 @@ from mobius.models import (
     SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
+    VibeVoiceASRForConditionalGeneration,
     VibeVoiceForConditionalGeneration,
     WhisperForConditionalGeneration,
     XverseCausalLMModel,
@@ -228,6 +230,7 @@ from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
+from mobius.models.vibevoice_asr import VIBEVOICE_ASR_MODEL_ID, VIBEVOICE_ASR_REVISION
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
@@ -904,6 +907,18 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         test_model_id=VIBEVOICE_MODEL_ID,
         test_revision=VIBEVOICE_REVISION,
         family="vibevoice",
+    ),
+    # VibeVoice's shared model_type is insufficient to choose a graph
+    # contract. The builder permits this architecture key only when the
+    # checkpoint declares the original, offline ASR implementation.
+    "VibeVoiceForASRTraining": ModelRegistration(
+        VibeVoiceASRForConditionalGeneration,
+        task="vibevoice-asr",
+        config_class=VibeVoiceASRConfig,
+        test_model_id=VIBEVOICE_ASR_MODEL_ID,
+        test_revision=VIBEVOICE_ASR_REVISION,
+        family="vibevoice",
+        variant="offline-asr",
     ),
     "whisper": ModelRegistration(
         WhisperForConditionalGeneration,

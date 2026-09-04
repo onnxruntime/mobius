@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import builtins
 from unittest import mock
 
 import pytest
@@ -653,6 +654,21 @@ class TestDictToPretrainedConfig:
             "StrictDataclassClassValidationError",
             raising=False,
         )
+        config = _dict_to_pretrained_config({"model_type": "llama", "hidden_size": 64})
+        assert config.hidden_size == 64
+
+    def test_older_hub_without_errors_module(self, monkeypatch):
+        import transformers
+
+        assert transformers.PretrainedConfig is not None
+        import_module = builtins.__import__
+
+        def import_without_hub_errors(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "huggingface_hub" and "errors" in fromlist:
+                raise ImportError("No module named 'huggingface_hub.errors'")
+            return import_module(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_hub_errors)
         config = _dict_to_pretrained_config({"model_type": "llama", "hidden_size": 64})
         assert config.hidden_size == 64
 
