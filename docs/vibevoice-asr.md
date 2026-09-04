@@ -61,9 +61,11 @@ dual cached audio encoders or the source JSON protocol, so Mobius writes
 contracts—not a runnable `genai_config.json` claim.
 
 The source system prompt requests JSON records with `Start time`, `End time`,
-`Speaker ID`, and `Content`. It uses one `<|speech_pad|>` placeholder per
-`ceil(samples / 3200)`, enclosed by `<|speech_start|>` and
-`<|speech_end|>`, plus the two-decimal audio duration. `context_info` is
+`Speaker ID`, and `Content`. It uses one `<|box_start|>` placeholder per
+`ceil(samples / 3200)`, enclosed by `<|object_ref_start|>` and
+`<|object_ref_end|>`, plus the two-decimal audio duration. These are the
+ASR tokenizer's actual values for the semantic speech-start/pad/end roles and
+the pad token ID is the embedding stage's `audio_token_id`. `context_info` is
 source-provided background information/hotword text in that prompt; there is
 no separate algorithmic hotword input. `VibeVoiceASRProcessor.build_input_ids()`
 uses the compatible tokenizer's chat template to build that exact layout, and

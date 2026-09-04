@@ -22,6 +22,9 @@ import numpy as np
 _SYSTEM_PROMPT = (
     "You are a helpful assistant that transcribes audio input into text output in JSON format."
 )
+_SPEECH_START_TOKEN = "<|object_ref_start|>"
+_SPEECH_PAD_TOKEN = "<|box_start|>"
+_SPEECH_END_TOKEN = "<|object_ref_end|>"
 
 
 @dataclass(frozen=True)
@@ -100,7 +103,7 @@ class VibeVoiceASRProcessor:
         audio_duration = audio_samples / VibeVoiceASRProcessor.sampling_rate
         audio_tokens = math.ceil(audio_samples / VibeVoiceASRProcessor.hop_length)
         request = (
-            f"<|speech_start|>{'<|speech_pad|>' * audio_tokens}<|speech_end|>\n"
+            f"{_SPEECH_START_TOKEN}{_SPEECH_PAD_TOKEN * audio_tokens}{_SPEECH_END_TOKEN}\n"
             f"This is a {audio_duration:.2f} seconds audio"
         )
         normalized_context = context_info.strip() if context_info else ""
@@ -135,7 +138,7 @@ class VibeVoiceASRProcessor:
         system_ids = list(tokenizer.encode(system_text))
         user_ids = list(tokenizer.apply_chat_template([messages[1]], tokenize=True))
         input_ids = system_ids + user_ids
-        speech_pad_id = tokenizer.convert_tokens_to_ids("<|speech_pad|>")
+        speech_pad_id = tokenizer.convert_tokens_to_ids(_SPEECH_PAD_TOKEN)
         return input_ids, [token == speech_pad_id for token in input_ids]
 
     @staticmethod
