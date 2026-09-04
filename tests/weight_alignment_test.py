@@ -87,6 +87,8 @@ _FILTERING_PREPROCESS_MODELS: set[str] = {
     "opt",
     # ModernBert decoder: expects model.layers.* HF format with renames
     "modernbert-decoder",
+    # VibeVoice ASR translates its executable checkpoint hierarchy into split-stage names.
+    "VibeVoiceForASRStreamingTraining",
 }
 
 
