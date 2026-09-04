@@ -24,6 +24,7 @@ __all__ = [
     "ShardedGGUFNotSupportedError",
     "UnsupportedGGUFArchitectureError",
     "UnsupportedGGUFQuantizationError",
+    "VibeASRBitNetGGUFImportError",
 ]
 
 
@@ -37,6 +38,10 @@ class UnsupportedGGUFArchitectureError(ValueError):
 
 class UnsupportedGGUFQuantizationError(ValueError):
     """A stored GGML tensor type that mobius cannot read or preserve."""
+
+
+class VibeASRBitNetGGUFImportError(UnsupportedGGUFQuantizationError):
+    """A VibeASR.cpp-native GGUF whose execution contract has no ORT equivalent."""
 
 
 class DisabledGGUFArchitectureError(NotImplementedError):
