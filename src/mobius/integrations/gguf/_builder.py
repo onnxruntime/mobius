@@ -599,7 +599,7 @@ def _preflight_hf_gguf_file(
         )
         return _GGUFPreflightFallbackRevision(commit_hash)
     _validate_preflight_split_header(header_info, source=source)
-    from mobius.integrations.gguf._vibeasr_bitnet import reject_vibeasr_bitnet_gguf
+    from mobius.integrations._vibeasr_bitnet import reject_vibeasr_bitnet_gguf
 
     reject_vibeasr_bitnet_gguf(
         source=source,
@@ -675,7 +675,7 @@ def _validate_gguf_model(
     if not isinstance(gguf_model, GgufShardSet):
         split_count = int(gguf_model.get_metadata("split.count", 1))
         _raise_for_sharded_gguf(source=source, split_count=split_count)
-    from mobius.integrations.gguf._vibeasr_bitnet import reject_vibeasr_bitnet_gguf
+    from mobius.integrations._vibeasr_bitnet import reject_vibeasr_bitnet_gguf
 
     reader_tensors = getattr(gguf_model, "reader_tensors", None)
     tensor_type_ids = frozenset()
