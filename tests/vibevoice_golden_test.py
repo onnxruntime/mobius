@@ -27,9 +27,12 @@ from mobius.integrations.transformers._builder import (
 )
 from mobius.integrations.transformers._config_resolver import _config_from_hf
 from mobius.models.vibevoice import (
+    VIBEVOICE_EXECUTABLE_MODEL_ID,
+    VIBEVOICE_EXECUTABLE_REVISION,
     VIBEVOICE_MODEL_ID,
     VIBEVOICE_REVISION,
     VibeVoiceForConditionalGeneration,
+    resolve_vibevoice_sources,
 )
 
 _ROOT = Path(__file__).parents[1]
@@ -62,9 +65,11 @@ def _selected_cases(cases: list[str]) -> list[str]:
 
 
 def _config():
+    sources = resolve_vibevoice_sources(VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION)
+    assert sources is not None
     hf_config, _ = _load_transformers_config(
-        VIBEVOICE_MODEL_ID,
-        revision=VIBEVOICE_REVISION,
+        sources.config_model_id,
+        revision=sources.config_revision,
         trust_remote_code=False,
     )
     primary, parent, _ = _select_primary_config(hf_config)
@@ -104,9 +109,11 @@ def vibevoice_package_dir(tmp_path_factory) -> Path:
 @pytest.fixture(scope="session")
 def vibevoice_processor():
     transformers = pytest.importorskip("transformers")
+    sources = resolve_vibevoice_sources(VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION)
+    assert sources is not None
     return transformers.AutoProcessor.from_pretrained(
-        VIBEVOICE_MODEL_ID,
-        revision=VIBEVOICE_REVISION,
+        sources.processor_model_id,
+        revision=sources.processor_revision,
     )
 
 
@@ -194,7 +201,8 @@ def test_vibevoice_l4_real_weight_prefill(
         device="cuda" if torch.cuda.is_available() else "cpu",
         max_new_tokens=1,
     )
-    assert expected["revision"] == VIBEVOICE_REVISION
+    assert expected["model_id"] == VIBEVOICE_EXECUTABLE_MODEL_ID
+    assert expected["revision"] == VIBEVOICE_EXECUTABLE_REVISION
     np.testing.assert_allclose(
         actual.prefill_control_logits,
         expected["prefill_control_logits"],
@@ -314,9 +322,11 @@ def test_vibevoice_real_weight_stage_parity(
 ):
     """Compare every real-weight stage, wiring ONNX outputs into the next stage."""
     transformers = pytest.importorskip("transformers")
+    sources = resolve_vibevoice_sources(VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION)
+    assert sources is not None
     model = transformers.AutoModelForTextToWaveform.from_pretrained(
-        VIBEVOICE_MODEL_ID,
-        revision=VIBEVOICE_REVISION,
+        sources.config_model_id,
+        revision=sources.config_revision,
         dtype=torch.float16,
         low_cpu_mem_usage=True,
     ).eval()
