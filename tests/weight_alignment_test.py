@@ -191,7 +191,7 @@ def test_official_vibevoice_weight_index_matches_native_conversion():
             filename="model.safetensors.index.json",
             revision=revision,
         )
-        with open(path) as file:
+        with open(path, encoding="utf-8") as file:
             return set(json.load(file)["weight_map"])
 
     official = weight_names(VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION)
