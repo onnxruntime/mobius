@@ -99,6 +99,73 @@ class TestCLIBuild:
             )
             assert os.path.isfile(os.path.join(tmpdir, "model.onnx"))
 
+    def test_mattergen_no_weights_routes_before_diffusers_or_transformers(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.mattergen._builder.build_mattergen",
+                return_value=mock.MagicMock(),
+            ) as build_mattergen,
+            mock.patch("mobius.__main__._save_package") as save_package,
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "microsoft/mattergen",
+                    "--mattergen-checkpoint",
+                    "mp_20_base",
+                    "--no-weights",
+                    "--output",
+                    tmpdir,
+                ]
+            )
+
+        assert build_mattergen.call_args.args == ("microsoft/mattergen",)
+        assert build_mattergen.call_args.kwargs == {
+            "checkpoint": "mp_20_base",
+            "revision": None,
+            "dtype": None,
+            "load_weights": False,
+            "execution_provider": "default",
+        }
+        save_package.assert_called_once()
+
+    def test_mattergen_rejects_onnx_genai_metadata(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match="host-owned"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "microsoft/mattergen",
+                    "--runtime",
+                    "onnx-genai",
+                    "--no-weights",
+                    "--output",
+                    tmpdir,
+                ]
+            )
+
+    def test_mattergen_rejects_transformer_rewrite_rules(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match="rewrite rules"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "microsoft/mattergen",
+                    "--optimize",
+                    "--no-weights",
+                    "--output",
+                    tmpdir,
+                ]
+            )
+
     def test_max_workers_defaults_to_eight(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,

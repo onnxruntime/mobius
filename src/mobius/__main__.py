@@ -329,11 +329,71 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
         revision = REUSE_REVISION
     output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
     optimize = args.optimize
     component_filter = args.component
     execution_provider = args.execution_provider
+
+    from mobius.integrations.mattergen._builder import (
+        build_mattergen,
+        is_mattergen_checkpoint,
+    )
+
+    mattergen_source = args.model or args.config
+    is_mattergen = is_mattergen_checkpoint(mattergen_source)
+    if args.mattergen_checkpoint is not None and not is_mattergen:
+        raise SystemExit(
+            "Error: --mattergen-checkpoint requires --model microsoft/mattergen or a "
+            "local MatterGen checkpoint root."
+        )
+    if is_mattergen:
+        if task is not None:
+            raise SystemExit(
+                "Error: MatterGen uses its fixed mattergen-score task; do not pass --task."
+            )
+        if args.runtime is not None:
+            raise SystemExit(
+                "Error: MatterGen cannot produce an ONNX Runtime GenAI package. Its "
+                "periodic graph and stochastic crystal scheduler remain host-owned."
+            )
+        if component_filter is not None:
+            raise SystemExit(
+                "Error: MatterGen exports exactly one score-core component; --component is unsupported."
+            )
+        if optimize is not None:
+            raise SystemExit(
+                "Error: Transformer rewrite rules are unsupported for MatterGen score-core exports."
+            )
+        if (
+            args.text_only
+            or args.static_cache
+            or fp8_kv_cache
+            or prune_prefill_prefix
+            or args.glm_full_attention
+            or export_paged_attention
+            or args.trust_remote_code
+            or args.dequantize
+        ):
+            raise SystemExit(
+                "Error: Transformer/compressed-weight build options are unsupported for MatterGen."
+            )
+        if input_sampling_rate is not None or bwe_sampling_rate is not None:
+            raise SystemExit(
+                "Error: --input-sample-rate and --bwe-sample-rate are unsupported for MatterGen."
+            )
+        try:
+            pkg = build_mattergen(
+                mattergen_source,
+                checkpoint=args.mattergen_checkpoint or "mp_20_base",
+                revision=revision,
+                dtype=dtype_override,
+                load_weights=load_weights,
+                execution_provider=execution_provider,
+            )
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from error
+        _save_package(pkg, output_dir, args, optimize, component_filter)
+        return
 
     # Auto-detect diffusers pipelines. Skipped when the text-only feature is set:
     # that flag only applies to transformers decoder exports, so we let the
@@ -1415,6 +1475,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--task",
         default=None,
         help="Model task (auto-detected if not specified). Use 'mobius list tasks' to see available tasks.",
+    )
+    build_parser.add_argument(
+        "--mattergen-checkpoint",
+        default=None,
+        metavar="FAMILY",
+        help=(
+            "Official MatterGen checkpoint family (default: mp_20_base). Only valid "
+            "with --model microsoft/mattergen or a local MatterGen checkpoint root."
+        ),
     )
     build_parser.add_argument(
         "--no-weights",

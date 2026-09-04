@@ -118,6 +118,8 @@ __all__ = [
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MaincoderCausalLMModel",
+    "MatterGenGemNetTModel",
+    "MatterGenModel",
     "MiniMaxCausalLMModel",
     "MiniCPM3CausalLMModel",
     "MiniCPMCausalLMModel",
@@ -327,6 +329,7 @@ from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mage_vl import MageVLForConditionalGeneration
 from mobius.models.maincoder import MaincoderCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.mattergen import MatterGenGemNetTModel, MatterGenModel
 from mobius.models.mimi import MimiModel
 from mobius.models.minicpm import MiniCPM3CausalLMModel, MiniCPMCausalLMModel
 from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
