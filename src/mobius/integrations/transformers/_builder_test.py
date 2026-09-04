@@ -210,6 +210,66 @@ def test_qwen38_multimodal_config_keeps_parent_fields(monkeypatch) -> None:
     assert built_configs[0].image_token_id == 248056
 
 
+def test_vibevoice_architecture_dispatch_is_explicit_and_fail_closed() -> None:
+    """The shared VibeVoice model_type cannot select ASR by accident."""
+    from mobius.models import (
+        VibeVoiceASRForConditionalGeneration,
+        VibeVoiceForConditionalGeneration,
+    )
+
+    asr_parent = SimpleNamespace(
+        model_type="vibevoice",
+        architectures=["VibeVoiceForASRTraining"],
+        decoder_config=SimpleNamespace(model_type="qwen2"),
+    )
+    primary, parent, model_type = transformers_builder._select_primary_config(asr_parent)
+    module, task, resolved = transformers_builder._resolve_module_class(
+        model_type, parent, None, None
+    )
+    assert primary is asr_parent.decoder_config
+    assert module is VibeVoiceASRForConditionalGeneration
+    assert task is None
+    assert resolved == "VibeVoiceForASRTraining"
+
+    tts_parent = SimpleNamespace(
+        model_type="vibevoice",
+        architectures=["VibeVoiceForConditionalGeneration"],
+    )
+    module, _, resolved = transformers_builder._resolve_module_class(
+        "vibevoice", tts_parent, None, None
+    )
+    assert module is VibeVoiceForConditionalGeneration
+    assert resolved == "vibevoice"
+
+    with pytest.raises(ValueError, match="Unsupported VibeVoice architecture"):
+        transformers_builder._resolve_module_class(
+            "vibevoice",
+            SimpleNamespace(
+                model_type="vibevoice",
+                architectures=["VibeVoiceForStreamingASR"],
+            ),
+            None,
+            None,
+        )
+
+
+@pytest.mark.arch_validation
+def test_vibevoice_asr_pinned_raw_config_builds_through_public_builder() -> None:
+    """The official raw ASR config reaches the architecture-specific five-stage task."""
+    package = transformers_builder.build_transformers_model(
+        "microsoft/VibeVoice-ASR",
+        revision="d0c9efdb8d614685062c04425d91e01b6f37d944",
+        load_weights=False,
+    )
+    assert set(package) == {
+        "acoustic_encoder",
+        "semantic_encoder",
+        "connectors",
+        "embedding",
+        "decoder",
+    }
+
+
 def test_qwen38_fp8_none_revision_uses_hugging_face_default(monkeypatch) -> None:
     calls = []
 

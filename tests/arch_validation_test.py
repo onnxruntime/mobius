@@ -104,6 +104,7 @@ def _load_hf_config(model_id: str, revision: str | None = None):
     model type isn't registered in transformers.
     """
     import transformers
+    from huggingface_hub.errors import StrictDataclassClassValidationError
 
     try:
         return transformers.AutoConfig.from_pretrained(
@@ -111,7 +112,7 @@ def _load_hf_config(model_id: str, revision: str | None = None):
             revision=revision,
             trust_remote_code=False,
         )
-    except (ValueError, OSError):
+    except (ValueError, OSError, StrictDataclassClassValidationError):
         return _try_load_config_json(model_id, revision=revision)
 
 

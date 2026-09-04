@@ -769,6 +769,68 @@ def _looks_like_vibevoice_tts(pkg: Any) -> bool:
     } <= names
 
 
+def _looks_like_vibevoice_asr(pkg: Any) -> bool:
+    """Detect the offline VibeVoice-ASR dual-encoder component topology."""
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    return {
+        "acoustic_encoder",
+        "semantic_encoder",
+        "connectors",
+        "embedding",
+        "decoder",
+    } <= names
+
+
+def _write_vibevoice_asr_processor_contract(output_dir: str, config: Any) -> str:
+    """Materialize the source processor protocol absent from the ASR checkpoint."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "vibevoice_asr_processor.json")
+    payload = {
+        "processor_class": "VibeVoiceASRProcessor",
+        "sampling_rate": int(getattr(config, "sampling_rate", 24_000)),
+        "hop_length": int(getattr(config.acoustic_tokenizer, "hop_length", 3_200)),
+        "chunk_samples": int(getattr(config, "acoustic_tokenizer_chunk_size", 1_440_000)),
+        "normalize_audio": True,
+        "target_dB_FS": -25.0,
+        "eps": 1e-6,
+        "acoustic_sampling": {
+            "noise_scale_input": "acoustic_noise_scale",
+            "latent_noise_input": "acoustic_latent_noise",
+            "formula": "latents + vae_std * noise_scale[:, None, None] * latent_noise",
+        },
+        "host_orchestration": [
+            (
+                "Split each 24 kHz waveform into chunk_samples windows and carry every "
+                "past_conv.* output into the matching input of both audio encoders."
+            ),
+            (
+                "Concatenate encoder chunks per utterance; call connectors once with the "
+                "full sample-level padding mask and explicit reproducible noise draws."
+            ),
+            (
+                "Create one audio placeholder token for each emitted audio_features row, "
+                "then run embedding and the left-padded cached decoder autoregressively."
+            ),
+            "Parse generated JSON records into start_time, end_time, speaker_id, and text.",
+        ],
+        "prompt_protocol": {
+            "system": (
+                "You are a helpful assistant that transcribes audio input into text output "
+                "in JSON format."
+            ),
+            "context_info": "Optional background information or hotwords inserted in the user prompt.",
+            "fields": ["Start time", "End time", "Speaker ID", "Content"],
+        },
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return path
+
+
 def _looks_like_speculative(pkg: Any) -> bool:
     try:
         return {"proposer", "verifier"} <= set(pkg.keys())
@@ -1289,6 +1351,30 @@ def write_onnx_genai_config(
                     "positive/negative Qwen2 caches, DPM-Solver diffusion loop, and "
                     "streaming convolution state. Exact graph and processor contracts "
                     "are exported without claiming downstream orchestration."
+                ),
+            )
+        )
+        return artifacts
+
+    if _looks_like_vibevoice_asr(pkg):
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "VibeVoice-ASR derives KV and convolution state dtypes from ONNX ports; "
+                "kv_native_dtype overrides are unsupported"
+            )
+        artifacts = _write_text_runtime_assets(output_dir, source, revision=revision)
+        artifacts["processor_contract"] = _write_vibevoice_asr_processor_contract(
+            output_dir, resolved_config
+        )
+        artifacts.update(
+            _write_advisory_component_contract(
+                pkg,
+                output_dir,
+                warning=(
+                    "The tested onnx-genai runtime does not orchestrate VibeVoice-ASR's "
+                    "dual cached audio encoders, source-defined latent sampling, or "
+                    "diarization JSON protocol. Exact graph and processor contracts are "
+                    "exported without claiming downstream orchestration."
                 ),
             )
         )

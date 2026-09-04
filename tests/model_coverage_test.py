@@ -180,6 +180,11 @@ _COVERAGE_SKIP: dict[str, str] = {
     "nvidia/RE-USE config.json is a bespoke model_cfg/stft_cfg document with no "
     "model_type field, which arch_validation_test requires, so the generic "
     "download-and-build path cannot drive it.",
+    "VibeVoiceForASRTraining": "The pinned offline ASR checkpoint contains "
+    "17,348,198,410 BF16 bytes (about 8.67B parameters), exceeding the 16 GiB "
+    "real-weight evidence budget. L1 stages, raw-config L2, exact checkpoint-index "
+    "classification, and source-synthetic L3 chunk/cache/diarization protocol "
+    "coverage are checked in; L4/L5 awaits the documented CUDA workflow.",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",

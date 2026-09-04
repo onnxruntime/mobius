@@ -127,6 +127,7 @@ def _load_transformers_config(
 ) -> tuple[object | None, bool]:
     """Load a Transformers config and report whether raw JSON was required."""
     import transformers
+    from huggingface_hub.errors import StrictDataclassClassValidationError
 
     from mobius.integrations.transformers._config_resolver import _try_load_config_json
 
@@ -135,7 +136,11 @@ def _load_transformers_config(
         if revision is not None:
             kwargs["revision"] = revision
         return transformers.AutoConfig.from_pretrained(model_id, **kwargs), False
-    except (ValueError, KeyError, OSError):
+    except (ValueError, KeyError, OSError, StrictDataclassClassValidationError):
+        # Official VibeVoice-ASR intentionally reuses the VibeVoice model_type
+        # with a different architecture. Current Transformers rejects that
+        # composite during strict TTS validation, so preserve its raw config for
+        # architecture-specific dispatch below.
         return _try_load_config_json(model_id, revision=revision), True
 
 
@@ -148,7 +153,18 @@ def _select_primary_config(hf_config):
     parent_config = hf_config
     model_type = hf_config.model_type
 
-    if hasattr(hf_config, "talker_config"):
+    if model_type == "vibevoice" and "VibeVoiceForASRTraining" in set(
+        getattr(hf_config, "architectures", None) or []
+    ):
+        # The original Microsoft checkpoint nests its Qwen2 decoder in
+        # ``decoder_config`` while reusing the TTS model_type. Retain the
+        # composite parent for audio configuration and let architecture routing
+        # select the distinct staged ASR export.
+        decoder = getattr(hf_config, "decoder_config", None)
+        if decoder is None:
+            raise ValueError("VibeVoiceForASRTraining config is missing decoder_config")
+        hf_config = decoder
+    elif hasattr(hf_config, "talker_config"):
         hf_config = hf_config.talker_config
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
@@ -189,6 +205,17 @@ def _resolve_module_class(
 ) -> tuple[type[nn.Module], str | ModelTask | None, str]:
     """Resolve architecture aliases and structural fallback registrations."""
     architectures = getattr(parent_config, "architectures", None) or []
+    if model_type == "vibevoice":
+        supported_architectures = {
+            "VibeVoiceForConditionalGeneration",
+            "VibeVoiceForASRTraining",
+        }
+        unknown = set(architectures) - supported_architectures
+        if unknown or not architectures:
+            raise ValueError(
+                "Unsupported VibeVoice architecture. Expected exactly one of "
+                f"{sorted(supported_architectures)}, got {architectures!r}."
+            )
     if allow_parent_architecture_override and architectures and architectures[0] in registry:
         architecture_key = architectures[0]
         model_type_class = registry.get(model_type) if model_type in registry else None
