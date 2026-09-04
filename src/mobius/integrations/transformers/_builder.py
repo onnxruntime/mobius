@@ -300,15 +300,18 @@ def build_transformers_model(
         _config_from_hf,
         _default_task_for_model,
     )
+    from mobius.models.vibevoice import resolve_vibevoice_sources
 
     detection_revision = revision
-    if model_id == "vibevoice/VibeVoice-1.5B-hf" and detection_revision is None:
-        from mobius.models.vibevoice import VIBEVOICE_REVISION
-
-        # The native conversion is the executable source of truth. Pin the
-        # first config probe and every later processor/weight call together.
-        revision = VIBEVOICE_REVISION
-        detection_revision = VIBEVOICE_REVISION
+    vibevoice_sources = resolve_vibevoice_sources(model_id, revision)
+    config_model_id = model_id
+    if vibevoice_sources is not None:
+        # The original official checkpoint has legacy metadata and no tokenizer
+        # assets. Resolve only executable inputs from the pinned conversion;
+        # model_id remains the graph identity and official weights stay official.
+        revision = vibevoice_sources.weight_revision
+        config_model_id = vibevoice_sources.config_model_id
+        detection_revision = vibevoice_sources.config_revision
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -318,7 +321,7 @@ def build_transformers_model(
         detection_revision = REUSE_REVISION
 
     hf_config, loaded_from_raw_json = _load_transformers_config(
-        model_id,
+        config_model_id,
         revision=detection_revision,
         trust_remote_code=trust_remote_code,
     )
@@ -527,6 +530,13 @@ def build_transformers_model(
         model.graph.name = f"{model_id}/{name}"
         if model_type in _QWEN4_MODEL_TYPES | {"vibevoice"}:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
+        if vibevoice_sources is not None:
+            model.metadata_props["mobius.executable_source"] = (
+                f"{vibevoice_sources.config_model_id}@{vibevoice_sources.config_revision}"
+            )
+            model.metadata_props["mobius.processor_source"] = (
+                f"{vibevoice_sources.processor_model_id}@{vibevoice_sources.processor_revision}"
+            )
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
@@ -586,7 +596,13 @@ def build_transformers_model(
         else:
             state_dict = _download_weights(model_id, revision=revision)
             if hasattr(model_module, "preprocess_weights"):
-                state_dict = model_module.preprocess_weights(state_dict)
+                if vibevoice_sources is not None:
+                    state_dict = model_module.preprocess_weights(
+                        state_dict,
+                        checkpoint_layout=vibevoice_sources.weight_layout,
+                    )
+                else:
+                    state_dict = model_module.preprocess_weights(state_dict)
             state_dict = preprocess_component_quantized_state_dict(
                 state_dict,
                 model_module,

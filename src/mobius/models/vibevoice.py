@@ -10,7 +10,9 @@ positive/negative decoder-cache orchestration.
 
 from __future__ import annotations
 
+import dataclasses
 import math
+import re
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
@@ -37,9 +39,206 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-VIBEVOICE_MODEL_ID = "vibevoice/VibeVoice-1.5B-hf"
-VIBEVOICE_REVISION = "edc39f80f5cae656da37baf8faa8f5502bf7081f"
-VIBEVOICE_MICROSOFT_PROVENANCE_REVISION = "c00898d257e6b46004e3e2866a47534085fb685a"
+VIBEVOICE_MODEL_ID = "microsoft/VibeVoice-1.5B"
+VIBEVOICE_REVISION = "c00898d257e6b46004e3e2866a47534085fb685a"
+VIBEVOICE_EXECUTABLE_MODEL_ID = "vibevoice/VibeVoice-1.5B-hf"
+VIBEVOICE_EXECUTABLE_REVISION = "edc39f80f5cae656da37baf8faa8f5502bf7081f"
+VIBEVOICE_MICROSOFT_PROVENANCE_REVISION = VIBEVOICE_REVISION
+
+
+@dataclasses.dataclass(frozen=True)
+class VibeVoiceSources:
+    """Immutable provenance for one VibeVoice TTS build.
+
+    ``model_id`` and ``weight_revision`` are always the user's checkpoint. The
+    official 1.5B release predates Transformers-native VibeVoice metadata, so
+    its executable config and processor are resolved from the pinned conversion
+    mirror while its official weights remain the only downloaded weights.
+    """
+
+    model_id: str
+    weight_revision: str
+    config_model_id: str
+    config_revision: str
+    processor_model_id: str
+    processor_revision: str
+    weight_layout: str
+
+
+_UNSUPPORTED_VIBEVOICE_MODELS = {
+    "microsoft/VibeVoice-Realtime-0.5B": (
+        "VibeVoice Realtime requires its streaming backbone and scheduler, "
+        "which Mobius does not export yet."
+    ),
+    "microsoft/VibeVoice-ASR": (
+        "VibeVoice ASR requires the VibeVoice-ASR encoder-decoder task, "
+        "which Mobius does not export yet."
+    ),
+    "microsoft/VibeVoice-ASR-Streaming-7B": (
+        "VibeVoice ASR Streaming requires the VibeVoice-ASR streaming task, "
+        "which Mobius does not export yet."
+    ),
+    "microsoft/VibeVoice-ASR-Streaming-1.5B": (
+        "VibeVoice ASR Streaming requires the VibeVoice-ASR streaming task, "
+        "which Mobius does not export yet."
+    ),
+    "microsoft/VibeVoice-ASR-BitNet": (
+        "VibeVoice ASR BitNet requires the VibeVoice-ASR task and BitNet "
+        "weight loader, which Mobius does not export yet."
+    ),
+    "microsoft/VibeVoice-ASR-HF": (
+        "VibeVoice ASR requires the VibeVoice-ASR encoder-decoder task, "
+        "which Mobius does not export yet."
+    ),
+    "microsoft/VibeVoice-AcousticTokenizer": (
+        "VibeVoice Acoustic Tokenizer requires a standalone codec task, "
+        "which Mobius does not export yet."
+    ),
+}
+
+
+def resolve_vibevoice_sources(model_id: str, revision: str | None) -> VibeVoiceSources | None:
+    """Resolve pinned config, processor, and weight sources for supported VibeVoice IDs.
+
+    This fail-closed resolver separates executable dependencies from checkpoint
+    provenance. It recognizes the current official collection entries so their
+    shared ``model_type="vibevoice"`` cannot accidentally route ASR weights
+    into the TTS graph.
+    """
+    canonical_model_id = model_id.casefold()
+    unsupported = {
+        known_model_id.casefold(): reason
+        for known_model_id, reason in _UNSUPPORTED_VIBEVOICE_MODELS.items()
+    }
+    if canonical_model_id in unsupported:
+        raise NotImplementedError(
+            f"{model_id} is unsupported: {unsupported[canonical_model_id]}"
+        )
+    if canonical_model_id == VIBEVOICE_MODEL_ID.casefold():
+        if revision not in {None, VIBEVOICE_REVISION}:
+            raise ValueError(
+                f"{model_id} is only verified at revision {VIBEVOICE_REVISION}; "
+                f"got {revision}. Refusing to pair it with a different executable dependency."
+            )
+        return VibeVoiceSources(
+            model_id=model_id,
+            weight_revision=VIBEVOICE_REVISION,
+            config_model_id=VIBEVOICE_EXECUTABLE_MODEL_ID,
+            config_revision=VIBEVOICE_EXECUTABLE_REVISION,
+            processor_model_id=VIBEVOICE_EXECUTABLE_MODEL_ID,
+            processor_revision=VIBEVOICE_EXECUTABLE_REVISION,
+            weight_layout="official",
+        )
+    if canonical_model_id == VIBEVOICE_EXECUTABLE_MODEL_ID.casefold():
+        if revision not in {None, VIBEVOICE_EXECUTABLE_REVISION}:
+            raise ValueError(
+                f"{model_id} is only verified at revision {VIBEVOICE_EXECUTABLE_REVISION}; "
+                f"got {revision}."
+            )
+        return VibeVoiceSources(
+            model_id=model_id,
+            weight_revision=VIBEVOICE_EXECUTABLE_REVISION,
+            config_model_id=model_id,
+            config_revision=VIBEVOICE_EXECUTABLE_REVISION,
+            processor_model_id=model_id,
+            processor_revision=VIBEVOICE_EXECUTABLE_REVISION,
+            weight_layout="transformers",
+        )
+    return None
+
+
+_OFFICIAL_WEIGHT_NAME_MAPPING = (
+    (
+        r"semantic_tokenizer\.encoder\.downsample_layers\.0\.0\.conv\.",
+        r"semantic_tokenizer_encoder.stem.conv.conv.",
+    ),
+    (r"semantic_tokenizer\.encoder\.stages\.0\.", r"semantic_tokenizer_encoder.stem.stage."),
+    (
+        r"semantic_tokenizer\.encoder\.downsample_layers\.(\d+)\.0\.conv\.",
+        r"semantic_tokenizer_encoder.conv_layers.PLACEHOLDER.conv.conv.",
+    ),
+    (
+        r"semantic_tokenizer\.encoder\.stages\.(\d+)\.",
+        r"semantic_tokenizer_encoder.conv_layers.PLACEHOLDER.stage.",
+    ),
+    (r"semantic_tokenizer\.encoder\.head\.conv\.", r"semantic_tokenizer_encoder.head."),
+    (
+        r"acoustic_tokenizer\.encoder\.downsample_layers\.0\.0\.conv\.",
+        r"audio_tower.encoder.stem.conv.conv.",
+    ),
+    (r"acoustic_tokenizer\.encoder\.stages\.0\.", r"audio_tower.encoder.stem.stage."),
+    (
+        r"acoustic_tokenizer\.encoder\.downsample_layers\.(\d+)\.0\.conv\.",
+        r"audio_tower.encoder.conv_layers.PLACEHOLDER.conv.conv.",
+    ),
+    (
+        r"acoustic_tokenizer\.encoder\.stages\.(\d+)\.",
+        r"audio_tower.encoder.conv_layers.PLACEHOLDER.stage.",
+    ),
+    (r"acoustic_tokenizer\.encoder\.head\.conv\.", r"audio_tower.encoder.head."),
+    (
+        r"acoustic_tokenizer\.decoder\.upsample_layers\.0\.0\.conv\.conv\.",
+        r"audio_tower.decoder.stem.conv.conv.",
+    ),
+    (r"acoustic_tokenizer\.decoder\.stages\.0\.", r"audio_tower.decoder.stem.stage."),
+    (
+        r"acoustic_tokenizer\.decoder\.upsample_layers\.(\d+)\.0\.convtr\.convtr\.",
+        r"audio_tower.decoder.conv_layers.PLACEHOLDER.convtr.convtr.",
+    ),
+    (
+        r"acoustic_tokenizer\.decoder\.stages\.(\d+)\.",
+        r"audio_tower.decoder.conv_layers.PLACEHOLDER.stage.",
+    ),
+    (r"acoustic_tokenizer\.decoder\.head\.conv\.", r"audio_tower.decoder.head."),
+    (r"acoustic_tokenizer\.", r"audio_tower."),
+    (r"prediction_head\.t_embedder\.mlp\.0\.", r"diffusion_head.timestep_proj.fc1."),
+    (r"prediction_head\.t_embedder\.mlp\.2\.", r"diffusion_head.timestep_proj.fc2."),
+    (
+        r"prediction_head\.layers\.(\d+)\.adaLN_modulation\.1\.",
+        r"diffusion_head.layers.\1.linear.",
+    ),
+    (
+        r"prediction_head\.final_layer\.adaLN_modulation\.1\.",
+        r"diffusion_head.final_layer.linear_1.",
+    ),
+    (r"prediction_head\.final_layer\.linear\.", r"diffusion_head.final_layer.linear_2."),
+    (r"prediction_head\.", r"diffusion_head."),
+    (r"acoustic_connector\.fc1\.", r"multi_modal_projector.linear_1."),
+    (r"acoustic_connector\.norm\.", r"multi_modal_projector.act."),
+    (r"acoustic_connector\.fc2\.", r"multi_modal_projector.linear_2."),
+    (r"semantic_connector\.fc1\.", r"semantic_connector.linear_1."),
+    (r"semantic_connector\.norm\.", r"semantic_connector.act."),
+    (r"semantic_connector\.fc2\.", r"semantic_connector.linear_2."),
+    (r"^model\.speech_scaling_factor", r"model.latent_scaling_factor"),
+    (r"^model\.speech_bias_factor", r"model.latent_bias_factor"),
+    (r"mixer\.conv\.conv\.conv\.", r"mixer.conv."),
+    (r"\.conv\.conv\.conv\.", r".conv.conv."),
+)
+
+
+def _transform_official_weight_name(name: str) -> str:
+    """Map one original Microsoft checkpoint key to the pinned HF-native layout."""
+    result = name
+    for pattern, replacement in _OFFICIAL_WEIGHT_NAME_MAPPING:
+        match = re.search(pattern, result)
+        if match:
+            if "PLACEHOLDER" in replacement:
+                replacement = replacement.replace("PLACEHOLDER", str(int(match.group(1)) - 1))
+            result = re.sub(pattern, replacement, result)
+    return result
+
+
+def _convert_official_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Convert the original Microsoft key layout with collision protection."""
+    converted: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        converted_key = _transform_official_weight_name(key)
+        if converted_key in converted:
+            raise ValueError(
+                f"Official VibeVoice weight conversion maps multiple tensors to {converted_key!r}."
+            )
+        converted[converted_key] = value
+    return converted
 
 
 class _CacheAllocator:
@@ -904,8 +1103,14 @@ class VibeVoiceForConditionalGeneration(nn.Module):
     def preprocess_weights(
         self,
         state_dict: dict[str, torch.Tensor],
+        *,
+        checkpoint_layout: str = "transformers",
     ) -> dict[str, torch.Tensor]:
-        """Route the native HF composite checkpoint to standardized package stages."""
+        """Route an official or Transformers-native checkpoint to package stages."""
+        if checkpoint_layout == "official":
+            state_dict = _convert_official_weights(state_dict)
+        elif checkpoint_layout != "transformers":
+            raise ValueError(f"Unknown VibeVoice checkpoint layout: {checkpoint_layout!r}")
         routed: dict[str, torch.Tensor] = {}
         stage_prefixes = tuple(f"{name}." for name in self.HF_COMPONENT_SOURCES)
         for key, value in state_dict.items():

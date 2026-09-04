@@ -25,6 +25,8 @@ they cannot roundtrip ONNX-aligned names by design.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 from _test_configs import (
@@ -168,6 +170,37 @@ def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
     )
 
     assert parameter_names == set(routed)
+
+
+@pytest.mark.integration
+def test_official_vibevoice_weight_index_matches_native_conversion():
+    """All official index keys map one-to-one to the pinned native checkpoint."""
+    from huggingface_hub import hf_hub_download
+
+    from mobius.models.vibevoice import (
+        VIBEVOICE_EXECUTABLE_MODEL_ID,
+        VIBEVOICE_EXECUTABLE_REVISION,
+        VIBEVOICE_MODEL_ID,
+        VIBEVOICE_REVISION,
+        _transform_official_weight_name,
+    )
+
+    def weight_names(model_id: str, revision: str) -> set[str]:
+        path = hf_hub_download(
+            repo_id=model_id,
+            filename="model.safetensors.index.json",
+            revision=revision,
+        )
+        with open(path) as file:
+            return set(json.load(file)["weight_map"])
+
+    official = weight_names(VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION)
+    native = weight_names(VIBEVOICE_EXECUTABLE_MODEL_ID, VIBEVOICE_EXECUTABLE_REVISION)
+    converted = {_transform_official_weight_name(name) for name in official}
+
+    assert len(official) == 1204
+    assert len(converted) == len(official)
+    assert converted == native
 
 
 # ---------------------------------------------------------------------------

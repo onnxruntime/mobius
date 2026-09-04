@@ -26,9 +26,14 @@ from mobius._pipeline_contract import (
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.vibevoice import (
+    VIBEVOICE_EXECUTABLE_MODEL_ID,
+    VIBEVOICE_EXECUTABLE_REVISION,
     VIBEVOICE_MODEL_ID,
     VIBEVOICE_REVISION,
     VibeVoiceForConditionalGeneration,
+    _convert_official_weights,
+    _transform_official_weight_name,
+    resolve_vibevoice_sources,
 )
 from mobius.tasks import VibeVoiceTask
 
@@ -92,6 +97,83 @@ def _make_tiny_hf_config():
         eos_token_id=63,
         pad_token_id=63,
     )
+
+
+def test_official_vibevoice_sources_preserve_weight_identity():
+    """The legacy official release uses only pinned executable sidecar assets."""
+    sources = resolve_vibevoice_sources(VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION)
+
+    assert sources is not None
+    assert sources.model_id == VIBEVOICE_MODEL_ID
+    assert sources.weight_revision == VIBEVOICE_REVISION
+    assert sources.config_model_id == VIBEVOICE_EXECUTABLE_MODEL_ID
+    assert sources.config_revision == VIBEVOICE_EXECUTABLE_REVISION
+    assert sources.processor_model_id == VIBEVOICE_EXECUTABLE_MODEL_ID
+    assert sources.processor_revision == VIBEVOICE_EXECUTABLE_REVISION
+    assert sources.weight_layout == "official"
+
+
+def test_official_vibevoice_rejects_unverified_revisions():
+    with pytest.raises(ValueError, match="only verified"):
+        resolve_vibevoice_sources(VIBEVOICE_MODEL_ID, "different-official-revision")
+
+
+def test_official_vibevoice_sources_normalize_hub_id_case():
+    sources = resolve_vibevoice_sources("Microsoft/VibeVoice-1.5B", None)
+
+    assert sources is not None
+    assert sources.model_id == "Microsoft/VibeVoice-1.5B"
+    with pytest.raises(NotImplementedError, match="unsupported"):
+        resolve_vibevoice_sources("Microsoft/VibeVoice-ASR", None)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "model.acoustic_tokenizer.encoder.downsample_layers.1.0.conv.conv.weight",
+            "model.audio_tower.encoder.conv_layers.0.conv.conv.weight",
+        ),
+        (
+            "model.acoustic_tokenizer.decoder.upsample_layers.3.0.convtr.convtr.bias",
+            "model.audio_tower.decoder.conv_layers.2.convtr.convtr.bias",
+        ),
+        (
+            "model.semantic_tokenizer.encoder.stages.2.1.mixer.conv.conv.conv.weight",
+            "model.semantic_tokenizer_encoder.conv_layers.1.stage.1.mixer.conv.weight",
+        ),
+        (
+            "model.prediction_head.layers.3.adaLN_modulation.1.weight",
+            "model.diffusion_head.layers.3.linear.weight",
+        ),
+        (
+            "model.acoustic_connector.fc1.weight",
+            "model.multi_modal_projector.linear_1.weight",
+        ),
+        ("model.speech_scaling_factor", "model.latent_scaling_factor"),
+    ],
+)
+def test_official_vibevoice_weight_names_match_transformers_conversion(source, expected):
+    """Keep every legacy layout rename synchronized with the upstream converter."""
+    assert _transform_official_weight_name(source) == expected
+
+
+def test_official_vibevoice_weight_conversion_preserves_all_entries():
+    """Reject collisions rather than silently dropping checkpoint tensors."""
+    source = {
+        "model.acoustic_connector.fc1.weight": torch.ones((2, 2)),
+        "model.semantic_connector.fc1.weight": torch.ones((2, 2)),
+        "model.speech_bias_factor": torch.ones(()),
+    }
+
+    converted = _convert_official_weights(source)
+
+    assert len(converted) == len(source)
+    assert set(converted) == {
+        "model.multi_modal_projector.linear_1.weight",
+        "model.semantic_connector.linear_1.weight",
+        "model.latent_bias_factor",
+    }
 
 
 def _make_tiny_models():

@@ -328,6 +328,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
         from mobius.models.reuse import REUSE_REVISION
 
         revision = REUSE_REVISION
+    if args.model:
+        from mobius.models.vibevoice import resolve_vibevoice_sources
+
+        vibevoice_sources = resolve_vibevoice_sources(args.model, revision)
+        if vibevoice_sources is not None:
+            # Pin the early Diffusers probe to the official checkpoint. The
+            # builder separately resolves its modern executable sidecars.
+            revision = vibevoice_sources.weight_revision
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
@@ -616,6 +624,30 @@ def _cmd_build(args: argparse.Namespace) -> None:
     _save_package(pkg, output_dir, args, optimize, component_filter)
 
 
+def _runtime_asset_source(
+    pkg,
+    source: str | None,
+    explicit_revision: str | None,
+) -> tuple[str | None, str | None]:
+    """Select a pinned processor source without changing checkpoint provenance."""
+    processor_sources = {
+        processor_source
+        for model in pkg.values()
+        if (
+            processor_source := getattr(model, "metadata_props", {}).get(
+                "mobius.processor_source"
+            )
+        )
+        is not None
+    }
+    if len(processor_sources) == 1:
+        processor_source = processor_sources.pop()
+        model_id, separator, revision = processor_source.rpartition("@")
+        if separator and model_id and revision:
+            return model_id, revision
+    return source, _runtime_source_revision(pkg, explicit_revision)
+
+
 def _runtime_source_revision(pkg, explicit_revision: str | None) -> str | None:
     """Recover the effective build revision for runtime asset downloads."""
     if explicit_revision is not None:
@@ -675,15 +707,15 @@ def _save_package(
     if runtime == "ort-genai":
         from mobius.integrations.ort_genai import write_ort_genai_config
 
-        hf_model_id = getattr(args, "model", None)
+        hf_model_id, runtime_revision = _runtime_asset_source(
+            pkg,
+            getattr(args, "model", None),
+            getattr(args, "revision", None),
+        )
         ep = getattr(args, "execution_provider", "cpu")
         # When --config (local dir) is used instead of --model, copy tokenizer
         # files from the local directory rather than downloading from HF.
         local_config_dir = getattr(args, "config", None)
-        runtime_revision = _runtime_source_revision(
-            pkg,
-            getattr(args, "revision", None),
-        )
         artifacts = write_ort_genai_config(
             pkg,
             output_dir,
@@ -705,8 +737,11 @@ def _save_package(
         )
 
         config = getattr(pkg, "config", None)
-        source = getattr(args, "config", None) or getattr(args, "model", None)
-        revision = _runtime_source_revision(pkg, getattr(args, "revision", None))
+        source, revision = _runtime_asset_source(
+            pkg,
+            getattr(args, "config", None) or getattr(args, "model", None),
+            getattr(args, "revision", None),
+        )
         if is_native_vlm_package(pkg):
             try:
                 artifacts = write_native_vlm_package_metadata(

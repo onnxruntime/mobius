@@ -196,7 +196,13 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 |---|---|---|---|
 | `qwen3_tts` | `Qwen3TTSForConditionalGeneration` | `tts` | — |
 | `qwen3_tts_tokenizer_12hz` | `Qwen3TTSTokenizerV2Model` | `codec` | — |
-| `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `vibevoice/VibeVoice-1.5B-hf` |
+| `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `microsoft/VibeVoice-1.5B` |
+
+`microsoft/VibeVoice-1.5B@c00898d` is tested with its official weights. Its legacy
+release has no Transformers-native tokenizer or processor assets, so Mobius pins only
+those executable sidecars to `vibevoice/VibeVoice-1.5B-hf@edc39f8`; it never substitutes
+mirror weights. The Realtime and ASR entries in the Microsoft VibeVoice collection are
+explicitly rejected until their distinct streaming or ASR architectures are implemented.
 
 ### Audio Feature Extraction
 
