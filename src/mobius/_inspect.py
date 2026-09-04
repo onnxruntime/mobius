@@ -114,10 +114,9 @@ def _get_hf_component_sources(
     hf_config: object,
 ) -> dict[str, tuple[str, ...]]:
     """Read runtime HuggingFace component paths from a registered model class."""
-    resolver = getattr(module_class, "get_hf_component_sources", None)
-    if resolver is not None:
-        return resolver(model_type=model_type, hf_config=hf_config)
-    return getattr(module_class, "HF_COMPONENT_SOURCES", {})
+    from mobius._component_manifest import get_hf_component_sources
+
+    return get_hf_component_sources(module_class, model_type, hf_config)
 
 
 def inspect_components(
@@ -151,23 +150,22 @@ def inspect_components(
         model_id, task, trust_remote_code
     )
     task_obj = get_task(resolved_task)
-    roles = task_obj.model_roles or {}
-
-    # Runtime HF paths are owned by the registered model class. Most classes
-    # declare a fixed ``HF_COMPONENT_SOURCES`` mapping; classes shared by
-    # several HF layouts can resolve paths from the already-loaded config.
-    component_sources: dict[str, tuple[str, ...]] = {}
+    module_class = None
     if model_type is not None and hf_config is not None and model_type in registry:
         module_class = registry.get(model_type)
-        component_sources = _get_hf_component_sources(module_class, model_type, hf_config)
+    manifest = task_obj.component_manifest(
+        module_class=module_class,
+        model_type=model_type,
+        hf_config=hf_config,
+    )
 
     components = [
         ComponentInfo(
-            name=name,
-            role=role,
-            source_paths=tuple(component_sources.get(name, ())),
+            name=component.name,
+            role=component.role,
+            source_paths=component.source_paths,
         )
-        for name, role in roles.items()
+        for component in manifest.values()
     ]
     logger.debug(
         "inspect_components(%s): task=%s components=%s",
