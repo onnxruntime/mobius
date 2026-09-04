@@ -223,6 +223,11 @@ class QuantizationConfig:
             expert_dtype=getattr(hf_config, "expert_dtype", None),
         )
 
+    @property
+    def has_module_plan(self) -> bool:
+        """Whether module-selection rules or overrides are present."""
+        return bool(self.modules_to_not_convert) or bool(self.overrides)
+
     @staticmethod
     def _matches_exclusion(pattern: str, module_name: str) -> bool:
         if pattern.startswith("re:"):
@@ -233,7 +238,7 @@ class QuantizationConfig:
     def _matches_override(pattern: str, module_name: str) -> bool:
         if pattern.startswith("re:"):
             return _compile_pattern(pattern[3:]).fullmatch(module_name) is not None
-        return pattern == module_name
+        return pattern == module_name or module_name.startswith(f"{pattern}.") or pattern in module_name
 
     def for_module(
         self,
@@ -253,3 +258,15 @@ class QuantizationConfig:
             ):
                 return override.apply(self)
         return self
+
+    def for_source_paths(
+        self,
+        source_paths: tuple[str, ...],
+        *,
+        component: str = "decoder",
+    ) -> QuantizationConfig | None:
+        """Resolve module-level rules for a set of source paths."""
+        resolved = self.for_module(source_paths)
+        if resolved is None:
+            return None
+        return dataclasses.replace(resolved, overrides={}, modules_to_not_convert=())

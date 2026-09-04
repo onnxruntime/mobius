@@ -604,7 +604,6 @@ def build_transformers_model(
                 manifest=component_manifest,
                 task=resolved_task,
             )
-            )
             package.apply_weights(
                 state_dict,
                 prefix_map=getattr(model_module, "weight_prefix_map", None),
