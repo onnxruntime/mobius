@@ -305,10 +305,15 @@ def test_strip_to_text_only_drops_component_quantization() -> None:
         quant_method="olive",
     )
     config = make_config(
+        quantization=decoder,
         component_quantization={
             "decoder": decoder,
-            "vision_encoder": decoder,
-        }
+            "vision_encoder": QuantizationConfig(
+                bits=8,
+                group_size=32,
+                quant_method="olive",
+            ),
+        },
     )
 
     stripped = transformers_builder._strip_to_text_only(config, "qwen2")
@@ -342,8 +347,6 @@ def test_strip_to_text_only_resolves_decoder_module_plan() -> None:
     assert stripped.quantization is not None
     assert (stripped.quantization.bits, stripped.quantization.group_size) == (8, 32)
     assert stripped.quantization.overrides == {}
-
-
 def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
     hf_config = type("HFConfig", (), {"model_type": "qwen2"})()
     config = make_config(model_type="qwen2")

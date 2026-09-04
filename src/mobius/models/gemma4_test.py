@@ -586,6 +586,39 @@ class TestGemma4PerComponentQuantization:
         )
 
 
+def test_component_regex_keeps_per_layer_decoder_projections_float():
+    from mobius._component_quantization import configure_component_quantization
+    from mobius.components import Linear, QuantizedLinear
+    from mobius.tasks._gemma4 import Gemma4Task
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+        modules_to_not_convert=(
+            "lm_head",
+            r"re:.*\.per_layer_input_gate",
+            r"re:.*\.per_layer_projection",
+        ),
+    )
+    config = _tiny_gemma4_config(
+        enable_moe_block=False,
+        hidden_size_per_layer_input=16,
+        vocab_size_per_layer_input=256,
+        quantization=quantization,
+        component_quantization={"decoder": quantization},
+    )
+    module = Gemma4Model(config)
+
+    configure_component_quantization(module, config, Gemma4Task())
+
+    layer = module.decoder.model.layers[0]
+    assert isinstance(layer.self_attn.q_proj, QuantizedLinear)
+    assert type(layer.per_layer_input_gate) is Linear
+    assert type(layer.per_layer_projection) is Linear
+
+
 class TestScaleFreeRMSNormOverflow:
     """V norm should handle FP16 overflow from squaring large values."""
 

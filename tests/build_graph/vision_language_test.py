@@ -25,6 +25,7 @@ from build_graph._support import (
     _assert_outputs_have_shapes_and_dtypes,
     _make_params,
     _run_onnx_checker,
+    _with_component_quantization,
 )
 from mobius._builder import DTYPE_MAP, build_from_module
 from mobius._configs import (

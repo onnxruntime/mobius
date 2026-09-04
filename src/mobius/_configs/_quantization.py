@@ -6,12 +6,20 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from collections.abc import Mapping
+
+
+def _compile_pattern(pattern: str) -> re.Pattern[str]:
+    try:
+        return re.compile(pattern)
+    except re.error as error:
+        raise ValueError(f"Invalid quantization regex {pattern!r}: {error}") from error
 
 
 @dataclasses.dataclass(frozen=True)
 class QuantizationOverride:
-    """Per-module overrides emitted by Olive mixed-precision quantization."""
+    """Per-module affine layout override emitted by an upstream quantizer."""
 
     bits: int | None = None
     group_size: int | None = None
@@ -19,7 +27,7 @@ class QuantizationOverride:
 
     @classmethod
     def from_value(cls, value: object) -> QuantizationOverride:
-        """Parse one serialized Olive override."""
+        """Parse one serialized module override."""
         if isinstance(value, cls):
             return value
         if hasattr(value, "to_dict"):
@@ -35,7 +43,7 @@ class QuantizationOverride:
         )
 
     def apply(self, config: QuantizationConfig) -> QuantizationConfig:
-        """Return *config* with this override applied."""
+        """Return *config* with this module override applied."""
         updates = {
             name: value
             for name, value in dataclasses.asdict(self).items()
@@ -76,13 +84,11 @@ class QuantizationConfig:
     # RTN records this in its own config (``tie_word_embeddings``) and may clear
     # the model's top-level flag, so it is tracked here independently.
     tie_word_embeddings: bool = False
-    # Root-relative HuggingFace module names left in floating point by Olive's
-    # mixed-precision planner. ``None`` means no component plan was recorded;
-    # an empty tuple means the planner explicitly quantized every eligible
-    # module with the default configuration.
-    modules_to_not_convert: tuple[str, ...] | None = None
-    # Olive per-module precision overrides. Mobius can collapse uniform
-    # overrides beneath one component into that component's effective config.
+    # HuggingFace full module names or ``re:``-prefixed full-match regexes that
+    # remain floating point inside this component.
+    modules_to_not_convert: tuple[str, ...] = ()
+    # Literal HuggingFace module names or ``re:``-prefixed full-match regexes.
+    # Insertion order is significant: the first matching override wins.
     overrides: dict[str, QuantizationOverride] = dataclasses.field(default_factory=dict)
 
     @classmethod
@@ -92,7 +98,7 @@ class QuantizationConfig:
         *,
         expert_dtype: object | None = None,
     ) -> QuantizationConfig | None:
-        """Parse a serialized HuggingFace quantization-config value."""
+        """Parse one serialized HuggingFace quantization configuration."""
         if value is None:
             return None
         if isinstance(value, cls):
@@ -176,16 +182,22 @@ class QuantizationConfig:
         # fp8 was already routed to the typed blocker above.)
         if method == "fp8":
             return None
-        raw_modules_to_not_convert = qc.get("modules_to_not_convert")
-        if raw_modules_to_not_convert is not None and not isinstance(
-            raw_modules_to_not_convert, (list, tuple)
-        ):
+        raw_exclusions = qc.get("modules_to_not_convert") or ()
+        if not isinstance(raw_exclusions, (list, tuple)):
             raise TypeError(
                 "quantization_config.modules_to_not_convert must be a list or tuple"
             )
+        exclusions = tuple(str(pattern) for pattern in raw_exclusions)
         raw_overrides = qc.get("overrides") or {}
         if not isinstance(raw_overrides, Mapping):
             raise TypeError("quantization_config.overrides must be a mapping")
+        overrides = {
+            str(pattern): QuantizationOverride.from_value(override)
+            for pattern, override in raw_overrides.items()
+        }
+        for pattern in (*exclusions, *overrides):
+            if pattern.startswith("re:"):
+                _compile_pattern(pattern[3:])
         return cls(
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),
@@ -196,15 +208,8 @@ class QuantizationConfig:
             quantize_lm_head=bool(qc.get("lm_head")),
             quantize_vision=bool(qc.get("quantize_vision")),
             tie_word_embeddings=bool(qc.get("tie_word_embeddings")),
-            modules_to_not_convert=(
-                tuple(str(name) for name in raw_modules_to_not_convert)
-                if raw_modules_to_not_convert is not None
-                else None
-            ),
-            overrides={
-                str(name): QuantizationOverride.from_value(override)
-                for name, override in raw_overrides.items()
-            },
+            modules_to_not_convert=exclusions,
+            overrides=overrides,
         )
 
     @classmethod
@@ -220,145 +225,48 @@ class QuantizationConfig:
 
     @property
     def has_module_plan(self) -> bool:
-        """Whether Olive recorded component-selection metadata."""
-        return self.modules_to_not_convert is not None or bool(self.overrides)
+        """Whether module-selection rules or overrides are present."""
+        return bool(self.modules_to_not_convert) or bool(self.overrides)
+
+    @staticmethod
+    def _matches_exclusion(pattern: str, module_name: str) -> bool:
+        if pattern.startswith("re:"):
+            return _compile_pattern(pattern[3:]).fullmatch(module_name) is not None
+        return pattern in module_name
+
+    @staticmethod
+    def _matches_override(pattern: str, module_name: str) -> bool:
+        if pattern.startswith("re:"):
+            return _compile_pattern(pattern[3:]).fullmatch(module_name) is not None
+        return pattern == module_name or module_name.startswith(f"{pattern}.") or pattern in module_name
+
+    def for_module(
+        self,
+        source_module_names: tuple[str, ...],
+    ) -> QuantizationConfig | None:
+        """Return this component's effective layout for one source module."""
+        if any(
+            self._matches_exclusion(pattern, module_name)
+            for pattern in self.modules_to_not_convert
+            for module_name in source_module_names
+        ):
+            return None
+        for pattern, override in self.overrides.items():
+            if any(
+                self._matches_override(pattern, module_name)
+                for module_name in source_module_names
+            ):
+                return override.apply(self)
+        return self
 
     def for_source_paths(
         self,
         source_paths: tuple[str, ...],
         *,
-        component: str,
+        component: str = "decoder",
     ) -> QuantizationConfig | None:
-        """Collapse a uniform Olive module plan into one component config.
-
-        A component-level ONNX graph cannot represent different quantization
-        layouts for individual projections without constructing each projection
-        separately. Uniform overrides are therefore accepted, fully excluded
-        components stay float, and mixed layouts fail loudly.
-        """
-        if not source_paths:
-            raise ValueError(
-                f"Cannot derive component quantization for {component!r}: "
-                "the model declares no HuggingFace source paths."
-            )
-
-        def targets_component(name: str) -> bool:
-            return any(
-                name == prefix
-                or name.startswith(f"{prefix}.")
-                or prefix.startswith(f"{name}.")
-                for prefix in source_paths
-            )
-
-        def covers_source_path(name: str, source_path: str) -> bool:
-            return name == source_path or source_path.startswith(f"{name}.")
-
-        regex_exclusions = [
-            name for name in self.modules_to_not_convert or () if name.startswith("re:")
-        ]
-        regex_overrides = [name for name in self.overrides if name.startswith("re:")]
-        if regex_exclusions or regex_overrides:
-            raise ValueError(
-                f"Cannot derive component quantization for {component!r} from "
-                "regex module rules. Store an explicit component_quantization "
-                "mapping in the checkpoint config instead."
-            )
-
-        exclusions = [
-            name for name in self.modules_to_not_convert or () if targets_component(name)
-        ]
-        component_overrides = [
-            (name, override)
-            for name, override in self.overrides.items()
-            if targets_component(name)
-        ]
-        if exclusions and component_overrides:
-            raise ValueError(
-                f"Component {component!r} mixes excluded and quantized modules; "
-                "Mobius requires one quantization configuration per component."
-            )
-        if exclusions:
-            fully_excluded = all(
-                any(covers_source_path(name, source_path) for name in exclusions)
-                for source_path in source_paths
-            )
-            if fully_excluded:
-                return None
-            raise ValueError(
-                f"Component {component!r} has partial module exclusions; "
-                "Mobius requires one quantization configuration per component."
-            )
-
-        base_layout = (self.bits, self.group_size, self.sym)
-        effective = [
-            (
-                override.bits if override.bits is not None else self.bits,
-                (override.group_size if override.group_size is not None else self.group_size),
-                override.sym if override.sym is not None else self.sym,
-            )
-            for _, override in component_overrides
-        ]
-        different_layouts = {layout for layout in effective if layout != base_layout}
-        if len(different_layouts) > 1:
-            raise ValueError(
-                f"Component {component!r} has multiple quantization layouts "
-                f"{sorted(different_layouts | {base_layout})!r}; "
-                "Mobius requires one per component."
-            )
-
-        config = self
-        if different_layouts:
-            target_layout = next(iter(different_layouts))
-            fully_overridden = all(
-                any(
-                    covers_source_path(name, source_path) and effective[index] == target_layout
-                    for index, (name, _) in enumerate(component_overrides)
-                )
-                for source_path in source_paths
-            )
-            if not fully_overridden:
-                raise ValueError(
-                    f"Component {component!r} mixes the default layout "
-                    f"{base_layout!r} with override layout {target_layout!r}; "
-                    "store an explicit component_quantization mapping instead."
-                )
-            override = next(
-                override
-                for index, (_, override) in enumerate(component_overrides)
-                if effective[index] == target_layout
-            )
-            config = override.apply(self)
-        return dataclasses.replace(
-            config,
-            modules_to_not_convert=None,
-            overrides={},
-        )
-
-    def for_components(
-        self,
-        component_sources: Mapping[str, tuple[str, ...]],
-    ) -> dict[str, QuantizationConfig]:
-        """Collapse an Olive module plan into package-component layouts."""
-        result: dict[str, QuantizationConfig] = {}
-        for component, source_paths in component_sources.items():
-            if not source_paths:
-                continue
-            effective_paths = source_paths
-            if component in {"decoder", "model"}:
-                # LM-head and token-table selection already have dedicated
-                # QuantizationConfig flags. Their exclusions must not turn an
-                # otherwise quantized decoder backbone into a float component.
-                effective_paths = tuple(
-                    path
-                    for path in source_paths
-                    if not path.endswith(("lm_head", "embed_tokens"))
-                )
-            if not effective_paths:
-                effective_paths = source_paths
-            quantization = self.for_source_paths(
-                effective_paths,
-                component=component,
-            )
-            if quantization is not None:
-                result[component] = quantization
-        return result
+        """Resolve module-level rules for a set of source paths."""
+        resolved = self.for_module(source_paths)
+        if resolved is None:
+            return None
+        return dataclasses.replace(resolved, overrides={}, modules_to_not_convert=())

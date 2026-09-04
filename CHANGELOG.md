@@ -7,25 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Independent quantization for multi-component packages
+### Per-component quantized checkpoint loading
 
 #### Added
 
-- HuggingFace composite checkpoints can declare a `component_quantization`
-  mapping (or `quantization_config.components`) whose keys match
-  `ModelPackage` component names such as `decoder`, `encoder`,
-  `vision_encoder`, `audio_encoder`, and `embedding`. Nested
-  `vision_config.quantization_config` and `audio_config.quantization_config`
-  values are also recognized.
-- `build_from_module` now configures every component independently. Existing
-  quantized decoder modules are retargeted to the component's bit width and
-  group size, float encoder/vision/audio projections are converted to
-  `MatMulNBits`, quantized embeddings use `GatherBlockQuantized`, and components
-  omitted from the mapping remain floating point.
-- Olive mixed-precision component-wide `modules_to_not_convert` and `overrides`
-  are collapsed into component layouts. Partial module rules and genuinely
-  mixed layouts inside one ONNX component fail with an actionable error instead
-  of loading packed weights with the wrong configuration.
+- Multi-component checkpoints may declare an authoritative
+  `component_quantization` mapping with independent affine layouts for decoder,
+  encoder, vision, audio, and embedding components. Exact and regex
+  `modules_to_not_convert` rules are evaluated for each component-local module
+  against its HuggingFace source name, so selected projections remain floating
+  point while the rest of the component binds existing packed weights.
+- Mobius validates and normalizes existing Olive, GPTQ, and AWQ sidecars per
+  component. It does not quantize floating-point checkpoint weights.
 
 ### Packed fused MoE experts (Olive/GPTQ/AWQ) survive HF weight renaming
 

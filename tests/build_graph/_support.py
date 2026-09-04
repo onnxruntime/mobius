@@ -63,6 +63,37 @@ def _run_onnx_checker(pkg: dict[str, ir.Model], model_type: str) -> None:
         _onnx_checker(model)
 
 
+def _with_component_quantization(config, task):
+    """Assign distinct tiny affine layouts to every materialized component."""
+    import dataclasses
+    from mobius._configs import QuantizationConfig
+
+    layouts = ((4, 16), (8, 32), (2, 16))
+    component_quantization = {}
+    for index, (component, role) in enumerate(task.model_roles.items()):
+        if role == "glue":
+            continue
+        if component == "audio_encoder" and getattr(config, "audio", None) is None:
+            continue
+        bits, group_size = layouts[index % len(layouts)]
+        component_quantization[component] = QuantizationConfig(
+            bits=bits,
+            group_size=group_size,
+            quant_method="olive",
+            sym=True,
+            quantize_embeddings=role == "embedding",
+        )
+    decoder_quantization = component_quantization.get(
+        "decoder",
+        component_quantization.get("model"),
+    )
+    return dataclasses.replace(
+        config,
+        quantization=decoder_quantization,
+        component_quantization=component_quantization,
+    )
+
+
 def _assert_outputs_have_shapes_and_dtypes(
     pkg: dict[str, ir.Model],
     model_type: str,
