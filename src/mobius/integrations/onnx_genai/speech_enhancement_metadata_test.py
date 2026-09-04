@@ -230,9 +230,9 @@ class TestMetadata:
             "sample_lengths",
         }
         # The complex spectrogram carries a trailing (real, imag) pair.
-        assert outputs["denoised_com"]["contract"]["rank"] == 4
+        assert len(outputs["denoised_com"]["contract"]["shape"]) == 4
         assert outputs["denoised_com"]["contract"]["shape"][-1] == 2
-        assert outputs["denoised_mag"]["contract"]["rank"] == 3
+        assert len(outputs["denoised_mag"]["contract"]["shape"]) == 3
         profile = metadata["profiles"]["speech_enhancement"]
         assert set(profile["outputs"]) == set(outputs)
 
@@ -274,8 +274,8 @@ class TestMetadata:
         assert bindings["reference_audio"]["source"] == "samples"
         assert bindings["sample_rate"]["source"] == "sample_rate"
         assert bindings["sample_lengths"]["source"] == "sample_lengths"
-        assert bindings["noisy_mag"]["contract"]["rank"] == 3
-        assert bindings["reference_audio"]["contract"]["rank"] == 2
+        assert len(bindings["noisy_mag"]["contract"]["shape"]) == 3
+        assert len(bindings["reference_audio"]["contract"]["shape"]) == 2
 
     def test_declares_the_adapter_abi_when_the_front_end_ships(self):
         """A runtime must be able to version-check the STFT adapter it has to supply.

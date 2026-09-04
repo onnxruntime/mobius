@@ -49,7 +49,6 @@ def test_codec_workflow_has_typed_ssa_and_audio_emit():
     workflow = pipeline["workflow"]
     assert workflow["inputs"]["request.waveform"]["contract"] == {
         "dtype": "float32",
-        "rank": 3,
         "shape": ["batch", 1, "audio_samples"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }

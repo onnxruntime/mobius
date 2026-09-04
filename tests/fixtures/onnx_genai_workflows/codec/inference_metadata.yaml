@@ -1,16 +1,11 @@
 schema_version: v1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
+    manifest: {}
     inputs:
       request.waveform:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 1
@@ -29,7 +24,6 @@ pipeline:
       waveform:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 1

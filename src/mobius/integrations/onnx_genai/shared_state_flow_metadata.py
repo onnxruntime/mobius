@@ -289,7 +289,7 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "version": "1",
         },
         "ports": {
-            "inputs": {"encoded": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]}},
+            "inputs": {"encoded": {"dtype": "uint8", "shape": ["encoded_bytes"]}},
             "outputs": {
                 "pixel_values": {
                     **_contract(vision_input),
@@ -306,7 +306,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
 
     batch_bool = {
         "dtype": "bool",
-        "rank": 1,
         "shape": ["batch"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
@@ -330,7 +329,7 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "source": {"kind": "request"},
         },
         "request.image": {
-            "contract": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]},
+            "contract": {"dtype": "uint8", "shape": ["encoded_bytes"]},
             "role": {"kind": "runtime", "version": "1.0", "role": "media"},
             "source": {"kind": "request"},
             "required": False,
@@ -361,7 +360,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
         "request.seed": {
             "contract": {
                 "dtype": "int64",
-                "rank": 1,
                 "shape": ["batch"],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             },
@@ -371,14 +369,14 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "default": 0,
         },
         "request.width": {
-            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            "contract": {"dtype": "int64", "shape": [1]},
             "role": {"kind": "runtime", "version": "1.0", "role": "width"},
             "source": {"kind": "request"},
             "required": False,
             "default": 512,
         },
         "request.height": {
-            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            "contract": {"dtype": "int64", "shape": [1]},
             "role": {"kind": "runtime", "version": "1.0", "role": "height"},
             "source": {"kind": "request"},
             "required": False,
@@ -387,7 +385,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
         "request.guidance_scale": {
             "contract": {
                 "dtype": "float32",
-                "rank": 1,
                 "shape": ["batch"],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             },
@@ -401,14 +398,14 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "default": float(guidance_scale),
         },
         "request.max_iterations": {
-            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            "contract": {"dtype": "int64", "shape": [1]},
             "role": {"kind": "runtime", "version": "1.0", "role": "max_iterations"},
             "source": {"kind": "request"},
             "required": False,
             "default": num_inference_steps,
         },
         "request.text_only": {
-            "contract": {"dtype": "bool", "rank": 1, "shape": [1]},
+            "contract": {"dtype": "bool", "shape": [1]},
             "role": {"kind": "opaque"},
             "source": {"kind": "application", "name": "text_only"},
             "required": False,
@@ -431,7 +428,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
         "package.accepted_len": {
             "contract": {
                 "dtype": "int64",
-                "rank": 1,
                 "shape": ["batch"],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             },
@@ -443,7 +439,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
         "package.rng_offset": {
             "contract": {
                 "dtype": "int64",
-                "rank": 1,
                 "shape": ["batch"],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             },
@@ -453,7 +448,7 @@ def build_shared_state_pixel_flow_workflow_metadata(
             "default": 0,
         },
         "package.one": {
-            "contract": {"dtype": "float32", "rank": 1, "shape": [1]},
+            "contract": {"dtype": "float32", "shape": [1]},
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
@@ -467,7 +462,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
                 if decoder_outputs["logits"].shape is not None
                 else {
                     "dtype": _contract(decoder_outputs["logits"])["dtype"],
-                    "rank": 3,
                     "shape": ["batch", "sequence_len", int(config.vocab_size)],
                     "batch_layout": {"kind": "request_aligned", "axis": 0},
                 }
@@ -870,7 +864,6 @@ def build_shared_state_pixel_flow_workflow_metadata(
                                         "value": "loop.iteration",
                                         "contract": {
                                             "dtype": "int64",
-                                            "rank": 1,
                                             "shape": [1],
                                         },
                                     },

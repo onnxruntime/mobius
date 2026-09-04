@@ -299,7 +299,8 @@ class TestOneSerializedContract:
             ports = component["ports"]
             assert ports["inputs"] or ports["outputs"]
             for contract in (*ports["inputs"].values(), *ports["outputs"].values()):
-                assert contract["rank"] == len(contract["shape"])
+                assert "rank" not in contract
+                assert isinstance(contract["shape"], list)
 
     def test_every_declared_role_names_a_port_the_graph_exposes(self, package):
         """A role is only meaningful if it resolves in the artifact.

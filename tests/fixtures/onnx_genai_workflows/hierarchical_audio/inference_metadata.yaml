@@ -4,19 +4,10 @@ pipeline:
     manifest:
       adapter_abis:
         onnx-genai.text-assembly: '1'
-      capabilities:
-      - workflow_ssa
-      - nested_control_flow
-      - loop_induction_values
-      - loop_carried_state
-      - typed_emit
-      - serving_service_contract
-      - bounded_state_recurrence
     inputs:
       request.prompt_tokens:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence_length
@@ -34,7 +25,6 @@ pipeline:
       request.max_frames_with_warmup:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -47,7 +37,6 @@ pipeline:
       request.seed:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -64,7 +53,6 @@ pipeline:
       package.temperature:
         contract:
           dtype: float32
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -79,7 +67,6 @@ pipeline:
       package.top_k:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -94,7 +81,6 @@ pipeline:
       package.top_p:
         contract:
           dtype: float32
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -109,7 +95,6 @@ pipeline:
       package.min_p:
         contract:
           dtype: float32
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -124,7 +109,6 @@ pipeline:
       package.one:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -135,7 +119,6 @@ pipeline:
       package.one_batch:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -150,7 +133,6 @@ pipeline:
       package.local_steps:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -161,7 +143,6 @@ pipeline:
       package.local_context:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -172,7 +153,6 @@ pipeline:
       package.global_context:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -183,7 +163,6 @@ pipeline:
       package.carry_length:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -194,7 +173,6 @@ pipeline:
       package.max_waveform_samples:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -205,7 +183,6 @@ pipeline:
       package.flow_steps:
         contract:
           dtype: int64
-          rank: 0
           shape: []
         role:
           kind: opaque
@@ -216,7 +193,6 @@ pipeline:
       package.flow_rng_offset:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -231,7 +207,6 @@ pipeline:
       package.loop_1_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -243,7 +218,6 @@ pipeline:
       package.loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -255,7 +229,6 @@ pipeline:
       package.loop_3_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -267,7 +240,6 @@ pipeline:
       package.loop_2_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -280,7 +252,6 @@ pipeline:
       audio:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 2
@@ -379,7 +350,6 @@ pipeline:
           inputs:
             prompt_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - prompt_sequence
@@ -390,7 +360,6 @@ pipeline:
           outputs:
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - past_sequence_length + sequence_length
@@ -400,7 +369,6 @@ pipeline:
                 factor: 2
             position_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - prompt_sequence
@@ -410,7 +378,6 @@ pipeline:
                 factor: 2
             body_attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - prompt_sequence + 1
@@ -420,7 +387,6 @@ pipeline:
                 factor: 2
             body_position_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -430,7 +396,6 @@ pipeline:
                 factor: 2
             token_slot:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -440,7 +405,6 @@ pipeline:
                 factor: 2
             past_key_values.0.key:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 1
@@ -452,7 +416,6 @@ pipeline:
                 factor: 2
             past_key_values.0.value:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - 1
@@ -470,7 +433,6 @@ pipeline:
           inputs:
             attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - context
@@ -480,7 +442,6 @@ pipeline:
                 factor: 2
             position_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -491,7 +452,6 @@ pipeline:
           outputs:
             next_attention_mask:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - context + 1
@@ -501,7 +461,6 @@ pipeline:
                 factor: 2
             next_position_ids:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -518,14 +477,12 @@ pipeline:
           outputs:
             frame_history:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 0
               - 64
             rng_counter:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -533,7 +490,6 @@ pipeline:
                 axis: 0
             active:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -541,7 +497,6 @@ pipeline:
                 axis: 0
             done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -555,7 +510,6 @@ pipeline:
           inputs:
             left:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -563,7 +517,6 @@ pipeline:
                 axis: 0
             right:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -572,7 +525,6 @@ pipeline:
           outputs:
             total:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -586,7 +538,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - sequence
@@ -594,7 +545,6 @@ pipeline:
           outputs:
             candidate_logits:
               dtype: float32
-              rank: 2
               shape:
               - 1
               - 16385
@@ -606,7 +556,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -615,7 +564,6 @@ pipeline:
                 axis: 0
             temperature:
               dtype: float32
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -623,7 +571,6 @@ pipeline:
                 axis: 0
             top_k:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -631,7 +578,6 @@ pipeline:
                 axis: 0
             top_p:
               dtype: float32
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -639,7 +585,6 @@ pipeline:
                 axis: 0
             min_p:
               dtype: float32
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -647,7 +592,6 @@ pipeline:
                 axis: 0
             seed:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -655,7 +599,6 @@ pipeline:
                 axis: 0
             counter:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -663,7 +606,6 @@ pipeline:
                 axis: 0
             active:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -671,7 +613,6 @@ pipeline:
                 axis: 0
             done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -680,7 +621,6 @@ pipeline:
           outputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -688,7 +628,6 @@ pipeline:
                 axis: 0
             next_counter:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -722,30 +661,25 @@ pipeline:
           inputs:
             candidate:
               dtype: int64
-              rank: 1
               shape:
               - 1
           outputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - 1
             semantic_code:
               dtype: int64
-              rank: 2
               shape:
               - 2
               - 1
             semantic_token:
               dtype: int64
-              rank: 2
               shape:
               - 2
               - 1
             is_stop:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -759,7 +693,6 @@ pipeline:
           inputs:
             done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -768,7 +701,6 @@ pipeline:
           outputs:
             continue:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -782,7 +714,6 @@ pipeline:
           inputs:
             value:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - sequence
@@ -790,7 +721,6 @@ pipeline:
           outputs:
             last:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 1
@@ -803,14 +733,12 @@ pipeline:
           inputs:
             global_hidden:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 1
               - 8
             semantic_embedding:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 1
@@ -818,20 +746,17 @@ pipeline:
           outputs:
             sequence:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - sequence
               - 8
             acoustic_codes:
               dtype: int64
-              rank: 2
               shape:
               - 2
               - codes
             local_hidden_parts:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - parts
@@ -844,16 +769,13 @@ pipeline:
           inputs:
             left:
               dtype: int64
-              rank: 0
               shape: []
             right:
               dtype: int64
-              rank: 0
               shape: []
           outputs:
             total:
               dtype: int64
-              rank: 0
               shape: []
       local_logits:
         implementation:
@@ -863,7 +785,6 @@ pipeline:
           inputs:
             all_codebook_logits:
               dtype: float32
-              rank: 4
               shape:
               - codebooks
               - 2
@@ -871,12 +792,10 @@ pipeline:
               - vocabulary
             codebook_index:
               dtype: int64
-              rank: 0
               shape: []
           outputs:
             logits:
               dtype: float32
-              rank: 2
               shape:
               - 1
               - vocabulary
@@ -888,17 +807,14 @@ pipeline:
           inputs:
             token:
               dtype: int64
-              rank: 1
               shape:
               - 1
             codebook_index:
               dtype: int64
-              rank: 0
               shape: []
           outputs:
             embedding_ids:
               dtype: int64
-              rank: 2
               shape:
               - 2
               - 1
@@ -910,39 +826,33 @@ pipeline:
           inputs:
             sequence:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - sequence
               - 8
             projected_embedding:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 1
               - 8
             acoustic_codes:
               dtype: int64
-              rank: 2
               shape:
               - 2
               - codes
             token:
               dtype: int64
-              rank: 1
               shape:
               - 1
             hidden_states:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - sequence
               - 8
             local_hidden_parts:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - parts
@@ -950,23 +860,20 @@ pipeline:
           outputs:
             next_sequence:
               dtype: float32
-              rank: 3
               shape:
               - 2
-              - next_sequence_dim_1
+              - Any
               - 8
             next_acoustic_codes:
               dtype: int64
-              rank: 2
               shape:
               - 2
-              - next_acoustic_codes_dim_1
+              - Any
             next_local_hidden_parts:
               dtype: float32
-              rank: 3
               shape:
               - 1
-              - next_local_hidden_parts_dim_1
+              - Any
               - 8
       frame_append:
         implementation:
@@ -976,21 +883,18 @@ pipeline:
           inputs:
             history:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - frames
               - 64
             global_hidden:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 1
               - 8
             local_hidden_parts:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 7
@@ -998,10 +902,9 @@ pipeline:
           outputs:
             next_history:
               dtype: float32
-              rank: 3
               shape:
               - 1
-              - next_history_dim_1
+              - Any
               - 64
       acoustic_frame:
         implementation:
@@ -1011,14 +914,12 @@ pipeline:
           inputs:
             acoustic_codes:
               dtype: int64
-              rank: 2
               shape:
               - 2
               - 7
           outputs:
             framed_acoustic_codes:
               dtype: int64
-              rank: 3
               shape:
               - 2
               - 1
@@ -1031,14 +932,12 @@ pipeline:
           inputs:
             semantic:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 1
               - 8
             acoustic:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 1
@@ -1046,7 +945,6 @@ pipeline:
           outputs:
             feedback:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 1
@@ -1059,20 +957,17 @@ pipeline:
           inputs:
             history:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - frames_with_warmup
               - 64
             stopped:
               dtype: bool
-              rank: 1
               shape:
               - 1
           outputs:
             frame_hiddens:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - frames
@@ -1085,7 +980,6 @@ pipeline:
           inputs:
             frame_hiddens:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - frames
@@ -1093,11 +987,9 @@ pipeline:
           outputs:
             chunk_count:
               dtype: int64
-              rank: 0
               shape: []
             waveform:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - 2
@@ -1107,14 +999,12 @@ pipeline:
                 axis: 0
             previous_latent:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
               - 0
             previous_condition:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 0
@@ -1131,19 +1021,16 @@ pipeline:
           inputs:
             frame_hiddens:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - frames
               - 64
             chunk_index:
               dtype: int64
-              rank: 0
               shape: []
           outputs:
             frame_chunk:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - chunk_frames
@@ -1160,21 +1047,18 @@ pipeline:
           inputs:
             condition:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - latent_length
               - 2048
             previous_condition:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - carry_length
               - 2048
             previous_latent:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
@@ -1182,25 +1066,21 @@ pipeline:
           outputs:
             guided_condition:
               dtype: float32
-              rank: 3
               shape:
-              - guided_condition_dim_0
-              - guided_condition_dim_1
-              - guided_condition_dim_2
+              - Any
+              - Any
+              - Any
             spliced_condition:
               dtype: float32
-              rank: 3
               shape:
-              - spliced_condition_dim_0
-              - spliced_condition_dim_1
-              - spliced_condition_dim_2
+              - Any
+              - Any
+              - Any
             overlap:
               dtype: int64
-              rank: 0
               shape: []
             noise_row_shape:
               dtype: int64
-              rank: 1
               shape:
               - 2
       latent_noise:
@@ -1211,7 +1091,6 @@ pipeline:
           inputs:
             seed:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -1219,7 +1098,6 @@ pipeline:
                 axis: 0
             offset:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -1227,13 +1105,11 @@ pipeline:
                 axis: 0
             row_shape:
               dtype: int64
-              rank: 1
               shape:
               - 2
           outputs:
             noise:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - channels
@@ -1243,7 +1119,6 @@ pipeline:
                 axis: 0
             next_offset:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -1267,7 +1142,6 @@ pipeline:
           outputs:
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - 31
       flow_timestep:
@@ -1278,12 +1152,10 @@ pipeline:
           inputs:
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - schedule_length
             step:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -1292,7 +1164,6 @@ pipeline:
           outputs:
             timestep:
               dtype: float32
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -1306,42 +1177,36 @@ pipeline:
           inputs:
             latents:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
               - latent_length
             initial_noise:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
               - latent_length
             previous_latent:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
               - carry_length
             overlap:
               dtype: int64
-              rank: 0
               shape: []
             timestep:
               dtype: float32
-              rank: 1
               shape:
               - 1
           outputs:
             blended_latents:
               dtype: float32
-              rank: 3
               shape:
-              - blended_latents_dim_0
-              - blended_latents_dim_1
-              - blended_latents_dim_2
+              - Any
+              - Any
+              - Any
       flow_inputs:
         implementation:
           kind: onnx
@@ -1350,27 +1215,23 @@ pipeline:
           inputs:
             latents:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
               - latent_length
             timestep:
               dtype: float32
-              rank: 1
               shape:
               - 1
           outputs:
             guided_latents:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 128
               - latent_length
             guided_timestep:
               dtype: float32
-              rank: 1
               shape:
               - 2
       flow_guidance:
@@ -1381,7 +1242,6 @@ pipeline:
           inputs:
             sample:
               dtype: float32
-              rank: 3
               shape:
               - 2
               - 128
@@ -1389,7 +1249,6 @@ pipeline:
           outputs:
             velocity:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
@@ -1402,7 +1261,6 @@ pipeline:
           inputs:
             sample:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - sequence
@@ -1412,7 +1270,6 @@ pipeline:
                 axis: 0
             derivative:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - sequence
@@ -1422,7 +1279,6 @@ pipeline:
                 axis: 0
             step:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -1430,13 +1286,11 @@ pipeline:
                 axis: 0
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - schedule_length
           outputs:
             next_state:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - sequence
@@ -1461,51 +1315,44 @@ pipeline:
           inputs:
             latents:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
               - latent_length
             previous_latent:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - 128
               - carry_length
             condition:
               dtype: float32
-              rank: 3
               shape:
               - 1
               - latent_length
               - 2048
             overlap:
               dtype: int64
-              rank: 0
               shape: []
           outputs:
             restored_latents:
               dtype: float32
-              rank: 3
               shape:
-              - restored_latents_dim_0
-              - restored_latents_dim_1
-              - restored_latents_dim_2
+              - Any
+              - Any
+              - Any
             next_previous_latent:
               dtype: float32
-              rank: 3
               shape:
-              - next_previous_latent_dim_0
-              - next_previous_latent_dim_1
-              - next_previous_latent_dim_2
+              - Any
+              - Any
+              - Any
             next_previous_condition:
               dtype: float32
-              rank: 3
               shape:
-              - next_previous_condition_dim_0
-              - next_previous_condition_dim_1
-              - next_previous_condition_dim_2
+              - Any
+              - Any
+              - Any
       waveform_stitch:
         implementation:
           kind: onnx
@@ -1514,7 +1361,6 @@ pipeline:
           inputs:
             waveform:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - 2
@@ -1524,7 +1370,6 @@ pipeline:
                 axis: 0
             history:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - 2
@@ -1534,16 +1379,13 @@ pipeline:
                 axis: 0
             chunk_index:
               dtype: int64
-              rank: 0
               shape: []
             chunk_count:
               dtype: int64
-              rank: 0
               shape: []
           outputs:
             next_history:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - 2
@@ -1555,7 +1397,6 @@ pipeline:
       global_logits:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - sequence_length
@@ -1573,7 +1414,6 @@ pipeline:
       global_hidden:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - sequence_length
@@ -1591,7 +1431,6 @@ pipeline:
       global_mask:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - past_sequence_length + sequence_length
@@ -1609,7 +1448,6 @@ pipeline:
       global_position:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 1
@@ -1624,7 +1462,6 @@ pipeline:
       frame_history:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - 1
           - frames
@@ -1639,7 +1476,6 @@ pipeline:
       rng:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1652,7 +1488,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1666,7 +1501,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1680,7 +1514,6 @@ pipeline:
       global_length:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1694,7 +1527,6 @@ pipeline:
       local_sequence:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - 2
           - steps
@@ -1709,7 +1541,6 @@ pipeline:
       local_codes:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - 2
           - codes
@@ -1723,7 +1554,6 @@ pipeline:
       local_hidden:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - 1
           - parts
@@ -1738,7 +1568,6 @@ pipeline:
       local_rng:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1751,7 +1580,6 @@ pipeline:
       flow_latents:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - 1
           - 128
@@ -1763,7 +1591,6 @@ pipeline:
       previous_latent:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - 1
           - 128
@@ -1777,7 +1604,6 @@ pipeline:
       previous_condition:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - 1
           - carry_length
@@ -1791,7 +1617,6 @@ pipeline:
       waveform:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - 2
@@ -1808,7 +1633,6 @@ pipeline:
       flow_rng:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1821,7 +1645,6 @@ pipeline:
       global_cache_0:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 1
@@ -1844,7 +1667,6 @@ pipeline:
       global_cache_1:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 1
@@ -1867,7 +1689,6 @@ pipeline:
       loop_1_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -1877,7 +1698,6 @@ pipeline:
       loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -1887,7 +1707,6 @@ pipeline:
       loop_3_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -1897,7 +1716,6 @@ pipeline:
       loop_2_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -2135,7 +1953,6 @@ pipeline:
           value: local.iteration
           contract:
             dtype: int64
-            rank: 0
             shape: []
       - kind: invoke
         component: frame_append
@@ -2229,7 +2046,6 @@ pipeline:
         value: frame.iteration
         contract:
           dtype: int64
-          rank: 0
           shape: []
     - kind: loop
       setup:
@@ -2350,7 +2166,6 @@ pipeline:
           value: flow.iteration
           contract:
             dtype: int64
-            rank: 1
             shape:
             - batch
             batch_layout:
@@ -2399,7 +2214,6 @@ pipeline:
         value: chunk.iteration
         contract:
           dtype: int64
-          rank: 0
           shape: []
     - kind: emit
       value: waveform

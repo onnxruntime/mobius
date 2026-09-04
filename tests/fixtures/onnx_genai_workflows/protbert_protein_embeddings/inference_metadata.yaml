@@ -12,11 +12,7 @@ profiles:
       normalize: false
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - typed_emit
+    manifest: {}
     effects:
       encode:
         retry: pure
@@ -26,7 +22,6 @@ pipeline:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence_len
@@ -43,7 +38,6 @@ pipeline:
       request.attention_mask:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence_len
@@ -59,7 +53,6 @@ pipeline:
       request.token_type_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence_len
@@ -76,10 +69,9 @@ pipeline:
       last_hidden_state:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
-          - last_hidden_state_dim_1
+          - Any
           - 64
           batch_layout:
             kind: request_aligned

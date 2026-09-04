@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
-import yaml
 from onnxscript import GraphBuilder
 from safetensors.numpy import save_file
 
@@ -34,6 +33,7 @@ from mobius.integrations.diffusers._configs import (
     MiniMaxMusic3WorkflowConfig,
 )
 from mobius.integrations.onnx_genai import write_onnx_genai_config
+from mobius.integrations.onnx_genai._metadata_io import _dump_yaml
 from mobius.integrations.onnx_genai._test_support import (
     _Cfg,
     _VlmCfg,
@@ -1441,7 +1441,7 @@ def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
     }
     add_adapter_service_to_metadata(metadata, package, str(directory))
     with open(directory / "inference_metadata.yaml", "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
 
 
 def generate_packages(output: Path) -> Path:

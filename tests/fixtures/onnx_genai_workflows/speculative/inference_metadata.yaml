@@ -2,25 +2,12 @@ schema_version: v1
 pipeline:
   workflow:
     manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - loop_induction_values
-      - typed_emit
-      - emit_valid_length
-      - bounded_state_recurrence
-      - serving_service_contract
-      - grammar_guidance_adapter
-      - adaptive_proposal_budget
-      - advisory_state
       adapter_abis:
         onnx-genai.grammar-guidance: '1'
     inputs:
       request.tokens:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 4
@@ -37,7 +24,6 @@ pipeline:
       request.seed:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -54,7 +40,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -67,7 +52,6 @@ pipeline:
       package.zero:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -82,7 +66,6 @@ pipeline:
       package.one:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -97,7 +80,6 @@ pipeline:
       package.max_context:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -109,7 +91,6 @@ pipeline:
       package.false:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -124,7 +105,6 @@ pipeline:
       package.active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -139,7 +119,6 @@ pipeline:
       request.cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -155,7 +134,6 @@ pipeline:
       request.grammar_state:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -170,7 +148,6 @@ pipeline:
       request.grammar_transition_table:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - grammar_states
           - vocabulary
@@ -183,7 +160,6 @@ pipeline:
       request.adaptive_k:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -199,7 +175,6 @@ pipeline:
       request.adaptive_estimates:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - 24
@@ -216,7 +191,6 @@ pipeline:
       request.draft_ms:
         contract:
           dtype: float32
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -231,7 +205,6 @@ pipeline:
       request.target_ms:
         contract:
           dtype: float32
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -246,7 +219,6 @@ pipeline:
       request.verifier.past_key_values.0.key:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 2
@@ -264,7 +236,6 @@ pipeline:
       request.verifier.past_key_values.0.value:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -283,7 +254,6 @@ pipeline:
       tokens:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - accepted_sequence
@@ -310,7 +280,6 @@ pipeline:
           inputs:
             state:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -318,7 +287,6 @@ pipeline:
                 axis: 0
             tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - proposal
@@ -327,7 +295,6 @@ pipeline:
                 axis: 0
             valid_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -335,14 +302,12 @@ pipeline:
                 axis: 0
             transition_table:
               dtype: int64
-              rank: 2
               shape:
               - grammar_states
               - vocabulary
           outputs:
             next_state:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -350,7 +315,6 @@ pipeline:
                 axis: 0
             consumed_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -358,7 +322,6 @@ pipeline:
                 axis: 0
             logits_mask:
               dtype: bool
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -367,7 +330,6 @@ pipeline:
                 axis: 0
             forced_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -376,7 +338,6 @@ pipeline:
                 axis: 0
             forced_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -411,7 +372,6 @@ pipeline:
           inputs:
             state:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -419,7 +379,6 @@ pipeline:
                 axis: 0
             tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - proposal
@@ -428,7 +387,6 @@ pipeline:
                 axis: 0
             valid_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -436,14 +394,12 @@ pipeline:
                 axis: 0
             transition_table:
               dtype: int64
-              rank: 2
               shape:
               - grammar_states
               - vocabulary
           outputs:
             next_state:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -451,7 +407,6 @@ pipeline:
                 axis: 0
             consumed_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -459,7 +414,6 @@ pipeline:
                 axis: 0
             logits_mask:
               dtype: bool
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -468,7 +422,6 @@ pipeline:
                 axis: 0
             forced_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -477,7 +430,6 @@ pipeline:
                 axis: 0
             forced_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -512,7 +464,6 @@ pipeline:
           inputs:
             state:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -520,7 +471,6 @@ pipeline:
                 axis: 0
             tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - proposal
@@ -529,7 +479,6 @@ pipeline:
                 axis: 0
             valid_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -537,14 +486,12 @@ pipeline:
                 axis: 0
             transition_table:
               dtype: int64
-              rank: 2
               shape:
               - grammar_states
               - vocabulary
           outputs:
             next_state:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -552,7 +499,6 @@ pipeline:
                 axis: 0
             consumed_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -560,7 +506,6 @@ pipeline:
                 axis: 0
             logits_mask:
               dtype: bool
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -569,7 +514,6 @@ pipeline:
                 axis: 0
             forced_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -578,7 +522,6 @@ pipeline:
                 axis: 0
             forced_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -612,7 +555,6 @@ pipeline:
           inputs:
             target_scores:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - draft_sequence
@@ -622,7 +564,6 @@ pipeline:
                 axis: 0
             proposed_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - draft_sequence
@@ -631,7 +572,6 @@ pipeline:
                 axis: 0
             seed:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -639,7 +579,6 @@ pipeline:
                 axis: 0
             offset:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -648,7 +587,6 @@ pipeline:
           outputs:
             accepted_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - draft_sequence
@@ -657,7 +595,6 @@ pipeline:
                 axis: 0
             accepted_len:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -665,7 +602,6 @@ pipeline:
                 axis: 0
             done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -673,7 +609,6 @@ pipeline:
                 axis: 0
             next_offset:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -681,7 +616,6 @@ pipeline:
                 axis: 0
             rollback_len:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -689,7 +623,6 @@ pipeline:
                 axis: 0
             continue:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -716,7 +649,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -725,7 +657,6 @@ pipeline:
                 axis: 0
             logits_mask:
               dtype: bool
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -734,7 +665,6 @@ pipeline:
                 axis: 0
             forced_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -743,7 +673,6 @@ pipeline:
                 axis: 0
             forced_length:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -752,7 +681,6 @@ pipeline:
           outputs:
             token:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - 1
@@ -767,7 +695,6 @@ pipeline:
           inputs:
             current_k:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -775,7 +702,6 @@ pipeline:
                 axis: 0
             accepted:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -783,7 +709,6 @@ pipeline:
                 axis: 0
             evaluated:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -791,7 +716,6 @@ pipeline:
                 axis: 0
             committed_tokens:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -799,7 +723,6 @@ pipeline:
                 axis: 0
             filled_proposal_budget:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -807,7 +730,6 @@ pipeline:
                 axis: 0
             draft_ms:
               dtype: float32
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -815,7 +737,6 @@ pipeline:
                 axis: 0
             target_ms:
               dtype: float32
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -823,7 +744,6 @@ pipeline:
                 axis: 0
             estimates:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - 24
@@ -833,7 +753,6 @@ pipeline:
           outputs:
             next_k:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -841,7 +760,6 @@ pipeline:
                 axis: 0
             next_estimates:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - 24
@@ -870,7 +788,6 @@ pipeline:
           inputs:
             left:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -878,7 +795,6 @@ pipeline:
                 axis: 0
             right:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -887,7 +803,6 @@ pipeline:
           outputs:
             minimum:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -901,7 +816,6 @@ pipeline:
           inputs:
             logits:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - sequence
@@ -912,7 +826,6 @@ pipeline:
           outputs:
             last_logits:
               dtype: float32
-              rank: 2
               shape:
               - batch
               - vocabulary
@@ -927,7 +840,6 @@ pipeline:
           inputs:
             proposed_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - proposal
@@ -936,7 +848,6 @@ pipeline:
                 axis: 0
             requested_k:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -945,7 +856,6 @@ pipeline:
           outputs:
             evaluated:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -953,7 +863,6 @@ pipeline:
                 axis: 0
             filled_proposal_budget:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -967,7 +876,6 @@ pipeline:
           inputs:
             left:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -975,7 +883,6 @@ pipeline:
                 axis: 0
             right:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -984,7 +891,6 @@ pipeline:
           outputs:
             total:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -994,7 +900,6 @@ pipeline:
       tokens_state:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - 4
@@ -1009,7 +914,6 @@ pipeline:
       rng_offset:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1023,7 +927,6 @@ pipeline:
       active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1037,7 +940,6 @@ pipeline:
       done:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1051,7 +953,6 @@ pipeline:
       accepted_len:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1065,7 +966,6 @@ pipeline:
       cache_lengths:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1079,7 +979,6 @@ pipeline:
       grammar:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1093,7 +992,6 @@ pipeline:
       proposal_k:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -1107,7 +1005,6 @@ pipeline:
       adaptive_estimates:
         contract:
           dtype: float32
-          rank: 2
           shape:
           - batch
           - 24
@@ -1122,7 +1019,6 @@ pipeline:
       cache_0:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 2
@@ -1144,7 +1040,6 @@ pipeline:
       cache_1:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -1363,7 +1258,6 @@ pipeline:
         value: speculative.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:

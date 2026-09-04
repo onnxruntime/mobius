@@ -196,7 +196,7 @@ def test_dispatch_decoder(tmp_path):
     ]
     assert workflow["steps"][0]["iteration"] == {
         "value": "loop.iteration",
-        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "contract": {"dtype": "int64", "shape": [1]},
     }
     assert "iteration" not in workflow["state"]
     serialized = yaml.safe_dump(workflow)
@@ -209,7 +209,6 @@ def test_dispatch_decoder(tmp_path):
     assert workflow["state"]["logits"] == {
         "contract": {
             "dtype": "float32",
-            "rank": 2,
             "shape": ["batch", 128],
             "batch_layout": {"kind": "request_aligned", "axis": 0},
         },
@@ -247,13 +246,11 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
     }
     assert sampler["ports"]["inputs"]["logits"] == {
         "dtype": "float32",
-        "rank": 2,
         "shape": ["batch", "vocabulary"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
     assert sampler["ports"]["outputs"]["token"] == {
         "dtype": "int64",
-        "rank": 1,
         "shape": ["batch"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
@@ -285,7 +282,7 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
     assert workflow["state"]["rng_counter"]["initializer"] == "request.rng_counter"
     emit = next(node for node in workflow["steps"][0]["steps"] if node["kind"] == "emit")
     assert "row_ids" not in emit
-    assert "emit_row_identity" not in workflow["manifest"]["capabilities"]
+    assert "capabilities" not in workflow["manifest"]
     assert set(
         workflow["serving"]["state_service"]["groups"]["decoder_cache"]["ports"]["model"]
     ) == {"cache_0", "cache_1"}
@@ -307,7 +304,6 @@ def test_seeded_decoder_sampler_uses_request_controls_and_direct_kv_carry():
     }
     assert workflow["components"]["termination"]["ports"]["inputs"]["iteration"] == {
         "dtype": "int64",
-        "rank": 1,
         "shape": [1],
     }
     assert workflow["components"]["token_state_update"]["contract"] == {
@@ -397,7 +393,7 @@ def test_dispatch_video_diffusion_uses_typed_ddim(tmp_path, monkeypatch):
     with open(artifacts["inference_metadata"]) as handle:
         metadata = yaml.safe_load(handle)
     workflow = metadata["pipeline"]["workflow"]
-    assert workflow["outputs"]["video"]["contract"]["rank"] == 5
+    assert len(workflow["outputs"]["video"]["contract"]["shape"]) == 5
     loop = next(step for step in workflow["steps"] if step["kind"] == "loop")
     assert [node["component"] for node in loop["steps"]].count("transformer") == 2
     _, schedule = _ddim_alpha_schedule(scheduler, 2)
@@ -817,7 +813,6 @@ def test_dispatch_diffusion_auto_reads_scheduler_from_source(tmp_path):
     components = meta["pipeline"]["workflow"]["components"]
     assert components["diffusion_schedule"]["ports"]["outputs"]["schedule"] == {
         "dtype": "float32",
-        "rank": 1,
         "shape": [16],
     }
     schedule = ir.load(out / "policies" / "diffusion_schedule.onnx")
@@ -875,7 +870,6 @@ def test_dispatch_vision_multimodal_pipeline(tmp_path):
     assert workflow["steps"][0]["iteration"]["value"] == "loop.iteration"
     assert workflow["state"]["logits"]["contract"] == {
         "dtype": "float32",
-        "rank": 2,
         "shape": ["batch", 128],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }

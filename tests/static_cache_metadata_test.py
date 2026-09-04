@@ -211,7 +211,7 @@ class TestStaticCacheWorkflow:
         assert capacity["default"] == CAPACITY
         assert capacity["required"] is False
         assert capacity["contract"]["dtype"] == "int64"
-        assert capacity["contract"]["rank"] == 1
+        assert capacity["contract"]["shape"] == [1]
 
     def test_cache_cells_are_invariant_not_growing(self, static_workflow):
         workflow = static_workflow["pipeline"]["workflow"]
@@ -292,7 +292,7 @@ class TestStaticCachePortDerivation:
         # has to allocate.
         workflow = static_workflow["pipeline"]["workflow"]
         contract = workflow["state"][_cache_cells(workflow)[0]]["contract"]
-        assert contract["rank"] == 3
+        assert len(contract["shape"]) == 3
         # 2 kv heads x 16 head_dim
         assert contract["shape"] == ["batch", CAPACITY, 32]
 

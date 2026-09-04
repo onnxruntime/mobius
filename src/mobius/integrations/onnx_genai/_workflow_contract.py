@@ -10,6 +10,8 @@ from typing import Any
 
 import onnx_ir as ir
 
+from mobius.integrations.onnx_genai._metadata_io import _published_metadata
+
 
 @dataclasses.dataclass(frozen=True)
 class _Port:
@@ -52,16 +54,21 @@ def _port(value: Any) -> _Port:
 
 def _shape_metadata(port: _Port) -> list[int | str]:
     """Return a YAML-safe graph shape without losing symbolic dimensions."""
+    if port.rank is None:
+        raise ValueError(
+            f"graph port {port.name!r} has unknown rank; ONNX-GenAI tensor "
+            "contracts require an explicit shape"
+        )
     shape: list[int | str] = []
-    for axis, dim in enumerate(port.dims):
+    for dim in port.dims:
         if isinstance(dim, int):
             shape.append(dim)
             continue
         value = getattr(dim, "value", None)
-        # Metadata dimensions cannot be null. Preserve named graph dimensions;
-        # give anonymous dynamic dimensions a stable, port-local name instead
-        # of pretending they are static or serializing an invalid null.
-        shape.append(str(value) if value is not None else f"{port.name}_dim_{axis}")
+        # Preserve named graph dimensions. Each anonymous dynamic dimension is
+        # independently unconstrained; "Any" states that without inventing a
+        # false equality between axes or a fixed extent.
+        shape.append(str(value) if value is not None else "Any")
     return shape
 
 
@@ -335,7 +342,6 @@ def add_policy_components_to_workflow(
         shape = _shape_metadata(port)
         contract: dict[str, Any] = {
             "dtype": dtype,
-            "rank": port.rank,
             "shape": shape,
         }
         layout = request_batch_layout(shape)
@@ -385,7 +391,6 @@ def _contract(value: ir.Value) -> dict[str, Any]:
     shape = _shape_metadata(port)
     contract: dict[str, Any] = {
         "dtype": dtype,
-        "rank": port.rank,
         "shape": shape,
     }
     layout = request_batch_layout(shape)
@@ -609,14 +614,14 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
                 active_cell = f"loop_{current_loop}_active"
                 active_initializer = f"package.{active_cell}"
                 workflow["inputs"][active_initializer] = {
-                    "contract": {"dtype": "bool", "rank": 1, "shape": [1]},
+                    "contract": {"dtype": "bool", "shape": [1]},
                     "role": {"kind": "opaque"},
                     "source": {"kind": "literal"},
                     "required": False,
                     "default": True,
                 }
                 workflow["state"][active_cell] = {
-                    "contract": {"dtype": "bool", "rank": 1, "shape": [1]},
+                    "contract": {"dtype": "bool", "shape": [1]},
                     "scope": "invocation",
                     "initializer": active_initializer,
                     "recurrence": {"kind": "invariant"},
@@ -647,7 +652,7 @@ def _publish_workflow_v1(workflow: dict[str, Any]) -> dict[str, Any]:
     workflow["steps"] = published["steps"] if published["kind"] == "sequence" else [published]
     declare_request_alignment(workflow)
     declare_input_admission(workflow)
-    return workflow
+    return _published_metadata({"pipeline": {"workflow": workflow}})["pipeline"]["workflow"]
 
 
 def _invoke(

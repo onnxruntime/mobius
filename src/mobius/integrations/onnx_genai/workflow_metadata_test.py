@@ -59,8 +59,7 @@ def test_speculative_emit_uses_accepted_prefix_length():
     assert emit["valid_length"] == "acceptance.length"
     # Row identity is runtime-private: the published emit step must not name it.
     assert "row_ids" not in emit
-    assert "emit_valid_length" in workflow["manifest"]["capabilities"]
-    assert "emit_row_identity" not in workflow["manifest"]["capabilities"]
+    assert "capabilities" not in workflow["manifest"]
     assert not any("slot_ids" in name for name in workflow["inputs"])
     assert workflow["outputs"]["tokens"]["contract"]["shape"][-1] == "accepted_sequence"
     assert workflow["state"]["cache_0"]["recurrence"] == {
@@ -289,13 +288,11 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert metadata["package"]["tokenizer"]["special_tokens"]["eos_token_id"] == [200001]
     assert workflow["state"]["cache_103"]["contract"] == {
         "dtype": "bfloat16",
-        "rank": 4,
         "shape": ["batch", 2, "past_sequence", 128],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
     assert workflow["state"]["logits"]["contract"] == {
         "dtype": "float32",
-        "rank": 2,
         "shape": ["batch", 202048],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
@@ -316,7 +313,6 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert workflow["inputs"]["request.max_iterations"]["contract"]["shape"] == [1]
     assert workflow["steps"][0]["iteration"]["contract"] == {
         "dtype": "int64",
-        "rank": 1,
         "shape": [1],
     }
     assert workflow["inputs"]["package.one"]["contract"]["shape"] == ["batch"]
@@ -351,7 +347,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert emit["when"] == "active"
     assert emit["valid_length"] == "token.emitted_length"
     assert "row_ids" not in emit
-    assert "emit_row_identity" not in workflow["manifest"]["capabilities"]
+    assert "capabilities" not in workflow["manifest"]
     assert policy_invokes["decoder_step_update"]["inputs"]["logical_length"] == "cache_lengths"
     assert workflow["state"]["attention_mask"]["initializer"] == ("initializer.attention_mask")
     assert any(
@@ -361,7 +357,7 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert workflow["inputs"]["request.image"]["required"] is False
     assert workflow["inputs"]["request.image"]["present_as"] == "request.image_present"
     assert "request.has_media" not in workflow["inputs"]
-    assert "input_presence" in workflow["manifest"]["capabilities"]
+    assert "capabilities" not in workflow["manifest"]
     assert workflow["steps"][0]["termination"] == "generation_eos"
     media_branch = workflow["steps"][0]["setup"][0]
     assert media_branch["kind"] == "branch"
@@ -569,10 +565,10 @@ def test_video_diffusion_keeps_the_temporal_axis_through_every_stage():
 
     published = workflow["outputs"]["video"]
     assert published["role"] == "video"
-    assert published["contract"]["rank"] == 5
+    assert len(published["contract"]["shape"]) == 5
 
     latent = workflow["state"]["latent"]
-    assert latent["contract"]["rank"] == 5
+    assert len(latent["contract"]["shape"]) == 5
     assert latent["contract"]["shape"][1] == "num_frames"
 
     # The scheduler trajectory is state, not telemetry: a multistep video solver
@@ -601,7 +597,7 @@ def test_video_diffusion_keeps_the_temporal_axis_through_every_stage():
     assert emit["mode"] == "append"
     assert emit["axis"] == 2
 
-    assert "bounded_state_recurrence" in workflow["manifest"]["capabilities"]
+    assert "capabilities" not in workflow["manifest"]
 
 
 def test_video_diffusion_rejects_an_image_latent():

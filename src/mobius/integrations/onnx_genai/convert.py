@@ -28,8 +28,7 @@ import math
 import os
 from typing import Any
 
-import yaml
-
+from mobius.integrations.onnx_genai._metadata_io import _dump_yaml
 from mobius.integrations.onnx_genai.comfyui import (
     ComfyUIWorkflow,
     parse_comfyui_workflow,
@@ -261,7 +260,7 @@ def convert_comfyui_workflow(
     package.save_policy_components(output_dir)
     metadata_path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(metadata_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
 
     run_params = {
         "prompt": parsed_workflow.prompt,

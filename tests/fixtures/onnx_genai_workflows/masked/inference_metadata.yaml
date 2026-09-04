@@ -1,19 +1,11 @@
 schema_version: '1.0'
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - typed_emit
-      - emit_valid_length
-      - loop_induction_values
+    manifest: {}
     inputs:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence
@@ -30,7 +22,6 @@ pipeline:
       request.mask:
         contract:
           dtype: bool
-          rank: 2
           shape:
           - batch
           - sequence
@@ -46,7 +37,6 @@ pipeline:
       request.seed:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -63,7 +53,6 @@ pipeline:
       request.rng_offset:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -79,7 +68,6 @@ pipeline:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -93,7 +81,6 @@ pipeline:
       package.num_steps:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -108,7 +95,6 @@ pipeline:
       package.loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -121,7 +107,6 @@ pipeline:
       tokens:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence
@@ -147,7 +132,6 @@ pipeline:
           inputs:
             current_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - sequence
@@ -156,7 +140,6 @@ pipeline:
                 axis: 0
             proposed_tokens:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - sequence
@@ -165,7 +148,6 @@ pipeline:
                 axis: 0
             logits:
               dtype: float32
-              rank: 3
               shape:
               - batch
               - sequence
@@ -175,7 +157,6 @@ pipeline:
                 axis: 0
             masked:
               dtype: bool
-              rank: 2
               shape:
               - batch
               - sequence
@@ -184,7 +165,6 @@ pipeline:
                 axis: 0
             step:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -192,7 +172,6 @@ pipeline:
                 axis: 0
             total_steps:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -200,7 +179,6 @@ pipeline:
                 axis: 0
             seed:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -208,7 +186,6 @@ pipeline:
                 axis: 0
             offset:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -217,7 +194,6 @@ pipeline:
           outputs:
             next_state:
               dtype: int64
-              rank: 2
               shape:
               - batch
               - sequence
@@ -226,7 +202,6 @@ pipeline:
                 axis: 0
             next_mask:
               dtype: bool
-              rank: 2
               shape:
               - batch
               - sequence
@@ -235,7 +210,6 @@ pipeline:
                 axis: 0
             next_offset:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -243,7 +217,6 @@ pipeline:
                 axis: 0
             done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -251,7 +224,6 @@ pipeline:
                 axis: 0
             continue:
               dtype: bool
-              rank: 1
               shape:
               - 1
         contract:
@@ -272,7 +244,6 @@ pipeline:
       tokens_state:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence
@@ -286,7 +257,6 @@ pipeline:
       mask:
         contract:
           dtype: bool
-          rank: 2
           shape:
           - batch
           - sequence
@@ -300,7 +270,6 @@ pipeline:
       rng_offset:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -313,7 +282,6 @@ pipeline:
       logits:
         contract:
           dtype: float32
-          rank: 3
           shape:
           - batch
           - sequence
@@ -328,7 +296,6 @@ pipeline:
       proposal:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - sequence
@@ -342,7 +309,6 @@ pipeline:
       loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -407,6 +373,5 @@ pipeline:
         value: loop.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1

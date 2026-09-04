@@ -592,7 +592,7 @@
       "type": "object"
     },
     "AudioTransform": {
-      "description": "One generic audio transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sample rates, channel counts, mel\nbin counts, and so on live in a model's fixture, never as constants baked\ninto this schema.",
+      "description": "One generic audio transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA \u2014 concrete sample rates, channel counts, mel\nbin counts, and so on live in a model's fixture, never as constants baked\ninto this schema.",
       "properties": {
         "channels": {
           "description": "Target channel count for a `downmix` operation.",
@@ -633,7 +633,7 @@
           ]
         },
         "mel_scale": {
-          "description": "Mel scale convention — generic string data (e.g. `slaney`, `htk`).",
+          "description": "Mel scale convention \u2014 generic string data (e.g. `slaney`, `htk`).",
           "minLength": 1,
           "type": [
             "string",
@@ -641,7 +641,7 @@
           ]
         },
         "mode": {
-          "description": "Padding side / normalization mode selector — generic string data\n(e.g. `right`, `left`, `fixed_window`).",
+          "description": "Padding side / normalization mode selector \u2014 generic string data\n(e.g. `right`, `left`, `fixed_window`).",
           "minLength": 1,
           "type": [
             "string",
@@ -726,7 +726,7 @@
           ]
         },
         "window": {
-          "description": "Analysis window function — generic string data (e.g. `hann`).",
+          "description": "Analysis window function \u2014 generic string data (e.g. `hann`).",
           "minLength": 1,
           "type": [
             "string",
@@ -854,7 +854,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "Items belonging to many requests concatenated along one axis.\n\nThere is exactly one packed axis. Structure above the item — frames\ninside clips inside request rows — is ownership, not a second axis: the\ntensor stays a flat run of items and `levels` says how to fold that run\nback into requests.",
+          "description": "Items belonging to many requests concatenated along one axis.\n\nThere is exactly one packed axis. Structure above the item \u2014 frames\ninside clips inside request rows \u2014 is ownership, not a second axis: the\ntensor stays a flat run of items and `levels` says how to fold that run\nback into requests.",
           "properties": {
             "axis": {
               "description": "Packed axis of this value.\n\nValidation requires axis zero. A run of items is only splittable\ninto per-request pieces without copying when the items are the\noutermost, contiguous stride of the tensor, and a packed axis\nanywhere else would silently turn every split into a gather.",
@@ -867,7 +867,7 @@
               "type": "string"
             },
             "levels": {
-              "description": "Ownership chain of the packed axis, innermost level first.\n\nLevel zero owns the physically packed positions; the last level owns\ninto request rows. One level is the ordinary flat case — items in\nrows — and two states one grouping in between, as frames in clips in\nrows. Validation rejects a third: a runtime walks the whole chain on\nevery split, and each level multiplies the states that have to be\nchecked and tested.",
+              "description": "Ownership chain of the packed axis, innermost level first.\n\nLevel zero owns the physically packed positions; the last level owns\ninto request rows. One level is the ordinary flat case \u2014 items in\nrows \u2014 and two states one grouping in between, as frames in clips in\nrows. Validation rejects a third: a runtime walks the whole chain on\nevery split, and each level multiplies the states that have to be\nchecked and tested.",
               "items": {
                 "$ref": "#/$defs/OwnershipLevel"
               },
@@ -903,7 +903,7 @@
       "description": "One materialized-footprint bound of an assembled invocation.\n\nA budget bounds what the invocation materializes, not what is nominally\nvalid. A packed dimension's footprint is the sum of the items' valid extents,\nwhich is exactly the packed extent because packing stores no padding; a\npadded dimension's footprint is the enclosing count times the padded extent,\nwhich is the rectangle the runtime allocates and the kernel reads. Budgeting\nthe valid sum instead would let one long and fifteen short items pass a bound\nthe group then blows through.",
       "properties": {
         "dimensions": {
-          "description": "Shape symbols whose materialized extents multiply to the bounded\nquantity, in order.\n\nOne symbol bounds that dimension directly — items at an ownership level,\npositions on a packed axis. Several bound an activation-shaped quantity,\nsuch as total padded patch slots, without the package ever naming bytes.",
+          "description": "Shape symbols whose materialized extents multiply to the bounded\nquantity, in order.\n\nOne symbol bounds that dimension directly \u2014 items at an ownership level,\npositions on a packed axis. Several bound an activation-shaped quantity,\nsuch as total padded patch slots, without the package ever naming bytes.",
           "items": {
             "minLength": 1,
             "type": "string"
@@ -941,17 +941,17 @@
     },
     "ComponentBatchCapacity": {
       "additionalProperties": false,
-      "description": "Batching capacity of one invocation of a component.\n\nThis describes the shape of an invocation, never a scheduling policy: which\ndimensions must already agree before two contributions can share a call, and\nhow much the assembled call may materialize. A runtime decides whether to\ngroup at all, and may always group fewer; the package only says what its\nartifact tolerates.\n\nEverything here is keyed by shape symbol rather than by axis index. Ports of\none component routinely differ in rank — a rank-3 payload, a rank-1\ncompanion, a rank-2 pooled output — so an axis index is only meaningful\nrelative to one port, while a symbol names the same quantity on every port\nthat mentions it.",
+      "description": "Batching capacity of one invocation of a component.\n\nThis describes the shape of an invocation, never a scheduling policy: which\ndimensions must already agree before two contributions can share a call, and\nhow much the assembled call may materialize. A runtime decides whether to\ngroup at all, and may always group fewer; the package only says what its\nartifact tolerates.\n\nEverything here is keyed by shape symbol rather than by axis index. Ports of\none component routinely differ in rank \u2014 a rank-3 payload, a rank-1\ncompanion, a rank-2 pooled output \u2014 so an axis index is only meaningful\nrelative to one port, while a symbol names the same quantity on every port\nthat mentions it.",
       "properties": {
         "budgets": {
-          "description": "Upper bounds on what one assembled invocation materializes, keyed by\nshape symbol.\n\nThese are static geometry — a fixed position table, an exported\nconstant, a kernel bound — never a measured throughput sweet spot, which\nwould be a cost model and belongs to the runtime. Every entry is an\nupper bound and never an obligation: a runtime may group fewer,\nincluding one. An empty list bounds nothing beyond what the runtime's\nown row budget already bounds.",
+          "description": "Upper bounds on what one assembled invocation materializes, keyed by\nshape symbol.\n\nThese are static geometry \u2014 a fixed position table, an exported\nconstant, a kernel bound \u2014 never a measured throughput sweet spot, which\nwould be a cost model and belongs to the runtime. Every entry is an\nupper bound and never an obligation: a runtime may group fewer,\nincluding one. An empty list bounds nothing beyond what the runtime's\nown row budget already bounds.",
           "items": {
             "$ref": "#/$defs/CapacityBudget"
           },
           "type": "array"
         },
         "uniform_dimensions": {
-          "description": "Shape symbols whose extents every item in a group must agree on.\n\nA symbol here names a property of one item — a patch width, a mel bin, a\nframe count of a fixed-length clip — that the artifact cannot vary\nwithin a single call. Items that disagree on it cannot share an\ninvocation, so a scheduler splits them into separate groups.\n\nIt may not name a count: not the extent of a packed axis, and not the\nunit or run count of an ownership level. Those are the numbers a packed\nlayout exists to let vary per request, and pinning one would describe a\nfixed-shape batch the package did not declare. A video whose frame count\nreally is fixed is expressed by pinning the frame dimension of an\nordinary request-aligned tensor and declaring no frame ownership level\nat all.",
+          "description": "Shape symbols whose extents every item in a group must agree on.\n\nA symbol here names a property of one item \u2014 a patch width, a mel bin, a\nframe count of a fixed-length clip \u2014 that the artifact cannot vary\nwithin a single call. Items that disagree on it cannot share an\ninvocation, so a scheduler splits them into separate groups.\n\nIt may not name a count: not the extent of a packed axis, and not the\nunit or run count of an ownership level. Those are the numbers a packed\nlayout exists to let vary per request, and pinning one would describe a\nfixed-shape batch the package did not declare. A video whose frame count\nreally is fixed is expressed by pinning the frame dimension of an\nordinary request-aligned tensor and declaring no frame ownership level\nat all.",
           "items": {
             "type": "string"
           },
@@ -1081,7 +1081,7 @@
           "additionalProperties": {
             "$ref": "#/$defs/PortRole"
           },
-          "description": "Semantic role of the ports whose meaning the workflow's own structure\ncannot recover, keyed by port name.\n\nState ports never need an entry: a state group already names its\nper-component `(input, output)` pair, and the fixed-capacity control\nports are named by [`StateUpdate::IndexedScatter`]. What is left is the\nper-step dataflow a workflow binds by SSA value, where the binding\nrecords WHICH value reaches a port but not WHAT the component does with\nit. A runtime that specializes a decode step — packing tokens, reusing a\nlogits buffer, skipping a mask it can prove is causal — needs that\nsecond fact, and inferring it from a port's spelling is exactly the\nname-guessing this schema refuses everywhere else.\n\nRoles are architecture-neutral and describe the port, never the model\nfamily that happens to expose it.",
+          "description": "Semantic role of the ports whose meaning the workflow's own structure\ncannot recover, keyed by port name.\n\nState ports never need an entry: a state group already names its\nper-component `(input, output)` pair, and the fixed-capacity control\nports are named by [`StateUpdate::IndexedScatter`]. What is left is the\nper-step dataflow a workflow binds by SSA value, where the binding\nrecords WHICH value reaches a port but not WHAT the component does with\nit. A runtime that specializes a decode step \u2014 packing tokens, reusing a\nlogits buffer, skipping a mask it can prove is causal \u2014 needs that\nsecond fact, and inferring it from a port's spelling is exactly the\nname-guessing this schema refuses everywhere else.\n\nRoles are architecture-neutral and describe the port, never the model\nfamily that happens to expose it.",
           "type": "object"
         }
       },
@@ -2184,7 +2184,7 @@
     },
     "OwnershipLevel": {
       "additionalProperties": false,
-      "description": "One level of a packed value's ownership chain.\n\nA level is a pair, never a tensor axis: `offsets` gives the exclusive prefix\noffset of each parent's run and `owner` gives the owning position of each\nentry at this level. The two together are what a runtime walks to answer\n\"which request does this item belong to\".\n\nBoth are `shared`, never `request_aligned`. An exclusive prefix sum is not\npermutation-followable — permuting rows does not permute a prefix-offset\nvector, it invalidates it — so a runtime that compacts rebuilds the chain\nrather than gathering it.",
+      "description": "One level of a packed value's ownership chain.\n\nA level is a pair, never a tensor axis: `offsets` gives the exclusive prefix\noffset of each parent's run and `owner` gives the owning position of each\nentry at this level. The two together are what a runtime walks to answer\n\"which request does this item belong to\".\n\nBoth are `shared`, never `request_aligned`. An exclusive prefix sum is not\npermutation-followable \u2014 permuting rows does not permute a prefix-offset\nvector, it invalidates it \u2014 so a runtime that compacts rebuilds the chain\nrather than gathering it.",
       "properties": {
         "extent": {
           "anyOf": [
@@ -2256,7 +2256,7 @@
     },
     "PaddedDimension": {
       "additionalProperties": false,
-      "description": "One padded dimension of a value and the companion that bounds it.\n\nThe dimension is named by its shape symbol rather than by an axis index. The\nsame extent sits at different positions in different values — `patches` is\naxis 1 of the pixel tensor and axis 0 of a pooled one — and an index would\nname whichever the author happened to be looking at.\n\nPadding is always appended: the real entries of a padded dimension form a\nprefix. That is what lets one integer per enclosing entry say everything a\nfull boolean mask would say, and it is a rule rather than a convention\nbecause left padding would shift every position-dependent computation and an\ninterior hole cannot be expressed by a length at all.",
+      "description": "One padded dimension of a value and the companion that bounds it.\n\nThe dimension is named by its shape symbol rather than by an axis index. The\nsame extent sits at different positions in different values \u2014 `patches` is\naxis 1 of the pixel tensor and axis 0 of a pooled one \u2014 and an index would\nname whichever the author happened to be looking at.\n\nPadding is always appended: the real entries of a padded dimension form a\nprefix. That is what lets one integer per enclosing entry say everything a\nfull boolean mask would say, and it is a rule rather than a convention\nbecause left padding would shift every position-dependent computation and an\ninterior hole cannot be expressed by a length at all.",
       "properties": {
         "dimension": {
           "description": "Shape symbol of the padded dimension of the owning value.",
@@ -2264,7 +2264,7 @@
           "type": "string"
         },
         "valid_lengths": {
-          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
+          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nWhen those outer axes include the owning value's request axis, this\ncompanion declares the same request-aligned/request-expanded layout and\nfollows the same positional row plan. When the padded dimension is\noutside the request axis, the companion is genuinely broadcast and\ndeclares `shared`.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
           "minLength": 1,
           "type": "string"
         }
@@ -2717,7 +2717,7 @@
     },
     "SequenceDecodingSpec": {
       "additionalProperties": false,
-      "description": "Frame-synchronous decoding contract for non-autoregressive sequence models.\n\nA CTC acoustic model emits one class distribution per encoder frame. The\ntranscript is recovered by taking the per-frame argmax, collapsing runs of\nrepeated ids, and dropping the blank id — no generation loop and no\nautoregressive state are involved.",
+      "description": "Frame-synchronous decoding contract for non-autoregressive sequence models.\n\nA CTC acoustic model emits one class distribution per encoder frame. The\ntranscript is recovered by taking the per-frame argmax, collapsing runs of\nrepeated ids, and dropping the blank id \u2014 no generation loop and no\nautoregressive state are involved.",
       "properties": {
         "blank_id": {
           "description": "Class id reserved for the CTC blank symbol.",
@@ -2853,7 +2853,7 @@
               "type": "null"
             }
           ],
-          "description": "How this cell continues one invocation's work into the next.\n\nAbsent means the lease is opaque: the runtime keeps the cell's value for\nthe session and hands it back as the cell's value, which is all a cell\nconsumed by the workflow's own steps needs. A cell the workflow never\nreads — a conversation the *request binding* has to carry — has no such\nreader, so it states which binding continues it here rather than leaving\na runtime to guess."
+          "description": "How this cell continues one invocation's work into the next.\n\nAbsent means the lease is opaque: the runtime keeps the cell's value for\nthe session and hands it back as the cell's value, which is all a cell\nconsumed by the workflow's own steps needs. A cell the workflow never\nreads \u2014 a conversation the *request binding* has to carry \u2014 has no such\nreader, so it states which binding continues it here rather than leaving\na runtime to guess."
         },
         "optimistic_metadata_version": {
           "default": false,
@@ -3175,7 +3175,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Where a runtime obtains `embed(last_token)` for the LEADING half of\nthe fused `token_embedding_input`. A folded-carry proposer graph\nconsumes only the fused input, so it reads no embedding initializer of\nits own and `speculative.shared_weights` stays empty; this names the\nmodel-agnostic embedding table the runtime gathers the leading half\nfrom (never extracted heuristically from a graph). Its `component`\nmust be the speculative target — an ONNX model that owns the named\n`table` initializer — so the table resolves to a real initializer in\nthe target model/artifact. Required whenever `folded_carry_output` is\npresent."
+              "description": "Where a runtime obtains `embed(last_token)` for the LEADING half of\nthe fused `token_embedding_input`. A folded-carry proposer graph\nconsumes only the fused input, so it reads no embedding initializer of\nits own and `speculative.shared_weights` stays empty; this names the\nmodel-agnostic embedding table the runtime gathers the leading half\nfrom (never extracted heuristically from a graph). Its `component`\nmust be the speculative target \u2014 an ONNX model that owns the named\n`table` initializer \u2014 so the table resolves to a real initializer in\nthe target model/artifact. Required whenever `folded_carry_output` is\npresent."
             },
             "token_embedding_input": {
               "description": "Proposer input port receiving the previous selected token embedding.",
@@ -3557,7 +3557,7 @@
           ]
         },
         "output": {
-          "description": "Graph output port carrying this pair's next-step value.\n\nRequired for a read-write transition. A `read_only` binding MAY omit it:\na pure borrowed-state reader — e.g. a shared-KV drafter that consumes\nanother decoder's cache and advances nothing — exposes no present output\nat all, so there is nothing to name. A read-only reader whose artifact\nstill emits a discarded present output for kernel-ABI reasons may name it\nhere, but that value is never a state transition.",
+          "description": "Graph output port carrying this pair's next-step value.\n\nRequired for a read-write transition. A `read_only` binding MAY omit it:\na pure borrowed-state reader \u2014 e.g. a shared-KV drafter that consumes\nanother decoder's cache and advances nothing \u2014 exposes no present output\nat all, so there is nothing to name. A read-only reader whose artifact\nstill emits a discarded present output for kernel-ABI reasons may name it\nhere, but that value is never a state transition.",
           "type": [
             "string",
             "null"
@@ -3807,24 +3807,17 @@
           },
           "type": "array"
         },
-        "rank": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
         "shape": {
+          "description": "Complete tensor shape. Its length is the tensor rank.",
           "items": {
             "$ref": "#/$defs/TensorDimension"
           },
-          "type": [
-            "array",
-            "null"
-          ]
+          "type": "array"
         }
       },
       "required": [
         "dtype",
-        "rank"
+        "shape"
       ],
       "type": "object"
     },
@@ -3884,12 +3877,12 @@
           "type": "integer"
         },
         {
-          "description": "A runtime shape symbol.",
+          "description": "A non-empty runtime shape symbol. `Any` means one independently\nunconstrained occurrence.",
           "minLength": 1,
           "type": "string"
         }
       ],
-      "description": "One fixed or runtime-resolved tensor-shape dimension."
+      "description": "One fixed, symbolic, or unconstrained tensor-shape dimension."
     },
     "TensorShardFacts": {
       "additionalProperties": false,
@@ -3957,7 +3950,7 @@
           "type": "string"
         },
         "scale": {
-          "description": "Normalizer the target applies to a looked-up row before its backbone\nreads it.\n\nA gathered row is not always the tensor a graph feeds its first block:\nseveral architectures scale the embedding by a constant folded into the\ngraph (`sqrt(hidden_size)` is the common one), so the initializer alone\nis not what a proposer's fused input needs. The proposer stands in for\nthe target's own embedding step, so it must see the *scaled* row — and\nthe factor has to be declared rather than guessed: nothing in a\n`[vocab, hidden]` initializer says whether one was applied, and a\nproposer fed the unscaled row drafts fluent, plausible, uniformly\nrejected tokens. It is the acceptance rate that collapses, not the\noutput, so the failure is invisible to a token-parity check.\n\nAbsent means 1.0: a package whose graph gathers and feeds directly.\n\nSingle precision because that is the precision it is *used* in: the\nfactor multiplies a float16 or float32 table, so declaring more would\npromise an accuracy the application of it discards.",
+          "description": "Normalizer the target applies to a looked-up row before its backbone\nreads it.\n\nA gathered row is not always the tensor a graph feeds its first block:\nseveral architectures scale the embedding by a constant folded into the\ngraph (`sqrt(hidden_size)` is the common one), so the initializer alone\nis not what a proposer's fused input needs. The proposer stands in for\nthe target's own embedding step, so it must see the *scaled* row \u2014 and\nthe factor has to be declared rather than guessed: nothing in a\n`[vocab, hidden]` initializer says whether one was applied, and a\nproposer fed the unscaled row drafts fluent, plausible, uniformly\nrejected tokens. It is the acceptance rate that collapses, not the\noutput, so the failure is invisible to a token-parity check.\n\nAbsent means 1.0: a package whose graph gathers and feeds directly.\n\nSingle precision because that is the precision it is *used* in: the\nfactor multiplies a float16 or float32 table, so declaring more would\npromise an accuracy the application of it discards.",
           "format": "float",
           "type": [
             "number",
@@ -4132,7 +4125,7 @@
       "properties": {
         "content": {
           "$ref": "#/$defs/VisionOutputContent",
-          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, validity mask, or the offsets/owner map of a packed batch\nat item, frame, or clip granularity) — never a model-family label."
+          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, validity mask, or the offsets/owner map of a packed batch\nat item, frame, or clip granularity) \u2014 never a model-family label."
         },
         "contract": {
           "anyOf": [
@@ -4187,7 +4180,7 @@
       "type": "object"
     },
     "VisionOutputContent": {
-      "description": "Generic pixel-output content-role vocabulary.\n\nA program that packs the media of several requests into one batch\nemits the values that map packed entries back to request rows,\nalongside the pixels themselves. Two roles cover every level:\n`pack_offsets` and `pack_owner`. Which level a value serves is\nstated by the ownership chain that references it, not by its role,\nso a frames-to-clips pair and a clips-to-rows pair carry the same\ntwo roles and a runtime resolves both the same way whatever the\nmedium calls its levels. `valid_lengths` says how much of a padded\ndimension is real, and is shared with the audio vocabulary rather\nthan duplicated.\n\nThey are content roles like any other: the runtime reads what a\ntensor means from here, never from the name a producer chose. What\neach value must structurally satisfy is stated by its tensor\ncontract — `batch_layout` and `padding` — which is what the\nvalidator enforces.",
+      "description": "Generic pixel-output content-role vocabulary.\n\nA program that packs the media of several requests into one batch\nemits the values that map packed entries back to request rows,\nalongside the pixels themselves. Two roles cover every level:\n`pack_offsets` and `pack_owner`. Which level a value serves is\nstated by the ownership chain that references it, not by its role,\nso a frames-to-clips pair and a clips-to-rows pair carry the same\ntwo roles and a runtime resolves both the same way whatever the\nmedium calls its levels. `valid_lengths` says how much of a padded\ndimension is real, and is shared with the audio vocabulary rather\nthan duplicated.\n\nThey are content roles like any other: the runtime reads what a\ntensor means from here, never from the name a producer chose. What\neach value must structurally satisfy is stated by its tensor\ncontract \u2014 `batch_layout` and `padding` \u2014 which is what the\nvalidator enforces.",
       "oneOf": [
         {
           "enum": [
@@ -4281,7 +4274,7 @@
       "description": "A square size or an explicit width/height for a pixel transform."
     },
     "VisionTransform": {
-      "description": "One generic pixel transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
+      "description": "One generic pixel transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA \u2014 concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
       "properties": {
         "canvas_pad_value": {
           "description": "RGB canvas fill value applied before dynamic tiling.",
@@ -4351,7 +4344,7 @@
           ]
         },
         "interpolation": {
-          "description": "Interpolation filter for a `resize` operation — generic string data.",
+          "description": "Interpolation filter for a `resize` operation \u2014 generic string data.",
           "minLength": 1,
           "type": [
             "string",
@@ -4424,7 +4417,7 @@
           ]
         },
         "mode": {
-          "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
+          "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) \u2014 generic string data.",
           "minLength": 1,
           "type": [
             "string",
@@ -5415,7 +5408,7 @@
           "type": "null"
         }
       ],
-      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contracts: the still-image,\nvideo, and audio transform programs and their named tensor outputs.\nEvery operation and output is generic, parameterized data — never a\nmodel family, vendor string, or baked-in shape. Absent means the model\ndeclares no native preprocessing program and a runtime must obtain it\nelsewhere or fail."
+      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contracts: the still-image,\nvideo, and audio transform programs and their named tensor outputs.\nEvery operation and output is generic, parameterized data \u2014 never a\nmodel family, vendor string, or baked-in shape. Absent means the model\ndeclares no native preprocessing program and a runtime must obtain it\nelsewhere or fail."
     },
     "profiles": {
       "additionalProperties": {
@@ -5451,7 +5444,7 @@
       "type": "array"
     },
     "schema_version": {
-      "description": "Schema version of this inference-metadata document, e.g. `\"v1.1\"`.\n\nCanonically `\"v<major>.<minor>\"`, matching the `v1` that every writer in\nthis repository already stamps. Absence means the initial `v1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"`, `\"1.0\"` and `\"v1.0\"` that\npredate a canonical form; readers normalize before comparing, so all of\nthem keep loading and `\"1.1\"` is an accepted synonym for `\"v1.1\"`. A\ndocument that uses nothing new keeps stamping what it already stamped —\nrewriting an existing spelling would change the package's semantic\nidentity to say something no reader distinguishes. Bump the major only\nfor breaking schema changes, and the minor whenever a document may carry\na field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.\n\nThat is a statement about *additive* fields, and it is not a promise that\nthis schema never reshapes one it already had. It does, while it is\npre-release: `token_packed` moved its `offsets` and `owner` into a\n`levels` chain in v1.1, and a document written against the flat spelling\ndoes not load at any version. A version says which fields a reader must\nunderstand; it is not a compatibility guarantee spanning a reshape, and\nnothing here silently reads an old spelling as a new one. See\n`reject_flat_token_packed`.",
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1.1\"`.\n\nCanonically `\"v<major>.<minor>\"`, matching the `v1` that every writer in\nthis repository already stamps. Absence means the initial `v1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"`, `\"1.0\"` and `\"v1.0\"` that\npredate a canonical form; readers normalize before comparing, so all of\nthem keep loading and `\"1.1\"` is an accepted synonym for `\"v1.1\"`. A\ndocument that uses nothing new keeps stamping what it already stamped \u2014\nrewriting an existing spelling would change the package's semantic\nidentity to say something no reader distinguishes. Bump the major only\nfor breaking schema changes, and the minor whenever a document may carry\na field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed \u2014 every structure here denies\nunknown fields \u2014 so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.\n\nThat is a statement about *additive* fields, and it is not a promise that\nthis schema never reshapes one it already had. It does, while it is\npre-release: `token_packed` moved its `offsets` and `owner` into a\n`levels` chain in v1.1, and a document written against the flat spelling\ndoes not load at any version. A version says which fields a reader must\nunderstand; it is not a compatibility guarantee spanning a reshape, and\nnothing here silently reads an old spelling as a new one. See\n`reject_flat_token_packed`.",
       "type": [
         "string",
         "null"

@@ -378,7 +378,7 @@ class TestMultimodalPackageFacts:
         media = workflow["inputs"]["request.image"]
         assert media["role"] == {"kind": "runtime", "version": "1.0", "role": "media"}
         assert media["contract"]["dtype"] == "uint8"
-        assert media["contract"]["rank"] == 1
+        assert media["contract"]["shape"] == ["encoded_bytes"]
         preprocess = next(
             step
             for step in workflow["steps"][0]["setup"]

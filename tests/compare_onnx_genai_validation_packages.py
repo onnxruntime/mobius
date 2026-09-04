@@ -102,6 +102,8 @@ def _metadata_invariant_errors(root: Path) -> list[str]:
 
     def retired_fields(value: Any, path: str) -> None:
         if isinstance(value, dict):
+            if "dtype" in value and "shape" in value and "rank" in value:
+                errors.append(f"{path}.rank: retired tensor-contract field")
             for key, nested in value.items():
                 field_path = f"{path}.{key}" if path else str(key)
                 if key in _RETIRED_INFERENCE_METADATA_FIELDS:

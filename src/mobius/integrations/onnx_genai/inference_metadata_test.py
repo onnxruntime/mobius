@@ -184,7 +184,6 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
         "inputs": {
             "logits": {
                 "dtype": "float32",
-                "rank": 2,
                 "shape": ["batch", "vocabulary"],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             }
@@ -192,7 +191,6 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
         "outputs": {
             "token": {
                 "dtype": "int64",
-                "rank": 1,
                 "shape": ["batch"],
                 "batch_layout": {"kind": "request_aligned", "axis": 0},
             }
@@ -1948,7 +1946,6 @@ def _seed_backbone_metadata(directory: Path) -> str:
     """
     kv_contract = {
         "dtype": "float16",
-        "rank": 4,
         "shape": ["batch", "kv_heads", "sequence", "head_dim"],
         "batch_layout": {"kind": "request_aligned", "axis": 0},
     }
@@ -1961,7 +1958,6 @@ def _seed_backbone_metadata(directory: Path) -> str:
                     "request.input_ids": {
                         "contract": {
                             "dtype": "int64",
-                            "rank": 2,
                             "shape": ["batch", "sequence"],
                             "batch_layout": {"kind": "request_aligned", "axis": 0},
                         },
@@ -1978,7 +1974,6 @@ def _seed_backbone_metadata(directory: Path) -> str:
                     "request.active": {
                         "contract": {
                             "dtype": "bool",
-                            "rank": 1,
                             "shape": ["batch"],
                             "batch_layout": {"kind": "request_aligned", "axis": 0},
                         },
@@ -1989,7 +1984,6 @@ def _seed_backbone_metadata(directory: Path) -> str:
                     "request.done": {
                         "contract": {
                             "dtype": "bool",
-                            "rank": 1,
                             "shape": ["batch"],
                             "batch_layout": {"kind": "request_aligned", "axis": 0},
                         },

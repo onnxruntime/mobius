@@ -48,6 +48,7 @@ from mobius._constants import (
     STATIC_CACHE_WRITE_INDICES,
 )
 from mobius._pipeline_contract import component_presence, optional_input_contract
+from mobius.integrations.onnx_genai._metadata_io import _dump_yaml
 from mobius.integrations.onnx_genai._workflow_contract import (
     _invoke,
     _Port,
@@ -1419,7 +1420,6 @@ def add_adapter_service_to_metadata(
         semantic_role = declaration.get("role", {})
         return (
             contract.get("dtype") == dtype
-            and contract.get("rank") == len(shape)
             and contract.get("shape") == shape
             # A selection tensor the service reads for every batch it plans has
             # no package-side escape, so admission derivation stamps it required
@@ -1442,7 +1442,7 @@ def add_adapter_service_to_metadata(
     ) -> None:
         if name not in inputs:
             inputs[name] = {
-                "contract": {"dtype": dtype, "rank": len(shape), "shape": shape},
+                "contract": {"dtype": dtype, "shape": shape},
                 "role": (
                     {"kind": "runtime", "version": "1.0", "role": role}
                     if role is not None
@@ -2375,18 +2375,16 @@ def build_diffusion_pipeline_metadata(
         )
 
     workflow_dtype = _WORKFLOW_DTYPES[activation_dtype]
-    latent_contract = _request_aligned(
-        {"dtype": workflow_dtype, "rank": 4, "shape": list(_LATENT_DIMS)}
-    )
-    row_float = _request_aligned({"dtype": "float32", "rank": 1, "shape": ["batch"]})
-    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": ["batch"]})
+    latent_contract = _request_aligned({"dtype": workflow_dtype, "shape": list(_LATENT_DIMS)})
+    row_float = _request_aligned({"dtype": "float32", "shape": ["batch"]})
+    batch_bool = _request_aligned({"dtype": "bool", "shape": ["batch"]})
     prompt_contract = _request_aligned(
-        {"dtype": "int64", "rank": 2, "shape": ["batch", "prompt_sequence"]}
+        {"dtype": "int64", "shape": ["batch", "prompt_sequence"]}
     )
 
     inputs: dict[str, Any] = {
         "request.max_iterations": {
-            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            "contract": {"dtype": "int64", "shape": [1]},
             "role": {"kind": "runtime", "version": "1.0", "role": "max_iterations"},
             "source": {"kind": "request", "field": "max_iterations"},
             "required": False,
@@ -2664,7 +2662,7 @@ def build_diffusion_pipeline_metadata(
                     "max_iterations": "request.max_iterations",
                     "iteration": {
                         "value": "loop.iteration",
-                        "contract": {"dtype": "int64", "rank": 1, "shape": ["batch"]},
+                        "contract": {"dtype": "int64", "shape": ["batch"]},
                     },
                     "carried": carried,
                 },
@@ -2817,7 +2815,7 @@ def write_multimodal_pipeline_metadata(
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, filename)
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -2908,7 +2906,7 @@ def write_speech_to_text_pipeline_metadata(
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, filename)
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -2935,7 +2933,7 @@ def write_diffusion_pipeline_metadata(
     package.save_policy_components(directory)
     path = os.path.join(directory, filename)
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 
@@ -3126,7 +3124,7 @@ def write_mtp_speculator_metadata(
         **({"rollback_state": rollback_cells} if rollback_cells else {}),
     }
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path
 
 

@@ -175,7 +175,7 @@ def test_audio_program_is_declared_and_bound_to_the_encoder_input(tmp_path):
 
     workflow = _workflow(metadata)
     assert workflow["manifest"]["adapter_abis"] == {"onnx-genai.audio-preprocess": "1"}
-    assert "audio_preprocessing_program" in workflow["manifest"]["capabilities"]
+    assert "capabilities" not in workflow["manifest"]
     adapter = workflow["components"]["audio_preprocess"]
     assert adapter["implementation"] == {
         "kind": "adapter",

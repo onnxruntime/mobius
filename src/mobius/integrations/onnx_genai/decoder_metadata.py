@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import yaml
+from mobius.integrations.onnx_genai._metadata_io import _dump_yaml
 
 # Mobius' unset-int sentinel.
 _UNSET = -42
@@ -290,5 +290,5 @@ def write_decoder_metadata(
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, filename)
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path

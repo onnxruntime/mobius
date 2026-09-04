@@ -299,7 +299,7 @@ def _grammar_adapter_component(action: str) -> dict[str, Any]:
     """Declare one action of the versioned grammar-guidance adapter ABI."""
 
     def port(dtype: str, shape: list[int | str]) -> dict[str, Any]:
-        return {"dtype": dtype, "rank": len(shape), "shape": shape}
+        return {"dtype": dtype, "shape": shape}
 
     return {
         "implementation": {
@@ -792,11 +792,11 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         ),
     )
 
-    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": ["batch"]})
-    batch_float = _request_aligned({"dtype": "float32", "rank": 1, "shape": ["batch"]})
-    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": ["batch"]})
-    scalar_int = {"dtype": "int64", "rank": 0, "shape": []}
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = _request_aligned({"dtype": "int64", "shape": ["batch"]})
+    batch_float = _request_aligned({"dtype": "float32", "shape": ["batch"]})
+    batch_bool = _request_aligned({"dtype": "bool", "shape": ["batch"]})
+    scalar_int = {"dtype": "int64", "shape": []}
+    control_int = {"dtype": "int64", "shape": [1]}
     prompt_contract = _contract(pkg[roles["global_embedding"]].graph.inputs[0])
     prompt_contract["batch_layout"] = {
         "kind": "request_expanded",
@@ -1619,7 +1619,6 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         "frame_history": {
             "contract": {
                 "dtype": dtype_name,
-                "rank": 3,
                 "shape": [1, "frames", fused_hidden_size],
             },
             "scope": "invocation",
@@ -1659,7 +1658,7 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "recurrence": {"kind": "invariant"},
         },
         "local_sequence": {
-            "contract": {"dtype": dtype_name, "rank": 3, "shape": [2, "steps", hidden_size]},
+            "contract": {"dtype": dtype_name, "shape": [2, "steps", hidden_size]},
             "scope": "invocation",
             "initializer": "local.initial_sequence",
             "recurrence": {
@@ -1670,7 +1669,7 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             },
         },
         "local_codes": {
-            "contract": {"dtype": "int64", "rank": 2, "shape": [2, "codes"]},
+            "contract": {"dtype": "int64", "shape": [2, "codes"]},
             "scope": "invocation",
             "initializer": "local.initial_codes",
             "recurrence": {
@@ -1681,7 +1680,7 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             },
         },
         "local_hidden": {
-            "contract": {"dtype": dtype_name, "rank": 3, "shape": [1, "parts", hidden_size]},
+            "contract": {"dtype": dtype_name, "shape": [1, "parts", hidden_size]},
             "scope": "invocation",
             "initializer": "local.initial_hidden",
             "recurrence": {
@@ -1700,7 +1699,6 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         "flow_latents": {
             "contract": {
                 "dtype": dtype_name,
-                "rank": 3,
                 "shape": [1, latent_channels, "latent_length"],
             },
             "scope": "invocation",
@@ -1710,7 +1708,6 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         "previous_latent": {
             "contract": {
                 "dtype": dtype_name,
-                "rank": 3,
                 "shape": [1, latent_channels, "carry_length"],
             },
             "scope": "invocation",
@@ -1720,7 +1717,6 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         "previous_condition": {
             "contract": {
                 "dtype": dtype_name,
-                "rank": 3,
                 "shape": [1, "carry_length", condition_size],
             },
             "scope": "invocation",
@@ -1731,7 +1727,6 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
             "contract": _request_aligned(
                 {
                     "dtype": _contract(waveform_output)["dtype"],
-                    "rank": 3,
                     "shape": ["batch", output_channels, "samples"],
                 }
             ),
@@ -1799,7 +1794,6 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
                 "contract": _request_aligned(
                     {
                         "dtype": _contract(waveform_output)["dtype"],
-                        "rank": 3,
                         "shape": ["batch", output_channels, "samples"],
                     }
                 ),
@@ -2596,9 +2590,9 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         pkg.add_policy_component("codec_layout", build_codec_layout_transpose(num_groups))
 
     batch = _contract(prompt)["shape"][0]
-    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
-    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = _request_aligned({"dtype": "int64", "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "shape": [batch]})
+    control_int = {"dtype": "int64", "shape": [1]}
     inputs = {
         "request.prompt_tokens": {
             "contract": _contract(prompt),
@@ -2620,14 +2614,14 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "default": False,
         },
         "package.zero_scalar": {
-            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "contract": {"dtype": "int64", "shape": []},
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": 0,
         },
         "package.one_scalar": {
-            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "contract": {"dtype": "int64", "shape": []},
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
@@ -2692,7 +2686,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     }
     for iteration in range(num_groups - 2):
         inputs[f"package.setup_predictor_iteration_{iteration}"] = {
-            "contract": {"dtype": "int64", "rank": 0, "shape": []},
+            "contract": {"dtype": "int64", "shape": []},
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
@@ -3224,7 +3218,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
 
     state = {
         "last_frame": {
-            "contract": {"dtype": "int64", "rank": 2, "shape": [batch, num_groups]},
+            "contract": {"dtype": "int64", "shape": [batch, num_groups]},
             "scope": "invocation",
             "initializer": setup_frame,
             "recurrence": {"kind": "invariant"},
@@ -3232,7 +3226,6 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         "history": {
             "contract": {
                 "dtype": "int64",
-                "rank": 3,
                 "shape": [batch, "frames", num_groups],
             },
             "scope": "invocation",
@@ -3247,7 +3240,6 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         "talker_mask": {
             "contract": {
                 "dtype": _contract(talker_mask)["dtype"],
-                "rank": 2,
                 "shape": [batch, "talker_context"],
             },
             "scope": "invocation",
@@ -3274,7 +3266,7 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
             "recurrence": {"kind": "invariant"},
         },
         "frame": {
-            "contract": {"dtype": "int64", "rank": 2, "shape": [batch, num_groups]},
+            "contract": {"dtype": "int64", "shape": [batch, num_groups]},
             "scope": "invocation",
             "initializer": "frame.frame_prefill",
             "recurrence": {"kind": "invariant"},
@@ -3288,7 +3280,6 @@ def _build_real_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         "predictor_mask": {
             "contract": {
                 "dtype": _contract(predictor_mask)["dtype"],
-                "rank": 2,
                 "shape": [batch, "predictor_context"],
             },
             "scope": "invocation",
@@ -3686,11 +3677,9 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
     if predictor_logits.shape is None or len(predictor_logits.shape) != 2:
         raise ValueError("TTS code predictor logits must be rank 2")
     predictor_step_contract = _contract(predictor_step_input)
-    scalar_code_index = predictor_step_contract["rank"] == 0
-    if predictor_step_contract["dtype"] != "int64" or predictor_step_contract["rank"] not in {
-        0,
-        1,
-    }:
+    predictor_step_rank = len(predictor_step_contract["shape"])
+    scalar_code_index = predictor_step_rank == 0
+    if predictor_step_contract["dtype"] != "int64" or predictor_step_rank not in {0, 1}:
         raise ValueError("TTS code predictor step index must be scalar or batch int64")
 
     codec_name = next(
@@ -3721,9 +3710,9 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         pkg.add_policy_component("codec_layout", build_codec_layout_transpose(num_groups))
 
     batch = _contract(prompt_input)["shape"][0]
-    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
-    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = _request_aligned({"dtype": "int64", "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "shape": [batch]})
+    control_int = {"dtype": "int64", "shape": [1]}
     inputs: dict[str, Any] = {
         "request.prompt_tokens": {
             "contract": _contract(prompt_input),
@@ -3820,12 +3809,10 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
 
     frame_contract = {
         "dtype": "int64",
-        "rank": 2,
         "shape": [batch, num_groups],
     }
     history_contract = {
         "dtype": "int64",
-        "rank": 3,
         "shape": [batch, "frames", num_groups],
     }
     initial_effects = {
@@ -4343,11 +4330,11 @@ def build_diffusion_workflow_metadata(
 
     batch = _contract(sample_input)["shape"][0]
     latent_contract = _request_aligned(_contract(sample_input))
-    row_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
-    row_float = _request_aligned({"dtype": "float32", "rank": 1, "shape": [batch]})
-    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
-    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    row_int = _request_aligned({"dtype": "int64", "shape": [batch]})
+    row_float = _request_aligned({"dtype": "float32", "shape": [batch]})
+    batch_int = _request_aligned({"dtype": "int64", "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "shape": [batch]})
+    control_int = {"dtype": "int64", "shape": [1]}
     inputs: dict[str, Any] = {
         "request.max_iterations": {
             "contract": control_int,
@@ -4895,7 +4882,6 @@ def build_image_edit_workflow_metadata(
     # carries the source tokens, so the two contracts differ in sequence length.
     latent_contract = {
         "dtype": _contract(sample_input)["dtype"],
-        "rank": 3,
         "shape": [
             "batch",
             "target_sequence_length",
@@ -4931,9 +4917,9 @@ def build_image_edit_workflow_metadata(
     clamp_output = pkg.policy_components["image_output_clamp"].model.graph.outputs[0]
 
     batch = latent_contract["shape"][0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = {"dtype": "int64", "shape": [batch]}
+    batch_bool = {"dtype": "bool", "shape": [batch]}
+    control_int = {"dtype": "int64", "shape": [1]}
 
     conditioning_ports = ("encoder_hidden_states", "encoder_hidden_states_mask")
     rotary_ports = ("image_rotary_cos", "image_rotary_sin")
@@ -5412,14 +5398,13 @@ def build_video_diffusion_workflow_metadata(
 
     latent_contract = _request_aligned(_contract(sample_input))
     batch = latent_contract["shape"][0]
-    batch_int = {"dtype": "int64", "rank": 1, "shape": [batch]}
-    batch_bool = {"dtype": "bool", "rank": 1, "shape": [batch]}
-    row_float = {"dtype": "float32", "rank": 1, "shape": [batch]}
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = {"dtype": "int64", "shape": [batch]}
+    batch_bool = {"dtype": "bool", "shape": [batch]}
+    row_float = {"dtype": "float32", "shape": [batch]}
+    control_int = {"dtype": "int64", "shape": [1]}
     history_contract = _request_aligned(
         {
             "dtype": _contract(timestep_input)["dtype"],
-            "rank": 2,
             "shape": [batch, "scheduler_history"],
         }
     )
@@ -6113,9 +6098,9 @@ def build_vlm_workflow_metadata(
         pkg.add_policy_component("cache_length_update", build_selective_integer_add())
 
     batch = _contract(token_input)["shape"][0]
-    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
-    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = _request_aligned({"dtype": "int64", "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "shape": [batch]})
+    control_int = {"dtype": "int64", "shape": [1]}
     inputs: dict[str, Any] = {
         "request.prompt_tokens": {
             "contract": _contract(token_input),
@@ -6124,7 +6109,7 @@ def build_vlm_workflow_metadata(
             "required": True,
         },
         "request.image": {
-            "contract": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]},
+            "contract": {"dtype": "uint8", "shape": ["encoded_bytes"]},
             "role": {"kind": "runtime", "version": "1.0", "role": "media"},
             "source": {"kind": "request", "field": "media"},
             "required": text_only_vision is None,
@@ -6151,9 +6136,9 @@ def build_vlm_workflow_metadata(
         },
         "request.eos_ids": {
             "contract": (
-                {"dtype": "int64", "rank": 2, "shape": [batch, "num_eos"]}
+                {"dtype": "int64", "shape": [batch, "num_eos"]}
                 if cache_pairs
-                else {"dtype": "int64", "rank": 1, "shape": ["num_eos"]}
+                else {"dtype": "int64", "shape": ["num_eos"]}
             ),
             "role": {"kind": "runtime", "version": "1.0", "role": "eos_token_ids"},
             "source": {"kind": "request"},
@@ -6252,7 +6237,7 @@ def build_vlm_workflow_metadata(
     inputs.update(
         {
             "request.temperature": {
-                "contract": {"dtype": "float32", "rank": 1, "shape": [batch]},
+                "contract": {"dtype": "float32", "shape": [batch]},
                 "role": {
                     "kind": "runtime",
                     "version": "1.0",
@@ -6274,7 +6259,7 @@ def build_vlm_workflow_metadata(
                 "default": 1,
             },
             "request.top_p": {
-                "contract": {"dtype": "float32", "rank": 1, "shape": [batch]},
+                "contract": {"dtype": "float32", "shape": [batch]},
                 "role": {
                     "kind": "runtime",
                     "version": "1.0",
@@ -6285,7 +6270,7 @@ def build_vlm_workflow_metadata(
                 "default": 1.0,
             },
             "request.min_p": {
-                "contract": {"dtype": "float32", "rank": 1, "shape": [batch]},
+                "contract": {"dtype": "float32", "shape": [batch]},
                 "role": {
                     "kind": "runtime",
                     "version": "1.0",
@@ -6387,12 +6372,11 @@ def build_vlm_workflow_metadata(
     logits_contract = _contract(logits_output)
     last_logits_contract = {
         "dtype": "float32",
-        "rank": 2,
         "shape": [logits_contract["shape"][0], logits_contract["shape"][-1]],
     }
     state: dict[str, Any] = {
         "token": {
-            "contract": {"dtype": "int64", "rank": 2, "shape": [batch, 1]},
+            "contract": {"dtype": "int64", "shape": [batch, 1]},
             "scope": "invocation",
             "initializer": "initializer.token_slot",
             "recurrence": {"kind": "invariant"},
@@ -6413,7 +6397,6 @@ def build_vlm_workflow_metadata(
         "attention_mask": {
             "contract": {
                 "dtype": _contract(attention_input)["dtype"],
-                "rank": 2,
                 "shape": [batch, "context"],
             },
             "scope": "invocation",
@@ -6538,7 +6521,6 @@ def build_vlm_workflow_metadata(
         state["position_ids"] = {
             "contract": {
                 "dtype": _contract(position_input)["dtype"],
-                "rank": 2,
                 "shape": [batch, 1],
             },
             "scope": "invocation",
@@ -6929,7 +6911,6 @@ def build_vlm_workflow_metadata(
             "inputs": {
                 "encoded": {
                     "dtype": "uint8",
-                    "rank": 1,
                     "shape": ["encoded_bytes"],
                 }
             },
@@ -6960,7 +6941,6 @@ def build_vlm_workflow_metadata(
                 "contract": _request_aligned(
                     {
                         "dtype": "int64",
-                        "rank": 2,
                         "shape": [batch, "generated_sequence"],
                     }
                 ),
@@ -6992,7 +6972,7 @@ def build_vlm_workflow_metadata(
             "max_iterations": "request.max_iterations",
             "iteration": {
                 "value": "loop.iteration",
-                "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+                "contract": {"dtype": "int64", "shape": [1]},
             },
             "carried": carried,
         },
@@ -7145,9 +7125,9 @@ def build_speculative_workflow_metadata(
         pkg.add_policy_component("proposal_metrics", build_proposal_metrics())
     pkg.add_policy_component("cache_length_update", build_integer_add())
     batch = _contract(proposer_input)["shape"][0]
-    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
-    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = _request_aligned({"dtype": "int64", "shape": [batch]})
+    batch_bool = _request_aligned({"dtype": "bool", "shape": [batch]})
+    control_int = {"dtype": "int64", "shape": [1]}
     inputs: dict[str, Any] = {
         "request.tokens": {
             "contract": _contract(proposer_input),
@@ -7230,7 +7210,6 @@ def build_speculative_workflow_metadata(
                 "request.grammar_transition_table": {
                     "contract": {
                         "dtype": "int64",
-                        "rank": 2,
                         "shape": ["grammar_states", "vocabulary"],
                     },
                     "role": {"kind": "opaque"},
@@ -7256,7 +7235,6 @@ def build_speculative_workflow_metadata(
                 "request.adaptive_estimates": {
                     "contract": {
                         "dtype": "float32",
-                        "rank": 2,
                         "shape": [batch, estimate_slots],
                     },
                     "role": {"kind": "opaque"},
@@ -7270,7 +7248,6 @@ def build_speculative_workflow_metadata(
                 "request.draft_ms": {
                     "contract": {
                         "dtype": "float32",
-                        "rank": 1,
                         "shape": [batch],
                     },
                     "role": {"kind": "opaque"},
@@ -7280,7 +7257,6 @@ def build_speculative_workflow_metadata(
                 "request.target_ms": {
                     "contract": {
                         "dtype": "float32",
-                        "rank": 1,
                         "shape": [batch],
                     },
                     "role": {"kind": "opaque"},
@@ -8232,15 +8208,15 @@ def _build_autoregressive_workflow_metadata(
         # Raw encoded audio is the request-level input; the adapter decodes and
         # turns it into the encoder feature tensor declared by the program.
         workflow_inputs["request.audio"] = {
-            "contract": {"dtype": "uint8", "rank": 1, "shape": ["encoded_bytes"]},
+            "contract": {"dtype": "uint8", "shape": ["encoded_bytes"]},
             "role": {"kind": "runtime", "version": "1.0", "role": "media"},
             "source": {"kind": "request", "field": "media"},
             "required": True,
         }
     batch_dimension = _shape_metadata(_port(token_input))[0]
-    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch_dimension]})
-    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch_dimension]})
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = _request_aligned({"dtype": "int64", "shape": [batch_dimension]})
+    batch_bool = _request_aligned({"dtype": "bool", "shape": [batch_dimension]})
+    control_int = {"dtype": "int64", "shape": [1]}
     workflow_inputs.update(
         {
             "request.max_iterations": {
@@ -8302,7 +8278,6 @@ def _build_autoregressive_workflow_metadata(
                 "request.eos_ids": {
                     "contract": {
                         "dtype": "int64",
-                        "rank": 2,
                         "shape": [batch_dimension, "num_eos"],
                     },
                     "role": {
@@ -8337,7 +8312,7 @@ def _build_autoregressive_workflow_metadata(
         )
     else:
         workflow_inputs["request.eos_ids"] = {
-            "contract": {"dtype": "int64", "rank": 1, "shape": ["num_eos"]},
+            "contract": {"dtype": "int64", "shape": ["num_eos"]},
             "role": {
                 "kind": "runtime",
                 "version": "1.0",
@@ -8354,7 +8329,6 @@ def _build_autoregressive_workflow_metadata(
                 "request.temperature": {
                     "contract": {
                         "dtype": "float32",
-                        "rank": 1,
                         "shape": [batch_dimension],
                     },
                     "role": {
@@ -8383,7 +8357,6 @@ def _build_autoregressive_workflow_metadata(
                 "request.top_p": {
                     "contract": {
                         "dtype": "float32",
-                        "rank": 1,
                         "shape": [batch_dimension],
                     },
                     "role": {
@@ -8398,7 +8371,6 @@ def _build_autoregressive_workflow_metadata(
                 "request.min_p": {
                     "contract": {
                         "dtype": "float32",
-                        "rank": 1,
                         "shape": [batch_dimension],
                     },
                     "role": {
@@ -8526,14 +8498,12 @@ def _build_autoregressive_workflow_metadata(
     logits_contract = _contract(logits_output)
     last_logits_contract = {
         "dtype": "float32",
-        "rank": 2,
         "shape": [logits_contract["shape"][0], logits_contract["shape"][-1]],
     }
     state: dict[str, Any] = {
         "token": {
             "contract": {
                 "dtype": "int64",
-                "rank": 2,
                 "shape": [batch_dimension, 1],
             },
             "scope": "invocation",
@@ -8692,7 +8662,6 @@ def _build_autoregressive_workflow_metadata(
         decoder_state_specs["attention_mask"] = (
             {
                 "dtype": _contract(attention_input)["dtype"],
-                "rank": 2,
                 "shape": [batch_dimension, "context"],
             },
             (
@@ -8716,7 +8685,6 @@ def _build_autoregressive_workflow_metadata(
         decoder_state_specs["position_ids"] = (
             {
                 "dtype": _contract(position_input)["dtype"],
-                "rank": 2,
                 "shape": [batch_dimension, 1],
             },
             "initializer.body_position_ids",
@@ -9191,7 +9159,6 @@ def _build_autoregressive_workflow_metadata(
                 "contract": _request_aligned(
                     {
                         "dtype": "int64",
-                        "rank": 2,
                         "shape": [batch_dimension, "generated_sequence"],
                     }
                 ),
@@ -9223,7 +9190,6 @@ def _build_autoregressive_workflow_metadata(
                             "inputs": {
                                 "encoded": {
                                     "dtype": "uint8",
-                                    "rank": 1,
                                     "shape": ["encoded_bytes"],
                                 }
                             },
@@ -9259,7 +9225,7 @@ def _build_autoregressive_workflow_metadata(
             "max_iterations": "request.max_iterations",
             "iteration": {
                 "value": "loop.iteration",
-                "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+                "contract": {"dtype": "int64", "shape": [1]},
             },
             "carried": carried,
         },
@@ -9320,12 +9286,11 @@ def build_language_diffusion_pipeline_metadata(
     token_contract = _contract(token_input)
     mask_contract = {
         "dtype": "bool",
-        "rank": 2,
         "shape": token_contract["shape"],
     }
     batch_dimension = token_contract["shape"][0]
-    batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch_dimension]})
-    control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
+    batch_int = _request_aligned({"dtype": "int64", "shape": [batch_dimension]})
+    control_int = {"dtype": "int64", "shape": [1]}
     inputs = {
         "request.input_ids": {
             "contract": token_contract,
@@ -9523,7 +9488,7 @@ def build_language_diffusion_pipeline_metadata(
             "max_iterations": "request.max_iterations",
             "iteration": {
                 "value": "loop.iteration",
-                "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+                "contract": {"dtype": "int64", "shape": [1]},
             },
             "carried": carried,
         },
@@ -9628,7 +9593,7 @@ def _audio_preprocess_component(
         },
         "ports": {
             "inputs": {
-                "encoded": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+                "encoded": {"dtype": "uint8", "shape": ["bytes"]},
             },
             "outputs": {
                 "input_values": values_contract,
@@ -9726,13 +9691,12 @@ def build_ctc_asr_workflow_metadata(
 
     values_contract = _contract(graph_inputs["input_values"])
     mask_contract = _contract(graph_inputs["attention_mask"])
-    logits_contract = _contract(graph_outputs["logits"])
-
     sample_rate = int(getattr(getattr(config, "audio", None), "sampling_rate", 0) or 16_000)
     # Shape inference may leave the class axis unknown (or the whole shape
     # absent), so fall back to the config rather than emitting a vocabulary
     # whose declared size silently disagrees with the graph.
-    logits_shape = logits_contract.get("shape") or []
+    logits_port = _port(graph_outputs["logits"])
+    logits_shape = _shape_metadata(logits_port) if logits_port.rank is not None else []
     inferred_classes = logits_shape[-1] if logits_shape else None
     vocab_size = int(inferred_classes or getattr(config, "vocab_size", 0) or 0)
     if vocab_size <= 0:
@@ -9740,6 +9704,19 @@ def build_ctc_asr_workflow_metadata(
             "CTC ASR metadata requires a vocabulary size; the 'logits' output "
             "declares no static class axis and the config has no vocab_size"
         )
+    if logits_shape:
+        logits_contract = _contract(graph_outputs["logits"])
+    else:
+        dtype = {
+            "fp16": "float16",
+            "bf16": "bfloat16",
+            "fp32": "float32",
+        }.get(logits_port.dtype, logits_port.dtype)
+        logits_contract = {
+            "dtype": dtype,
+            "shape": [values_contract["shape"][0], "Any", vocab_size],
+            "batch_layout": {"kind": "request_aligned", "axis": 0},
+        }
     blank_id = int(getattr(config, "pad_token_id", 0) or 0)
 
     workflow_outputs = {
@@ -9793,7 +9770,7 @@ def build_ctc_asr_workflow_metadata(
         },
         "inputs": {
             "request.audio": {
-                "contract": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+                "contract": {"dtype": "uint8", "shape": ["bytes"]},
                 "role": {"kind": "runtime", "version": "1.0", "role": "media"},
                 "source": {"kind": "request", "field": "media"},
                 "required": True,
@@ -9877,14 +9854,12 @@ def build_ctc_asr_workflow_metadata(
                         "source": "values",
                         "content": "waveform",
                         "dtype": values_contract["dtype"],
-                        "rank": values_contract["rank"],
                     },
                     {
                         "name": "attention_mask",
                         "source": "sample_mask",
                         "content": "validity_mask",
                         "dtype": mask_contract["dtype"],
-                        "rank": mask_contract["rank"],
                     },
                 ],
             }
@@ -10102,7 +10077,7 @@ def _stft_preprocess_component(
         },
         "ports": {
             "inputs": {
-                "encoded": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+                "encoded": {"dtype": "uint8", "shape": ["bytes"]},
             },
             "outputs": {
                 "noisy_mag": mag_contract,
@@ -10377,11 +10352,10 @@ def build_speech_enhancement_workflow_metadata(
     transforms = _stft_transforms(config)
     waveform_contract = {
         "dtype": "float32",
-        "rank": 2,
         "shape": ["batch", "audio_samples"],
     }
-    sample_rate_contract = {"dtype": "int64", "rank": 0, "shape": []}
-    lengths_contract = {"dtype": "int64", "rank": 1, "shape": ["batch"]}
+    sample_rate_contract = {"dtype": "int64", "shape": []}
+    lengths_contract = {"dtype": "int64", "shape": ["batch"]}
     geometry = _reuse_stft_geometry(config)
     if geometry is not None and geometry["mode"] != "native_scaled":
         expected_bins = geometry["n_fft"] // 2 + 1
@@ -10452,7 +10426,7 @@ def build_speech_enhancement_workflow_metadata(
         initial_effects["audio_postprocess"] = "audio_postprocess.0"
         workflow_inputs = {
             "request.audio": {
-                "contract": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+                "contract": {"dtype": "uint8", "shape": ["bytes"]},
                 "role": {"kind": "runtime", "version": "1.0", "role": "media"},
                 "source": {"kind": "request", "field": "media"},
                 "required": True,
@@ -10577,7 +10551,6 @@ def build_speech_enhancement_workflow_metadata(
                         "source": "magnitude",
                         "content": "features",
                         "dtype": mag_contract["dtype"],
-                        "rank": mag_contract["rank"],
                         "contract": mag_contract,
                     },
                     {
@@ -10585,7 +10558,6 @@ def build_speech_enhancement_workflow_metadata(
                         "source": "phase",
                         "content": "features",
                         "dtype": pha_contract["dtype"],
-                        "rank": pha_contract["rank"],
                         "contract": pha_contract,
                     },
                     {
@@ -10593,7 +10565,6 @@ def build_speech_enhancement_workflow_metadata(
                         "source": "samples",
                         "content": "waveform",
                         "dtype": waveform_contract["dtype"],
-                        "rank": waveform_contract["rank"],
                         "contract": waveform_contract,
                     },
                     {
@@ -10601,7 +10572,6 @@ def build_speech_enhancement_workflow_metadata(
                         "source": "sample_rate",
                         "content": "sample_rate",
                         "dtype": sample_rate_contract["dtype"],
-                        "rank": sample_rate_contract["rank"],
                         "contract": sample_rate_contract,
                     },
                     {
@@ -10609,7 +10579,6 @@ def build_speech_enhancement_workflow_metadata(
                         "source": "sample_lengths",
                         "content": "sample_lengths",
                         "dtype": lengths_contract["dtype"],
-                        "rank": lengths_contract["rank"],
                         "contract": lengths_contract,
                     },
                 ],
@@ -10746,7 +10715,6 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         if temporal_position is not None
         else {
             "dtype": "int64",
-            "rank": 2,
             "shape": [_contract(input_frame)["shape"][0], 1],
         }
     )
@@ -10784,28 +10752,25 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
 
     batch = _contract(input_frame)["shape"][0]
     request_aligned = {"kind": "request_aligned", "axis": 0}
-    control_int = {"dtype": "int64", "rank": 0, "shape": []}
-    scalar_bool = {"dtype": "bool", "rank": 0, "shape": []}
+    control_int = {"dtype": "int64", "shape": []}
+    scalar_bool = {"dtype": "bool", "shape": []}
     batch_bool = {
         "dtype": "bool",
-        "rank": 1,
         "shape": [batch],
         "batch_layout": request_aligned,
     }
     batch_int = {
         "dtype": "int64",
-        "rank": 1,
         "shape": [batch],
         "batch_layout": request_aligned,
     }
-    loop_flag = {"dtype": "bool", "rank": 1, "shape": [1]}
-    frame_contract = {"dtype": "int64", "rank": 2, "shape": [batch, channels]}
+    loop_flag = {"dtype": "bool", "shape": [1]}
+    frame_contract = {"dtype": "int64", "shape": [batch, channels]}
     ring_contract = {
         "dtype": "int64",
-        "rank": 3,
         "shape": [batch, channels, cache_length],
     }
-    ring_flags = {"dtype": "bool", "rank": 3, "shape": [batch, channels, cache_length]}
+    ring_flags = {"dtype": "bool", "shape": [batch, channels, cache_length]}
 
     inputs: dict[str, Any] = {
         "request.audio_chunk": {
@@ -10815,7 +10780,7 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
             "required": True,
         },
         "request.session_id": {
-            "contract": {"dtype": "int64", "rank": 1, "shape": [batch]},
+            "contract": {"dtype": "int64", "shape": [batch]},
             "role": {"kind": "runtime", "version": "1.0", "role": "session_id"},
             "source": {"kind": "request", "field": "session_id"},
             "required": True,
@@ -10867,14 +10832,14 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
             "default": 1,
         },
         "package.delays": {
-            "contract": {"dtype": "int64", "rank": 1, "shape": [channels]},
+            "contract": {"dtype": "int64", "shape": [channels]},
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
             "default": delays,
         },
         "package.initial_tokens": {
-            "contract": {"dtype": "int64", "rank": 1, "shape": [channels]},
+            "contract": {"dtype": "int64", "shape": [channels]},
             "role": {"kind": "opaque"},
             "source": {"kind": "literal"},
             "required": False,
@@ -10937,7 +10902,6 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         "attention_mask": session_cell(
             {
                 "dtype": _contract(temporal_mask)["dtype"],
-                "rank": 2,
                 "shape": [batch, "context"],
             },
             "package.attention_mask_init",
@@ -10954,7 +10918,6 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         "user_waveform": session_cell(
             {
                 "dtype": _contract(waveform_input)["dtype"],
-                "rank": 3,
                 "shape": [batch, 1, "user_samples"],
             },
             "package.user_waveform_init",
@@ -10969,7 +10932,6 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         "agent_codes": session_cell(
             {
                 "dtype": _contract(codes_input)["dtype"],
-                "rank": 3,
                 "shape": [batch, audio_streams, "agent_frames"],
             },
             "package.agent_codes_init",
@@ -11110,7 +11072,7 @@ def build_full_duplex_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]
         "recurrence": invariant,
     }
     state["prev_token"] = {
-        "contract": {"dtype": "int64", "rank": 1, "shape": [batch]},
+        "contract": {"dtype": "int64", "shape": [batch]},
         "scope": "invocation",
         "initializer": "duplex.text_token",
         "recurrence": invariant,

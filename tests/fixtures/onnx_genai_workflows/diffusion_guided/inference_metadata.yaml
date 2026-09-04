@@ -1,18 +1,11 @@
 schema_version: v1.1
 pipeline:
   workflow:
-    manifest:
-      capabilities:
-      - workflow_ssa
-      - linear_effects
-      - nested_control_flow
-      - loop_induction_values
-      - typed_emit
+    manifest: {}
     inputs:
       request.max_iterations:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - 1
         role:
@@ -26,7 +19,6 @@ pipeline:
       package.false:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -41,7 +33,6 @@ pipeline:
       request.seed:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -59,7 +50,6 @@ pipeline:
       package.rng_offset:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -74,7 +64,6 @@ pipeline:
       request.input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - prompt_sequence
@@ -92,7 +81,6 @@ pipeline:
       request.negative_input_ids:
         contract:
           dtype: int64
-          rank: 2
           shape:
           - batch
           - prompt_sequence
@@ -110,7 +98,6 @@ pipeline:
       request.guidance_scale:
         contract:
           dtype: float32
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -127,7 +114,6 @@ pipeline:
       package.loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         role:
@@ -140,7 +126,6 @@ pipeline:
       image:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 3
@@ -155,7 +140,6 @@ pipeline:
       latent:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -169,7 +153,6 @@ pipeline:
       noise_estimate:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -183,7 +166,6 @@ pipeline:
       latent_trajectory:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -197,7 +179,6 @@ pipeline:
       rng_offset:
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
@@ -236,7 +217,6 @@ pipeline:
           inputs:
             sample:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -247,7 +227,6 @@ pipeline:
                 axis: 0
             estimate:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -258,7 +237,6 @@ pipeline:
                 axis: 0
             history:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -269,7 +247,6 @@ pipeline:
                 axis: 0
             step:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -277,13 +254,11 @@ pipeline:
                 axis: 0
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - schedule_length
           outputs:
             next_state:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -294,7 +269,6 @@ pipeline:
                 axis: 0
             next_history:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -328,7 +302,6 @@ pipeline:
           inputs:
             done:
               dtype: bool
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -337,7 +310,6 @@ pipeline:
           outputs:
             continue:
               dtype: bool
-              rank: 1
               shape:
               - 1
         batch_capacity: {}
@@ -350,7 +322,6 @@ pipeline:
           outputs:
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - 4
         batch_capacity: {}
@@ -363,7 +334,6 @@ pipeline:
           outputs:
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - 3
         batch_capacity: {}
@@ -375,12 +345,10 @@ pipeline:
           inputs:
             schedule:
               dtype: float32
-              rank: 1
               shape:
               - schedule_length
             step:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -389,7 +357,6 @@ pipeline:
           outputs:
             timestep:
               dtype: float32
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -406,7 +373,6 @@ pipeline:
           inputs:
             tensor:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -417,13 +383,11 @@ pipeline:
                 axis: 0
             scale:
               dtype: float32
-              rank: 1
               shape:
               - 1
           outputs:
             scaled:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -446,7 +410,6 @@ pipeline:
           outputs:
             value:
               dtype: float32
-              rank: 1
               shape:
               - 1
         batch_capacity: {}
@@ -458,7 +421,6 @@ pipeline:
           inputs:
             reference:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -470,7 +432,6 @@ pipeline:
           outputs:
             zeros:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -492,7 +453,6 @@ pipeline:
           inputs:
             unconditional:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -503,7 +463,6 @@ pipeline:
                 axis: 0
             conditional:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -514,7 +473,6 @@ pipeline:
                 axis: 0
             scale:
               dtype: float32
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -523,7 +481,6 @@ pipeline:
           outputs:
             estimate:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -553,7 +510,6 @@ pipeline:
           inputs:
             tensor:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - axis_1
@@ -565,7 +521,6 @@ pipeline:
           outputs:
             clamped:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - axis_1
@@ -588,7 +543,6 @@ pipeline:
           outputs:
             shape:
               dtype: int64
-              rank: 1
               shape:
               - 3
         batch_capacity: {}
@@ -600,7 +554,6 @@ pipeline:
           inputs:
             seed:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -608,7 +561,6 @@ pipeline:
                 axis: 0
             offset:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -616,13 +568,11 @@ pipeline:
                 axis: 0
             row_shape:
               dtype: int64
-              rank: 1
               shape:
               - 3
           outputs:
             noise:
               dtype: float32
-              rank: 4
               shape:
               - batch
               - channels
@@ -633,7 +583,6 @@ pipeline:
                 axis: 0
             next_offset:
               dtype: int64
-              rank: 1
               shape:
               - batch
               batch_layout:
@@ -653,7 +602,6 @@ pipeline:
       latent_state:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -669,7 +617,6 @@ pipeline:
       history:
         contract:
           dtype: float32
-          rank: 4
           shape:
           - batch
           - 4
@@ -685,7 +632,6 @@ pipeline:
       loop_0_active:
         contract:
           dtype: bool
-          rank: 1
           shape:
           - 1
         scope: invocation
@@ -820,7 +766,6 @@ pipeline:
         value: loop.iteration
         contract:
           dtype: int64
-          rank: 1
           shape:
           - batch
           batch_layout:
