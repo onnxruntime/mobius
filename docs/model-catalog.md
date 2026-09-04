@@ -196,6 +196,7 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 |---|---|---|---|
 | `qwen3_tts` | `Qwen3TTSForConditionalGeneration` | `tts` | — |
 | `qwen3_tts_tokenizer_12hz` | `Qwen3TTSTokenizerV2Model` | `codec` | — |
+| `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `vibevoice/VibeVoice-1.5B-hf` |
 
 ### Audio Feature Extraction
 

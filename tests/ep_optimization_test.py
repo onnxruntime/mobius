@@ -21,6 +21,7 @@ from _test_configs import _base_config
 
 from mobius._builder import build_from_module
 from mobius._optimizations import _count_ops, optimize_model
+from mobius._pipeline_contract import declare_arbitrary_attention_mask
 from mobius._registry import registry
 
 # ---------------------------------------------------------------------------
@@ -183,6 +184,21 @@ def test_cuda_float16_has_gqa_qwen2():
     model = pkg["model"]
     gqa_count = _count_ops(model, "GroupQueryAttention")
     assert gqa_count > 0, f"CUDA+FLOAT16 Qwen2 should have GQA, got {gqa_count}"
+
+
+def test_arbitrary_mask_contract_disables_decoder_gqa():
+    """A suffix-valid mask retains standard Attention even on a GQA-capable EP.
+
+    This is the generic fusion gate used by VibeVoice's negative CFG cache
+    branch; the normal CPU float Llama test above still proves GQA fuses.
+    """
+    model = _make_llama_pkg(ep="default", dtype=ir.DataType.FLOAT)["model"]
+    declare_arbitrary_attention_mask(model.graph)
+
+    optimize_model(model, ep="cpu", dtype=ir.DataType.FLOAT, model_role="decoder")
+
+    assert _count_ops(model, "GroupQueryAttention") == 0
+    assert _count_ops(model, "Attention") > 0
 
 
 def test_cuda_float16_qwen2_has_packed_qkv():

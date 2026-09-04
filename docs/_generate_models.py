@@ -80,11 +80,25 @@ def _source_file(cls: type) -> str:
 
 
 def _class_description(cls: type) -> str:
-    """Extract the full class docstring for the generated model page."""
+    """Extract the first paragraph of the class docstring."""
     doc = inspect.getdoc(cls)
     if not doc:
         return ""
-    return doc
+    lines = []
+    for line in doc.split("\n"):
+        if not line.strip() and lines:
+            break
+        lines.append(line.strip())
+    return " ".join(lines)
+
+
+def _class_details(cls: type) -> str:
+    """Extract all docstring content after the first paragraph."""
+    doc = inspect.getdoc(cls)
+    if not doc:
+        return ""
+    parts = doc.split("\n\n", maxsplit=1)
+    return parts[1] if len(parts) == 2 else ""
 
 
 def _generate_model_page(model_type: str, cls: type) -> str:
@@ -92,6 +106,7 @@ def _generate_model_page(model_type: str, cls: type) -> str:
     task = _get_task(cls)
     source = _source_file(cls)
     description = _class_description(cls)
+    details = _class_details(cls)
 
     lines = [
         f"# {model_type}",
@@ -112,6 +127,8 @@ def _generate_model_page(model_type: str, cls: type) -> str:
             description,
             "",
         ]
+    if details:
+        lines += [details, ""]
 
     lines += [
         "## Usage",

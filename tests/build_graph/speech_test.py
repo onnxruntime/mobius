@@ -49,6 +49,16 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     "audio-feature-extraction": {"model"},
     "feature-ctc-asr": {"model"},
     "speech-enhancement": {"model"},
+    "vibevoice-tts": {
+        "audio_encoder",
+        "audio_projection",
+        "embedding",
+        "decoder",
+        "diffusion_head",
+        "audio_decoder",
+        "semantic_encoder",
+        "semantic_projection",
+    },
 }
 
 

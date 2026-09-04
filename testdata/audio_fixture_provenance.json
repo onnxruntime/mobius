@@ -1,0 +1,16 @@
+{
+  "652-129742-0006-24khz.wav": {
+    "derived_sha256": "6f6ef448df45b8e8eb797679f905399a8c0dc2ac370c0d8da5db362aa2ad93f9",
+    "license": "CC BY 4.0",
+    "resampling": {
+      "algorithm": "scipy.signal.resample_poly",
+      "down": 2,
+      "source_sampling_rate": 16000,
+      "target_sampling_rate": 24000,
+      "up": 3
+    },
+    "source": "LibriSpeech train-clean-100 / OpenSLR corpus 12, utterance 652-129742-0006",
+    "source_file": "652-129742-0006.flac",
+    "source_sha256": "081f8aed018bb8324cf490f95df9efbeab37e002d81b4400a66e3166c4b6c21c"
+  }
+}

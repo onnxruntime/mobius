@@ -47,6 +47,7 @@ from mobius._configs import (
     Plamo2Config,
     Qwen4ExpConfig,
     SenseNovaU1Config,
+    VibeVoiceConfig,
     WhisperConfig,
     XverseConfig,
 )
@@ -158,6 +159,7 @@ from mobius.models import (
     SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
+    VibeVoiceForConditionalGeneration,
     WhisperForConditionalGeneration,
     XverseCausalLMModel,
 )
@@ -225,6 +227,7 @@ from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.trocr import TrOCRForConditionalGeneration
+from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
@@ -894,6 +897,14 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
     "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
     "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
+    "vibevoice": ModelRegistration(
+        VibeVoiceForConditionalGeneration,
+        task="vibevoice-tts",
+        config_class=VibeVoiceConfig,
+        test_model_id=VIBEVOICE_MODEL_ID,
+        test_revision=VIBEVOICE_REVISION,
+        family="vibevoice",
+    ),
     "whisper": ModelRegistration(
         WhisperForConditionalGeneration,
         task="speech-to-text",

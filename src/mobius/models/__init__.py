@@ -210,6 +210,7 @@ __all__ = [
     "remap_diffusers_unet_lora",
     "ViTModel",
     "VideoAutoencoderModel",
+    "VibeVoiceForConditionalGeneration",
     "Wav2Vec2ForCTCModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
@@ -452,6 +453,7 @@ from mobius.models.unet import (
     remap_diffusers_unet_lora,
 )
 from mobius.models.vae import AutoencoderKLModel
+from mobius.models.vibevoice import VibeVoiceForConditionalGeneration
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model

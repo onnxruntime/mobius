@@ -1224,6 +1224,42 @@ class TestCLIBuildRuntime:
         assert writer.call_args.kwargs["guidance_scale"] == pytest.approx(6.0)
         assert writer.call_args.kwargs["revision"] == "pinned-revision"
 
+    def test_runtime_onnx_genai_uses_effective_build_revision(self):
+        model = mock.MagicMock()
+        model.metadata_props = {
+            "mobius.source_revision": "edc39f80f5cae656da37baf8faa8f5502bf7081f"
+        }
+        pkg = mock.MagicMock()
+        pkg.items.return_value = [("decoder", model)]
+        pkg.values.return_value = [model]
+        pkg.__iter__.return_value = iter(("decoder",))
+        pkg.config = object()
+        args = SimpleNamespace(
+            max_shard_size=None,
+            max_workers=8,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime="onnx-genai",
+            config=None,
+            model="vibevoice/VibeVoice-1.5B-hf",
+            guidance_scale=None,
+            revision=None,
+            release=False,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config",
+                return_value={},
+            ) as writer,
+        ):
+            _save_package(pkg, tmpdir, args, None, None)
+
+        assert writer.call_args.kwargs["revision"] == (
+            "edc39f80f5cae656da37baf8faa8f5502bf7081f"
+        )
+
     def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
         pkg = mock.MagicMock()
         pkg.items.return_value = []
