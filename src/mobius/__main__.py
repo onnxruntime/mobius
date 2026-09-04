@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import logging
 import os
@@ -14,24 +13,16 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-import tqdm
-
 if TYPE_CHECKING:
     import onnx_ir as ir
-    import torch
 
 from mobius._builder import (
     DTYPE_MAP,
-    build_from_module,
     resolve_dtype,
 )
 from mobius._optimizations import strip_debug_metadata
 from mobius._registry import registry
 from mobius.integrations.transformers import build
-from mobius.integrations.transformers._config_resolver import (
-    _config_from_hf,
-    _default_task_for_model,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -85,33 +76,6 @@ def _parse_size(size_str: str) -> int:
     return int(size_str)
 
 
-def _load_weights_from_dir(model_dir: str) -> dict[str, torch.Tensor]:
-    """Load safetensors weights from a local model directory."""
-    import safetensors.torch
-
-    model_dir = os.path.abspath(model_dir)
-    if os.path.isfile(model_dir):
-        model_dir = os.path.dirname(model_dir)
-
-    index_path = os.path.join(model_dir, "model.safetensors.index.json")
-
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            index = json.load(f)
-        all_files = sorted(set(index["weight_map"].values()))
-        paths = [os.path.join(model_dir, f) for f in all_files]
-    else:
-        paths = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
-
-    if not paths:
-        raise FileNotFoundError(f"No safetensors files found in {model_dir}")
-
-    state_dict: dict[str, torch.Tensor] = {}
-    for path in tqdm.tqdm(paths, desc="Loading weights"):
-        state_dict.update(safetensors.torch.load_file(path))
-    return state_dict
-
-
 def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
     """Apply rewrite rules if --optimize is specified."""
     if not optimize:
@@ -153,8 +117,6 @@ def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
 
 def _cmd_build(args: argparse.Namespace) -> None:
     """Execute the 'build' subcommand."""
-    import dataclasses
-
     from mobius.integrations.diffusers._builder import (
         _load_diffusers_pipeline_index,
         build_diffusers_pipeline,
@@ -328,7 +290,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
         revision = REUSE_REVISION
     output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
     optimize = args.optimize
     component_filter = args.component
@@ -436,124 +397,49 @@ def _cmd_build(args: argparse.Namespace) -> None:
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
-        import onnx_ir as ir
-        import transformers
-
         if input_sampling_rate is not None or bwe_sampling_rate is not None:
             raise SystemExit(
                 "Error: --input-sample-rate and --bwe-sample-rate are only "
                 "supported for RE-USE speech-enhancement checkpoints."
             )
-        try:
-            hf_config = transformers.AutoConfig.from_pretrained(
-                config_path, trust_remote_code=trust_remote_code
-            )
-        except (ValueError, KeyError, OSError):
-            # A checkpoint predating the mandatory ``model_type`` key still
-            # names its architecture; resolve it the same way the HF-id path
-            # does rather than refusing a directory Mobius can build.
-            from mobius.integrations.transformers._config_resolver import (
-                _try_load_config_json,
-            )
-
-            hf_config = _try_load_config_json(config_path)
-            if hf_config is None:
-                raise
-        model_type = hf_config.model_type
-        parent_config = hf_config
         from mobius.integrations.transformers._builder import (
             _is_qwen4_exp_composite,
+            _load_transformers_config,
         )
 
+        parent_config, _loaded_from_raw_json = _load_transformers_config(
+            config_path,
+            revision=None,
+            trust_remote_code=trust_remote_code,
+        )
+        if parent_config is None:
+            raise ValueError(f"Could not load a Transformers config from {config_path!r}.")
+        model_type = parent_config.model_type
         if _is_qwen4_exp_composite(parent_config):
             raise SystemExit(
                 "Error: local Qwen4-Exp composite configs cannot be silently "
                 "exported as text-only. Use --model <hf-id> --features text-only."
             )
-        if hasattr(hf_config, "text_config"):
-            hf_config = hf_config.text_config
-        from mobius.integrations.compressed_tensors import (
-            CompressedTensorsConfig,
-            stream_compressed_tensors_to_package,
-        )
-
-        compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
-        config = _config_from_hf(hf_config, parent_config=parent_config)
-        if dtype_override is not None:
-            config = dataclasses.replace(config, dtype=dtype_override)
-        elif compressed_tensors_config is not None and keep_quantized:
-            config = dataclasses.replace(config, dtype=ir.DataType.FLOAT16)
-        if (
-            compressed_tensors_config is not None
-            and keep_quantized
-            and config.dtype != ir.DataType.FLOAT16
-        ):
-            raise SystemExit(
-                "Error: storage-preserving compressed-tensors export requires "
-                "--dtype f16 for the Microsoft W4A16/W8A16 custom-op ABI. "
-                "Use --dtype f16 or --dequantize."
-            )
-        if args.glm_full_attention:
-            if model_type != "glm_moe_dsa":
-                raise SystemExit(
-                    "Error: --features glm-full-attention is only supported for "
-                    f"model_type 'glm_moe_dsa' (got '{model_type}')."
-                )
-            config = dataclasses.replace(config, use_dsa=False)
-        if export_paged_attention:
-            from mobius.components._paged_mla import paged_attention_rejection
-
-            config = dataclasses.replace(config, export_paged_attention=True)
-            reason = paged_attention_rejection(config)
-            if reason is not None:
-                raise SystemExit(
-                    f"Error: --features paged-attention is not supported for this "
-                    f"model: {reason}"
-                )
         if static_cache_params is not None:
             task = _resolve_static_cache_task(model_type)
-        elif task is None:
-            task = _default_task_for_model(model_type)
-        module_class = registry.get(model_type)
-        model_module = module_class(config)
-        pkg = build_from_module(
-            model_module,
-            config,
+        pkg = build(
+            config_path,
             task=task,
+            dtype=dtype_override,
+            load_weights=load_weights,
+            revision=None,
+            trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
+            text_only=args.text_only,
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
+            glm_full_attention=args.glm_full_attention,
+            export_paged_attention=export_paged_attention,
+            keep_quantized=keep_quantized,
+            input_sampling_rate=input_sampling_rate,
+            bwe_sampling_rate=bwe_sampling_rate,
         )
-        for name, model in pkg.items():
-            model.graph.name = f"{config_path}/{name}"
-        if load_weights:
-            if compressed_tensors_config is not None:
-                # Packed FP4 weights cannot pass through ordinary apply_weights.
-                # The same loader owns both faithful native storage and the
-                # explicit keep_quantized=False dense reconstruction policy.
-                checkpoint_dir = (
-                    os.path.dirname(config_path)
-                    if os.path.isfile(config_path)
-                    else config_path
-                )
-                stream_compressed_tensors_to_package(
-                    pkg,
-                    checkpoint_dir,
-                    compressed_tensors_config,
-                    preprocess_weights=getattr(
-                        model_module,
-                        "preprocess_weights",
-                        None,
-                    ),
-                    fp8_kv_cache=fp8_kv_cache,
-                    keep_quantized=keep_quantized,
-                )
-            else:
-                state_dict = _load_weights_from_dir(config_path)
-                if hasattr(model_module, "preprocess_weights"):
-                    state_dict = model_module.preprocess_weights(state_dict)
-                pkg.apply_weights(state_dict)
     else:
         model_id_or_path = args.model
         if static_cache_params is not None:
@@ -1500,8 +1386,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--dequantize",
         action="store_true",
         help=(
-            "Explicitly reconstruct supported compressed-tensors weights as dense "
-            "floating point. By default their FP8/NVFP4 storage is preserved."
+            "Explicitly reconstruct supported compressed-tensors and GPT-OSS "
+            "MXFP4 weights as dense floating point. Dense GPT-OSS reconstruction "
+            "is eager and memory-intensive; the default preserves MXFP4 with "
+            "bounded native streaming."
         ),
     )
     _add_shared_build_arguments(build_parser)

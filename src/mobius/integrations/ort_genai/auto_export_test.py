@@ -33,10 +33,8 @@ from mobius.integrations.ort_genai.auto_export import (
     _uses_compact_sliding_kv_cache,
     _write_audio_processor_config,
     _write_genai_config,
-    _write_runtime_compatibility,
     _write_vision_processor_config,
     auto_export,
-    export_package,
     write_ort_genai_config,
 )
 
@@ -93,14 +91,6 @@ def _mock_decoder_model(
         inputs.extend([f"past_key_values.{index}.key", f"past_key_values.{index}.value"])
         outputs.extend([f"present.{index}.key", f"present.{index}.value"])
     return _mock_model(inputs=inputs, outputs=outputs)
-
-
-def test_moonshine_runtime_limitation_is_advisory(tmp_path):
-    result = write_ort_genai_config(_make_fake_llm_pkg("moonshine"), str(tmp_path))
-
-    compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
-    assert "variable-length raw-waveform encoder" in compatibility["warnings"][0]
 
 
 def _make_fake_llm_pkg(model_type: str = "qwen2"):
@@ -1392,36 +1382,6 @@ class TestExportForOrtGenai:
         assert "model" in data
         assert data["model"]["type"] == "decoder"
         assert data["model"]["decoder"]["inputs"]["position_ids"] == "position_ids"
-        assert (tmp_path / "runtime_compatibility.json").is_file()
-
-    def test_generic_vision_encoder_decoder_exports_with_warning(self, tmp_path):
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "nemotron_parse"
-            vocab_size: int = 256
-            hidden_size: int = 64
-            num_hidden_layers: int = 2
-            num_attention_heads: int = 4
-            num_key_value_heads: int = 2
-            head_dim: int = 16
-            max_position_embeddings: int = 4096
-            pad_token_id: int = 0
-
-        pkg = ModelPackage(
-            {
-                "vision_encoder": _mock_model(),
-                "decoder": _mock_model(),
-            },
-            config=FakeConfig(),
-        )
-        result = write_ort_genai_config(pkg, str(tmp_path))
-        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
-        assert "generic vision encoder-decoder" in compatibility["warnings"][0]
 
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""
@@ -1850,46 +1810,6 @@ class TestExportForOrtGenai:
         assert data["model"]["type"] == "qwen3_5_moe"
         assert data["model"]["vision"]["patch_size"] == 16
 
-    def test_mage_vl_exports_with_runtime_warning(self, tmp_path):
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
-
-        @dataclasses.dataclass
-        class FakeVision:
-            image_size: int = 448
-            patch_size: int = 16
-            spatial_merge_size: int = 2
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "mage_vl"
-            vocab_size: int = 151936
-            hidden_size: int = 2560
-            num_hidden_layers: int = 1
-            num_attention_heads: int = 32
-            num_key_value_heads: int = 8
-            head_dim: int = 128
-            image_token_id: int = 151655
-            temporal_patch_size: int = 1
-            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
-
-        pkg = ModelPackage(
-            {
-                "decoder": _mock_model(),
-                "vision_encoder": _mock_model(),
-                "embedding": _mock_model(),
-            },
-            config=FakeConfig(),
-        )
-
-        output_dir = tmp_path / "ort-genai"
-        result = write_ort_genai_config(pkg, str(output_dir))
-        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
-        assert "vision_encoder" in compatibility["graph_contract"]
-
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
@@ -2095,51 +2015,6 @@ class TestExportForOrtGenai:
         # input_names mapping: genai internal name -> ONNX model input name
         assert speech["inputs"]["audio_embeds"] == "input_features"
         assert speech["inputs"]["attention_mask"] == "input_features_mask"
-
-    def test_glmasr_registry_gap_does_not_block_export(self, tmp_path):
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
-
-        @dataclasses.dataclass
-        class FakeAudio:
-            audio_token_id: int = 59260
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "glmasr"
-            vocab_size: int = 59264
-            hidden_size: int = 2048
-            num_hidden_layers: int = 28
-            num_attention_heads: int = 16
-            num_key_value_heads: int = 4
-            head_dim: int = 128
-            audio_token_id: int = 59260
-            audio: FakeAudio = dataclasses.field(default_factory=FakeAudio)
-
-        pkg = ModelPackage(
-            {
-                "decoder": _mock_model_with_inputs(
-                    ["inputs_embeds", "attention_mask", "position_ids"]
-                ),
-                "audio_encoder": _mock_model(
-                    inputs=["input_features", "input_features_mask"],
-                    outputs=["audio_features", "audio_feature_lengths"],
-                ),
-                "embedding": _mock_model(
-                    inputs=["input_ids", "audio_features"],
-                    outputs=["inputs_embeds"],
-                ),
-            },
-            config=FakeConfig(),
-        )
-
-        result = write_ort_genai_config(pkg, str(tmp_path))
-        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-        assert compatibility["model_type"] == "glmasr"
-        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
-        assert "does not register" in compatibility["warnings"][0]
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
@@ -3043,17 +2918,6 @@ class TestExportPackage:
         # ONNX path is in the manifest (single-component package)
         assert result["model"] == os.path.join(str(tmp_path), "model.onnx")
 
-    def test_mage_vl_runtime_gap_does_not_block_saving_onnx(self, tmp_path):
-        pkg = self._make_pkg()
-        pkg.config.model_type = "mage_vl"
-
-        with mock.patch.object(pkg, "save") as save:
-            result = export_package(pkg, str(tmp_path))
-
-        save.assert_called_once()
-        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
-
     def test_propagates_save_kwargs(self, tmp_path, monkeypatch):
         """external_data and progress_bar are forwarded to pkg.save."""
         from mobius.integrations.ort_genai.auto_export import export_package
@@ -3075,6 +2939,22 @@ class TestExportPackage:
 
         assert save_calls[0]["external_data"] == "safetensors"
         assert save_calls[0]["progress_bar"] is False
+
+    def test_streaming_package_can_transactionally_create_output(self, tmp_path):
+        from mobius.integrations.ort_genai.auto_export import export_package
+
+        pkg = self._make_pkg()
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        output = tmp_path / "output"
+
+        result = export_package(pkg, str(output), progress_bar=False)
+
+        assert (output / "model.onnx").is_file()
+        assert (output / "weight-loading-report.json").is_file()
+        assert result["genai_config"] == str(output / "genai_config.json")
 
     def test_propagates_genai_config_kwargs(self, tmp_path, monkeypatch):
         """The ep and context_length kwargs reach the generated genai_config.json."""
@@ -3740,52 +3620,8 @@ class TestGenericDecoderAbi:
         assert abi.cache_slots == 2
 
 
-def test_generic_decoder_runtime_compatibility_metadata(tmp_path):
-    result = write_ort_genai_config(
-        _make_fake_llm_pkg("unknown_architecture"),
-        str(tmp_path),
-        runtime_version="0.15.2",
-    )
-    with open(result["runtime_compatibility"], encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    assert metadata == {
-        "runtime": "onnxruntime-genai",
-        "model_type": "decoder",
-        "requested_version": "0.15.2",
-        "runtime_validation_status": "unvalidated",
-        "warnings": [],
-        "minimum_version": "0.14.0",
-        "tested_versions": ["0.15.2"],
-        "uses_main_only_state_groups": False,
-        "heterogeneous_state_manifest": (
-            "deferred: https://github.com/onnxruntime/mobius/issues/605"
-        ),
-        "graph_contract": {
-            "model": {
-                "inputs": [
-                    "input_ids",
-                    "attention_mask",
-                    "position_ids",
-                    "past_key_values.0.key",
-                    "past_key_values.0.value",
-                    "past_key_values.1.key",
-                    "past_key_values.1.value",
-                ],
-                "outputs": [
-                    "logits",
-                    "present.0.key",
-                    "present.0.value",
-                    "present.1.key",
-                    "present.1.value",
-                ],
-            }
-        },
-    }
-
-
-def test_heterogeneous_decoder_state_exports_with_specific_runtime_warning(tmp_path):
-    pkg = _make_fake_llm_pkg("unknown_architecture")
-    pkg["model"] = _mock_model(
+def test_heterogeneous_decoder_state_preserves_graph_contract():
+    decoder = _mock_model(
         inputs=[
             "input_ids",
             "cache_position",
@@ -3801,32 +3637,12 @@ def test_heterogeneous_decoder_state_exports_with_specific_runtime_warning(tmp_p
         ],
     )
 
-    result = write_ort_genai_config(pkg, str(tmp_path))
-    compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-
-    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
-    assert any("ssm_state" in warning for warning in compatibility["warnings"])
-    assert any("cache_position" in warning for warning in compatibility["warnings"])
-    assert "past_key_values.1.ssm_state" in compatibility["graph_contract"]["model"]["inputs"]
+    abi = _inspect_decoder_abi(decoder, model_type="decoder")
+    assert abi.cache_slots == 2
+    assert abi.inputs["cache_position"] == "cache_position"
 
 
-def test_lfm2_runtime_compatibility_is_pinned_to_released_probe(tmp_path):
-    path = _write_runtime_compatibility(
-        str(tmp_path), model_type="lfm2", runtime_version="0.15.2"
-    )
-    with open(path, encoding="utf-8") as handle:
-        metadata = json.load(handle)
-
-    assert metadata["minimum_version"] == "0.15.2"
-    assert metadata["tested_versions"] == ["0.15.2"]
-    old_path = _write_runtime_compatibility(
-        str(tmp_path), model_type="lfm2", runtime_version="0.15.1"
-    )
-    old_metadata = json.loads(Path(old_path).read_text())
-    assert old_metadata["runtime_validation_status"] == "unsupported-by-tested-runtime"
-
-
-def test_decoder_sidecar_preserves_type_and_matching_compatibility_metadata(tmp_path):
+def test_decoder_sidecar_preserves_model_type(tmp_path):
     pkg = _make_fake_llm_pkg("qwen2")
     pkg.config.num_nextn_predict_layers = 1
     pkg["mtp"] = _mock_model(inputs=["hidden_states"], outputs=["draft_logits"])
@@ -3834,12 +3650,7 @@ def test_decoder_sidecar_preserves_type_and_matching_compatibility_metadata(tmp_
     result = write_ort_genai_config(pkg, str(tmp_path))
     with open(result["genai_config"], encoding="utf-8") as handle:
         config = json.load(handle)
-    with open(result["runtime_compatibility"], encoding="utf-8") as handle:
-        compatibility = json.load(handle)
-
     assert config["model"]["type"] == "qwen2"
-    assert compatibility["model_type"] == config["model"]["type"]
-    assert compatibility["runtime_validation_status"] == "unvalidated"
     assert result["mtp_config"].endswith("mtp_config.json")
 
 
@@ -3868,15 +3679,9 @@ def test_attached_mtp_sidecar_emits_component_qualified_cache_contract(tmp_path)
         ),
     )
 
-    result = write_ort_genai_config(
-        pkg,
-        str(tmp_path),
-        runtime_version="0.15.2",
-    )
+    result = write_ort_genai_config(pkg, str(tmp_path))
     with open(result["mtp_config"], encoding="utf-8") as handle:
         mtp = json.load(handle)
-    with open(result["runtime_compatibility"], encoding="utf-8") as handle:
-        compatibility = json.load(handle)
 
     assert mtp["status"] == "runtime_unvalidated"
     assert mtp["model"]["filename"] == ".mobius-mtp/model.onnx"
@@ -3914,9 +3719,6 @@ def test_attached_mtp_sidecar_emits_component_qualified_cache_contract(tmp_path)
             ],
         },
     }
-    assert compatibility["runtime_validation_status"] == "unvalidated"
-    assert compatibility["tested_versions"] == ["0.15.2"]
-    assert compatibility["graph_contract"] is not None
 
 
 def test_gguf_mtp_count_overrides_architecture_config_default_zero(tmp_path):
@@ -4140,25 +3942,6 @@ def test_cuda_decoder_capture_tracks_graph_kv_cache_contract(
     cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
     assert config["search"]["past_present_share_buffer"] is share_buffer
     assert cuda_options["enable_cuda_graph"] == enable_cuda_graph
-
-
-@pytest.mark.parametrize("runtime_version", ["0.13.0", "unknown-development-build"])
-def test_generic_decoder_old_or_unknown_runtime_does_not_block_export(
-    tmp_path, runtime_version
-):
-    result = write_ort_genai_config(
-        _make_fake_llm_pkg("unknown_architecture"),
-        str(tmp_path),
-        runtime_version=runtime_version,
-    )
-    config = json.loads(Path(result["genai_config"]).read_text())
-    compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-    assert config["model"]["type"] == "decoder"
-    assert config["model"]["decoder"]["inputs"]["past_key_names"] == ("past_key_values.%d.key")
-    assert compatibility["runtime_validation_status"] in {
-        "unvalidated",
-        "unsupported-by-tested-runtime",
-    }
 
 
 def test_gpt2_separate_cache_graph_uses_generic_decoder(tmp_path):
@@ -4467,36 +4250,6 @@ class TestGemma4RealModel:
             str(tmp_path),
             revision=revision,
         )
-
-    def test_auto_export_keeps_mage_vl_runtime_gap_advisory(self, tmp_path):
-        pkg = _make_fake_llm_pkg("mage_vl")
-
-        with (
-            mock.patch("mobius.integrations.transformers.build", return_value=pkg),
-            mock.patch.object(pkg, "save") as save,
-            mock.patch(
-                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
-                return_value=[],
-            ),
-            mock.patch(
-                "transformers.AutoConfig.from_pretrained",
-                return_value=types.SimpleNamespace(
-                    model_type="mage_vl",
-                    bos_token_id=1,
-                    eos_token_id=2,
-                    pad_token_id=0,
-                ),
-            ),
-            mock.patch(
-                "mobius.integrations.ort_genai.auto_export._load_generation_config",
-                return_value=None,
-            ),
-        ):
-            result = auto_export("microsoft/Mage-VL", str(tmp_path))
-
-        save.assert_called_once()
-        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""

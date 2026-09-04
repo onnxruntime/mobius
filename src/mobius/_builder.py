@@ -25,6 +25,7 @@ from onnx_ir import tensor_adapters
 from onnxscript import nn
 
 from mobius._build_context import build_context
+from mobius._component_quantization import configure_component_quantization
 from mobius._configs import BaseModelConfig
 from mobius._execution_providers import ep_registry
 from mobius._flags import flags
@@ -143,7 +144,7 @@ def build_from_module(
         module: An ``onnxscript.nn.Module`` whose ``forward`` signature is
             compatible with *task*.
         config: Architecture configuration. Its ``dtype`` controls model
-            precision and its optional ``validate`` method runs before build.
+            precision and its ``validate`` method runs before build.
         task: Task name or :class:`ModelTask` instance.
         execution_provider: Target for EP-aware optimizations.
         trace_optimization: Log optimization diagnostics when true.
@@ -158,10 +159,11 @@ def build_from_module(
     if hasattr(config, "validate"):
         config.validate()
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
-    _cast_module_dtype(module, dtype)
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)
     resolved_task = get_task(task)
+    configure_component_quantization(module, config, resolved_task)
+    _cast_module_dtype(module, dtype)
     capabilities = ep_registry.require(execution_provider)
     with build_context(capabilities, dtype):
         package = resolved_task.build(module, config)

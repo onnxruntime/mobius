@@ -11,11 +11,16 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import (
+    is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
+)
 from mobius.components._activations import ACT2FN
 from mobius.components._common import Embedding, LayerNorm, Linear
 from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
+from mobius.models.base import effective_tie_word_embeddings
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -249,19 +254,54 @@ class BartForConditionalGeneration(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        if self.config.component_quantization is not None and any(
+            name.removeprefix("model.").startswith("shared.") and is_packed_quant_key(name)
+            for name in state_dict
+        ):
+            layouts = []
+            for component in ("encoder", "decoder"):
+                quantization = self.config.quantization_for(component)
+                layouts.append(
+                    (
+                        quantization.bits,
+                        quantization.group_size,
+                        quantization.sym,
+                    )
+                    if quantization is not None
+                    and quantization.quant_method != "none"
+                    and quantization.quantize_embeddings
+                    else None
+                )
+            if layouts[0] != layouts[1]:
+                raise ValueError(
+                    "BART shared packed embeddings require encoder and decoder "
+                    "components to use the same embedding quantization layout."
+                )
+
         new_state_dict = {}
         for name, tensor in state_dict.items():
             new_name = _rename_bart_weight(name)
             if new_name is not None:
                 new_state_dict[new_name] = tensor
 
-        # Shared embeddings
-        shared = new_state_dict.pop("shared.weight", None)
-        if shared is not None:
-            if "encoder.embed_tokens.weight" not in new_state_dict:
-                new_state_dict["encoder.embed_tokens.weight"] = shared
-            if "decoder.embed_tokens.weight" not in new_state_dict:
-                new_state_dict["decoder.embed_tokens.weight"] = shared
+        # Shared float weights and packed sidecars feed both component graphs.
+        for name, tensor in list(new_state_dict.items()):
+            if not name.startswith("shared."):
+                continue
+            suffix = name[len("shared.") :]
+            new_state_dict.setdefault(f"encoder.embed_tokens.{suffix}", tensor)
+            new_state_dict.setdefault(f"decoder.embed_tokens.{suffix}", tensor)
+            del new_state_dict[name]
+
+        if effective_tie_word_embeddings(self.config):
+            decoder_quantization = self.config.quantization_for("decoder")
+            materialize_split_tied_olive_lm_head(
+                new_state_dict,
+                embed_key="decoder.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                embedding_quantization=decoder_quantization,
+                head_quantization=decoder_quantization,
+            )
 
         # Tied lm_head
         if "decoder.lm_head.weight" not in new_state_dict:
@@ -294,11 +334,15 @@ def _rename_bart_weight(name: str) -> str | None:
     # Strip "model." prefix
     if name.startswith("model."):
         name = name[len("model.") :]
-    elif name == "lm_head.weight":
+    if name == "lm_head.weight":
         return "decoder.lm_head.weight"
+    if name.startswith("lm_head.") and is_packed_quant_key(name):
+        return f"decoder.{name}"
 
     if name == "shared.weight":
         return "shared.weight"
+    if name.startswith("shared.") and is_packed_quant_key(name):
+        return name
 
     for prefix in ("encoder.", "decoder."):
         if not name.startswith(prefix):

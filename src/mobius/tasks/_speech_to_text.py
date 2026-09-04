@@ -133,7 +133,7 @@ class SpeechToTextTask(ModelTask):
         encoder_hidden_states = builder.input(
             "encoder_hidden_states",
             dtype=config.dtype,
-            shape=[batch, encoder_seq_len, config.hidden_size],
+            shape=[batch, encoder_seq_len, config.encoder_output_size],
         )
         position_ids = builder.input(
             "position_ids",

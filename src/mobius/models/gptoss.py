@@ -175,12 +175,6 @@ def _reinterpret_mxfp4_scales_unchecked(scales: torch.Tensor) -> torch.Tensor:
     return scales.view(torch.float8_e8m0fnu)
 
 
-def _reinterpret_valid_mxfp4_scales(scales: torch.Tensor, scale_key: str) -> torch.Tensor:
-    """Validate and reinterpret raw E8M0 bytes without a numeric copy."""
-    _validate_mxfp4_scale_bytes(scales, scale_key)
-    return _reinterpret_mxfp4_scales_unchecked(scales)
-
-
 def _native_mxfp4_projection_specs(
     config: ArchitectureConfig,
 ) -> dict[str, dict[str, tuple[tuple[int, ...], str]]]:
@@ -213,7 +207,7 @@ def _native_mxfp4_projection_specs(
     }
 
 
-def _validate_native_mxfp4_state(
+def _validate_gptoss_mxfp4_state(
     state_dict: dict[str, torch.Tensor],
     config: ArchitectureConfig,
     mxfp4_blocks: dict[str, str],
@@ -291,17 +285,16 @@ def _validate_native_mxfp4_state(
         for key, (expected_shape, description) in tensor_specs.items():
             tensor = state_dict.get(key)
             if tensor is None:
-                raise ValueError(
-                    f"Native GPT-OSS MXFP4 QMoE requires {description} tensor {key!r}."
-                )
+                raise ValueError(f"GPT-OSS MXFP4 requires {description} tensor {key!r}.")
             if tuple(tensor.shape) != expected_shape:
                 raise ValueError(
                     f"GPT-OSS {description} {key!r} must have shape "
                     f"{expected_shape}, got {tuple(tensor.shape)}"
                 )
-            if not tensor.is_floating_point():
+            if tensor.dtype not in {torch.bfloat16, torch.float16, torch.float32}:
                 raise TypeError(
-                    f"GPT-OSS {description} {key!r} must be floating point, got {tensor.dtype}"
+                    f"GPT-OSS {description} {key!r} must be bfloat16, float16, "
+                    f"or float32, got {tensor.dtype}"
                 )
     return specs
 
@@ -483,9 +476,10 @@ class _GptOssMoELayer(nn.Module):
                 "fallback/runtime configuration."
             )
 
-        router_probs, _, normalize, _ = _realize_gate_and_get_qmoe_routing(
+        router_probs, _, normalize, output_scale = _realize_gate_and_get_qmoe_routing(
             op, self.gate, hidden_states
         )
+        assert output_scale == 1.0  # noqa: RUF069 - QMoE owns the unscaled router output
 
         return op.QMoE(
             hidden_states,
@@ -1003,6 +997,7 @@ class GPTOSSCausalLMModel(CausalLMModel):
     def __init__(self, config: ArchitectureConfig):
         nn.Module.__init__(self)
         self.config = config
+        self._dequantize_mxfp4_checkpoint = False
         self.model = _GptOssTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1022,9 +1017,11 @@ class GPTOSSCausalLMModel(CausalLMModel):
           ``down_proj.weight [hidden, inter]``
         - ``mlp.experts.down_proj_bias [N, hidden]``: split to per-expert ``down_proj.bias``
 
-        Native MXFP4 checkpoints keep expert ``_blocks`` and ``_scales`` packed.
-        Their E2M1 nibbles are losslessly rearranged for QMoE, while E8M0 scale
+        Native MXFP4 checkpoints keep expert ``_blocks`` and ``_scales`` packed:
+        their E2M1 nibbles are losslessly rearranged for QMoE, while E8M0 scale
         bytes are reinterpreted as FLOAT8E8M0 without numerical conversion.
+        The Transformers builder may instead explicitly mark a dense module for
+        eager MXFP4 dequantization when ``keep_quantized=False``.
         """
         native_mxfp4 = _is_native_mxfp4(self.config)
         mxfp4_blocks = {
@@ -1038,27 +1035,31 @@ class GPTOSSCausalLMModel(CausalLMModel):
             if key.endswith("_scales") and ".mlp.experts." in key
         }
         mxfp4_bases = set(mxfp4_blocks) | set(mxfp4_scales)
-        if mxfp4_bases and not native_mxfp4:
+        if mxfp4_bases and not native_mxfp4 and not self._dequantize_mxfp4_checkpoint:
             raise ValueError(
                 "GPT-OSS MXFP4 expert blocks were found, but the model does not "
-                "declare native MXFP4 quantization. A lossless dense fallback is "
-                "not available; load the checkpoint's quantization_config with "
-                "quant_method='mxfp4' and export com.microsoft::QMoE."
+                "declare native MXFP4 quantization and was not explicitly built "
+                "for dense MXFP4 dequantization. Rebuild through "
+                "build(..., keep_quantized=False) or `mobius build --dequantize` "
+                "so original-source classification can set the dense marker."
+            )
+
+        specs = None
+        if native_mxfp4 or self._dequantize_mxfp4_checkpoint:
+            # Both paths share one fail-closed preflight. It runs before any
+            # source pop, converter call, or destination allocation.
+            specs = _validate_gptoss_mxfp4_state(
+                state_dict,
+                self.config,
+                mxfp4_blocks,
+                mxfp4_scales,
             )
 
         native_weights: dict[str, torch.Tensor] = {}
         if native_mxfp4:
             num_experts = self.config.num_local_experts
             assert num_experts is not None
-            # Validate the complete checkpoint before popping a single source
-            # or allocating any repacked destination. A late bad layer must
-            # leave the caller's state dict byte-for-byte intact.
-            specs = _validate_native_mxfp4_state(
-                state_dict,
-                self.config,
-                mxfp4_blocks,
-                mxfp4_scales,
-            )
+            assert specs is not None
             for mlp_root in sorted(specs):
                 for projection, (_expected_block_shape, target) in specs[mlp_root].items():
                     base = f"{mlp_root}.experts.{projection}"
@@ -1091,6 +1092,18 @@ class GPTOSSCausalLMModel(CausalLMModel):
                 }
                 for source, target in bias_specs.items():
                     native_weights[target] = state_dict.pop(source)
+        elif self._dequantize_mxfp4_checkpoint:
+            assert specs is not None
+            from transformers.integrations.mxfp4 import _convert_moe_packed_tensors
+
+            for mlp_root in sorted(specs):
+                for projection in specs[mlp_root]:
+                    base = f"{mlp_root}.experts.{projection}"
+                    state_dict[base] = _convert_moe_packed_tensors(
+                        state_dict.pop(mxfp4_blocks[base]),
+                        state_dict.pop(mxfp4_scales[base]),
+                        dtype=torch.bfloat16,
+                    )
 
         # Split fused/stacked weights into per-expert tensors for the full
         # precision path. Native MXFP4 expert tensors use the QMoE names above.

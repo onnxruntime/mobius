@@ -59,6 +59,7 @@ from mobius._configs._base import (
     MllamaConfig,
     MMSConfig,
     MoonshineConfig,
+    MoonshineStreamingConfig,
     MuseGlimmerConfig,
     NanoChatConfig,
     NemotronHConfig,
@@ -92,7 +93,11 @@ from mobius._configs._base import (
     _shallow_fields,
     _shared_expert_size,
 )
-from mobius._configs._quantization import QuantizationConfig, QuantizedWeightFormat
+from mobius._configs._quantization import (
+    QuantizationConfig,
+    QuantizationOverride,
+    QuantizedWeightFormat,
+)
 from mobius._configs._sub_configs import (
     AudioConfig,
     CodecDecoderConfig,
@@ -149,6 +154,7 @@ __all__ = [
     "MiniMaxConfig",
     "MMSConfig",
     "MoonshineConfig",
+    "MoonshineStreamingConfig",
     "MuseGlimmerConfig",
     "NanoChatConfig",
     "NemotronParseConfig",
@@ -158,6 +164,7 @@ __all__ = [
     "QuantizationConfig",
     "QuantizedWeightFormat",
     "Qwen4ExpConfig",
+    "QuantizationOverride",
     "Qwen35MtpConfig",
     "RoPEConfig",
     "Sam2Config",

@@ -69,6 +69,28 @@ _SAFETENSORS_TO_IR_DTYPE = {
     "F32": ir.DataType.FLOAT,
     "F8_E4M3": ir.DataType.FLOAT8E4M3FN,
 }
+_TORCH_TO_SAFETENSORS_DTYPE = {
+    torch.bfloat16: "BF16",
+    torch.bool: "BOOL",
+    torch.complex64: "C64",
+    torch.float16: "F16",
+    torch.float32: "F32",
+    torch.float64: "F64",
+    torch.float8_e4m3fn: "F8_E4M3",
+    torch.float8_e4m3fnuz: "F8_E4M3FNUZ",
+    torch.float8_e5m2: "F8_E5M2",
+    torch.float8_e5m2fnuz: "F8_E5M2FNUZ",
+    torch.int8: "I8",
+    torch.int16: "I16",
+    torch.int32: "I32",
+    torch.int64: "I64",
+    torch.uint8: "U8",
+    torch.uint16: "U16",
+    torch.uint32: "U32",
+    torch.uint64: "U64",
+}
+if (torch_e8m0_dtype := getattr(torch, "float8_e8m0fnu", None)) is not None:
+    _TORCH_TO_SAFETENSORS_DTYPE[torch_e8m0_dtype] = "F8_E8M0"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,9 +114,11 @@ class StreamingExpertBankSource:
 class StreamingTransformedWeightSource:
     """One source tensor transformed lazily into a differently laid-out target.
 
-    The planner declares the exact source header contract. ``validate_tensor``
-    may cheaply inspect source values during preflight and is repeated on the
-    bytes loaded immediately before ``transform``. The transform runs when ONNX
+    The planner declares exact source and target metadata contracts. The target
+    contract is checked against the graph initializer before any binding or
+    serialization without executing ``transform``. ``validate_tensor`` may
+    cheaply inspect source values during preflight and is repeated on the bytes
+    loaded immediately before ``transform``. The transform runs when ONNX
     external data is serialized, so only one source tensor and one final
     destination are live at a time.
     """
@@ -102,6 +126,8 @@ class StreamingTransformedWeightSource:
     source_name: str
     expected_source_shape: tuple[int, ...]
     expected_source_dtype: str
+    expected_target_shape: tuple[int, ...]
+    expected_target_dtype: ir.DataType
     transform: Callable[[torch.Tensor, str], torch.Tensor]
     validate_tensor: Callable[[torch.Tensor, str], None] | None = None
     scratch_bytes: int = 0
@@ -109,7 +135,13 @@ class StreamingTransformedWeightSource:
 
 @dataclasses.dataclass(frozen=True)
 class StreamingWeightPlan:
-    """Complete fail-closed source classification for a streaming export."""
+    """Complete fail-closed source classification for a streaming export.
+
+    ``constants`` maps checkpoint sources to values already embedded in the
+    graph and validates rather than assigns them. ``target_constants`` maps
+    graph initializer names to synthesized values that have no checkpoint
+    source and must be assigned by the loader.
+    """
 
     targets: Mapping[
         str,
@@ -563,7 +595,13 @@ def _shard_key_index(paths: list[str]) -> dict[str, tuple[str, list[int], str]]:
 
 
 def _assign_lazy_from_shard(
-    initializer: ir.Value, shard_path: str, key: str, name: str
+    initializer: ir.Value,
+    shard_path: str,
+    key: str,
+    name: str,
+    *,
+    expected_source_shape: list[int],
+    expected_source_dtype: str,
 ) -> None:
     """Assign an initializer a LazyTensor that reads its weight from a shard.
 
@@ -577,10 +615,21 @@ def _assign_lazy_from_shard(
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
 
     def tensor_func(
-        p: str = shard_path, k: str = key, dt=target_dtype, n: str = name
+        p: str = shard_path,
+        k: str = key,
+        dt=target_dtype,
+        n: str = name,
+        expected_shape: list[int] = expected_source_shape,
+        expected_dtype: str = expected_source_dtype,
     ) -> tensor_adapters.TorchTensor:
         with safe_open(p, framework="pt") as handle:
             tensor = handle.get_tensor(k)
+        _validate_materialized_tensor_metadata(
+            tensor,
+            k,
+            expected_shape=expected_shape,
+            expected_dtype=expected_dtype,
+        )
         if tensor.dtype != dt:
             tensor = tensor.to(dt)
         return tensor_adapters.TorchTensor(tensor, name=n)
@@ -593,21 +642,52 @@ def _assign_lazy_from_shard(
     )
 
 
+def _validate_materialized_tensor_metadata(
+    tensor: torch.Tensor,
+    source_name: str,
+    *,
+    expected_shape: list[int],
+    expected_dtype: str,
+) -> None:
+    """Recheck a lazily loaded tensor against the header indexed at planning time."""
+    actual_shape = list(tensor.shape)
+    actual_dtype = _TORCH_TO_SAFETENSORS_DTYPE.get(tensor.dtype)
+    if actual_shape != expected_shape or actual_dtype != expected_dtype:
+        raise ValueError(
+            f"Safetensors source '{source_name}' changed after indexing: expected "
+            f"{expected_dtype}/{expected_shape}, loaded {actual_dtype or tensor.dtype}/"
+            f"{actual_shape}"
+        )
+
+
+def _load_indexed_tensor(
+    source_name: str,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+) -> torch.Tensor:
+    """Load one tensor and verify that its current shard matches the indexed header."""
+    source_path, source_shape, source_dtype = key_index[source_name]
+    with safe_open(source_path, framework="pt") as handle:
+        tensor = handle.get_tensor(source_name)
+    _validate_materialized_tensor_metadata(
+        tensor,
+        source_name,
+        expected_shape=source_shape,
+        expected_dtype=source_dtype,
+    )
+    return tensor
+
+
 def _materialize_preprocessed_source(
     source: StreamingWeightSource,
     key_index: Mapping[str, tuple[str, list[int], str]],
     target_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Read and reconstruct one classified source tensor."""
-    source_path, source_shape, source_dtype = key_index[source.source_name]
-    del source_shape
-    with safe_open(source_path, framework="pt") as handle:
-        tensor = handle.get_tensor(source.source_name)
+    source_dtype = key_index[source.source_name][2]
+    tensor = _load_indexed_tensor(source.source_name, key_index)
     if source.mode == "fp8_block_128":
         assert source.scale_name is not None
-        scale_path = key_index[source.scale_name][0]
-        with safe_open(scale_path, framework="pt") as handle:
-            scale = handle.get_tensor(source.scale_name)
+        scale = _load_indexed_tensor(source.scale_name, key_index)
         tensor = _dequantize_fp8_tensor(
             tensor,
             scale,
@@ -622,9 +702,7 @@ def _materialize_preprocessed_source(
                 f"but has dtype {source_dtype}"
             )
         assert source.scale_name is not None
-        scale_path = key_index[source.scale_name][0]
-        with safe_open(scale_path, framework="pt") as handle:
-            scale = handle.get_tensor(source.scale_name)
+        scale = _load_indexed_tensor(source.scale_name, key_index)
         actual_scale = float(scale.to(torch.float32).item())
         if source.expected_scale is None or actual_scale != source.expected_scale:
             raise ValueError(
@@ -683,18 +761,15 @@ def _assign_lazy_transformed(
     assert onnx_dtype is not None
     assert initializer.shape is not None
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
-    target_shape = tuple(cast(int, dim) for dim in initializer.shape)
-    source_path = key_index[source.source_name][0]
+    target_shape = _validate_transformed_target(initializer, source, target_name)
 
     def tensor_func(
         source_spec: StreamingTransformedWeightSource = source,
-        path: str = source_path,
         dtype: torch.dtype = target_dtype,
         shape: tuple[int, ...] = target_shape,
         name: str = target_name,
     ) -> tensor_adapters.TorchTensor:
-        with safe_open(path, framework="pt") as handle:
-            source_tensor = handle.get_tensor(source_spec.source_name)
+        source_tensor = _load_indexed_tensor(source_spec.source_name, key_index)
         if source_spec.validate_tensor is not None:
             source_spec.validate_tensor(source_tensor, source_spec.source_name)
         transformed = source_spec.transform(source_tensor, source_spec.source_name)
@@ -717,6 +792,30 @@ def _assign_lazy_transformed(
         shape=ir.Shape(target_shape),
         name=target_name,
     )
+
+
+def _validate_transformed_target(
+    initializer: ir.Value,
+    source: StreamingTransformedWeightSource,
+    target_name: str,
+) -> tuple[int, ...]:
+    """Validate a transformed source's declared graph target contract."""
+    assert initializer.dtype is not None
+    assert initializer.shape is not None
+    target_shape = tuple(cast(int, dim) for dim in initializer.shape)
+    if target_shape != source.expected_target_shape:
+        raise ValueError(
+            f"Streaming transform for '{target_name}' declares target shape "
+            f"{source.expected_target_shape}, but the graph initializer has "
+            f"shape {target_shape}"
+        )
+    if initializer.dtype != source.expected_target_dtype:
+        raise TypeError(
+            f"Streaming transform for '{target_name}' declares target dtype "
+            f"{source.expected_target_dtype}, but the graph initializer has "
+            f"dtype {initializer.dtype}"
+        )
+    return target_shape
 
 
 def _assign_lazy_expert_bank(
@@ -887,6 +986,7 @@ def stream_preprocessed_safetensors_to_model(
         expected_shape = [int(dim) for dim in initializer.shape]
         target_bytes = (math.prod(expected_shape) * initializer.dtype.bitwidth + 7) // 8
         if isinstance(source, StreamingTransformedWeightSource):
+            _validate_transformed_target(initializer, source, target_name)
             if source.source_name not in key_index:
                 raise ValueError(f"Streaming source '{source.source_name}' does not exist")
             source_path, source_shape, source_dtype = key_index[source.source_name]
@@ -1128,7 +1228,14 @@ def _qdq_source_initializer(
         type=ir.TensorType(dtype),
         shape=ir.Shape(shape),
     )
-    _assign_lazy_from_shard(value, path, source_name, source_name)
+    _assign_lazy_from_shard(
+        value,
+        path,
+        source_name,
+        source_name,
+        expected_source_shape=shape,
+        expected_source_dtype=safetensors_dtype,
+    )
     graph.register_initializer(value)
     return value
 
@@ -1700,7 +1807,14 @@ def stream_qdq_safetensors_to_model(
                         largest_source_cast_overlap_bytes,
                         source_bytes + target_bytes,
                     )
-                _assign_lazy_from_shard(target, path, source.source_name, target_name)
+                _assign_lazy_from_shard(
+                    target,
+                    path,
+                    source.source_name,
+                    target_name,
+                    expected_source_shape=shape,
+                    expected_source_dtype=source_dtype,
+                )
                 consumed.add(source.source_name)
                 assigned.add(target_name)
                 continue
@@ -1930,7 +2044,7 @@ def stream_safetensors_to_model(
         if located is None:
             missing.append(name)
             continue
-        shard_path, shard_shape, _shard_dtype = located
+        shard_path, shard_shape, shard_dtype = located
         if initializer.shape is not None:
             expected = [int(d) for d in initializer.shape]
             if expected != list(shard_shape):
@@ -1938,7 +2052,14 @@ def stream_safetensors_to_model(
                     f"Weight shape mismatch for '{name}': model expects "
                     f"{expected}, checkpoint has {list(shard_shape)}"
                 )
-        _assign_lazy_from_shard(initializer, shard_path, name, name)
+        _assign_lazy_from_shard(
+            initializer,
+            shard_path,
+            name,
+            name,
+            expected_source_shape=shard_shape,
+            expected_source_dtype=shard_dtype,
+        )
         assigned.add(name)
 
     if missing and require_passthrough:

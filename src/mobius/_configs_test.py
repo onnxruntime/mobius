@@ -18,6 +18,7 @@ from mobius._configs import (
     GlmAsrConfig,
     MuseGlimmerConfig,
     QuantizationConfig,
+    QuantizationOverride,
     QuantizedWeightFormat,
     VisionConfig,
     _extract_audio_config,
@@ -1081,6 +1082,150 @@ class TestQuantizationConfig:
         assert qc.quantize_embeddings is True
         assert qc.quantize_lm_head is True
         assert qc.quantize_vision is True
+
+    def test_from_transformers_olive_module_plan(self):
+        hf = SimpleNamespace(
+            quantization_config={
+                "quant_method": "olive",
+                "bits": 4,
+                "group_size": 32,
+                "symmetric": False,
+                "modules_to_not_convert": ["model.embed_tokens"],
+                "overrides": {
+                    "model.vision_tower": {
+                        "bits": 8,
+                        "group_size": 64,
+                        "symmetric": True,
+                    }
+                },
+            }
+        )
+
+        qc = QuantizationConfig.from_transformers(hf)
+
+        assert qc is not None
+        assert qc.modules_to_not_convert == ("model.embed_tokens",)
+        assert qc.has_module_plan is True
+        vision = qc.for_source_paths(
+            ("model.vision_tower",),
+            component="vision_encoder",
+        )
+        assert vision is not None
+        assert (vision.bits, vision.group_size, vision.sym) == (8, 64, True)
+        assert vision.modules_to_not_convert is None
+        assert vision.overrides == {}
+
+    def test_module_plan_keeps_excluded_component_float(self):
+        qc = QuantizationConfig(
+            quant_method="olive",
+            modules_to_not_convert=("model.audio_tower",),
+        )
+
+        assert (
+            qc.for_source_paths(
+                ("model.audio_tower",),
+                component="audio_encoder",
+            )
+            is None
+        )
+
+    def test_module_plan_rejects_partial_component_override(self):
+        qc = QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="olive",
+            overrides={"model.audio_tower.layers.0.q_proj": QuantizationOverride(bits=8)},
+        )
+
+        with pytest.raises(ValueError, match="mixes the default layout"):
+            qc.for_source_paths(
+                ("model.audio_tower",),
+                component="audio_encoder",
+            )
+
+    def test_architecture_config_parses_explicit_component_quantization(self):
+        text = SimpleNamespace(
+            model_type="llama",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            hidden_act="silu",
+            max_position_embeddings=128,
+        )
+        parent = SimpleNamespace(
+            model_type="composite",
+            component_quantization={
+                "text": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                },
+                "vision": {
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 64,
+                },
+                "audio": {
+                    "quant_method": "gptq",
+                    "bits": 2,
+                    "group_size": 16,
+                },
+            },
+        )
+
+        config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+
+        assert config.component_quantization is not None
+        assert config.quantization_for("decoder").bits == 4
+        assert config.quantization_for("vision_encoder").bits == 8
+        assert config.quantization_for("audio_encoder").bits == 2
+        assert config.quantization is config.quantization_for("decoder")
+
+    def test_architecture_config_parses_nested_component_quantization(self):
+        text = SimpleNamespace(
+            model_type="llama",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            hidden_act="silu",
+            max_position_embeddings=128,
+            quantization_config={
+                "quant_method": "olive",
+                "bits": 4,
+                "group_size": 32,
+            },
+        )
+        parent = SimpleNamespace(
+            model_type="composite",
+            vision_config=SimpleNamespace(
+                quantization_config={
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 64,
+                }
+            ),
+            audio_config=SimpleNamespace(
+                quantization_config={
+                    "quant_method": "olive",
+                    "bits": 2,
+                    "group_size": 16,
+                }
+            ),
+        )
+
+        config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+
+        assert config.component_quantization is not None
+        assert config.quantization_for("decoder").bits == 4
+        assert config.quantization_for("embedding").bits == 4
+        assert config.quantization_for("vision_encoder").bits == 8
+        assert config.quantization_for("audio_encoder").bits == 2
 
     def test_quantize_component_flags_default_false(self):
         qc = QuantizationConfig()

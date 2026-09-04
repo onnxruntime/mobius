@@ -29,9 +29,10 @@ import shutil
 import tempfile
 import threading
 from collections import UserDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -41,7 +42,6 @@ import torch
 import tqdm
 
 from mobius._export_report import ComponentExportReport
-from mobius._ir_utils import iter_graph_tensor_dtypes
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.adapters import (
     AdapterArtifact,
@@ -202,24 +202,67 @@ def _validate_streaming_safetensors_destination(
     external_data: str,
     component_layout: _ComponentSaveLayout,
 ) -> None:
-    """Reject model output directories that could overwrite lazy source shards."""
-    if external_data != "safetensors":
-        return
+    """Defensively reject known aliases to files read by a streaming package.
 
+    Streaming saves publish a fresh staged directory without replacement; that
+    transaction, rather than this pathname inventory, protects the complete
+    artifact set. These direct checks retain clearer diagnostics for known
+    source-directory, hard-link, and symlink collisions. They are not a claim
+    of complete TOCTOU protection for ordinary non-streaming saves.
+    """
     output_directories: set[Path] = set()
+    output_files: set[Path] = set()
     source_directories: set[Path] = set()
     source_files: set[Path] = set()
     current_package = package
     current_directory = Path(directory)
     current_layout = component_layout
     while True:
-        output_directories.update(
+        component_directories = {
             _component_output_directory(
                 current_directory,
                 name,
                 uses_subdirectories=current_layout.uses_subdirectories,
-            ).resolve()
+            )
             for name, _ in current_layout.components
+        }
+        output_directories.update(path.resolve() for path in component_directories)
+        for output_directory in component_directories:
+            output_files.add(output_directory / "model.onnx")
+            if external_data == "onnx":
+                output_files.add(output_directory / "model.onnx.data")
+            else:
+                output_files.update(
+                    {
+                        output_directory / "model.safetensors",
+                        output_directory / "model.safetensors.index.json",
+                    }
+                )
+            if output_directory.is_dir():
+                for existing in output_directory.iterdir():
+                    name = existing.name
+                    if external_data == "onnx" and (
+                        name == "model.onnx.data"
+                        or (name.startswith("model.onnx-") and name.endswith(".data"))
+                    ):
+                        output_files.add(existing)
+                    elif external_data == "safetensors" and (
+                        name == "model.safetensors"
+                        or name == "model.safetensors.index.json"
+                        or (name.startswith("model-") and name.endswith(".safetensors"))
+                    ):
+                        output_files.add(existing)
+
+        # These package control files are written, replaced, or removed by
+        # save() at the package root rather than a component directory.
+        output_files.update(
+            current_directory / name
+            for name in (
+                _PACKAGE_MANIFEST,
+                _QUANTIZATION_REPORT,
+                _EXPORT_REPORT,
+                _WEIGHT_LOADING_REPORT,
+            )
         )
 
         source_directories.update(
@@ -237,34 +280,32 @@ def _validate_streaming_safetensors_destination(
         # MTP sidecars are always saved in full by the recursive save call.
         current_layout = _select_component_save_layout(current_package, None)
 
-    collisions = output_directories & source_directories
-    if collisions:
-        collision = min(collisions, key=str)
-        raise ValueError(
-            "A native streaming package cannot save safetensors external data "
-            f"into source checkpoint directory {str(collision)!r}: output shards "
-            "could overwrite weights that are still read lazily. Choose a separate "
-            "output directory."
-        )
+    if external_data == "safetensors":
+        collisions = output_directories & source_directories
+        if collisions:
+            collision = min(collisions, key=str)
+            raise ValueError(
+                "A native streaming package cannot save safetensors external data "
+                f"into source checkpoint directory {str(collision)!r}: output shards "
+                "could overwrite weights that are still read lazily. Choose a separate "
+                "output directory."
+            )
 
-    for output_directory in output_directories:
-        if not output_directory.is_dir():
+    for output_file in sorted(output_files, key=str):
+        if not os.path.lexists(output_file):
             continue
-        for output_file in output_directory.iterdir():
-            if not output_file.is_file() or output_file.is_symlink():
-                continue
-            for source_file in source_files:
-                try:
-                    aliases_source = os.path.samefile(output_file, source_file)
-                except FileNotFoundError:
-                    aliases_source = False
-                if aliases_source:
-                    raise ValueError(
-                        "A native streaming package cannot overwrite an output file "
-                        f"{str(output_file)!r} that is hard-linked to lazy source shard "
-                        f"{str(source_file)!r}. Remove the hard link or choose a new "
-                        "empty output directory."
-                    )
+        for source_file in source_files:
+            try:
+                aliases_source = os.path.samefile(output_file, source_file)
+            except FileNotFoundError:
+                aliases_source = False
+            if aliases_source:
+                raise ValueError(
+                    "A native streaming package cannot overwrite output file "
+                    f"{str(output_file)!r} because it aliases lazy source file "
+                    f"{str(source_file)!r} through the same path, a hard link, or "
+                    "a symlink. Remove the alias or choose a separate output path."
+                )
 
 
 def _validate_output_directory(
@@ -442,9 +483,29 @@ def _adapter_source_file(artifact: AdapterArtifact) -> str:
 
 def _save_safetensors(model: ir.Model, path: str, **kwargs: Any) -> None:
     """Save safetensors with the spelling required by its zero-copy writer."""
-    contains_e8m0 = any(
-        dtype == ir.DataType.FLOAT8E8M0 for dtype in iter_graph_tensor_dtypes(model.graph)
-    )
+    contains_e8m0 = False
+    for graph in chain((model.graph,), model.graph.subgraphs()):
+        # onnx-ir externalizes graph values and initializers; tensor-valued
+        # attributes remain embedded and intentionally are not part of this scan.
+        values = chain(
+            graph.inputs,
+            graph.outputs,
+            graph.initializers.values(),
+            chain.from_iterable(chain(node.inputs, node.outputs) for node in graph),
+        )
+        if any(
+            value is not None
+            and (
+                value.dtype == ir.DataType.FLOAT8E8M0
+                or (
+                    value.const_value is not None
+                    and value.const_value.dtype == ir.DataType.FLOAT8E8M0
+                )
+            )
+            for value in values
+        ):
+            contains_e8m0 = True
+            break
     if not contains_e8m0:
         ir.save_safetensors(model, path, **kwargs)
         return
@@ -555,6 +616,24 @@ class ModelPackage(UserDict[str, ir.Model]):
                     f"{artifact.name!r}"
                 )
             self.add_adapter_artifact(artifact)
+
+    def register_lazy_source_artifacts(
+        self,
+        *,
+        files: Iterable[str | os.PathLike[str]] = (),
+        directories: Iterable[str | os.PathLike[str]] = (),
+    ) -> None:
+        """Register local artifacts that lazy tensors may read during save."""
+
+        def resolved(paths: Iterable[str | os.PathLike[str]]) -> set[Path]:
+            return {Path(path).expanduser().resolve() for path in paths}
+
+        self._native_streaming_source_files = frozenset(
+            set(self._native_streaming_source_files) | resolved(files)
+        )
+        self._native_streaming_source_directories = frozenset(
+            set(self._native_streaming_source_directories) | resolved(directories)
+        )
 
     def __repr__(self) -> str:
         names = ", ".join(repr(k) for k in self.data)
@@ -674,12 +753,23 @@ class ModelPackage(UserDict[str, ir.Model]):
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
         reuse_plan = getattr(self, "gguf_reuse_plan", None)
-        if self.export_report is not None and _atomic_export_report and reuse_plan is None:
+        streaming_external_data = False
+        current_package = self
+        while True:
+            report = current_package.weight_loading_report
+            if report is not None and report.get("streaming_external_data") is True:
+                streaming_external_data = True
+                break
+            if current_package.mtp_head is None:
+                break
+            current_package = current_package.mtp_head
+        if (
+            streaming_external_data or (self.export_report is not None and reuse_plan is None)
+        ) and _atomic_export_report:
             destination = os.path.abspath(directory)
             if os.path.lexists(destination):
                 raise FileExistsError(
-                    "Component-report package destination already exists; refusing "
-                    "non-atomic replacement."
+                    "Transactional package destination already exists; refusing replacement."
                 )
             parent = os.path.dirname(destination)
             os.makedirs(parent, exist_ok=True)
@@ -879,6 +969,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                 check_weights=check_weights,
                 include_policy_components=include_policy_components,
                 include_adapter_artifacts=include_adapter_artifacts,
+                _atomic_export_report=False,
             )
             _write_mtp_manifest(directory, sidecar_name)
         else:

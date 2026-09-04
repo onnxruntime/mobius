@@ -115,6 +115,8 @@ class GatedDeltaNet(nn.Module):
             never quantized regardless of this argument.
     """
 
+    component_quantization_excluded_methods: frozenset[str] = frozenset()
+
     def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
         super().__init__()
         if linear_class is None:

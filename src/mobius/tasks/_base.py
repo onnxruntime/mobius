@@ -14,7 +14,6 @@ from onnxscript import GraphBuilder, nn
 import mobius
 from mobius._configs import BaseModelConfig
 from mobius._constants import OPSET_VERSION
-from mobius._ir_utils import minimum_ir_version
 from mobius._model_package import ModelPackage
 
 
@@ -125,7 +124,7 @@ def _make_graph(
 
 def _make_model(graph: ir.Graph) -> ir.Model:
     """Create an ``ir.Model`` with standard producer metadata."""
-    model = ir.Model(graph, ir_version=minimum_ir_version(graph))
+    model = ir.Model(graph, ir_version=12)
     model.producer_name = "mobius"
     model.producer_version = mobius.__version__
     return model

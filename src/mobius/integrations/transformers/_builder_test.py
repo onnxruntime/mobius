@@ -12,7 +12,11 @@ import onnx_ir as ir
 import pytest
 from onnxscript import nn
 
-from mobius._configs import QuantizationConfig, QuantizedWeightFormat
+from mobius._configs import (
+    QuantizationConfig,
+    QuantizationOverride,
+    QuantizedWeightFormat,
+)
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.integrations._block_quant import BlockQuantScheme
@@ -44,7 +48,10 @@ def _native_gptoss_config(*, dtype=ir.DataType.FLOAT16):
     )
 
 
-def test_native_gptoss_selects_streaming_before_eager_loader(monkeypatch) -> None:
+@pytest.mark.parametrize("local_checkpoint", [False, True], ids=["model-id", "local-config"])
+def test_native_gptoss_selects_streaming_before_eager_loader(
+    monkeypatch, tmp_path, local_checkpoint
+) -> None:
     from mobius.integrations.transformers import _gptoss_weights
 
     hf_config = type("HFConfig", (), {"model_type": "gpt_oss"})()
@@ -72,8 +79,9 @@ def test_native_gptoss_selects_streaming_before_eager_loader(monkeypatch) -> Non
     monkeypatch.setattr(transformers_builder, "_download_weights", eager)
     monkeypatch.setattr(_gptoss_weights, "stream_gptoss_mxfp4_safetensors_to_package", stream)
 
+    model_id = str(tmp_path) if local_checkpoint else "openai/gpt-oss-120b"
     result = transformers_builder.build_transformers_model(
-        "openai/gpt-oss-120b",
+        model_id,
         revision="immutable",
         execution_provider="cuda",
     )
@@ -82,10 +90,87 @@ def test_native_gptoss_selects_streaming_before_eager_loader(monkeypatch) -> Non
     eager.assert_not_called()
     stream.assert_called_once_with(
         package,
-        "openai/gpt-oss-120b",
+        model_id,
         config,
         revision="immutable",
     )
+
+
+def test_gptoss_dequantize_builds_dense_and_uses_eager_preprocessing(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from mobius.integrations.transformers import _gptoss_weights
+
+    hf_config = type("HFConfig", (), {"model_type": "gpt_oss"})()
+    source_config = _native_gptoss_config()
+    package = ModelPackage(
+        {"model": ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)}
+    )
+    built_configs = []
+    module_instances = []
+    preprocess_inputs = []
+
+    class DenseGPTOSSModule(_DummyModule):
+        def __init__(self, config):
+            super().__init__(config)
+            module_instances.append(self)
+
+        def preprocess_weights(self, state_dict):
+            preprocess_inputs.append(state_dict)
+            return {}
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            DenseGPTOSSModule,
+            "text-generation",
+            "gpt_oss",
+        ),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: source_config,
+    )
+
+    def build_dense(_module, config, *args, **kwargs):
+        built_configs.append((config, kwargs["execution_provider"]))
+        return package
+
+    monkeypatch.setattr(transformers_builder, "build_from_module", build_dense)
+    checkpoint_state = {"packed": object()}
+    eager = mock.Mock(return_value=checkpoint_state)
+    stream = mock.Mock(side_effect=AssertionError("dense export must not stream native QMoE"))
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+    monkeypatch.setattr(
+        _gptoss_weights,
+        "stream_gptoss_mxfp4_safetensors_to_package",
+        stream,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+
+    result = transformers_builder.build_transformers_model(
+        str(checkpoint),
+        keep_quantized=False,
+    )
+
+    assert result is package
+    assert built_configs[0][0].quantization is None
+    assert built_configs[0][1] == "default"
+    assert module_instances[0].config.quantization is None
+    assert module_instances[0]._dequantize_mxfp4_checkpoint is True
+    assert preprocess_inputs == [checkpoint_state]
+    eager.assert_called_once_with(str(checkpoint), revision=None)
+    stream.assert_not_called()
+    assert package["model"].graph.name == "gpt_oss/model"
+    assert "can require substantial host memory" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -360,6 +445,52 @@ def test_transformers_config_forwards_only_explicit_revision(monkeypatch, revisi
     assert calls == [("unsloth/Qwen3.8-Flash-Next-FP8", expected_kwargs)]
 
 
+def test_strip_to_text_only_drops_component_quantization() -> None:
+    decoder = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+    )
+    config = make_config(
+        component_quantization={
+            "decoder": decoder,
+            "vision_encoder": decoder,
+        }
+    )
+
+    stripped = transformers_builder._strip_to_text_only(config, "qwen2")
+
+    assert stripped.component_quantization is None
+    assert stripped.quantization is decoder
+
+
+def test_strip_to_text_only_resolves_decoder_module_plan() -> None:
+    decoder = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        overrides={"model.language_model": QuantizationOverride(bits=8, group_size=32)},
+    )
+    config = make_config(
+        quantization=decoder,
+        component_quantization={"decoder": decoder},
+    )
+
+    stripped = transformers_builder._strip_to_text_only(
+        config,
+        "qwen2",
+        decoder_source_paths=(
+            "model.language_model.layers",
+            "model.language_model.norm",
+        ),
+    )
+
+    assert stripped.component_quantization is None
+    assert stripped.quantization is not None
+    assert (stripped.quantization.bits, stripped.quantization.group_size) == (8, 32)
+    assert stripped.quantization.overrides == {}
+
+
 def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
     hf_config = type("HFConfig", (), {"model_type": "qwen2"})()
     config = make_config(model_type="qwen2")
@@ -556,6 +687,85 @@ def test_qwen4_multimodal_build_streams_entire_package_without_eager_loader(
     assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
         "immutable"
     }
+
+
+def test_qwen4_affine_component_plan_fails_before_weight_loading(
+    monkeypatch,
+) -> None:
+    text_config = type("TextConfig", (), {"model_type": "qwen4_exp_text"})()
+    parent_config = type(
+        "Qwen4ExpParent",
+        (),
+        {
+            "model_type": "qwen4_exp",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": text_config,
+            "vision_config": object(),
+            "quantization_config": None,
+        },
+    )()
+    decoder_quantization = QuantizationConfig(
+        bits=4,
+        group_size=32,
+        quant_method="olive",
+    )
+    config = make_config(
+        model_type="qwen4_exp",
+        quantization=decoder_quantization,
+        component_quantization={"decoder": decoder_quantization},
+    )
+    package = ModelPackage(
+        {
+            name: ir.Model(ir.Graph([], [], nodes=[], name=name), ir_version=11)
+            for name in ("decoder", "vision_encoder", "embedding")
+        },
+        config=config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (parent_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (text_config, parent_config, "qwen4_exp"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            _DummyModule,
+            "qwen4-exp-vision-language",
+            "qwen4_exp",
+        ),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        lambda *args, **kwargs: package,
+    )
+    download = mock.Mock()
+    monkeypatch.setattr(transformers_builder, "_download_weights", download)
+
+    with (
+        mock.patch(
+            "mobius.integrations.transformers._qwen4_exp_weights."
+            "stream_qwen4_exp_safetensors_to_package"
+        ) as stream,
+        pytest.raises(NotImplementedError, match="packed expert"),
+    ):
+        transformers_builder.build_transformers_model(
+            "Qwen/Qwen3.8-Flash-Next",
+        )
+
+    stream.assert_not_called()
+    download.assert_not_called()
 
 
 def test_transformers_build_routes_compressed_tensors_to_streaming_loader(

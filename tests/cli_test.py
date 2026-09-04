@@ -347,6 +347,125 @@ class TestCLIBuild:
                 ]
             )
 
+    def test_local_config_delegates_to_shared_transformers_builder(self, tmp_path):
+        from mobius._model_package import ModelPackage
+
+        hf_config = SimpleNamespace(model_type="qwen2")
+        output_dir = tmp_path / "output"
+
+        with (
+            mock.patch(
+                "mobius.integrations.transformers._builder._load_transformers_config",
+                return_value=(hf_config, False),
+            ),
+            mock.patch(
+                "mobius.__main__.build",
+                return_value=ModelPackage({}),
+            ) as build_model,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(output_dir),
+                    "--no-weights",
+                ]
+            )
+
+        build_model.assert_called_once()
+        assert build_model.call_args.args == (str(tmp_path),)
+        assert build_model.call_args.kwargs["load_weights"] is False
+        assert build_model.call_args.kwargs["keep_quantized"] is True
+
+    @pytest.mark.parametrize(
+        ("extra_args", "keep_quantized"),
+        [([], True), (["--dequantize"], False)],
+    )
+    def test_local_gptoss_quantization_policy_reaches_shared_builder(
+        self, tmp_path, extra_args, keep_quantized
+    ):
+        hf_config = SimpleNamespace(model_type="gpt_oss")
+        output = tmp_path / "output"
+
+        with (
+            mock.patch(
+                "mobius.integrations.transformers._builder._load_transformers_config",
+                return_value=(hf_config, False),
+            ),
+            mock.patch(
+                "mobius.__main__.build",
+                return_value=mock.MagicMock(),
+            ) as build_model,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(output),
+                    "--execution-provider",
+                    "cuda",
+                    "--dtype",
+                    "f16",
+                    *extra_args,
+                ]
+            )
+
+        assert build_model.call_args.kwargs["keep_quantized"] is keep_quantized
+        assert build_model.call_args.kwargs["execution_provider"] == "cuda"
+        assert build_model.call_args.kwargs["dtype"] == ir.DataType.FLOAT16
+        assert not output.exists()
+
+    def test_dequantize_help_warns_about_dense_gptoss_memory(self):
+        parser = build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        build_command = subparsers.choices["build"]
+        dequantize = next(
+            action for action in build_command._actions if action.dest == "dequantize"
+        )
+
+        assert "GPT-OSS MXFP4" in dequantize.help
+        assert "memory-intensive" in dequantize.help
+        assert "bounded native streaming" in dequantize.help
+
+    @pytest.mark.parametrize(
+        "model_type",
+        ["qwen4_exp_text", "Qwen4ExpForConditionalGeneration"],
+    )
+    def test_local_qwen4_affine_error_from_shared_builder_propagates(
+        self, tmp_path, model_type
+    ):
+        hf_config = SimpleNamespace(model_type=model_type)
+
+        with (
+            mock.patch(
+                "mobius.integrations.transformers._builder._load_transformers_config",
+                return_value=(hf_config, False),
+            ),
+            mock.patch(
+                "mobius.__main__.build",
+                side_effect=NotImplementedError(
+                    "Affine per-component Qwen4-Exp loading is blocked"
+                ),
+            ),
+            pytest.raises(NotImplementedError, match="Affine per-component Qwen4-Exp"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(tmp_path / "output"),
+                ]
+            )
+
     def test_text_only_with_component_errors(self):
         """The text-only feature is rejected when combined with --component."""
         with (

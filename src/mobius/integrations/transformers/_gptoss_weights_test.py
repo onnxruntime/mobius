@@ -110,7 +110,7 @@ def _package_and_state():
     return config, package, state
 
 
-def _save_cross_sharded(state, directory):
+def _save_cross_sharded(state, directory, *, shard_prefix=""):
     names = sorted(state)
     shard_a_names = [
         name for index, name in enumerate(names) if name.endswith("_blocks") or index % 2 == 0
@@ -129,8 +129,11 @@ def _save_cross_sharded(state, directory):
     }
     weight_map = {}
     for filename, tensors in shards.items():
-        safetensors.torch.save_file(tensors, str(directory / filename))
-        weight_map.update(dict.fromkeys(tensors, filename))
+        relative_filename = f"{shard_prefix}/{filename}" if shard_prefix else filename
+        shard_path = directory / relative_filename
+        shard_path.parent.mkdir(parents=True, exist_ok=True)
+        safetensors.torch.save_file(tensors, str(shard_path))
+        weight_map.update(dict.fromkeys(tensors, relative_filename))
     (directory / "model.safetensors.index.json").write_text(
         json.dumps({"metadata": {}, "weight_map": weight_map})
     )
@@ -342,7 +345,7 @@ def test_safetensors_save_rejects_hard_link_to_lazy_source_before_mutation(tmp_p
 
     source_before = _directory_snapshot(checkpoint)
     output_before = _directory_snapshot(output)
-    with pytest.raises(ValueError, match="hard-linked to lazy source shard"):
+    with pytest.raises(ValueError, match="aliases lazy source file"):
         package.save(
             str(output),
             external_data="safetensors",
@@ -350,6 +353,82 @@ def test_safetensors_save_rejects_hard_link_to_lazy_source_before_mutation(tmp_p
         )
 
     assert _directory_snapshot(checkpoint) == source_before
+    assert _directory_snapshot(output) == output_before
+
+
+def test_nested_shard_checkpoint_root_is_registered_and_rejected_for_safetensors(
+    tmp_path,
+):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, checkpoint, shard_prefix="weights")
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(checkpoint), config
+    )
+
+    assert package._native_streaming_source_directories == frozenset(
+        {checkpoint.resolve(), (checkpoint / "weights").resolve()}
+    )
+    assert (checkpoint / "model.safetensors.index.json").resolve() in (
+        package._native_streaming_source_files
+    )
+    source_before = _directory_snapshot(checkpoint)
+
+    with pytest.raises(ValueError, match="source checkpoint directory"):
+        package.save(
+            str(checkpoint),
+            external_data="safetensors",
+            progress_bar=False,
+        )
+
+    assert _directory_snapshot(checkpoint) == source_before
+
+
+@pytest.mark.parametrize(
+    ("external_data", "output_name", "link_kind"),
+    [
+        ("onnx", "model.onnx", "symlink"),
+        ("onnx", "model.onnx.data", "hardlink"),
+        ("onnx", "weight-loading-report.json", "hardlink"),
+        ("safetensors", "model.safetensors.index.json", "hardlink"),
+    ],
+)
+def test_streaming_save_rejects_exact_output_file_alias_for_every_format(
+    tmp_path,
+    external_data,
+    output_name,
+    link_kind,
+):
+    checkpoint = tmp_path / "checkpoint"
+    output = tmp_path / "output"
+    checkpoint.mkdir()
+    output.mkdir()
+    config, package, state = _package_and_state()
+    _save_single_file(state, checkpoint)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(checkpoint), config
+    )
+    source = checkpoint / "model.safetensors"
+    alias = output / output_name
+    try:
+        if link_kind == "symlink":
+            alias.symlink_to(source)
+        else:
+            alias.hardlink_to(source)
+    except OSError as error:
+        pytest.skip(f"{link_kind}s are unavailable: {error}")
+
+    source_before = source.read_bytes()
+    output_before = _directory_snapshot(output)
+    with pytest.raises(ValueError, match="aliases lazy source file"):
+        package.save(
+            str(output),
+            external_data=external_data,
+            progress_bar=False,
+        )
+
+    assert source.read_bytes() == source_before
     assert _directory_snapshot(output) == output_before
 
 
@@ -423,7 +502,7 @@ def test_stateful_component_filter_is_frozen_before_streaming_collision_validati
     assert tuple(sorted(path.name for path in parent.iterdir())) == parent_listing_before
 
 
-def test_component_filter_excludes_colliding_streaming_output_directory(tmp_path):
+def test_component_filter_does_not_replace_existing_streaming_destination(tmp_path):
     parent = tmp_path / "parent"
     checkpoint = parent / "model"
     checkpoint.mkdir(parents=True)
@@ -438,15 +517,16 @@ def test_component_filter_excludes_colliding_streaming_output_directory(tmp_path
     )
     source_before = _directory_snapshot(checkpoint)
 
-    package.save(
-        str(parent),
-        external_data="safetensors",
-        components=lambda name: name == "auxiliary",
-        progress_bar=False,
-    )
+    with pytest.raises(FileExistsError, match="destination already exists"):
+        package.save(
+            str(parent),
+            external_data="safetensors",
+            components=lambda name: name == "auxiliary",
+            progress_bar=False,
+        )
 
     assert _directory_snapshot(checkpoint) == source_before
-    assert (parent / "model.onnx").is_file()
+    assert not (parent / "model.onnx").exists()
 
 
 def test_safetensors_save_to_separate_directory_roundtrips_without_source_path(
@@ -551,17 +631,17 @@ def test_non_streaming_package_can_save_safetensors_in_existing_directory(tmp_pa
     assert (tmp_path / "model.onnx").is_file()
 
 
-def test_native_streaming_allows_onnx_external_data_in_source_directory(tmp_path):
+def test_native_streaming_rejects_onnx_output_in_existing_source_directory(tmp_path):
     config, package, state = _package_and_state()
     _save_cross_sharded(state, tmp_path)
     _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(package, str(tmp_path), config)
     source_contents = _directory_snapshot(tmp_path)[1]
 
-    package.save(str(tmp_path), external_data="onnx", progress_bar=False)
+    with pytest.raises(FileExistsError, match="destination already exists"):
+        package.save(str(tmp_path), external_data="onnx", progress_bar=False)
 
-    for relative_path, contents in source_contents.items():
-        assert (tmp_path / relative_path).read_bytes() == contents
-    assert (tmp_path / "model.onnx").is_file()
+    assert _directory_snapshot(tmp_path)[1] == source_contents
+    assert not (tmp_path / "model.onnx").exists()
 
 
 @pytest.mark.parametrize("replacement_byte", [0x00, 0xFE])
@@ -603,6 +683,72 @@ def test_lazy_scale_materialization_revalidates_replaced_source_shard(tmp_path):
         cause = cause.__cause__
     assert isinstance(cause, ValueError)
     assert "0xff (NaN)" in str(cause)
+
+
+def test_pass_through_u8_tensor_is_rejected_during_header_preflight(tmp_path):
+    config, package, state = _package_and_state()
+    direct_name = next(name for name in state if ".mlp.experts." not in name)
+    state[direct_name] = torch.zeros(state[direct_name].shape, dtype=torch.uint8)
+    _save_cross_sharded(state, tmp_path)
+
+    with pytest.raises(ValueError, match=r"pass-through.*dtype.*U8"):
+        _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+            package, str(tmp_path), config
+        )
+
+
+def test_lazy_direct_materialization_rechecks_indexed_dtype(tmp_path):
+    config, package, state = _package_and_state()
+    direct_name = next(name for name in state if ".mlp.experts." not in name)
+    _save_single_file(state, tmp_path)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(package, str(tmp_path), config)
+
+    state[direct_name] = torch.zeros(state[direct_name].shape, dtype=torch.uint8)
+    _save_single_file(state, tmp_path)
+    direct = package["model"].graph.initializers[direct_name].const_value
+    assert direct is not None
+
+    with pytest.raises(ValueError, match=r"changed after indexing.*U8"):
+        direct.numpy()
+
+
+@pytest.mark.parametrize("mismatch", ["shape", "dtype"])
+def test_transformed_target_metadata_mismatch_fails_before_transform(
+    tmp_path, monkeypatch, mismatch
+):
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, tmp_path)
+    target = package["model"].graph.initializers[f"{_ROOT}.fc1_experts_weights"]
+    if mismatch == "shape":
+        target.shape = ir.Shape([_E, _H, _I + 1])
+        error = ValueError
+    else:
+        target.type = ir.TensorType(ir.DataType.FLOAT16)
+        error = TypeError
+    transform = pytest.fail
+    monkeypatch.setattr(_gptoss_weights, "_repack_blocks", transform)
+
+    with pytest.raises(error, match=rf"declares target {mismatch}"):
+        _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+            package, str(tmp_path), config
+        )
+
+
+def test_unexpected_expert_diagnostics_are_counted_and_bounded(tmp_path):
+    config, package, state = _package_and_state()
+    for index in range(20):
+        state[f"{_ROOT}.experts.unexpected_{index:02d}"] = torch.zeros(1)
+    _save_single_file(state, tmp_path)
+
+    with pytest.raises(ValueError) as exc_info:
+        _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+            package, str(tmp_path), config
+        )
+
+    message = str(exc_info.value)
+    assert "unexpected 20" in message
+    assert "unexpected_00" in message
+    assert "unexpected_19" not in message
 
 
 @pytest.mark.parametrize("malformation", ["missing_pair", "invalid_scale"])

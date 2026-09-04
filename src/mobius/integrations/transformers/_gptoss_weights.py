@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import heapq
 import json
 import pathlib
 from collections.abc import Mapping
@@ -24,6 +25,8 @@ from mobius.integrations._weight_loading import (
     stream_preprocessed_safetensors_to_model,
 )
 from mobius.models.gptoss import (
+    _MXFP4_BLOCK_SIZE,
+    _MXFP4_REPACK_OUTPUT_PAIRS_PER_CHUNK,
     _native_mxfp4_projection_specs,
     _reinterpret_mxfp4_scales_unchecked,
     _validate_mxfp4_scale_bytes,
@@ -106,11 +109,13 @@ def build_gptoss_mxfp4_streaming_plan(
         )
     actual_expert_keys = {key for key in key_index if ".mlp.experts." in key}
     if actual_expert_keys != expected_expert_keys:
+        missing = expected_expert_keys - actual_expert_keys
+        unexpected = actual_expert_keys - expected_expert_keys
         raise ValueError(
             "Malformed GPT-OSS MXFP4 checkpoint: every expected MoE layer must "
             "contain exactly gate_up_proj/down_proj blocks, scales, and biases. "
-            f"Missing: {sorted(expected_expert_keys - actual_expert_keys)}; "
-            f"unexpected: {sorted(actual_expert_keys - expected_expert_keys)}."
+            f"Missing {len(missing)} (sample: {heapq.nsmallest(5, missing)}); "
+            f"unexpected {len(unexpected)} (sample: {heapq.nsmallest(5, unexpected)})."
         )
 
     targets: dict[
@@ -143,7 +148,10 @@ def build_gptoss_mxfp4_streaming_plan(
 
             output_pairs = block_shape[1] // 2
             scratch_bytes = (
-                block_shape[0] * block_shape[2] * block_shape[3] * min(64, output_pairs)
+                block_shape[0]
+                * block_shape[2]
+                * block_shape[3]
+                * min(_MXFP4_REPACK_OUTPUT_PAIRS_PER_CHUNK, output_pairs)
             )
             weight_target = f"{mlp_root}.{target}_experts_weights"
             scale_target = f"{mlp_root}.{target}_scales"
@@ -152,6 +160,12 @@ def build_gptoss_mxfp4_streaming_plan(
                 source_name=block_name,
                 expected_source_shape=block_shape,
                 expected_source_dtype="U8",
+                expected_target_shape=(
+                    block_shape[0],
+                    block_shape[2] * _MXFP4_BLOCK_SIZE,
+                    block_shape[1] // 2,
+                ),
+                expected_target_dtype=ir.DataType.UINT8,
                 transform=_repack_blocks,
                 scratch_bytes=scratch_bytes,
             )
@@ -159,6 +173,8 @@ def build_gptoss_mxfp4_streaming_plan(
                 source_name=scale_name,
                 expected_source_shape=scale_shape,
                 expected_source_dtype="U8",
+                expected_target_shape=scale_shape,
+                expected_target_dtype=ir.DataType.FLOAT8E8M0,
                 transform=_reinterpret_scales,
                 validate_tensor=_validate_scales,
             )
@@ -216,6 +232,13 @@ def build_gptoss_mxfp4_streaming_plan(
         if initializer.const_value is not None or target_name in claimed_targets:
             continue
         if target_name in key_index:
+            _require_header(
+                key_index,
+                target_name,
+                tuple(int(dim) for dim in initializer.shape),
+                expected_dtypes=_FLOAT_DTYPES,
+                description="pass-through",
+            )
             targets[target_name] = StreamingWeightSource(target_name)
 
     return StreamingWeightPlan(
@@ -226,7 +249,7 @@ def build_gptoss_mxfp4_streaming_plan(
             "native_mxfp4": True,
             "streaming_external_data": True,
             "streaming_unit": "one_moe_projection",
-            "num_moe_layers": config.num_hidden_layers,
+            "num_moe_layers": len(specs),
         },
     )
 
@@ -279,11 +302,18 @@ def stream_gptoss_mxfp4_safetensors_to_package(
             "the repository publishes no model.safetensors index/file. Convert "
             "the checkpoint to safetensors; eager loading is intentionally disabled."
         ) from exc
-    package._native_streaming_source_directories = _lazy_safetensors_source_parent_aliases(
-        paths
-    )
-    package._native_streaming_source_files = frozenset(
-        pathlib.Path(path).resolve() for path in paths
+    source_control_paths: list[str] = []
+    if local is not None:
+        local_index = pathlib.Path(model_id) / "model.safetensors.index.json"
+        if local_index.is_file():
+            source_control_paths.append(str(local_index))
+    all_source_paths = [*paths, *source_control_paths]
+    source_directories = set(_lazy_safetensors_source_parent_aliases(all_source_paths))
+    if local is not None:
+        source_directories.add(pathlib.Path(model_id).resolve())
+    package.register_lazy_source_artifacts(
+        files=all_source_paths,
+        directories=source_directories,
     )
     if local is not None:
         # Local filesystem paths are needed by LazyTensor closures and the

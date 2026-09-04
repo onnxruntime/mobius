@@ -664,14 +664,11 @@ class TestBuildMtpHead:
             qwen35_mtp_gguf,
             output,
             runtime="ort-genai",
-            runtime_version="0.15.2",
             progress_bar=False,
         )
 
         with open(artifacts["mtp_config"], encoding="utf-8") as handle:
             mtp_config = json.load(handle)
-        with open(artifacts["runtime_compatibility"], encoding="utf-8") as handle:
-            compatibility = json.load(handle)
         with open(artifacts["mtp_runtime_status"], encoding="utf-8") as handle:
             status = json.load(handle)
         assert (output / ".mobius-mtp" / "model.onnx").is_file()
@@ -682,8 +679,6 @@ class TestBuildMtpHead:
             mtp_config["cache_namespaces"]["target"]["namespace"]
             != mtp_config["cache_namespaces"]["mtp"]["namespace"]
         )
-        assert compatibility["runtime_validation_status"] == "unvalidated"
-        assert compatibility["tested_versions"] == ["0.15.2"]
         assert status["status"] == "runtime_unvalidated"
         assert status["artifact"]["sha256"] == package.gguf_artifact_identity.sha256
         assert status["graph_package"]["sha256"]
@@ -1301,10 +1296,11 @@ class TestMtpAutoDetect:
         assert getattr(pkg, "mtp_head", None) is not None
 
     def test_text_only_gguf_omits_head_sidecar(self, tmp_path: Path):
-        from mobius.integrations.gguf import _builder_test, build_from_gguf
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._builder_test_utils import _write_quantized_gguf
 
         # A plain GGUF with no nextn block -> nothing to emit, byte-identical.
         path = tmp_path / "no_mtp.gguf"
-        _builder_test._write_quantized_gguf(path, projection_quantization="f32")
+        _write_quantized_gguf(path, projection_quantization="f32")
         pkg = build_from_gguf(str(path))
         assert getattr(pkg, "mtp_head", None) is None

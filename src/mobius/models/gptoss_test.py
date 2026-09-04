@@ -90,8 +90,8 @@ def _native_expert_state(layer: str = _LAYER) -> dict[str, torch.Tensor]:
     }
 
 
-def _make_gqa_parity_model(*, decode: bool) -> onnx.ModelProto:
-    """Create an in-memory FP16 GQA graph for the runtime sink/window parity test."""
+def _make_gqa_parity_model(*, decode: bool) -> ir.Model:
+    """Create a focused FP16 GQA graph for sink/window kernel parity."""
     batch = 2
     query_length = 1 if decode else 4
     past_length = 4 if decode else 0
@@ -99,76 +99,103 @@ def _make_gqa_parity_model(*, decode: bool) -> onnx.ModelProto:
     num_heads = 2
     num_kv_heads = 1
     head_dim = 8
-    tensor = onnx.helper.make_tensor_value_info
+
+    def value(name: str, dtype: ir.DataType, shape: list[int]) -> ir.Value:
+        return ir.Value(name=name, shape=ir.Shape(shape), type=ir.TensorType(dtype))
+
     inputs = [
-        tensor("query", onnx.TensorProto.FLOAT16, [batch, query_length, 16]),
-        tensor("key", onnx.TensorProto.FLOAT16, [batch, query_length, 8]),
-        tensor("value", onnx.TensorProto.FLOAT16, [batch, query_length, 8]),
-        tensor(
+        value("query", ir.DataType.FLOAT16, [batch, query_length, 16]),
+        value("key", ir.DataType.FLOAT16, [batch, query_length, 8]),
+        value("value", ir.DataType.FLOAT16, [batch, query_length, 8]),
+        value(
             "past_key",
-            onnx.TensorProto.FLOAT16,
+            ir.DataType.FLOAT16,
             [batch, num_kv_heads, past_length, head_dim],
         ),
-        tensor(
+        value(
             "past_value",
-            onnx.TensorProto.FLOAT16,
+            ir.DataType.FLOAT16,
             [batch, num_kv_heads, past_length, head_dim],
         ),
+        value("seqlens_k", ir.DataType.INT32, [batch]),
+        value("total_sequence_length", ir.DataType.INT32, []),
+        value("head_sink", ir.DataType.FLOAT16, [num_heads]),
     ]
-    node_inputs = ["query", "key", "value", "past_key", "past_value"]
-    inputs.extend(
-        [
-            tensor("seqlens_k", onnx.TensorProto.INT32, [batch]),
-            tensor("total_sequence_length", onnx.TensorProto.INT32, []),
-            tensor("head_sink", onnx.TensorProto.FLOAT16, [num_heads]),
-        ]
-    )
-    node_inputs.extend(
-        [
-            "seqlens_k",
-            "total_sequence_length",
-            "",  # cos_cache
-            "",  # sin_cache
-            "",  # position_ids
-            "",  # attention_bias
-            "head_sink",
-        ]
-    )
-    node = onnx.helper.make_node(
-        "GroupQueryAttention",
-        node_inputs,
-        ["output", "present_key", "present_value"],
-        domain="com.microsoft",
-        num_heads=num_heads,
-        kv_num_heads=num_kv_heads,
-        scale=head_dim**-0.5,
-        local_window_size=2,
-        do_rotary=0,
-    )
     outputs = [
-        tensor("output", onnx.TensorProto.FLOAT16, [batch, query_length, 16]),
-        tensor(
+        value("output", ir.DataType.FLOAT16, [batch, query_length, 16]),
+        value(
             "present_key",
-            onnx.TensorProto.FLOAT16,
+            ir.DataType.FLOAT16,
             [batch, num_kv_heads, total_length, head_dim],
         ),
-        tensor(
+        value(
             "present_value",
-            onnx.TensorProto.FLOAT16,
+            ir.DataType.FLOAT16,
             [batch, num_kv_heads, total_length, head_dim],
         ),
     ]
-    graph = onnx.helper.make_graph([node], "gptoss_gqa_parity", inputs, outputs)
-    model = onnx.helper.make_model(
-        graph,
-        opset_imports=[
-            onnx.helper.make_opsetid("", 24),
-            onnx.helper.make_opsetid("com.microsoft", 1),
+    node = ir.Node(
+        domain="com.microsoft",
+        op_type="GroupQueryAttention",
+        inputs=[
+            *inputs[:7],
+            None,  # cos_cache
+            None,  # sin_cache
+            None,  # position_ids
+            None,  # attention_bias
+            inputs[7],
         ],
+        outputs=outputs,
+        attributes=ir.convenience.convert_attributes(
+            {
+                "num_heads": num_heads,
+                "kv_num_heads": num_kv_heads,
+                "scale": head_dim**-0.5,
+                "local_window_size": 2,
+                "do_rotary": 0,
+            }
+        ),
+    )
+    graph = ir.Graph(
+        inputs=inputs,
+        outputs=outputs,
+        nodes=[node],
+        opset_imports={"": 24, "com.microsoft": 1},
+        name="gptoss_gqa_parity",
+    )
+    return ir.Model(graph, ir_version=12)
+
+
+def _require_usable_cuda_provider(ort) -> None:
+    """Skip only when a separate valid CUDA probe cannot initialize the provider."""
+    probe_input = onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1, 1])
+    probe_output = onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1, 1])
+    probe_weight = onnx.helper.make_tensor("weight", onnx.TensorProto.FLOAT, [1, 1], [1.0])
+    probe = onnx.helper.make_model(
+        onnx.helper.make_graph(
+            [onnx.helper.make_node("MatMul", ["input", "weight"], ["output"])],
+            "cuda_provider_probe",
+            [probe_input],
+            [probe_output],
+            [probe_weight],
+        ),
+        opset_imports=[onnx.helper.make_opsetid("", 13)],
         ir_version=10,
     )
-    onnx.checker.check_model(model)
-    return model
+    provider_errors = (
+        ort.capi.onnxruntime_pybind11_state.Fail,
+        ort.capi.onnxruntime_pybind11_state.RuntimeException,
+        ort.capi.onnxruntime_pybind11_state.EPFail,
+    )
+    try:
+        session = ort.InferenceSession(
+            probe.SerializeToString(),
+            providers=["CUDAExecutionProvider"],
+        )
+    except provider_errors as error:
+        pytest.skip(f"CUDAExecutionProvider could not initialize valid probe: {error}")
+    if session.get_providers()[0] != "CUDAExecutionProvider":
+        pytest.skip("CUDAExecutionProvider could not initialize valid probe on this host")
 
 
 def _manual_sink_attention(
@@ -486,6 +513,81 @@ class TestGPTOSSNativeMXFP4Preprocess:
         with pytest.raises(ValueError, match="does not declare native MXFP4"):
             model.preprocess_weights(_native_expert_state())
 
+    def test_explicit_dense_mxfp4_dequantizes_then_splits_experts(self):
+        model = GPTOSSCausalLMModel(_gptoss_config())
+        model._dequantize_mxfp4_checkpoint = True
+        state = _native_expert_state()
+
+        def dequantize(blocks, scales, *, dtype):
+            assert blocks.dtype == torch.uint8
+            assert scales.dtype == torch.uint8
+            assert dtype == torch.bfloat16
+            if blocks.shape[2] == _H // 32:
+                return (
+                    torch.arange(
+                        _E * _H * 2 * _I,
+                        dtype=torch.float32,
+                    )
+                    .reshape(_E, _H, 2 * _I)
+                    .to(dtype)
+                )
+            return (
+                torch.arange(
+                    _E * _I * _H,
+                    dtype=torch.float32,
+                )
+                .reshape(_E, _I, _H)
+                .to(dtype)
+            )
+
+        with patch(
+            "transformers.integrations.mxfp4._convert_moe_packed_tensors",
+            side_effect=dequantize,
+        ) as convert:
+            result = model.preprocess_weights(state)
+
+        assert convert.call_count == 2
+        assert f"{_LAYER}.fc1_experts_weights" not in result
+        assert f"{_LAYER}.fc2_experts_weights" not in result
+        assert result[f"{_LAYER}.experts.0.gate_proj.weight"].shape == (_I, _H)
+        assert result[f"{_LAYER}.experts.0.up_proj.weight"].shape == (_I, _H)
+        assert result[f"{_LAYER}.experts.0.down_proj.weight"].shape == (_H, _I)
+        assert result[f"{_LAYER}.experts.0.gate_proj.weight"].dtype == torch.bfloat16
+        assert not any(key.endswith(("_blocks", "_scales")) for key in result)
+
+    @pytest.mark.parametrize(
+        "malformation",
+        ["missing_projection", "wrong_dtype", "wrong_shape", "invalid_scale"],
+    )
+    def test_dense_preflight_rejects_before_mutation_or_converter(self, malformation):
+        model = GPTOSSCausalLMModel(_gptoss_config())
+        model._dequantize_mxfp4_checkpoint = True
+        state = _native_expert_state()
+        if malformation == "missing_projection":
+            del state[f"{_LAYER}.experts.down_proj_blocks"]
+        elif malformation == "wrong_dtype":
+            key = f"{_LAYER}.experts.gate_up_proj_blocks"
+            state[key] = state[key].to(torch.int16)
+        elif malformation == "wrong_shape":
+            key = f"{_LAYER}.experts.down_proj_scales"
+            state[key] = state[key][..., :-1]
+        else:
+            state[f"{_LAYER}.experts.gate_up_proj_scales"].reshape(-1)[-1] = 0xFF
+        original_objects = dict(state)
+        original_values = {key: tensor.clone() for key, tensor in state.items()}
+
+        with (
+            patch("transformers.integrations.mxfp4._convert_moe_packed_tensors") as convert,
+            pytest.raises((TypeError, ValueError)),
+        ):
+            model.preprocess_weights(state)
+
+        convert.assert_not_called()
+        assert state.keys() == original_objects.keys()
+        for key, tensor in state.items():
+            assert tensor is original_objects[key]
+            torch.testing.assert_close(tensor, original_values[key])
+
 
 class TestGPTOSSNativeMXFP4Graph:
     def test_transformers_mxfp4_config_selects_typed_native_format(self):
@@ -616,7 +718,7 @@ class TestGPTOSSNativeMXFP4Graph:
         # no manual attention Softmax core can remain in this supported slice.
         assert not any(node.op_type == "Softmax" for node in graph)
 
-    def test_native_ir12_serialization_does_not_bump_unquantized_model(self, tmp_path):
+    def test_native_and_unquantized_serialization_use_universal_ir12(self, tmp_path):
         packages = {}
         with build_context(EpCapabilities(name="cuda"), ir.DataType.FLOAT16):
             for name, native_mxfp4 in (("native", True), ("unquantized", False)):
@@ -626,14 +728,13 @@ class TestGPTOSSNativeMXFP4Graph:
                 )
                 packages[name] = CausalLMTask().build(GPTOSSCausalLMModel(config), config)
 
-        expected_versions = {"native": 12, "unquantized": 11}
         for name, package in packages.items():
-            assert package["model"].ir_version == expected_versions[name]
+            assert package["model"].ir_version == 12
             output = tmp_path / name
             package.save(str(output), check_weights=False, progress_bar=False)
             proto = onnx.load_model(output / "model.onnx", load_external_data=False)
 
-            assert proto.ir_version == expected_versions[name]
+            assert proto.ir_version == 12
             assert {item.domain: item.version for item in proto.opset_import} == {
                 "": 24,
                 "com.microsoft": 1,
@@ -695,20 +796,33 @@ class TestGPTOSSNativeMXFP4Graph:
         assert supported_qmoe_quantization(quantization) is None
         assert linear_class_for_config(config) is None
 
+    def test_dense_graph_uses_portable_experts_and_not_native_qmoe(self):
+        config = _gptoss_config(dtype=ir.DataType.FLOAT16)
+        module = GPTOSSCausalLMModel(config)
+
+        with build_context(EpCapabilities(name="default"), ir.DataType.FLOAT16):
+            graph = CausalLMTask().build(module, config)["model"].graph
+
+        assert module.model.layers[0].mlp.experts is not None
+        assert not any(node.op_type == "QMoE" for node in graph)
+        assert not any(node.op_type == "GroupQueryAttention" for node in graph)
+
     @pytest.mark.parametrize("decode", [False, True], ids=["prefill", "decode"])
-    def test_cuda_gqa_matches_manual_sink_attention_with_local_window(self, decode):
+    def test_cuda_gqa_kernel_matches_manual_sink_attention_with_local_window(
+        self, decode, tmp_path
+    ):
+        """Check the focused GQA kernel; production graph structure is tested above."""
         ort = pytest.importorskip("onnxruntime")
         if "CUDAExecutionProvider" not in ort.get_available_providers():
             pytest.skip("CUDAExecutionProvider is not available")
-        try:
-            session = ort.InferenceSession(
-                _make_gqa_parity_model(decode=decode).SerializeToString(),
-                providers=["CUDAExecutionProvider"],
-            )
-        except Exception as error:
-            pytest.skip(f"CUDAExecutionProvider could not initialize: {error}")
-        if session.get_providers()[0] != "CUDAExecutionProvider":
-            pytest.skip("CUDAExecutionProvider could not initialize on this host")
+        _require_usable_cuda_provider(ort)
+        model_path = tmp_path / f"gqa_{'decode' if decode else 'prefill'}.onnx"
+        ir.save(_make_gqa_parity_model(decode=decode), model_path)
+        session = ort.InferenceSession(
+            model_path,
+            providers=["CUDAExecutionProvider"],
+        )
+        assert session.get_providers()[0] == "CUDAExecutionProvider"
 
         rng = np.random.default_rng(5 if decode else 4)
         query_length = 1 if decode else 4

@@ -48,6 +48,7 @@ from mobius._configs import (
     MiniMaxConfig,
     MllamaConfig,
     MoonshineConfig,
+    MoonshineStreamingConfig,
     MuseGlimmerConfig,
     NanoChatConfig,
     NemotronHConfig,
@@ -3551,6 +3552,25 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
             "encoder_num_hidden_layers": TINY_LAYERS,
             "encoder_num_attention_heads": TINY_HEADS,
             "encoder_num_key_value_heads": TINY_HEADS,
+        },
+        True,
+    ),
+    # --- Moonshine Streaming (causal framing front end + windowed encoder) ---
+    (
+        "moonshine_streaming",
+        {
+            "_config_cls": MoonshineStreamingConfig,
+            "num_key_value_heads": TINY_HEADS,
+            "partial_rotary_factor": 0.8,
+            "rope_type": "default",
+            "rope_interleave": True,
+            "mlp_bias": True,
+            "tie_word_embeddings": False,
+            "encoder_num_hidden_layers": TINY_LAYERS,
+            "encoder_num_attention_heads": TINY_HEADS,
+            "encoder_num_key_value_heads": TINY_HEADS,
+            # Asymmetric lookahead on layer 0, fully causal on layer 1.
+            "encoder_sliding_windows": ((16, 4), (16, 0)),
         },
         True,
     ),

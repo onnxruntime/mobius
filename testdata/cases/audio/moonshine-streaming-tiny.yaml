@@ -1,0 +1,23 @@
+model_id: "moonshine-ai/moonshine-streaming-tiny"
+model_type: "moonshine_streaming"
+revision: "f8e9dfd8c562c257c151a907b7b7f2fe8ff8511a"
+task_type: "speech-to-text"
+dtype: "float32"
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+  eos_token_id: 2
+  exact_match: true
+
+level: "L4+L5"
+
+notes: >-
+  Moonshine Streaming tiny: causal framing front end (5 ms frames, CMVN, asinh
+  compression, two left-padded stride-2 convolutions) feeding a windowed encoder
+  with per-layer asymmetric (left, right) lookahead, and a cached Moonshine
+  decoder that cross-attends to the position-adapted encoder context.

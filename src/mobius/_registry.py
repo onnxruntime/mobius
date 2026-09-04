@@ -40,6 +40,7 @@ from mobius._configs import (
     MiniMaxConfig,
     MMSConfig,
     MoonshineConfig,
+    MoonshineStreamingConfig,
     MuseGlimmerConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
@@ -115,6 +116,7 @@ from mobius.models import (
     Mistral4GGUFCausalLMModel,
     MoECausalLMModel,
     MoonshineForConditionalGeneration,
+    MoonshineStreamingForConditionalGeneration,
     NanoChatCausalLMModel,
     NemotronCausalLMModel,
     NemotronParseForConditionalGeneration,
@@ -902,6 +904,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         task="speech-to-text",
         config_class=MoonshineConfig,
     ),
+    "moonshine_streaming": ModelRegistration(
+        MoonshineStreamingForConditionalGeneration,
+        task="speech-to-text",
+        config_class=MoonshineStreamingConfig,
+    ),
     # --- Encoder-only ---
     "albert": ModelRegistration(BertModel, task="feature-extraction"),
     "bert": ModelRegistration(BertModel, task="feature-extraction"),
@@ -1361,6 +1368,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
 
     # --- Speech ---
     "moonshine": "moonshine-ai/moonshine-tiny",
+    "moonshine_streaming": "moonshine-ai/moonshine-streaming-tiny",
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
