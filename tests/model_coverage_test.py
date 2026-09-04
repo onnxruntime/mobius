@@ -309,8 +309,8 @@ _COVERAGE_SKIP: dict[str, str] = {
     "VibeVoiceForASRStreamingTraining": "Streaming ASR has host-owned dual-convolution "
     "state, arbitrary-mask decoder, hotword, and speaker-attribution orchestration that "
     "the generic L4/L5 runner cannot drive. Pinned L1-L3 graph/config/source-parity and "
-    "complete checkpoint-index routing are covered; 17 GB real-weight goldens require "
-    "a dedicated GPU workflow.",
+    "complete checkpoint-index routing are covered for the 1.5B and 7B checkpoints; "
+    "real-weight goldens require a dedicated GPU workflow.",
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",

@@ -26,8 +26,7 @@ from mobius._pipeline_contract import (
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.vibevoice import (
-    VIBEVOICE_ASR_MODEL_ID,
-    VIBEVOICE_ASR_REVISION,
+    VIBEVOICE_ASR_MODEL_REVISIONS,
     VIBEVOICE_ASR_SOURCE_REVISION,
     VibeVoiceASRForConditionalGeneration,
 )
@@ -190,8 +189,30 @@ class TestVibeVoiceASR:
         assert registration.module_class is VibeVoiceASRForConditionalGeneration
         assert registration.task == "vibevoice-asr-streaming"
         assert registration.config_class is VibeVoiceASRConfig
-        assert registration.test_model_id == VIBEVOICE_ASR_MODEL_ID
-        assert registration.test_revision == VIBEVOICE_ASR_REVISION
+        assert registration.test_model_id in VIBEVOICE_ASR_MODEL_REVISIONS
+        assert (
+            registration.test_revision
+            == VIBEVOICE_ASR_MODEL_REVISIONS[registration.test_model_id]
+        )
+
+    def test_tied_checkpoint_lm_head_preserves_its_explicit_tensor(self):
+        """A tied checkpoint's explicit LM head must not be overwritten by an embedding fallback."""
+        module = VibeVoiceASRForConditionalGeneration(
+            dataclasses.replace(_config(), tie_word_embeddings=True)
+        )
+        embedding_weight = torch.zeros(1)
+        lm_head_weight = torch.ones(1)
+
+        routed = module.preprocess_weights(
+            {
+                "model.language_model.embed_tokens.weight": embedding_weight,
+                "lm_head.weight": lm_head_weight,
+            }
+        )
+
+        assert set(routed) == {"embedding.embed_tokens.weight", "decoder.lm_head.weight"}
+        assert routed["embedding.embed_tokens.weight"] is embedding_weight
+        assert routed["decoder.lm_head.weight"] is lm_head_weight
 
     def test_vibevoice_dispatch_rejects_ambiguous_or_unknown_architectures(self):
         from mobius.integrations.transformers._builder import _resolve_module_class
@@ -516,13 +537,17 @@ def test_vibevoice_asr_synthetic_two_chunk_prefill_and_cached_decode_parity():
 
 
 @pytest.mark.integration
-def test_vibevoice_asr_pinned_processor_contract_for_hotwords_and_speakers():
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    tuple(VIBEVOICE_ASR_MODEL_REVISIONS.items()),
+)
+def test_vibevoice_asr_pinned_processor_contract_for_hotwords_and_speakers(model_id, revision):
     """Validate processor rows, left padding, bilingual hotword prompts, and speaker JSON."""
     _require_pinned_reference()
     processor_module = pytest.importorskip("vibevoice.processor.vibevoice_asr_processor")
     processor = processor_module.VibeVoiceASRProcessor.from_pretrained(
-        VIBEVOICE_ASR_MODEL_ID,
-        revision=VIBEVOICE_ASR_REVISION,
+        model_id,
+        revision=revision,
     )
     english = np.linspace(-0.1, 0.1, 3200, dtype=np.float32)
     chinese = np.linspace(0.1, -0.1, 6500, dtype=np.float32)
@@ -552,6 +577,20 @@ def test_vibevoice_asr_pinned_processor_contract_for_hotwords_and_speakers():
     assert batch["attention_mask"][0, 0].item() == 0
     assert batch["attention_mask"][1, 0].item() == 1
     assert plain["input_ids"].tolist() != hotwords["input_ids"].tolist()
+    assert {
+        token: processor.tokenizer.convert_tokens_to_ids(token)
+        for token in (
+            "<|object_ref_start|>",
+            "<|object_ref_end|>",
+            "<|box_start|>",
+            "<|text_chunk_end|>",
+        )
+    } == {
+        "<|object_ref_start|>": 151646,
+        "<|object_ref_end|>": 151647,
+        "<|box_start|>": 151648,
+        "<|text_chunk_end|>": 151665,
+    }
     assert processor.post_process_transcription(
         '[{"Start time": 0.0, "End time": 1.2, "Speaker ID": "spk-1", '
         '"Content": "hello"}, {"Start": 1.2, "End": 2.0, "Speaker": "说话人2", '

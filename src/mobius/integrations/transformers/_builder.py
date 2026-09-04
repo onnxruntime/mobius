@@ -326,25 +326,16 @@ def build_transformers_model(
         _config_from_hf,
         _default_task_for_model,
     )
+    from mobius.models.vibevoice import VIBEVOICE_ASR_MODEL_REVISIONS, VIBEVOICE_REVISION
 
     detection_revision = revision
     if (
-        model_id
-        in {
-            "vibevoice/VibeVoice-1.5B-hf",
-            "microsoft/VibeVoice-ASR-Streaming-7B",
-        }
+        model_id in {"vibevoice/VibeVoice-1.5B-hf", *VIBEVOICE_ASR_MODEL_REVISIONS}
         and detection_revision is None
     ):
-        from mobius.models.vibevoice import VIBEVOICE_ASR_REVISION, VIBEVOICE_REVISION
-
         # The native conversion is the executable source of truth. Pin the
         # first config probe and every later processor/weight call together.
-        revision = (
-            VIBEVOICE_ASR_REVISION
-            if model_id == "microsoft/VibeVoice-ASR-Streaming-7B"
-            else VIBEVOICE_REVISION
-        )
+        revision = VIBEVOICE_ASR_MODEL_REVISIONS.get(model_id, VIBEVOICE_REVISION)
         detection_revision = revision
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later

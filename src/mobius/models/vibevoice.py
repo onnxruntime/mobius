@@ -41,8 +41,10 @@ if TYPE_CHECKING:
 VIBEVOICE_MODEL_ID = "vibevoice/VibeVoice-1.5B-hf"
 VIBEVOICE_REVISION = "edc39f80f5cae656da37baf8faa8f5502bf7081f"
 VIBEVOICE_MICROSOFT_PROVENANCE_REVISION = "c00898d257e6b46004e3e2866a47534085fb685a"
-VIBEVOICE_ASR_MODEL_ID = "microsoft/VibeVoice-ASR-Streaming-7B"
-VIBEVOICE_ASR_REVISION = "60d858b518b4e19d404af3737f848fc185b30177"
+VIBEVOICE_ASR_MODEL_REVISIONS = {
+    "microsoft/VibeVoice-ASR-Streaming-1.5B": "4262d23d8a539a6530cf64fbd0b1751ef9a30853",
+    "microsoft/VibeVoice-ASR-Streaming-7B": "60d858b518b4e19d404af3737f848fc185b30177",
+}
 VIBEVOICE_ASR_SOURCE_REVISION = "505653d3873b065a488aea551c6ee3dc51d3062f"
 
 
@@ -1142,8 +1144,8 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
 
     Mirrors the executable reference at
     ``microsoft/VibeVoice@505653d3873b065a488aea551c6ee3dc51d3062f`` with
-    ``transformers==4.51.3`` for checkpoint revision
-    ``60d858b518b4e19d404af3737f848fc185b30177``.
+    ``transformers==4.51.3`` for the pinned Microsoft 1.5B and 7B streaming
+    ASR checkpoints.
 
     ```mermaid
     flowchart LR
@@ -1232,6 +1234,7 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Route every inference-used tensor and explicitly exclude the unused VAE decoder."""
         routed: dict[str, torch.Tensor] = {}
+        has_explicit_lm_head = "lm_head.weight" in state_dict
         for key, value in state_dict.items():
             if key.startswith("model.acoustic_tokenizer.encoder."):
                 suffix = key.removeprefix("model.acoustic_tokenizer.encoder.")
@@ -1252,7 +1255,13 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
             elif key.startswith("model.language_model.embed_tokens."):
                 suffix = key.removeprefix("model.language_model.embed_tokens.")
                 routed[f"embedding.embed_tokens.{suffix}"] = value
-                if suffix == "weight" and self.config.tie_word_embeddings:
+                # Some tied checkpoints retain lm_head.weight in their index.
+                # Route that trained tensor below rather than silently overwriting it.
+                if (
+                    suffix == "weight"
+                    and self.config.tie_word_embeddings
+                    and not has_explicit_lm_head
+                ):
                     routed["decoder.lm_head.weight"] = value
             elif key.startswith("model.language_model.layers."):
                 suffix = key.removeprefix("model.language_model.")

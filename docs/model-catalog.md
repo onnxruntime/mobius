@@ -189,7 +189,7 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | `moonshine_streaming` | `MoonshineStreamingForConditionalGeneration` | `speech-to-text` | `moonshine-ai/moonshine-streaming-tiny` |
 | `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 | `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
-| `VibeVoiceForASRStreamingTraining` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr-streaming` | `microsoft/VibeVoice-ASR-Streaming-7B` |
+| `VibeVoiceForASRStreamingTraining` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr-streaming` | `microsoft/VibeVoice-ASR-Streaming-1.5B`, `microsoft/VibeVoice-ASR-Streaming-7B` |
 
 ### Text-to-Speech
 

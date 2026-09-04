@@ -142,11 +142,18 @@ def test_vibevoice_assets_and_revision_are_forwarded(monkeypatch, tmp_path):
     } <= set(artifacts)
 
 
-def test_vibevoice_asr_writes_pinned_advisory_contract(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_vibevoice_asr_writes_pinned_advisory_contract(
+    monkeypatch, tmp_path, model_id, revision
+):
     from mobius.integrations.onnx_genai import auto_export
     from mobius.models.vibevoice import (
-        VIBEVOICE_ASR_MODEL_ID,
-        VIBEVOICE_ASR_REVISION,
         VibeVoiceASRForConditionalGeneration,
     )
     from mobius.models.vibevoice_asr_test import _config
@@ -188,14 +195,14 @@ def test_vibevoice_asr_writes_pinned_advisory_contract(monkeypatch, tmp_path):
     artifacts = write_onnx_genai_config(
         package,
         str(tmp_path),
-        source=VIBEVOICE_ASR_MODEL_ID,
-        revision=VIBEVOICE_ASR_REVISION,
+        source=model_id,
+        revision=revision,
     )
 
     assert calls == [
-        ("text", VIBEVOICE_ASR_REVISION),
-        ("runtime", VIBEVOICE_ASR_REVISION),
-        ("audio", VIBEVOICE_ASR_REVISION),
+        ("text", revision),
+        ("runtime", revision),
+        ("audio", revision),
     ]
     assert "arbitrary left-padded attention masks" in warnings[0]
     assert {

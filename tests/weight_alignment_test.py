@@ -173,8 +173,17 @@ def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
 
 
 @pytest.mark.arch_validation
-def test_vibevoice_asr_pinned_weight_index_routes_every_inference_tensor_once():
-    """Audit all 1,177 pinned checkpoint tensor names without downloading the 17 GB weights."""
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_vibevoice_asr_pinned_weight_index_routes_every_inference_tensor_once(
+    model_id, revision
+):
+    """Audit each pinned 1,177-tensor ASR checkpoint without downloading its weights."""
     import json
 
     from huggingface_hub import hf_hub_download
@@ -182,8 +191,6 @@ def test_vibevoice_asr_pinned_weight_index_routes_every_inference_tensor_once():
     from mobius import build
     from mobius.models.vibevoice import VibeVoiceASRForConditionalGeneration
 
-    model_id = "microsoft/VibeVoice-ASR-Streaming-7B"
-    revision = "60d858b518b4e19d404af3737f848fc185b30177"
     with open(
         hf_hub_download(
             model_id,
