@@ -155,6 +155,13 @@ class TestMapGGUFToHFNames:
         result = map_gguf_to_hf_names("blk.0.attn_q.weight", arch)
         assert result == "model.layers.0.self_attn.q_proj.weight"
 
+    @pytest.mark.parametrize("kind", ["q", "k"])
+    def test_qwen3_maps_attention_norms(self, kind: str) -> None:
+        assert (
+            map_gguf_to_hf_names(f"blk.0.attn_{kind}_norm.weight", "qwen3")
+            == f"model.layers.0.self_attn.{kind}_norm.weight"
+        )
+
     @pytest.mark.parametrize(
         ("architecture", "gguf_name", "expected"),
         [

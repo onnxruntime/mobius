@@ -5,7 +5,7 @@
 
 These tests exercise the 3-model split pipeline (audio_encoder → embedding
 → decoder) through ORT with random weights, covering edge cases that the
-L1 graph-build tests in build_graph_test.py do not reach.
+L1 graph-build tests in the domain-split graph suite do not reach.
 
 Test levels:
   - Extended L1/runtime: ORT execution with various input shapes and edge cases

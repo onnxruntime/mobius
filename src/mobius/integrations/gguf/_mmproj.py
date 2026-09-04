@@ -22,19 +22,21 @@ HF names (:mod:`_mmproj_mapping`) so they flow through the same tested
 ``Gemma4Model.preprocess_weights`` path as a real HF checkpoint.
 
 Audio: :func:`read_mmproj_audio_config` extracts the Conformer
-:class:`Gemma4AudioConfig` and the audio tensor mapping exists
-(:func:`map_mmproj_audio_to_hf`), but the audio encoder is **not** yet wired
-into the assembled package — its Conformer forward-pass weight layout still
-needs validation against llama.cpp's ``clip.cpp`` gemma4a reference.  Pass
-``include_audio=True`` to opt in to the (experimental) audio path.
+:class:`Gemma4AudioConfig`; active ``gemma4a`` and encoder-free ``gemma4ua``
+roles are retained by default. Callers may explicitly request a vision-only
+package with ``include_audio=False``.
 """
 
 from __future__ import annotations
 
 __all__ = [
+    "build_audio_projector_from_gguf",
     "build_generic_projector_vlm_from_gguf",
     "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
+    "build_mmproj_from_gguf",
+    "build_qwen_glm_projector_from_gguf",
+    "build_remaining_vision_projector_from_gguf",
     "build_qwen_vlm_from_gguf",
     "build_vlm_from_gguf",
     "build_muse_glimmer_vlm_from_gguf",
@@ -47,11 +49,14 @@ __all__ = [
 ]
 
 import dataclasses
+import json
 import logging
 import math
+import re
+import warnings
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -59,6 +64,8 @@ from mobius._model_package import ModelPackage
 from mobius.integrations.gguf._arch_registry import MMPROJ_ARCHITECTURE
 from mobius.integrations.gguf._mmproj_registry import (
     LLAMA_CPP_MMPROJ_SHA,
+    BlockTensorVariantSpec,
+    IndexedTensorSpec,
     MMProjModality,
     ProjectorSpec,
     get_projector_spec,
@@ -435,7 +442,9 @@ def read_mmproj_audio_config(gguf_model: Any):
         linear_units=int(md["clip.audio.feed_forward_length"]),
         subsampling_conv_channels=[conv0, conv1],
         output_proj_dims=output_proj_dims,
-        rms_norm_eps=float(md.get("clip.audio.attention.layer_norm_epsilon", 1e-6)),
+        # The converter historically serialized 1e-5 here, while every
+        # Gemma4 audio graph and the upstream loader use 1e-6.
+        rms_norm_eps=1e-6,
     )
 
 
@@ -506,6 +515,19 @@ def _collect_block_tensors(
     return blocks, matched
 
 
+def _all_block_suffixes(
+    suffixes: tuple[str, ...],
+    variant: BlockTensorVariantSpec | None,
+) -> tuple[str, ...]:
+    if variant is None:
+        return suffixes
+    return (
+        *suffixes,
+        *variant.default_suffixes,
+        *variant.triggered_suffixes,
+    )
+
+
 def _validate_block_tensor_set(
     *,
     projector_type: str,
@@ -513,6 +535,8 @@ def _validate_block_tensor_set(
     blocks: dict[int, set[str]],
     block_count: int,
     required_suffixes: tuple[str, ...],
+    suffix_variants: tuple[tuple[str, ...], ...] = (),
+    variant: BlockTensorVariantSpec | None = None,
 ) -> None:
     expected_layers = set(range(block_count))
     if set(blocks) != expected_layers:
@@ -520,17 +544,90 @@ def _validate_block_tensor_set(
             f"{projector_type} {modality.value} block indices are "
             f"{sorted(blocks)}, expected {sorted(expected_layers)}."
         )
-    required = set(required_suffixes)
-    missing = {
-        layer: sorted(required - blocks[layer])
-        for layer in sorted(blocks)
-        if required - blocks[layer]
-    }
+    if suffix_variants:
+        variants = tuple(set(variant) for variant in suffix_variants)
+        mismatched = {
+            layer: sorted(blocks[layer])
+            for layer in sorted(blocks)
+            if not any(blocks[layer] == variant for variant in variants)
+        }
+        if mismatched:
+            raise ValueError(
+                f"{projector_type} mmproj has unsupported {modality.value} block "
+                f"suffix variants: {mismatched}"
+            )
+        return
+
+    common = set(required_suffixes)
+    missing: dict[int, list[str]] = {}
+    mixed: dict[int, list[str]] = {}
+    for layer in sorted(blocks):
+        present = blocks[layer]
+        required = set(common)
+        if variant is not None:
+            triggered = variant.trigger_suffix in present
+            selected = (
+                set(variant.triggered_suffixes) if triggered else set(variant.default_suffixes)
+            )
+            forbidden = (
+                set(variant.default_suffixes) if triggered else set(variant.triggered_suffixes)
+            )
+            required.update(selected)
+            unexpected_variant = sorted(present & forbidden)
+            if unexpected_variant:
+                mixed[layer] = unexpected_variant
+        absent = sorted(required - present)
+        if absent:
+            missing[layer] = absent
     if missing:
         raise ValueError(
             f"{projector_type} mmproj is missing required {modality.value} block "
             f"suffixes: {missing}"
         )
+    if mixed:
+        raise ValueError(
+            f"{projector_type} mmproj mixes dense and triggered {modality.value} "
+            f"block suffix families: {mixed}"
+        )
+
+
+def _indexed_tensor_count(metadata: dict[str, Any], family: IndexedTensorSpec) -> int:
+    value = metadata[family.count_metadata]
+    if family.count_is_array_length:
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{family.count_metadata} must be a nonempty integer array.")
+        if any(
+            isinstance(item, bool) or not isinstance(item, (int, np.integer)) for item in value
+        ):
+            raise ValueError(f"{family.count_metadata} must contain only integers.")
+        return len(value)
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+        raise ValueError(f"{family.count_metadata} must be a positive integer.")
+    return int(value)
+
+
+def _collect_indexed_tensor_family(
+    names: set[str],
+    metadata: dict[str, Any],
+    family: IndexedTensorSpec,
+    *,
+    projector_type: str,
+    modality: MMProjModality,
+) -> set[str]:
+    count = _indexed_tensor_count(metadata, family)
+    blocks, matched = _collect_block_tensors(
+        names,
+        prefix=family.prefix,
+        suffixes=family.required_suffixes,
+    )
+    _validate_block_tensor_set(
+        projector_type=projector_type,
+        modality=modality,
+        blocks=blocks,
+        block_count=count,
+        required_suffixes=family.required_suffixes,
+    )
+    return matched
 
 
 def _validate_gemma4_audio_metadata(metadata: dict[str, Any]) -> None:
@@ -539,8 +636,6 @@ def _validate_gemma4_audio_metadata(metadata: dict[str, Any]) -> None:
         raise ValueError("clip.has_audio_encoder must be boolean true for gemma4a.")
     positive_integer_keys = (
         "clip.audio.embedding_length",
-        "clip.audio.feed_forward_length",
-        "clip.audio.block_count",
         "clip.audio.projection_dim",
         "clip.audio.attention.head_count",
         "clip.audio.num_mel_bins",
@@ -549,6 +644,17 @@ def _validate_gemma4_audio_metadata(metadata: dict[str, Any]) -> None:
         value = metadata[key]
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
             raise ValueError(f"{key} must be a positive integer, got {value!r}.")
+    encoder_free = metadata.get("clip.audio.projector_type") == "gemma4ua"
+    for key in ("clip.audio.feed_forward_length", "clip.audio.block_count"):
+        value = metadata[key]
+        minimum = 0 if encoder_free else 1
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or value < minimum
+        ):
+            qualifier = "non-negative" if encoder_free else "positive"
+            raise ValueError(f"{key} must be a {qualifier} integer, got {value!r}.")
     epsilon = metadata["clip.audio.attention.layer_norm_epsilon"]
     if (
         isinstance(epsilon, bool)
@@ -566,12 +672,45 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
     """Validate the complete sidecar inventory, including deferred companions."""
     names = set(mmproj_gguf.tensor_names)
     top = set(spec.required_top_tensors) | set(spec.optional_top_tensors)
-    block_names, matched = _collect_block_tensors(
-        names,
-        prefix=spec.block_prefix or "",
-        suffixes=spec.block_suffixes,
-    )
+    if spec.block_prefix is None:
+        block_names: dict[int, set[str]] = {}
+        matched: set[str] = set()
+    else:
+        allowed_suffixes = (
+            tuple(
+                sorted(
+                    {suffix for variant in spec.block_suffix_variants for suffix in variant}
+                )
+            )
+            if spec.block_suffix_variants
+            else spec.block_suffixes
+        )
+        block_names, matched = _collect_block_tensors(
+            names,
+            prefix=spec.block_prefix,
+            suffixes=_all_block_suffixes(allowed_suffixes, spec.block_variant),
+        )
+    for pattern in spec.auxiliary_tensor_patterns:
+        expression = re.compile(pattern)
+        matched.update(name for name in names if expression.fullmatch(name))
     matched.update(top & names)
+    for group in spec.optional_top_tensor_groups:
+        present = set(group) & names
+        if present and present != set(group):
+            raise ValueError(
+                f"{spec.projector_type} mmproj has a partial optional tensor family: "
+                f"present={sorted(present)}, expected={sorted(group)}."
+            )
+    for family in spec.indexed_tensors:
+        matched.update(
+            _collect_indexed_tensor_family(
+                names,
+                mmproj_gguf.metadata,
+                family,
+                projector_type=spec.projector_type,
+                modality=spec.primary_modality,
+            )
+        )
 
     active_companions = []
     for companion in spec.companion_tensors:
@@ -595,13 +734,18 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
             )
         if companion.projector_type == "gemma4a":
             _validate_gemma4_audio_metadata(mmproj_gguf.metadata)
-        companion_top = set(companion.required_top_tensors)
+        companion_top = set(companion.required_top_tensors) | set(
+            companion.optional_top_tensors
+        )
         companion_blocks, companion_matched = _collect_block_tensors(
             names,
             prefix=companion.block_prefix,
-            suffixes=companion.block_suffixes,
+            suffixes=_all_block_suffixes(
+                companion.block_suffixes,
+                companion.block_variant,
+            ),
         )
-        missing_top = sorted(companion_top - names)
+        missing_top = sorted(set(companion.required_top_tensors) - names)
         if missing_top:
             raise ValueError(
                 f"{companion.projector_type} companion is missing required tensor(s): "
@@ -614,10 +758,46 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
             blocks=companion_blocks,
             block_count=int(mmproj_gguf.metadata[block_count_key]),
             required_suffixes=companion.block_suffixes,
+            variant=companion.block_variant,
         )
         matched.update(companion_top & names)
         matched.update(companion_matched)
+        for family in companion.indexed_tensors:
+            matched.update(
+                _collect_indexed_tensor_family(
+                    names,
+                    mmproj_gguf.metadata,
+                    family,
+                    projector_type=companion.projector_type,
+                    modality=companion.modality,
+                )
+            )
         active_companions.append(companion)
+
+    quarantined_names: set[str] = set()
+    for deferred in spec.deferred_companions:
+        presence_key = f"clip.has_{deferred.modality.value.replace('.', '_')}_encoder"
+        if not mmproj_gguf.metadata.get(presence_key):
+            continue
+        actual_type = projector_type_for_modality(
+            mmproj_gguf.metadata,
+            deferred.modality,
+        )
+        if actual_type != deferred.projector_type:
+            raise ValueError(
+                f"{spec.projector_type} sidecar declares deferred "
+                f"{deferred.modality.value} projector {actual_type!r}, expected "
+                f"{deferred.projector_type!r}."
+            )
+        for prefix in deferred.tensor_prefixes:
+            prefixed = {name for name in names if name.startswith(prefix)}
+            if not prefixed:
+                raise ValueError(
+                    f"{deferred.projector_type} deferred companion has no tensors "
+                    f"under required namespace {prefix!r}."
+                )
+            quarantined_names.update(prefixed)
+        matched.update(quarantined_names)
 
     unexpected = sorted(names - matched)
     if unexpected:
@@ -631,16 +811,22 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
         raise ValueError(
             f"{spec.projector_type} mmproj is missing required tensor(s): {missing_top}"
         )
-    layers = int(mmproj_gguf.metadata["clip.vision.block_count"])
-    _validate_block_tensor_set(
-        projector_type=spec.projector_type,
-        modality=MMProjModality.VISION,
-        blocks=block_names,
-        block_count=layers,
-        required_suffixes=spec.block_suffixes,
-    )
+    if spec.block_prefix is not None:
+        primary_modality = spec.primary_modality
+        layers = int(mmproj_gguf.metadata[f"clip.{primary_modality.value}.block_count"])
+        _validate_block_tensor_set(
+            projector_type=spec.projector_type,
+            modality=primary_modality,
+            blocks=block_names,
+            block_count=layers,
+            required_suffixes=spec.block_suffixes,
+            suffix_variants=spec.block_suffix_variants,
+            variant=spec.block_variant,
+        )
 
     for name in sorted(names):
+        if name in quarantined_names:
+            continue
         qtype = mmproj_gguf.get_tensor_type(name).name
         is_calibration = name.endswith(_CLIPPING_BOUND_SUFFIXES)
         if is_calibration and qtype != "F32":
@@ -654,7 +840,12 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
                 "an F16, BF16, or F32 mmproj so every role is explicitly dequantized."
             )
 
-    _validate_supported_mmproj_shapes(mmproj_gguf, spec)
+    if spec.projector_type == "dots3note_a":
+        _validate_supported_mmproj_shapes(mmproj_gguf, spec)
+    elif spec.primary_modality is MMProjModality.VISION:
+        _validate_supported_mmproj_shapes(mmproj_gguf, spec)
+    elif spec.primary_modality is MMProjModality.AUDIO:
+        _validate_gemma4_audio_metadata(mmproj_gguf.metadata)
     for companion in active_companions:
         if companion.projector_type == "gemma4a":
             _validate_gemma4_audio_companion_shapes(mmproj_gguf, companion)
@@ -721,6 +912,7 @@ def _validate_gemma4_audio_companion_shapes(mmproj_gguf: Any, companion: Any) ->
         "attn_pre_norm.weight": (hidden,),
         "attn_post_norm.weight": (hidden,),
         "ln2.weight": (hidden,),
+        "conv_norm.weight": (hidden,),
         "norm_conv.weight": (hidden,),
         "per_dim_scale.weight": (head_dim,),
     }
@@ -733,8 +925,791 @@ def _validate_gemma4_audio_companion_shapes(mmproj_gguf: Any, companion: Any) ->
                 _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (1,))
 
 
-def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+def _require_true(metadata: dict[str, Any], key: str, projector_type: str) -> None:
+    if metadata.get(key) is not True:
+        raise ValueError(f"{projector_type} requires {key}=true.")
+
+
+def _positive_metadata_int(metadata: dict[str, Any], key: str) -> int:
+    value = metadata[key]
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+        raise ValueError(f"{key} must be a positive integer, got {value!r}.")
+    return int(value)
+
+
+def _positive_metadata_float(metadata: dict[str, Any], key: str) -> float:
+    value = metadata[key]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise ValueError(f"{key} must be a positive finite number, got {value!r}.")
+    return float(value)
+
+
+def _metadata_int_array(metadata: dict[str, Any], key: str, *, nonempty: bool) -> list[int]:
+    value = metadata[key]
+    if (
+        not isinstance(value, list)
+        or (nonempty and not value)
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, np.integer)) for item in value
+        )
+    ):
+        qualifier = "nonempty " if nonempty else ""
+        raise ValueError(f"{key} must be a {qualifier}integer array.")
+    return [int(item) for item in value]
+
+
+def _validate_ocr_metadata(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    """Validate exact typed metadata before any OCR graph dimensions are used."""
+    route = spec.projector_type
+    if route not in {
+        "deepseekocr",
+        "deepseekocr2",
+        "dots_ocr",
+        "dots3note_v",
+        "dots3note_a",
+        "paddleocr",
+        "lightonocr",
+        "youtuvl",
+        "granite4_vision",
+    }:
+        return
     md = mmproj_gguf.metadata
+    presence = f"clip.has_{spec.primary_modality.value}_encoder"
+    _require_true(md, presence, route)
+    prefix = f"clip.{spec.primary_modality.value}"
+    for suffix in (
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "projection_dim",
+        "attention.head_count",
+    ):
+        _positive_metadata_int(md, f"{prefix}.{suffix}")
+    _positive_metadata_float(md, f"{prefix}.attention.layer_norm_epsilon")
+    if spec.primary_modality is MMProjModality.VISION:
+        image_size = md["clip.vision.image_size"]
+        if (
+            isinstance(image_size, bool)
+            or not isinstance(image_size, (int, np.integer))
+            or image_size < 0
+        ):
+            raise ValueError("clip.vision.image_size must be a non-negative integer.")
+        _positive_metadata_int(md, "clip.vision.patch_size")
+        for key in ("clip.vision.image_mean", "clip.vision.image_std"):
+            value = md[key]
+            if (
+                not isinstance(value, list)
+                or len(value) < 3
+                or any(
+                    isinstance(item, bool)
+                    or not isinstance(item, (int, float, np.integer, np.floating))
+                    or not math.isfinite(float(item))
+                    for item in value[:3]
+                )
+            ):
+                raise ValueError(f"{key} must contain at least three finite numbers.")
+    else:
+        _positive_metadata_int(md, "clip.audio.num_mel_bins")
+
+    if route in {"deepseekocr", "deepseekocr2"}:
+        if _positive_metadata_int(md, "clip.vision.sam.block_count") != 12:
+            raise ValueError("clip.vision.sam.block_count must be exactly 12.")
+        _positive_metadata_int(md, "clip.vision.sam.embedding_length")
+        _positive_metadata_int(md, "clip.vision.sam.head_count")
+        _positive_metadata_int(md, "clip.vision.window_size")
+        min_tiles = md.get("clip.vision.preproc_min_tiles", 2)
+        max_tiles = md.get(
+            "clip.vision.preproc_max_tiles",
+            9 if route == "deepseekocr" else 6,
+        )
+        if (
+            isinstance(min_tiles, bool)
+            or isinstance(max_tiles, bool)
+            or not isinstance(min_tiles, (int, np.integer))
+            or not isinstance(max_tiles, (int, np.integer))
+            or not 0 <= int(min_tiles) <= int(max_tiles) <= 256
+        ):
+            raise ValueError("DeepSeek OCR preprocessor tile bounds are invalid.")
+    if route in {"dots_ocr", "dots3note_v", "paddleocr"}:
+        minimum = _positive_metadata_int(md, "clip.vision.image_min_pixels")
+        maximum = _positive_metadata_int(md, "clip.vision.image_max_pixels")
+        if minimum > maximum:
+            raise ValueError("clip.vision.image_min_pixels must not exceed image_max_pixels.")
+    if route == "dots_ocr":
+        _positive_metadata_int(md, "clip.vision.projector.scale_factor")
+    if route == "dots3note_v":
+        _require_true(md, "clip.has_audio_encoder", route)
+        _positive_metadata_int(md, "clip.vision.spatial_merge_size")
+        _positive_metadata_int(md, "clip.vision.expert_used_count")
+    if route == "dots3note_a":
+        _require_true(md, "clip.has_vision_encoder", route)
+    if route == "lightonocr":
+        _positive_metadata_int(md, "clip.vision.spatial_merge_size")
+        if "clip.vision.preproc_image_size" in md:
+            _positive_metadata_int(md, "clip.vision.preproc_image_size")
+    if route == "youtuvl":
+        if _positive_metadata_int(md, "clip.vision.spatial_merge_size") != 2:
+            raise ValueError("youtuvl spatial merge size must be exactly 2.")
+        _positive_metadata_int(md, "clip.vision.window_size")
+        _metadata_int_array(md, "clip.vision.wa_layer_indexes", nonempty=True)
+    if route == "granite4_vision":
+        feature_layers = _metadata_int_array(
+            md,
+            "clip.vision.feature_layer",
+            nonempty=True,
+        )
+        offsets = _metadata_int_array(
+            md,
+            "clip.vision.projector.spatial_offsets",
+            nonempty=True,
+        )
+        if len(feature_layers) != len(offsets):
+            raise ValueError(
+                "granite4_vision feature layers and spatial offsets must have equal length."
+            )
+        pinpoints = _metadata_int_array(
+            md,
+            "clip.vision.image_grid_pinpoints",
+            nonempty=True,
+        )
+        if len(pinpoints) % 2:
+            raise ValueError(
+                "clip.vision.image_grid_pinpoints must contain height/width pairs."
+            )
+        _positive_metadata_int(md, "clip.vision.projector.query_side")
+        _positive_metadata_int(md, "clip.vision.projector.window_side")
+
+
+def _validate_deepseek_sam_shapes(mmproj_gguf: Any, output_channels: int) -> None:
+    md = mmproj_gguf.metadata
+    sam_hidden = int(md["clip.vision.sam.embedding_length"])
+    sam_heads = int(md["clip.vision.sam.head_count"])
+    sam_layers = int(md["clip.vision.sam.block_count"])
+    if sam_layers != 12 or sam_hidden <= 0 or sam_hidden % sam_heads:
+        raise ValueError(
+            "DeepSeek OCR SAM must have 12 layers and divisible hidden/head dimensions."
+        )
+    head_dim = sam_hidden // sam_heads
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.sam.patch_embd.weight",
+        (sam_hidden, 3, 16, 16),
+    )
+    _expect_mmproj_shape(mmproj_gguf, "v.sam.patch_embd.bias", (sam_hidden,))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.sam.pos_embd.weight",
+        (1, 64, 64, sam_hidden),
+    )
+    global_layers = {2, 5, 8, 11}
+    window = int(md["clip.vision.window_size"])
+    for layer in range(sam_layers):
+        prefix = f"v.sam.blk.{layer}."
+        for suffix in ("pre_ln.weight", "pre_ln.bias", "post_ln.weight", "post_ln.bias"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (sam_hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "attn.qkv.weight",
+            (3 * sam_hidden, sam_hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "attn.qkv.bias", (3 * sam_hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "attn.out.weight",
+            (sam_hidden, sam_hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "attn.out.bias", (sam_hidden,))
+        rel_length = 127 if layer in global_layers else 2 * window - 1
+        for axis in ("h", "w"):
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + f"attn.pos_{axis}.weight",
+                (rel_length, head_dim),
+            )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "mlp.lin1.weight",
+            (4 * sam_hidden, sam_hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "mlp.lin1.bias", (4 * sam_hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "mlp.lin2.weight",
+            (sam_hidden, 4 * sam_hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "mlp.lin2.bias", (sam_hidden,))
+    _expect_mmproj_shape(mmproj_gguf, "v.sam.neck.0.weight", (256, sam_hidden, 1, 1))
+    for name in ("v.sam.neck.1.weight", "v.sam.neck.1.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (256,))
+    _expect_mmproj_shape(mmproj_gguf, "v.sam.neck.2.weight", (256, 256, 3, 3))
+    for name in ("v.sam.neck.3.weight", "v.sam.neck.3.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (256,))
+    _expect_mmproj_shape(mmproj_gguf, "v.sam.net_2.weight", (512, 256, 3, 3))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.sam.net_3.weight",
+        (output_channels, 512, 3, 3),
+    )
+
+
+def _validate_deepseek_ocr_shapes(mmproj_gguf: Any, projector_type: str) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_gelu", projector_type)
+    hidden = int(md["clip.vision.embedding_length"])
+    heads = int(md["clip.vision.attention.head_count"])
+    layers = int(md["clip.vision.block_count"])
+    projection = int(md["clip.vision.projection_dim"])
+    if (
+        hidden <= 0
+        or heads <= 0
+        or hidden % heads
+        or (projector_type == "deepseekocr2" and (hidden // heads) % 2)
+    ):
+        raise ValueError(f"{projector_type} has invalid hidden/head dimensions.")
+    _validate_deepseek_sam_shapes(mmproj_gguf, hidden)
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        if projector_type == "deepseekocr":
+            for suffix in ("ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "attn_qkv.weight",
+                (3 * hidden, hidden),
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + "attn_qkv.bias", (3 * hidden,))
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "attn_out.weight",
+                (hidden, hidden),
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + "attn_out.bias", (hidden,))
+            ffn = mmproj_gguf.get_tensor_shape(prefix + "ffn_up.weight")[0]
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.weight", (ffn, hidden))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.bias", (ffn,))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.weight", (hidden, ffn))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+        else:
+            kv_heads = int(md["clip.vision.attention.head_count_kv"])
+            if kv_heads <= 0 or heads % kv_heads:
+                raise ValueError("deepseekocr2 head_count_kv must divide head_count.")
+            head_dim = hidden // heads
+            kv_width = kv_heads * head_dim
+            for stem, width in (
+                ("attn_q", hidden),
+                ("attn_k", kv_width),
+                ("attn_v", kv_width),
+            ):
+                _expect_mmproj_shape(
+                    mmproj_gguf,
+                    prefix + stem + ".weight",
+                    (width, hidden),
+                )
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (width,))
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "attn_out.weight",
+                (hidden, hidden),
+            )
+            for suffix in ("ln1.weight", "ln2.weight"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+            ffn = int(md["clip.vision.feed_forward_length"])
+            for stem in ("ffn_gate", "ffn_up"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (ffn, hidden))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.weight", (hidden, ffn))
+    if projector_type == "deepseekocr":
+        _expect_mmproj_shape(mmproj_gguf, "v.class_embd", (hidden,))
+        _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, 14, 14))
+        _expect_mmproj_shape(mmproj_gguf, "v.position_embd.weight", (257, hidden))
+        for name in ("v.pre_ln.weight", "v.pre_ln.bias"):
+            _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+        _expect_mmproj_shape(mmproj_gguf, "v.image_newline", (projection,))
+        _expect_mmproj_shape(mmproj_gguf, "mm.model.fc.weight", (projection, 2 * hidden))
+    else:
+        _expect_mmproj_shape(mmproj_gguf, "v.post_ln.weight", (hidden,))
+        _expect_mmproj_shape(mmproj_gguf, "v.resample_query_768.weight", (144, hidden))
+        _expect_mmproj_shape(mmproj_gguf, "v.resample_query_1024.weight", (256, hidden))
+        _expect_mmproj_shape(mmproj_gguf, "mm.model.fc.weight", (projection, hidden))
+    _expect_mmproj_shape(mmproj_gguf, "mm.model.fc.bias", (projection,))
+    view_shape = mmproj_gguf.get_tensor_shape("v.view_seperator")
+    if view_shape not in {(projection,), (1, projection)}:
+        raise ValueError(
+            f"v.view_seperator has shape {view_shape}, expected {(projection,)} or "
+            f"{(1, projection)}."
+        )
+
+
+def _validate_dots_audio_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    hidden = int(md["clip.audio.embedding_length"])
+    intermediate = int(md["clip.audio.feed_forward_length"])
+    layers = int(md["clip.audio.block_count"])
+    heads = int(md["clip.audio.attention.head_count"])
+    output = int(md["clip.audio.projection_dim"])
+    mel_bins = int(md["clip.audio.num_mel_bins"])
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4:
+        raise ValueError("dots3note_a has invalid hidden/head dimensions.")
+    conv_channels = mmproj_gguf.get_tensor_shape("a.conv2d.1.weight")[0]
+    _expect_mmproj_shape(mmproj_gguf, "a.conv2d.1.weight", (conv_channels, 1, 3, 3))
+    _expect_mmproj_shape(mmproj_gguf, "a.conv2d.1.bias", (conv_channels,))
+    for index in (2, 3):
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            f"a.conv2d.{index}.weight",
+            (conv_channels, conv_channels, 3, 3),
+        )
+        _expect_mmproj_shape(mmproj_gguf, f"a.conv2d.{index}.bias", (conv_channels,))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "a.conv_out.weight",
+        (hidden, conv_channels * ((mel_bins + 7) // 8)),
+    )
+    _expect_mmproj_shape(mmproj_gguf, "a.post_ln.weight", (hidden,))
+    for layer in range(layers):
+        prefix = f"a.blk.{layer}."
+        for suffix in ("ln1.weight", "ln2.weight"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+        for stem in ("attn_q", "attn_v", "attn_out"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
+        _expect_mmproj_shape(mmproj_gguf, prefix + "attn_k.weight", (hidden, hidden))
+        for stem in ("ffn_gate", "ffn_up"):
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + stem + ".weight",
+                (intermediate, hidden),
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (intermediate,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_down.weight",
+            (hidden, intermediate),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+    for name in ("mm.a.norm_pre.weight", "mm.a.norm_pre.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.mlp.1.weight", (output, hidden))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.mlp.1.bias", (output,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.mlp.3.weight", (output, output))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.mlp.3.bias", (output,))
+
+
+def _validate_dots_vision_shapes(mmproj_gguf: Any, projector_type: str) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_silu", projector_type)
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    merge = int(
+        md[
+            "clip.vision.projector.scale_factor"
+            if projector_type == "dots_ocr"
+            else "clip.vision.spatial_merge_size"
+        ]
+    )
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4 or merge <= 0:
+        raise ValueError(f"{projector_type} has invalid hidden/head/merge dimensions.")
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
+    _expect_mmproj_shape(mmproj_gguf, "v.pre_ln.weight", (hidden,))
+    expert_counts: list[int] = []
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        for suffix in ("ln1.weight", "ln2.weight"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "attn_qkv.weight",
+            (3 * hidden, hidden),
+        )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "attn_out.weight",
+            (hidden, hidden),
+        )
+        if projector_type == "dots3note_v":
+            head_dim = hidden // heads
+            for suffix in ("attn_q_norm.weight", "attn_k_norm.weight"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (head_dim,))
+        if prefix + "ffn_gate_exps.weight" in mmproj_gguf.tensor_names:
+            experts, expert_intermediate, expert_hidden = mmproj_gguf.get_tensor_shape(
+                prefix + "ffn_gate_exps.weight"
+            )
+            expert_counts.append(experts)
+            if expert_hidden != hidden:
+                raise ValueError(f"{prefix} expert gate hidden size is invalid.")
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "ffn_up_exps.weight",
+                (experts, expert_intermediate, hidden),
+            )
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "ffn_down_exps.weight",
+                (experts, hidden, expert_intermediate),
+            )
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "ffn_gate_inp.weight",
+                (experts, hidden),
+            )
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "exp_probs_b.weight",
+                (experts,),
+            )
+        else:
+            for stem in ("ffn_gate", "ffn_up"):
+                _expect_mmproj_shape(
+                    mmproj_gguf,
+                    prefix + stem + ".weight",
+                    (intermediate, hidden),
+                )
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "ffn_down.weight",
+                (hidden, intermediate),
+            )
+    if expert_counts:
+        top_k = int(md.get("clip.vision.expert_used_count", 0))
+        if top_k <= 0 or any(top_k > count for count in expert_counts):
+            raise ValueError(
+                f"{projector_type} expert_used_count must be positive and no larger "
+                "than every layer expert count."
+            )
+    _expect_mmproj_shape(mmproj_gguf, "mm.post_norm.weight", (hidden,))
+    for name in ("mm.input_norm.weight", "mm.input_norm.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    merged = hidden * merge * merge
+    _expect_mmproj_shape(mmproj_gguf, "mm.0.weight", (merged, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.0.bias", (merged,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.bias", (projection,))
+    if projector_type == "dots3note_v":
+        _validate_ocr_metadata(mmproj_gguf, get_projector_spec("dots3note_a"))
+        _validate_dots_audio_shapes(mmproj_gguf)
+
+
+def _validate_split_vision_block_shapes(
+    mmproj_gguf: Any,
+    *,
+    hidden: int,
+    intermediate: int,
+    layers: int,
+) -> None:
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
+        for suffix in ("ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_up.weight",
+            (intermediate, hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.bias", (intermediate,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_down.weight",
+            (hidden, intermediate),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+
+
+def _validate_paddleocr_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_gelu", "paddleocr")
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4:
+        raise ValueError("paddleocr has invalid hidden/head dimensions.")
+    if int(md.get("clip.vision.spatial_merge_size", 2)) != 2:
+        raise ValueError("paddleocr only supports its hard-coded spatial merge size 2.")
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
+    position = mmproj_gguf.get_tensor_shape("v.position_embd.weight")
+    if (
+        len(position) != 2
+        or position[1] != hidden
+        or math.isqrt(position[0]) ** 2 != position[0]
+    ):
+        raise ValueError("paddleocr position embeddings must be a square table.")
+    for name in ("v.post_ln.weight", "v.post_ln.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    _validate_split_vision_block_shapes(
+        mmproj_gguf,
+        hidden=hidden,
+        intermediate=intermediate,
+        layers=layers,
+    )
+    for name in ("mm.input_norm.weight", "mm.input_norm.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    merged = hidden * 4
+    _expect_mmproj_shape(mmproj_gguf, "mm.1.weight", (merged, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.1.bias", (merged,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.bias", (projection,))
+
+
+def _validate_lightonocr_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_silu", "lightonocr")
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    merge = int(md["clip.vision.spatial_merge_size"])
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4:
+        raise ValueError("lightonocr has invalid hidden/head dimensions.")
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+    _expect_mmproj_shape(mmproj_gguf, "v.pre_ln.weight", (hidden,))
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
+        for suffix in ("ln1.weight", "ln2.weight"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+        for stem in ("ffn_gate", "ffn_up"):
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + stem + ".weight",
+                (intermediate, hidden),
+            )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_down.weight",
+            (hidden, intermediate),
+        )
+    _expect_mmproj_shape(mmproj_gguf, "mm.input_norm.weight", (hidden,))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "mm.patch_merger.weight",
+        (hidden, hidden * merge * merge),
+    )
+    _expect_mmproj_shape(mmproj_gguf, "mm.1.weight", (hidden, hidden))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, hidden))
+    for name in ("mm.1.bias", "mm.2.bias"):
+        if name in mmproj_gguf.tensor_names:
+            expected = hidden if name == "mm.1.bias" else projection
+            _expect_mmproj_shape(mmproj_gguf, name, (expected,))
+
+
+def _validate_youtuvl_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_gelu", "youtuvl")
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    merge = int(md["clip.vision.spatial_merge_size"])
+    window = int(md["clip.vision.window_size"])
+    indexes = md["clip.vision.wa_layer_indexes"]
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4:
+        raise ValueError("youtuvl has invalid hidden/head dimensions.")
+    if (
+        not isinstance(indexes, list)
+        or not indexes
+        or len(set(indexes)) != len(indexes)
+        or any(isinstance(index, bool) or not 0 <= index < layers for index in indexes)
+    ):
+        raise ValueError("youtuvl wa_layer_indexes must be unique in-range integers.")
+    if window <= 0 or window % (patch * merge):
+        raise ValueError("youtuvl window_size must divide into merged patch windows.")
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.patch_embd.weight",
+        (hidden, 3 * patch * patch),
+    )
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
+    for name in ("v.post_ln.weight", "v.post_ln.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    _validate_split_vision_block_shapes(
+        mmproj_gguf,
+        hidden=hidden,
+        intermediate=intermediate,
+        layers=layers,
+    )
+    _expect_mmproj_shape(mmproj_gguf, "mm.input_norm.weight", (hidden,))
+    merged = hidden * merge * merge
+    _expect_mmproj_shape(mmproj_gguf, "mm.0.weight", (merged, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.0.bias", (merged,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.bias", (projection,))
+
+
+def _validate_granite4_vision_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_gelu", "granite4_vision")
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    image = int(md["clip.vision.image_size"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError("granite4_vision has invalid hidden/head dimensions.")
+    feature_layers = md["clip.vision.feature_layer"]
+    offsets = md["clip.vision.projector.spatial_offsets"]
+    query_side = int(md["clip.vision.projector.query_side"])
+    window_side = int(md["clip.vision.projector.window_side"])
+    if (
+        not isinstance(feature_layers, list)
+        or not feature_layers
+        or not isinstance(offsets, list)
+        or len(offsets) != len(feature_layers)
+        or any(not 0 <= index < layers for index in feature_layers)
+        or any(offset not in {-1, 0, 1, 2, 3} for offset in offsets)
+    ):
+        raise ValueError("granite4_vision feature layers/spatial offsets are invalid.")
+    image_side = image // patch
+    if (
+        image % patch
+        or image_side % window_side
+        or image_side // window_side * query_side * 2 != image_side
+    ):
+        raise ValueError("granite4_vision patch/window/query geometry is invalid.")
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.position_embd.weight",
+        (image_side * image_side, hidden),
+    )
+    for name in ("v.post_ln.weight", "v.post_ln.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    _expect_mmproj_shape(mmproj_gguf, "v.image_newline", (projection,))
+    _validate_split_vision_block_shapes(
+        mmproj_gguf,
+        hidden=hidden,
+        intermediate=intermediate,
+        layers=layers,
+    )
+    for index in range(len(feature_layers)):
+        prefix = f"v.proj_blk.{index}."
+        _expect_mmproj_shape(mmproj_gguf, prefix + "img_pos", (1, window_side**2, hidden))
+        _expect_mmproj_shape(mmproj_gguf, prefix + "query", (1, query_side**2, hidden))
+        for stem in (
+            "norm",
+            "post_norm",
+            "self_attn_norm",
+            "cross_attn_norm",
+            "ffn_norm",
+        ):
+            for kind in ("weight", "bias"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + "." + kind, (hidden,))
+        for stem in (
+            "self_attn_q",
+            "self_attn_k",
+            "self_attn_v",
+            "self_attn_out",
+            "cross_attn_q",
+            "cross_attn_k",
+            "cross_attn_v",
+            "cross_attn_out",
+        ):
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + stem + ".weight",
+                (hidden, hidden),
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
+        qformer_intermediate = mmproj_gguf.get_tensor_shape(prefix + "ffn_up.weight")[0]
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_up.weight",
+            (qformer_intermediate, hidden),
+        )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_up.bias",
+            (qformer_intermediate,),
+        )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_down.weight",
+            (hidden, qformer_intermediate),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "linear.weight",
+            (projection, hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "linear.bias", (projection,))
+
+
+def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    _validate_ocr_metadata(mmproj_gguf, spec)
+    if spec.sidecar_builder == "core_vlm_projector":
+        from mobius.integrations.gguf._core_vlm_projector import (
+            validate_core_vlm_projector_shapes,
+        )
+
+        validate_core_vlm_projector_shapes(mmproj_gguf, spec.projector_type)
+        return
+    if spec.sidecar_builder == "qwen_glm_projector":
+        from mobius.integrations.gguf._qwen_glm_projector import (
+            validate_qwen_glm_projector_shapes,
+        )
+
+        validate_qwen_glm_projector_shapes(mmproj_gguf, spec.projector_type)
+        return
+    if spec.sidecar_builder == "remaining_vision_projector":
+        from mobius.integrations.gguf._remaining_projectors import (
+            validate_remaining_projector_shapes,
+        )
+
+        validate_remaining_projector_shapes(mmproj_gguf, spec.projector_type)
+        validate_remaining_projector_shapes(mmproj_gguf, spec.projector_type)
+    if spec.projector_type == "dots3note_a":
+        _validate_ocr_metadata(mmproj_gguf, get_projector_spec("dots3note_v"))
+        _validate_dots_audio_shapes(mmproj_gguf)
+        _validate_dots_vision_shapes(mmproj_gguf, "dots3note_v")
+        _validate_dots_vision_shapes(mmproj_gguf, "dots3note_v")
+        return
+    if spec.primary_modality is not MMProjModality.VISION:
+        raise RuntimeError(
+            f"{spec.projector_type} declares a non-vision primary modality without "
+            "an architecture-specific shape validator."
+        )
+    md = mmproj_gguf.metadata
+    if spec.projector_type in {"deepseekocr", "deepseekocr2"}:
+        _validate_deepseek_ocr_shapes(mmproj_gguf, spec.projector_type)
+        return
+    if spec.projector_type in {"dots_ocr", "dots3note_v"}:
+        _validate_dots_vision_shapes(mmproj_gguf, spec.projector_type)
+        return
+    if spec.projector_type == "paddleocr":
+        _validate_paddleocr_shapes(mmproj_gguf)
+        return
+    if spec.projector_type == "lightonocr":
+        _validate_lightonocr_shapes(mmproj_gguf)
+        return
+    if spec.projector_type == "youtuvl":
+        _validate_youtuvl_shapes(mmproj_gguf)
+        return
+    if spec.projector_type == "granite4_vision":
+        _validate_granite4_vision_shapes(mmproj_gguf)
+        return
     hidden = int(md["clip.vision.embedding_length"])
     intermediate = int(md["clip.vision.feed_forward_length"])
     layers = int(md["clip.vision.block_count"])
@@ -984,6 +1959,15 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         _generic_projector_dimensions(mmproj_gguf, spec.projector_type, vision)
 
 
+def _validate_supported_mmproj_metadata(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    if spec.sidecar_builder == "qwen_glm_projector":
+        from mobius.integrations.gguf._qwen_glm_projector import (
+            validate_qwen_glm_projector_metadata,
+        )
+
+        validate_qwen_glm_projector_metadata(mmproj_gguf, spec.projector_type)
+
+
 def _preflight_mmproj_pair(
     text_gguf: Any,
     mmproj_gguf: Any,
@@ -1024,6 +2008,7 @@ def _preflight_mmproj_pair(
             raise ValueError(
                 f"{projector_type} mmproj is missing required metadata: {missing_metadata}"
             )
+        _validate_supported_mmproj_metadata(mmproj_gguf, spec)
         _validate_mmproj_tensor_closure(mmproj_gguf, spec)
         if not spec.is_importable:
             blocked = ", ".join(
@@ -1038,6 +2023,151 @@ def _preflight_mmproj_pair(
             )
         resolved[modality] = spec
     return resolved
+
+
+def _preflight_standalone_mmproj(
+    mmproj_gguf: Any,
+    *,
+    projector_type: str,
+    target_architecture: str,
+) -> ProjectorSpec:
+    """Validate one explicitly selected standalone sidecar graph route."""
+    if mmproj_gguf.architecture != MMPROJ_ARCHITECTURE:
+        raise ValueError(
+            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF, got architecture "
+            f"{mmproj_gguf.architecture!r}."
+        )
+    _validate_mmproj_container_type(mmproj_gguf)
+    spec = get_projector_spec(projector_type)
+    canonical_target = _canonical_text_architecture(target_architecture)
+    if canonical_target not in spec.target_architectures:
+        raise ValueError(
+            f"clip projector {projector_type!r} targets "
+            f"{sorted(spec.target_architectures)}, not text architecture "
+            f"{target_architecture!r}."
+        )
+
+    selected_modalities = []
+    for modality in spec.modalities:
+        presence_key = f"clip.has_{modality.value.replace('.', '_')}_encoder"
+        presence = mmproj_gguf.metadata.get(presence_key)
+        if modality is spec.primary_modality and presence is not True:
+            raise ValueError(
+                f"{presence_key} must be the literal boolean true for {projector_type!r}."
+            )
+        if presence is not True:
+            continue
+        if projector_type_for_modality(mmproj_gguf.metadata, modality) == projector_type:
+            selected_modalities.append(modality)
+    if spec.primary_modality not in selected_modalities:
+        raise ValueError(
+            f"mmproj GGUF does not declare {projector_type!r} for its "
+            f"{spec.primary_modality.value} encoder."
+        )
+
+    missing_metadata = [
+        key for key in spec.required_metadata if key not in mmproj_gguf.metadata
+    ]
+    if missing_metadata:
+        raise ValueError(
+            f"{projector_type} mmproj is missing required metadata: {missing_metadata}"
+        )
+    _validate_supported_mmproj_metadata(mmproj_gguf, spec)
+    _validate_mmproj_tensor_closure(mmproj_gguf, spec)
+    if not spec.is_importable or spec.sidecar_builder is None:
+        blocked = ", ".join(
+            name
+            for name, verdict in spec.verdicts.items()
+            if name != "runtime" and verdict is not Support.SUPPORTED
+        )
+        raise NotImplementedError(
+            f"clip projector {projector_type!r} has no standalone graph importer at "
+            f"llama.cpp {LLAMA_CPP_MMPROJ_SHA} ({blocked or 'dispatch'} unavailable): "
+            f"{spec.reason}"
+        )
+    return spec
+
+
+def build_mmproj_from_gguf(
+    mmproj_gguf_path: str | Path,
+    *,
+    projector_type: str,
+    target_architecture: str,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build explicit standalone encoder/projector components from one sidecar.
+
+    This entry point never synthesizes a text decoder or runtime assembly. The
+    caller names both the serialized projector route and its paired text
+    architecture so a vision, audio, merger, or speaker encoder cannot be
+    mistaken for a generic VLM package.
+    """
+    from mobius.integrations.gguf._builder import _validate_gguf_model
+    from mobius.integrations.gguf._reader import GGUFModel
+
+    resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
+    )
+    _validate_gguf_model(
+        mmproj_gguf,
+        source=str(mmproj_gguf_path),
+        allow_mmproj_companion=True,
+    )
+    spec = _preflight_standalone_mmproj(
+        mmproj_gguf,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+    )
+    if spec.runtime is not Support.SUPPORTED:
+        warnings.warn(
+            f"clip projector {projector_type!r} exports an exact ONNX component, "
+            "but downstream runtime execution remains unvalidated.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    builder_attribute = _MMPROJ_BUILDERS.get(spec.sidecar_builder or "")
+    if builder_attribute is None:
+        raise RuntimeError(
+            f"Projector registry references unknown standalone builder "
+            f"{spec.sidecar_builder!r}."
+        )
+    builder: Callable[..., ModelPackage] = globals()[builder_attribute]
+    package = builder(
+        resolved_path,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+        dtype=dtype,
+        execution_provider=execution_provider,
+        _mmproj_gguf_model=mmproj_gguf,
+    )
+    expected_roles = {role.value for role in spec.model_roles}
+    if set(package) != expected_roles:
+        raise RuntimeError(
+            f"{projector_type} standalone builder produced components "
+            f"{sorted(package)}, expected {sorted(expected_roles)}."
+        )
+    if spec.runtime is not Support.SUPPORTED:
+        logger.warning(
+            "Built standalone %s graph component(s) for clip projector %r; "
+            "downstream runtime orchestration is %s: %s",
+            ", ".join(sorted(expected_roles)),
+            projector_type,
+            spec.runtime.value,
+            spec.reason,
+        )
+    return package
+
+
+def build_ocr_projector_from_gguf(*args, **kwargs) -> ModelPackage:
+    """Lazily dispatch the OCR/document standalone sidecar builder."""
+    from mobius.integrations.gguf._ocr_projector import (
+        build_ocr_projector_from_gguf as build,
+    )
+
+    return build(*args, **kwargs)
 
 
 def _token_id(text_gguf: Any, token: str) -> int | None:
@@ -2176,6 +3306,7 @@ def _preflight_mmproj_quantization_report(
     mmproj_gguf: Any,
     *,
     include_audio: bool,
+    standalone_projector_type: str | None = None,
 ) -> GGUFQuantizationReport:
     """Classify every mapped mmproj vision/(audio) tensor before conversion.
 
@@ -2195,8 +3326,10 @@ def _preflight_mmproj_quantization_report(
     into the package-level report.
     """
     from mobius.integrations.gguf._mmproj_mapping import (
+        map_mmproj_audio_projector_to_onnx,
         map_mmproj_audio_to_hf,
         map_mmproj_vision_to_hf,
+        map_ocr_projector_to_onnx,
     )
     from mobius.integrations.gguf._quant_registry import (
         float_storage_type_ids,
@@ -2210,6 +3343,19 @@ def _preflight_mmproj_quantization_report(
     from mobius.integrations.gguf._spec import Support
 
     float_type_ids = float_storage_type_ids()
+    metadata = getattr(mmproj_gguf, "metadata", {})
+    vision_projector_type = (
+        projector_type_for_modality(metadata, MMProjModality.VISION) if metadata else "gemma4v"
+    )
+    audio_projector_type = (
+        (
+            projector_type_for_modality(metadata, MMProjModality.AUDIO)
+            if metadata
+            else "gemma4a"
+        )
+        if include_audio
+        else None
+    )
     source_qtypes: list[tuple[str, int]] = []
     records: list[QuantizationTensorRecord] = []
     rejected: list[QuantizationTensorRecord] = []
@@ -2224,12 +3370,42 @@ def _preflight_mmproj_quantization_report(
         source_qtypes.append((qtype_name, source_bytes))
 
         hf_name = None
-        if tensor.name.startswith("v.") or tensor.name == "mm.input_projection.weight":
-            hf_name = map_mmproj_vision_to_hf(tensor.name)
+        if standalone_projector_type is not None:
+            standalone_spec = get_projector_spec(standalone_projector_type)
+            if standalone_spec.sidecar_builder == "ocr_projector":
+                route = standalone_projector_type
+                if standalone_projector_type in {"dots3note_v", "dots3note_a"}:
+                    route = (
+                        "dots3note_a"
+                        if tensor.name.startswith(("a.", "mm.a."))
+                        else "dots3note_v"
+                    )
+                hf_name = map_ocr_projector_to_onnx(tensor.name, route)
+            else:
+                hf_name = map_mmproj_audio_projector_to_onnx(
+                    tensor.name,
+                    standalone_projector_type,
+                )
+        elif tensor.name.startswith("v.") or tensor.name == "mm.input_projection.weight":
+            if vision_projector_type == "gemma4uv":
+                from mobius.integrations.gguf._core_vlm_projector import (
+                    map_core_vlm_projector_tensor,
+                )
+
+                hf_name = map_core_vlm_projector_tensor(tensor.name, "gemma4uv")
+            else:
+                hf_name = map_mmproj_vision_to_hf(tensor.name)
         elif include_audio and (
             tensor.name.startswith("a.") or tensor.name == "mm.a.input_projection.weight"
         ):
-            hf_name = map_mmproj_audio_to_hf(tensor.name)
+            if audio_projector_type == "gemma4ua":
+                from mobius.integrations.gguf._core_vlm_projector import (
+                    map_core_vlm_projector_tensor,
+                )
+
+                hf_name = map_core_vlm_projector_tensor(tensor.name, "gemma4ua")
+            else:
+                hf_name = map_mmproj_audio_to_hf(tensor.name)
         if hf_name is None:
             # Unmapped tensor (e.g. a different modality, or an unused
             # metadata tensor): still counted in the source qtype census
@@ -2347,7 +3523,7 @@ def build_gemma4_vlm_from_gguf(
     dtype: str | None = None,
     execution_provider: str = "default",
     image_token_id: int | None = None,
-    include_audio: bool = False,
+    include_audio: bool | None = None,
     keep_quantized: bool = True,
     _text_gguf_model: Any | None = None,
     _mmproj_gguf_model: Any | None = None,
@@ -2362,8 +3538,8 @@ def build_gemma4_vlm_from_gguf(
         image_token_id: Vocabulary id of the image soft-token placeholder used
             to scatter image features into text embeddings. When ``None``, the
             value carried by the text config is used (if any).
-        include_audio: When ``True``, also build the (experimental) audio
-            encoder. Off by default — see the module docstring.
+        include_audio: Whether to build an audio role when the sidecar carries
+            one. ``None`` (the default) preserves every active supported role.
         keep_quantized: Preserve the text backbone's GGUF quantization when
             present as quantized target storage. This is the default: decoder projections become
             MatMulNBits and compatible token-embedding tables become
@@ -2395,6 +3571,7 @@ def build_gemma4_vlm_from_gguf(
     import dataclasses
 
     from mobius._builder import resolve_dtype
+    from mobius._configs import Gemma4Config
     from mobius.integrations.gguf._builder import (
         _has_quantized_weights,
         _preflight_quantization_report,
@@ -2403,8 +3580,8 @@ def build_gemma4_vlm_from_gguf(
     )
     from mobius.integrations.gguf._config_mapping import gguf_to_config
     from mobius.integrations.gguf._reader import GGUFModel
-    from mobius.models.gemma4 import Gemma4Model
-    from mobius.tasks._gemma4 import Gemma4Task
+    from mobius.models.gemma4 import Gemma4Model, Gemma4UnifiedModel
+    from mobius.tasks._gemma4 import Gemma4Task, Gemma4UnifiedTask
 
     resolved_text_path = _resolve_local_path(text_gguf_path)
     text_gguf = (
@@ -2442,6 +3619,13 @@ def build_gemma4_vlm_from_gguf(
         source=str(mmproj_gguf_path),
         allow_mmproj_companion=True,
     )
+    vision_projector_type = projector_type_for_modality(
+        mmproj_gguf.metadata,
+        MMProjModality.VISION,
+    )
+    is_unified = vision_projector_type == "gemma4uv"
+    if include_audio is None:
+        include_audio = bool(mmproj_gguf.metadata.get("clip.has_audio_encoder"))
     modalities = (
         (MMProjModality.VISION, MMProjModality.AUDIO)
         if include_audio
@@ -2451,8 +3635,18 @@ def build_gemma4_vlm_from_gguf(
     logger.info("Building Gemma4 VLM from text=%s mmproj=%s", text_gguf_path, mmproj_gguf_path)
 
     # 1. Text config + merged vision/audio sub-configs.
-    config = gguf_to_config(text_gguf)
-    vision_config = read_mmproj_vision_config(mmproj_gguf)
+    config = cast(Gemma4Config, gguf_to_config(text_gguf))
+    if is_unified:
+        from mobius.integrations.gguf._core_vlm_projector import (
+            read_core_vlm_projector_config,
+        )
+
+        vision_config = read_core_vlm_projector_config(
+            mmproj_gguf,
+            "gemma4uv",
+        ).vision
+    else:
+        vision_config = read_mmproj_vision_config(mmproj_gguf)
     if vision_config is None:
         raise ValueError(
             "mmproj GGUF has no vision encoder (clip.has_vision_encoder is unset)."
@@ -2460,7 +3654,14 @@ def build_gemma4_vlm_from_gguf(
     config = dataclasses.replace(config, vision=vision_config)
 
     if include_audio:
-        config = dataclasses.replace(config, audio=read_mmproj_audio_config(mmproj_gguf))
+        if is_unified:
+            audio_config = read_core_vlm_projector_config(
+                mmproj_gguf,
+                "gemma4ua",
+            ).audio
+        else:
+            audio_config = read_mmproj_audio_config(mmproj_gguf)
+        config = dataclasses.replace(config, audio=audio_config)
     else:
         # Vision-only VLM: drop any audio sub-config so the package is the
         # 3-component (decoder + vision + embedding) multimodal shape.
@@ -2473,9 +3674,22 @@ def build_gemma4_vlm_from_gguf(
         if config.image_token_id is not None
         else _token_id(text_gguf, "<|image|>")
     )
-    updates: dict[str, Any] = {"image_token_id": resolved_image_token_id}
-    if include_audio and config.audio_token_id is None:
-        updates["audio_token_id"] = _token_id(text_gguf, "<|audio|>")
+    updates: dict[str, Any] = {
+        "image_token_id": resolved_image_token_id,
+        "model_type": "gemma4_unified" if is_unified else config.model_type,
+    }
+    if include_audio:
+        resolved_audio_token_id = (
+            config.audio_token_id
+            if config.audio_token_id is not None
+            else _token_id(text_gguf, "<|audio|>")
+        )
+        updates["audio_token_id"] = resolved_audio_token_id
+        if config.audio is not None:
+            updates["audio"] = dataclasses.replace(
+                config.audio,
+                audio_token_id=resolved_audio_token_id,
+            )
     config = dataclasses.replace(config, **updates)
     if dtype is not None:
         resolved = resolve_dtype(dtype)
@@ -2536,7 +3750,8 @@ def build_gemma4_vlm_from_gguf(
     #    directly would skip those optimizations.
     from mobius._builder import build_from_module
 
-    module = Gemma4Model(config)
+    module = Gemma4UnifiedModel(config) if is_unified else Gemma4Model(config)
+    task = Gemma4UnifiedTask() if is_unified else Gemma4Task()
 
     def target_name(hf_name: str) -> str:
         if hf_name.startswith("language_model.lm_head."):
@@ -2553,14 +3768,21 @@ def build_gemma4_vlm_from_gguf(
     # afterwards can never introduce a lossy-requantize tensor (mmproj
     # weights always stay float — see _preflight_mmproj_quantization_report),
     # so it cannot change that warning; the merge below must not re-emit it.
+    quantization = config.quantization
     quantization_report = _preflight_quantization_report(
         text_gguf,
         "gemma4",
         module,
         config,
         preserve_quantization=preserve_quantization,
-        target_bits=(config.quantization.bits if preserve_quantization else None),
-        target_block_size=(config.quantization.group_size if preserve_quantization else None),
+        target_bits=(
+            quantization.bits if preserve_quantization and quantization is not None else None
+        ),
+        target_block_size=(
+            quantization.group_size
+            if preserve_quantization and quantization is not None
+            else None
+        ),
         execution_provider=execution_provider,
         name_mapper=lambda name, _architecture: _text_gguf_name_to_hf_multimodal(name),
         target_name_mapper=target_name,
@@ -2571,9 +3793,7 @@ def build_gemma4_vlm_from_gguf(
     quantization_report = _merge_component_quantization_reports(
         quantization_report, mmproj_quantization_report
     )
-    pkg = build_from_module(
-        module, config, task=Gemma4Task(), execution_provider=execution_provider
-    )
+    pkg = build_from_module(module, config, task=task, execution_provider=execution_provider)
     pkg.gguf_quantization_report = quantization_report
     logger.info("Built Gemma4 VLM graph (%d components: %s)", len(pkg), list(pkg))
 
@@ -2592,13 +3812,21 @@ def build_gemma4_vlm_from_gguf(
         )
     else:
         state_dict = _text_gguf_to_hf_multimodal(text_gguf)
-    state_dict.update(_mmproj_vision_to_hf(mmproj_gguf))
-    if include_audio:
-        state_dict.update(_mmproj_audio_to_hf(mmproj_gguf))
+    if is_unified:
+        from mobius.integrations.gguf._core_vlm_projector import (
+            _load_core_vlm_projector_weights,
+        )
 
-    # 4. Run the tested HF→ONNX preprocessing and apply. Names are already
-    #    component-qualified after preprocessing, so no prefix_map is needed.
-    state_dict = module.preprocess_weights(state_dict)
+        state_dict = module.preprocess_weights(state_dict)
+        state_dict.update(_load_core_vlm_projector_weights(mmproj_gguf, "gemma4uv"))
+        if include_audio:
+            state_dict.update(_load_core_vlm_projector_weights(mmproj_gguf, "gemma4ua"))
+    else:
+        state_dict.update(_mmproj_vision_to_hf(mmproj_gguf))
+        if include_audio:
+            state_dict.update(_mmproj_audio_to_hf(mmproj_gguf))
+        # Run the tested HF->ONNX preprocessing for the non-unified layout.
+        state_dict = module.preprocess_weights(state_dict)
     pkg.apply_weights(state_dict)
     logger.info("Applied %d mapped weights to the Gemma4 VLM package", len(state_dict))
     from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
@@ -2819,6 +4047,361 @@ def build_muse_glimmer_vlm_from_gguf(
     return pkg
 
 
+def build_qwen_glm_projector_from_gguf(
+    mmproj_gguf_path: str | Path,
+    *,
+    projector_type: str,
+    target_architecture: str,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build the exact standalone Qwen/GLM vision, audio, or speaker roles."""
+    from mobius.integrations.gguf._qwen_glm_projector import (
+        build_qwen_glm_projector_package,
+    )
+
+    resolved_path = Path(mmproj_gguf_path)
+    mmproj_gguf = _mmproj_gguf_model
+    if mmproj_gguf is None:
+        from mobius.integrations.gguf._builder import _validate_gguf_model
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+        mmproj_gguf = GGUFModel(resolved_path)
+        _validate_gguf_model(
+            mmproj_gguf,
+            source=str(mmproj_gguf_path),
+            allow_mmproj_companion=True,
+        )
+        _preflight_standalone_mmproj(
+            mmproj_gguf,
+            projector_type=projector_type,
+            target_architecture=target_architecture,
+        )
+    return build_qwen_glm_projector_package(
+        mmproj_gguf,
+        resolved_path=resolved_path,
+        projector_type=projector_type,
+        dtype=dtype,
+        execution_provider=execution_provider,
+    )
+
+
+def _interleaved_rope_rows(values: np.ndarray, head_dim: int) -> np.ndarray:
+    """Convert adjacent-pair Q/K rows to Mobius's half-split RoPE convention."""
+    out_features, in_features = values.shape
+    if out_features % head_dim:
+        raise ValueError(
+            f"RoPE projection with {out_features} rows is not divisible by head_dim={head_dim}."
+        )
+    reshaped = values.reshape(out_features // head_dim, head_dim, in_features)
+    order = np.concatenate(
+        [
+            np.arange(0, head_dim, 2, dtype=np.int64),
+            np.arange(1, head_dim, 2, dtype=np.int64),
+        ]
+    )
+    return reshaped[:, order, :].reshape(values.shape)
+
+
+def _audio_head_dim(metadata: dict[str, Any]) -> int:
+    head_count = int(metadata["clip.audio.attention.head_count"])
+    hidden_size = int(metadata["clip.audio.embedding_length"])
+    if head_count <= 0 or hidden_size <= 0 or hidden_size % head_count:
+        raise ValueError(
+            "clip.audio.embedding_length must be positive and evenly divisible by "
+            "the positive clip.audio.attention.head_count."
+        )
+    return hidden_size // head_count
+
+
+def _mmproj_audio_projector_to_onnx(
+    mmproj_gguf: Any,
+    projector_type: str,
+) -> dict[str, Any]:
+    import torch
+
+    from mobius.integrations.gguf._mmproj_mapping import (
+        map_mmproj_audio_projector_to_onnx,
+    )
+
+    head_dim = _audio_head_dim(mmproj_gguf.metadata)
+    state_dict: dict[str, torch.Tensor] = {}
+    for name in mmproj_gguf.tensor_names:
+        mapped = map_mmproj_audio_projector_to_onnx(name, projector_type)
+        if mapped is None:
+            continue
+        values = np.asarray(mmproj_gguf.get_tensor(name), dtype=np.float32)
+        if name.startswith("a.conv1d.") and name.endswith(".bias") and values.ndim > 1:
+            values = values.reshape(-1)
+        if (
+            name.endswith(".conv_dw.weight")
+            and values.ndim == 2
+            and "depthwise_conv.weight" in mapped
+        ):
+            values = values[:, None, :]
+        if projector_type == "pockettts_spkenc" and name.endswith(
+            ("attn_q.weight", "attn_k.weight")
+        ):
+            values = _interleaved_rope_rows(values, head_dim)
+        state_dict[mapped] = torch.from_numpy(values.copy())
+    return state_dict
+
+
+def _require_loaded_projector_initializers(
+    package: ModelPackage,
+    projector_type: str,
+) -> None:
+    """Fail if production weight application left any graph parameter unresolved."""
+    missing = {
+        component: sorted(
+            name
+            for name, initializer in model.graph.initializers.items()
+            if initializer.const_value is None
+        )
+        for component, model in package.items()
+    }
+    missing = {component: names for component, names in missing.items() if names}
+    if missing:
+        raise ValueError(
+            f"{projector_type} did not initialize every exported graph parameter: {missing}"
+        )
+
+
+def build_audio_projector_from_gguf(
+    mmproj_gguf_path: str | Path,
+    *,
+    projector_type: str,
+    target_architecture: str,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build the standalone MERaLiON audio encoder/projector sidecar."""
+    from mobius._builder import build_from_module, resolve_dtype
+    from mobius._configs import ArchitectureConfig
+    from mobius.integrations.gguf._builder import _validate_gguf_model
+    from mobius.integrations.gguf._reader import GGUFModel
+    from mobius.models.gguf_audio_projector import (
+        AUDIO_PROCESSOR_ABIS,
+        create_gguf_audio_projector,
+    )
+    from mobius.tasks import (
+        GGUFAudioProjectorModel,
+        GGUFAudioProjectorTask,
+        GGUFSpeakerProjectorModel,
+        GGUFSpeakerProjectorTask,
+    )
+
+    resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
+    )
+    _validate_gguf_model(
+        mmproj_gguf,
+        source=str(mmproj_gguf_path),
+        allow_mmproj_companion=True,
+    )
+    spec = _preflight_standalone_mmproj(
+        mmproj_gguf,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+    )
+    hidden_size = int(mmproj_gguf.metadata["clip.audio.embedding_length"])
+    num_heads = int(mmproj_gguf.metadata["clip.audio.attention.head_count"])
+    head_dim = _audio_head_dim(mmproj_gguf.metadata)
+    config = ArchitectureConfig(
+        model_type=f"gguf_{projector_type}",
+        vocab_size=1,
+        hidden_size=hidden_size,
+        intermediate_size=int(mmproj_gguf.metadata["clip.audio.feed_forward_length"]),
+        num_hidden_layers=int(mmproj_gguf.metadata["clip.audio.block_count"]),
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        head_dim=head_dim,
+        max_position_embeddings=65_536,
+        hidden_act="gelu",
+    )
+    if dtype is not None:
+        resolved_dtype = resolve_dtype(dtype)
+        if resolved_dtype is not None:
+            config = dataclasses.replace(config, dtype=resolved_dtype)
+    tensor_shapes = {
+        name: tuple(int(dim) for dim in mmproj_gguf.get_tensor_shape(name))
+        for name in mmproj_gguf.tensor_names
+    }
+    audio_encoder = create_gguf_audio_projector(
+        spec.projector_type,
+        mmproj_gguf.metadata,
+        tensor_shapes,
+    )
+    if spec.model_roles[0].value == "speaker_encoder":
+        package = build_from_module(
+            GGUFSpeakerProjectorModel(audio_encoder, output_name="speaker_features"),
+            config,
+            task=GGUFSpeakerProjectorTask(),
+            execution_provider=execution_provider,
+        )
+    else:
+        package = build_from_module(
+            GGUFAudioProjectorModel(audio_encoder),
+            config,
+            task=GGUFAudioProjectorTask(),
+            execution_provider=execution_provider,
+        )
+    package.apply_weights(_mmproj_audio_projector_to_onnx(mmproj_gguf, projector_type))
+    _require_loaded_projector_initializers(package, projector_type)
+    processor_abi = AUDIO_PROCESSOR_ABIS[projector_type]
+    output_size = getattr(
+        audio_encoder,
+        "output_size",
+        mmproj_gguf.metadata.get("clip.audio.projection_dim"),
+    )
+    if not isinstance(output_size, int) or output_size <= 0:
+        raise TypeError(f"{projector_type} audio encoder must declare a positive output_size")
+    serialized_processor_abi = json.dumps(
+        dataclasses.asdict(processor_abi),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    for model in package.values():
+        model.metadata_props["mobius.gguf_projector_type"] = projector_type
+        model.metadata_props["mobius.gguf_target_architecture"] = target_architecture
+        model.metadata_props["mobius.gguf_audio_processor_abi"] = serialized_processor_abi
+        model.metadata_props["mobius.processor_abi"] = serialized_processor_abi
+        model.metadata_props["mobius.projector_output_size"] = str(output_size)
+        model.metadata_props["mobius.runtime_support"] = (
+            "standalone-sidecar-only; paired multimodal runtime unvalidated"
+        )
+    package.gguf_quantization_report = _preflight_mmproj_quantization_report(
+        mmproj_gguf,
+        include_audio=True,
+        standalone_projector_type=spec.projector_type,
+    )
+    package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
+    package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
+    package.gguf_projector_output_size = output_size  # type: ignore[attr-defined]
+    package.gguf_audio_processor_abi = processor_abi  # type: ignore[attr-defined]
+    runtime_warning = (
+        "Standalone projector graph only; paired text insertion and downstream "
+        "multimodal runtime execution are not validated."
+    )
+    package.gguf_runtime_warning = runtime_warning  # type: ignore[attr-defined]
+    logger.warning("%s", runtime_warning)
+    return package
+
+
+def build_remaining_vision_projector_from_gguf(
+    mmproj_gguf_path: str | Path,
+    *,
+    projector_type: str,
+    target_architecture: str,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build one exact standalone vision encoder/projector sidecar."""
+    from mobius._builder import build_from_module, resolve_dtype
+    from mobius._configs import ArchitectureConfig
+    from mobius.integrations.gguf._builder import _validate_gguf_model
+    from mobius.integrations.gguf._reader import GGUFModel
+    from mobius.integrations.gguf._remaining_projectors import (
+        create_remaining_vision_projector,
+        remaining_projector_state_dict,
+        validate_remaining_projector_state_dict,
+    )
+    from mobius.tasks import GGUFVisionProjectorModel, GGUFVisionProjectorTask
+
+    resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
+    )
+    _validate_gguf_model(
+        mmproj_gguf,
+        source=str(mmproj_gguf_path),
+        allow_mmproj_companion=True,
+    )
+    _preflight_standalone_mmproj(
+        mmproj_gguf,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+    )
+    hidden_size = int(mmproj_gguf.metadata["clip.vision.embedding_length"])
+    num_heads = int(mmproj_gguf.metadata["clip.vision.attention.head_count"])
+    config = ArchitectureConfig(
+        model_type=f"gguf_{projector_type}",
+        vocab_size=1,
+        hidden_size=hidden_size,
+        intermediate_size=int(mmproj_gguf.metadata["clip.vision.feed_forward_length"]),
+        num_hidden_layers=int(mmproj_gguf.metadata["clip.vision.block_count"]),
+        num_attention_heads=num_heads,
+        num_key_value_heads=int(
+            mmproj_gguf.metadata.get("clip.vision.attention.head_count_kv", num_heads)
+        ),
+        head_dim=hidden_size // num_heads,
+        max_position_embeddings=65_536,
+        hidden_act="gelu",
+    )
+    if dtype is not None:
+        resolved_dtype = resolve_dtype(dtype)
+        if resolved_dtype is not None:
+            config = dataclasses.replace(config, dtype=resolved_dtype)
+    tensor_shapes = {
+        name: tuple(int(dim) for dim in mmproj_gguf.get_tensor_shape(name))
+        for name in mmproj_gguf.tensor_names
+    }
+    vision_encoder = create_remaining_vision_projector(
+        projector_type,
+        mmproj_gguf.metadata,
+        tensor_shapes,
+    )
+    vision_input_schema = cast(Any, vision_encoder).input_schema
+    input_schema = [
+        {
+            "name": name,
+            "dtype": str(dtype),
+            "shape": [str(dim) for dim in shape],
+        }
+        for name, dtype, shape in vision_input_schema
+    ]
+    package = build_from_module(
+        GGUFVisionProjectorModel(vision_encoder),
+        config,
+        task=GGUFVisionProjectorTask(),
+        execution_provider=execution_provider,
+    )
+    for model in package.values():
+        model.metadata_props["mobius.gguf_projector_type"] = projector_type
+        model.metadata_props["mobius.gguf_target_architecture"] = target_architecture
+        model.metadata_props["mobius.gguf_input_schema"] = json.dumps(
+            input_schema,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        model.metadata_props["mobius.runtime_support"] = (
+            "standalone-sidecar-only; paired multimodal runtime unvalidated"
+        )
+    state_dict = remaining_projector_state_dict(mmproj_gguf, projector_type)
+    validate_remaining_projector_state_dict(
+        package["vision_encoder"],
+        state_dict,
+        projector_type,
+    )
+    package.apply_weights(state_dict)
+    _require_loaded_projector_initializers(package, projector_type)
+    package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
+    package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
+    package.gguf_input_schema = input_schema  # type: ignore[attr-defined]
+    runtime_warning = (
+        "Standalone projector graph only; paired text insertion and downstream "
+        "multimodal runtime execution are not validated."
+    )
+    package.gguf_runtime_warning = runtime_warning  # type: ignore[attr-defined]
+    logger.warning("%s", runtime_warning)
+    return package
+
+
 def build_vlm_from_gguf(
     text_gguf_path: str | Path,
     mmproj_gguf_path: str | Path,
@@ -2884,6 +4467,26 @@ _VLM_BUILDERS: dict[str, str] = {
 }
 
 
+#: Standalone sidecar graph entry points selected by
+#: :attr:`ProjectorSpec.sidecar_builder`. Unlike ``_VLM_BUILDERS``, these
+#: functions never create or silently omit a paired text decoder.
+def _build_core_vlm_projector_mmproj(*args, **kwargs) -> ModelPackage:
+    from mobius.integrations.gguf._core_vlm_projector import (
+        build_core_vlm_projector_mmproj,
+    )
+
+    return build_core_vlm_projector_mmproj(*args, **kwargs)
+
+
+_MMPROJ_BUILDERS: dict[str, str] = {
+    "core_vlm_projector": "_build_core_vlm_projector_mmproj",
+    "qwen_glm_projector": "build_qwen_glm_projector_from_gguf",
+    "audio_projector": "build_audio_projector_from_gguf",
+    "remaining_vision_projector": "build_remaining_vision_projector_from_gguf",
+    "ocr_projector": "build_ocr_projector_from_gguf",
+}
+
+
 def _resolve_vlm_builder(text_arch: str, projector_type: str) -> Callable[..., ModelPackage]:
     """Resolve dispatch only from an exact supported projector/target pair."""
     from mobius.integrations.gguf._arch_registry import try_get_arch_spec
@@ -2946,6 +4549,13 @@ def _mmproj_audio_to_hf(mmproj_gguf: Any) -> dict:
             continue
         values = np.array(mmproj_gguf.get_tensor(name)).astype(np.float32)
         if hf_name.endswith(".per_dim_scale"):
-            values = values.reshape(-1)
+            # Gemma converters store softplus(raw); the model applies softplus.
+            if np.any(values <= 0):
+                raise ValueError(f"{name} must contain positive baked softplus values.")
+            values = np.log(np.expm1(values.astype(np.float64))).astype(np.float32)
+        elif name.endswith(".conv_dw.weight") and values.ndim == 2:
+            values = values[:, None, :]
+        elif name.endswith(_CLIPPING_BOUND_SUFFIXES):
+            values = values.reshape(())
         state_dict[hf_name] = torch.from_numpy(values)
     return state_dict

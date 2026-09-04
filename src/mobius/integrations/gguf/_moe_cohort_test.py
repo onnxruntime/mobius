@@ -80,6 +80,7 @@ def test_new_cohort_fields_preserve_existing_route_fingerprint_bytes(
     for field_name in (
         *_SPECIALIZED_ENCODER_FINGERPRINT_FIELDS,
         "attention_clamp",
+        "component_quantization",
         "moe_layer_frequency",
         "routing_weight_normalization_floor",
     ):

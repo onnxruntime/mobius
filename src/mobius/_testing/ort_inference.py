@@ -189,6 +189,11 @@ class OnnxModelSession:
     def input_names(self) -> list[str]:
         return self._input_names
 
+    @property
+    def providers(self) -> list[str]:
+        """Execution providers in their runtime priority order."""
+        return self._session.get_providers()
+
     def get_input_shape(self, name: str) -> list[int | str] | None:
         """Return the declared shape of an input, or ``None`` if not found.
 

@@ -27,8 +27,8 @@ from typing import Any
 import onnx_ir as ir
 
 from mobius._model_package import ModelPackage
+from mobius.integrations.onnx_genai._metadata_io import _dump_yaml
 from mobius.integrations.onnx_genai.workflow_metadata import (
-    _dump_yaml,
     build_speech_to_text_workflow_metadata,
 )
 

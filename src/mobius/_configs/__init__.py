@@ -40,6 +40,8 @@ from mobius._configs._base import (
     Gemma4Config,
     GlmAsrConfig,
     GraniteMoeHybridConfig,
+    GrokGGUFConfig,
+    GroveMoEGGUFConfig,
     HyV3Config,
     HyV3MtpConfig,
     Jais2Config,
@@ -57,6 +59,7 @@ from mobius._configs._base import (
     MllamaConfig,
     MMSConfig,
     MoonshineConfig,
+    MoonshineStreamingConfig,
     MuseGlimmerConfig,
     NanoChatConfig,
     NemotronHConfig,
@@ -90,7 +93,7 @@ from mobius._configs._base import (
     _shallow_fields,
     _shared_expert_size,
 )
-from mobius._configs._quantization import QuantizationConfig
+from mobius._configs._quantization import QuantizationConfig, QuantizationOverride
 from mobius._configs._sub_configs import (
     AudioConfig,
     CodecDecoderConfig,
@@ -104,6 +107,11 @@ from mobius._configs._sub_configs import (
     VisionConfig,
 )
 from mobius._configs._world_model import WorldModelConfig
+from mobius._configs.vibevoice import (
+    VibeVoiceConfig,
+    VibeVoiceDiffusionConfig,
+    VibeVoiceTokenizerConfig,
+)
 
 __all__ = [
     "DEFAULT_INT",
@@ -127,6 +135,8 @@ __all__ = [
     "Gemma4AudioConfig",
     "Gemma4Config",
     "GlmAsrConfig",
+    "GrokGGUFConfig",
+    "GroveMoEGGUFConfig",
     "GraniteMoeHybridConfig",
     "HyV3Config",
     "HyV3MtpConfig",
@@ -145,6 +155,7 @@ __all__ = [
     "MiniMaxConfig",
     "MMSConfig",
     "MoonshineConfig",
+    "MoonshineStreamingConfig",
     "MuseGlimmerConfig",
     "NanoChatConfig",
     "NemotronParseConfig",
@@ -153,6 +164,7 @@ __all__ = [
     "Plamo2Config",
     "QuantizationConfig",
     "Qwen4ExpConfig",
+    "QuantizationOverride",
     "Qwen35MtpConfig",
     "RoPEConfig",
     "Sam2Config",
@@ -163,6 +175,9 @@ __all__ = [
     "TTSConfig",
     "VisionConfig",
     "VisionLanguageConfig",
+    "VibeVoiceConfig",
+    "VibeVoiceDiffusionConfig",
+    "VibeVoiceTokenizerConfig",
     "WhisperConfig",
     "XverseConfig",
     "WorldModelConfig",

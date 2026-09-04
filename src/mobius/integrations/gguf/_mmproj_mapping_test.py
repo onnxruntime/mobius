@@ -13,6 +13,12 @@ from mobius.integrations.gguf._mmproj_mapping import (
     map_generic_vision_to_onnx,
     map_mmproj_audio_to_hf,
     map_mmproj_gemma3_vision_to_hf,
+    map_mmproj_glm4v_vision_to_onnx,
+    map_mmproj_glma_audio_to_onnx,
+    map_mmproj_qwen2_audio_to_onnx,
+    map_mmproj_qwen3_audio_to_onnx,
+    map_mmproj_qwen3_speaker_to_onnx,
+    map_mmproj_qwen3_vision_to_onnx,
     map_mmproj_vision_to_hf,
 )
 
@@ -246,13 +252,30 @@ class TestAudioMapping:
                 "mm.a.input_projection.weight",
                 "embed_audio.embedding_projection.weight",
             ),
+            (
+                "a.pre_encode.out.weight",
+                "audio_tower.output_proj.weight",
+            ),
         ],
     )
     def test_audio_names(self, gguf_name: str, expected: str):
         assert map_mmproj_audio_to_hf(gguf_name) == expected
 
-    def test_stat_tensors_skipped(self):
-        assert map_mmproj_audio_to_hf("a.blk.0.attn_q.weight.output_min") is None
+    def test_clipping_bounds_are_mapped(self):
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.attn_q.output_min")
+            == "audio_tower.layers.0.self_attn.q_proj.output_min"
+        )
+
+    def test_historical_conv_norm_names_are_swapped_back(self):
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.conv_norm.weight")
+            == "audio_tower.layers.0.lconv1d.pre_layer_norm.weight"
+        )
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.norm_conv.weight")
+            == "audio_tower.layers.0.lconv1d.conv_norm.weight"
+        )
 
 
 class TestMuseGlimmerVisionMapping:
@@ -313,3 +336,72 @@ class TestMuseGlimmerVisionMapping:
         assert convert("v.blk.0.ffn_gate.weight") is None
         assert convert("v.blk.0.attn_q_norm.weight") is None
         assert convert("a.blk.0.attn_q.weight") is None
+
+
+class TestQwenGlmProjectorMapping:
+    def test_qwen3vl_deepstack_layer_maps_to_dense_merger_index(self) -> None:
+        assert (
+            map_mmproj_qwen3_vision_to_onnx(
+                "v.deepstack.11.fc2.weight",
+                deepstack_layers=(5, 11, 17),
+            )
+            == "visual.deepstack_merger_list.1.linear_fc2.weight"
+        )
+        assert (
+            map_mmproj_qwen3_vision_to_onnx(
+                "v.deepstack.7.fc2.weight",
+                deepstack_layers=(5, 11, 17),
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                "v.blk.2.attn_qkv.weight",
+                "visual.blocks.2.attn.qkv.weight",
+            ),
+            ("v.post_ln.bias", "visual.merger.norm.bias"),
+            ("mm.2.weight", "visual.merger.linear_fc2.weight"),
+        ],
+    )
+    def test_qwen3vl_names(self, source: str, expected: str) -> None:
+        assert (
+            map_mmproj_qwen3_vision_to_onnx(
+                source,
+                deepstack_layers=(5, 11, 17),
+            )
+            == expected
+        )
+
+    def test_glm4v_qk_norm_variant(self) -> None:
+        assert (
+            map_mmproj_glm4v_vision_to_onnx("v.blk.3.attn_q_norm.weight")
+            == "visual.blocks.3.attn.q_norm.weight"
+        )
+        assert (
+            map_mmproj_glm4v_vision_to_onnx("mm.patch_merger.weight")
+            == "visual.downsample.weight"
+        )
+
+    def test_qwen2_and_qwen3_audio_names_remain_distinct(self) -> None:
+        assert map_mmproj_qwen2_audio_to_onnx("mm.a.fc.weight") == "projection.weight"
+        assert (
+            map_mmproj_qwen3_audio_to_onnx("a.blk.4.attn_k.bias")
+            == "audio_tower.layers.4.self_attn.k_proj.bias"
+        )
+        assert (
+            map_mmproj_qwen3_audio_to_onnx("mm.a.mlp.2.weight") == "audio_tower.proj2.weight"
+        )
+
+    def test_glma_boundary_rows_and_stack_projector(self) -> None:
+        assert map_mmproj_glma_audio_to_onnx("v.boi") == "boi"
+        assert map_mmproj_glma_audio_to_onnx("mm.a.mlp.1.weight") == "linear_1.weight"
+
+    def test_qwen3tts_speaker_res2_branch(self) -> None:
+        assert (
+            map_mmproj_qwen3_speaker_to_onnx("a.blk.2.res2.6.weight")
+            == "encoder.blocks.2.res2net_block.blocks.6.conv.weight"
+        )
+        assert map_mmproj_qwen3_speaker_to_onnx("a.gen.code.proj_in.weight") is None

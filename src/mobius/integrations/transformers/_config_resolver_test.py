@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 
 from mobius._configs import (
     ArchitectureConfig,
     MoonshineConfig,
+    MoonshineStreamingConfig,
+    QuantizationConfig,
     WhisperConfig,
 )
 from mobius.integrations.transformers._config_resolver import (
@@ -46,6 +50,33 @@ def _fake_hf_config(model_type: str, **overrides):
     }
     defaults.update(overrides)
     return type("FakeHFConfig", (), defaults)()
+
+
+def test_component_overlay_does_not_reparse_deferred_block_quantization():
+    hf = _fake_hf_config(
+        "unregistered_block_model",
+        quantization_config={
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+        },
+    )
+    resolved = ArchitectureConfig(block_quant_scheme=object())
+
+    with (
+        mock.patch.object(
+            ArchitectureConfig,
+            "from_transformers",
+            return_value=resolved,
+        ),
+        mock.patch.object(
+            QuantizationConfig,
+            "from_value",
+            side_effect=AssertionError("block quantization must stay deferred"),
+        ),
+    ):
+        result = _config_from_hf(hf)
+
+    assert result is resolved
 
 
 # ── Top 5 HF config formats ─────────────────────────────────────────────
@@ -429,6 +460,29 @@ class TestWhisperEncoderDecoder:
         assert result.attn_qkv_bias is True
         assert result.attn_o_bias is True
 
+    def test_explicit_component_quantization_survives_custom_config_parser(self):
+        hf = self._whisper_hf_config(
+            component_quantization={
+                "encoder": {
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 32,
+                },
+                "decoder": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 16,
+                },
+            }
+        )
+
+        result = _config_from_hf(hf)
+
+        assert result.component_quantization is not None
+        assert result.component_quantization["encoder"].bits == 8
+        assert result.component_quantization["decoder"].bits == 4
+        assert result.quantization is result.component_quantization["decoder"]
+
     def test_whisper_tie_word_embeddings(self):
         hf = self._whisper_hf_config(tie_word_embeddings=True)
         result = _config_from_hf(hf)
@@ -491,6 +545,94 @@ class TestMoonshineEncoderDecoder:
 
     def test_moonshine_default_task(self):
         assert _default_task_for_model("moonshine") == "speech-to-text"
+
+
+class TestMoonshineStreamingEncoderDecoder:
+    """Moonshine Streaming extraction keeps its encoder sub-config semantics."""
+
+    def _hf_config(self, encoder_config):
+        return type(
+            "FakeMoonshineStreamingConfig",
+            (),
+            {
+                "model_type": "moonshine_streaming",
+                "encoder_config": encoder_config,
+                "vocab_size": 32768,
+                "hidden_size": 320,
+                "intermediate_size": 1280,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "head_dim": 40,
+                "hidden_act": "silu",
+                "max_position_embeddings": 4096,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 10_000.0,
+                    "partial_rotary_factor": 0.8,
+                },
+                "attention_bias": False,
+                "pad_token_id": 0,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "decoder_start_token_id": 1,
+                "tie_word_embeddings": False,
+            },
+        )()
+
+    def _encoder_dict(self):
+        return {
+            "hidden_size": 320,
+            "intermediate_size": 1280,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 8,
+            "head_dim": 40,
+            "hidden_act": "gelu",
+            "sample_rate": 16000,
+            "frame_ms": 5.0,
+            "sliding_windows": [[16, 4], [16, 4], [16, 0], [16, 0], [16, 4], [16, 4]],
+        }
+
+    def test_routes_to_moonshine_streaming_config(self):
+        result = _config_from_hf(self._hf_config(self._encoder_dict()))
+        assert isinstance(result, MoonshineStreamingConfig)
+        assert result.encoder_input_name == "input_values"
+        assert result.encoder_uses_attention_mask is True
+        assert result.decoder_uses_encoder_attention_mask is True
+        assert result.tie_word_embeddings is False
+
+    def test_encoder_sub_config_dict_and_object_agree(self):
+        """A dict sub-config and an attribute-style sub-config extract alike."""
+        from_dict = _config_from_hf(self._hf_config(self._encoder_dict()))
+        encoder_object = type("FakeEncoderConfig", (), self._encoder_dict())()
+        from_object = _config_from_hf(self._hf_config(encoder_object))
+        assert from_dict == from_object
+
+    def test_streaming_specific_fields(self):
+        result = _config_from_hf(self._hf_config(self._encoder_dict()))
+        assert result.encoder_sliding_windows == (
+            (16, 4),
+            (16, 4),
+            (16, 0),
+            (16, 0),
+            (16, 4),
+            (16, 4),
+        )
+        assert result.encoder_hidden_act == "gelu"
+        assert result.decoder_hidden_act == "silu"
+        assert result.encoder_head_dim == 40
+        assert result.encoder_sample_rate == 16000
+        assert result.encoder_frame_ms == pytest.approx(5.0)
+        assert result.frame_length == 80
+        assert result.partial_rotary_factor == pytest.approx(0.8)
+        assert result.rope_interleave is True
+        assert result.mlp_bias is True
+        assert result.attn_qkv_bias is False
+        assert result.attn_o_bias is False
+
+    def test_default_task(self):
+        assert _default_task_for_model("moonshine_streaming") == "speech-to-text"
 
 
 # ── _dict_to_pretrained_config ──────────────────────────────────────────

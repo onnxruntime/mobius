@@ -6,8 +6,13 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
+import torch
 from onnxscript import GraphBuilder
 
+from mobius._component_quantization import (
+    configure_component_quantization,
+    preprocess_component_quantized_state_dict,
+)
 from mobius._configs import ArchitectureConfig, VisionConfig
 from mobius.components import Gemma3MultiModalProjector, OffsetRMSNorm
 from mobius.models.gemma3 import Gemma3MultiModalModel, _Gemma3EmbeddingModel
@@ -81,6 +86,138 @@ class TestGemma3Embedding:
         np.testing.assert_array_equal(actual[0, 0], weights[14])
         np.testing.assert_array_equal(actual[0, 1:257], features)
         np.testing.assert_array_equal(actual[0, 257], weights[15])
+
+    def test_packed_token_table_routes_only_to_embedding_component(self) -> None:
+        from mobius._configs import QuantizationConfig
+
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            quantize_embeddings=True,
+        )
+        config = ArchitectureConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            hidden_act="gelu",
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            pad_token_id=0,
+            max_position_embeddings=32,
+            rope_type="default",
+            rope_local_base_freq=10_000.0,
+            layer_types=["full_attention"],
+            sliding_window=8,
+            attn_qk_norm=True,
+            image_token_id=9,
+            vision=VisionConfig(
+                hidden_size=4,
+                intermediate_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=16,
+                patch_size=4,
+                mm_tokens_per_image=1,
+            ),
+            quantization=quantization,
+            component_quantization={
+                "decoder": QuantizationConfig(
+                    bits=4,
+                    group_size=16,
+                    quant_method="olive",
+                ),
+                "embedding": quantization,
+            },
+        )
+        model = Gemma3MultiModalModel(config)
+        result = model.preprocess_weights(
+            {
+                "language_model.model.embed_tokens.weight_qweight": torch.zeros(
+                    32, 8, dtype=torch.uint8
+                ),
+                "language_model.model.embed_tokens.weight_scales": torch.ones(32, 1),
+            }
+        )
+
+        assert "embedding.embed_tokens.weight_qweight" in result
+        assert "embedding.embed_tokens.weight_scales" in result
+        assert not any(name.startswith("decoder.model.embed_tokens.") for name in result)
+
+    def test_packed_tied_table_materializes_split_decoder_head(self) -> None:
+        from mobius._configs import QuantizationConfig
+
+        decoder_quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            quantize_lm_head=True,
+            tie_word_embeddings=True,
+        )
+        embedding_quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            quantize_embeddings=True,
+            tie_word_embeddings=True,
+        )
+        config = ArchitectureConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            hidden_act="gelu",
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            pad_token_id=0,
+            max_position_embeddings=32,
+            rope_type="default",
+            rope_local_base_freq=10_000.0,
+            layer_types=["full_attention"],
+            sliding_window=8,
+            attn_qk_norm=True,
+            image_token_id=9,
+            tie_word_embeddings=True,
+            vision=VisionConfig(
+                hidden_size=4,
+                intermediate_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=16,
+                patch_size=4,
+                mm_tokens_per_image=1,
+            ),
+            quantization=decoder_quantization,
+            component_quantization={
+                "decoder": decoder_quantization,
+                "embedding": embedding_quantization,
+            },
+        )
+        model = Gemma3MultiModalModel(config)
+        configure_component_quantization(model, config, model.default_task)
+        qweight = torch.zeros(32, 8, dtype=torch.uint8)
+        scales = torch.ones(32, 1)
+        routed = model.preprocess_weights(
+            {
+                "language_model.model.embed_tokens.weight_qweight": qweight,
+                "language_model.model.embed_tokens.weight_scales": scales,
+            }
+        )
+
+        assert routed["decoder.lm_head.weight_qweight"] is qweight
+        result = preprocess_component_quantized_state_dict(
+            routed,
+            model,
+            config,
+            model.default_task,
+            ("decoder", "vision_encoder", "embedding"),
+        )
+
+        assert result["decoder.lm_head.weight"].shape == (32, 1, 8)
+        assert result["embedding.embed_tokens.qweight"] is qweight
 
 
 class TestGemma3VisionEncoder:

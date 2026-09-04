@@ -1,0 +1,61 @@
+model_id: "swiss-ai/Apertus-v1.1-1.5B-Instruct"
+model_type: "apertus"
+revision: "9e9d01154446a645d30f04174cf1515a38058be7"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "MrMeOrYou/Apertus-v1.1-1.5B-Instruct-GGUF"
+  revision: "88c75ad49566d3c2157d03709bf772262c3241ed"
+  filename: "Apertus-v1.1-1.5B-Instruct-BF16.gguf"
+  size: 3028052608
+  lfs_sha256: "f9ec154d0ec29dad1f6465b458b7f27bd25ad7b9a3899233ae98ca6d358501c2"
+  tensor_count: 163
+  tensor_qtypes:
+    BF16: 98
+    F32: 65
+  execution_provider: "cpu"
+  config_sha256: "2a9660c48656c0980e76f1b374262bf8383256603e8b4221aa99bcfa11c510b0"
+  preserve_quantization: false
+  keep_quantized: true
+  tokenizer:
+    repository: "swiss-ai/Apertus-v1.1-1.5B-Instruct"
+    revision: "9e9d01154446a645d30f04174cf1515a38058be7"
+    metadata_sha256: "3097bd9f22efd32db9045c4705d978539dc8adeeae763324062a5e1a73fc24a5"
+    identity_status: "exact"
+    assets:
+      - filename: "chat_template.jinja"
+        size: 5250
+        sha256: "4afab8361a4bd0c2994404e0b0851dbaad461a06e56bdfdb635aae3977473c19"
+      - filename: "special_tokens_map.json"
+        size: 560
+        sha256: "9f69883bd70fc5d8b55822799837a216d3ac4fb565e05256a0d4f9850404bbc5"
+      - filename: "tokenizer.json"
+        size: 17078368
+        sha256: "be12f4375d655cc740864e3a9041bcddd8477942f209d9e7f27f6c8767162638"
+      - filename: "tokenizer_config.json"
+        size: 177274
+        sha256: "77b14a0664585c26065f07d7a4c852a4615c83348d9378e23def01957bbd3f57"
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 3050000000
+  released_capabilities:
+    "0.15.2": {generic_decoder: true, state_groups: false}
+
+inputs:
+  prompts:
+    - "Hello"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Pinned BF16 GGUF; independent raw-reader same-value oracle, full logits, 20-step cached decode, state semantics, and ORT GenAI generation are verified."

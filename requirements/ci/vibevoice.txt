@@ -1,0 +1,2 @@
+# VibeVoice is upstream but not yet available in a released Transformers wheel.
+transformers @ git+https://github.com/huggingface/transformers.git@640a08a597034221ca1c4fc0c129cf0118179225

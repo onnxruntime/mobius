@@ -175,6 +175,11 @@ _COVERAGE_SKIP: dict[str, str] = {
     "hy_v3": "L1 graph construction, native Transformers L2 config loading, and "
     "payload-free L3 trunk parity are covered; the immutable official checkpoint is "
     "597,578,239,288 bytes, so L4/L5 real-weight goldens exceed the 16 GiB policy.",
+    "reuse": "RE-USE / SEMamba speech enhancement — L1/L3 run from "
+    "SPEECH_CONFIGS and src/mobius/models/reuse_test.py. No L2: the published "
+    "nvidia/RE-USE config.json is a bespoke model_cfg/stft_cfg document with no "
+    "model_type field, which arch_validation_test requires, so the generic "
+    "download-and-build path cannot drive it.",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
@@ -211,6 +216,12 @@ _COVERAGE_SKIP: dict[str, str] = {
     "smallthinker_gguf": "GGUF-only SmallThinker route whose routing and SWA/NoPE schedules "
     "are restored by GGUF metadata postprocessing, not the native HF config path; dedicated "
     "config/graph/synthetic execution tests cover it while real-weight L4/L5 is deferred.",
+    "minimax_m2_gguf": "GGUF-only MiniMax-M2 route with dedicated config, tensor closure, "
+    "full-vector Q/K norm, partial-RoPE, routing, and cache execution tests; the smallest "
+    "immutable public GGUF is 46,514,882,176 bytes, above the 16 GiB evidence budget.",
+    "mistral4_gguf": "GGUF-only Mistral4 latent-cache route with dedicated config, tensor "
+    "closure, and prefill/cached-decode execution tests; the smallest immutable public GGUF "
+    "is 32,306,941,632 bytes, above the 16 GiB evidence budget.",
     "arctic_gguf": "GGUF-only Arctic route whose residual-MoE tensor layout is reconstructed "
     "from GGUF metadata; dedicated exact closure, graph, and synthetic execution tests cover "
     "it while real-weight L2/L4/L5 remains deferred.",
@@ -220,6 +231,15 @@ _COVERAGE_SKIP: dict[str, str] = {
     "ernie4_5_moe_gguf": "GGUF-only ERNIE MoE route whose dense/MoE schedule and shared "
     "experts are restored from GGUF metadata; dedicated exact closure, graph, and synthetic "
     "execution tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "grok_gguf": "GGUF-only Grok route whose scaling, sandwich norms, and dense-plus-routed "
+    "expert topology are restored from GGUF metadata; dedicated exact closure, graph, and "
+    "synthetic parity tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "grovemoe_gguf": "GGUF-only GroveMoE route whose primary and chunk expert banks are "
+    "restored from GGUF metadata; dedicated exact closure, graph, and synthetic parity tests "
+    "cover it while real-weight L2/L4/L5 remains deferred.",
+    "hunyuan_moe_gguf": "GGUF-only Hunyuan-MoE route whose post-RoPE Q/K norms and parallel "
+    "shared expert are restored from GGUF metadata; dedicated exact closure, graph, and "
+    "synthetic parity tests cover it while real-weight L2/L4/L5 remains deferred.",
     "nomic_bert_moe_gguf": "GGUF-only NomicBERT-MoE encoder route whose alternating MoE "
     "schedule and fused QKV layout are restored from GGUF metadata; dedicated exact closure, "
     "graph, and synthetic execution tests cover it while real-weight L2/L4/L5 remains deferred.",
@@ -230,6 +250,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
     "are covered by _specialized_encoders_test.py.",
     "seed_oss": "Internal model — no public HF checkpoint",
+    "semamba": "Alias for reuse — covered by reuse",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",
     # --- VL models / text-decoder submodels (L1 graph-build only) ---
@@ -422,7 +443,7 @@ class TestSkipListIntegrity:
 class TestL1L3GraphBuildCoverage:
     """L1 + L3: every model needs a test config in _test_configs.py.
 
-    The config enables ``build_graph_test.py`` to exercise the model.
+    The config enables the L1 graph-construction suite to exercise the model.
     For causal-LM models, it also enables ``synthetic_parity_test.py``.
     """
 

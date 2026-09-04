@@ -22,22 +22,29 @@ Last Updated: 2025-03-09
 
 ### 1.1 `/tests/` Directory Structure
 
-**Main Test Files (18 total):**
+**Selected main test files:**
 
 | File | Classes | Methods | Purpose | Markers |
 |------|---------|---------|---------|---------|
-| `build_graph_test.py` | 33 | 100 | **L1 Unit Tests**: Build ONNX graphs for all supported architectures without weights or network access | `parametrize` |
+| `tests/build_graph/` | 33 | 100 | **L1 Unit Tests**: Build ONNX graphs for all supported architectures without weights or network access | `parametrize` |
 | `arch_validation_test.py` | 1 | 4 | **L2 Architecture Validation**: Downloads config.json from HF for registered models, builds full-size ONNX graphs (no weights), validates structure | `arch_validation`, `parametrize` |
 | `synthetic_parity_test.py` | 0 | 1 | **L3 Synthetic Parity**: Builds tiny random-weight models (PyTorch + ONNX), compares logits to detect op-level bugs | `parametrize` |
 | `e2e_golden_test.py` | 2 | 2 | **L4/L5 Golden Comparison**: Data-driven tests from YAML files in `testdata/cases/`; L4 compares single-forward logits, L5 compares generation | `golden`, `generation`, `integration`, `parametrize` |
-| `integration_test.py` | 15 | 34 | **Integration Tests**: Downloads real model weights, compares logits and greedy generation vs HF PyTorch reference | `integration`, `integration_fast`, `integration_slow`, `parametrize` |
+| `integration/text_test.py` | 1 | 2 | **Text parity**: Generic real-weight causal-LM prefill and decode | `integration`, `integration_fast`, `parametrize` |
+| `integration/generation_test.py` | 2 | 6 | **Generation**: Real-weight token comparison and synthetic generation loops | `integration`, `integration_fast`, `parametrize` |
+| `integration/vlm_test.py` | 5 | 15 | **VLM parity**: Real-checkpoint text, vision, and 3-model pipelines | `integration`, `integration_slow`, `parametrize` |
+| `integration/encoder_media_seq2seq_test.py` | 5 | 8 | **Non-causal parity**: Encoder, vision, audio, seq2seq, and Whisper matrices | `integration`, `integration_fast`, `parametrize` |
+| `integration/architectures_test.py` | 1 | 2 | **Architecture-specific parity**: Custom references, routing, and artifact paths | `integration`, `integration_fast`, `integration_slow` |
+| `integration/qwen3_5_vl_test.py` | 0 | 5 | **Qwen3.5-VL**: Three-model and hybrid-state parity | `integration`, `integration_fast` |
+| `integration/multimodal_pipeline_test.py` | 1 | 4 | **Synthetic multimodal pipelines**: Gemma3, BLIP-2, and InternVL2 | `integration`, `integration_fast` |
+| `integration/gemma4_test.py` | 0 | 5 | **Gemma4**: Heavyweight text, multimodal, BF16, and mask parity | `integration`, `integration_slow` |
 | `weight_alignment_test.py` | 5 | 5 | **Weight Alignment Tests**: Verifies preprocess_weights() doesn't corrupt ONNX names; catches renaming bugs | `parametrize` |
 | `onnx_checker_test.py` | 1 | 1 | **ONNX Checker Tests**: Runs CheckerPass on all built models; detects op errors, malformed protos (~30s) | `parametrize` |
 | `cli_test.py` | 3 | 8 | **CLI Tests**: Invokes `main()` directly; no network access, all build tests use `--no-weights` | None |
 | `seq2seq_integration_test.py` | 8 | 9 | **Seq2Seq Integration**: T5/BART encoder-decoder vs HF PyTorch | `integration`, `parametrize` |
 | `vision_integration_test.py` | 2 | 2 | **Vision Integration**: ViT/CLIP with random weights vs PyTorch | `integration`, `integration_fast` |
 | `multimodal_integration_test.py` | 1 | 2 | **Multimodal Integration**: Vision-language models (Gemma3, etc.) | `integration`, `integration_slow` |
-| `moe_integration_test.py` | 2 | 3 | **MoE Integration**: Deprecated (superseded by `integration_test.py`); MoE models prefill/decode | `integration`, `integration_fast` |
+| `moe_integration_test.py` | 2 | 3 | **MoE Integration**: Deprecated (superseded by focused text/generation suites); MoE models prefill/decode | `integration`, `integration_fast` |
 | `whisper_integration_test.py` | 3 | 4 | **Whisper Integration**: Audio encoder-decoder vs HF | `integration`, `integration_fast` |
 | `ort_genai_test.py` | 2 | 3 | **ONNX Runtime GenAI**: End-to-end with onnxruntime-genai inference | `integration`, `integration_slow`, `parametrize` |
 | `mamba2_integration_test.py` | 1 | 2 | **Mamba2 Integration**: SSM state carry, single-token decode | `integration` |
@@ -48,6 +55,7 @@ Last Updated: 2025-03-09
 **Support Files:**
 - `conftest.py` (141 lines) — Shared fixtures, marker registration, CLI flags, test filtering
 - `_test_configs.py` (38KB) — Config data for parametrized tests
+- `integration/_support.py` — Shared integration session/feed helpers and text cases
 
 ### 1.2 `src/` Test Files (54 total)
 
@@ -59,7 +67,7 @@ Last Updated: 2025-03-09
 | **Building & Export** | 22 | 113 | `_exporter_test.py` (32M), `_model_package_test.py` (29M), `_diffusers_builder_test.py` (21M) |
 | **Components** | 67 | 379 | 23 test files (rotary_embedding 28M, quantized_linear 22M, audio 16M, attention 17M, vision 16M, whisper 20M, etc.) |
 | **Weight Handling** | 17 | 114 | `_weight_utils_test.py` (58M), `_weight_loading_test.py` (27M), `_graph_diff_test.py` (24M) |
-| **GGUF Integration** | 19 | 91 | `_builder_test.py`, `_reader_test.py` (26M), `_repacker_test.py` (30M), `_tensor_mapping_test.py` (18M) |
+| **GGUF Integration** | 19 | 91 | `_builder_core_test.py`, `_builder_architectures_test.py`, `_builder_contracts_test.py`, `_reader_test.py` (26M) |
 | **Testing Utilities** | 9 | 55 | `golden_test.py` (28M), `parity_test.py` (11M), `code_paths_test.py` (16M) |
 | **Tasks Framework** | 15 | 81 | `_task_test.py` (15 classes, 81 methods — core model building logic) |
 | **Other** | 27 | 61 | ORT GenAI auto_export_test (integration marker), rewrite rules (bias/gelu/layer_norm fusion, etc.) |
@@ -141,7 +149,7 @@ def deterministic_seed():
 
 | File | Trigger | Level | Test Command | Purpose |
 |------|---------|-------|--------------|---------|
-| **main.yml** | PR + push to main | L1–L3, selective L4 | `pytest tests/build_graph_test.py -n auto` (L1); `pytest tests/synthetic_parity_test.py -n auto` (L3); `pytest -m 'not integration'` (coverage); selective L4 + L5 | Fast PR feedback; runs on every push |
+| **main.yml** | PR + push to main | L1–L3, selective L4 | `pytest tests/build_graph -n auto` (L1); `pytest tests/synthetic_parity_test.py -n auto` (L3); `pytest -m 'not integration'` (coverage); selective L4 + L5 | Fast PR feedback; runs on every push |
 | **gpu_tests.yml** | push to main + weekly (Mon 4am UTC) | L4–L5 | `pytest tests/e2e_golden_test.py -m golden` (L4); `pytest tests/e2e_golden_test.py -m generation` (L5) | GPU-only golden/generation tests (requires checkpoint verification) |
 | **nightly_l2.yml** | nightly (3am UTC) + l2-* tags | L2 | `pytest tests/arch_validation_test.py -m arch_validation` | Architecture validation with real HF configs |
 | **golden_regen.yml** | weekly (Sun 2am UTC) + manual | — | Regenerates golden files | Updates L4/L5 reference data (before nightly_l2) |
@@ -151,7 +159,7 @@ def deterministic_seed():
 
 **CI Test Levels:**
 ```
-L1 (Smoke)           → build_graph_test.py            (fast, no weights, no network)
+L1 (Smoke)           → tests/build_graph/            (fast, no weights, no network)
 L2 (Architecture)    → arch_validation_test.py        (real HF configs, no weights, nightly)
 L3 (Synthetic)       → synthetic_parity_test.py       (tiny random weights, detects op bugs)
 L4 (Golden Logits)   → e2e_golden_test.py -m golden   (checkpoint-verified single-forward)
@@ -270,7 +278,7 @@ def deterministic_seed():
     return seed
 ```
 
-**`src/mobius/integrations/gguf/_builder_test.py`:**
+**`src/mobius/integrations/gguf/_builder_test_utils.py`:**
 ```python
 @pytest.fixture
 def [fixture_name]  # Implementation details TBD
@@ -295,9 +303,9 @@ def [fixture_name_2]  # Implementation details TBD
 
 | Type | Count | Location | Purpose |
 |------|-------|----------|---------|
-| **Unit (L0/L1)** | ~100 methods | `src/**/*_test.py`, `tests/build_graph_test.py` | Fast, no network |
+| **Unit (L0/L1)** | ~100 methods | `src/**/*_test.py`, `tests/build_graph` | Fast, no network |
 | **Component** | ~379 methods | `src/components/*_test.py` | Individual operator validation |
-| **Integration (L3)** | ~52 methods | `tests/*_integration_test.py`, `tests/synthetic_parity_test.py` | Real weights, network required |
+| **Integration (L3)** | ~52 methods | `tests/integration/`, `tests/synthetic_parity_test.py` | Real weights, network required |
 | **Golden (L4/L5)** | ~2–10 methods | `tests/e2e_golden_test.py`, parametrized via YAML | Data-driven, checkpoint-verified |
 | **Architecture (L2)** | 4 methods | `tests/arch_validation_test.py` | Real HF configs, no weights |
 | **Infrastructure** | ~55 methods | `src/*_testing*/*_test.py` | Golden/parity utils testing |
@@ -326,7 +334,7 @@ def test_build_model(model_type, config_overrides):
 ```python
 @pytest.mark.integration
 @pytest.mark.integration_fast
-@pytest.mark.parametrize("model_id,trust_remote_code", _TEXT_MODELS)
+@pytest.mark.parametrize("model_id,trust_remote_code", TEXT_MODELS)
 def test_export_and_run(model_id, trust_remote_code):
     # Downloads weights, compares logits
 ```
@@ -365,10 +373,10 @@ def test_parity_causal_lm():
 
 ```bash
 # L1 Smoke (all architectures)
-pytest tests/build_graph_test.py -v
+pytest tests/build_graph -v
 
 # L1 Fast (representative only)
-pytest tests/build_graph_test.py -v --fast
+pytest tests/build_graph -v --fast
 
 # L2 Architecture Validation
 pytest tests/arch_validation_test.py -m arch_validation -v
@@ -383,16 +391,16 @@ pytest tests/e2e_golden_test.py -m golden -v
 pytest tests/e2e_golden_test.py -m generation -v
 
 # Integration (small models only)
-pytest tests/integration_test.py -m integration_fast -v -k "smollm or albert"
+pytest tests/integration -m integration_fast -v -k "smollm or albert"
 
 # All non-integration tests with coverage
 pytest -m 'not integration' --cov=src --cov-report=html
 
 # Filter by model type
-pytest tests/build_graph_test.py -v --models "qwen2,llama"
+pytest tests/build_graph -v --models "qwen2,llama"
 
 # Run specific test
-pytest tests/build_graph_test.py::TestQwen2::test_qwen2 -v
+pytest tests/build_graph/core_test.py::TestBuildGraph::test_graph_builds_without_weights[qwen2] -v
 ```
 
 ---
@@ -423,4 +431,3 @@ pytest tests/build_graph_test.py::TestQwen2::test_qwen2 -v
 - Avoids fixture complexity; easier to understand test flow
 
 ---
-

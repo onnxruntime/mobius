@@ -17,7 +17,10 @@ from collections import defaultdict
 from typing import Literal
 
 from mobius.integrations.gguf._arch_registry import iter_arch_specs
-from mobius.integrations.gguf._draft import is_draft_architecture
+from mobius.integrations.gguf._draft import (
+    has_direct_draft_runtime,
+    is_draft_architecture,
+)
 from mobius.integrations.gguf._mmproj_registry import iter_projector_specs
 from mobius.integrations.gguf._mtp import mtp_architecture_capabilities
 from mobius.integrations.gguf._spec import Support
@@ -26,7 +29,7 @@ from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 RouteCategory = Literal[
     "immediately-implementable",
     "evidence-only",
-    "dependency-or-runtime-abi-blocked",
+    "dependency-or-mobius-abi-blocked",
     "artifact-unavailable",
     "intentionally-rejected",
 ]
@@ -86,10 +89,46 @@ RECENT_PR_DEPENDENCIES: tuple[RecentPRDependency, ...] = (
         "merged",
         "follow-up hardening for sharded GGUF evidence edge cases after PR #656",
     ),
+    RecentPRDependency(
+        672,
+        "Prove Qwen3.5 MoE GGUF explicit-float runtime route",
+        "merged",
+        "Qwen3.5 MoE runtime evidence is complete; exclude it from follow-up evidence batches",
+    ),
+    RecentPRDependency(
+        674,
+        "Keep Nemotron-H GGUF runtime fail-closed with pinned evidence",
+        "merged",
+        "Nemotron-H MoE blocker evidence is complete; exclude it from follow-up evidence batches",
+    ),
+    RecentPRDependency(
+        677,
+        "Promote first GGUF text architecture cohort",
+        "merged",
+        "the text architecture cohort is merged into the authoritative graph-route census",
+    ),
+    RecentPRDependency(
+        678,
+        "Promote generic GGUF projector cohort",
+        "merged",
+        "the generic projector cohort is merged into the authoritative projector census",
+    ),
+    RecentPRDependency(
+        679,
+        "Add exact Hunyuan V3 GGUF graph support",
+        "merged",
+        "Hunyuan V3 graph and MTP routes are merged into the authoritative route census",
+    ),
+    RecentPRDependency(
+        680,
+        "Promote first GGUF MoE architecture cohort",
+        "merged",
+        "the MoE architecture cohort is merged into the authoritative graph-route census",
+    ),
 )
 
-# Reviewed dispositions for routes that cannot advance until Mobius owns a new
-# state/package ABI. Classification must not depend on wording in the reason.
+# Reviewed dispositions for routes that cannot advance until Mobius owns missing
+# graph, state, or package semantics. Downstream runtime capability is not a blocker.
 _ARCHITECTURE_ABI_BLOCKED = frozenset(
     {
         "afmoe",
@@ -128,18 +167,6 @@ _ARCHITECTURE_ABI_BLOCKED = frozenset(
         "wavtokenizer-dec",
     }
 )
-_ARCHITECTURE_RUNTIME_SCHEMA_BLOCKED = frozenset(
-    {
-        "falcon-h1",
-        "granitehybrid",
-        "jamba",
-        "kimi-k3",
-        "kimi-linear",
-        "minimax-01",
-        "nemotron_h_moe",
-        "plamo2",
-    }
-)
 _ARCHITECTURE_INTENTIONAL_REJECTIONS = frozenset(
     {"bailingmoe2", "dots3note", "exaone-moe", "exaone4", "glm4", "glm4moe"}
 )
@@ -163,7 +190,9 @@ def _architecture_dependencies(spec) -> tuple[str, ...]:
 def _architecture_items() -> list[GGUFRouteWorkItem]:
     items = []
     for spec in iter_arch_specs():
-        if spec.runtime is Support.SUPPORTED:
+        if spec.runtime is Support.SUPPORTED or (
+            is_draft_architecture(spec.gguf_arch) and has_direct_draft_runtime(spec.gguf_arch)
+        ):
             continue
         reason = spec.reason or "Registry has no reason."
         core_verdicts = (spec.config, spec.tensor_map, spec.graph, spec.runtime)
@@ -175,20 +204,10 @@ def _architecture_items() -> list[GGUFRouteWorkItem]:
             category: RouteCategory = "intentionally-rejected"
             batch = "policy-rejections"
             dependencies = ("policy change plus independent correctness proof",)
-        elif (
-            spec.gguf_arch
-            in (_ARCHITECTURE_ABI_BLOCKED | _ARCHITECTURE_RUNTIME_SCHEMA_BLOCKED)
-            or spec.preflight_only
-        ):
-            category = "dependency-or-runtime-abi-blocked"
+        elif spec.gguf_arch in _ARCHITECTURE_ABI_BLOCKED or spec.preflight_only:
+            category = "dependency-or-mobius-abi-blocked"
             batch = "architecture-abi-dependencies"
-            if spec.gguf_arch in _ARCHITECTURE_RUNTIME_SCHEMA_BLOCKED:
-                dependencies = (
-                    "ORT GenAI heterogeneous-state schema (issue #605)",
-                    "stateful runtime package parity",
-                )
-            else:
-                dependencies = _architecture_dependencies(spec)
+            dependencies = _architecture_dependencies(spec)
         elif spec.is_importable:
             category = "evidence-only"
             batch = "architecture-runtime-evidence"
@@ -234,9 +253,9 @@ def _projector_items() -> list[GGUFRouteWorkItem]:
             and spec.tensor_map is Support.SUPPORTED
             and spec.graph is Support.DEFERRED
         ):
-            category = "dependency-or-runtime-abi-blocked"
-            batch = "projector-runtime-abi"
-            dependencies = ("dynamic processor-to-graph media shape ABI",)
+            category = "dependency-or-mobius-abi-blocked"
+            batch = "projector-package-abi"
+            dependencies = ("Mobius dynamic processor-to-graph media shape contract",)
         elif spec.projector_type in _PROJECTOR_ARTIFACT_UNAVAILABLE:
             category = "artifact-unavailable"
             batch = "projector-artifact-discovery"
@@ -266,9 +285,16 @@ def _tokenizer_items() -> list[GGUFRouteWorkItem]:
         reason = record.candidate_disposition or str(record.blocker_category)
         dependencies: tuple[str, ...]
         if record.blocker_category == "compiled-llama.cpp-semantic-dependency":
-            category: RouteCategory = "dependency-or-runtime-abi-blocked"
+            category: RouteCategory = "dependency-or-mobius-abi-blocked"
             batch = "tokenizer-compiled-semantics"
             dependencies = ("compiled pinned llama.cpp oracle", "dispatch-equivalence fixture")
+        elif record.blocker_category == "pinned-candidate-source-semantic-mismatch":
+            category = "dependency-or-mobius-abi-blocked"
+            batch = "tokenizer-compiled-semantics"
+            dependencies = (
+                "upstream tokenizer semantic parity",
+                "independently proven replacement reconstruction",
+            )
         elif record.blocker_category == "pinned-artifact-source-parity-pending":
             category = "evidence-only"
             batch = "tokenizer-artifact-evidence"
@@ -307,7 +333,7 @@ def _mtp_items() -> list[GGUFRouteWorkItem]:
             batch = "mtp-runtime-evidence"
             dependencies = ("target acceptance loop", "cache-threaded draft/target parity")
         elif capability.loader_behavior == "executed-sidecar":
-            category = "dependency-or-runtime-abi-blocked"
+            category = "dependency-or-mobius-abi-blocked"
             batch = "mtp-specialized-abi"
             dependencies = ("specialized sidecar graph", "routed/cache state ABI")
         else:
@@ -346,7 +372,7 @@ def _draft_items() -> list[GGUFRouteWorkItem]:
             reason,
         )
         for architecture in ("dflash", "eagle3")
-        if is_draft_architecture(architecture)
+        if is_draft_architecture(architecture) and not has_direct_draft_runtime(architecture)
     ]
 
 
