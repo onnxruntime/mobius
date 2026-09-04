@@ -618,6 +618,22 @@ def preflight_hf_gguf(
         quantization=quantization,
         source=f"{repo_id}{('/' + filename) if filename else ''}",
     )
+    from mobius.integrations.gguf._vibeasr_bitnet import find_vibeasr_bitnet_gguf_artifact
+
+    for file in files:
+        artifact = find_vibeasr_bitnet_gguf_artifact(
+            repository=repo_id,
+            revision=revision,
+            filename=file.filename,
+            size_bytes=file.size_bytes,
+            sha256=file.sha256,
+        )
+        if artifact is not None:
+            blockers.append(
+                f"VibeVoice ASR BitNet native GGUF blocker for {artifact.filename}: "
+                f"{artifact.blocker} Build from the dense F32 safetensors conversion source "
+                "instead; Mobius does not claim native BitNet/GGUF execution."
+            )
 
     warnings: list[str] = []
     if architecture is None:

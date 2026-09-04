@@ -38,7 +38,7 @@ from typing import Any, cast
 
 import numpy as np
 
-from mobius.integrations.gguf._header import _gguf_architecture_from_header
+from mobius.integrations.gguf._header import _gguf_header_info_from_header
 
 logger = logging.getLogger(__name__)
 
@@ -247,11 +247,17 @@ class GGUFModel:
                 )
             with os.fdopen(os.dup(descriptor), "rb") as stream:
                 with mmap.mmap(stream.fileno(), length=0, access=mmap.ACCESS_READ) as mapped:
-                    _gguf_architecture_from_header(
+                    header_info = _gguf_header_info_from_header(
                         mapped,
                         source=str(self._path),
                         require_architecture=False,
+                        collect_tensor_type_ids=True,
                     )
+                    from mobius.integrations.gguf._vibeasr_bitnet import (
+                        reject_vibeasr_bitnet_gguf,
+                    )
+
+                    reject_vibeasr_bitnet_gguf(source=str(self._path), header=header_info)
                 stream.seek(0)
                 self._reader = GGUFReader(cast(Any, stream))
                 stream.seek(0)

@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from typing import Any
 
 _GGUF_ARCHITECTURE_KEY = b"general.architecture"
+_GGUF_IDENTITY_STRING_KEYS = {
+    b"general.name": "name",
+}
+_GGUF_IDENTITY_INTEGER_KEYS = {
+    b"general.file_type": "file_type",
+    b"general.quantization_version": "quantization_version",
+}
 _GGUF_SPLIT_KEYS = {
     b"split.no": "split_no",
     b"split.count": "split_count",
@@ -58,6 +65,10 @@ class GGUFHeaderInfo:
     split_no: int | None
     split_count: int | None
     split_tensors_count: int | None
+    name: str | None = None
+    file_type: int | None = None
+    quantization_version: int | None = None
+    tensor_type_ids: frozenset[int] = frozenset()
 
 
 def _gguf_header_info_from_header(
@@ -65,6 +76,7 @@ def _gguf_header_info_from_header(
     *,
     source: str,
     require_architecture: bool = True,
+    collect_tensor_type_ids: bool = False,
 ) -> GGUFHeaderInfo:
     """Validate a GGUF metadata table and return bounded preflight fields."""
     size = len(data)
@@ -95,6 +107,15 @@ def _gguf_header_info_from_header(
             raise GGUFHeaderTruncatedError(f"{source!r} has a truncated GGUF metadata header.")
         return struct.unpack_from(f"{byte_order}Q", data, offset)[0], end
 
+    def skip_bytes(offset: int, count: int, *, field_name: str) -> int:
+        end = offset + count
+        if end > size:
+            raise GGUFHeaderTruncatedError(
+                f"{source!r} has a truncated GGUF {field_name}: "
+                f"requires {count} bytes with only {size - offset} remaining."
+            )
+        return end
+
     def read_string_span(offset: int) -> tuple[int, int, int]:
         length, offset = read_uint64(offset)
         end = offset + length
@@ -105,18 +126,17 @@ def _gguf_header_info_from_header(
             )
         return offset, end, end
 
-    def read_integer(value_type: int, offset: int) -> tuple[int, int]:
+    def read_integer(value_type: int, offset: int, *, key_name: str) -> tuple[int, int]:
         format_char = _GGUF_INTEGER_FORMATS.get(value_type)
         if format_char is None:
             raise ValueError(
-                f"{source!r} encodes split bookkeeping with non-integer GGUF "
-                f"type {value_type}."
+                f"{source!r} encodes {key_name} with non-integer GGUF type {value_type}."
             )
         width = _GGUF_SCALAR_WIDTHS[value_type]
         end = offset + width
         if end > size:
             raise GGUFHeaderTruncatedError(
-                f"{source!r} has a truncated GGUF split metadata value."
+                f"{source!r} has a truncated GGUF {key_name} metadata value."
             )
         return int(struct.unpack_from(f"{byte_order}{format_char}", data, offset)[0]), end
 
@@ -188,6 +208,12 @@ def _gguf_header_info_from_header(
     split_values: dict[str, list[int]] = {
         field_name: [] for field_name in _GGUF_SPLIT_KEYS.values()
     }
+    identity_string_values: dict[str, list[bytes]] = {
+        field_name: [] for field_name in _GGUF_IDENTITY_STRING_KEYS.values()
+    }
+    identity_integer_values: dict[str, list[int]] = {
+        field_name: [] for field_name in _GGUF_IDENTITY_INTEGER_KEYS.values()
+    }
     for _ in range(kv_count):
         key_start, key_end, offset = read_string_span(offset)
         value_type, offset = read_uint32(offset)
@@ -204,8 +230,25 @@ def _gguf_header_info_from_header(
                 )
             value_start, value_end, offset = read_string_span(offset)
             architecture_values.append(bytes(data[value_start:value_end]))
+        elif (field_name := _GGUF_IDENTITY_STRING_KEYS.get(key)) is not None:
+            if value_type != _GGUF_STRING:
+                raise ValueError(
+                    f"{source!r} encodes general.{field_name} with GGUF type "
+                    f"{value_type}, expected string type {_GGUF_STRING}."
+                )
+            value_start, value_end, offset = read_string_span(offset)
+            identity_string_values[field_name].append(bytes(data[value_start:value_end]))
+        elif (field_name := _GGUF_IDENTITY_INTEGER_KEYS.get(key)) is not None:
+            value, offset = read_integer(
+                value_type,
+                offset,
+                key_name=f"general.{field_name}",
+            )
+            identity_integer_values[field_name].append(value)
         elif (field_name := _GGUF_SPLIT_KEYS.get(key)) is not None:
-            value, offset = read_integer(value_type, offset)
+            value, offset = read_integer(
+                value_type, offset, key_name=field_name.replace("_", ".")
+            )
             split_values[field_name].append(value)
         else:
             offset = skip_value(value_type, offset)
@@ -232,12 +275,54 @@ def _gguf_header_info_from_header(
                 f"{source!r} contains duplicate {field_name.replace('_', '.')} metadata."
             )
         split_fields[field_name] = values[0] if values else None
+    identity_strings: dict[str, str | None] = {}
+    for field_name, values in identity_string_values.items():
+        if len(values) > 1:
+            raise ValueError(f"{source!r} contains duplicate general.{field_name} metadata.")
+        if not values:
+            identity_strings[field_name] = None
+            continue
+        try:
+            identity_strings[field_name] = values[0].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"{source!r} has a non-UTF-8 general.{field_name} value."
+            ) from error
+    identity_integers: dict[str, int | None] = {}
+    for field_name, values in identity_integer_values.items():
+        if len(values) > 1:
+            raise ValueError(f"{source!r} contains duplicate general.{field_name} metadata.")
+        identity_integers[field_name] = values[0] if values else None
+    tensor_type_ids: frozenset[int] = frozenset()
+    if collect_tensor_type_ids:
+        types: set[int] = set()
+        for tensor_index in range(tensor_count):
+            _, _, offset = read_string_span(offset)
+            dimensions, offset = read_uint32(offset)
+            if dimensions > 4:
+                raise ValueError(
+                    f"{source!r} tensor {tensor_index} has {dimensions} dimensions; "
+                    "GGUF tensor metadata permits at most 4."
+                )
+            offset = skip_bytes(
+                offset,
+                dimensions * 8,
+                field_name=f"tensor {tensor_index} dimensions",
+            )
+            tensor_type, offset = read_uint32(offset)
+            types.add(tensor_type)
+            offset = skip_bytes(offset, 8, field_name=f"tensor {tensor_index} offset")
+        tensor_type_ids = frozenset(types)
     return GGUFHeaderInfo(
         architecture=architecture,
         tensor_count=tensor_count,
         split_no=split_fields["split_no"],
         split_count=split_fields["split_count"],
         split_tensors_count=split_fields["split_tensors_count"],
+        name=identity_strings["name"],
+        file_type=identity_integers["file_type"],
+        quantization_version=identity_integers["quantization_version"],
+        tensor_type_ids=tensor_type_ids,
     )
 
 
