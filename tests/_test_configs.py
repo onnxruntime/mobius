@@ -54,6 +54,7 @@ from mobius._configs import (
     NemotronHConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
+    Phi4FlashConfig,
     Plamo2Config,
     Qwen4ExpConfig,
     Sam2Config,
@@ -2765,6 +2766,23 @@ DETECTION_CONFIGS: list[tuple[str, dict, bool]] = [
 # SSM (State Space Model) configs — pure Mamba/Mamba2, no attention
 # ---------------------------------------------------------------------------
 SSM_CONFIGS: list[tuple[str, dict, bool]] = [
+    # Phi-4 Flash's SambaY path owns only the first-half recurrent/local states;
+    # its later YOCO cross layers consume transient shared memory/KV.
+    (
+        "phi4flash",
+        {
+            "_config_cls": Phi4FlashConfig,
+            "num_hidden_layers": 4,
+            "mamba_d_state": 8,
+            "mamba_d_conv": 4,
+            "mamba_dt_rank": 4,
+            "mamba_expand": 2,
+            "local_attention_window": 8,
+            "layer_norm_eps": 1e-5,
+            "tie_word_embeddings": True,
+        },
+        True,
+    ),
     # mamba: pure Mamba SSM (no attention) — requires MambaConfig
     (
         "mamba",

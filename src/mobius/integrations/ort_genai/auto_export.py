@@ -1986,6 +1986,11 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
+    if getattr(config, "model_type", None) == "phi4flash":
+        raise ValueError(
+            "ORT GenAI cannot represent Phi-4 Flash's heterogeneous dynamic SambaY "
+            "cache ABI. Use the custom ONNX Runtime Session cache contract instead."
+        )
     os.makedirs(directory, exist_ok=True)
     if set(pkg) in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
         pkg, "gguf_projector_type", None

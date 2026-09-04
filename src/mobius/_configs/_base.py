@@ -3768,6 +3768,148 @@ class BambaConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class Phi4FlashConfig(ArchitectureConfig):
+    """Configuration for Phi-4 Flash's SambaY hybrid decoder.
+
+    The first half alternates Mamba-1 and local differential GQA. Layer 16
+    produces transient Mamba memory, layer 17 produces global shared KV, and
+    the final half consumes those two shared values through cross-Mamba and
+    cross-differential-attention layers. It deliberately has no RoPE despite
+    the inactive ``rope_theta`` field in the remote configuration.
+    """
+
+    layer_norm_eps: float = 1e-5
+    attention_dropout: float = 0.0
+    mamba_d_state: int = 16
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_dt_rank: int = 160
+    mamba_conv_bias: bool = True
+    mamba_proj_bias: bool = False
+    mb_per_layer: int = 2
+    local_attention_window: int = 512
+
+    def __post_init__(self) -> None:
+        if self.num_hidden_layers % 4:
+            raise ValueError("Phi4FlashConfig num_hidden_layers must be divisible by four")
+        if self.mb_per_layer != 2:
+            raise ValueError(
+                "Phi4FlashConfig supports the SambaY mb_per_layer=2 schedule only"
+            )
+        if self.export_paged_attention:
+            raise ValueError(
+                "Phi4FlashConfig cannot use paged attention: SambaY has heterogeneous "
+                "recurrent, local-KV, and shared-global-KV state"
+            )
+        if self.local_attention_window <= 0:
+            raise ValueError("Phi4FlashConfig local_attention_window must be positive")
+        if self.mamba_d_state <= 0 or self.mamba_d_conv <= 1 or self.mamba_expand <= 0:
+            raise ValueError(
+                "Phi4FlashConfig requires positive Mamba state/expansion and a convolution width above one"
+            )
+        if self.mamba_dt_rank <= 0:
+            raise ValueError("Phi4FlashConfig mamba_dt_rank must be positive")
+        if self.hidden_size % self.num_attention_heads:
+            raise ValueError(
+                "Phi4FlashConfig hidden_size must be divisible by num_attention_heads"
+            )
+        if self.head_dim != self.hidden_size // self.num_attention_heads:
+            raise ValueError(
+                "Phi4FlashConfig head_dim must equal hidden_size / num_attention_heads"
+            )
+        if self.num_attention_heads % 2 or self.num_key_value_heads % 2:
+            raise ValueError(
+                "Phi4FlashConfig differential attention requires even Q and KV head counts"
+            )
+        if self.num_attention_heads % self.num_key_value_heads:
+            raise ValueError(
+                "Phi4FlashConfig num_attention_heads must be divisible by num_key_value_heads"
+            )
+        expected = self._derive_layer_types(self.num_hidden_layers)
+        if self.layer_types is None:
+            self.layer_types = expected
+        elif self.layer_types != expected:
+            raise ValueError(
+                "Phi4FlashConfig layer_types is derived from the fixed SambaY schedule; "
+                f"expected {expected}, got {self.layer_types}"
+            )
+        # `rope_theta` is configuration residue. The source has no RoPE call.
+        self.rope_type = None
+        self.rope_theta = None
+        self.rope_scaling = None
+        self.partial_rotary_factor = None
+
+    @staticmethod
+    def _derive_layer_types(num_hidden_layers: int) -> list[str]:
+        midpoint = num_hidden_layers // 2
+        global_attention = midpoint + 1
+        layer_types = []
+        for index in range(num_hidden_layers):
+            if index < midpoint:
+                layer_types.append(
+                    "mamba" if index % 2 == 0 else "local_differential_attention"
+                )
+            elif index == midpoint:
+                layer_types.append("shared_memory_mamba")
+            elif index == global_attention:
+                layer_types.append("global_differential_attention")
+            else:
+                layer_types.append(
+                    "cross_mamba" if index % 2 == 0 else "cross_differential_attention"
+                )
+        return layer_types
+
+    @property
+    def cache_slot_count(self) -> int:
+        """The source cache owns layers 0 through the global attention layer."""
+        return self.num_hidden_layers // 2 + 2
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Phi4FlashConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        # The pinned remote config exposes its checkpoint precision as
+        # ``torch_dtype`` rather than the modern ``dtype`` property.
+        checkpoint_dtype = _resolve_dtype_value(getattr(config, "torch_dtype", None))
+        local_window = getattr(config, "sliding_window", 512)
+        if isinstance(local_window, (list, tuple)):
+            local_window = next((value for value in local_window if value is not None), 512)
+        dt_rank = getattr(config, "mamba_dt_rank", "auto")
+        if dt_rank == "auto":
+            dt_rank = math.ceil(base.hidden_size / 16)
+        excluded = {
+            "layer_types",
+            "sliding_window",
+            "rope_type",
+            "rope_theta",
+            "rope_scaling",
+            "partial_rotary_factor",
+            "dtype",
+        }
+        base_fields = {
+            key: value for key, value in _shallow_fields(base).items() if key not in excluded
+        }
+        return cls(
+            **base_fields,
+            dtype=checkpoint_dtype or base.dtype,
+            layer_types=cls._derive_layer_types(base.num_hidden_layers),
+            layer_norm_eps=getattr(config, "layer_norm_eps", 1e-5),
+            attention_dropout=getattr(config, "attention_dropout", 0.0),
+            mamba_d_state=getattr(config, "mamba_d_state", 16),
+            mamba_d_conv=getattr(config, "mamba_d_conv", 4),
+            mamba_expand=getattr(config, "mamba_expand", 2),
+            mamba_dt_rank=int(dt_rank),
+            mamba_conv_bias=getattr(config, "mamba_conv_bias", True),
+            mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
+            mb_per_layer=getattr(config, "mb_per_layer", 2),
+            local_attention_window=int(local_window),
+            rope_type=None,
+            rope_theta=None,
+            rope_scaling=None,
+            partial_rotary_factor=None,
+        )
+
+
+@dataclasses.dataclass
 class FalconH1Config(ArchitectureConfig):
     """Configuration for Falcon-H1 parallel Attention + Mamba2 decoder layers."""
 

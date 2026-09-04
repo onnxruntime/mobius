@@ -12,6 +12,8 @@ This module provides:
   ``com.microsoft.CausalConvWithState`` for depthwise Conv1D.
   Supports both single-token decode (T=1) and multi-token prefill
   (T>1) in a single code path.
+- **StatefulMambaBlock**: source-compatible Mamba-1 with sequence prefill
+  and an externally threaded convolution/SSM state ABI.
 
 HuggingFace reference: ``MambaMixer``, ``BambaMixer``,
 ``NemotronHMamba2Mixer``.
@@ -171,6 +173,225 @@ class MambaBlock(nn.Module):
         output = self.out_proj(op, gated)
 
         return output, new_conv_state, new_ssm_state
+
+
+class _FloatBiasLinear(nn.Module):
+    """Linear projection that accumulates its bias in float32."""
+
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter([out_features, in_features])
+        self.bias = nn.Parameter([out_features])
+
+    def forward(self, op: OpBuilder, value: ir.Value) -> ir.Value:
+        product = op.MatMul(value, op.Transpose(self.weight))
+        return op.Add(
+            op.Cast(product, to=ir.DataType.FLOAT),
+            op.Cast(self.bias, to=ir.DataType.FLOAT),
+        )
+
+
+class StatefulMambaBlock(nn.Module):
+    """Mamba-1 over a token chunk with caller-owned convolution and SSM state.
+
+    This is the portable sequence counterpart to :class:`MambaBlock`. It
+    implements the ordinary Mamba-1 equations without Jamba's B/C/dt norms,
+    and exposes the full recurrent state after every chunk. ``conv_state_width``
+    may be either ``conv_kernel - 1`` (the conventional CausalConv state) or
+    ``conv_kernel`` for references that retain the current raw convolution
+    input in their public cache ABI.
+
+    Inputs:
+        hidden_states: ``[B, T, d_model]``.
+        conv_state: ``[B, d_inner, conv_state_width]``.
+        ssm_state: ``[B, d_inner, d_state]``.
+
+    Returns:
+        Output ``[B, T, d_model]``, updated convolution/SSM states, and the
+        ungated SSM readout ``[B, T, d_inner]``. The final value lets a
+        topology share Mamba memory without exposing it as persistent state.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_inner: int,
+        d_state: int = 16,
+        dt_rank: int | None = None,
+        conv_kernel: int = 4,
+        conv_state_width: int | None = None,
+        conv_bias: bool = True,
+        proj_bias: bool = False,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.dt_rank = dt_rank if dt_rank is not None else -(-d_model // 16)
+        self.conv_kernel = conv_kernel
+        self.conv_state_width = (
+            conv_state_width if conv_state_width is not None else conv_kernel - 1
+        )
+        if self.conv_state_width not in (conv_kernel - 1, conv_kernel):
+            raise ValueError(
+                "StatefulMambaBlock conv_state_width must be conv_kernel - 1 or conv_kernel"
+            )
+
+        # Keep source-compatible parameter paths directly on the block:
+        # in_proj → conv1d → (x_proj, dt_proj, A_log, D) → out_proj.
+        self.in_proj = Linear(d_model, 2 * d_inner, bias=proj_bias)
+        self.conv1d = _DepthwiseConv1d(d_inner, conv_kernel, bias=conv_bias)
+        self.x_proj = Linear(d_inner, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = _FloatBiasLinear(self.dt_rank, d_inner)
+        self.A_log = nn.Parameter([d_inner, d_state])
+        self.D = nn.Parameter([d_inner])
+        # Phi3Mamba declares its S4D spectrum and skip vector as fp32 even
+        # when the surrounding checkpoint is bf16.
+        self.A_log._keep_float32 = True
+        self.D._keep_float32 = True
+        self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
+        self.activation = FloatSwiGLU()
+
+    def _repeat_for_channels(self, op: OpBuilder, value: ir.Value) -> ir.Value:
+        """Expand token-wise B/C vectors across independent SSM channels."""
+        value = op.Unsqueeze(value, [2])  # (B, T, 1, d_state)
+        value = op.Tile(value, [1, 1, self.d_inner, 1])
+        return op.Reshape(value, [0, 0, self.d_inner * self.d_state])
+
+    def _conv_history(self, op: OpBuilder, conv_state: ir.Value) -> ir.Value:
+        """Select the K-1 inputs needed by the causal depthwise convolution."""
+        if self.conv_state_width == self.conv_kernel - 1:
+            return conv_state
+        return op.Slice(
+            conv_state,
+            starts=[1],
+            ends=[INT64_MAX],
+            axes=[2],
+        )
+
+    def _last_conv_state(self, op: OpBuilder, conv_input: ir.Value) -> ir.Value:
+        """Preserve the caller's ABI width after appending this token chunk."""
+        total_length = op.Shape(conv_input, start=2, end=3)
+        starts = op.Sub(total_length, self.conv_state_width)
+        return op.Slice(
+            conv_input,
+            starts=starts,
+            ends=total_length,
+            axes=[2],
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        conv_state: ir.Value,
+        ssm_state: ir.Value,
+        padding_mask: ir.Value | None = None,
+    ):
+        """Process a prefill or decode chunk and return output plus all states."""
+        projected = self.in_proj(op, hidden_states)  # (B, T, 2 * d_inner)
+        x_branch, z_gate = op.Split(
+            projected,
+            [self.d_inner, self.d_inner],
+            axis=-1,
+            _outputs=2,
+        )
+        x_channels_first = op.Transpose(x_branch, perm=[0, 2, 1])  # (B, d_inner, T)
+        if padding_mask is not None:
+            x_channels_first = op.Mul(
+                x_channels_first,
+                op.Unsqueeze(op.CastLike(padding_mask, x_channels_first), [1]),
+            )
+
+        # The convolution receives the last K-1 raw inputs plus the current
+        # chunk. A K-wide public cache retains one extra historical value so
+        # references can update it in-place during single-token decode.
+        conv_input = op.Concat(self._conv_history(op, conv_state), x_channels_first, axis=2)
+        present_conv_state = self._last_conv_state(op, conv_input)
+        x_ssm = op.Swish(self.conv1d(op, conv_input))  # (B, d_inner, T)
+        if padding_mask is not None:
+            x_ssm = op.Mul(x_ssm, op.Unsqueeze(op.CastLike(padding_mask, x_ssm), [1]))
+        x_ssm = op.Transpose(x_ssm, perm=[0, 2, 1])  # (B, T, d_inner)
+
+        # Mamba's selective recurrence is a gated linear attention where C
+        # reads state, B writes state, and dt*x is the value vector.
+        dt_raw, b_mat, c_mat = op.Split(
+            self.x_proj(op, x_ssm),
+            [self.dt_rank, self.d_state, self.d_state],
+            axis=-1,
+            _outputs=3,
+        )
+        # The source computes the BFloat16 rank projection first, then supplies
+        # ``dt_proj.bias.float()`` as the selective-scan delta bias. This module
+        # keeps the bias out of low-precision accumulation before fp32 Softplus
+        # determines the recurrent decay.
+        dt = op.Softplus(self.dt_proj(op, dt_raw))
+        a_neg = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
+        decay = op.Reshape(
+            op.Mul(op.Unsqueeze(dt, [-1]), op.Unsqueeze(a_neg, [0, 1])),
+            [0, 0, self.d_inner * self.d_state],
+        )
+        ssm_output, present_state = op.LinearAttention(
+            self._repeat_for_channels(op, op.Cast(c_mat, to=ir.DataType.FLOAT)),
+            self._repeat_for_channels(op, op.Cast(b_mat, to=ir.DataType.FLOAT)),
+            op.Mul(dt, op.Cast(x_ssm, to=ir.DataType.FLOAT)),
+            op.Unsqueeze(op.Cast(ssm_state, to=ir.DataType.FLOAT), [-1]),
+            decay,
+            scale=1.0,
+            q_num_heads=self.d_inner,
+            kv_num_heads=self.d_inner,
+            update_rule="gated",
+            _domain="com.microsoft",
+            _outputs=2,
+        )
+        ssm_output = op.Add(
+            ssm_output,
+            op.Mul(
+                op.Cast(x_ssm, to=ir.DataType.FLOAT), op.Cast(self.D, to=ir.DataType.FLOAT)
+            ),
+        )
+        ssm_output = op.CastLike(ssm_output, x_ssm)  # (B, T, d_inner)
+        present_ssm_state = op.CastLike(op.Squeeze(present_state, [-1]), ssm_state)
+
+        # The raw SSM readout is separately returned for shared-memory
+        # topologies; the normal Mamba output still applies the SiLU z gate.
+        output = self.out_proj(op, self.activation(op, z_gate, ssm_output))
+        return output, present_conv_state, present_ssm_state, ssm_output
+
+
+class FloatSwiGLU(nn.Module):
+    """SwiGLU with float32 intermediate arithmetic and activation-shaped output.
+
+    CUDA Jiterator implementations commonly evaluate
+    ``float(gate) * float(value) * sigmoid(float(gate))`` before storing the
+    result in the activation dtype. This stateless primitive preserves that
+    behavior for model families whose source uses the fused kernel.
+    """
+
+    def forward(self, op: OpBuilder, gate: ir.Value, value: ir.Value) -> ir.Value:
+        gate_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
+        value_f32 = op.Cast(value, to=ir.DataType.FLOAT)
+        activated = op.Mul(op.Mul(gate_f32, value_f32), op.Sigmoid(gate_f32))
+        return op.CastLike(activated, gate)
+
+
+class GatedMemoryMixer(nn.Module):
+    """Cross-memory gate ``out_proj(SiLU(in_proj(x)) * memory)``.
+
+    It is useful for YOCO-style second-stage layers: the producer memory is
+    transient within one forward call, while this mixer has no recurrent cache
+    of its own.
+    """
+
+    def __init__(self, d_model: int, d_inner: int, bias: bool = False):
+        super().__init__()
+        self.in_proj = Linear(d_model, d_inner, bias=bias)
+        self.out_proj = Linear(d_inner, d_model, bias=bias)
+        self.activation = FloatSwiGLU()
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, memory: ir.Value) -> ir.Value:
+        gate = self.in_proj(op, hidden_states)  # (B, T, d_inner)
+        return self.out_proj(op, self.activation(op, gate, memory))
 
 
 class SequenceMambaBlock(nn.Module):

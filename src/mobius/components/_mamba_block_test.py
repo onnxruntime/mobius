@@ -16,7 +16,12 @@ from mobius._testing import (
     create_test_builder,
     create_test_input,
 )
-from mobius.components._mamba_block import MambaBlock, SequenceMambaBlock
+from mobius.components._mamba_block import (
+    FloatSwiGLU,
+    MambaBlock,
+    SequenceMambaBlock,
+    StatefulMambaBlock,
+)
 
 
 class TestMambaBlock:
@@ -250,3 +255,62 @@ class TestSequenceMambaBlock:
         (got,) = session.run(None, {"hidden_states": hidden_states.numpy()})
 
         np.testing.assert_allclose(got, reference(hidden_states).detach().numpy(), atol=1e-5)
+
+
+class TestStatefulMambaBlock:
+    """Verify the externally threaded, chunk-capable Mamba-1 variant."""
+
+    def test_public_k_wide_convolution_state_and_recurrence_are_explicit(self) -> None:
+        block = StatefulMambaBlock(
+            d_model=32,
+            d_inner=64,
+            d_state=8,
+            dt_rank=4,
+            conv_kernel=4,
+            conv_state_width=4,
+        )
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden_states", [2, 5, 32])
+        conv_state = create_test_input(builder, "conv_state", [2, 64, 4])
+        ssm_state = create_test_input(builder, "ssm_state", [2, 64, 8])
+
+        output, present_conv, present_ssm, raw_ssm = block(op, hidden, conv_state, ssm_state)
+        builder._adapt_outputs([output, present_conv, present_ssm, raw_ssm], "")
+
+        assert list(block.A_log.shape) == [64, 8]
+        assert list(block.D.shape) == [64]
+        assert block.A_log._keep_float32
+        assert block.D._keep_float32
+        assert count_op_type(graph, "Conv") == 1
+        assert count_op_type(graph, "LinearAttention") == 1
+
+    def test_dt_bias_is_added_after_float32_rank_projection(self) -> None:
+        block = StatefulMambaBlock(d_model=32, d_inner=64, d_state=8, dt_rank=4)
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden_states", [1, 2, 32], ir.DataType.BFLOAT16)
+        conv_state = create_test_input(builder, "conv_state", [1, 64, 4], ir.DataType.BFLOAT16)
+        ssm_state = create_test_input(builder, "ssm_state", [1, 64, 8], ir.DataType.BFLOAT16)
+
+        block(op, hidden, conv_state, ssm_state)
+
+        dt_bias_cast = next(
+            node
+            for node in graph
+            if node.op_type == "Cast" and node.inputs[0].name == "dt_proj.bias"
+        )
+        assert dt_bias_cast.attributes["to"].value == int(ir.DataType.FLOAT)
+
+
+class TestFloatSwiGLU:
+    """Verify the Jiterator-compatible gated activation uses fp32 intermediates."""
+
+    def test_keeps_fused_expression_precision_order(self) -> None:
+        component = FloatSwiGLU()
+        builder, op, graph = create_test_builder()
+        gate = create_test_input(builder, "gate", [1, 2, 8], ir.DataType.BFLOAT16)
+        value = create_test_input(builder, "value", [1, 2, 8], ir.DataType.BFLOAT16)
+
+        builder.add_output(component(op, gate, value), "output")
+
+        assert count_op_type(graph, "Sigmoid") == 1
+        assert count_op_type(graph, "Swish") == 0

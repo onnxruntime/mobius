@@ -59,6 +59,7 @@ def test_vibevoice_synthetic_pipeline_parity():
 # ---------------------------------------------------------------------------
 _SKIP_REASONS: dict[str, str] = {
     "phi4mm": "Multi-modal model, requires special HF setup",
+    "phi4flash": "Pinned remote SambaY source requires its CUDA reference dependency stack",
     # trust_remote_code models: require downloading model files — not suitable for offline tests
     "chatglm": "Requires trust_remote_code=True (not in HF native CONFIG_MAPPING)",
     "qwen": "HF Qwen requires trust_remote_code=True (not in HF native CONFIG_MAPPING)",

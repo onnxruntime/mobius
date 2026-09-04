@@ -1,0 +1,54 @@
+name: "L3: Phi-4 Flash Pinned CUDA Parity"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/mobius/_configs/_base.py"
+      - "src/mobius/_configs/__init__.py"
+      - "src/mobius/_builder.py"
+      - "src/mobius/_model_package.py"
+      - "src/mobius/_registry.py"
+      - "src/mobius/components/__init__.py"
+      - "src/mobius/components/_differential_attention.py"
+      - "src/mobius/components/_mamba_block.py"
+      - "src/mobius/components/_common.py"
+      - "src/mobius/functions/linear_attention.py"
+      - "src/mobius/models/__init__.py"
+      - "src/mobius/models/phi4flash.py"
+      - "src/mobius/tasks/__init__.py"
+      - "src/mobius/tasks/_base.py"
+      - "src/mobius/tasks/_phi4flash.py"
+      - "tests/phi4flash_integration_test.py"
+      - "requirements/ci/phi4flash.txt"
+      - ".github/workflows/phi4flash_parity.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  pinned-source-parity:
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=phi4flash-parity-${{ github.run_id }}-${{ github.run_attempt }}"
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install exact Phi-4 Flash reference stack
+        run: |
+          pip install -r requirements/ci/requirements.txt
+          pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install -r requirements/ci/phi4flash.txt
+          pip install huggingface_hub ml_dtypes numpy onnx_ir onnx-shape-inference onnxscript rfc8785 safetensors tqdm
+          pip install onnxruntime-easy pytest-timeout
+          pip install --no-deps -e .
+          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
+      - name: Run pinned remote-source L3 parity
+        env:
+          MOBIUS_PHI4FLASH_REFERENCE: "1"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: pytest tests/phi4flash_integration_test.py -m integration -v --tb=short

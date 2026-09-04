@@ -231,6 +231,9 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # Hybrid SSM+Attention dedicated tests
     "bamba",
     "jamba",
+    "phi4flash",
+    # Architecture-string alias of the L1-tested phi4flash SambaY config.
+    "Phi4FlashForCausalLM",
     # Speculative-decoding draft models with bespoke IO contracts
     # (DFlash drafter takes noise_embedding + target_hidden instead of
     # input_ids; the generic ALL_CAUSAL_LM_CONFIGS matrix can't drive it).
