@@ -1,0 +1,20 @@
+model_id: "vibevoice/VibeVoice-1.5B-hf"
+model_type: "vibevoice"
+revision: "edc39f80f5cae656da37baf8faa8f5502bf7081f"
+task_type: "text-to-speech"
+dtype: "float16"
+level: "L4"
+
+inputs:
+  prompts:
+    - "The first speaker opens the test."
+    - "The second speaker completes it."
+  audio:
+    - "652-129742-0006-24khz.wav"
+    - "652-129742-0006-24khz.wav"
+
+notes: >
+  Two-speaker reference-audio ordering contract. Both roles intentionally reuse
+  the same immutable LibriSpeech train-clean-100 utterance 652-129742-0006 from
+  OpenSLR corpus 12 (CC BY 4.0), deterministically resampled to 24 kHz,
+  isolating role/order handling from voice content.

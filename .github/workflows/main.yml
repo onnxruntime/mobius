@@ -149,6 +149,7 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install onnxruntime
           pip install -e '.[testing,transformers]'
+          pip install --force-reinstall --no-deps -r requirements/ci/vibevoice.txt
       - name: Run L3 synthetic parity tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -257,6 +258,7 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install onnxruntime
           pip install -e '.[testing]'
+          pip install --force-reinstall --no-deps -r requirements/ci/vibevoice.txt
       - name: Run tests
         run: |
           pytest -n auto -m 'not integration and not arch_validation' --cov=src --cov-report=xml --cov-branch --junitxml junit.xml

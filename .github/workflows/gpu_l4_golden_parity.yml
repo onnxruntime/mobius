@@ -75,6 +75,7 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           pip install -e '.[testing,transformers]'
+          pip install --force-reinstall --no-deps -r requirements/ci/vibevoice.txt
           # PyPI's ORT 1.27+ wheel requires CUDA 13, while these runners use CUDA 12.
           pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
           pip install --no-deps onnxruntime-genai-cuda
@@ -100,16 +101,37 @@ jobs:
         run: |
           AFFECTED="$AFFECTED_MODELS"
           CASES="$AFFECTED_CASES"
+          run_vibevoice_l4() {
+            if [ "$1" = all ]; then
+              pytest tests/vibevoice_golden_test.py \
+                -m 'golden and not generation' \
+                -v \
+                --timeout=300 \
+                --junitxml=junit-vibevoice-l4.xml \
+                --cov=src --cov-append --cov-report=xml --cov-branch \
+                --tb=short
+            else
+              MOBIUS_VIBEVOICE_GOLDEN_CASES="$1" pytest tests/vibevoice_golden_test.py \
+                -m 'golden and not generation' \
+                -v \
+                --timeout=300 \
+                --junitxml=junit-vibevoice-l4.xml \
+                --cov=src --cov-append --cov-report=xml --cov-branch \
+                --tb=short
+            fi
+          }
+          VIBEVOICE_CASES=$(python -c "import json, sys; cases = json.loads(sys.argv[1]) if sys.argv[1] else []; print(json.dumps([case for case in cases if case.startswith('vibevoice-')]))" "$CASES")
           if { [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; } && \
              { [ -z "$CASES" ] || [ "$CASES" = "[]" ]; }; then
             echo "Running all L4 golden comparison tests"
             pytest tests/e2e_golden_test.py \
-              -m golden \
+              -m 'golden and not generation' \
               -v \
               --timeout=300 \
               --junitxml=junit-l4.xml \
               --cov=src --cov-report=xml --cov-branch \
               --tb=short
+            run_vibevoice_l4 all
           else
             if [ -n "$AFFECTED" ] && [ "$AFFECTED" != "[]" ]; then
               echo "Running L4 golden tests for affected models: $AFFECTED"
@@ -117,7 +139,7 @@ jobs:
               MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
               if [ -n "$MODELS" ]; then
                 pytest tests/e2e_golden_test.py \
-                  -m golden \
+                  -m 'golden and not generation' \
                   -v \
                   --models "$MODELS" \
                   --timeout=300 \
@@ -125,17 +147,23 @@ jobs:
                   --cov=src --cov-report=xml --cov-branch \
                   --tb=short \
                   || { rc=$?; if [ $rc -eq 5 ]; then echo "No matching tests found — skipping"; else exit $rc; fi; }
+                if echo "$MODELS" | tr ',' '\n' | grep -qx "vibevoice"; then
+                  run_vibevoice_l4 all
+                fi
               fi
             fi
             if [ -n "$CASES" ] && [ "$CASES" != "[]" ]; then
               echo "Running L4 golden tests for exact cases: $CASES"
               MOBIUS_GOLDEN_CASES="$CASES" pytest tests/e2e_golden_test.py \
-                -m golden \
+                -m 'golden and not generation' \
                 -v \
                 --timeout=300 \
                 --junitxml=junit-l4-cases.xml \
                 --cov=src --cov-append --cov-report=xml --cov-branch \
                 --tb=short
+              if [ "$VIBEVOICE_CASES" != "[]" ]; then
+                run_vibevoice_l4 "$VIBEVOICE_CASES"
+              fi
             fi
           fi
         timeout-minutes: 60

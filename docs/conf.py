@@ -29,6 +29,7 @@ extensions = [
     "sphinx.ext.viewcode",
     "sphinx.ext.intersphinx",
     "sphinx.ext.napoleon",
+    "sphinxcontrib.mermaid",
     # Local extensions that generate content during build
     "models_gen",
     "flags_gen",

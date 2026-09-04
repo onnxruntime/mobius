@@ -53,7 +53,7 @@ testing = [
     "jsonschema>=4.0",
 ]
 ort-genai = ["onnxruntime-genai", "Pillow"]
-docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton"]
+docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton", "sphinxcontrib-mermaid"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

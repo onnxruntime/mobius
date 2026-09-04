@@ -751,6 +751,24 @@ def _looks_like_multi_decoder_tts(pkg: Any) -> bool:
     return {"talker", "code_predictor"} <= names
 
 
+def _looks_like_vibevoice_tts(pkg: Any) -> bool:
+    """Detect the continuous-token VibeVoice component topology."""
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    return {
+        "audio_encoder",
+        "audio_projection",
+        "embedding",
+        "decoder",
+        "diffusion_head",
+        "audio_decoder",
+        "semantic_encoder",
+        "semantic_projection",
+    } <= names
+
+
 def _looks_like_speculative(pkg: Any) -> bool:
     try:
         return {"proposer", "verifier"} <= set(pkg.keys())
@@ -1240,6 +1258,42 @@ def write_onnx_genai_config(
             "onnx-genai decoder metadata requires a model config (pass config=... "
             "or a package carrying `.config`)"
         )
+    if _looks_like_vibevoice_tts(pkg):
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow VibeVoice export derives KV and convolution state dtypes "
+                "from ONNX ports; kv_native_dtype overrides are unsupported"
+            )
+        artifacts = _write_text_runtime_assets(output_dir, source, revision=revision)
+        artifacts.update(
+            _copy_runtime_assets(
+                output_dir,
+                source,
+                ("processor_config.json", "generation_config.json"),
+                revision=revision,
+            )
+        )
+        audio_processor_path = _write_hf_audio_processor(
+            output_dir,
+            source,
+            revision=revision,
+        )
+        if audio_processor_path is not None:
+            artifacts["audio_processor"] = audio_processor_path
+        artifacts.update(
+            _write_advisory_component_contract(
+                pkg,
+                output_dir,
+                warning=(
+                    "The tested onnx-genai runtime does not implement VibeVoice's "
+                    "positive/negative Qwen2 caches, DPM-Solver diffusion loop, and "
+                    "streaming convolution state. Exact graph and processor contracts "
+                    "are exported without claiming downstream orchestration."
+                ),
+            )
+        )
+        return artifacts
+
     if _looks_like_multimodal(pkg):
         if kv_native_dtype is not None:
             raise ValueError(

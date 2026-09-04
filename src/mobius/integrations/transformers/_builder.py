@@ -357,6 +357,13 @@ def build_transformers_model(
     )
 
     detection_revision = revision
+    if model_id == "vibevoice/VibeVoice-1.5B-hf" and detection_revision is None:
+        from mobius.models.vibevoice import VIBEVOICE_REVISION
+
+        # The native conversion is the executable source of truth. Pin the
+        # first config probe and every later processor/weight call together.
+        revision = VIBEVOICE_REVISION
+        detection_revision = VIBEVOICE_REVISION
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -585,7 +592,7 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{graph_source_name}/{name}"
-        if model_type in _QWEN4_MODEL_TYPES:
+        if model_type in _QWEN4_MODEL_TYPES | {"vibevoice"}:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:

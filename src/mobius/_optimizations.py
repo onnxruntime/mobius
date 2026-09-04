@@ -65,6 +65,7 @@ from mobius._passes import (
     Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
 )
+from mobius._pipeline_contract import requires_arbitrary_attention_mask
 from mobius.functions import register_function_bodies
 from mobius.rewrite_rules import (
     clip_to_min_max_rules,
@@ -527,7 +528,17 @@ def optimize_model(
             f"Unknown execution provider {ep!r}. Supported: {sorted(ep_registry)}"
         )
 
-    fuse_stages, lower_stages = _get_optimization_passes(caps, dtype, model_role)
+    gqa_allowed = model_role == "decoder" and not requires_arbitrary_attention_mask(
+        model.graph
+    )
+    optimization_role = (
+        model_role if gqa_allowed or model_role != "decoder" else "masked-decoder"
+    )
+    fuse_stages, lower_stages = _get_optimization_passes(
+        caps,
+        dtype,
+        optimization_role,
+    )
 
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
@@ -654,7 +665,7 @@ def optimize_model(
         )
 
     # Fusion assertion: warn if GQA was expected but no GQA nodes produced.
-    if model_role == "decoder" and dtype in caps.gqa_dtypes:
+    if gqa_allowed and dtype in caps.gqa_dtypes:
         gqa_count = _count_ops(model, "GroupQueryAttention")
         attn_count = _count_ops(model, "Attention")
         if gqa_count == 0 and attn_count > 0:
@@ -670,7 +681,7 @@ def optimize_model(
     # Runs after fusion so the GQA nodes exist. Requires GQA (a decoder on a
     # GQA-capable EP/dtype); otherwise there is no KV-cache op to convert.
     if fp8_kv_cache:
-        gqa_active = model_role == "decoder" and dtype in caps.gqa_dtypes
+        gqa_active = gqa_allowed and dtype in caps.gqa_dtypes
         if not gqa_active or not caps.supports_fp8_kv_cache:
             warnings.warn(
                 f"fp8_kv_cache=True was requested but the FP8 GQA KV-cache kernel "
