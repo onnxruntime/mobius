@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import builtins
 from types import SimpleNamespace
 from unittest import mock
 
@@ -375,6 +376,30 @@ def test_transformers_config_accepts_hub_without_strict_validation_error(monkeyp
 
     config = SimpleNamespace(model_type="qwen2")
     monkeypatch.delattr(hub_errors, "StrictDataclassClassValidationError", raising=False)
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config
+    )
+
+    assert transformers_builder._load_transformers_config(
+        "test/qwen2",
+        revision=None,
+        trust_remote_code=False,
+    ) == (config, False)
+
+
+def test_transformers_config_accepts_hub_without_errors_module(monkeypatch) -> None:
+    """Older supported huggingface_hub releases expose no ``errors`` module."""
+    import transformers
+
+    config = SimpleNamespace(model_type="qwen2")
+    import_module = builtins.__import__
+
+    def import_without_hub_errors(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "huggingface_hub" and "errors" in fromlist:
+            raise ImportError("No module named 'huggingface_hub.errors'")
+        return import_module(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_hub_errors)
     monkeypatch.setattr(
         transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config
     )
