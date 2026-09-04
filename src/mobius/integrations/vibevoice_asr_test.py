@@ -39,6 +39,16 @@ def test_processor_normalizes_pads_chunks_prompts_and_parses_diarization():
         "This is a 0.27 seconds audio, with extra info: Mobius is a hotword.\n\n"
         "Please transcribe it with these keys: Start time, End time, Speaker ID, Content"
     )
+    assert processor.make_prompt(audio_samples=3_200, context_info="  ")[1]["content"] == (
+        "<|speech_start|><|speech_pad|><|speech_end|>\n"
+        "This is a 0.13 seconds audio, please transcribe it with these keys: "
+        "Start time, End time, Speaker ID, Content"
+    )
+    impulse = np.zeros(10_000, dtype=np.float32)
+    impulse[0] = 1.0
+    assert np.abs(
+        processor.prepare_audio(impulse, sampling_rate=24_000).input_values
+    ).max() == pytest.approx(1.0)
     assert processor.parse_diarization(
         'assistant\n[{"Start time": 0.0, "End_Time": 1.2, '
         '"Speaker ID": "S0", "Content": "hello"}]\n'

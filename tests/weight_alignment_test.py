@@ -151,7 +151,7 @@ def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
     modeling = pytest.importorskip("transformers.models.vibevoice.modeling_vibevoice")
     from mobius._configs import VibeVoiceConfig
     from mobius.models.vibevoice import VibeVoiceForConditionalGeneration
-    from mobius.models.vibevoice_asr_test import _make_tiny_hf_config
+    from mobius.models.vibevoice_test import _make_tiny_hf_config
     from mobius.tasks import VibeVoiceTask
 
     torch.manual_seed(11)
