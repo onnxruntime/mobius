@@ -485,6 +485,11 @@ class VibeVoiceASRStreamingConfig(ArchitectureConfig):
             raise ValueError(
                 "VibeVoice streaming ASR acoustic and semantic tokenizer hop lengths must match."
             )
+        # The composite ASR config controls the tokenizer and connector precision,
+        # while decoder_config independently records Qwen's checkpoint storage dtype.
+        pipeline_dtype = _resolve_dtype_value(getattr(parent, "dtype", None))
+        if pipeline_dtype is None:
+            pipeline_dtype = _resolve_dtype_value(getattr(parent, "torch_dtype", None))
         return dataclasses.replace(
             result,
             model_type="vibevoice_asr_streaming",
@@ -500,4 +505,5 @@ class VibeVoiceASRStreamingConfig(ArchitectureConfig):
             lookahead_frames=int(getattr(parent, "lookahead_frames", 4)),
             eos_token_id=getattr(parent, "eos_token_id", 151643),
             pad_token_id=getattr(parent, "pad_token_id", 151655),
+            dtype=pipeline_dtype or result.dtype,
         )
