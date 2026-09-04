@@ -592,7 +592,15 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
-        if model_type in _QWEN4_MODEL_TYPES | {"vibevoice", "VibeVoiceForASRTraining"}:
+        if (
+            model_type
+            in _QWEN4_MODEL_TYPES
+            | {
+                "vibevoice",
+                "VibeVoiceForASRTraining",
+            }
+            or is_vibeasr_bitnet_dense_source
+        ):
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
