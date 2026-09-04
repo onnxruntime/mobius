@@ -12,12 +12,10 @@ from __future__ import annotations
 
 from unittest import mock
 
-import onnx_ir as ir
 import pytest
 
 from mobius.__main__ import build_parser
 from mobius._model_package import ModelPackage
-from mobius._testing import make_config
 
 _SOURCE_ARGS = {
     "build": ["--model", "some/model"],
@@ -135,49 +133,18 @@ class TestLocalCompressedCheckpointRouting:
     @staticmethod
     def _run(monkeypatch, tmp_path, *extra_args):
         from mobius import __main__ as cli
-        from mobius.integrations import compressed_tensors
-
-        class DummyModule:
-            def __init__(self, config):
-                self.config = config
-
-            @staticmethod
-            def preprocess_weights(state):
-                return state
+        from mobius.integrations.transformers import _builder as transformers_builder
 
         hf_config = type("HFConfig", (), {"model_type": "qwen2"})()
-        compressed_config = object()
-        config = make_config(model_type="qwen2")
         package = ModelPackage({})
-        built_configs = []
-        stream = mock.Mock()
-
-        import transformers
-
+        build = mock.Mock(return_value=package)
         monkeypatch.setattr(
-            transformers.AutoConfig,
-            "from_pretrained",
-            lambda *args, **kwargs: hf_config,
+            transformers_builder,
+            "_load_transformers_config",
+            lambda *args, **kwargs: (hf_config, False),
         )
-        monkeypatch.setattr(cli, "_config_from_hf", lambda *args, **kwargs: config)
-        monkeypatch.setattr(cli.registry, "get", lambda _model_type: DummyModule)
-
-        def fake_build_from_module(_module, built_config, *args, **kwargs):
-            built_configs.append(built_config)
-            return package
-
-        monkeypatch.setattr(cli, "build_from_module", fake_build_from_module)
+        monkeypatch.setattr(cli, "build", build)
         monkeypatch.setattr(cli, "_save_package", mock.Mock())
-        monkeypatch.setattr(
-            compressed_tensors.CompressedTensorsConfig,
-            "from_hf_config",
-            lambda _config: compressed_config,
-        )
-        monkeypatch.setattr(
-            compressed_tensors,
-            "stream_compressed_tensors_to_package",
-            stream,
-        )
         args = build_parser().parse_args(
             [
                 "build",
@@ -192,43 +159,40 @@ class TestLocalCompressedCheckpointRouting:
 
         cli._cmd_build(args)
 
-        return built_configs, stream, compressed_config
+        return build
 
-    def test_default_routes_local_checkpoint_to_native_streaming_loader(
-        self, monkeypatch, tmp_path
-    ):
-        built_configs, stream, compressed_config = self._run(
+    def test_default_preserves_local_checkpoint_quantization(self, monkeypatch, tmp_path):
+        build = self._run(
             monkeypatch,
             tmp_path,
         )
 
-        assert built_configs[0].dtype == ir.DataType.FLOAT16
-        stream.assert_called_once()
-        assert stream.call_args.args[2] is compressed_config
-        assert stream.call_args.kwargs["keep_quantized"] is True
+        build.assert_called_once()
+        assert build.call_args.args == (str(tmp_path),)
+        assert build.call_args.kwargs["keep_quantized"] is True
+        assert build.call_args.kwargs["load_weights"] is True
 
-    def test_dequantize_routes_local_checkpoint_to_dense_streaming_fallback(
-        self, monkeypatch, tmp_path
-    ):
-        built_configs, stream, _compressed_config = self._run(
+    def test_dequantize_is_forwarded_to_shared_builder(self, monkeypatch, tmp_path):
+        build = self._run(
             monkeypatch,
             tmp_path,
             "--dequantize",
         )
 
-        assert built_configs[0].dtype == ir.DataType.FLOAT
-        stream.assert_called_once()
-        assert stream.call_args.kwargs["keep_quantized"] is False
+        build.assert_called_once()
+        assert build.call_args.kwargs["keep_quantized"] is False
+        assert build.call_args.kwargs["load_weights"] is True
 
-    def test_no_weights_does_not_open_local_compressed_shards(self, monkeypatch, tmp_path):
-        built_configs, stream, _compressed_config = self._run(
+    def test_no_weights_is_forwarded_to_shared_builder(self, monkeypatch, tmp_path):
+        build = self._run(
             monkeypatch,
             tmp_path,
             "--no-weights",
         )
 
-        assert built_configs[0].dtype == ir.DataType.FLOAT16
-        stream.assert_not_called()
+        build.assert_called_once()
+        assert build.call_args.kwargs["keep_quantized"] is True
+        assert build.call_args.kwargs["load_weights"] is False
 
 
 class TestSharedSaveOptions:
