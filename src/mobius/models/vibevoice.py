@@ -1039,8 +1039,14 @@ class VibeVoiceForConditionalGeneration(nn.Module):
         return routed
 
 
-VIBEVOICE_ASR_STREAMING_MODEL_ID = "microsoft/VibeVoice-ASR-Streaming-7B"
-VIBEVOICE_ASR_STREAMING_REVISION = "60d858b518b4e19d404af3737f848fc185b30177"
+VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS = {
+    "microsoft/VibeVoice-ASR-Streaming-1.5B": "4262d23d8a539a6530cf64fbd0b1751ef9a30853",
+    "microsoft/VibeVoice-ASR-Streaming-7B": "60d858b518b4e19d404af3737f848fc185b30177",
+}
+VIBEVOICE_ASR_STREAMING_MODEL_ID = "microsoft/VibeVoice-ASR-Streaming-1.5B"
+VIBEVOICE_ASR_STREAMING_REVISION = VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS[
+    VIBEVOICE_ASR_STREAMING_MODEL_ID
+]
 VIBEVOICE_ASR_STREAMING_SOURCE_REVISION = "505653d3873b065a488aea551c6ee3dc51d3062f"
 
 
@@ -1119,10 +1125,12 @@ class VibeVoiceASRStreamingEmbeddingModel(nn.Module):
 class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
     """Streaming ASR package for ``VibeVoiceForASRStreamingTraining`` checkpoints.
 
-    Unlike native offline ASR, this architecture executes two cached causal
-    tokenizers and their connectors in one ``audio_encoder`` stage. The host
-    supplies speech masks and reproducible acoustic noise, inserts flattened
-    speech embeddings at placeholder positions, then caches Qwen2 decoding.
+    This shared implementation supports the pinned Microsoft 1.5B and 7B
+    streaming-ASR checkpoints. Unlike native offline ASR, it executes two
+    cached causal tokenizers and their connectors in one ``audio_encoder``
+    stage. The host supplies speech masks and reproducible acoustic noise,
+    inserts flattened speech embeddings at placeholder positions, then caches
+    Qwen2 decoding.
     """
 
     default_task = "vibevoice-asr-streaming"
@@ -1175,6 +1183,7 @@ class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Route used streaming-ASR tensors and reject unknown checkpoint fields."""
         routed: dict[str, torch.Tensor] = {}
+        has_explicit_lm_head = "lm_head.weight" in state_dict
         for key, value in state_dict.items():
             if key.startswith("audio_encoder.") or key.startswith("embedding.") or key.startswith("decoder."):
                 routed[key] = value
@@ -1199,7 +1208,7 @@ class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
             elif key.startswith("model.language_model.embed_tokens."):
                 suffix = key.removeprefix("model.language_model.embed_tokens.")
                 routed[f"embedding.embed_tokens.{suffix}"] = value
-                if suffix == "weight" and self.config.tie_word_embeddings:
+                if suffix == "weight" and self.config.tie_word_embeddings and not has_explicit_lm_head:
                     routed["decoder.lm_head.weight"] = value
             elif key.startswith("model.language_model.layers.") or key.startswith(
                 "model.language_model.norm."

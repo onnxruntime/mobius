@@ -405,6 +405,7 @@ def build_transformers_model(
         _config_from_hf,
         _default_task_for_model,
     )
+    from mobius.models.vibevoice import VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS
 
     detection_revision = revision
     if model_id == "vibevoice/VibeVoice-1.5B-hf" and detection_revision is None:
@@ -433,11 +434,9 @@ def build_transformers_model(
         # processor contract. Keep config detection and weight loading pinned.
         revision = VIBEVOICE_ASR_REVISION
         detection_revision = VIBEVOICE_ASR_REVISION
-    if model_id == "microsoft/VibeVoice-ASR-Streaming-7B" and detection_revision is None:
-        from mobius.models.vibevoice import VIBEVOICE_ASR_STREAMING_REVISION
-
-        revision = VIBEVOICE_ASR_STREAMING_REVISION
-        detection_revision = VIBEVOICE_ASR_STREAMING_REVISION
+    if model_id in VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS and detection_revision is None:
+        revision = VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS[model_id]
+        detection_revision = revision
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch

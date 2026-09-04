@@ -32,8 +32,7 @@ from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from mobius.models.vibevoice import (
-    VIBEVOICE_ASR_STREAMING_MODEL_ID,
-    VIBEVOICE_ASR_STREAMING_REVISION,
+    VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS,
     VIBEVOICE_ASR_STREAMING_SOURCE_REVISION,
     VibeVoiceASRStreamingForConditionalGeneration,
 )
@@ -405,8 +404,30 @@ class TestVibeVoiceASRStreaming:
         assert registration.module_class is VibeVoiceASRStreamingForConditionalGeneration
         assert registration.task == "vibevoice-asr-streaming"
         assert registration.config_class is VibeVoiceASRStreamingConfig
-        assert registration.test_model_id == VIBEVOICE_ASR_STREAMING_MODEL_ID
-        assert registration.test_revision == VIBEVOICE_ASR_STREAMING_REVISION
+        assert registration.test_model_id in VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS
+        assert (
+            registration.test_revision
+            == VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS[registration.test_model_id]
+        )
+
+    def test_tied_checkpoint_lm_head_preserves_its_explicit_tensor(self):
+        """A tied checkpoint's explicit LM head must beat the embedding fallback."""
+        module = VibeVoiceASRStreamingForConditionalGeneration(
+            dataclasses.replace(_streaming_config(), tie_word_embeddings=True)
+        )
+        embedding_weight = torch.zeros(1)
+        lm_head_weight = torch.ones(1)
+
+        routed = module.preprocess_weights(
+            {
+                "model.language_model.embed_tokens.weight": embedding_weight,
+                "lm_head.weight": lm_head_weight,
+            }
+        )
+
+        assert set(routed) == {"embedding.embed_tokens.weight", "decoder.lm_head.weight"}
+        assert routed["embedding.embed_tokens.weight"] is embedding_weight
+        assert routed["decoder.lm_head.weight"] is lm_head_weight
 
     def test_vibevoice_dispatch_rejects_ambiguous_or_unknown_architectures(self):
         from mobius.integrations.transformers._builder import _resolve_module_class
@@ -731,13 +752,19 @@ def test_vibevoice_asr_synthetic_two_chunk_prefill_and_cached_decode_parity():
 
 
 @pytest.mark.integration
-def test_vibevoice_asr_pinned_processor_contract_for_hotwords_and_speakers():
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    tuple(VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS.items()),
+)
+def test_vibevoice_streaming_asr_pinned_processor_contract_for_hotwords_and_speakers(
+    model_id, revision
+):
     """Validate processor rows, left padding, bilingual hotword prompts, and speaker JSON."""
     _require_pinned_reference()
     processor_module = pytest.importorskip("vibevoice.processor.vibevoice_asr_processor")
     processor = processor_module.VibeVoiceASRProcessor.from_pretrained(
-        VIBEVOICE_ASR_STREAMING_MODEL_ID,
-        revision=VIBEVOICE_ASR_STREAMING_REVISION,
+        model_id,
+        revision=revision,
     )
     english = np.linspace(-0.1, 0.1, 3200, dtype=np.float32)
     chinese = np.linspace(0.1, -0.1, 6500, dtype=np.float32)
