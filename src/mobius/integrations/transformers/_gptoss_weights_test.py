@@ -161,6 +161,50 @@ def test_lazy_source_parent_aliases_include_snapshot_and_blob_directories(tmp_pa
     assert aliases == frozenset({snapshot.resolve(), blobs.resolve()})
 
 
+def test_local_hf_snapshot_symlinked_shards_bind_materialize_and_register_aliases(
+    tmp_path,
+):
+    config, package, state = _package_and_state()
+    cache_root = tmp_path / "models--openai--gpt-oss"
+    snapshot = cache_root / "snapshots" / "revision"
+    blobs = cache_root / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    _save_cross_sharded(state, snapshot)
+
+    index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+    blob_paths = []
+    for shard_number, filename in enumerate(sorted(set(index["weight_map"].values()))):
+        snapshot_shard = snapshot / filename
+        blob = blobs / f"hash-{shard_number}"
+        snapshot_shard.replace(blob)
+        try:
+            snapshot_shard.symlink_to(Path("../../blobs") / blob.name)
+        except OSError as error:
+            pytest.skip(f"file symlinks are unavailable: {error}")
+        blob_paths.append(blob.resolve())
+
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(package, str(snapshot), config)
+
+    lazy_initializers = [
+        initializer
+        for initializer in package["model"].graph.initializers.values()
+        if isinstance(initializer.const_value, ir.LazyTensor)
+    ]
+    assert lazy_initializers
+    for initializer in lazy_initializers:
+        assert initializer.const_value is not None
+        initializer.const_value.numpy()
+
+    assert package._native_streaming_source_directories == frozenset(
+        {snapshot.resolve(), blobs.resolve()}
+    )
+    assert set(blob_paths).issubset(package._native_streaming_source_files)
+    assert (snapshot / "model.safetensors.index.json").resolve() in (
+        package._native_streaming_source_files
+    )
+
+
 def _directory_snapshot(directory: Path) -> tuple[tuple[str, ...], dict[str, bytes]]:
     entries = tuple(
         sorted(

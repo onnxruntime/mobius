@@ -320,7 +320,13 @@ def _validate_weight_filenames(filenames: list[str]) -> list[str]:
     for filename in filenames:
         normalized = filename.replace("\\", "/")
         path = pathlib.PurePosixPath(normalized)
-        if path.is_absolute() or ".." in path.parts:
+        windows_path = pathlib.PureWindowsPath(filename)
+        if (
+            path.is_absolute()
+            or windows_path.is_absolute()
+            or windows_path.drive
+            or ".." in path.parts
+        ):
             raise ValueError(f"Unsafe weight filename in weight index: {filename!r}")
         validated.append(normalized)
     return validated
@@ -356,14 +362,13 @@ def _local_weight_paths(model_dir: pathlib.Path) -> tuple[list[str], str] | None
             f"'{_SINGLE_WEIGHT_NAME}', nor legacy PyTorch weights: {model_dir}"
         )
 
-    root = model_dir.resolve()
     paths = []
     for filename in filenames:
-        path = (model_dir / filename).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError as exc:
-            raise ValueError(f"Unsafe weight filename in weight index: {filename!r}") from exc
+        # Keep the validated lexical path so Hugging Face snapshot symlinks remain
+        # identifiable as snapshot artifacts. Resolving here would replace them
+        # with their sibling cache blob paths. Absolute and traversal filenames
+        # have already been rejected by _validate_weight_filenames.
+        path = model_dir / filename
         if not path.is_file():
             raise FileNotFoundError(f"Weight file referenced by index not found: {path}")
         paths.append(str(path))
