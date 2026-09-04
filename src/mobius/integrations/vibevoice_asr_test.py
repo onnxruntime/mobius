@@ -35,12 +35,12 @@ def test_processor_normalizes_pads_chunks_prompts_and_parses_diarization():
     ]
     messages = processor.make_prompt(audio_samples=6_401, context_info="Mobius is a hotword.")
     assert messages[1]["content"] == (
-        "<|speech_start|><|speech_pad|><|speech_pad|><|speech_pad|><|speech_end|>\n"
+        "<|object_ref_start|><|box_start|><|box_start|><|box_start|><|object_ref_end|>\n"
         "This is a 0.27 seconds audio, with extra info: Mobius is a hotword.\n\n"
         "Please transcribe it with these keys: Start time, End time, Speaker ID, Content"
     )
     assert processor.make_prompt(audio_samples=3_200, context_info="  ")[1]["content"] == (
-        "<|speech_start|><|speech_pad|><|speech_end|>\n"
+        "<|object_ref_start|><|box_start|><|object_ref_end|>\n"
         "This is a 0.13 seconds audio, please transcribe it with these keys: "
         "Start time, End time, Speaker ID, Content"
     )
@@ -132,7 +132,7 @@ def test_processor_builds_source_chat_template_token_layout():
             self.messages.append(content)
             if not tokenize:
                 return content
-            return [10, 11, *([42] * content.count("<|speech_pad|>")), 12]
+            return [10, 11, *([42] * content.count("<|box_start|>")), 12]
 
         @staticmethod
         def encode(_text):
@@ -140,7 +140,7 @@ def test_processor_builds_source_chat_template_token_layout():
 
         @staticmethod
         def convert_tokens_to_ids(token):
-            assert token == "<|speech_pad|>"
+            assert token == "<|box_start|>"
             return 42
 
     tokenizer = Tokenizer()
