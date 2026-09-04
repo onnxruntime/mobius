@@ -195,7 +195,7 @@ class VibeVoiceASRProcessor:
         if self.avoid_clipping:
             peak = float(np.max(np.abs(result)))
             if peak > 1.0:
-                result = result / np.float32(peak)
+                result = result / np.float32(peak + self.eps)
         return result
 
 

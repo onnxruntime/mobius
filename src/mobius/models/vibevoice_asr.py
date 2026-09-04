@@ -243,6 +243,19 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
         """Route every inference tensor and deliberately exclude unused VAE decoding."""
         routed: dict[str, torch.Tensor] = {}
         for source_key, value in state_dict.items():
+            if source_key.startswith(
+                (
+                    "acoustic_encoder.",
+                    "semantic_encoder.",
+                    "connectors.",
+                    "embedding.",
+                    "decoder.",
+                )
+            ):
+                # Preserve already ONNX-aligned weights for direct package loading.
+                routed[source_key] = value
+                continue
+
             acoustic_key = _map_original_tokenizer_encoder_key(
                 source_key,
                 source="model.acoustic_tokenizer.encoder.",
