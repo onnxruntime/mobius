@@ -20,7 +20,7 @@ from collections.abc import Collection, Sequence
 
 import torch
 
-from mobius._configs import QuantizationConfig
+from mobius._configs import QuantizationConfig, QuantizedWeightFormat
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,7 @@ def supported_qmoe_quantization(
     if (
         quantization is None
         or quantization.bits != 4
+        or quantization.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
         or quantization.float_zero_point
         or quantization.quant_method not in {"gptq", "awq", "olive"}
     ):

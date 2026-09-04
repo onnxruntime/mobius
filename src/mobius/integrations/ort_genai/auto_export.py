@@ -2259,8 +2259,6 @@ def export_package(
             "Diffusion models (which have no config) are not supported — "
             "use ModelPackage.save() directly for those."
         )
-    os.makedirs(output_dir, exist_ok=True)
-
     # 1. Save ONNX models + weights
     logger.info("Saving ONNX models to %s", output_dir)
     pkg.save(
@@ -2355,8 +2353,6 @@ def auto_export(
             }
     """
     from mobius.integrations.transformers import build
-
-    os.makedirs(output_dir, exist_ok=True)
 
     # Build ONNX graph(s) with weights. The runtime EP (``ep``) also drives
     # EP-aware graph construction so fused ops (e.g. GroupQueryAttention on

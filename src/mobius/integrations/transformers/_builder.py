@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import pathlib
 from typing import Any
 
 import onnx_ir as ir
@@ -17,6 +18,7 @@ from mobius._component_quantization import (
     attach_hf_component_sources,
     preprocess_component_quantized_state_dict,
 )
+from mobius._configs import QuantizedWeightFormat
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import (
@@ -65,6 +67,59 @@ def _reject_unsupported_affine_qwen4(model_type: str, config: object) -> None:
         "are implemented. Use the unquantized BF16 checkpoint or the "
         "supported block-FP8/QDQ route."
     )
+
+
+def _is_native_gptoss_mxfp4(config) -> bool:
+    quantization = getattr(config, "quantization", None)
+    return bool(
+        getattr(config, "model_type", None) == "gpt_oss"
+        and quantization is not None
+        and quantization.weight_format is QuantizedWeightFormat.MXFP4
+    )
+
+
+def _validate_native_gptoss_build_contract(
+    config,
+    *,
+    execution_provider: str,
+) -> None:
+    """Fail before weight I/O when native FP4 QMoE cannot be exported."""
+    if not _is_native_gptoss_mxfp4(config):
+        return
+    if execution_provider != "cuda":
+        raise ValueError(
+            "Native GPT-OSS MXFP4 requires explicit CUDA export. Pass "
+            "--execution-provider cuda and --dtype f16 (or bf16); the default/CPU "
+            "provider has no lossless fallback. ORT must be built with FP4 QMoE "
+            "enabled (CUDA >=12.8); pre-Blackwell GPUs such as A100 may require "
+            "the available SM80 fallback/runtime configuration."
+        )
+    if config.dtype not in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+        raise ValueError(
+            "Native GPT-OSS MXFP4 requires dtype='f16' or 'bf16' with "
+            "--execution-provider cuda. ORT must be built with FP4 QMoE enabled "
+            "(CUDA >=12.8); pre-Blackwell GPUs such as A100 may require the "
+            "available SM80 fallback/runtime configuration."
+        )
+
+
+def _apply_gptoss_mxfp4_source_policy(
+    config,
+    *,
+    is_gptoss_mxfp4_source: bool,
+    keep_quantized: bool,
+    execution_provider: str,
+):
+    """Apply the build policy frozen from the original checkpoint config."""
+    if not is_gptoss_mxfp4_source:
+        return config, False
+    if keep_quantized:
+        _validate_native_gptoss_build_contract(
+            config,
+            execution_provider=execution_provider,
+        )
+        return config, False
+    return dataclasses.replace(config, quantization=None), True
 
 
 def _is_qwen4_exp_composite(config) -> bool:
@@ -466,6 +521,7 @@ def build_transformers_model(
             model_type,
             decoder_source_paths=decoder_source_paths,
         )
+    is_gptoss_mxfp4_source = _is_native_gptoss_mxfp4(config)
     if dtype is not None:
         config = dataclasses.replace(config, dtype=resolve_dtype(dtype))
     elif compressed_tensors_config is not None and keep_quantized:
@@ -481,6 +537,12 @@ def build_transformers_model(
             "for the Microsoft W4A16/W8A16 custom-op ABI. Use dtype='f16' or "
             "set keep_quantized=False (--dequantize)."
         )
+    config, dequantize_gptoss_mxfp4 = _apply_gptoss_mxfp4_source_policy(
+        config,
+        is_gptoss_mxfp4_source=is_gptoss_mxfp4_source,
+        keep_quantized=keep_quantized,
+        execution_provider=execution_provider,
+    )
     if output_layer_indices is not None:
         config = dataclasses.replace(
             config,
@@ -508,6 +570,8 @@ def build_transformers_model(
         task = _default_task_for_model(model_type)
 
     model_module = module_class(config)
+    if dequantize_gptoss_mxfp4:
+        model_module._dequantize_mxfp4_checkpoint = True
     attach_hf_component_sources(
         model_module,
         model_type=model_type,
@@ -523,14 +587,28 @@ def build_transformers_model(
         kv_cache_scales=kv_cache_scales,
         prune_prefill_prefix=prune_prefill_prefix,
     )
+    graph_source_name = (
+        model_type if is_gptoss_mxfp4_source and pathlib.Path(model_id).is_dir() else model_id
+    )
     for name, model in package.items():
-        model.graph.name = f"{model_id}/{name}"
+        model.graph.name = f"{graph_source_name}/{name}"
         if model_type in _QWEN4_MODEL_TYPES | {"vibevoice"}:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
-        if config.block_quant_scheme is not None and hasattr(
+        if is_gptoss_mxfp4_source and keep_quantized:
+            from mobius.integrations.transformers._gptoss_weights import (
+                stream_gptoss_mxfp4_safetensors_to_package,
+            )
+
+            stream_gptoss_mxfp4_safetensors_to_package(
+                package,
+                model_id,
+                config,
+                revision=revision,
+            )
+        elif config.block_quant_scheme is not None and hasattr(
             model_module, "build_fp8_streaming_plan"
         ):
             if len(package) != 1:
@@ -584,6 +662,12 @@ def build_transformers_model(
                 keep_quantized=keep_quantized,
             )
         else:
+            if dequantize_gptoss_mxfp4:
+                logger.warning(
+                    "Explicit dense GPT-OSS MXFP4 reconstruction eagerly loads and "
+                    "dequantizes the checkpoint and can require substantial host "
+                    "memory. The default native MXFP4 streaming path is bounded."
+                )
             state_dict = _download_weights(model_id, revision=revision)
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)

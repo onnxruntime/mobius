@@ -19,6 +19,7 @@ from mobius._configs import (
     MuseGlimmerConfig,
     QuantizationConfig,
     QuantizationOverride,
+    QuantizedWeightFormat,
     VisionConfig,
     _extract_audio_config,
     _extract_mrope_fields,
@@ -919,6 +920,29 @@ class TestQuantizationConfig:
         assert qc.group_size == 128
         assert qc.quant_method == "none"
         assert qc.sym is True
+
+    def test_new_weight_format_preserves_existing_positional_arguments(self):
+        qc = QuantizationConfig(8, 64, "olive", False, True, True, False, True, True)
+
+        assert qc.float_zero_point is True
+        assert qc.quantize_embeddings is True
+        assert qc.quantize_lm_head is False
+        assert qc.quantize_vision is True
+        assert qc.tie_word_embeddings is True
+        assert qc.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
+
+    def test_serialized_weight_format_is_normalized_to_enum(self):
+        qc = QuantizationConfig(
+            quant_method="manual",
+            weight_format="mxfp4",  # type: ignore[arg-type]
+        )
+
+        assert qc.weight_format is QuantizedWeightFormat.MXFP4
+
+    def test_quant_method_alone_does_not_infer_native_storage(self):
+        qc = QuantizationConfig(quant_method="mxfp4")
+
+        assert qc.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
 
     def test_from_transformers_gptq_dict(self):
         """Parse a GPTQ quantization_config dict."""

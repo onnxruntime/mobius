@@ -82,7 +82,7 @@ Models that route tokens to a subset of expert MLPs.
 | `deepseek_v2` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V2-Lite` |
 | `deepseek_v3` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V3` |
 | `phimoe` | `Phi3MoECausalLMModel` | `microsoft/Phi-3.5-MoE-instruct` |
-| `gptoss` | `GPTOSSCausalLMModel` | — |
+| `gpt_oss` | `GPTOSSCausalLMModel` | `openai/gpt-oss-20b` (native MXFP4/QMoE on CUDA) |
 
 Also registered with `MoECausalLMModel`: `arctic`, `dbrx`,
 `ernie4_5_moe`, `flex_olmo`, `glm4_moe`, `granitemoe`,

@@ -12,7 +12,11 @@ import onnx_ir as ir
 import pytest
 from onnxscript import nn
 
-from mobius._configs import QuantizationConfig, QuantizationOverride
+from mobius._configs import (
+    QuantizationConfig,
+    QuantizationOverride,
+    QuantizedWeightFormat,
+)
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.integrations._block_quant import BlockQuantScheme
@@ -30,6 +34,181 @@ class _DummyModule(nn.Module):
 class _DummyFp8Module(_DummyModule):
     def build_fp8_streaming_plan(self, *_args):
         raise AssertionError("mock streaming function should own planning")
+
+
+def _native_gptoss_config(*, dtype=ir.DataType.FLOAT16):
+    return make_config(
+        model_type="gpt_oss",
+        dtype=dtype,
+        quantization=QuantizationConfig(
+            quant_method="mxfp4",
+            group_size=32,
+            weight_format=QuantizedWeightFormat.MXFP4,
+        ),
+    )
+
+
+@pytest.mark.parametrize("local_checkpoint", [False, True], ids=["model-id", "local-config"])
+def test_native_gptoss_selects_streaming_before_eager_loader(
+    monkeypatch, tmp_path, local_checkpoint
+) -> None:
+    from mobius.integrations.transformers import _gptoss_weights
+
+    hf_config = type("HFConfig", (), {"model_type": "gpt_oss"})()
+    config = _native_gptoss_config()
+    package = ModelPackage(
+        {"model": ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)},
+        config=config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "text-generation", "gpt_oss"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        transformers_builder, "build_from_module", lambda *args, **kwargs: package
+    )
+    eager = mock.Mock(side_effect=AssertionError("must not eagerly load GPT-OSS"))
+    stream = mock.Mock(return_value={})
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+    monkeypatch.setattr(_gptoss_weights, "stream_gptoss_mxfp4_safetensors_to_package", stream)
+
+    model_id = str(tmp_path) if local_checkpoint else "openai/gpt-oss-120b"
+    result = transformers_builder.build_transformers_model(
+        model_id,
+        revision="immutable",
+        execution_provider="cuda",
+    )
+
+    assert result is package
+    eager.assert_not_called()
+    stream.assert_called_once_with(
+        package,
+        model_id,
+        config,
+        revision="immutable",
+    )
+
+
+def test_gptoss_dequantize_builds_dense_and_uses_eager_preprocessing(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    from mobius.integrations.transformers import _gptoss_weights
+
+    hf_config = type("HFConfig", (), {"model_type": "gpt_oss"})()
+    source_config = _native_gptoss_config()
+    package = ModelPackage(
+        {"model": ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)}
+    )
+    built_configs = []
+    module_instances = []
+    preprocess_inputs = []
+
+    class DenseGPTOSSModule(_DummyModule):
+        def __init__(self, config):
+            super().__init__(config)
+            module_instances.append(self)
+
+        def preprocess_weights(self, state_dict):
+            preprocess_inputs.append(state_dict)
+            return {}
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            DenseGPTOSSModule,
+            "text-generation",
+            "gpt_oss",
+        ),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: source_config,
+    )
+
+    def build_dense(_module, config, *args, **kwargs):
+        built_configs.append((config, kwargs["execution_provider"]))
+        return package
+
+    monkeypatch.setattr(transformers_builder, "build_from_module", build_dense)
+    checkpoint_state = {"packed": object()}
+    eager = mock.Mock(return_value=checkpoint_state)
+    stream = mock.Mock(side_effect=AssertionError("dense export must not stream native QMoE"))
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+    monkeypatch.setattr(
+        _gptoss_weights,
+        "stream_gptoss_mxfp4_safetensors_to_package",
+        stream,
+    )
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+
+    result = transformers_builder.build_transformers_model(
+        str(checkpoint),
+        keep_quantized=False,
+    )
+
+    assert result is package
+    assert built_configs[0][0].quantization is None
+    assert built_configs[0][1] == "default"
+    assert module_instances[0].config.quantization is None
+    assert module_instances[0]._dequantize_mxfp4_checkpoint is True
+    assert preprocess_inputs == [checkpoint_state]
+    eager.assert_called_once_with(str(checkpoint), revision=None)
+    stream.assert_not_called()
+    assert package["model"].graph.name == "gpt_oss/model"
+    assert "can require substantial host memory" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("execution_provider", "dtype", "message"),
+    [
+        ("default", ir.DataType.FLOAT16, "explicit CUDA"),
+        ("cuda", ir.DataType.FLOAT, "f16.*bf16"),
+    ],
+)
+def test_native_gptoss_contract_fails_before_graph_or_weight_io(
+    monkeypatch, execution_provider, dtype, message
+) -> None:
+    hf_config = type("HFConfig", (), {"model_type": "gpt_oss"})()
+    config = _native_gptoss_config(dtype=dtype)
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "text-generation", "gpt_oss"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    build = mock.Mock(side_effect=AssertionError("contract must fail before graph build"))
+    eager = mock.Mock(side_effect=AssertionError("contract must fail before weight I/O"))
+    monkeypatch.setattr(transformers_builder, "build_from_module", build)
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+
+    with pytest.raises(ValueError, match=message):
+        transformers_builder.build_transformers_model(
+            "openai/gpt-oss-120b",
+            execution_provider=execution_provider,
+        )
+
+    build.assert_not_called()
+    eager.assert_not_called()
 
 
 @pytest.mark.parametrize(

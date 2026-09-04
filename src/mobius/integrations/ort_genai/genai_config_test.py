@@ -753,6 +753,185 @@ def test_cuda_decoder_graph_capture_can_be_disabled():
     assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "0"
 
 
+def test_cuda_lfm2_disables_graph_capture_when_share_buffer_is_forced_off():
+    gen = GenaiConfigGenerator(
+        "lfm2",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        layer_types=["conv", "full_attention"],
+    )
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["search"]["past_present_share_buffer"] is False
+    assert cuda_options["enable_cuda_graph"] == "0"
+
+
+def test_cuda_search_override_disables_graph_capture_when_share_buffer_is_false():
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        supports_in_place_kv_cache=True,
+    )
+    gen._search_overrides = {"past_present_share_buffer": False}
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["search"]["past_present_share_buffer"] is False
+    assert cuda_options["enable_cuda_graph"] == "0"
+
+
+def test_cuda_beam_search_disables_decoder_graph_capture():
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    )
+    gen._search_overrides = {"num_beams": 4}
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["search"]["past_present_share_buffer"] is True
+    assert cuda_options["enable_cuda_graph"] == "0"
+
+
+def test_cuda_internal_whisper_emitted_as_decoder_disables_beam_graph_capture():
+    gen = GenaiConfigGenerator(
+        "whisper",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    )
+    gen._search_overrides = {"num_beams": 4}
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["model"]["type"] == "decoder"
+    assert config["search"]["past_present_share_buffer"] is True
+    assert cuda_options["enable_cuda_graph"] == "0"
+
+
+def test_cuda_emitted_whisper_preserves_beam_graph_capture():
+    gen = GenaiConfigGenerator(
+        "whisper",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        has_specialized_topology=True,
+    )
+    gen._search_overrides = {"num_beams": 4}
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["model"]["type"] == "whisper"
+    assert config["search"]["past_present_share_buffer"] is True
+    assert cuda_options["enable_cuda_graph"] == "1"
+
+
+@pytest.mark.parametrize("share_buffer", ["true", 1, None])
+def test_graph_capture_rejects_non_boolean_share_buffer(share_buffer):
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    )
+    gen._search_overrides = {"past_present_share_buffer": share_buffer}
+
+    with pytest.raises(TypeError, match="past_present_share_buffer must be a boolean"):
+        gen.generate()
+
+
+@pytest.mark.parametrize("num_beams", [True, "1"])
+def test_graph_capture_rejects_non_integer_num_beams(num_beams):
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    )
+    gen._search_overrides = {"num_beams": num_beams}
+
+    with pytest.raises(TypeError, match=r"num_beams must be an integer"):
+        gen.generate()
+
+
+@pytest.mark.parametrize(
+    (
+        "supports_in_place_kv_cache",
+        "decoder_graph_capture",
+        "share_buffer",
+        "enable_cuda_graph",
+    ),
+    [
+        (False, True, False, "0"),
+        (True, None, True, "1"),
+        (None, None, True, "1"),
+    ],
+)
+def test_cuda_graph_capture_respects_introspected_kv_cache_capability(
+    supports_in_place_kv_cache,
+    decoder_graph_capture,
+    share_buffer,
+    enable_cuda_graph,
+):
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        supports_in_place_kv_cache=supports_in_place_kv_cache,
+        decoder_graph_capture=decoder_graph_capture,
+    )
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["search"]["past_present_share_buffer"] is share_buffer
+    assert cuda_options["enable_cuda_graph"] == enable_cuda_graph
+
+
 def test_embedding_session_options_can_be_updated():
     gen = GenaiConfigGenerator(
         "gemma4",

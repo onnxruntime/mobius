@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### GPT-OSS MXFP4 export
+
+#### Added
+
+- GPT-OSS MXFP4 checkpoints now preserve their native block/scales storage by
+  default through bounded safetensors streaming. `--model` and local
+  `--config` builds use the same CUDA f16/bf16 contract and transactional
+  package publication.
+- `--dequantize` explicitly selects the portable dense GPT-OSS graph. Dense
+  MXFP4 reconstruction eagerly loads and converts the checkpoint and can
+  require substantial host memory; native streaming remains the default.
+
 ### Independent quantization for multi-component packages
 
 #### Added

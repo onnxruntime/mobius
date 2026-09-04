@@ -185,6 +185,22 @@ class MyCausalLMModel(CausalLMModel):
 > norms, identity folding), read
 > [`references/weight-preprocessing.md`](references/weight-preprocessing.md).
 
+Before choosing eager preprocessing, estimate the peak memory from the source
+checkpoint and transformed tensors. Use an architecture-specific streaming
+planner when the checkpoint is large or a packed source must be converted to a
+different operator layout. In particular:
+
+- use `StreamingWeightSource` for direct one-source/one-target bindings;
+- use `StreamingExpertBankSource` to assemble per-expert sources;
+- use `StreamingTransformedWeightSource` for lazy custom repacking;
+- distinguish storage semantics explicitly rather than treating every 4-bit,
+  group-size-32 checkpoint as affine INT4.
+
+The generic streaming engine belongs in `integrations/_weight_loading.py`.
+Model-specific source names, topology checks, and source-to-target mappings
+belong in `integrations/transformers/_<model>_weights.py`; graph math and tensor
+transforms belong in the model module.
+
 ### 5. Register the model
 
 Add to `_create_default_registry()` in `src/mobius/_registry.py`:
@@ -278,6 +294,10 @@ see the [quality-checklist skill](../quality-checklist/SKILL.md).
 - [ ] Class has `default_task` and `category` attributes (if not standard text-generation)
 - [ ] Class has a descriptive docstring (first paragraph used in generated docs)
 - [ ] `preprocess_weights` handles any key mismatches
+- [ ] Peak checkpoint/transformation memory was assessed; large or packed-layout
+      conversions use a fail-closed streaming planner
+- [ ] Quantized storage semantics are identified from authoritative metadata and
+      checkpoint headers, not inferred from bit width alone
 - [ ] Registered in `_create_default_registry()`
 - [ ] Exported from `models/__init__.py`
 - [ ] Config extraction works (`ArchitectureConfig.from_transformers`)

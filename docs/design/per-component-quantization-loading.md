@@ -3,6 +3,28 @@
 **Status:** Proposed
 **Date:** 2026-08-26
 
+### Implemented precedents
+
+The complete component manifest, codec registry, and `ModelWeightAdapter`
+design below remain proposed. Native GPT-OSS MXFP4 support has since landed
+several narrower building blocks that should be reused by the migration:
+
+- `QuantizedWeightFormat` distinguishes integer-affine storage from MXFP4
+  instead of inferring semantics from bit width and group size.
+- `StreamingWeightPlan` supports direct, expert-bank, and transformed lazy
+  sources with fail-closed source/target metadata validation.
+- Architecture-specific planners can map checkpoint headers to graph
+  initializers without materializing a complete state dict.
+- The native GPT-OSS loader registers its lazy source artifacts and marks its
+  report for transactional `ModelPackage.save()` publication. These lifecycle
+  protections are opt-in requirements, not yet automatic for every streaming
+  loader.
+
+These are precedents, not an implementation of the proposed
+`QuantizationCodec` or `ModelWeightAdapter` registries. The current
+Transformers builder still dispatches exceptional loaders such as GPT-OSS and
+Qwen4 explicitly.
+
 ---
 
 ## Executive summary

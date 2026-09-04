@@ -127,7 +127,7 @@ def _make_graph(
 
 def _make_model(graph: ir.Graph) -> ir.Model:
     """Create an ``ir.Model`` with standard producer metadata."""
-    model = ir.Model(graph, ir_version=11)
+    model = ir.Model(graph, ir_version=12)
     model.producer_name = "mobius"
     model.producer_version = mobius.__version__
     return model

@@ -23,8 +23,12 @@ from onnx_ir import tensor_adapters
 from mobius._builder import build_from_module
 from mobius._testing import make_config
 from mobius.integrations._weight_loading import (
+    StreamingTransformedWeightSource,
+    StreamingWeightPlan,
     _shard_key_index,
+    _validate_materialized_tensor_metadata,
     external_data_checksums,
+    stream_preprocessed_safetensors_to_model,
     stream_safetensors_to_model,
 )
 from mobius.models.base import CausalLMModel
@@ -195,6 +199,21 @@ class TestStreamingRefusals:
         with pytest.raises(ValueError, match="quantized"):
             stream_safetensors_to_model(model, str(tmp_path))
 
+    def test_lazy_materialization_rechecks_indexed_dtype(self, tmp_path):
+        model = _fresh_model()
+        state = _make_checkpoint_state(model)
+        target_name = next(iter(state))
+        _save_single(state, tmp_path)
+        stream_safetensors_to_model(model, str(tmp_path))
+
+        state[target_name] = torch.zeros(state[target_name].shape, dtype=torch.uint8)
+        _save_single(state, tmp_path)
+        lazy_tensor = model.graph.initializers[target_name].const_value
+        assert lazy_tensor is not None
+
+        with pytest.raises(ValueError, match=r"changed after indexing.*U8"):
+            lazy_tensor.numpy()
+
     def test_scale_key_alone_signals_quantized_source(self, tmp_path):
         model = _fresh_model()
         state = _make_checkpoint_state(model)
@@ -206,6 +225,127 @@ class TestStreamingRefusals:
 
         with pytest.raises(ValueError, match="quantized"):
             stream_safetensors_to_model(model, str(tmp_path))
+
+    @pytest.mark.parametrize(
+        ("declared_shape", "declared_dtype", "error"),
+        [
+            ((3,), ir.DataType.FLOAT, ValueError),
+            ((2,), ir.DataType.FLOAT16, TypeError),
+        ],
+    )
+    def test_transformed_target_contract_fails_before_binding(
+        self,
+        tmp_path,
+        declared_shape,
+        declared_dtype,
+        error,
+    ):
+        source_path = tmp_path / "model.safetensors"
+        safetensors.torch.save_file(
+            {"source": torch.ones(2, dtype=torch.float32)},
+            str(source_path),
+        )
+        target = ir.Value(
+            name="target",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([2]),
+            const_value=ir.tensor(torch.zeros(2)),
+        )
+        graph = ir.Graph([], [], nodes=[], name="transformed")
+        graph.register_initializer(target)
+        target.const_value = None
+        model = ir.Model(graph, ir_version=12)
+        transform_calls = []
+
+        def planner(_key_index, _initializers):
+            return StreamingWeightPlan(
+                targets={
+                    "target": StreamingTransformedWeightSource(
+                        source_name="source",
+                        expected_source_shape=(2,),
+                        expected_source_dtype="F32",
+                        expected_target_shape=declared_shape,
+                        expected_target_dtype=declared_dtype,
+                        transform=lambda tensor, _name: transform_calls.append(True) or tensor,
+                    )
+                }
+            )
+
+        with pytest.raises(error, match=r"declares target (shape|dtype)"):
+            stream_preprocessed_safetensors_to_model(
+                model,
+                str(tmp_path),
+                planner,
+            )
+
+        assert target.const_value is None
+        assert transform_calls == []
+
+    def test_transformed_validator_rechecks_materialized_source(self, tmp_path):
+        source_path = tmp_path / "model.safetensors"
+        safetensors.torch.save_file(
+            {"source": torch.ones(2, dtype=torch.float32)},
+            str(source_path),
+        )
+        target = ir.Value(
+            name="target",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([2]),
+            const_value=ir.tensor(torch.zeros(2)),
+        )
+        graph = ir.Graph([], [], nodes=[], name="transformed")
+        graph.register_initializer(target)
+        target.const_value = None
+        model = ir.Model(graph, ir_version=12)
+        transform_calls = []
+
+        def validate_tensor(tensor, source_name):
+            if torch.any(tensor < 0).item():
+                raise ValueError(f"{source_name} contains a negative value")
+
+        def transform(tensor, _source_name):
+            transform_calls.append(True)
+            return tensor
+
+        def planner(_key_index, _initializers):
+            return StreamingWeightPlan(
+                targets={
+                    "target": StreamingTransformedWeightSource(
+                        source_name="source",
+                        expected_source_shape=(2,),
+                        expected_source_dtype="F32",
+                        expected_target_shape=(2,),
+                        expected_target_dtype=ir.DataType.FLOAT,
+                        transform=transform,
+                        validate_tensor=validate_tensor,
+                    )
+                }
+            )
+
+        stream_preprocessed_safetensors_to_model(model, str(tmp_path), planner)
+        safetensors.torch.save_file(
+            {"source": -torch.ones(2, dtype=torch.float32)},
+            str(source_path),
+        )
+
+        assert target.const_value is not None
+        with pytest.raises(ValueError, match="contains a negative value"):
+            target.const_value.numpy()
+        assert transform_calls == []
+
+    @pytest.mark.skipif(
+        not hasattr(torch, "float8_e8m0fnu"),
+        reason="torch does not expose float8_e8m0fnu",
+    )
+    def test_materialized_e8m0_dtype_matches_safetensors_header(self):
+        tensor = torch.zeros(4, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+        _validate_materialized_tensor_metadata(
+            tensor,
+            "scale",
+            expected_shape=[4],
+            expected_dtype="F8_E8M0",
+        )
 
 
 class TestExternalDataChecksums:

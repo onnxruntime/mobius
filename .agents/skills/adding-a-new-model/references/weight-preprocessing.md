@@ -14,6 +14,52 @@ to weight loading or dtype problems.
 - **Split fused gate+up:** `Wi.weight` [2I, H] → `gate_proj`, `up_proj` (ModernBERT)
 - **Split fused BLIP QKV:** `in_proj_weight` [3H, H] → separate Q/K/V projections
 
+## Choose eager preprocessing or a streaming adapter
+
+Use `preprocess_weights(state_dict)` for checkpoints that fit comfortably in
+host memory and require only inexpensive rename, split, fuse, transpose, or
+dtype operations. The generic eager loader retains the complete state dict, so
+it is not appropriate when source tensors plus transformed tensors can approach
+available RAM.
+
+Use an architecture-specific streaming planner when the checkpoint is large or
+the destination requires a substantial layout transformation. Keep the
+architecture-specific mapping in
+`integrations/transformers/_<model>_weights.py` and reuse the mechanisms in
+`integrations/_weight_loading.py`:
+
+| Source type | Use when |
+|---|---|
+| `StreamingWeightSource` | One checkpoint tensor binds directly to one initializer, optionally using a supported built-in mode |
+| `StreamingExpertBankSource` | Multiple per-expert source matrices are assembled into one expert-major initializer |
+| `StreamingTransformedWeightSource` | One source tensor is lazily validated and transformed into a differently shaped or encoded target |
+
+A transformed source declares both sides of the contract:
+
+```python
+StreamingTransformedWeightSource(
+    source_name=source_name,
+    expected_source_shape=source_shape,
+    expected_source_dtype=source_dtype,
+    expected_target_shape=target_shape,
+    expected_target_dtype=target_dtype,
+    transform=repack_source_layout,
+    validate_tensor=validate_source_values,
+)
+```
+
+The planner must classify every source key, validate checkpoint headers against
+the model config, and validate target metadata against graph initializers before
+binding lazy tensors. The transform runs during external-data serialization so
+only the current source, transformation scratch space, and destination tensor
+need to be resident.
+
+Do not infer a checkpoint storage format from `bits` and `group_size` alone.
+Those fields cannot distinguish, for example, affine INT4 from E2M1 MXFP4 with
+E8M0 block scales. Config metadata identifies the format family, safetensors
+headers provide the actual names/shapes/dtypes, and the model adapter bridges
+that source contract to the emitted operator ABI.
+
 ## Debugging mismatches: initializer comparison
 
 Build the ONNX model, list its initializer names, and compare against
