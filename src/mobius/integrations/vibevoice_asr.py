@@ -225,6 +225,82 @@ class VibeVoiceASRHost:
         seed: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return flattened audio features and per-item valid frame lengths."""
+        valid_lengths = self._valid_lengths(batch)
+        if len(set(valid_lengths)) == 1:
+            acoustic_latents, semantic_latents = self._encode_latents(batch)
+            return self._connect_latents(
+                acoustic_latents,
+                semantic_latents,
+                batch.padding_mask,
+                seed=seed,
+            )
+
+        # A scalar final flag is correct only when every waveform ends together.
+        # Finalize unequal utterances alone so each convolution sees its source-
+        # defined padding at that utterance's actual terminal chunk.
+        acoustic_latents_by_item: list[np.ndarray] = []
+        semantic_latents_by_item: list[np.ndarray] = []
+        for index, valid_length in enumerate(valid_lengths):
+            item = VibeVoiceASRBatch(
+                input_values=batch.input_values[index : index + 1, :valid_length],
+                padding_mask=batch.padding_mask[index : index + 1, :valid_length],
+            )
+            acoustic_latents, semantic_latents = self._encode_latents(item)
+            acoustic_latents_by_item.append(acoustic_latents)
+            semantic_latents_by_item.append(semantic_latents)
+
+        generator = np.random.default_rng(seed)
+        acoustic_noise_scales = generator.standard_normal(len(valid_lengths))
+        max_frames = max(latents.shape[1] for latents in acoustic_latents_by_item)
+        acoustic_noise = generator.standard_normal(
+            (len(valid_lengths), max_frames, acoustic_latents_by_item[0].shape[-1])
+        )
+        audio_features: list[np.ndarray] = []
+        audio_feature_lengths: list[np.ndarray] = []
+        for index, (acoustic_latents, semantic_latents) in enumerate(
+            zip(acoustic_latents_by_item, semantic_latents_by_item, strict=True)
+        ):
+            frames = acoustic_latents.shape[1]
+            connector = self._run_stage(
+                "connectors",
+                {
+                    "acoustic_latents": acoustic_latents,
+                    "semantic_latents": semantic_latents,
+                    "padding_mask": batch.padding_mask[
+                        index : index + 1, : valid_lengths[index]
+                    ],
+                    "acoustic_noise_scale": acoustic_noise_scales[index : index + 1].astype(
+                        acoustic_latents.dtype
+                    ),
+                    "acoustic_latent_noise": acoustic_noise[index : index + 1, :frames].astype(
+                        acoustic_latents.dtype
+                    ),
+                },
+            )
+            audio_features.append(np.asarray(connector["audio_features"]))
+            audio_feature_lengths.append(np.asarray(connector["audio_feature_lengths"]))
+        return np.concatenate(audio_features), np.concatenate(audio_feature_lengths)
+
+    @staticmethod
+    def _valid_lengths(batch: VibeVoiceASRBatch) -> list[int]:
+        if (
+            batch.input_values.ndim != 2
+            or batch.padding_mask.shape != batch.input_values.shape
+        ):
+            raise ValueError(
+                "VibeVoice-ASR host expects equal-shaped (batch, samples) inputs and masks"
+            )
+        valid_lengths: list[int] = []
+        for index, mask in enumerate(batch.padding_mask):
+            valid_length = int(mask.sum())
+            if valid_length == 0 or not mask[:valid_length].all() or mask[valid_length:].any():
+                raise ValueError(
+                    f"VibeVoice-ASR waveform {index} must have a non-empty right-padded validity mask"
+                )
+            valid_lengths.append(valid_length)
+        return valid_lengths
+
+    def _encode_latents(self, batch: VibeVoiceASRBatch) -> tuple[np.ndarray, np.ndarray]:
         acoustic_cache = dict(
             self._make_initial_conv_cache("acoustic_encoder", batch.input_values.shape[0])
         )
@@ -259,6 +335,16 @@ class VibeVoiceASRHost:
 
         acoustic_latents = np.concatenate(acoustic_chunks, axis=1)
         semantic_latents = np.concatenate(semantic_chunks, axis=1)
+        return acoustic_latents, semantic_latents
+
+    def _connect_latents(
+        self,
+        acoustic_latents: np.ndarray,
+        semantic_latents: np.ndarray,
+        padding_mask: np.ndarray,
+        *,
+        seed: int | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         generator = np.random.default_rng(seed)
         acoustic_noise_scale = generator.standard_normal(acoustic_latents.shape[0]).astype(
             acoustic_latents.dtype
@@ -271,7 +357,7 @@ class VibeVoiceASRHost:
             {
                 "acoustic_latents": acoustic_latents,
                 "semantic_latents": semantic_latents,
-                "padding_mask": batch.padding_mask,
+                "padding_mask": padding_mask,
                 "acoustic_noise_scale": acoustic_noise_scale,
                 "acoustic_latent_noise": acoustic_latent_noise,
             },

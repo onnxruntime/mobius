@@ -45,6 +45,9 @@ resulting latents, then runs `connectors` once over the full sample mask.
 It passes `is_final_chunk=[true]` only on the terminal window. The encoder
 performs the original source's right-padding independently at every causal
 convolution; hosts must **not** zero-pad the raw terminal waveform.
+Equal-length utterances share this staged execution. A right-padded
+variable-length batch is finalized one utterance at a time, so every sample
+receives its own terminal flag and source-equivalent final latent frame.
 `VibeVoiceASRHost` and `VibeVoiceASRProcessor` in
 `mobius.integrations.vibevoice_asr` define that behavior. The explicit noise
 inputs reproduce the source's acoustic sample
