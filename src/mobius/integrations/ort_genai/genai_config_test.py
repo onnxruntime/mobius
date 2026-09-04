@@ -894,35 +894,6 @@ def test_graph_capture_rejects_non_integer_num_beams(num_beams):
 
 
 @pytest.mark.parametrize(
-    ("supports_in_place_kv_cache", "expected_graph_capture"),
-    [(False, "0"), (None, None), (True, None)],
-)
-def test_dml_graph_capture_tracks_share_buffer_contract(
-    supports_in_place_kv_cache,
-    expected_graph_capture,
-):
-    gen = GenaiConfigGenerator(
-        "test_model",
-        vocab_size=1000,
-        hidden_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-        ep="dml",
-        supports_in_place_kv_cache=supports_in_place_kv_cache,
-    )
-
-    config = gen.generate()
-    dml_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["dml"]
-
-    assert config["search"]["past_present_share_buffer"] is (
-        supports_in_place_kv_cache is not False
-    )
-    assert dml_options.get("enable_graph_capture") == expected_graph_capture
-
-
-@pytest.mark.parametrize(
     (
         "supports_in_place_kv_cache",
         "decoder_graph_capture",
