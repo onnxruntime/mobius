@@ -165,12 +165,14 @@ def _active_quantization(
 def _component_quantization_config(
     config: Gemma4Config,
     component: str,
+    *,
+    source_module_names: tuple[str, ...] = (),
 ) -> QuantizationConfig | None:
     """Return the effective packed-linear layout for one Gemma4 component."""
     if config.component_quantization is not None:
         quantization = config.quantization_for_source_paths(
             component,
-            _GEMMA4_COMPONENT_SOURCES.get(component, ()),
+            source_module_names or _GEMMA4_COMPONENT_SOURCES.get(component, ()),
         )
         return _active_quantization(quantization)
 
@@ -191,12 +193,18 @@ def _component_quantization_config(
 def _table_quantization_config(
     config: Gemma4Config,
     component: str,
+    *,
+    source_module_names: tuple[str, ...] = (),
 ) -> QuantizationConfig | None:
     """Return the config controlling embedding tables in *component*."""
     if config.component_quantization is None:
         return _active_quantization(config.quantization)
-    return _active_quantization(config.quantization_for(component))
-
+    return _active_quantization(
+        config.quantization_for_source_paths(
+            component,
+            source_module_names or _GEMMA4_COMPONENT_SOURCES.get(component, ()),
+        )
+    )
 
 def _quantized_linear_class(
     config: Gemma4Config,
@@ -285,6 +293,7 @@ def _make_scaled_word_embedding(
     embed_scale: float,
     *,
     component: str = "decoder",
+    source_module_names: tuple[str, ...] = ("model.language_model.embed_tokens",),
 ):
     """Build a scaled token embedding, quantized when the config requests it.
 
@@ -292,7 +301,11 @@ def _make_scaled_word_embedding(
     lookup) when embedding quantization is enabled and the embedding dimension
     is block-aligned, otherwise a float :class:`Gemma3TextScaledWordEmbedding`.
     """
-    quantization_config = _table_quantization_config(config, component)
+    quantization_config = _table_quantization_config(
+        config,
+        component,
+        source_module_names=source_module_names,
+    )
     if (
         quantization_config is not None
         and quantization_config.quantize_embeddings
@@ -437,7 +450,7 @@ def _preprocess_component_quantized_weights(
                 embed_key="embedding.embed_tokens.weight",
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=None,
-                reject_quantized_embeddings_lm_head=True,
+                reject_quantized_embeddings_lm_head=component != "embedding",
             )
         )
     return result
@@ -2128,6 +2141,7 @@ class Gemma4TextModel(nn.Module):
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
                 float(self._per_layer_dim**0.5),
+                source_module_names=("model.language_model.embed_tokens_per_layer",),
             )
             # Split [V, D] tables — used when split_per_layer_embedding is True
             # (i.e. the fused table exceeds the EP's max_buffer_size, e.g. WebGPU's
@@ -3471,6 +3485,25 @@ class Gemma4Model(nn.Module):
 
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = _GEMMA4_COMPONENT_SOURCES
+    HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
+        "decoder": {
+            "model": "model.language_model",
+            "lm_head": "lm_head",
+        },
+        "vision_encoder": {
+            "encoder": "model.vision_tower.encoder",
+            "projector": "model.embed_vision.embedding_projection",
+        },
+        "audio_encoder": {
+            "encoder": "model.audio_tower",
+            "projector": "model.embed_audio.embedding_projection",
+        },
+        "embedding": {
+            "embed_tokens": "model.language_model.embed_tokens",
+            "embed_tokens_per_layer": ("model.language_model.embed_tokens_per_layer"),
+            "per_layer_model_projection": ("model.language_model.per_layer_model_projection"),
+        },
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
@@ -3553,6 +3586,14 @@ class Gemma4Model(nn.Module):
                     renamed["decoder." + suffix] = value
                 elif any(suffix.startswith(p) for p in per_layer_prefixes):
                     # Per-layer embedding weights → embedding sub-model
+                    renamed["embedding." + suffix] = value
+                elif (
+                    suffix.startswith("embed_tokens.")
+                    and self.config.component_quantization is not None
+                ):
+                    # The split decoder consumes inputs_embeds and has no token
+                    # table initializer. Route authoritative component-plan
+                    # embedding sidecars only to the embedding graph.
                     renamed["embedding." + suffix] = value
                 else:
                     # All other text weights nest under decoder.model.*
@@ -3704,6 +3745,22 @@ class Gemma4UnifiedModel(nn.Module):
         "vision_encoder": ("model.vision_embedder", "model.embed_vision"),
         "audio_encoder": ("model.embed_audio",),
         "embedding": ("model.language_model.embed_tokens",),
+    }
+    HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
+        "decoder": {
+            "model": "model.language_model",
+            "lm_head": "lm_head",
+        },
+        "vision_encoder": {
+            "patch_dense": "model.vision_embedder.patch_dense",
+            "projector": "model.embed_vision.embedding_projection",
+        },
+        "audio_encoder": {
+            "projector": "model.embed_audio.embedding_projection",
+        },
+        "embedding": {
+            "embed_tokens": "model.language_model.embed_tokens",
+        },
     }
 
     def __init__(self, config: Gemma4Config):

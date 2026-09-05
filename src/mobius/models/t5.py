@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import ClassVar
 
@@ -540,8 +541,27 @@ class T5ForConditionalGeneration(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
-        self.encoder = T5Encoder(config)
-        self.decoder = T5Decoder(config)
+        encoder_config = config
+        decoder_config = config
+        if config.component_quantization is not None:
+            encoder_config = dataclasses.replace(
+                config,
+                quantization=config.quantization_for_source_paths(
+                    "encoder",
+                    self.HF_COMPONENT_SOURCES["encoder"],
+                ),
+                component_quantization=None,
+            )
+            decoder_config = dataclasses.replace(
+                config,
+                quantization=config.quantization_for_source_paths(
+                    "decoder",
+                    self.HF_COMPONENT_SOURCES["decoder"],
+                ),
+                component_quantization=None,
+            )
+        self.encoder = T5Encoder(encoder_config)
+        self.decoder = T5Decoder(decoder_config)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
