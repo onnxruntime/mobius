@@ -244,8 +244,8 @@ def test_qwen4exp_header_fixture_matches_pinned_evidence():
 @pytest.mark.parametrize(
     ("keep_quantized", "message"),
     [
-        (True, r"IQ4_NL embedding.*rank-3 routed experts.*No GGUF tensor payload"),
-        (False, r"191 GiB.*bounded-memory route.*No GGUF tensor payload"),
+        (True, r"IQ4_NL embedding.*rank-3 routed experts.*may fall back to downloading"),
+        (False, r"191 GiB.*bounded-memory route.*may fall back to downloading"),
     ],
 )
 def test_qwen4exp_payload_modes_fail_closed_before_raw_payload_access(
@@ -278,10 +278,69 @@ def test_qwen4exp_hub_preflight_is_source_independent_and_forwards_revision(monk
         lambda _url: SimpleNamespace(
             commit_hash="a" * 40,
             location="https://cdn.example/model.gguf",
+            size=len(bounded_response) + 1,
         ),
     )
     response = mock.MagicMock()
-    response.iter_bytes.return_value = [b"header"]
+    bounded_response = b"complete-metadata-header|initial-tensor-bytes"
+    response.iter_bytes.return_value = [bounded_response]
+    response_context = mock.MagicMock()
+    response_context.__enter__.return_value = response
+    session = mock.MagicMock()
+    session.stream.return_value = response_context
+    monkeypatch.setattr(_builder, "get_session", lambda: session)
+    inspected_ranges = []
+
+    def inspect_range(data, **_kwargs):
+        inspected_ranges.append(data)
+        return _builder.GGUFHeaderInfo(
+            architecture="qwen4exp",
+            tensor_count=0,
+            split_no=0,
+            split_count=3,
+            split_tensors_count=1224,
+        )
+
+    monkeypatch.setattr(
+        _builder,
+        "_gguf_header_info_from_header_prefix",
+        inspect_range,
+    )
+
+    with pytest.raises(
+        Qwen4ExpGGUFImportError,
+        match=r"intentionally fail-closed.*Only bounded GGUF preflight range data",
+    ):
+        _builder._preflight_hf_gguf_file(
+            "other/Qwen4Exp-GGUF",
+            "renamed-00001-of-00003.gguf",
+            revision="feature/revision",
+        )
+    assert inspected_ranges == [bounded_response]
+    assert b"initial-tensor-bytes" in inspected_ranges[0]
+    hub_url.assert_called_once_with(
+        "other/Qwen4Exp-GGUF",
+        "renamed-00001-of-00003.gguf",
+        revision="feature/revision",
+    )
+
+
+def test_qwen4exp_preflight_reports_complete_file_that_fits_in_range(monkeypatch):
+    from mobius.integrations.gguf import _builder
+
+    complete_file = b"small-complete-gguf"
+    monkeypatch.setattr(_builder, "hf_hub_url", lambda *_args, **_kwargs: "hub-url")
+    monkeypatch.setattr(
+        _builder,
+        "get_hf_file_metadata",
+        lambda _url: SimpleNamespace(
+            commit_hash="c" * 40,
+            location="https://cdn.example/small.gguf",
+            size=len(complete_file),
+        ),
+    )
+    response = mock.MagicMock()
+    response.iter_bytes.return_value = [complete_file]
     response_context = mock.MagicMock()
     response_context.__enter__.return_value = response
     session = mock.MagicMock()
@@ -292,21 +351,62 @@ def test_qwen4exp_hub_preflight_is_source_independent_and_forwards_revision(monk
         "_gguf_header_info_from_header_prefix",
         lambda *_args, **_kwargs: _builder.GGUFHeaderInfo(
             architecture="qwen4exp",
-            tensor_count=0,
-            split_no=0,
-            split_count=3,
-            split_tensors_count=1224,
+            tensor_count=1,
+            split_no=None,
+            split_count=None,
+            split_tensors_count=None,
         ),
     )
 
-    with pytest.raises(Qwen4ExpGGUFImportError, match="intentionally fail-closed"):
+    with pytest.raises(
+        Qwen4ExpGGUFImportError,
+        match="bounded preflight response contained a complete GGUF file",
+    ):
         _builder._preflight_hf_gguf_file(
             "other/Qwen4Exp-GGUF",
-            "renamed-00001-of-00003.gguf",
-            revision="feature/revision",
+            "small.gguf",
         )
-    hub_url.assert_called_once_with(
-        "other/Qwen4Exp-GGUF",
-        "renamed-00001-of-00003.gguf",
-        revision="feature/revision",
+
+
+def test_qwen4exp_split_fallback_does_not_claim_complete_payload_was_not_downloaded(
+    monkeypatch,
+):
+    from mobius.integrations.gguf import _builder
+
+    commit_hash = "b" * 40
+    shards = [
+        "model-00001-of-00002.gguf",
+        "model-00002-of-00002.gguf",
+    ]
+    download_shards = mock.Mock(return_value="cached-primary.gguf")
+    monkeypatch.setattr(
+        _builder,
+        "_preflight_hf_gguf_file",
+        lambda *_args, **_kwargs: _builder._GGUFPreflightFallbackRevision(commit_hash),
     )
+    api = mock.Mock()
+    api.list_repo_files.return_value = shards
+    monkeypatch.setattr(_builder, "HfApi", mock.Mock(return_value=api))
+    monkeypatch.setattr(_builder, "_download_hf_gguf_shards", download_shards)
+
+    assert (
+        _builder._resolve_gguf_path(f"other/Qwen4Exp-GGUF:{shards[0]}")
+        == "cached-primary.gguf"
+    )
+    download_shards.assert_called_once_with(
+        api,
+        repo_id="other/Qwen4Exp-GGUF",
+        selected_filename=shards[0],
+        shard_filenames=shards,
+        revision=commit_hash,
+    )
+
+    with pytest.raises(Qwen4ExpGGUFImportError) as exc_info:
+        _builder._validate_gguf_model(
+            _HeaderFixture(),
+            source="cached-primary.gguf",
+            keep_quantized=True,
+        )
+    message = str(exc_info.value)
+    assert "may fall back to downloading" in message
+    assert "no complete GGUF file or shard payload was downloaded" not in message
