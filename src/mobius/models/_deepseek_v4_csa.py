@@ -284,6 +284,26 @@ class CsaLayerPlan:
     def selected_indices_name(self) -> str:
         return f"selected_indices.{self.layer_id}"
 
+    # -- dynamic record-axis symbolic dim names ---------------------------
+    # Each layer's compressed-record axis is a *per-layer* symbolic dim. A
+    # mixed schedule pools at different ratios per layer (ratio-4 keeps one
+    # record per 4 tokens, ratio-128 one per 128), so their record counts
+    # diverge and MUST NOT share one symbol -- ORT rejects binding the same
+    # symbolic dim to two sizes. Within a layer the attention cache and the
+    # learned-index cache advance in lockstep (same ratio), so they share this
+    # one per-layer symbol; that lockstep constraint is real and worth stating.
+    @property
+    def past_records_axis_name(self) -> str:
+        return f"past_compressed_records.{self.layer_id}"
+
+    @property
+    def present_records_axis_name(self) -> str:
+        return f"present_compressed_records.{self.layer_id}"
+
+    @property
+    def selected_records_axis_name(self) -> str:
+        return f"selected_records.{self.layer_id}"
+
 
 def _layer_compress_ratio(config: ArchitectureConfig, layer_id: int) -> int:
     ratios = config.compress_ratios or []
