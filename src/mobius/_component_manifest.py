@@ -158,10 +158,10 @@ def resolve_component_manifest(
 
     component_sources: dict[str, tuple[str, ...]] = {}
     component_aliases: dict[str, tuple[tuple[str, str], ...]] = {}
-    if module_class is not None and model_type is not None and hf_config is not None:
+    if module_class is not None and hf_config is not None:
         component_sources = get_hf_component_sources(
             module_class,
-            model_type,
+            model_type or "",
             hf_config,
         )
         raw_aliases = getattr(module_class, "HF_COMPONENT_MODULE_ALIASES", {})

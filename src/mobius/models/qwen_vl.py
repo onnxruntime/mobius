@@ -9,7 +9,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import tie_word_embeddings
+from mobius._weight_utils import is_packed_quant_key, tie_word_embeddings
 from mobius.components import (
     InputMixer,
     Qwen2VLVisionModel,
@@ -28,6 +28,21 @@ from mobius.models.base import CausalLMModel, TextModel
 
 if TYPE_CHECKING:
     import onnx_ir as ir
+
+
+def _route_split_embedding_weight(
+    renamed: dict[str, torch.Tensor],
+    source_name: str,
+    value: torch.Tensor,
+    *,
+    decoder_name: str,
+    embedding_name: str,
+    config: ArchitectureConfig,
+) -> None:
+    """Route packed split-model embeddings only to their owning component."""
+    if config.component_quantization is None or not is_packed_quant_key(source_name):
+        renamed[decoder_name] = value
+    renamed[embedding_name] = value
 
 
 def split_per_layer_inputs(
@@ -160,10 +175,15 @@ class Qwen25VLCausalLMModel(nn.Module):
                 new_key = new_key.replace(".merger.mlp.2.", ".merger.mlp_2.")
                 renamed[new_key] = value
             elif key.startswith("model.embed_tokens."):
-                # Shared embedding → both decoder (TextModel) and embedding model
-                renamed[f"decoder.{key}"] = value
                 stripped = key[len("model.") :]
-                renamed[f"embedding.{stripped}"] = value
+                _route_split_embedding_weight(
+                    renamed,
+                    key,
+                    value,
+                    decoder_name=f"decoder.{key}",
+                    embedding_name=f"embedding.{stripped}",
+                    config=self.config,
+                )
             elif key.startswith("model."):
                 renamed[f"decoder.{key}"] = value
             elif key.startswith("lm_head."):
@@ -493,9 +513,15 @@ class Qwen2VLCausalLMModel(nn.Module):
                 new_key = new_key.replace(".merger.mlp.2.", ".merger.mlp_2.")
                 renamed[new_key] = value
             elif key.startswith("model.embed_tokens."):
-                renamed[f"decoder.{key}"] = value
                 stripped = key[len("model.") :]
-                renamed[f"embedding.{stripped}"] = value
+                _route_split_embedding_weight(
+                    renamed,
+                    key,
+                    value,
+                    decoder_name=f"decoder.{key}",
+                    embedding_name=f"embedding.{stripped}",
+                    config=self.config,
+                )
                 if self.config.tie_word_embeddings and key == "model.embed_tokens.weight":
                     renamed["decoder.lm_head.weight"] = value
             elif key.startswith("model."):
@@ -864,10 +890,15 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
                 stripped = stripped.replace(".mlp.linear_fc2.", ".mlp.down_proj.")
                 renamed[f"vision_encoder.{stripped}"] = value
             elif stripped.startswith("language_model.embed_tokens."):
-                # Shared embedding → both decoder and embedding model
                 suffix = stripped[len("language_model.") :]
-                renamed[f"decoder.model.{suffix}"] = value
-                renamed[f"embedding.{suffix}"] = value
+                _route_split_embedding_weight(
+                    renamed,
+                    key,
+                    value,
+                    decoder_name=f"decoder.model.{suffix}",
+                    embedding_name=f"embedding.{suffix}",
+                    config=self.config,
+                )
             elif stripped.startswith("language_model.lm_head."):
                 if not self.config.tie_word_embeddings:
                     renamed[f"decoder.{stripped[len('language_model.') :]}"] = value

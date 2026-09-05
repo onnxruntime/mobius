@@ -25,12 +25,13 @@ from mobius._builder import (
     build_from_module,
     resolve_dtype,
 )
+from mobius._component_quantization import attach_hf_component_sources
 from mobius._optimizations import strip_debug_metadata
 from mobius._registry import registry
-from mobius.integrations.transformers import (
+from mobius.integrations.transformers import build
+from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _default_task_for_model,
-    build,
 )
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 "--static-cache cannot represent Falcon-H1's per-layer K, V, "
                 "convolution, and SSM states"
             )
+        if model_type == "glm_moe_dsa":
+            raise ValueError(
+                "--static-cache cannot represent GLM-DSA's per-layer-varying packed DSA cache"
+            )
+        if model_type == "mistral4_gguf":
+            raise ValueError(
+                "--static-cache is not implemented for Mistral4's latent K-only cache"
+            )
         if model_type == "gemma4":
             from mobius.tasks._gemma4 import Gemma4Task
 
@@ -218,6 +227,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
     guidance_scale = getattr(args, "guidance_scale", None)
     if guidance_scale is not None and args.runtime != "onnx-genai":
         raise SystemExit("Error: --guidance-scale can only be used with --runtime onnx-genai.")
+    input_sampling_rate = getattr(args, "input_sampling_rate", None)
+    bwe_sampling_rate = getattr(args, "bwe_sampling_rate", None)
+    for option, value in (
+        ("--input-sample-rate", input_sampling_rate),
+        ("--bwe-sample-rate", bwe_sampling_rate),
+    ):
+        if value is not None and value <= 0:
+            raise SystemExit(f"Error: {option} must be a positive integer.")
 
     # Validate static-cache + --task compatibility.
     if args.static_cache and args.task is not None:
@@ -296,6 +313,21 @@ def _cmd_build(args: argparse.Namespace) -> None:
         task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision
+    from mobius.integrations._moshi import (
+        _is_personaplex_checkpoint,
+        _personaplex_revision,
+    )
+
+    is_personaplex = bool(args.model and _is_personaplex_checkpoint(args.model))
+    if is_personaplex:
+        revision = _personaplex_revision(args.model, revision)
+    if args.model == "nvidia/RE-USE" and revision is None:
+        # Pin every Hub probe, including the early Diffusers detector. A
+        # mutable model_index.json on Hub main must not reroute this checkpoint
+        # before the bespoke builder applies its immutable default.
+        from mobius.models.reuse import REUSE_REVISION
+
+        revision = REUSE_REVISION
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
@@ -307,9 +339,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # that flag only applies to transformers decoder exports, so we let the
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
-    if args.model and not args.config and not args.text_only:
+    if args.model and not args.config and not args.text_only and not is_personaplex:
         pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
+            if input_sampling_rate is not None or bwe_sampling_rate is not None:
+                raise SystemExit(
+                    "Error: --input-sample-rate and --bwe-sample-rate are only "
+                    "supported for RE-USE speech-enhancement checkpoints."
+                )
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
             )
@@ -351,10 +388,63 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     # Build from HuggingFace model ID or local config
     if args.config:
+        config_path = args.config
+        from mobius.integrations._moshi import _is_personaplex_checkpoint
+
+        if _is_personaplex_checkpoint(config_path):
+            if static_cache_params is not None:
+                raise SystemExit(
+                    "Error: PersonaPlex does not support --features static-cache."
+                )
+            pkg = build(
+                config_path,
+                task=task,
+                dtype=dtype_override,
+                load_weights=load_weights,
+                revision=None,
+                trust_remote_code=trust_remote_code,
+                execution_provider=execution_provider,
+                text_only=args.text_only,
+                fp8_kv_cache=fp8_kv_cache,
+                kv_cache_scales=kv_cache_scales,
+                prune_prefill_prefix=prune_prefill_prefix,
+                glm_full_attention=args.glm_full_attention,
+                export_paged_attention=export_paged_attention,
+                keep_quantized=keep_quantized,
+                input_sampling_rate=input_sampling_rate,
+                bwe_sampling_rate=bwe_sampling_rate,
+            )
+            _save_package(pkg, output_dir, args, optimize, component_filter)
+            return
+
+        from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
+
+        if _is_reuse_checkpoint(config_path):
+            if task not in (None, "speech-enhancement"):
+                from mobius.tasks import SpeechEnhancementTask
+
+                if not isinstance(task, SpeechEnhancementTask):
+                    raise SystemExit(
+                        "Error: RE-USE checkpoints only support --task speech-enhancement."
+                    )
+            pkg = _build_reuse(
+                config_path,
+                dtype=dtype_override,
+                execution_provider=execution_provider,
+                load_weights=load_weights,
+                input_sampling_rate=input_sampling_rate,
+                bwe_sampling_rate=bwe_sampling_rate,
+            )
+            _save_package(pkg, output_dir, args, optimize, component_filter)
+            return
         import onnx_ir as ir
         import transformers
 
-        config_path = args.config
+        if input_sampling_rate is not None or bwe_sampling_rate is not None:
+            raise SystemExit(
+                "Error: --input-sample-rate and --bwe-sample-rate are only "
+                "supported for RE-USE speech-enhancement checkpoints."
+            )
         try:
             hf_config = transformers.AutoConfig.from_pretrained(
                 config_path, trust_remote_code=trust_remote_code
@@ -374,6 +464,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         parent_config = hf_config
         from mobius.integrations.transformers._builder import (
             _is_qwen4_exp_composite,
+            _reject_unsupported_affine_qwen4,
         )
 
         if _is_qwen4_exp_composite(parent_config):
@@ -431,6 +522,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         elif task is None:
             task = _default_task_for_model(model_type)
         from mobius.tasks import get_task
+        from mobius._component_quantization import attach_hf_component_sources
 
         resolved_task = get_task(task)
         component_manifest = resolved_task.component_manifest(
@@ -439,6 +531,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
             hf_config=parent_config,
         )
         model_module = module_class(config)
+        attach_hf_component_sources(
+            model_module,
+            model_type=model_type,
+            hf_config=parent_config,
+        )
         pkg = build_from_module(
             model_module,
             config,
@@ -456,6 +553,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 validate_quantized_component_bindings,
             )
 
+            _reject_unsupported_affine_qwen4(model_type, config)
             if compressed_tensors_config is not None:
                 # Packed FP4 weights cannot pass through ordinary apply_weights.
                 # The same loader owns both faithful native storage and the
@@ -504,6 +602,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
     else:
         model_id_or_path = args.model
         if static_cache_params is not None:
+            if is_personaplex:
+                raise SystemExit(
+                    "Error: PersonaPlex does not support --features static-cache."
+                )
             # Detect model type to resolve the correct static cache task.
             import transformers
 
@@ -529,9 +631,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
             keep_quantized=keep_quantized,
+            input_sampling_rate=input_sampling_rate,
+            bwe_sampling_rate=bwe_sampling_rate,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
+
+
+def _runtime_source_revision(pkg, explicit_revision: str | None) -> str | None:
+    """Recover the effective build revision for runtime asset downloads."""
+    if explicit_revision is not None:
+        return explicit_revision
+    revisions = {
+        revision
+        for model in pkg.values()
+        if (revision := getattr(model, "metadata_props", {}).get("mobius.source_revision"))
+        not in {None, "unpinned"}
+    }
+    return next(iter(revisions)) if len(revisions) == 1 else None
 
 
 def _save_package(
@@ -539,15 +656,6 @@ def _save_package(
 ) -> None:
     """Save a ModelPackage to disk, applying optimizations and runtime configs."""
     runtime = getattr(args, "runtime", None)
-    if runtime == "ort-genai":
-        from mobius.integrations.ort_genai.auto_export import (
-            _validate_ort_genai_compatibility,
-        )
-
-        try:
-            _validate_ort_genai_compatibility(pkg)
-        except ValueError as error:
-            raise SystemExit(f"Error: {error}") from error
 
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
@@ -594,6 +702,10 @@ def _save_package(
         # When --config (local dir) is used instead of --model, copy tokenizer
         # files from the local directory rather than downloading from HF.
         local_config_dir = getattr(args, "config", None)
+        runtime_revision = _runtime_source_revision(
+            pkg,
+            getattr(args, "revision", None),
+        )
         artifacts = write_ort_genai_config(
             pkg,
             output_dir,
@@ -601,7 +713,7 @@ def _save_package(
             ep=ep,
             local_config_dir=local_config_dir,
             trust_remote_code=getattr(args, "trust_remote_code", False),
-            revision=getattr(args, "revision", None),
+            revision=runtime_revision,
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
@@ -609,12 +721,14 @@ def _save_package(
         from mobius.integrations.onnx_genai import write_onnx_genai_config
         from mobius.integrations.onnx_genai.inference_metadata import (
             is_native_vlm_package,
+        )
+        from mobius.integrations.onnx_genai.workflow_metadata import (
             write_native_vlm_package_metadata,
         )
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
-        revision = getattr(args, "revision", None)
+        revision = _runtime_source_revision(pkg, getattr(args, "revision", None))
         if is_native_vlm_package(pkg):
             try:
                 artifacts = write_native_vlm_package_metadata(
@@ -700,12 +814,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
     reuse_gguf_weights = args.reuse_gguf_weights
-    if reuse_gguf_weights and args.runtime == "ort-genai":
-        raise SystemExit(
-            "Error: --reuse-gguf-weights cannot be combined with --runtime ort-genai "
-            "because genai_config.json cannot require disabled ORT constant folding. "
-            "Use direct ONNX Runtime with ORT_DISABLE_ALL."
-        )
 
     if keep_quantized:
         print(
@@ -721,7 +829,10 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     gguf_reference = gguf_path
     output_dir = args.output_dir
     target_config = getattr(args, "target_config", None)
+    target_gguf = getattr(args, "target_gguf", None)
     runtime = getattr(args, "runtime", None)
+    draft_pair = target_gguf is not None
+    requested_pair_runtime = runtime if draft_pair else None
 
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -731,10 +842,12 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-workers must be a positive integer.")
     if mmproj_path is not None and args.static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
-    if target_config is not None and runtime is not None:
+    if draft_pair and target_config is None:
+        raise SystemExit("Error: --target-gguf requires --target-config.")
+    if draft_pair and (mmproj_path is not None or args.static_cache or reuse_gguf_weights):
         raise SystemExit(
-            "Error: dflash/eagle3 target-coupled drafts do not support standalone "
-            "runtime packaging; omit --runtime to save the auxiliary graph and manifest."
+            "Error: --target-gguf cannot be combined with --mmproj, --static-cache, "
+            "or --reuse-gguf-weights."
         )
     tokenizer_repository = getattr(args, "tokenizer_repository", None)
     tokenizer_revision = getattr(args, "tokenizer_revision", None)
@@ -742,74 +855,99 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit(
             "Error: --tokenizer-repository and --tokenizer-revision must be provided together."
         )
-    if runtime is None and tokenizer_repository is not None:
+    if (runtime is None or draft_pair) and tokenizer_repository is not None:
         raise SystemExit(
             "Error: pinned tokenizer materialization is only available with --runtime."
         )
 
-    if runtime is not None:
-        from mobius.integrations.gguf._arch_registry import get_arch_spec
+    if runtime is not None and not draft_pair:
         from mobius.integrations.gguf._builder import (
             _resolve_gguf_path,
             _validate_gguf_model,
         )
         from mobius.integrations.gguf._shard_set import open_gguf_model
-        from mobius.integrations.gguf._spec import Support
 
-        # Resolve and validate the exact selected source before graph construction
-        # so a deferred tokenizer cannot leave a graph-only directory behind.
+        # Resolve and validate the exact selected source before graph construction.
+        # Authoritative tokenizer blockers may later produce a clearly reported
+        # partial package; all model and source checks still fail closed here.
         resolved_gguf_path = _resolve_gguf_path(gguf_path)
         gguf_model = open_gguf_model(resolved_gguf_path)
         _validate_gguf_model(gguf_model, source=str(resolved_gguf_path))
-        architecture_spec = get_arch_spec(gguf_model.architecture)
-        if architecture_spec.runtime is not Support.SUPPORTED:
-            raise SystemExit(
-                f"Error: GGUF runtime packaging for {architecture_spec.gguf_arch!r} is "
-                f"{architecture_spec.runtime.value}: {architecture_spec.reason}"
-            )
-        if tokenizer_repository is None or tokenizer_revision is None:
-            raise SystemExit(
-                "Error: GGUF runtime packaging requires --tokenizer-repository and an "
-                "immutable --tokenizer-revision."
-            )
-        if tokenizer_repository.count("/") != 1 or not all(tokenizer_repository.split("/")):
+        if tokenizer_repository is not None and (
+            tokenizer_repository.count("/") != 1 or not all(tokenizer_repository.split("/"))
+        ):
             raise SystemExit(
                 "Error: --tokenizer-repository must be an owner/repository Hub ID."
             )
-        if re.fullmatch(r"[0-9a-f]{40}", tokenizer_revision) is None:
+        if (
+            tokenizer_revision is not None
+            and re.fullmatch(r"[0-9a-f]{40}", tokenizer_revision) is None
+        ):
             raise SystemExit(
                 "Error: --tokenizer-revision must be an immutable 40-hex commit SHA."
             )
 
-    pkg = build_from_gguf(
-        gguf_reference,
-        mmproj=mmproj_path,
-        image_token_id=args.image_token_id,
-        dtype=args.dtype,
-        keep_quantized=keep_quantized,
-        execution_provider=args.execution_provider,
-        static_cache=args.static_cache,
-        max_seq_len=args.max_seq_len,
-        reuse_gguf_weights=reuse_gguf_weights,
-        target_config=target_config,
-        _gguf_model=gguf_model if runtime is not None else None,
-    )
+    if draft_pair:
+        from mobius.integrations.gguf import build_draft_pair_from_gguf
+
+        pkg = build_draft_pair_from_gguf(
+            target_gguf,
+            gguf_reference,
+            target_config=target_config,
+            dtype=args.dtype,
+            keep_quantized=keep_quantized,
+            execution_provider=args.execution_provider,
+        )
+        if runtime is not None:
+            print(
+                f"Warning: --runtime {runtime} does not claim downstream draft execution; "
+                "saving the direct-ORT package with runtime=runtime_unvalidated."
+            )
+            runtime = None
+    else:
+        pkg = build_from_gguf(
+            gguf_reference,
+            mmproj=mmproj_path,
+            image_token_id=args.image_token_id,
+            dtype=args.dtype,
+            keep_quantized=keep_quantized,
+            execution_provider=args.execution_provider,
+            static_cache=args.static_cache,
+            max_seq_len=args.max_seq_len,
+            reuse_gguf_weights=reuse_gguf_weights,
+            target_config=target_config,
+            _gguf_model=gguf_model if runtime is not None else None,
+        )
 
     if args.release:
         for model in pkg.values():
             strip_debug_metadata(model)
 
     if runtime is None:
-        os.makedirs(output_dir, exist_ok=True)
-        pkg.save(
-            output_dir,
-            external_data=args.external_data,
-            max_shard_size_bytes=(
+        save_kwargs = {
+            "external_data": args.external_data,
+            "max_shard_size_bytes": (
                 _parse_size(args.max_shard_size) if args.max_shard_size else None
             ),
-            max_workers=args.max_workers,
-        )
+            "max_workers": args.max_workers,
+        }
+        if draft_pair:
+            from mobius.integrations.gguf import write_draft_pair_package
+
+            artifacts = write_draft_pair_package(
+                pkg,
+                output_dir,
+                requested_runtime=requested_pair_runtime,
+                runtime_version=getattr(args, "runtime_version", None),
+                **save_kwargs,
+            )
+        else:
+            if getattr(pkg, "export_report", None) is None:
+                os.makedirs(output_dir, exist_ok=True)
+            pkg.save(output_dir, **save_kwargs)
+            artifacts = {}
         _print_saved_gguf_models(pkg, output_dir)
+        _print_gguf_export_status(pkg, output_dir, runtime=runtime)
 
         # ModelPackage.save() persisted the MTP sidecar into its manifest-selected
         # collision-safe directory.
@@ -822,11 +960,16 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             print(f"Saved mtp head to {os.path.join(output_dir, mtp_dir, 'model.onnx')}")
 
         draft_manifest = getattr(pkg, "draft_manifest", None)
-        if draft_manifest is not None:
-            from mobius.integrations.gguf._draft import write_draft_manifest
+        if draft_manifest is not None and not draft_pair:
+            if getattr(pkg, "export_report", None) is None:
+                from mobius.integrations.gguf._draft import write_draft_manifest
 
-            manifest_path = write_draft_manifest(draft_manifest, output_dir)
+                manifest_path = write_draft_manifest(draft_manifest, output_dir)
+            else:
+                manifest_path = os.path.join(output_dir, "draft_manifest.json")
             print(f"Saved draft pairing manifest to {manifest_path}")
+        elif draft_pair:
+            print(f"Saved draft pairing manifest to {artifacts['manifest']}")
 
     if runtime in ("onnx-genai", "ort-genai"):
         from mobius.integrations.gguf import write_gguf_runtime_package
@@ -846,11 +989,20 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             ),
             max_workers=args.max_workers,
         )
-        # The writer returns only after atomically publishing the complete graph,
-        # tokenizer, and runtime configuration directory.
+        # The writer atomically publishes either the validated runtime package or
+        # an accurate model package with an explicit unvalidated disposition.
         _print_saved_gguf_models(pkg, output_dir)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
+        from mobius._export_report import ComponentExportReport
+
+        if isinstance(getattr(pkg, "export_report", None), ComponentExportReport):
+            _print_gguf_export_status(pkg, output_dir, runtime=runtime)
+        else:
+            print(
+                f"Export status: COMPLETE - {runtime} package is end-to-end runnable "
+                "under its pinned evidence contract."
+            )
 
 
 def _print_saved_gguf_models(pkg: Any, output_dir: str) -> None:
@@ -863,6 +1015,59 @@ def _print_saved_gguf_models(pkg: Any, output_dir: str) -> None:
             else os.path.join(output_dir, "model.onnx")
         )
         print(f"Saved {name} to {path}")
+
+
+def _print_gguf_export_status(
+    pkg: Any,
+    output_dir: str,
+    *,
+    runtime: str | None,
+) -> None:
+    """Distinguish a durable partial package from a complete runtime package."""
+    from mobius._export_report import ComponentExportReport
+
+    report = getattr(pkg, "export_report", None)
+    if not isinstance(report, ComponentExportReport):
+        print(
+            "Export status: MODEL ONLY - ONNX model files were saved; "
+            "runtime/tokenizer packaging was not requested."
+        )
+        return
+    omitted = ", ".join(
+        component.name for component in report.components if component.output == "omitted"
+    )
+    if report.export_status == "partial":
+        if omitted:
+            print(
+                "Export status: PARTIAL - proven model files were saved, but one or more "
+                "components were omitted."
+            )
+        else:
+            print(
+                "Export status: PARTIAL - all requested components were exported, but "
+                "one or more support dispositions remain deferred or blocked."
+            )
+    else:
+        print("Export status: COMPLETE - the accurate model package was saved.")
+    if report.runtime_validation_status == "unvalidated":
+        print(
+            "Runtime validation: UNVALIDATED - export success is not a runtime "
+            "support or end-to-end execution claim."
+        )
+    elif report.runtime_validation_status == "validated":
+        print("Runtime validation: VALIDATED - the package is end-to-end runnable.")
+    runtime_component = report.component("runtime")
+    if (
+        runtime is not None
+        and runtime_component is not None
+        and runtime_component.output == "omitted"
+    ):
+        print(f"  requested runtime: {runtime} (omitted)")
+    elif runtime is not None and report.runtime_validation_status == "unvalidated":
+        print(f"  requested runtime: {runtime} (unvalidated)")
+    if omitted:
+        print(f"  omitted components: {omitted}")
+    print(f"  export report: {os.path.join(output_dir, 'export_report.json')}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
@@ -1318,6 +1523,29 @@ def build_parser() -> argparse.ArgumentParser:
             "for unguided generation."
         ),
     )
+    sample_rate_group = build_parser.add_mutually_exclusive_group()
+    sample_rate_group.add_argument(
+        "--input-sample-rate",
+        dest="input_sampling_rate",
+        type=int,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Build RE-USE for a known native input rate with static FFT geometry. "
+            "Omit to preserve native-rate dynamic geometry."
+        ),
+    )
+    sample_rate_group.add_argument(
+        "--bwe-sample-rate",
+        dest="bwe_sampling_rate",
+        type=int,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Build RE-USE with NVIDIA BWE semantics: resample input audio to this "
+            "target rate and use consistently scaled FFT geometry."
+        ),
+    )
     build_parser.add_argument(
         "--kv-cache-scale-file",
         dest="kv_cache_scale_file",
@@ -1400,13 +1628,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     gguf_parser.add_argument(
+        "--target-gguf",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Exact target GGUF for a dflash/eagle3 pair. Emits target and draft "
+            "graphs, independent cache namespaces, required embedding/head bridges, "
+            "and a runtime_unvalidated direct-ORT manifest."
+        ),
+    )
+    gguf_parser.add_argument(
         "--runtime",
         choices=["ort-genai", "onnx-genai"],
         default=None,
         help=(
-            "Generate runtime-specific config files after building. "
-            "Both routes require an exact tokenizer.huggingface.json embedded in "
-            "the GGUF; opaque tokenizer.ggml.pre metadata is not reconstructed. "
+            "Request runtime-specific packaging after building. Exact evidence emits "
+            "a validated runtime config and tokenizer; downstream runtime/version/"
+            "registry/executor limitations preserve the model with an unvalidated "
+            "export report instead of blocking it. "
             "'onnx-genai' writes inference_metadata.yaml and 'ort-genai' writes "
             "genai_config.json."
         ),
@@ -1415,8 +1654,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--runtime-version",
         default=None,
         help=(
-            "Exact selected runtime version. Required once an architecture has a "
-            "runtime-supported evidence record; it must equal the version validated there."
+            "Selected runtime version. An exact evidence match marks the package "
+            "validated; other versions are exported with runtime status unvalidated."
         ),
     )
     gguf_parser.add_argument(
@@ -1425,7 +1664,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="OWNER/REPO",
         help=(
             "Exact Hugging Face repository containing tokenizer assets for runtime "
-            "packaging. Requires --tokenizer-revision and must match runtime evidence."
+            "packaging. Requires --tokenizer-revision. Missing or unmatched evidence "
+            "preserves a model-only runtime-unvalidated package."
         ),
     )
     gguf_parser.add_argument(

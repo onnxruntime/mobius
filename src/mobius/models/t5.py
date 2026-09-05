@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import ClassVar
 
@@ -13,15 +14,22 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import preprocess_quantized_weights
-from mobius._weight_utils import tie_word_embeddings as tie_weight_tensors
+from mobius._weight_utils import (
+    is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
+    preprocess_quantized_weights,
+)
 from mobius.components._activations import ACT2FN
 from mobius.components._common import Embedding, Linear
 from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._rms_norm import RMSNorm
-from mobius.models.base import embedding_for_config, linear_class_for_config
+from mobius.models.base import (
+    effective_tie_word_embeddings,
+    embedding_for_config,
+    linear_class_for_config,
+)
 
 # ---------------------------------------------------------------------------
 # T5 Relative Position Bias
@@ -533,41 +541,87 @@ class T5ForConditionalGeneration(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
-        self.encoder = T5Encoder(config)
-        self.decoder = T5Decoder(config)
+        encoder_config = config
+        decoder_config = config
+        if config.component_quantization is not None:
+            encoder_config = dataclasses.replace(
+                config,
+                quantization=config.quantization_for_source_paths(
+                    "encoder",
+                    self.HF_COMPONENT_SOURCES["encoder"],
+                ),
+                component_quantization=None,
+            )
+            decoder_config = dataclasses.replace(
+                config,
+                quantization=config.quantization_for_source_paths(
+                    "decoder",
+                    self.HF_COMPONENT_SOURCES["decoder"],
+                ),
+                component_quantization=None,
+            )
+        self.encoder = T5Encoder(encoder_config)
+        self.decoder = T5Decoder(decoder_config)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        if self.config.component_quantization is not None and any(
+            name.startswith("shared.") and is_packed_quant_key(name) for name in state_dict
+        ):
+            layouts = []
+            for component in ("encoder", "decoder"):
+                quantization = self.config.quantization_for(component)
+                layouts.append(
+                    (
+                        quantization.bits,
+                        quantization.group_size,
+                        quantization.sym,
+                    )
+                    if quantization is not None
+                    and quantization.quant_method != "none"
+                    and quantization.quantize_embeddings
+                    else None
+                )
+            if layouts[0] != layouts[1]:
+                raise ValueError(
+                    "T5 shared packed embeddings require encoder and decoder "
+                    "components to use the same embedding quantization layout."
+                )
+
         new_state_dict = {}
         for name, tensor in state_dict.items():
             new_name = _rename_t5_weight(name, is_gated_act=self.config.is_gated_act)
             if new_name is not None:
                 new_state_dict[new_name] = tensor
-        # Shared embeddings: encoder and decoder use the same embedding
-        if "encoder.embed_tokens.weight" not in new_state_dict:
-            shared = new_state_dict.get("shared.weight")
-            if shared is not None:
-                new_state_dict["encoder.embed_tokens.weight"] = shared
-                new_state_dict["decoder.embed_tokens.weight"] = shared
+        # Shared embedding float weights and packed sidecars belong to both
+        # component graphs. Keep each logical sidecar intact for the generic
+        # component-specific normalizer.
+        for name, tensor in list(new_state_dict.items()):
+            if not name.startswith("shared."):
+                continue
+            suffix = name[len("shared.") :]
+            new_state_dict.setdefault(f"encoder.embed_tokens.{suffix}", tensor)
+            new_state_dict.setdefault(f"decoder.embed_tokens.{suffix}", tensor)
+            del new_state_dict[name]
+        if effective_tie_word_embeddings(self.config):
+            decoder_quantization = self.config.quantization_for("decoder")
+            materialize_split_tied_olive_lm_head(
+                new_state_dict,
+                embed_key="decoder.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                embedding_quantization=decoder_quantization,
+                head_quantization=decoder_quantization,
+            )
         # Tied lm_head
         if "decoder.lm_head.weight" not in new_state_dict:
             embed = new_state_dict.get("encoder.embed_tokens.weight")
             if embed is not None:
                 new_state_dict["decoder.lm_head.weight"] = embed
         if self.config.component_quantization is not None:
-            tie_weight_tensors(
-                new_state_dict,
-                embed_key="encoder.embed_tokens.weight",
-                head_key="decoder.lm_head.weight",
-            )
-            if (
-                "encoder.embed_tokens.weight" in new_state_dict
-                and "decoder.embed_tokens.weight" not in new_state_dict
-            ):
-                new_state_dict["decoder.embed_tokens.weight"] = new_state_dict[
-                    "encoder.embed_tokens.weight"
-                ]
+            # The Transformers builder preprocesses each package component
+            # after this architecture-specific rename, using that component's
+            # own packing layout.
             return new_state_dict
         return preprocess_quantized_weights(
             new_state_dict,
@@ -660,8 +714,12 @@ def _rename_t5_weight(name: str, *, is_gated_act: bool = False) -> str | None:
     # Keep shared embedding as-is for now (handled by preprocess_weights)
     if name == "shared.weight":
         return "shared.weight"
+    if name.startswith("shared.") and is_packed_quant_key(name):
+        return name
     if name == "lm_head.weight":
         return "decoder.lm_head.weight"
+    if name.startswith("lm_head.") and is_packed_quant_key(name):
+        return f"decoder.{name}"
 
     # encoder.block.{i}.layer.X.{...} or decoder.block.{i}.layer.X.{...}
     for prefix in ("encoder.", "decoder."):

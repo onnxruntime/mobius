@@ -334,9 +334,10 @@ _DIFFUSION_RUNTIME_VALIDATION_PENDING = (
 _DRAFT_RUNTIME_VALIDATION_PENDING = (
     "This is a target-coupled speculative draft, never a standalone CausalLM. "
     "Config extraction, exact tensor closure, target shape/tokenizer validation, and "
-    "synthetic draft execution are covered, but no pinned real GGUF pair has passed "
-    "independent target+draft full-logit/proposed-token parity. Runtime packaging remains "
-    "deferred until that evidence and an acceptance-loop integration exist."
+    "synthetic draft execution are covered. Exact real target/draft pairs pass the direct "
+    "ONNX Runtime acceptance loop with independent source/raw-GGUF evidence, cache rollback, "
+    "multi-token acceptance, and target-only greedy equality. Use build_draft_pair_from_gguf; "
+    "higher-level generation runtimes remain runtime_unvalidated and do not gate export."
 )
 
 _POCKETTTS_BUNDLE_REASON = (
@@ -505,11 +506,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "Q/K permutation, optional long/short RoPE tensors, and a conditional dense-or-MoE "
         "loader. The existing MiniCPM graph does not prove this complete GGUF contract."
     ),
-    "minimax-m2": (
-        "MiniMax-M2 uses full-vector Q/K norms, partial RoPE, and all-layer "
-        "correction-biased routed experts under metadata-selected gating. Mobius has no "
-        "exact graph or suffix-safe expert import for that topology."
-    ),
     "minimax-m3": (
         "MiniMax-M3 adds F32 sparse-indexer tensors and a second index-key cache with "
         "position/cell maps, block masks, rollback, and reorder semantics alongside main "
@@ -584,11 +580,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "KV cache, and three chained heads selected by offsets. Mobius permits one head "
         "and cannot preserve that state or FP8 converter transform."
     ),
-    "mistral4": (
-        "Mistral4 has no NextN metadata or MTP graph; it inherits Mistral3's conditional "
-        "dense/MoE tensor loader and overrides graph construction. It is not llama, "
-        "mistral alias text, or any DeepSeek/Qwen MTP family."
-    ),
     "step35": (
         "Step3.5 executes one or more interleaved-SWA NextN heads with optional gates, "
         "routed/shared experts, centered-norm transforms, per-layer head geometry, and "
@@ -659,7 +650,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     GGUFArchitectureSpec(
         gguf_arch="qwen3",
         model_type="qwen3",
-        tensor_map_recipe=("llama",),
+        tensor_map_recipe=("llama", "moe_qk_norm_extras"),
+        config_postprocessor="qwen3",
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
     ),
@@ -1042,11 +1034,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="gpt2",
         tensor_map_recipe=("gpt2",),
         tensor_processor="gpt2",
-        runtime=Support.DEFERRED,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("gpt2-q2-k-ort-genai-0.15.2",),
         quantized_import=Support.REJECTED,
         reason=(
-            _RUNTIME_VALIDATION_PENDING
-            + " Quantization preservation is rejected because canonical GPT-2 GGUF "
+            "Runtime support is restricted to the exact evidenced GPT-2 Q2_K artifact, "
+            "explicit-float CPU import route, pinned tokenizer, and ORT GenAI 0.15.2. "
+            "Quantization preservation is rejected because canonical GPT-2 GGUF "
             "projections must be transposed into graph order, and the current packed "
             "route cannot transpose values together with their scales and zero-points. "
             "Use keep_quantized=False for explicit float import."
@@ -1332,6 +1326,43 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
     ),
     GGUFArchitectureSpec(
+        gguf_arch="minimax-m2",
+        model_type="minimax_m2_gguf",
+        module_type="minimax_m2_gguf",
+        config_key_map="minimax_m2",
+        config_postprocessor="minimax_m2",
+        tensor_map_recipe=("minimax_m2",),
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_gating_func",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact explicit-float import owns MiniMax-M2's non-square Q/O geometry, "
+            "full-vector Q/K RMSNorm, partial NeoX RoPE, standard dynamic/static KV cache, "
+            "and F32 selection-biased sigmoid MoE routing. Loader-accepted Q/K/V biases "
+            "and fused QKV are rejected because the pinned graph ignores or cannot execute "
+            "them. Packed projection/expert import and real-artifact runtime validation remain "
+            "deferred; "
+            "the smallest immutable public GGUF is 46,514,882,176 bytes, above the "
+            "16 GiB evidence budget. Use keep_quantized=False."
+        ),
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="plamo",
         model_type="plamo",
         module_type="gguf_plamo",
@@ -1383,7 +1414,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "Mamba1/attention layers and mixed state ABI. ORT GenAI 0.15.2 discovers "
             "sparse KV and conv/recurrent slots, but its recurrent-state naming, beam "
             "reorder, and nonzero-rewind contracts do not yet match this export. Runtime "
-            "packaging remains deferred to onnxruntime/mobius#605."
+            "validation remains deferred to onnxruntime/mobius#605; export remains available "
+            "with the exact graph state contract."
         ),
     ),
     GGUFArchitectureSpec(
@@ -1413,9 +1445,10 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=(
             "The dedicated graph and GGUF importer preserve parallel Attention+Mamba2 "
-            "layers and their four-state ABI, but runtime packaging remains deferred "
-            "pending heterogeneous-state schema support (onnxruntime/mobius#605) and "
-            "real full-logit plus deterministic stateful-generation evidence."
+            "layers and their four-state ABI. Export records that exact state contract; "
+            "runtime validation remains pending heterogeneous-state executor support "
+            "(onnxruntime/mobius#605) and real full-logit plus deterministic "
+            "stateful-generation evidence."
         ),
     ),
     # --------------------------------------------------------- Encoder-only
@@ -1610,8 +1643,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="starcoder2",
         model_type="starcoder2",
         tensor_map_recipe=("llama",),
-        runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        config_postprocessor="starcoder2",
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("tiny-starcoder2-q2-k-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to the exact evidenced tiny StarCoder2 Q2_K "
+            "artifact, explicit-float CPU import route, pinned tokenizer, and ORT GenAI 0.15.2."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="stablelm",
@@ -1638,8 +1676,12 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         required_metadata=("attention.layer_norm_epsilon",),
         tensor_processor="llama",
         llama_qk_permute=True,
-        runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("tiny-olmo-q2-k-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to the exact evidenced tiny OLMo Q2_K artifact, "
+            "explicit-float CPU import route, pinned tokenizer, and ORT GenAI 0.15.2."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="olmo2",
@@ -1851,19 +1893,70 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="grok",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="grok_gguf",
+        module_type="grok_gguf",
+        tensor_map_recipe=("grok",),
+        config_postprocessor="grok",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+        ),
+        tensor_processor="llama",
+        quantized_import=Support.REJECTED,
         runtime=Support.DEFERRED,
-        reason=_GROK_GGUF_GRAPH_REASON,
+        reason=_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="grovemoe",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="grovemoe_gguf",
+        module_type="grovemoe_gguf",
+        tensor_map_recipe=("grovemoe",),
+        config_postprocessor="grovemoe",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_group_scale",
+            "experts_per_group",
+        ),
+        tensor_processor="llama",
+        quantized_import=Support.REJECTED,
         runtime=Support.DEFERRED,
-        reason=_GROVEMOE_GGUF_GRAPH_REASON,
+        reason=_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="hunyuan-moe",
+        model_type="hunyuan_moe_gguf",
+        module_type="hunyuan_moe_gguf",
+        tensor_map_recipe=("hunyuan_moe",),
+        config_postprocessor="hunyuan_moe_gguf",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+        ),
+        tensor_processor="llama",
+        quantized_import=Support.REJECTED,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="smallthinker",
@@ -2068,6 +2161,48 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=_DEEPSEEK4_GGUF_GRAPH_REASON,
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="mistral4",
+        model_type="mistral4_gguf",
+        module_type="mistral4_gguf",
+        config_key_map="mistral4",
+        config_postprocessor="mistral4",
+        tensor_map_recipe=("mistral4",),
+        tensor_processor="mistral4",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.key_length_mla",
+            "attention.value_length_mla",
+            "attention.q_lora_rank",
+            "attention.kv_lora_rank",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+        ),
+        rope_interleave=True,
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact explicit-float import owns Mistral4's DeepSeek-V2 MLA projections, "
+            "dense-prefix plus mandatory shared/routed MoE blocks, YaRN scaling, and one "
+            "graph-visible latent-plus-RoPE K cache per layer. Legacy non-MLA, Q-LoRA-free, "
+            "temperature-scaled, and NextN layouts fail closed. Packed import and runtime "
+            "packaging remain deferred; the smallest immutable public GGUF is "
+            "32,306,941,632 bytes, above the 16 GiB evidence budget. "
+            "Use keep_quantized=False."
+        ),
+    ),
     # GLM-5.2 GGUFs (e.g. unsloth/GLM-5.2-GGUF) tag the architecture 'glm-dsa'
     # (MLA + DeepSeek Sparse Attention + MoE) and mobius's registry key is
     # 'glm_moe_dsa'. The format bridge is keyed on the authoritative
@@ -2079,12 +2214,43 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="glm_moe_dsa",
         aliases=frozenset({"glm_dsa"}),
         config_key_map="glm_dsa",
-        tensor_map=Support.DEFERRED,
+        config_postprocessor="glm_dsa",
+        tensor_map_recipe=("glm_dsa",),
+        tensor_processor="glm_dsa",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.key_length_mla",
+            "attention.value_length_mla",
+            "attention.q_lora_rank",
+            "attention.kv_lora_rank",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+            "attention.indexer.head_count",
+            "attention.indexer.key_length",
+            "attention.indexer.top_k",
+        ),
+        rope_interleave=True,
+        quantized_import=Support.REJECTED,
         reason=(
-            "Config extraction and the glm_moe_dsa graph are both available, but "
-            "no GGUF→HuggingFace tensor-name mapping has been written for GLM-5.2's "
-            "MLA + DSA-indexer tensor families yet, so weights cannot be routed "
-            "into the graph. " + _NO_TENSOR_MAP
+            "Exact explicit-float MLA, DSA indexer, dense-prefix/routed-MoE tensor routing, "
+            "and packed dynamic-cache graph construction are covered. Packed import remains "
+            "rejected because GLM-5.2's rank-3 K/V-B transforms and correction-biased routed "
+            "experts do not have an independently proven storage-preserving runtime path. "
+            "The released GGUF also carries a routed DSA/MLA MTP block outside the current "
+            "sidecar ABI, and representative real-weight runtime evidence exceeds the 16 GiB "
+            "artifact budget. Use keep_quantized=False."
         ),
     ),
     GGUFArchitectureSpec(
@@ -2092,15 +2258,14 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="apertus",
         tensor_map_recipe=("llama", "apertus_extras"),
         config_postprocessor="apertus",
-        required_metadata=(
-            "attention.layer_norm_rms_epsilon",
-            "xielu.alpha_n",
-            "xielu.alpha_p",
-            "xielu.beta",
-            "xielu.eps",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to the pinned Apertus-v1.1-1.5B-Instruct "
+            "BF16 artifact's exact-float CPU route, official tokenizer revision, full-logit "
+            "stateful evidence, and ORT GenAI 0.15.2."
         ),
-        runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="minicpm",
@@ -2174,11 +2339,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("legacy_layernorm",),
         config_postprocessor="exact_legacy_gguf",
         required_metadata=("attention.layer_norm_epsilon", "attention.max_alibi_bias"),
-        runtime=Support.DEFERRED,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("tiny-mpt-q2-k-ort-genai-0.15.2",),
         quantized_import=Support.REJECTED,
         reason=(
-            _RUNTIME_VALIDATION_PENDING
-            + " The admitted subset rejects learned positions, Q/K norms, KQV clipping, "
+            "Runtime support is restricted to the exact evidenced tiny MPT Q2_K artifact, "
+            "explicit-float portable graph, pinned tokenizer, and ORT GenAI 0.15.2. "
+            "The admitted subset rejects learned positions, Q/K norms, KQV clipping, "
             "AWQ activation scales, and inconsistent optional bias families. Quantization "
             "preservation is rejected because fused QKV must be split."
         ),
@@ -2190,11 +2357,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("legacy_layernorm",),
         config_postprocessor="exact_legacy_gguf",
         required_metadata=("attention.layer_norm_epsilon", "use_parallel_residual"),
-        runtime=Support.DEFERRED,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("pythia-70m-q2-k-ort-genai-0.15.2",),
         quantized_import=Support.REJECTED,
         reason=(
-            _RUNTIME_VALIDATION_PENDING
-            + " The admitted subset requires parallel residual MHA. Quantization "
+            "Runtime support is restricted to the exact evidenced Pythia-70M Q2_K artifact, "
+            "explicit-float portable graph, pinned tokenizer, and ORT GenAI 0.15.2. "
+            "The admitted subset requires parallel residual MHA. Quantization "
             "preservation is rejected because fused QKV rows must be split."
         ),
     ),
@@ -2336,11 +2505,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("starcoder",),
         config_postprocessor="conventional_legacy",
         required_metadata=("attention.layer_norm_epsilon",),
-        runtime=Support.DEFERRED,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("tiny-starcoder-q2-k-ort-genai-0.15.2",),
         quantized_import=Support.REJECTED,
         reason=(
-            _RUNTIME_VALIDATION_PENDING
-            + " Quantization preservation is rejected because StarCoder stores one fused "
+            "Runtime support is restricted to the exact evidenced tiny StarCoder Q2_K "
+            "artifact, explicit-float CPU import route, pinned tokenizer, and ORT GenAI "
+            "0.15.2. Quantization preservation is rejected because StarCoder stores one fused "
             "biased MQA projection that must be split for the graph."
         ),
     ),
@@ -2515,6 +2686,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "command-r",
             "ernie4_5",
             "gptneox",
+            "hunyuan-moe",
             "hy_v3",
             "jais",
             "gemma-embedding",

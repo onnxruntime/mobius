@@ -16,6 +16,10 @@ import json
 from pathlib import Path
 from typing import cast
 
+from mobius.integrations.gguf._mtp_runtime_evidence import (
+    GGUFMtpArtifact,
+    iter_mtp_runtime_evidence,
+)
 from mobius.integrations.gguf._quant_registry import iter_quant_specs, quant_import_decision
 from mobius.integrations.gguf._runtime_blocker_evidence import (
     iter_runtime_blocker_evidence,
@@ -108,7 +112,7 @@ _TRANSFORM_EVIDENCE: dict[str, tuple[str, ...]] = {
     ),
     "qkv-split-and-row-permutation": (
         _test_ref(
-            "src/mobius/integrations/gguf/_builder_test.py",
+            "src/mobius/integrations/gguf/_builder_core_test.py",
             "test_phimoe_fused_qkv_is_split_without_loss",
         ),
         _test_ref(
@@ -132,17 +136,17 @@ _TRANSFORM_EVIDENCE: dict[str, tuple[str, ...]] = {
     ),
     "embedding-and-output-aliases": (
         _test_ref(
-            "src/mobius/integrations/gguf/_builder_test.py",
+            "src/mobius/integrations/gguf/_builder_core_test.py",
             "test_tied_quantized_embedding_is_shared_with_output_head",
         ),
         _test_ref(
-            "src/mobius/integrations/gguf/_builder_test.py",
+            "src/mobius/integrations/gguf/_builder_architectures_test.py",
             "test_quantized_untied_output_head_is_preserved",
         ),
     ),
     "expert-stacking-and-3d-experts": (
         _test_ref(
-            "src/mobius/integrations/gguf/_builder_test.py",
+            "src/mobius/integrations/gguf/_builder_contracts_test.py",
             "test_fused_experts_are_split_without_tensor_loss",
         ),
         _test_ref(
@@ -289,6 +293,34 @@ def _artifact_records() -> tuple[list[dict[str, object]], int]:
     return artifacts, sum(cast(int, record["size"]) for record in artifacts)
 
 
+def _mtp_artifact_record(artifact: GGUFMtpArtifact) -> dict[str, object]:
+    return {
+        "role": artifact.role,
+        "repository": artifact.repository,
+        "revision": artifact.revision,
+        "filename": artifact.filename,
+        "size": artifact.size,
+        "lfs_sha256": artifact.lfs_sha256,
+        "bounded_header_bytes": artifact.bounded_header_bytes,
+        "bounded_header_sha256": artifact.bounded_header_sha256,
+        "data_offset": artifact.data_offset,
+        "architecture": artifact.architecture,
+        "model_name": artifact.model_name,
+        "block_count": artifact.block_count,
+        "nextn_predict_layers": artifact.nextn_predict_layers,
+        "physical_blocks": {
+            "first": artifact.first_block_index,
+            "last": artifact.last_block_index,
+            "count": artifact.physical_block_count,
+        },
+        "tensor_count": artifact.tensor_count,
+        "tensor_qtypes": dict(artifact.tensor_qtypes),
+        "nextn_tensor_count": artifact.nextn_tensor_count,
+        "nextn_tensor_qtypes": dict(artifact.nextn_tensor_qtypes),
+        "tokenizer_metadata_sha256": artifact.tokenizer_metadata_sha256,
+    }
+
+
 def quantization_capability_matrix() -> dict[str, object]:
     """Return the complete JSON-serializable stored-qtype capability matrix."""
     artifacts, selected_bytes = _artifact_records()
@@ -405,6 +437,76 @@ def quantization_capability_matrix() -> dict[str, object]:
         }
         for evidence in iter_runtime_blocker_evidence()
     ]
+    mtp_runtime_status = [
+        {
+            "evidence_id": evidence.evidence_id,
+            "architecture": evidence.architecture,
+            "layouts": [
+                {
+                    "name": layout.name,
+                    "total_size": layout.total_size,
+                    "within_bounded_artifact_policy": (layout.within_bounded_artifact_policy),
+                    "artifacts": [
+                        _mtp_artifact_record(artifact) for artifact in layout.artifacts
+                    ],
+                }
+                for layout in evidence.layouts
+            ],
+            "target_only_discriminator": (
+                _mtp_artifact_record(evidence.target_only_discriminator)
+                if evidence.target_only_discriminator is not None
+                else None
+            ),
+            "config": {
+                "repository": evidence.config_repository,
+                "revision": evidence.config_revision,
+                "sha256": evidence.config_sha256,
+            },
+            "tokenizer": {
+                "repository": evidence.tokenizer_repository,
+                "revision": evidence.tokenizer_revision,
+                "metadata_sha256": evidence.tokenizer_metadata_sha256,
+                "assets": [
+                    {"filename": name, "size": size, "sha256": sha256}
+                    for name, size, sha256 in evidence.tokenizer_assets
+                ],
+                "status": "separately-deferred",
+            },
+            "cache_topology": {
+                "target_namespace": evidence.cache_topology.target_namespace,
+                "mtp_namespace": evidence.cache_topology.mtp_namespace,
+                "target_state_slots": dict(evidence.cache_topology.target_state_slots),
+                "mtp_state_slots": dict(evidence.cache_topology.mtp_state_slots),
+            },
+            "bounded_complete_layout_available": (evidence.bounded_complete_layout_available),
+            "source_fidelity": evidence.source_fidelity,
+            "storage_fidelity": evidence.storage_fidelity,
+            "graph_sha256": evidence.graph_sha256,
+            "runtime_package_sha256": evidence.runtime_package_sha256,
+            "runtime": {
+                "name": evidence.runtime,
+                "version": evidence.runtime_version,
+                "source_revision": evidence.runtime_source_revision,
+                "onnxruntime_version": evidence.onnxruntime_version,
+                "execution_provider": evidence.execution_provider,
+                "missing_capabilities": list(evidence.missing_runtime_capabilities),
+            },
+            "result": evidence.result,
+            "downstream_limitations": list(evidence.downstream_limitations),
+            "separate_deferrals": list(evidence.separate_deferrals),
+            "withheld_checks": list(evidence.withheld_checks),
+            "synthetic_coordinator": (
+                {
+                    "test": evidence.synthetic_coordinator_test,
+                    "acceptance_statistics": dict(evidence.synthetic_acceptance_statistics),
+                    "scope": "reduced synthetic contract; not real-artifact evidence",
+                }
+                if evidence.synthetic_coordinator_test is not None
+                else None
+            ),
+        }
+        for evidence in iter_mtp_runtime_evidence()
+    ]
     return {
         "schema_version": 1,
         "llama_cpp_commit": UPSTREAM_COMMIT,
@@ -433,6 +535,7 @@ def quantization_capability_matrix() -> dict[str, object]:
             key: list(value) for key, value in sorted(_TRANSFORM_EVIDENCE.items())
         },
         "selected_artifacts": artifacts,
+        "mtp_runtime_evidence": mtp_runtime_status,
         "runtime_blocker_evidence": runtime_blockers,
         "lossy_target_artifacts": list(_LOSSY_TARGET_ARTIFACTS),
         "qtypes": qtypes,

@@ -32,7 +32,7 @@ multi-component export for pipelines.
 | **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), Nemotron Parse, LLaVA, InternVL2, Mage-VL (image + streaming video), MiniCPM-V 4.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
 | **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa, DistilBERT, ELECTRA, XLNet |
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
-| **Speech-to-Text** | Whisper, Moonshine, FastConformer-RNNT, FunASR, GLM-ASR, Qwen3-ASR, SenseVoice |
+| **Speech-to-Text** | Whisper, Moonshine, Moonshine Streaming, FastConformer-RNNT, FunASR, GLM-ASR, Qwen3-ASR, SenseVoice |
 | **Audio** | Wav2Vec2, HuBERT, WavLM, SpeechT5 |
 | **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
 | **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage / Qwen-Image-Edit-2509, HunyuanDiT, CogVideoX |
@@ -175,10 +175,10 @@ See the [design document](https://onnxruntime.github.io/mobius/design.html) for 
 
 ```bash
 # Unit tests (fast, no network needed)
-pytest tests/build_graph_test.py -v
+pytest tests/build_graph -v
 
 # Integration tests (downloads models)
-pytest tests/integration_test.py -m integration -v
+pytest tests/integration -m integration -v
 
 # All unit tests (components, configs, tasks, models)
 pytest src tests -m "not integration" -v

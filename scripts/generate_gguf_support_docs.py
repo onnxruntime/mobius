@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Refresh or check the generated GGUF support census documentation."""
+"""Refresh or check the generated GGUF capability catalog and evidence."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def main() -> None:
     if args.check:
         if current != generated or current_capability_matrix != capability_matrix:
             raise SystemExit(
-                "GGUF generated docs or capability evidence is stale; run "
+                "GGUF capability catalog or generated evidence is stale; run "
                 "`python scripts/generate_gguf_support_docs.py`"
             )
         return

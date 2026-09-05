@@ -309,11 +309,11 @@ Compare ONNX model outputs against HuggingFace PyTorch reference:
 
 | Test suite | Model | Checks |
 |-----------|-------|--------|
-| `integration_test.py` | Qwen2.5-0.5B | Prefill + decode logits |
-| `generation_test.py` | Qwen2.5-0.5B | Greedy generation token match |
+| `integration/text_test.py` | Qwen2.5-0.5B | Prefill + decode logits |
+| `integration/generation_test.py` | Qwen2.5-0.5B | Greedy generation token match |
 | `moe_integration_test.py` | Phi-tiny-MoE-instruct | Prefill + decode + generation |
 | `multimodal_integration_test.py` | Gemma-3-4b-pt | Prefill with image + decode |
-| `build_graph_test.py` | All 128 model types | Graph construction (unit tests) |
+| `tests/build_graph/` | All registered model types | Graph construction (unit tests) |
 
 Integration tests are marked `@pytest.mark.integration` and excluded from
 the default test run.  They download real model weights and run inference.

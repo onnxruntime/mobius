@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import ClassVar
 
 import onnx_ir as ir
@@ -34,6 +35,7 @@ from mobius.models.qwen_vl import (
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
     _QwenVLTextMixin,
+    _route_split_embedding_weight,
     split_per_layer_inputs,
 )
 
@@ -91,6 +93,17 @@ def _linear_factory(config: ArchitectureConfig) -> type | None:
 _FLOAT_MODULE_QUANT_METHODS = frozenset({"olive"})
 
 
+def _decoder_component_config(
+    config: ArchitectureConfig,
+    source_paths: tuple[str, ...],
+) -> ArchitectureConfig:
+    """Use the effective decoder layout while constructing its expert parameters."""
+    if config.component_quantization is None:
+        return config
+    quantization = config.quantization_for_source_paths("decoder", source_paths)
+    return dataclasses.replace(config, quantization=quantization, component_quantization=None)
+
+
 def _keeps_modules_float(config: ArchitectureConfig) -> bool:
     """True when the checkpoint's quantizer leaves the opt-out modules float."""
     quantization = _decoder_quantization(config)
@@ -136,6 +149,9 @@ class Qwen35DecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             self.linear_attn = GatedDeltaNet(
                 config, linear_class=self._linear_attn_class(config, linear_class)
+            )
+            self.linear_attn.component_quantization_excluded_methods = (
+                self.float_linear_attn_quant_methods
             )
         else:
             self.self_attn = Qwen35Attention(config, linear_class=linear_class)
@@ -368,6 +384,9 @@ class Qwen35MoEBlock(Qwen2MoELayer):
             linear_class=linear_class,
             # ``None`` falls back to ``linear_class``.
             shared_expert_gate_class=Linear if _keeps_modules_float(config) else None,
+        )
+        self.shared_expert_gate.component_quantization_excluded_methods = (
+            _FLOAT_MODULE_QUANT_METHODS
         )
 
 
@@ -603,6 +622,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "decoder": (
+            "model.language_model",
             "model.language_model.layers",
             "model.language_model.norm",
             "model.language_model.rotary_emb",
@@ -615,7 +635,11 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
-        self.decoder = Qwen35VLDecoderModel(config)
+        decoder_config = _decoder_component_config(
+            config,
+            self.HF_COMPONENT_SOURCES["decoder"],
+        )
+        self.decoder = Qwen35VLDecoderModel(decoder_config)
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
         self.embedding = Qwen3VLEmbeddingModel(config)
 
@@ -651,8 +675,14 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 renamed[f"vision_encoder.{stripped}"] = value
             elif stripped.startswith("language_model.embed_tokens."):
                 suffix = stripped[len("language_model.") :]
-                renamed[f"decoder.model.{suffix}"] = value
-                renamed[f"embedding.{suffix}"] = value
+                _route_split_embedding_weight(
+                    renamed,
+                    key,
+                    value,
+                    decoder_name=f"decoder.model.{suffix}",
+                    embedding_name=f"embedding.{suffix}",
+                    config=self.config,
+                )
             elif stripped.startswith("language_model.lm_head."):
                 renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("lm_head."):
@@ -676,9 +706,13 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             other_weights = {
                 key: value for key, value in renamed.items() if not key.startswith("decoder.")
             }
+            decoder_quantization = self.config.quantization_for_source_paths(
+                "decoder",
+                self.HF_COMPONENT_SOURCES["decoder"],
+            )
             result = preprocess_quantized_weights(
                 decoder_weights,
-                self.config.quantization_for("decoder"),
+                decoder_quantization,
                 tie_embeddings=apply_tie,
                 embed_key="decoder.model.embed_tokens.weight",
                 head_key="decoder.lm_head.weight",
@@ -843,6 +877,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "decoder": (
+            "model.language_model",
             "model.language_model.layers",
             "model.language_model.norm",
             "model.language_model.rotary_emb",
@@ -855,7 +890,11 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
-        self.decoder = Qwen35MoEVLDecoderModel(config)
+        decoder_config = _decoder_component_config(
+            config,
+            self.HF_COMPONENT_SOURCES["decoder"],
+        )
+        self.decoder = Qwen35MoEVLDecoderModel(decoder_config)
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
         self.embedding = Qwen3VLEmbeddingModel(config)
 
@@ -880,8 +919,16 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         native QMoE ABI, they instead remain expert-major, are renamed from
         Olive's suffix convention, and are packed into QMoE parameters.
         """
-        quantization = _decoder_quantization(self.config)
-        use_qmoe = supported_qmoe_quantization(quantization) is not None
+        quantization = self.config.quantization
+        decoder_quantization = (
+            self.config.quantization_for_source_paths(
+                "decoder",
+                self.HF_COMPONENT_SOURCES["decoder"],
+            )
+            if self.config.component_quantization is not None
+            else quantization
+        )
+        use_qmoe = supported_qmoe_quantization(decoder_quantization) is not None
 
         tie = effective_tie_word_embeddings(self.config)
         renamed: dict[str, torch.Tensor] = {}
@@ -898,8 +945,14 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 renamed[f"vision_encoder.{stripped}"] = value
             elif stripped.startswith("language_model.embed_tokens."):
                 suffix = stripped[len("language_model.") :]
-                renamed[f"decoder.model.{suffix}"] = value
-                renamed[f"embedding.{suffix}"] = value
+                _route_split_embedding_weight(
+                    renamed,
+                    key,
+                    value,
+                    decoder_name=f"decoder.model.{suffix}",
+                    embedding_name=f"embedding.{suffix}",
+                    config=self.config,
+                )
             elif stripped.startswith("language_model.lm_head."):
                 renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("lm_head."):
@@ -941,7 +994,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
             }
             result = preprocess_quantized_weights(
                 decoder_weights,
-                self.config.quantization_for("decoder"),
+                decoder_quantization,
                 tie_embeddings=apply_tie,
                 embed_key="decoder.model.embed_tokens.weight",
                 head_key="decoder.lm_head.weight",

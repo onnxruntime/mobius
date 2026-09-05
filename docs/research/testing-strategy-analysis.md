@@ -57,7 +57,7 @@ Key design choices in this numbering:
 
 ### Why L3 (synthetic parity) at full breadth is feasible
 
-The existing `integration_test.py` already demonstrates the pattern: create
+The architecture-specific integration suites already demonstrate the pattern: create
 an HF model from config (tiny), build an ONNX model from the same config,
 transfer weights via `preprocess_weights()` + `apply_weights()`, and compare
 outputs. This takes ~2–5 seconds per model. For 273 models, that is
@@ -391,7 +391,7 @@ FAILED: qwen3_moe prefill parity
 When a contributor adds a new variant, the system should guide them:
 
 ```
-$ python -m pytest tests/build_graph_test.py -k "qwen3_moe"
+$ python -m pytest tests/build_graph -k "qwen3_moe"
 PASSED: Graph builds successfully
 
 Dashboard preview:

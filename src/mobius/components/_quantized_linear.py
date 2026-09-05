@@ -287,6 +287,9 @@ class ClippableQuantizedLinear(QuantizedLinear):
         minimum: ir.Value,
         maximum: ir.Value,
     ) -> ir.Value:
+        # Clip bounds are learned in float32 even when the component computes
+        # in fp16/bf16. Upcast for schema/provider compatibility, then restore
+        # the activation dtype before the next projection.
         x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
         minimum_f32 = op.Cast(minimum, to=ir.DataType.FLOAT)
         maximum_f32 = op.Cast(maximum, to=ir.DataType.FLOAT)

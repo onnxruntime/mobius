@@ -146,6 +146,30 @@ def _assert_identity_roundtrip(model_type: str, config_overrides: dict) -> None:
     )
 
 
+def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
+    """The converted checkpoint namespace routes without missing trained weights."""
+    modeling = pytest.importorskip("transformers.models.vibevoice.modeling_vibevoice")
+    from mobius._configs import VibeVoiceConfig
+    from mobius.models.vibevoice import VibeVoiceForConditionalGeneration
+    from mobius.models.vibevoice_test import _make_tiny_hf_config
+    from mobius.tasks import VibeVoiceTask
+
+    torch.manual_seed(11)
+    hf_config = _make_tiny_hf_config()
+    config = VibeVoiceConfig.from_transformers(
+        hf_config.text_config,
+        parent_config=hf_config,
+    )
+    module = VibeVoiceForConditionalGeneration(config)
+    package = VibeVoiceTask().build(module, config)
+    parameter_names = _collect_parameter_names(package)
+    routed = module.preprocess_weights(
+        modeling.VibeVoiceForConditionalGeneration(hf_config).state_dict()
+    )
+
+    assert parameter_names == set(routed)
+
+
 # ---------------------------------------------------------------------------
 # Causal LM weight alignment
 # ---------------------------------------------------------------------------
