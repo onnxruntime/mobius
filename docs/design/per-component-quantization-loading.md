@@ -181,6 +181,15 @@ Architectures whose names cannot be aligned structurally declare explicit path
 aliases on their component descriptor; individual loaders must not invent
 their own mapping.
 
+Component-owned source roots also prefix local descendants without a shared
+anchor segment, such as T5's `encoder` and `decoder` stacks. Models can publish
+static `HF_COMPONENT_MODULE_ALIASES` or implement
+`get_hf_component_module_aliases(model_type=..., hf_config=...)` when aliases
+depend on configuration, such as distinct encoder and decoder layer counts.
+An existing alias or separately declared source takes precedence over
+synthesizing a component-root name; a top-level `lm_head` must not also become
+`decoder.lm_head` for rule matching.
+
 ## 2. Component quantization manifest
 
 The parsed architecture config keeps legacy compatibility while exposing an
@@ -243,6 +252,12 @@ This keeps `per_layer_input_gate`, `per_layer_projection`, and other explicit
 float exceptions as ordinary `Linear` modules without weakening the rest of a
 quantized decoder.
 
+Graph construction and packed-weight normalization use the same effective
+module policy. Model-declared `COMPONENT_OUTPUT_HEADS` stay float unless
+`quantize_lm_head` is enabled. A module's
+`component_quantization_excluded_methods` applies to that module and all its
+descendants; selecting a quantized component must not override this invariant.
+
 This replaces post-construction scanning that tries to swap `Linear` instances
 after a model has already encoded architecture-specific choices.
 
@@ -288,8 +303,10 @@ class WeightRecord:
 ```
 
 Grouping prevents several raw sidecar keys from being renamed, split, or
-overwritten independently. A missing scale or zero point is detected before
-any architecture transform executes.
+overwritten independently. Missing scales are rejected during grouping.
+Zero-point requirements are validated after resolving the module's effective
+symmetry, since an override may make one projection symmetric inside an
+otherwise asymmetric component.
 
 `WeightBundle` owns records for one component:
 
@@ -314,6 +331,8 @@ class QuantizationCodec(Protocol):
         self,
         record: WeightRecord,
         target: QuantizationConfig,
+        *,
+        kind: Literal["linear", "embedding"] = "linear",
     ) -> WeightRecord: ...
 ```
 
@@ -331,6 +350,13 @@ The codec:
 - never computes quantization parameters from float values.
 
 Model names and model-specific parameter paths are prohibited inside codecs.
+
+The target module supplies the weight kind: linear projections use the
+three-dimensional `MatMulNBits` layout, while embedding tables use the
+two-dimensional `GatherBlockQuantized` layout. A shared `.scales` suffix alone
+does not identify a canonical group; the packed tensor, scales, and required
+zero points must all match the target parameters before normalization is
+skipped.
 
 ## 6. ModelWeightAdapter
 
@@ -409,6 +435,11 @@ The migration keeps current APIs operational:
 - existing `ComponentSpec`, `model_roles`, and `HF_COMPONENT_SOURCES` feed the
   manifest resolver;
 - loaders without a component manifest retain current single-model behavior.
+
+Component-aware compatibility adapters preserve raw sidecars through their
+architecture-specific renames. They must not normalize an entire component
+with one root-resolved layout before the generic loader evaluates projection
+overrides.
 
 Compatibility paths emit no behavior changes in the first two implementation
 PRs. Removal occurs only after model migrations and parity coverage.

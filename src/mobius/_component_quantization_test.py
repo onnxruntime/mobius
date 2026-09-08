@@ -231,6 +231,71 @@ class _QuantizedEmbeddingModel(nn.Module):
         )
 
 
+def test_component_plan_retargets_existing_quantized_embedding():
+    module = _QuantizedEmbeddingModel()
+    quantization = QuantizationConfig(
+        bits=8, group_size=32, quant_method="olive", quantize_embeddings=True
+    )
+    configure_component_quantization(
+        module,
+        ArchitectureConfig(component_quantization={"model": quantization}),
+        _SingleTask(),
+    )
+
+    assert (module.embed_tokens._bits, module.embed_tokens._block_size) == (8, 32)
+    assert list(module.embed_tokens.qweight.shape) == [32, 64]
+    assert list(module.embed_tokens.scales.shape) == [32, 2]
+
+
+def test_single_component_retains_model_attribute_in_embedding_path():
+    module = nn.Module()
+    module.model = _QuantizedEmbeddingModel()
+    quantization = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_embeddings=True
+    )
+    config = ArchitectureConfig(component_quantization={"model": quantization})
+    task = _SingleTask()
+    manifest = configure_component_quantization(module, config, task)
+    packed = torch.arange(1024).reshape(32, 32).to(torch.uint8)
+    state_dict = {
+        "model.embed_tokens.weight_qweight": packed,
+        "model.embed_tokens.weight_scales": torch.ones(32, 4),
+    }
+
+    result = normalize_component_quantized_weights(
+        state_dict, module, config, ("model",), manifest=manifest, task=task
+    )
+
+    assert result["model.embed_tokens.qweight"] is packed
+    assert "model.embed_tokens.weight" not in result
+
+
+@pytest.mark.parametrize("target", ["embed_tokens", "blocks"])
+def test_raw_packed_weight_requires_supported_target_module(target):
+    from mobius.components import Embedding
+
+    module = nn.Module()
+    module.embed_tokens = Embedding(32, 64)
+    module.blocks = nn.ModuleList([Linear(64, 32, bias=False)])
+    quantization = QuantizationConfig(bits=4, group_size=16, quant_method="olive")
+    config = ArchitectureConfig(component_quantization={"model": quantization})
+    task = _SingleTask()
+    manifest = configure_component_quantization(module, config, task)
+
+    with pytest.raises(TypeError, match="module unsupported by the affine codec"):
+        normalize_component_quantized_weights(
+            {
+                f"{target}.weight_qweight": torch.zeros(32, 32, dtype=torch.uint8),
+                f"{target}.weight_scales": torch.ones(32, 4),
+            },
+            module,
+            config,
+            ("model",),
+            manifest=manifest,
+            task=task,
+        )
+
+
 def test_canonical_quantized_embedding_is_not_treated_as_raw_sidecars():
     module = _QuantizedEmbeddingModel()
     quantization = QuantizationConfig(

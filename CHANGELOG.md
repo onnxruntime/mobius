@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Fixed
 
+- Raw GPTQ/AWQ scales are no longer mistaken for already-normalized parameters.
+  Canonical detection requires a complete group with the target layout, and
+  zero-point requirements follow each projection's effective symmetry.
+- Independently quantized embedding tables retain the two-dimensional
+  `GatherBlockQuantized` layout instead of being packed as linear projections.
+- Graph construction and loading honor model-declared float exclusions and
+  output heads, including Qwen3.5-MoE and Whisper. Legacy global module rules
+  no longer fail when the component mapping is absent.
+- Gemma4 preserves raw component sidecars until per-projection normalization,
+  and T5 maps local projections back to their HuggingFace names, so component
+  and projection overrides select the same layout for graph and weights.
 - Sparse per-layer configuration dictionaries preserve the default attention
   head dimension and KV-head count instead of replacing them with overrides
   declared for only a subset of layers.

@@ -101,6 +101,55 @@ def test_descriptor_maps_local_path_to_huggingface_source_name():
     assert descriptor.source_module_names("lm_head") == ("lm_head",)
 
 
+def test_component_root_source_prefixes_local_descendants():
+    descriptor = ComponentDescriptor(
+        name="decoder",
+        module_attribute_path="decoder",
+        role="decoder",
+        source_paths=("model.decoder", "lm_head"),
+    )
+
+    assert descriptor.source_module_names("block.0.self_attn.q_proj") == (
+        "block.0.self_attn.q_proj",
+        "model.decoder.block.0.self_attn.q_proj",
+    )
+    assert descriptor.source_module_names("lm_head") == ("lm_head",)
+    assert descriptor.source_module_names("lm_head.adapter") == ("lm_head.adapter",)
+
+
+def test_explicit_alias_takes_precedence_over_component_root_synthesis():
+    descriptor = ComponentDescriptor(
+        name="decoder",
+        module_attribute_path="decoder",
+        role="decoder",
+        source_paths=("decoder", "lm_head"),
+        source_path_aliases=(("output", "lm_head"),),
+    )
+
+    assert descriptor.source_module_names("output") == ("output", "lm_head")
+
+
+def test_t5_aliases_follow_encoder_and_decoder_layer_counts():
+    from mobius._configs import ArchitectureConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+    from mobius.tasks import get_task
+
+    config = ArchitectureConfig(num_hidden_layers=1, num_decoder_layers=3)
+    manifest = resolve_component_manifest(
+        get_task("seq2seq"),
+        module_class=T5ForConditionalGeneration,
+        model_type="t5",
+        hf_config=config,
+    )
+
+    assert "encoder.block.0.layer.0.SelfAttention.q" in manifest[
+        "encoder"
+    ].source_module_names("block.0.self_attn.q_proj")
+    assert "decoder.block.2.layer.1.EncDecAttention.k" in manifest[
+        "decoder"
+    ].source_module_names("block.2.cross_attn.k_proj")
+
+
 def test_single_component_uses_root_module_path():
     class _SingleTask:
         model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}

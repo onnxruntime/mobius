@@ -12,7 +12,7 @@ __all__ = [
 ]
 
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Literal, Protocol
 
 import torch
 
@@ -45,6 +45,8 @@ class QuantizationCodec(Protocol):
         self,
         record: WeightRecord,
         config: QuantizationConfig,
+        *,
+        kind: Literal["linear", "embedding"] = "linear",
     ) -> dict[str, torch.Tensor]:
         """Convert one packed record to Mobius's canonical parameter layout."""
         ...
@@ -125,12 +127,9 @@ class _LegacyAffineCodec:
                 raise ValueError(
                     f"Packed weight {qweight_key!r} is missing scales {scales_key!r}"
                 )
-            zero_points = state_dict.get(zero_points_key)
-            if not config.sym and zero_points is None:
-                raise ValueError(
-                    f"Asymmetric packed weight {qweight_key!r} is missing "
-                    f"zero points {zero_points_key!r}"
-                )
+            zero_points = (
+                state_dict.get(zero_points_key) if zero_points_key is not None else None
+            )
             storage = PackedWeight(
                 qweight=state_dict[qweight_key],
                 scales=state_dict[scales_key],
@@ -178,6 +177,8 @@ class _LegacyAffineCodec:
         self,
         record: WeightRecord,
         config: QuantizationConfig,
+        *,
+        kind: Literal["linear", "embedding"] = "linear",
     ) -> dict[str, torch.Tensor]:
         if not isinstance(record.storage, PackedWeight):
             raise TypeError(f"weight {record.name!r} is not packed")
@@ -186,12 +187,24 @@ class _LegacyAffineCodec:
                 f"weight {record.name!r} uses {record.storage.method!r}, "
                 f"not codec {self.method!r}"
             )
-        return preprocess_quantized_weights(
+        # Zero-point requirements depend on the effective per-module override.
+        if not config.sym and record.storage.zero_points is None:
+            raise ValueError(
+                f"Asymmetric packed weight {record.name!r} is missing zero points"
+            )
+        normalized = preprocess_quantized_weights(
             record.storage.as_state_dict(),
             config,
             tie_embeddings=False,
+            embed_key=record.name if kind == "embedding" else "",
             qmoe_target_path=None,
         )
+        if kind == "embedding" and self.method in {"gptq", "awq"}:
+            # The affine packers produce [rows, blocks, bytes]; Gather consumes
+            # the same packed bytes as a [rows, packed_columns] table.
+            weight = normalized.pop(record.name)
+            normalized[f"{record.name.removesuffix('.weight')}.qweight"] = weight.flatten(1)
+        return normalized
 
 
 codec_registry = QuantizationCodecRegistry()

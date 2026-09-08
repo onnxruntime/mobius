@@ -87,12 +87,18 @@ def test_rejects_missing_asymmetric_zero_points():
         "model.q_proj.weight_scales": torch.ones(32, 4),
     }
 
+    codec = codec_registry.get("olive")
+    record = codec.group(_component(), state_dict, _config(sym=False))["model.q_proj.weight"]
+
     with pytest.raises(ValueError, match="missing zero points"):
-        codec_registry.get("olive").group(
-            _component(),
-            state_dict,
-            _config(sym=False),
-        )
+        codec.normalize(record, _config(sym=False))
+
+    # A symmetric module override does not require the component's zero points.
+    assert codec.normalize(record, _config(sym=True))["model.q_proj.weight"].shape == (
+        32,
+        4,
+        8,
+    )
 
 
 def test_rejects_orphan_sidecars():
@@ -116,6 +122,41 @@ def test_compatibility_normalizer_uses_existing_packer():
 
     assert normalized["model.q_proj.weight"].shape == (32, 4, 8)
     assert normalized["model.q_proj.scales"].shape == (32, 4)
+
+
+@pytest.mark.parametrize(("method", "bits"), [("gptq", 4), ("gptq", 8), ("awq", 4)])
+def test_dotted_affine_embedding_normalizes_to_gather_bytes(method, bits):
+    component = ComponentDescriptor("embedding", "embedding", "embedding")
+    config = QuantizationConfig(
+        bits=bits,
+        group_size=16,
+        quant_method=method,
+        sym=True,
+        quantize_embeddings=True,
+    )
+    qweight = (
+        torch.arange(bits * 8, dtype=torch.int32).reshape(bits, 8) * 0x010203 + 0x12345678
+    )
+    scales = torch.linspace(0.125, 1.125, 16).reshape(2, 8)
+    codec = codec_registry.get(method)
+    record = codec.group(
+        component,
+        {"embedding.tokens.qweight": qweight, "embedding.tokens.scales": scales},
+        config,
+    )["embedding.tokens.weight"]
+
+    normalized = codec.normalize(record, config, kind="embedding")
+
+    expected = (
+        torch.stack([(qweight >> shift) & 255 for shift in (0, 8, 16, 24)], dim=-1)
+        .transpose(0, 1)
+        .reshape(8, 32 * bits // 8)
+        .to(torch.uint8)
+    )
+    assert set(normalized) == {"embedding.tokens.qweight", "embedding.tokens.scales"}
+    assert normalized["embedding.tokens.qweight"].dtype == torch.uint8
+    torch.testing.assert_close(normalized["embedding.tokens.qweight"], expected)
+    torch.testing.assert_close(normalized["embedding.tokens.scales"], scales.T)
 
 
 def test_registry_rejects_duplicate_method():

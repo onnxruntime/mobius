@@ -367,94 +367,32 @@ def _preprocess_component_quantized_weights(
     state_dict: dict[str, torch.Tensor],
     config: Gemma4Config,
 ) -> dict[str, torch.Tensor]:
-    """Convert packed weights with each package component's own layout."""
+    """Normalize legacy weights; leave component plans to the shared loader."""
+    if config.component_quantization is not None:
+        # Normalizing here would apply one layout to every projection before
+        # the generic loader can resolve source-name rules and overrides.
+        return state_dict
+
     root_quantization = _active_quantization(config.quantization)
-    component_mode = config.component_quantization is not None
-    if not component_mode:
-        if root_quantization is None or root_quantization.quant_method not in {
-            "olive",
-            "gptq",
-            "awq",
-        }:
-            return state_dict
-        tie = config.tie_word_embeddings
-        apply_tie = tie and any(
-            key in state_dict
-            for key in (
-                "embedding.embed_tokens.weight",
-                "decoder.lm_head.weight",
-            )
-        )
-        return preprocess_quantized_weights(
-            state_dict,
-            root_quantization,
-            tie_embeddings=apply_tie,
-            embed_key="embedding.embed_tokens.weight",
-            head_key="decoder.lm_head.weight",
-            qmoe_target_path=None,
-            reject_quantized_embeddings_lm_head=True,
-        )
-
-    result = {
-        key: value
-        for key, value in state_dict.items()
-        if key.split(".", 1)[0]
-        not in {"decoder", "embedding", "vision_encoder", "audio_encoder"}
-    }
-    for component in ("decoder", "embedding", "vision_encoder", "audio_encoder"):
-        component_weights = {
-            key: value for key, value in state_dict.items() if key.startswith(f"{component}.")
-        }
-        if not component_weights:
-            continue
-
-        quantization = _component_quantization_config(config, component)
-        if component == "embedding":
-            table_quantization = _table_quantization_config(config, component)
-            if table_quantization is not None and table_quantization.quantize_embeddings:
-                if quantization is not None and (
-                    quantization.bits,
-                    quantization.group_size,
-                    quantization.sym,
-                ) != (
-                    table_quantization.bits,
-                    table_quantization.group_size,
-                    table_quantization.sym,
-                ):
-                    raise ValueError(
-                        "Gemma4 embedding tables and projections use different "
-                        "quantization layouts inside one component."
-                    )
-                quantization = table_quantization
-
-        if quantization is None:
-            packed_key = next(
-                (key for key in component_weights if is_packed_quant_key(key)),
-                None,
-            )
-            if packed_key is not None:
-                raise ValueError(
-                    f"Component {component!r} is configured as floating point, "
-                    f"but packed checkpoint weight {packed_key!r} was found."
-                )
-            result.update(component_weights)
-            continue
-
-        if quantization.quant_method not in {"olive", "gptq", "awq"}:
-            result.update(component_weights)
-            continue
-        result.update(
-            preprocess_quantized_weights(
-                component_weights,
-                quantization,
-                tie_embeddings=False,
-                embed_key="embedding.embed_tokens.weight",
-                head_key="decoder.lm_head.weight",
-                qmoe_target_path=None,
-                reject_quantized_embeddings_lm_head=component != "embedding",
-            )
-        )
-    return result
+    if root_quantization is None or root_quantization.quant_method not in {
+        "olive",
+        "gptq",
+        "awq",
+    }:
+        return state_dict
+    apply_tie = config.tie_word_embeddings and any(
+        key in state_dict
+        for key in ("embedding.embed_tokens.weight", "decoder.lm_head.weight")
+    )
+    return preprocess_quantized_weights(
+        state_dict,
+        root_quantization,
+        tie_embeddings=apply_tie,
+        embed_key="embedding.embed_tokens.weight",
+        head_key="decoder.lm_head.weight",
+        qmoe_target_path=None,
+        reject_quantized_embeddings_lm_head=True,
+    )
 
 
 class Gemma4ScaledWordEmbedding(Gemma3TextScaledWordEmbedding):

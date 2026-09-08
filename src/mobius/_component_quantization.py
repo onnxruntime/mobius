@@ -14,9 +14,10 @@ __all__ = [
 ]
 
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import onnx_ir as ir
+import torch
 from onnxscript import nn
 
 from mobius._component_manifest import ComponentDescriptor, ComponentManifest
@@ -33,9 +34,6 @@ from mobius.components import (
 )
 from mobius.tasks import ModelTask, get_task
 from mobius.weights import FloatWeight, PackedWeight, codec_registry
-
-if TYPE_CHECKING:
-    import torch
 
 _AFFINE_METHODS = frozenset({"olive", "gptq", "awq"})
 _KNOWN_SPLIT_COMPONENTS = frozenset(
@@ -162,12 +160,38 @@ def _embedding_layout_matches(
     )
 
 
+def _component_output_head_paths(module: nn.Module, component: str) -> tuple[str, ...]:
+    mapping = getattr(type(module), "COMPONENT_OUTPUT_HEADS", {})
+    aliases = {
+        "decoder": ("decoder", "model"),
+        "model": ("model", "decoder"),
+    }.get(component, (component,))
+    declared = next((tuple(mapping[name]) for name in aliases if name in mapping), ())
+    return tuple(dict.fromkeys(("lm_head", *declared)))
+
+
+def _excluded_from_component_quantization(
+    root: nn.Module,
+    path: str,
+    quantization: QuantizationConfig,
+) -> bool:
+    parts = path.split(".")
+    for end in range(len(parts) + 1):
+        ancestor = _resolve_module(root, ".".join(parts[:end]))
+        methods = getattr(ancestor, "component_quantization_excluded_methods", ())
+        if quantization.quant_method in methods:
+            return True
+    return False
+
+
 def _effective_module_quantization(
     component_quantization: QuantizationConfig | None,
     descriptor: ComponentDescriptor,
     local_module_path: str,
     *,
     source_module_names: tuple[str, ...] | None = None,
+    component_module: nn.Module | None = None,
+    output_head_paths: tuple[str, ...] = ("lm_head",),
 ) -> QuantizationConfig | None:
     if component_quantization is None or component_quantization.quant_method == "none":
         return None
@@ -176,7 +200,19 @@ def _effective_module_quantization(
         if source_module_names is not None
         else descriptor.source_module_names(local_module_path)
     )
-    return component_quantization.for_module(source_names)
+    quantization = component_quantization.for_module(source_names)
+    if quantization is None:
+        return None
+    if not quantization.quantize_lm_head and any(
+        local_module_path == path or local_module_path.endswith(f".{path}")
+        for path in output_head_paths
+    ):
+        return None
+    if component_module is not None and _excluded_from_component_quantization(
+        component_module, local_module_path, quantization
+    ):
+        return None
+    return quantization
 
 
 def _source_module_names(
@@ -197,6 +233,7 @@ def _configure_component_module(
     component_quantization: QuantizationConfig | None,
     *,
     owned_by_other_components: tuple[str, ...] = (),
+    output_head_paths: tuple[str, ...] = ("lm_head",),
 ) -> None:
     replacements: list[tuple[str, nn.Module]] = []
     for local_path, child in list(component_module.named_modules()):
@@ -216,10 +253,9 @@ def _configure_component_module(
                 local_path,
                 child,
             ),
+            component_module=component_module,
+            output_head_paths=output_head_paths,
         )
-        is_lm_head = local_path == "lm_head" or local_path.endswith(".lm_head")
-        if quantization is not None and is_lm_head and not quantization.quantize_lm_head:
-            quantization = None
 
         if isinstance(child, ClippableQuantizedLinear):
             if type(child).forward is not ClippableQuantizedLinear.forward:
@@ -283,6 +319,23 @@ def _configure_component_module(
                 )
             if quantization is None or not quantization.quantize_embeddings:
                 replacements.append((local_path, _float_embedding(child)))
+            elif not _embedding_layout_matches(child, quantization):
+                assert child.qweight.shape is not None
+                num_embeddings = child.qweight.shape[0]
+                assert isinstance(num_embeddings, int)
+                replacements.append(
+                    (
+                        local_path,
+                        QuantizedEmbedding(
+                            num_embeddings,
+                            child._embedding_dim,
+                            padding_idx=child.padding_idx,
+                            bits=quantization.bits,
+                            block_size=quantization.group_size,
+                            has_zero_point=not quantization.sym,
+                        ),
+                    )
+                )
             continue
 
         if quantization is None:
@@ -380,7 +433,7 @@ def configure_component_quantization(
     if mapping is None and not single_component_rules:
         return manifest
 
-    unresolved = set(mapping) - set(manifest)
+    unresolved = set(mapping) - set(manifest) if mapping is not None else set()
     if "model" in manifest:
         unresolved.discard("decoder")
     if "decoder" in manifest:
@@ -417,6 +470,7 @@ def configure_component_quantization(
             config,
             quantization,
             owned_by_other_components=owned_elsewhere,
+            output_head_paths=_component_output_head_paths(module, descriptor.name),
         )
     return manifest
 
@@ -428,7 +482,9 @@ def _raw_qweight_key(name: str) -> bool:
 def _canonical_component_parameter_keys(
     module: nn.Module,
     descriptor: ComponentDescriptor,
+    weights: Mapping[str, torch.Tensor],
 ) -> frozenset[str]:
+    """Identify complete canonical groups, not individual shared sidecar names."""
     component_module = _resolve_module(
         module,
         descriptor.module_attribute_path,
@@ -447,23 +503,32 @@ def _canonical_component_parameter_keys(
             f"{prefix}.{local_path}" if prefix else local_path for prefix in (*prefixes, "")
         }
         if isinstance(child, QuantizedEmbedding):
-            for stem in stems:
-                keys.update(
-                    {
-                        f"{stem}.qweight",
-                        f"{stem}.scales",
-                        f"{stem}.zero_points",
-                    }
-                )
+            weight_name = "qweight"
+            weight_parameter = child.qweight
         elif isinstance(child, QuantizedLinear):
-            for stem in stems:
-                keys.update(
-                    {
-                        f"{stem}.weight",
-                        f"{stem}.scales",
-                        f"{stem}.zero_points",
-                    }
-                )
+            weight_name = "weight"
+            weight_parameter = child.weight
+        else:
+            continue
+        parameters = {weight_name: weight_parameter, "scales": child.scales}
+        if child.zero_points is not None:
+            parameters["zero_points"] = child.zero_points
+        for stem in stems:
+            packed_key = f"{stem}.{weight_name}"
+            if packed_key not in weights or weights[packed_key].dtype != torch.uint8:
+                continue
+            if any(
+                parameter.shape is None
+                or f"{stem}.{name}" not in weights
+                or tuple(weights[f"{stem}.{name}"].shape) != tuple(parameter.shape)
+                for name, parameter in parameters.items()
+            ):
+                continue
+            if isinstance(child, QuantizedLinear) and any(
+                key in weights for key in (f"{stem}.qweight", f"{stem}.weight_qweight")
+            ):
+                continue
+            keys.update(f"{stem}.{name}" for name in parameters)
     return frozenset(keys)
 
 
@@ -521,6 +586,8 @@ def _local_weight_module_path(
     descriptor: ComponentDescriptor,
 ) -> str:
     name = record_name.removesuffix(".weight")
+    if not descriptor.module_attribute_path:
+        return name
     for prefix in (descriptor.module_attribute_path, descriptor.name):
         if prefix and name.startswith(f"{prefix}."):
             return name[len(prefix) + 1 :]
@@ -548,7 +615,6 @@ def normalize_component_quantized_weights(
     if mapping is None and not single_component_rules:
         return state_dict
     manifest = manifest or _default_manifest(module, config, task)
-    manifest = manifest or _default_manifest(module, config, task)
     routed = _route_component_weights(state_dict, manifest, component_names)
     result = dict(state_dict)
 
@@ -557,6 +623,7 @@ def normalize_component_quantized_weights(
         canonical_keys = _canonical_component_parameter_keys(
             module,
             manifest[component],
+            weights,
         )
         source_weights = {
             key: value for key, value in weights.items() if key not in canonical_keys
@@ -565,6 +632,8 @@ def normalize_component_quantized_weights(
             continue
 
         descriptor = manifest[component]
+        component_module = _resolve_module(module, descriptor.module_attribute_path)
+        output_head_paths = _component_output_head_paths(module, component)
         component_quantization = _component_quantization(config, component)
         if component_quantization is None:
             packed_key = next(key for key in weights if _raw_qweight_key(key))
@@ -604,10 +673,6 @@ def normalize_component_quantized_weights(
                     "component-specific tied-weight adapter."
                 )
             local_path = _local_weight_module_path(record.name, descriptor)
-            component_module = _resolve_module(
-                module,
-                descriptor.module_attribute_path,
-            )
             local_module = (
                 _resolve_module(component_module, local_path)
                 if component_module is not None
@@ -623,13 +688,33 @@ def normalize_component_quantized_weights(
                 descriptor,
                 local_path,
                 source_module_names=source_names,
+                component_module=component_module,
+                output_head_paths=output_head_paths,
             )
             if quantization is None:
                 raise ValueError(
                     f"Packed checkpoint weight {record.name!r} targets a module "
                     f"excluded from component {component!r} quantization"
                 )
-            result.update(codec.normalize(record, quantization))
+            if local_module is None:
+                raise ValueError(
+                    f"Packed checkpoint weight {record.name!r} has no target module "
+                    f"in component {component!r}"
+                )
+            if not isinstance(local_module, (QuantizedLinear, QuantizedEmbedding)):
+                raise TypeError(
+                    f"Packed checkpoint weight {record.name!r} targets a "
+                    f"module unsupported by the affine codec: {type(local_module).__name__}"
+                )
+            result.update(
+                codec.normalize(
+                    record,
+                    quantization,
+                    kind="embedding"
+                    if isinstance(local_module, QuantizedEmbedding)
+                    else "linear",
+                )
+            )
 
     canonical_keys = frozenset(
         key
@@ -637,6 +722,7 @@ def normalize_component_quantized_weights(
         for key in _canonical_component_parameter_keys(
             module,
             manifest[component],
+            result,
         )
     )
     remaining = next(

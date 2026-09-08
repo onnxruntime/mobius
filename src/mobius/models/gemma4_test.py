@@ -11,6 +11,7 @@ import onnx_ir as ir
 import pytest
 import torch
 
+from mobius._component_quantization import normalize_component_quantized_weights
 from mobius._configs import (
     AudioConfig,
     Gemma4AudioConfig,
@@ -559,7 +560,7 @@ class TestGemma4PerComponentQuantization:
         assert self._layouts(package["audio_encoder"].graph) == {(2, 16)}
         assert self._layouts(package["embedding"].graph) == {(8, 16)}
 
-    def test_preprocesses_each_component_with_its_own_layout(self):
+    def test_preprocess_preserves_raw_component_sidecars(self):
         model = Gemma4Model(self._config())
         state_dict = {
             "model.language_model.layers.0.self_attn.q_proj.weight_qweight": torch.zeros(
@@ -586,26 +587,24 @@ class TestGemma4PerComponentQuantization:
 
         result = model.preprocess_weights(state_dict)
 
-        assert result["decoder.model.layers.0.self_attn.q_proj.weight"].shape == (
-            64,
-            4,
-            8,
-        )
-        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
-            32,
-            1,
-            32,
-        )
-        assert result["audio_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
-            32,
-            2,
-            4,
-        )
-        assert result["embedding.per_layer_model_projection.weight"].shape == (
-            32,
-            4,
-            16,
-        )
+        source_to_target = {
+            "model.language_model.layers.0.self_attn.q_proj": (
+                "decoder.model.layers.0.self_attn.q_proj"
+            ),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear": (
+                "vision_encoder.encoder.layers.0.self_attn.q_proj"
+            ),
+            "model.audio_tower.layers.0.self_attn.q_proj.linear": (
+                "audio_encoder.encoder.layers.0.self_attn.q_proj"
+            ),
+            "model.language_model.per_layer_model_projection": (
+                "embedding.per_layer_model_projection"
+            ),
+        }
+        for source, target in source_to_target.items():
+            for suffix in ("weight_qweight", "weight_scales"):
+                assert result[f"{target}.{suffix}"] is state_dict[f"{source}.{suffix}"]
+            assert f"{target}.weight" not in result
 
     def test_component_override_uses_same_layout_for_graph_and_weights(self):
         from mobius.tasks._gemma4 import Gemma4Task
@@ -624,7 +623,9 @@ class TestGemma4PerComponentQuantization:
         config = self._config()
         config.component_quantization["vision_encoder"] = vision_quantization
         model = Gemma4Model(config)
-        graph = Gemma4Task().build(model, config)["vision_encoder"].graph
+        task = Gemma4Task()
+        package = task.build(model, config)
+        graph = package["vision_encoder"].graph
 
         result = model.preprocess_weights(
             {
@@ -635,6 +636,9 @@ class TestGemma4PerComponentQuantization:
                     32, 1
                 ),
             }
+        )
+        result = normalize_component_quantized_weights(
+            result, model, config, package.keys(), task=task
         )
 
         assert self._layouts(graph) == {(8, 32)}

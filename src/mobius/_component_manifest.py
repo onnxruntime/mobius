@@ -74,7 +74,7 @@ class ComponentDescriptor:
             return self.source_paths
 
         local_parts = local_module_path.split(".")
-        candidates = [local_module_path]
+        candidates: list[str] = []
         for local_prefix, source_prefix in self.source_path_aliases:
             if local_module_path == local_prefix:
                 candidates.append(source_prefix)
@@ -89,9 +89,16 @@ class ComponentDescriptor:
             ]
             if anchor_indices:
                 for index in anchor_indices:
-                    suffix = local_parts[index + 1 :]
-                    candidates.append(".".join((*source_parts, *suffix)))
-        return tuple(dict.fromkeys(candidates))
+                    suffix_parts = local_parts[index + 1 :]
+                    candidates.append(".".join((*source_parts, *suffix_parts)))
+        if not candidates:
+            component_roots = {self.name, self.module_attribute_path.rsplit(".", 1)[-1]}
+            for source_path in self.source_paths:
+                if source_path.rsplit(".", 1)[-1] in component_roots:
+                    # Use the component root only if no alias or separate
+                    # source (such as a top-level output head) already owns it.
+                    candidates.append(f"{source_path}.{local_module_path}")
+        return tuple(dict.fromkeys((local_module_path, *candidates)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,7 +171,12 @@ def resolve_component_manifest(
             model_type or "",
             hf_config,
         )
-        raw_aliases = getattr(module_class, "HF_COMPONENT_MODULE_ALIASES", {})
+        alias_resolver = getattr(module_class, "get_hf_component_module_aliases", None)
+        raw_aliases = (
+            alias_resolver(model_type=model_type or "", hf_config=hf_config)
+            if alias_resolver is not None
+            else getattr(module_class, "HF_COMPONENT_MODULE_ALIASES", {})
+        )
         component_aliases = {
             name: tuple(aliases.items()) for name, aliases in raw_aliases.items()
         }
