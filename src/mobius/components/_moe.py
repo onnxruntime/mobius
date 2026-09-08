@@ -429,10 +429,15 @@ class MoELayer(nn.Module):
         assert config.num_experts_per_tok is not None
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        quantization = (
+            config.quantization_for("decoder")
+            if config.component_quantization is not None
+            else config.quantization
+        )
         self._qmoe_quantization = (
             None
             if getattr(config, "disable_qmoe", False)
-            else _supported_qmoe_quantization(config.quantization)
+            else _supported_qmoe_quantization(quantization)
         )
         # Clipped-SwiGLU attributes (QMoE's ``activation_alpha``/``activation_beta``/
         # ``swiglu_limit``). Left ``None`` by default so existing callers get a

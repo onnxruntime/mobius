@@ -390,7 +390,6 @@ def _parse_component_quantization_mapping(
     *,
     expert_dtype: object | None,
 ) -> dict[str, QuantizationConfig]:
-    """Parse an explicit component-name to quantization-config mapping."""
     if not isinstance(value, Mapping):
         raise TypeError(
             "component_quantization must be a mapping of component names to "
@@ -421,14 +420,12 @@ def _extract_component_quantization(
     parent_config: object | None,
     decoder_quantization: QuantizationConfig | None,
 ) -> dict[str, QuantizationConfig] | None:
-    """Extract explicit or nested per-component quantization metadata."""
+    """Extract authoritative explicit or nested component configurations."""
     sources = []
     for source in (parent_config, config):
         if source is not None and all(id(source) != id(item) for item in sources):
             sources.append(source)
 
-    # Explicit mapping is authoritative. Accept a top-level field or a
-    # ``components`` mapping nested in the traditional quantization_config.
     for source in sources:
         declaration = _get_config_value(source, "component_quantization")
         if declaration is None:
@@ -445,8 +442,6 @@ def _extract_component_quantization(
                 expert_dtype=_get_config_value(source, "expert_dtype"),
             )
 
-    # Composite checkpoints may instead put independent quantization_config
-    # dictionaries directly on their vision/audio sub-configs.
     composite = parent_config or config
     nested: dict[str, QuantizationConfig] = {}
     found_nested_declaration = False
@@ -500,8 +495,8 @@ class BaseModelConfig:
     # Model dtype (from HF config dtype)
     dtype: ir.DataType = ir.DataType.FLOAT
     quantization: QuantizationConfig | None = None
-    # ``None`` preserves the legacy model-wide quantization behavior. A mapping
-    # is authoritative: omitted components remain floating point.
+    # ``None`` keeps legacy model-wide behavior. A mapping is authoritative:
+    # omitted components remain floating point.
     component_quantization: dict[str, QuantizationConfig] | None = None
 
     # HuggingFace identity and token metadata used by package persistence.
@@ -512,7 +507,7 @@ class BaseModelConfig:
     diffusion_shift_logits: bool = False
 
     def quantization_for(self, component: str) -> QuantizationConfig | None:
-        """Return the effective quantization config for one package component."""
+        """Return the effective quantization plan for one package component."""
         if self.component_quantization is None:
             return self.quantization
         candidates = {

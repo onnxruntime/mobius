@@ -521,6 +521,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task = _resolve_static_cache_task(model_type)
         elif task is None:
             task = _default_task_for_model(model_type)
+        from mobius.tasks import get_task
+
+        resolved_task = get_task(task)
+        component_manifest = resolved_task.component_manifest(
+            module_class=module_class,
+            model_type=model_type,
+            hf_config=parent_config,
+        )
         model_module = module_class(config)
         attach_hf_component_sources(
             model_module,
@@ -535,10 +543,15 @@ def _cmd_build(args: argparse.Namespace) -> None:
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
+            component_manifest=component_manifest,
         )
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
+            from mobius._component_quantization import (
+                validate_quantized_component_bindings,
+            )
+
             _reject_unsupported_affine_qwen4(model_type, config)
             if compressed_tensors_config is not None:
                 # Packed FP4 weights cannot pass through ordinary apply_weights.
@@ -563,20 +576,28 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 )
             else:
                 state_dict = _load_weights_from_dir(config_path)
-                if hasattr(model_module, "preprocess_weights"):
-                    state_dict = model_module.preprocess_weights(state_dict)
+                from mobius.weights import adapt_model_weights
+
+                state_dict = adapt_model_weights(
+                    model_module,
+                    state_dict,
+                    config=config,
+                    manifest=component_manifest,
+                )
                 from mobius._component_quantization import (
-                    preprocess_component_quantized_state_dict,
+                    normalize_component_quantized_weights,
                 )
 
-                state_dict = preprocess_component_quantized_state_dict(
+                state_dict = normalize_component_quantized_weights(
                     state_dict,
                     model_module,
                     config,
-                    task,
                     pkg.keys(),
+                    manifest=component_manifest,
+                    task=resolved_task,
                 )
                 pkg.apply_weights(state_dict)
+            validate_quantized_component_bindings(pkg, config)
     else:
         model_id_or_path = args.model
         if static_cache_params is not None:
