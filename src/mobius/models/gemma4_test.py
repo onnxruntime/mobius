@@ -347,6 +347,65 @@ class TestGemma4EmbeddingModel:
         assert not hasattr(model, "_audio_token_id_mask")
 
 
+class TestGemma4PerLayerInputLayout:
+    @pytest.mark.parametrize(
+        ("execution_provider", "expected_rank"),
+        [("default", 3), ("openvino", 4)],
+    )
+    def test_layout_matches_execution_provider(self, execution_provider, expected_rank):
+        from mobius._builder import build_from_module
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=256,
+            num_kv_shared_layers=0,
+        )
+        package = build_from_module(
+            Gemma4Model(config),
+            config,
+            task=Gemma4Task(),
+            execution_provider=execution_provider,
+        )
+        decoder_input = next(
+            value
+            for value in package["decoder"].graph.inputs
+            if value.name == "per_layer_inputs"
+        )
+        embedding_output = next(
+            value
+            for value in package["embedding"].graph.outputs
+            if value.name == "per_layer_inputs"
+        )
+
+        assert len(decoder_input.shape) == expected_rank
+        assert len(embedding_output.shape) == expected_rank
+        if expected_rank == 4:
+            assert list(decoder_input.shape[-2:]) == [
+                config.num_hidden_layers,
+                config.hidden_size_per_layer_input,
+            ]
+            assert list(embedding_output.shape[-2:]) == [
+                config.num_hidden_layers,
+                config.hidden_size_per_layer_input,
+            ]
+            assert not any(
+                node.op_type == "Reshape"
+                and any(value is decoder_input for value in node.inputs if value is not None)
+                for node in package["decoder"].graph
+            )
+        else:
+            assert (
+                decoder_input.shape[-1]
+                == config.num_hidden_layers * config.hidden_size_per_layer_input
+            )
+            assert (
+                embedding_output.shape[-1]
+                == config.num_hidden_layers * config.hidden_size_per_layer_input
+            )
+
+
 class TestGemma4VisionQuantization:
     def test_quantize_vision_emits_matmulnbits_and_keeps_activation_clipping(self):
         from mobius.tasks._gemma4 import Gemma4Task

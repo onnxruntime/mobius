@@ -1325,6 +1325,42 @@ class TestGemma4Config:
         assert config.num_key_value_heads == 8
         assert config.num_global_key_value_heads == 2
 
+    def test_sparse_per_layer_head_dim_preserves_default(self):
+        from mobius._configs import Gemma4Config
+
+        config = type(
+            "FakeConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "num_hidden_layers": 5,
+                "vocab_size": 262144,
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "hidden_act": "silu",
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10_000.0,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "per_layer_config": {"04": {"head_dim": 512}},
+            },
+        )()
+
+        result = Gemma4Config.from_transformers(config)
+
+        assert result.head_dim == 256
+        assert result.global_head_dim == 512
+
     def test_unsupported_third_heterogeneous_layer_type_fails(self):
         from mobius._configs import Gemma4Config
 

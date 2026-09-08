@@ -945,6 +945,11 @@ class ArchitectureConfig(BaseModelConfig):
                 if isinstance(per_layer_config, dict)
                 else per_layer_config
             )
+        has_sparse_per_layer_config = (
+            isinstance(per_layer_config, dict)
+            and num_hidden_layers
+            and len(layer_configs) < num_hidden_layers
+        )
 
         def _per_layer_value(attribute: str) -> int | None:
             values = set()
@@ -976,10 +981,12 @@ class ArchitectureConfig(BaseModelConfig):
                 )
             return next(iter(values_by_layer_type["sliding_attention"]))
 
-        head_dim = _per_layer_value("head_dim")
+        head_dim = None if has_sparse_per_layer_config else _per_layer_value("head_dim")
         if head_dim is None:
             head_dim = getattr(config, "head_dim", None)
-        num_key_value_heads = _per_layer_value("num_key_value_heads")
+        num_key_value_heads = (
+            None if has_sparse_per_layer_config else _per_layer_value("num_key_value_heads")
+        )
         if num_key_value_heads is None:
             num_key_value_heads = getattr(config, "num_key_value_heads", None)
 

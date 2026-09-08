@@ -2310,15 +2310,18 @@ class Gemma4TextModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(op, input_ids)
 
-        # Unpack precomputed per_layer_inputs [B, S, L*D] (VLM split),
-        # or compute from input_ids (text-only single-model).
+        # Unpack flattened per_layer_inputs [B, S, L*D] when required by the EP,
+        # or consume the layered [B, S, L, D] representation directly.
         per_layer_list: list[ir.Value] | None = None
         if self._per_layer_dim and per_layer_inputs is not None:
-            # VLM split: unpack precomputed per-layer inputs
             num_layers = len(self.layers)
-            per_layer_4d = op.Reshape(
-                per_layer_inputs,
-                op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
+            per_layer_4d = (
+                per_layer_inputs
+                if ep_capabilities().layered_per_layer_inputs
+                else op.Reshape(
+                    per_layer_inputs,
+                    op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
+                )
             )
             per_layer_list = [
                 op.Squeeze(op.Slice(per_layer_4d, starts=[i], ends=[i + 1], axes=[2]), [2])
@@ -2780,8 +2783,9 @@ class _Gemma4DecoderModel(nn.Module):
 
     When ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B), per-layer input
     embeddings are precomputed by the embedding sub-model and passed as
-    ``per_layer_inputs`` (shape ``[B, S, L*D]``).  The decoder unpacks them
-    and feeds one ``[B, S, D]`` slice to each decoder layer's gating mechanism.
+    ``per_layer_inputs``: flattened ``[B, S, L*D]`` by default, or layered
+    ``[B, S, L, D]`` when requested by the execution provider. The decoder feeds
+    one ``[B, S, D]`` slice to each decoder layer's gating mechanism.
     """
 
     def __init__(self, config: Gemma4Config):
@@ -2946,6 +2950,9 @@ class Gemma4EmbeddingModel(nn.Module):
     Outputs:
     - ``inputs_embeds [B, S, hidden_size]``
     - ``per_layer_inputs [B, S, L*D]`` (only when ``hidden_size_per_layer_input > 0``)
+
+    Execution providers with ``layered_per_layer_inputs`` enabled keep the last
+    two output dimensions separate as ``[B, S, L, D]``.
     """
 
     def __init__(self, config: Gemma4Config):
@@ -3105,13 +3112,16 @@ class Gemma4EmbeddingModel(nn.Module):
             op.Constant(value_ints=[0, 0, self._num_layers, self._per_layer_dim]),
         )
 
-        # 4. Combine: (proj + emb) * 0.707 per layer, then flatten back
+        # 4. Combine: (proj + emb) * 0.707 per layer.
         combined = op.Add(proj, fused_emb)  # [B, S, L, D]
         combined = op.Mul(combined, float(0.5**0.5))
-        # Flatten L*D → single per_layer_inputs output: [B, S, L*D]
-        per_layer_inputs = op.Reshape(
-            combined,
-            op.Constant(value_ints=[0, 0, self._num_layers * self._per_layer_dim]),
+        per_layer_inputs = (
+            combined
+            if ep_capabilities().layered_per_layer_inputs
+            else op.Reshape(
+                combined,
+                op.Constant(value_ints=[0, 0, self._num_layers * self._per_layer_dim]),
+            )
         )
         outputs["per_layer_inputs"] = per_layer_inputs
 

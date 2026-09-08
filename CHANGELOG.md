@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gemma4, Qwen3.5/QMoE, and T5 adapters preserve their architecture-specific
   rename, tied-weight, and expert-packing semantics while handing independently
   routed component sidecars to the generic codec and binding validator.
+- OpenVINO Gemma4 exports keep the layer and projection dimensions separate in
+  `per_layer_inputs` between the embedding and decoder components. Other
+  execution providers retain the existing flattened layout.
+
+#### Fixed
+
+- Sparse per-layer configuration dictionaries preserve the default attention
+  head dimension and KV-head count instead of replacing them with overrides
+  declared for only a subset of layers.
 
 ### Packed fused MoE experts (Olive/GPTQ/AWQ) survive HF weight renaming
 
