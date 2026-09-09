@@ -539,9 +539,7 @@ class T5ForConditionalGeneration(nn.Module):
     }
 
     @staticmethod
-    def get_hf_component_module_aliases(
-        *, model_type: str, hf_config: object
-    ) -> dict[str, dict[str, str]]:
+    def get_hf_component_module_aliases(*, hf_config: object) -> dict[str, dict[str, str]]:
         num_layers = getattr(hf_config, "num_hidden_layers", None)
         if num_layers is None:
             num_layers = getattr(hf_config, "num_layers", 0)

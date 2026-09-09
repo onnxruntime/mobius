@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Fixed
 
+- Dynamic component source resolvers use the available HuggingFace model type
+  instead of receiving an empty identifier. Configs without a model type retain
+  static component metadata and config-based aliases, including T5 layer mappings.
 - Split tied tables already materialized by a model adapter load into their
   quantized embedding and LM-head targets instead of being rejected solely
   because the checkpoint declares tied weights.

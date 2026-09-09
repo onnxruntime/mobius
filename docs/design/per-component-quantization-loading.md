@@ -164,6 +164,12 @@ Every consumer uses the same manifest:
 An unresolved component is a typed error. Consumers must not independently
 guess aliases or state-dict prefixes.
 
+Dynamic `get_hf_component_sources(model_type=..., hf_config=...)` hooks use the
+explicit model type, or `hf_config.model_type` when it is not supplied. If neither
+is available, the dynamic hook is skipped without guessing static source paths.
+Classes without a dynamic hook still publish their `HF_COMPONENT_SOURCES` for
+manually constructed configs that omit the model type.
+
 ### Mapping local module paths to HuggingFace names
 
 Quantizer metadata names runtime HuggingFace modules, while graph construction
@@ -184,8 +190,10 @@ their own mapping.
 Component-owned source roots also prefix local descendants without a shared
 anchor segment, such as T5's `encoder` and `decoder` stacks. Models can publish
 static `HF_COMPONENT_MODULE_ALIASES` or implement
-`get_hf_component_module_aliases(model_type=..., hf_config=...)` when aliases
+`get_hf_component_module_aliases(hf_config=...)` when aliases
 depend on configuration, such as distinct encoder and decoder layer counts.
+These config-based aliases do not require a model type and remain available
+for manually constructed T5 configs.
 An existing alias or separately declared source takes precedence over
 synthesizing a component-root name; a top-level `lm_head` must not also become
 `decoder.lm_head` for rule matching.

@@ -139,12 +139,15 @@ class ComponentManifest(Mapping[str, ComponentDescriptor]):
 
 def get_hf_component_sources(
     module_class: type,
-    model_type: str,
+    model_type: str | None,
     hf_config: object,
 ) -> dict[str, tuple[str, ...]]:
-    """Read runtime HuggingFace component paths from a registered model class."""
+    """Read component paths, invoking dynamic hooks only with a known model type."""
     resolver = getattr(module_class, "get_hf_component_sources", None)
     if resolver is not None:
+        model_type = model_type or getattr(hf_config, "model_type", None)
+        if not model_type:
+            return {}
         resolved = resolver(model_type=model_type, hf_config=hf_config)
     else:
         resolved = getattr(module_class, "HF_COMPONENT_SOURCES", {})
@@ -168,12 +171,12 @@ def resolve_component_manifest(
     if module_class is not None and hf_config is not None:
         component_sources = get_hf_component_sources(
             module_class,
-            model_type or "",
+            model_type,
             hf_config,
         )
         alias_resolver = getattr(module_class, "get_hf_component_module_aliases", None)
         raw_aliases = (
-            alias_resolver(model_type=model_type or "", hf_config=hf_config)
+            alias_resolver(hf_config=hf_config)
             if alias_resolver is not None
             else getattr(module_class, "HF_COMPONENT_MODULE_ALIASES", {})
         )

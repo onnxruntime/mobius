@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -12,6 +13,7 @@ import pytest
 from mobius._component_manifest import (
     ComponentDescriptor,
     ComponentManifest,
+    get_hf_component_sources,
     resolve_component_manifest,
 )
 from mobius.tasks import ComponentSpec
@@ -44,11 +46,12 @@ class _Model:
     }
 
 
-def test_manifest_combines_task_and_model_metadata():
+@pytest.mark.parametrize("model_type", ["test", None, ""])
+def test_manifest_combines_task_and_model_metadata(model_type):
     manifest = resolve_component_manifest(
         _Task(),
         module_class=_Model,
-        model_type="test",
+        model_type=model_type,
         hf_config=object(),
     )
 
@@ -67,23 +70,75 @@ def test_manifest_combines_task_and_model_metadata():
     )
 
 
-def test_dynamic_source_resolver_is_authoritative():
-    class _DynamicModel:
+@pytest.mark.parametrize(
+    ("model_type", "hf_model_type"),
+    [("dynamic", None), ("dynamic", "other"), (None, "dynamic"), ("", "dynamic")],
+)
+def test_dynamic_source_resolver_is_authoritative(model_type, hf_model_type):
+    config = SimpleNamespace(model_type=hf_model_type)
+
+    class _DynamicModel(_Model):
         @classmethod
         def get_hf_component_sources(cls, *, model_type, hf_config):
             assert model_type == "dynamic"
-            assert hf_config == "config"
+            assert hf_config is config
             return {"decoder": ("resolved.decoder",)}
 
     manifest = resolve_component_manifest(
         _Task(),
         module_class=_DynamicModel,
-        model_type="dynamic",
-        hf_config="config",
+        model_type=model_type,
+        hf_config=config,
     )
 
     assert manifest["decoder"].source_paths == ("resolved.decoder",)
     assert manifest["vision_encoder"].source_paths == ()
+    assert get_hf_component_sources(_DynamicModel, model_type, config) == {
+        "decoder": ("resolved.decoder",)
+    }
+
+
+@pytest.mark.parametrize("model_type", [None, ""])
+@pytest.mark.parametrize(
+    "hf_config", [object(), SimpleNamespace(model_type=None), SimpleNamespace(model_type="")]
+)
+def test_dynamic_source_resolver_is_skipped_without_model_type(model_type, hf_config):
+    class _DynamicModel(_Model):
+        @classmethod
+        def get_hf_component_sources(cls, *, model_type, hf_config):
+            pytest.fail("Dynamic source resolution requires a known model type")
+
+    manifest = resolve_component_manifest(
+        _Task(),
+        module_class=_DynamicModel,
+        model_type=model_type,
+        hf_config=hf_config,
+    )
+
+    assert all(not component.source_paths for component in manifest.values())
+    assert get_hf_component_sources(_DynamicModel, model_type, hf_config) == {}
+
+
+def test_config_based_alias_resolver_does_not_require_model_type():
+    config = object()
+
+    class _DynamicAliasModel(_Model):
+        @classmethod
+        def get_hf_component_module_aliases(cls, *, hf_config):
+            assert hf_config is config
+            return {"decoder": {"blocks": "model.layers"}}
+
+    manifest = resolve_component_manifest(
+        _Task(),
+        module_class=_DynamicAliasModel,
+        hf_config=config,
+    )
+
+    assert manifest["decoder"].source_module_names("blocks.0.q_proj") == (
+        "blocks.0.q_proj",
+        "model.layers.0.q_proj",
+    )
+    assert manifest["vision_encoder"].source_path_aliases == ()
 
 
 def test_descriptor_maps_local_path_to_huggingface_source_name():
@@ -129,7 +184,8 @@ def test_explicit_alias_takes_precedence_over_component_root_synthesis():
     assert descriptor.source_module_names("output") == ("output", "lm_head")
 
 
-def test_t5_aliases_follow_encoder_and_decoder_layer_counts():
+@pytest.mark.parametrize("model_type", ["t5", None, ""])
+def test_t5_aliases_follow_encoder_and_decoder_layer_counts(model_type):
     from mobius._configs import ArchitectureConfig
     from mobius.models.t5 import T5ForConditionalGeneration
     from mobius.tasks import get_task
@@ -138,7 +194,7 @@ def test_t5_aliases_follow_encoder_and_decoder_layer_counts():
     manifest = resolve_component_manifest(
         get_task("seq2seq"),
         module_class=T5ForConditionalGeneration,
-        model_type="t5",
+        model_type=model_type,
         hf_config=config,
     )
 
