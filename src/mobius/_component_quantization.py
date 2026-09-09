@@ -665,13 +665,6 @@ def normalize_component_quantized_weights(
                     f"Packed expert weight {record.name!r} requires a "
                     "component-specific QMoE weight adapter."
                 )
-            if component_quantization.tie_word_embeddings and any(
-                token in record.name for token in ("embed_tokens", "lm_head")
-            ):
-                raise NotImplementedError(
-                    f"Tied packed table {record.name!r} requires a "
-                    "component-specific tied-weight adapter."
-                )
             local_path = _local_weight_module_path(record.name, descriptor)
             local_module = (
                 _resolve_module(component_module, local_path)
@@ -702,6 +695,13 @@ def normalize_component_quantized_weights(
                     f"in component {component!r}"
                 )
             if not isinstance(local_module, (QuantizedLinear, QuantizedEmbedding)):
+                if quantization.tie_word_embeddings and any(
+                    token in record.name for token in ("embed_tokens", "lm_head")
+                ):
+                    raise NotImplementedError(
+                        f"Tied packed table {record.name!r} requires a "
+                        "component-specific tied-weight adapter."
+                    )
                 raise TypeError(
                     f"Packed checkpoint weight {record.name!r} targets a "
                     f"module unsupported by the affine codec: {type(local_module).__name__}"
@@ -790,11 +790,13 @@ def preprocess_component_quantized_state_dict(
     state_dict: dict[str, torch.Tensor],
     module: nn.Module,
     config: BaseModelConfig,
-    task: ModelTask | str | None,
+    task: ModelTask | str,
     package_components: Iterable[str],
 ) -> dict[str, torch.Tensor]:
-    """Compatibility wrapper for normalize_component_quantized_weights."""
-    resolved_task = get_task(task) if task is not None else None
+    """Normalize component weights with an explicit task ownership contract."""
+    if task is None:
+        raise ValueError("task must be provided to normalize component quantized weights")
+    resolved_task = get_task(task)
     return normalize_component_quantized_weights(
         state_dict,
         module,

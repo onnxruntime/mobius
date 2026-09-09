@@ -84,10 +84,10 @@ class QuantizationConfig:
     # RTN records this in its own config (``tie_word_embeddings``) and may clear
     # the model's top-level flag, so it is tracked here independently.
     tie_word_embeddings: bool = False
-    # HuggingFace full module names or ``re:``-prefixed full-match regexes that
-    # remain floating point inside this component.
+    # Full HuggingFace module paths (including descendants) or ``re:``-prefixed
+    # full-match regexes that remain floating point inside this component.
     modules_to_not_convert: tuple[str, ...] = ()
-    # Literal HuggingFace module names or ``re:``-prefixed full-match regexes.
+    # The same path/regex matching rules apply to per-module overrides.
     # Insertion order is significant: the first matching override wins.
     overrides: dict[str, QuantizationOverride] = dataclasses.field(default_factory=dict)
 
@@ -229,20 +229,10 @@ class QuantizationConfig:
         return bool(self.modules_to_not_convert) or bool(self.overrides)
 
     @staticmethod
-    def _matches_exclusion(pattern: str, module_name: str) -> bool:
+    def _matches_module(pattern: str, module_name: str) -> bool:
         if pattern.startswith("re:"):
             return _compile_pattern(pattern[3:]).fullmatch(module_name) is not None
-        return pattern in module_name
-
-    @staticmethod
-    def _matches_override(pattern: str, module_name: str) -> bool:
-        if pattern.startswith("re:"):
-            return _compile_pattern(pattern[3:]).fullmatch(module_name) is not None
-        return (
-            pattern == module_name
-            or module_name.startswith(f"{pattern}.")
-            or pattern in module_name
-        )
+        return pattern == module_name or module_name.startswith(f"{pattern}.")
 
     def for_module(
         self,
@@ -250,14 +240,14 @@ class QuantizationConfig:
     ) -> QuantizationConfig | None:
         """Return this component's effective layout for one source module."""
         if any(
-            self._matches_exclusion(pattern, module_name)
+            self._matches_module(pattern, module_name)
             for pattern in self.modules_to_not_convert
             for module_name in source_module_names
         ):
             return None
         for pattern, override in self.overrides.items():
             if any(
-                self._matches_override(pattern, module_name)
+                self._matches_module(pattern, module_name)
                 for module_name in source_module_names
             ):
                 return override.apply(self)

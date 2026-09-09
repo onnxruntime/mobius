@@ -46,8 +46,8 @@ from mobius.components import (
     Embedding,
     LayerNorm,
     Linear,
-    QuantizedEmbedding,
     RMSNorm,
+    ScaledQuantizedEmbedding,
     ScaleFreeRMSNorm,
     create_attention_bias,
     initialize_rope,
@@ -406,41 +406,13 @@ class Gemma4ScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
         return op.Mul(embeddings, scale)
 
 
-class Gemma4ScaledQuantizedWordEmbedding(QuantizedEmbedding):
+class Gemma4ScaledQuantizedWordEmbedding(ScaledQuantizedEmbedding):
     """GatherBlockQuantized token embedding scaled by ``embed_scale``.
 
     Quantized counterpart of :class:`Gemma3TextScaledWordEmbedding`: the packed
     embedding rows are gathered and dequantized by ``GatherBlockQuantized`` and
     then multiplied by the Gemma ``sqrt(hidden_size)`` (or per-layer) scale.
     """
-
-    def __init__(
-        self,
-        num_embeddings: int,
-        embedding_dim: int,
-        padding_idx: int,
-        embed_scale: float = 1.0,
-        *,
-        bits: int = 4,
-        block_size: int = 32,
-        has_zero_point: bool = True,
-    ):
-        super().__init__(
-            num_embeddings,
-            embedding_dim,
-            bits=bits,
-            block_size=block_size,
-            has_zero_point=has_zero_point,
-            padding_idx=padding_idx,
-        )
-        self.embed_scale = embed_scale
-
-    def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
-        embeddings = super().forward(op, input_ids)
-        scale = op.Constant(
-            value=ir.tensor(np.asarray(self.embed_scale, dtype=self.scales.dtype.numpy()))
-        )
-        return op.Mul(embeddings, scale)
 
 
 def _dtype_safe_compress(
@@ -3449,8 +3421,8 @@ class Gemma4Model(nn.Module):
         },
         "embedding": {
             "embed_tokens": "model.language_model.embed_tokens",
-            "embed_tokens_per_layer": ("model.language_model.embed_tokens_per_layer"),
-            "per_layer_model_projection": ("model.language_model.per_layer_model_projection"),
+            "embed_tokens_per_layer": "model.language_model.embed_tokens_per_layer",
+            "per_layer_model_projection": "model.language_model.per_layer_model_projection",
         },
     }
 

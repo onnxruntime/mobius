@@ -40,7 +40,6 @@ class ModelWeightAdapter(Protocol):
         context: WeightAdapterContext,
     ) -> dict[str, torch.Tensor]:
         """Return semantically aligned weights without format normalization."""
-        ...
 
 
 def adapt_model_weights(

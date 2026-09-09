@@ -14,6 +14,7 @@ from onnxscript import nn
 from mobius._component_quantization import (
     configure_component_quantization,
     normalize_component_quantized_weights,
+    preprocess_component_quantized_state_dict,
     validate_quantized_component_bindings,
 )
 from mobius._configs import ArchitectureConfig, QuantizationConfig
@@ -212,6 +213,39 @@ class _SingleTask(ModelTask):
         raise NotImplementedError
 
 
+@pytest.mark.parametrize("component_plan", [None, {}, {"model": QuantizationConfig()}])
+def test_compatibility_normalizer_requires_an_explicit_task(component_plan):
+    with pytest.raises(ValueError, match="task must be provided"):
+        preprocess_component_quantized_state_dict(
+            {},
+            _Projection(),
+            ArchitectureConfig(component_quantization=component_plan),
+            None,
+            ("model",),
+        )
+
+
+@pytest.mark.parametrize("task", ["text-generation", _SingleTask()])
+def test_compatibility_normalizer_accepts_task_names_and_instances(task):
+    module = _Projection()
+    quantization = QuantizationConfig(bits=4, group_size=16, quant_method="olive")
+    config = ArchitectureConfig(component_quantization={"model": quantization})
+    configure_component_quantization(module, config, task)
+    packed = torch.arange(1024).reshape(32, 32).to(torch.uint8)
+    scales = torch.ones(32, 4)
+
+    result = preprocess_component_quantized_state_dict(
+        {"proj.weight_qweight": packed, "proj.weight_scales": scales},
+        module,
+        config,
+        task,
+        ("model",),
+    )
+
+    torch.testing.assert_close(result["proj.weight"], packed.reshape(32, 4, 8))
+    assert result["proj.scales"] is scales
+
+
 class _QuantizedEmbeddingModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -228,6 +262,36 @@ class _QuantizedEmbeddingModel(nn.Module):
             bits=4,
             block_size=16,
             has_zero_point=False,
+        )
+
+
+def test_unmaterialized_tied_head_still_requires_an_adapter():
+    from mobius.components import TiedQuantizedLMHead
+
+    module = _QuantizedEmbeddingModel()
+    module.lm_head = TiedQuantizedLMHead(module.embed_tokens, 64, 32)
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        quantize_embeddings=True,
+        quantize_lm_head=True,
+        tie_word_embeddings=True,
+    )
+    config = ArchitectureConfig(component_quantization={"model": quantization})
+    task = _SingleTask()
+    configure_component_quantization(module, config, task)
+
+    with pytest.raises(NotImplementedError, match="component-specific tied-weight adapter"):
+        preprocess_component_quantized_state_dict(
+            {
+                "lm_head.weight_qweight": torch.zeros(32, 32, dtype=torch.uint8),
+                "lm_head.weight_scales": torch.ones(32, 4),
+            },
+            module,
+            config,
+            task,
+            ("model",),
         )
 
 

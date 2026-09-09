@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Fixed
 
+- Split tied tables already materialized by a model adapter load into their
+  quantized embedding and LM-head targets instead of being rejected solely
+  because the checkpoint declares tied weights.
+- Literal quantization exclusions and overrides respect module-path boundaries
+  rather than accidentally matching similarly named layers or unrelated paths.
+- The compatibility weight normalizer requires an explicit task and reports a
+  clear error if it is missing.
 - Raw GPTQ/AWQ scales are no longer mistaken for already-normalized parameters.
   Canonical detection requires a complete group with the target layout, and
   zero-point requirements follow each projection's effective symmetry.

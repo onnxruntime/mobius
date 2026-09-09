@@ -226,6 +226,10 @@ class ComponentQuantizationPlan:
 `modules_to_not_convert` is evaluated for each candidate HuggingFace module
 name while the component is constructed. A matching module remains a normal
 `Linear`; other eligible projections use the component's packed layout.
+Literal exclusions and overrides match the complete module path or a
+dot-separated descendant, never an arbitrary substring: `model.layers.1`
+matches `model.layers.1.self_attn` but not `model.layers.10`. Patterns prefixed
+with `re:` continue to use full-match regular expressions.
 Different packed layouts inside one component require per-module overrides and
 must be represented explicitly rather than inferred from a root plan.
 

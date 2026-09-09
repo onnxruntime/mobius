@@ -39,7 +39,6 @@ class QuantizationCodec(Protocol):
         config: QuantizationConfig,
     ) -> WeightBundle:
         """Group checkpoint sidecars into typed logical records."""
-        ...
 
     def normalize(
         self,
@@ -49,7 +48,6 @@ class QuantizationCodec(Protocol):
         kind: Literal["linear", "embedding"] = "linear",
     ) -> dict[str, torch.Tensor]:
         """Convert one packed record to Mobius's canonical parameter layout."""
-        ...
 
 
 class QuantizationCodecRegistry:

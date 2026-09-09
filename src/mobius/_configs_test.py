@@ -1091,6 +1091,37 @@ class TestQuantizationConfig:
                 }
             )
 
+    @pytest.mark.parametrize("rule", ["exclusion", "override"])
+    @pytest.mark.parametrize(
+        ("module_name", "matches"),
+        [
+            ("model.layers.1", True),
+            ("model.layers.1.self_attn.q_proj", True),
+            ("model.layers.10.self_attn.q_proj", False),
+            ("model.layers.1_extra", False),
+            ("other.model.layers.1.self_attn.q_proj", False),
+        ],
+    )
+    def test_literal_module_rules_respect_path_boundaries(self, rule, module_name, matches):
+        policy = (
+            {"modules_to_not_convert": ["model.layers.1"]}
+            if rule == "exclusion"
+            else {"overrides": {"model.layers.1": {"bits": 8, "group_size": 64}}}
+        )
+        qc = QuantizationConfig.from_value(
+            {"quant_method": "olive", "bits": 4, "group_size": 32, **policy}
+        )
+        assert qc is not None
+
+        resolved = qc.for_module((module_name,))
+
+        if rule == "exclusion" and matches:
+            assert resolved is None
+        else:
+            assert resolved is not None
+            expected = (8, 64) if matches else (4, 32)
+            assert (resolved.bits, resolved.group_size) == expected
+
     def test_architecture_config_parses_explicit_component_quantization(self):
         text = SimpleNamespace(
             model_type="llama",

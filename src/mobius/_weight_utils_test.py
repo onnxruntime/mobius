@@ -11,6 +11,7 @@ import torch
 from mobius._configs import QuantizationConfig
 from mobius._weight_utils import (
     is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
@@ -28,6 +29,43 @@ from mobius._weight_utils import (
     vlm_embedding_weights,
     vlm_vision_weights,
 )
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("float_head", NotImplementedError, "requires quantize_lm_head=True"),
+        ("different_layout", ValueError, "must use the same quantization layout"),
+        ("missing_scales", ValueError, "missing Olive sidecars"),
+    ],
+)
+def test_split_tied_table_rejects_unsupported_materialization(case, error, message):
+    embedding = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_embeddings=True
+    )
+    head = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_lm_head=True
+    )
+    state_dict = {
+        "embedding.embed_tokens.weight_qweight": torch.zeros(32, 8, dtype=torch.uint8),
+        "embedding.embed_tokens.weight_scales": torch.ones(32, 1),
+    }
+    if case == "float_head":
+        head.quantize_lm_head = False
+    elif case == "different_layout":
+        head.bits = 8
+    else:
+        del state_dict["embedding.embed_tokens.weight_scales"]
+
+    with pytest.raises(error, match=message):
+        materialize_split_tied_olive_lm_head(
+            state_dict,
+            embed_key="embedding.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+            embedding_quantization=embedding,
+            head_quantization=head,
+        )
+    assert "decoder.lm_head.weight_qweight" not in state_dict
 
 
 class TestSplitFusedQKV:
