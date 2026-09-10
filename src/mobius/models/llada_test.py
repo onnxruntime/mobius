@@ -324,7 +324,7 @@ def test_diffusion_moe_graph_executes_without_cache(model_class, norm_topk_prob)
     import onnx_ir as ir
     import onnxruntime as ort
 
-    from mobius.rewrite_rules._testing_utils import fill_random_weights
+    from mobius._testing.model import fill_random_weights
 
     config = dataclasses.replace(
         _make_config(),

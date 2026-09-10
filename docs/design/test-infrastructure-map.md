@@ -70,7 +70,7 @@ Last Updated: 2025-03-09
 | **GGUF Integration** | 19 | 91 | `_builder_core_test.py`, `_builder_architectures_test.py`, `_builder_contracts_test.py`, `_reader_test.py` (26M) |
 | **Testing Utilities** | 9 | 55 | `golden_test.py` (28M), `parity_test.py` (11M), `code_paths_test.py` (16M) |
 | **Tasks Framework** | 15 | 81 | `_task_test.py` (15 classes, 81 methods — core model building logic) |
-| **Other** | 27 | 61 | ORT GenAI auto_export_test (integration marker), rewrite rules (bias/gelu/layer_norm fusion, etc.) |
+| **Other** | 27 | 61 | ORT GenAI auto_export_test and graph-finalization coverage |
 
 **Total: 204 test classes, 1003 test methods in src/**
 

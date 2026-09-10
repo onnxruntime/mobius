@@ -162,7 +162,7 @@ class TestFp8KvCacheGraph:
     def test_ignored_and_warns_on_non_fp8_ep_with_gqa(self):
         """GQA-active but non-FP8 EP (CPU/float32) must NOT emit FP8 KV I/O.
 
-        Regression: fp8_kv_cache was previously applied whenever GQA fusion was
+        Regression: fp8_kv_cache was previously applied whenever GQA was
         active, which includes CPU (gqa_dtypes={FLOAT}) — an EP without the FP8
         GQA kernel — producing models that can't load/run.
         """

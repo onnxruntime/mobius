@@ -276,7 +276,7 @@ class TestCLIBuild:
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         assert pkg.save.call_args.kwargs["max_workers"] == 1
 
@@ -1076,7 +1076,7 @@ class TestCLIBuildRuntime:
         with mock.patch(
             "mobius.integrations.ort_genai.write_ort_genai_config"
         ) as config_writer:
-            _save_package(pkg, str(tmp_path), args, None, None)
+            _save_package(pkg, str(tmp_path), args, None)
 
         pkg.save.assert_called_once()
         config_writer.assert_called_once()
@@ -1184,7 +1184,7 @@ class TestCLIBuildRuntime:
                 return_value={},
             ) as vlm_writer,
         ):
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         vlm_writer.assert_called_once_with(
             pkg,
@@ -1219,7 +1219,7 @@ class TestCLIBuildRuntime:
                 return_value={},
             ) as writer,
         ):
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         assert writer.call_args.kwargs["guidance_scale"] == pytest.approx(6.0)
         assert writer.call_args.kwargs["revision"] == "pinned-revision"
@@ -1254,7 +1254,7 @@ class TestCLIBuildRuntime:
                 return_value={},
             ) as writer,
         ):
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         assert writer.call_args.kwargs["revision"] == (
             "edc39f80f5cae656da37baf8faa8f5502bf7081f"
@@ -1290,7 +1290,7 @@ class TestCLIBuildRuntime:
             ) as vlm_writer,
             pytest.raises(SystemExit, match=r"regenerate.*register"),
         ):
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         vlm_writer.assert_called_once_with(
             pkg,

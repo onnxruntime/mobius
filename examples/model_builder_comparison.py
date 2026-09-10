@@ -112,8 +112,8 @@ _OP_CATALOG: list[tuple[str, str, str]] = [
         "RotaryEmbedding",
         "RotaryEmbedding",
         (
-            "RoPE kept explicit (default EP) or after SeparateRoPE lowering (DML). "
-            "Absent when fused into GQA (cuda)."
+            "RoPE stays explicit on standard-Attention paths and is absent when "
+            "the builder emits GQA with internal rotation."
         ),
     ),
     (

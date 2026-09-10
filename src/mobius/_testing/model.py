@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Shared test utilities for rewrite rule tests."""
+"""Shared ONNX model test utilities."""
 
 from __future__ import annotations
 

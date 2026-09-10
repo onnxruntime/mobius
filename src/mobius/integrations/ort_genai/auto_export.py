@@ -1530,8 +1530,8 @@ def _write_genai_config(
     # requires past_present_share_buffer=true" otherwise).
     #
     # Hybrid models mix LinearAttention layers with full-attention layers,
-    # which may lower to GQA *or* to the standard (non-GQA) ``Attention`` op
-    # depending on EP/dtype (e.g. the CPU EP only lowers to GQA for fp32;
+    # which may emit GQA *or* the standard (non-GQA) ``Attention`` op
+    # depending on EP/dtype (e.g. the CPU EP emits GQA only for fp32;
     # fp16 falls back to standard Attention -- see ``_execution_providers.py``
     # ``gqa_dtypes``). If a hybrid graph has LinearAttention but its
     # full-attention layers are still standard (non-GQA) Attention, forcing
@@ -1541,7 +1541,7 @@ def _write_genai_config(
     # generation time with an ``attn_mask``/``total_sequence_length``
     # mismatch rather than at load time. Rather than silently emit a broken
     # config, raise a clear error so the caller picks an EP/dtype combination
-    # (e.g. fp32 on CPU) that lowers full attention to GQA.
+    # (e.g. fp32 on CPU) that directly emits GQA.
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
         has_gqa = any(

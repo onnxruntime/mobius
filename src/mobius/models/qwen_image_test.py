@@ -242,7 +242,7 @@ def test_all_supported_dtypes_build(dtype: ir.DataType):
     assert not any(node.op_type == "Identity" for node in model.graph)
 
 
-def test_transformer_graph_is_fused_and_post_weight_optimized():
+def test_transformer_graph_preserves_downstream_fusions_and_folds_weights():
     from collections import Counter
 
     from mobius import build_from_module
@@ -272,7 +272,8 @@ def test_transformer_graph_is_fused_and_post_weight_optimized():
     # across image/text streams and transformer blocks.
     assert counts["Swish"] == 2
     assert counts["Sigmoid"] == 0
-    assert counts["SkipLayerNormalization"] == 6
+    assert counts["SkipLayerNormalization"] == 0
+    assert counts["LayerNormalization"] == 8
     assert counts["Gelu"] == 3
     assert counts["Identity"] == 0
     assert counts["Attention"] == config.num_layers
@@ -450,21 +451,17 @@ def test_edit_vae_skips_temporal_convolutions_for_single_frame_images():
 
 
 @pytest.mark.parametrize("part", ["encoder", "decoder"])
-def test_edit_vae_bfloat16_graph_has_only_kernel_backed_ops(part):
-    """bfloat16 VAE graphs must avoid ops onnxruntime has no bfloat16 kernel for.
+def test_edit_vae_bfloat16_graph_avoids_unsafe_exporter_ops(part):
+    """bfloat16 VAE graphs avoid unsafe ops that are controlled during export.
 
-    onnxruntime ships no bfloat16 ``ReduceL2``, ``Resize`` or ``Clip`` kernel on
-    any execution provider, and a single unassignable node aborts session
-    creation outright. The RMS norm reduces in float32, ``Resize`` is sandwiched
-    between casts, and the bfloat16 lowering pass rewrites ``Clip`` into
-    ``Min``/``Max``, so no bfloat16-typed instance of those ops may survive.
+    Clip lowering is a downstream Olive responsibility.
     """
     from mobius._optimizations import optimize_model
 
     package = _temporal_vae(ir.DataType.BFLOAT16)[2]
     model = package[part]
     optimize_model(model, ep="cuda", dtype=ir.DataType.BFLOAT16, model_role="encoder")
-    unsupported = {"ReduceL2", "Resize", "Clip"}
+    unsupported = {"ReduceL2", "Resize"}
     offenders = [
         node.op_type
         for node in ir.traversal.RecursiveGraphIterator(model.graph)

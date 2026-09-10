@@ -203,12 +203,12 @@ class TextModel(nn.Module):
         #  - EP gqa_dtypes: EP must declare GQA support for the build dtype (cuda/f16,
         #    cpu/f32, etc.). Default EP has gqa_dtypes={} so GQA is never emitted.
         #  - supports_fused_rope: EP must handle do_rotary=1 inside GQA. DML has
-        #    gqa_dtypes={FLOAT16} but supports_fused_rope=False, so it uses the
-        #    RotaryAttentionToGQA rewrite + SeparateRoPE path instead.
+        #    gqa_dtypes={FLOAT16} but supports_fused_rope=False, so it retains
+        #    standard ONNX Attention for downstream optimization.
         #  - BaseRope (not _MRopeBase): standard 1D RoPE tables are required.
         #    _MRopeBase subclasses (ChunkedMRope for Qwen2.5-VL, InterleavedMRope for
         #    Qwen3-VL/Qwen3.5) use 3D position_ids; GQA do_rotary=1 only implements 1D
-        #    RoPE, so those models must fall through to the RotaryAttentionToGQA rule.
+        #    RoPE, so those models retain standard ONNX Attention.
         caps = ep_capabilities()
         dtype = get_build_dtype()
         use_gqa = (

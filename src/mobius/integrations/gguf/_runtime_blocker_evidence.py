@@ -201,7 +201,7 @@ _NEMOTRON_H_MOE_30B_IQ2_XXS = GGUFRuntimeBlockerEvidence(
     experts_per_token=6,
     layer_counts=(("full_attention", 6), ("mamba2", 23), ("moe", 23)),
     pre_optimization_graph_node_count=40_167,
-    graph_node_count=37_142,
+    graph_node_count=37_194,
     graph_initializer_count=6_255,
     graph_matmul_count=6_028,
     state_slots=(
@@ -222,7 +222,7 @@ _NEMOTRON_H_MOE_30B_IQ2_XXS = GGUFRuntimeBlockerEvidence(
             "float16/float32 weights require 63,155,880,576/126,311,761,152 bytes."
         ),
         (
-            "The normal optimized CPU export has 37,142 nodes (40,167 before Mobius "
+            "The normal optimized CPU export has 37,194 nodes (40,167 before Mobius "
             "optimization) and 6,028 MatMul nodes because its truthful ReLU2 routed "
             "experts remain an ONNX loop. ORT 1.29 MoE/QMoE exposes ReLU but not ReLU2. "
             "QMoE has separate router_probs/router_weights for correction-biased "

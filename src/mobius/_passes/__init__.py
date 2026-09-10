@@ -1,10 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Graph optimization passes for mobius ONNX models.
+"""Graph finalization passes for mobius ONNX models.
 
-This module provides IR passes that operate on the ONNX graph structure,
-complementing the rewrite-rule infrastructure in :mod:`mobius.rewrite_rules`.
+This module provides exporter-owned IR passes that operate on ONNX graph
+structure. Olive owns post-export fusions and EP-specific lowerings.
 
 **Split between** ``passes/`` **and** ``_optimizations.py``
 ------------------------------------------------------------
@@ -13,8 +13,7 @@ complementing the rewrite-rule infrastructure in :mod:`mobius.rewrite_rules`.
   Concat nodes) and can be used, tested, and benchmarked independently.
 
 - ``mobius/_optimizations.py`` is the **orchestration layer**: it sequences
-  passes and rewrite rules into a coherent pipeline (``optimize_model``),
-  encodes all EP-specific gating logic, and exposes the
+  cleanup and function-inlining passes and exposes the
   :func:`~mobius._optimizations.fold_initializers_after_weights` convenience
   function that runs the post-weight-loading pipeline in one call.
 

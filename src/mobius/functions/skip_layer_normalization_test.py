@@ -16,32 +16,11 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnx_ir.passes.common import InlinePass
 
-from mobius._builder import build_from_module
-from mobius._configs import ArchitectureConfig
-from mobius._registry import registry
 from mobius.functions import register_function_bodies
 from mobius.functions.skip_layer_normalization import (
     skip_layer_normalization,
     skip_simplified_layer_normalization,
 )
-
-
-def _tiny_config() -> ArchitectureConfig:
-    return ArchitectureConfig(
-        hidden_size=64,
-        intermediate_size=128,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-        num_hidden_layers=2,
-        vocab_size=256,
-        max_position_embeddings=128,
-        hidden_act="silu",
-        rms_norm_eps=1e-6,
-        rope_type="default",
-        rope_theta=10000.0,
-        pad_token_id=0,
-    )
 
 
 def _count(model: ir.Model, op_type: str) -> int:
@@ -93,18 +72,40 @@ class TestSkipSimplifiedInline:
         InlinePass(criteria=criteria)(model)
 
     def test_inline_preserves_residual(self):
-        """Inlining the fallback must expand every fused op and keep the graph valid.
+        """Inlining the fallback must expand the custom op and keep the graph valid.
 
         Regression test: with the old 2-output body, InlinePass raised
         ``ValueError`` (output-count mismatch) because the 4-output node's
         ``input_skip_bias_sum`` (index 3) had no replacement value. The fixed
         4-output body reconnects the residual and leaves no dangling inputs.
         """
-        config = _tiny_config()
-        model = build_from_module(registry.get("qwen2")(config), config)["model"]
+        value_type = ir.TensorType(ir.DataType.FLOAT)
+        x = ir.Value(name="x", shape=ir.Shape([1, 2, 4]), type=value_type)
+        skip = ir.Value(name="skip", shape=ir.Shape([1, 2, 4]), type=value_type)
+        weight = ir.Value(name="weight", shape=ir.Shape([4]), type=value_type)
+        outputs = [ir.Value(name=name) for name in ("norm", "mean", "inv_std", "sum")]
+        fused_node = ir.Node(
+            "com.microsoft",
+            "SkipSimplifiedLayerNormalization",
+            inputs=[x, skip, weight],
+            outputs=outputs,
+            attributes=ir.convenience.convert_attributes({"epsilon": 1e-5}),
+        )
+        residual = ir.Value(name="residual")
+        consumer = ir.Node("", "Identity", inputs=[outputs[3]], outputs=[residual])
+        model = ir.Model(
+            ir.Graph(
+                inputs=[x, skip, weight],
+                outputs=[outputs[0], residual],
+                nodes=[fused_node, consumer],
+                opset_imports={"": 24, "com.microsoft": 1},
+                name="skip_simplified",
+            ),
+            ir_version=11,
+        )
 
         fused = _count(model, "SkipSimplifiedLayerNormalization")
-        assert fused > 0, "expected the build pipeline to fuse Add+RMSNorm"
+        assert fused == 1
 
         self._inline_skip_norm(model)
 

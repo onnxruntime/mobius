@@ -3303,12 +3303,12 @@ class TestHybridAttentionShareBufferGuard:
         assert data["search"]["past_present_share_buffer"] is True
 
     def test_recurrent_state_with_standard_attention_and_gqa_exports(self, tmp_path):
-        """Partial GQA fusion still leaves an incompatible standard Attention node.
+        """A hybrid GQA graph can still contain a standard Attention node.
 
         Regression test: the guard previously read
         ``has_recurrent_state and has_standard_attention and not has_gqa``, so
         a GQA node present *anywhere* in the graph would short-circuit the
-        check even though a separate, unfused standard Attention node
+        check even though a separate standard Attention node
         coexists. A GQA node on one layer doesn't make a standard Attention
         node on another layer safe for ``past_present_share_buffer=True``.
         """

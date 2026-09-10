@@ -422,7 +422,6 @@ asked to add a new model.
 | `moe-models` | When the model uses mixture-of-experts |
 | `multimodal-models` | When the model processes images + text |
 | `writing-tests` | When writing integration tests |
-| `writing-rewrite-rules` | When adding post-export graph transformations |
 
 ---
 

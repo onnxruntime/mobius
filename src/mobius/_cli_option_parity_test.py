@@ -131,6 +131,14 @@ class TestKeepQuantizedRemoved:
         assert args.dequantize is True
 
 
+class TestOptimizeRemoved:
+    def test_flag_is_gone(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(
+                ["build", "--model", "some/model", "--output", "out", "--optimize"]
+            )
+
+
 class TestLocalCompressedCheckpointRouting:
     @staticmethod
     def _run(monkeypatch, tmp_path, *extra_args):

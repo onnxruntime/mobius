@@ -359,7 +359,7 @@ class TestGQAContextDispatch:
         """build_from_module with CUDA EP and float16 config emits GroupQueryAttention directly."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing.model import count_ops
 
         config = make_config(
             dtype=ir.DataType.FLOAT16,
@@ -382,7 +382,7 @@ class TestGQAContextDispatch:
         """WebGPU float16 builds keep attention and KV updates in GQA."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing.model import count_ops
 
         config = make_config(
             dtype=ir.DataType.FLOAT16,
@@ -410,7 +410,7 @@ class TestGQAContextDispatch:
         """build_from_module with default EP keeps standard ONNX Attention (no GQA)."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing.model import count_ops
 
         config = make_config(
             max_position_embeddings=128,
@@ -433,12 +433,12 @@ class TestGQAContextDispatch:
         (ChunkedMRope, InterleavedMRope) use 3D position_ids for temporal/
         height/width axes. Silently emitting GQA would produce wrong outputs.
         CUDA+f16 EP is used to trigger the GQA path for 1D-RoPE models;
-        the MRoPE model must fall through to the rewrite-rule path instead.
+        the MRoPE model must retain standard ONNX Attention instead.
         """
         from mobius._builder import build_from_module
         from mobius._configs import ArchitectureConfig
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing.model import count_ops
 
         # Minimal Qwen2.5-VL-style config with mrope_section (activates ChunkedMRope).
         mrope_config = ArchitectureConfig(
@@ -466,52 +466,5 @@ class TestGQAContextDispatch:
             execution_provider="cuda",
         )
         ops = count_ops(pkg["model"])
-        # MRoPE model must NOT use direct GQA (do_rotary=1 is 1D only).
-        # The rewrite rule path still applies GroupQueryAttention after graph construction.
-        assert ops.get("GroupQueryAttention", 0) == mrope_config.num_hidden_layers
-
-    def test_direct_gqa_and_rewrite_rule_produce_same_structure(self):
-        """Direct GQA and rewrite-rule paths both produce GroupQueryAttention per layer.
-
-        Verifies that for a standard 1D-RoPE model:
-        - CPU EP (direct path): num_layers GQA nodes
-        - Default EP + manual rewrite rule: same count
-        """
-        from onnxscript.rewriter import rewrite
-
-        from mobius._builder import build_from_module
-        from mobius._registry import registry
-        from mobius.rewrite_rules import group_query_attention_rules
-        from mobius.rewrite_rules._testing_utils import count_ops
-
-        config = make_config(
-            max_position_embeddings=128,
-            rope_type="default",
-            rope_theta=10000.0,
-        )
-        num_layers = config.num_hidden_layers
-
-        # Direct path: CPU EP uses GQA directly (FLOAT is in cpu.gqa_dtypes)
-        pkg_direct = build_from_module(
-            registry.get("llama")(config),
-            config,
-            execution_provider="cpu",
-        )
-
-        # Rewrite-rule path: default EP keeps Attention + RoPE, then rewrite fires
-        pkg_default = build_from_module(
-            registry.get("llama")(config),
-            config,
-            execution_provider="default",
-        )
-        rewrite(pkg_default["model"], group_query_attention_rules())
-
-        ops_direct = count_ops(pkg_direct["model"])
-        ops_rewrite = count_ops(pkg_default["model"])
-
-        # Both paths must produce the same number of GroupQueryAttention nodes
-        assert ops_direct.get("GroupQueryAttention", 0) == num_layers
-        assert ops_rewrite.get("GroupQueryAttention", 0) == num_layers
-        # Neither path should leave any standard Attention nodes
-        assert ops_direct.get("Attention", 0) == 0
-        assert ops_rewrite.get("Attention", 0) == 0
+        assert ops.get("GroupQueryAttention", 0) == 0
+        assert ops.get("Attention", 0) == mrope_config.num_hidden_layers

@@ -331,7 +331,7 @@ class TestWeightAlignment:
 
 
 def _fill(model: ir.Model) -> None:
-    from mobius.rewrite_rules._testing_utils import fill_random_weights
+    from mobius._testing.model import fill_random_weights
 
     fill_random_weights(model)
 

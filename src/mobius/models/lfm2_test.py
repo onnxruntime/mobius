@@ -71,7 +71,7 @@ def test_model_uses_effective_intermediate_size():
     assert tuple(mlp.down_proj.weight.shape) == (2048, 4608)
 
 
-def test_cuda_graph_uses_lfm2_fusions():
+def test_cuda_graph_uses_direct_ops_and_inlines_causal_conv():
     config = Lfm2Config.from_transformers(
         _hf_config(
             hidden_size=64,
@@ -102,7 +102,7 @@ def test_cuda_graph_uses_lfm2_fusions():
     # must be inlined or ORT aborts while assigning providers.
     assert counts["com.microsoft", "CausalConvWithState"] == 0
     assert counts["", "Conv"] == 1
-    assert counts["com.microsoft", "SkipSimplifiedLayerNormalization"] == 4
+    assert counts["com.microsoft", "SkipSimplifiedLayerNormalization"] == 0
 
     remaining_norms = [node for node in model.graph if node.op_type == "RMSNormalization"]
     assert remaining_norms

@@ -150,10 +150,6 @@ _TRANSFORM_EVIDENCE: dict[str, tuple[str, ...]] = {
             "test_fused_experts_are_split_without_tensor_loss",
         ),
         _test_ref(
-            "src/mobius/integrations/gguf/_block_quantized_moe_builder_test.py",
-            "test_e2e_uniform_native_moe_fuses_through_builder",
-        ),
-        _test_ref(
             "src/mobius/integrations/_block_quant_test.py",
             "test_stack_is_byte_exact_and_recoverable",
         ),

@@ -150,9 +150,9 @@ class ModelTask(ABC):
                 ...
     """
 
-    #: Maps package key → optimization role for each model produced by this task.
-    #: The role controls which fusion passes run (e.g. only ``"decoder"`` gets
-    #: GQA fusion). Override in subclasses that produce non-decoder outputs.
+    #: Maps package key → finalization role for each model produced by this task.
+    #: The role controls decoder-only features such as FP8 KV-cache conversion.
+    #: Override in subclasses that produce non-decoder outputs.
     #: Unrecognised keys fall back to ``_MODEL_ROLE_MAP`` in ``_builder.py``,
     #: then default to ``"decoder"``.
     model_roles: ClassVar[dict[str, str]] = {"model": "decoder"}

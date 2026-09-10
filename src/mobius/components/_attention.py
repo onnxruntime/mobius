@@ -25,11 +25,8 @@ class GQAContext(NamedTuple):
     emit ``GroupQueryAttention`` directly instead of the generic
     ``Attention + RotaryEmbedding`` sequence.
 
-    Using this context skips the post-hoc
-    :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
-    rewrite rule for models that use the standard :class:`TextModel` backbone.
-    The rewrite rule remains as a fallback for models with non-standard RoPE
-    (e.g. Qwen3.5 with 3D mRoPE).
+    Models with non-standard RoPE (for example Qwen3.5 with 3D mRoPE) retain
+    standard ONNX Attention for downstream optimization.
 
     Fields:
         seqlens_k: Per-batch last valid KV index ``[batch]`` INT32.
@@ -361,10 +358,8 @@ class Attention(nn.Module):
             # Apply llama_4_attn_scale if present (Ministral3/Mistral4).
             # The scale is computed from position_ids by the RoPE module
             # and passed as the 3rd element of position_embeddings.
-            # Applied BEFORE RoPE so the graph keeps the
-            # RotaryEmbedding → Attention pattern that the
-            # RotaryAttentionToGQA rewrite rule matches. Scaling
-            # commutes with rotation: scale(RoPE(q)) == RoPE(scale(q)).
+            # Applied before RoPE because scaling commutes with rotation:
+            # scale(RoPE(q)) == RoPE(scale(q)).
             if len(position_embeddings) > 2:
                 attn_scale = position_embeddings[2]
                 query_states = op.Mul(query_states, attn_scale)
@@ -432,9 +427,7 @@ class Attention(nn.Module):
         Called from :meth:`forward` when ``attention_bias`` is a
         :class:`GQAContext`.  Bypasses the external
         :class:`~mobius.components._rotary_embedding.RotaryEmbeddingBase`
-        forward pass and the post-hoc
-        :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
-        rewrite rule; RoPE is handled by the ``do_rotary=1`` attribute instead.
+        forward pass; RoPE is handled by the ``do_rotary=1`` attribute instead.
 
         Returns ``(attn_output, (present_key, present_value))`` in the same
         shape as the standard :meth:`forward` path.

@@ -3,11 +3,10 @@
 
 """Pass that removes unused graph inputs.
 
-After EP-aware optimization (e.g. GQA fusion absorbs RoPE), some graph
-inputs may have zero consumers.  For example, ``position_ids`` becomes
-dead when all attention layers use ``GroupQueryAttention`` with
-``do_rotary=1``.  Removing dead inputs produces cleaner models and
-avoids requiring the runtime to provide dummy feed values.
+After graph construction, some graph inputs may have zero consumers. For
+example, ``position_ids`` becomes dead when all attention layers directly emit
+``GroupQueryAttention`` with ``do_rotary=1``. Removing dead inputs produces
+cleaner models and avoids requiring the runtime to provide dummy feed values.
 
 KV cache inputs (``past_key_values.*``) are always retained even if
 they appear unused in the graph, because ORT GenAI manages them

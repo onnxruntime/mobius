@@ -31,10 +31,7 @@ to the matching architecture-specific multimodal builder.
 
 from __future__ import annotations
 
-from mobius.integrations.gguf._builder import (
-    SparseMoEExportError,
-    build_from_gguf,
-)
+from mobius.integrations.gguf._builder import build_from_gguf
 from mobius.integrations.gguf._config_mapping import (
     GgufArchResolutionError,
     resolve_model_type,
@@ -120,8 +117,6 @@ __all__ = [
     # Architecture resolution
     "resolve_model_type",
     "GgufArchResolutionError",
-    # Sparse-MoE honesty gate
-    "SparseMoEExportError",
     # Metadata-only preflight
     "preflight_gguf",
     "preflight_local_gguf",

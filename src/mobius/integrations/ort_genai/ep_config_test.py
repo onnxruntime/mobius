@@ -81,10 +81,10 @@ class TestMakeProviderOptions:
         result = make_provider_options("openvino")
         assert result == [{"OpenVINO": {"device_type": "NPU"}}]
 
-    def test_openvino_disables_skip_layer_norm_fusion(self):
+    def test_openvino_inlines_skip_layer_norm_when_present(self):
         # The OpenVINO ONNX frontend cannot consume the com.microsoft
-        # SkipSimplifiedLayerNormalization op, so the openvino EP must keep the
-        # residual Add + RMSNormalization separate (no skip-norm fusion).
+        # SkipSimplifiedLayerNormalization op, so finalization must inline any
+        # such op emitted directly during graph construction.
         from mobius._execution_providers import ep_registry
 
         caps = ep_registry.get("openvino")

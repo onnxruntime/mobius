@@ -36,7 +36,7 @@ def test_scale_free_rms_norm_preserves_input_dtype(dtype):
     assert rms_node.inputs[1].shape == ir.Shape([16])
 
 
-def test_muse_glimmer_uses_fused_rms_normalization():
+def test_muse_glimmer_preserves_standard_rms_normalization():
     config = MuseGlimmerConfig(
         hidden_size=64,
         intermediate_size=128,
@@ -65,8 +65,8 @@ def test_muse_glimmer_uses_fused_rms_normalization():
     model = build_from_module(module, config, execution_provider="cuda")["model"]
     counts = Counter(node.op_type for node in model.graph)
 
-    assert counts["RMSNormalization"] == 25
-    assert counts["SkipSimplifiedLayerNormalization"] == 1
+    assert counts["RMSNormalization"] == 26
+    assert counts["SkipSimplifiedLayerNormalization"] == 0
     assert counts["ReduceMean"] == 0
     assert counts["Pow"] == 0
 

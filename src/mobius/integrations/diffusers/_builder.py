@@ -509,7 +509,7 @@ def build_diffusers_pipeline(
             adapter weights.
         components: Optional component-name allowlist. Non-neural pipeline metadata
             is still retained so a single-component export preserves its contract.
-        execution_provider: Target execution provider for EP-aware graph optimization.
+        execution_provider: Target execution provider for graph construction and packaging.
         workflow_config: Optional typed, model-agnostic workflow description for
             pipelines whose ONNX GenAI execution cannot be derived from the graphs
             alone (currently hierarchical audio). When omitted, mobius supplies the

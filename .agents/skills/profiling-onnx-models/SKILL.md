@@ -318,7 +318,7 @@ A thorough benchmark varies these dimensions independently:
 | EP | Attention kernel | Notes |
 |----|-----------------|-------|
 | `default` | ONNX Attention → MEA | Portable, no vendor fusions |
-| `cuda` | GQA rewrite → hybrid GQA/Attention | Best CUDA perf for simple models |
+| `cuda` | Direct GQA emission or ONNX Attention | Depends on the model construction path |
 | `onnx-standard` | Inlined functions → standard ops | Strict ONNX-only |
 
 #### 4. Input modality

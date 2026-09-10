@@ -159,14 +159,6 @@ Models with dedicated test methods are tracked in
 HF state dict keys to ONNX initializer names correctly. Catches bugs
 like prefix replacement corrupting names or fused weight names being dropped.
 
-### Rewrite rule unit tests
-
-Place rewrite rule tests **next to** the source file:
-- Source: `src/mobius/rewrite_rules/_packed_attention.py`
-- Test: `src/mobius/rewrite_rules/_packed_attention_test.py`
-
----
-
 ## L2: Config compatibility
 
 Detected from the `test_model_id` field in YAML test cases. To add L2:

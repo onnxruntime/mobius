@@ -253,7 +253,7 @@ decoder_inputs = {name: name for name in decoder_input_names}
 ```
 
 This means the genai config automatically adapts when `RemoveDeadGraphInputsPass`
-removes unused inputs (e.g. `position_ids` absorbed by GQA fusion).
+removes unused inputs (for example after direct GQA emission).
 
 Hybrid cache metadata must preserve global layer indices across KV, convolution,
 and recurrent states. Derive slot count from the maximum

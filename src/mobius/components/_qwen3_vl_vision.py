@@ -13,8 +13,8 @@ Provides modules for the Qwen3-VL vision backbone:
 - ``Qwen3VLVisionModel``: Full encoder stack with DeepStack outputs.
 
 Packed attention loops over sub-sequences indicated by ``cu_seqlens``.
-This uses standard ONNX ops; the ``rewrite_rules`` submodule provides
-optional rules to replace the loop with a custom packed-attention op.
+This uses standard ONNX ops so downstream tooling can choose any
+packed-attention transformation.
 """
 
 from __future__ import annotations

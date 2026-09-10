@@ -1222,9 +1222,8 @@ class ModelPackage(UserDict[str, ir.Model]):
         if not fold_constants:
             return
 
-        # Fold constants now that weights have been loaded.
-        # PackQKV emits Concat(w_q, w_k, w_v) in the graph; those nodes can only
-        # be constant-folded once the weight tensors carry their const_value.
+        # Fold exporter-emitted Transpose and Concat nodes now that their
+        # initializer inputs carry const_value.
         for model in self.data.values():
             fold_initializers_after_weights(model)
 

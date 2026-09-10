@@ -206,9 +206,8 @@ def test_deepseek_moe_ffn_linear_class_reaches_routed_experts():
     Regression test for a bug where ``_DeepSeekMoEFFN`` constructed its
     ``MoELayer`` without forwarding ``linear_class``, so a quantized config
     quantized attention/dense-FFN/shared-expert linears but silently left the
-    routed MoE experts as plain float ``MatMul`` -- losing quantization and
-    breaking the ``fuse_dense_moe_to_qmoe`` post-hoc rewrite, which only
-    matches a quantized ``MatMulNBits`` dense-fallback pattern.
+    routed MoE experts as plain float ``MatMul``, losing the requested
+    quantization before downstream graph optimization.
     """
     from mobius.components._common import Linear
 

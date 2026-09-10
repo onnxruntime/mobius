@@ -76,9 +76,7 @@ _MOE_MODEL_TYPES = frozenset(
     }
 )
 
-# GGUF quantization tokens whose routed experts lower to native
-# ``pkg.nxrt::BlockQuantizedMatMul`` blocks (no sparse top-k fusion exists yet).
-# Only int4 ``MatMulNBits`` experts fuse into ``com.microsoft::QMoE``.
+# GGUF quantization tokens that use native ``pkg.nxrt::BlockQuantizedMatMul`` blocks.
 _NATIVE_BLOCK_QUANT_RE = re.compile(
     r"(IQ1_[SM]|IQ2_(XXS|XS|S)|IQ3_(XXS|S)|IQ4_(NL|XS)|MXFP4|TQ1_0|TQ2_0)",
     re.IGNORECASE,
@@ -151,8 +149,8 @@ class GgufPreflightReport:
         total_params: Total parameter count when the Hub exposes it (``None``
             for a local-only metadata read).
         num_experts: Routed-expert count when known (MoE detection signal).
-        sparse_moe_fusion_supported: False when routed experts would lower to
-            native block ``BlockQuantizedMatMul`` nodes with no sparse fusion.
+        sparse_moe_fusion_supported: Whether the exported routed-expert pattern
+            has a known downstream sparse-MoE optimization path.
         files: Per-file metadata (sizes + checksums).
         blockers: Hard export blockers (each is a human-readable reason).
         warnings: Non-fatal advisories.
@@ -226,7 +224,7 @@ class GgufPreflightReport:
         if self.num_experts:
             lines.append(f"  moe experts  : {self.num_experts}")
         lines.append(
-            "  sparse MoE   : "
+            "  sparse MoE downstream path: "
             + ("supported" if self.sparse_moe_fusion_supported else "NOT supported")
         )
         if self.output_bytes is not None:
@@ -299,14 +297,7 @@ def _assess_sparse_moe(
     quantization: str | None,
     source: str,
 ) -> tuple[bool, list[str]]:
-    """Return ``(fusion_supported, blockers)`` for the routed-expert stack.
-
-    Mobius has exactly one sparse MoE path: int4 ``MatMulNBits`` experts fused
-    into ``com.microsoft::QMoE``. GGUF always tags ``quant_method="gguf"``, so
-    routed experts follow the dense per-expert loop; when their block format is
-    a native IQ/MXFP4 layout they lower to ``pkg.nxrt::BlockQuantizedMatMul``
-    with no fusion, i.e. dense-all-expert compute. Report that as a blocker.
-    """
+    """Return the downstream sparse-MoE capability verdict and hard blockers."""
     is_nemotron_h_moe = architecture == "nemotron_h_moe"
     if not is_nemotron_h_moe and not _is_moe(model_type, num_experts):
         return True, []
@@ -324,22 +315,19 @@ def _assess_sparse_moe(
         )
         return False, [blocker]
 
-    native_block = _NATIVE_BLOCK_QUANT_RE.search(quantization or "") is not None
-    if not native_block:
-        # int4-class MoE experts can be repacked to MatMulNBits and fused.
-        return True, []
+    if model_type == "glm_moe_dsa" and quantization is not None:
+        return False, [
+            (
+                f"quantized GGUF import blocker: GLM-DSA routed experts use {quantization}, "
+                "but Mobius does not support quantization-preserving "
+                "GLM-DSA import. Use keep_quantized=False."
+            )
+        ]
 
-    blocker = (
-        f"sparse-MoE fusion blocker: {source} is a MoE architecture "
-        f"('{model_type}') whose routed experts use '{quantization}' native "
-        "blocks. No sparse top-k BlockQuantizedMoE fusion exists for these "
-        "block formats — only int4 MatMulNBits experts fuse into "
-        "com.microsoft::QMoE. A default export would build a dense-all-expert "
-        "graph (every expert evaluated for every token) with no performance "
-        "guarantee, so build_from_gguf fails closed. Next slice: sparse IQ-block "
-        "BlockQuantizedMoE fusion (top-k gather over native-block expert weights)."
-    )
-    return False, [blocker]
+    # Mobius exports the routed expert pattern without post-export fusion.
+    # Olive owns both MatMulNBits-to-QMoE and native-block BlockQuantizedMoE
+    # transformations.
+    return True, []
 
 
 def _matmulnbits_output_bytes(np_shape: tuple[int, ...], bits: int, block_size: int) -> int:

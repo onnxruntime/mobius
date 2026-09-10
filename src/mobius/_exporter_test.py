@@ -200,7 +200,6 @@ class TestResolveDtype:
 
         caps = ep_registry.require("mlx")
         assert ir.DataType.BFLOAT16 in caps.gqa_dtypes
-        assert caps.qkv_pack_dtypes == frozenset()
         assert caps.supports_past_present_share_buffer
 
 

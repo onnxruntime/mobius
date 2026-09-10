@@ -256,7 +256,6 @@ class _PromotedRuntimeCase:
     reference_kind: str = "direct"
     dequantize: bool = False
     release: bool = False
-    allow_dense_moe: bool = False
     required_free_bytes: int = 0
 
 
@@ -566,7 +565,6 @@ _PROMOTED_RUNTIME_CASES = (
         cache_atol=0.35,
         dequantize=True,
         release=True,
-        allow_dense_moe=True,
         required_free_bytes=5_000_000_000,
     ),
 )
@@ -1690,8 +1688,6 @@ def test_promoted_gguf_full_runtime_evidence(
         cli_args.append("--dequantize")
     if case.release:
         cli_args.append("--release")
-    if case.allow_dense_moe:
-        monkeypatch.setenv("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", "1")
     with mock.patch.object(ModelPackage, "save", capture_save):
         main(cli_args)
     assert len(captured) == 1

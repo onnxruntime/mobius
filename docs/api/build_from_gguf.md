@@ -36,7 +36,6 @@ def build_from_gguf(
     image_token_id: int | None = None,
     static_cache: bool = False,
     max_seq_len: int | None = None,
-    allow_dense_moe: bool | None = None,
     reuse_gguf_weights: bool = False,
     target_config: str | Path | Mapping[str, object] | None = None,
     output_layer_indices: Sequence[int] | None = None,
@@ -49,11 +48,10 @@ def build_from_gguf(
 | `task` | Optional task override; otherwise selected from GGUF architecture metadata. |
 | `dtype` | Target float dtype, such as `"f32"`, `"f16"`, or `"bf16"`. |
 | `keep_quantized` | Request quantized target storage where the selected graph and qtype route support it. This does not promise source-byte or numerical fidelity. |
-| `execution_provider` | Target EP for EP-aware graph optimization; `"default"` emits portable ONNX. |
+| `execution_provider` | Target EP for graph construction and runtime packaging; `"default"` uses the portable construction path. |
 | `mmproj` | Companion projector GGUF for a registry-evidenced multimodal route. |
 | `image_token_id` | Processor-owned image placeholder ID for an `mmproj` package. |
 | `static_cache`, `max_seq_len` | Request a fixed-width KV cache and optionally set its length. |
-| `allow_dense_moe` | Opt in to a dense fallback for supported MoE imports. |
 | `reuse_gguf_weights` | Reuse compatible source tensor byte ranges in the saved package. |
 | `target_config` | Exact target configuration for a supported speculative draft model. |
 | `output_layer_indices` | Optional hidden-layer outputs to expose. |
@@ -78,7 +76,10 @@ Key options:
 |---|---|
 | `--dequantize` | Store all mapped weights as float instead of requesting quantized target storage. |
 | `--dtype {bf16,f16,f32}` | Set the target float dtype. |
-| `--ep EP`, `--execution-provider EP` | Select EP-aware optimization; use `mobius list eps` for available values. |
+
+Routed GGUF MoE experts are exported without post-export fusion. Apply the
+corresponding Olive graph surgery before deployment.
+| `--ep EP`, `--execution-provider EP` | Select graph-construction and runtime-packaging contracts; use `mobius list eps` for available values. |
 | `--mmproj PATH`, `--image-token-id ID` | Build an evidenced multimodal package with a companion projector. |
 | `--runtime {ort-genai,onnx-genai}` | Request runtime-specific metadata and tokenizer packaging. |
 | `--runtime-version VERSION` | Record the selected runtime version for exact evidence matching. |

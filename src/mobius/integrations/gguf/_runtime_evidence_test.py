@@ -215,7 +215,7 @@ def test_nemotron_h_runtime_blocker_is_pinned_without_support_claim() -> None:
     assert record.runtime_schema_issue.endswith("/issues/605")
     assert _runtime_evidence.runtime_evidence(record.evidence_id) is None
     assert "full-logit parity" in record.withheld_checks
-    assert record.graph_node_count == 37_142
+    assert record.graph_node_count == 37_194
     assert record.pre_optimization_graph_node_count == 40_167
     assert "separate router_probs/router_weights" in record.blockers[1]
     assert "not fused-op blockers" in record.blockers[1]

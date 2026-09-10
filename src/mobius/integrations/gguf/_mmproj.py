@@ -3534,7 +3534,7 @@ def build_gemma4_vlm_from_gguf(
         text_gguf_path: Path (or HF ref) to the Gemma4 text-backbone GGUF.
         mmproj_gguf_path: Path (or HF ref) to the companion ``clip`` mmproj GGUF.
         dtype: Optional dtype override (e.g. ``"f16"``); defaults to float32.
-        execution_provider: Target EP for EP-aware optimisations.
+        execution_provider: Target EP for graph construction and runtime packaging.
         image_token_id: Vocabulary id of the image soft-token placeholder used
             to scatter image features into text embeddings. When ``None``, the
             value carried by the text config is used (if any).
@@ -3744,10 +3744,8 @@ def build_gemma4_vlm_from_gguf(
         )
 
     # 2. Build the multimodal graph (decoder + vision + embedding [+ audio]).
-    #    Route through build_from_module so each component gets the EP-aware
-    #    optimize_model passes (GQA fusion, etc.) — the same pipeline the
-    #    text-only build_from_gguf path uses; calling Gemma4Task().build()
-    #    directly would skip those optimizations.
+    #    Route through build_from_module so graph construction runs under the
+    #    selected EP context and each component receives exporter finalization.
     from mobius._builder import build_from_module
 
     module = Gemma4UnifiedModel(config) if is_unified else Gemma4Model(config)
@@ -3878,7 +3876,7 @@ def build_muse_glimmer_vlm_from_gguf(
         text_gguf_path: Path (or HF ref) to the Muse Glimmer text GGUF.
         mmproj_gguf_path: Path (or HF ref) to the companion ``clip`` mmproj.
         dtype: Optional dtype override (e.g. ``"bf16"``).
-        execution_provider: Target EP for EP-aware optimisations.
+        execution_provider: Target EP for graph construction and runtime packaging.
         image_token_id: Vocabulary id of the image placeholder token. GGUF
             carries no such key, so when ``None`` the model's published default
             is used.

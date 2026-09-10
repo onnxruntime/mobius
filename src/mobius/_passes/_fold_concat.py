@@ -13,11 +13,7 @@ deferred until the tensor data is first accessed (e.g. during ONNX
 serialization), avoiding memory spikes from eagerly materialising all
 concatenated weights during the pass itself.
 
-Primary use case: QKV weight packing.  After the GQA rewrite rules produce
-``Concat(q_weight_t, k_weight_t, v_weight_t, axis=0)`` and the Transpose
-folding pass replaces each ``*_weight_t`` with a pre-transposed initializer,
-this pass folds the resulting all-initializer Concat into a single packed
-``qkv_weight`` initializer.
+This applies to any exporter-emitted packed weight assembled with ``Concat``.
 """
 
 from __future__ import annotations
@@ -145,7 +141,7 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
 
             # Stamp the resolved dtype on the new initializer's type so the
             # declared type, the LazyTensor, and the materialized data all agree
-            # (out_val.type may be missing after stage-2 rewrites).
+            # (out_val.type may be missing after graph construction).
             new_val = ir.Value(
                 name=packed_name, shape=out_shape, type=ir.TensorType(packed_dtype)
             )

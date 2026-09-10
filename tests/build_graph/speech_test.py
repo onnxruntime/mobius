@@ -531,8 +531,8 @@ class TestBuildGraphGlmAsr:
         assert "GroupQueryAttention" not in decoder_ops
 
     def test_three_stage_pipeline_runs_with_ort(self):
+        from mobius._testing.model import fill_random_weights
         from mobius._testing.ort_inference import OnnxModelSession
-        from mobius.rewrite_rules._testing_utils import fill_random_weights
 
         config, _, pkg = self._build()
         for model in pkg.values():
@@ -752,14 +752,14 @@ class TestBuildGraphQwen3ASR:
         """
         import numpy as np
 
+        from mobius._testing.model import (
+            fill_random_weights,
+        )
         from mobius._testing.ort_inference import (
             OnnxModelSession,
         )
         from mobius.models.qwen3_asr import (
             Qwen3ASRForConditionalGeneration,
-        )
-        from mobius.rewrite_rules._testing_utils import (
-            fill_random_weights,
         )
         from mobius.tasks import SpeechLanguageTask
 
@@ -956,9 +956,9 @@ class TestBuildGraphFunASR:
         """Run audio_encoder → embedding → decoder with ORT."""
         import numpy as np
 
+        from mobius._testing.model import fill_random_weights
         from mobius._testing.ort_inference import OnnxModelSession
         from mobius.models.fun_asr import FunASRForConditionalGeneration
-        from mobius.rewrite_rules._testing_utils import fill_random_weights
         from mobius.tasks import FunASRSpeechLanguageTask
 
         config = self._fun_asr_config()

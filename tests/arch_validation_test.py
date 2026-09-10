@@ -230,8 +230,7 @@ class TestArchValidation:
             assert len(model.graph.outputs) > 0, f"{component_name} has no outputs"
 
         # Every component the task builds must declare a role. An undeclared
-        # component falls back to the "decoder" role in build_from_module and
-        # would be handed fusion passes meant for attention stacks, and
+        # component falls back to the "decoder" role during finalization, and
         # inspect_components would not report it at all.
         undeclared = sorted(set(pkg) - set(task.model_roles or {}))
         assert not undeclared, (

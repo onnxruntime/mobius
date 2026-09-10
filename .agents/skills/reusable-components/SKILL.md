@@ -247,4 +247,3 @@ Key patterns for building components:
 - **Multimodal components:** `.agents/skills/multimodal-models/SKILL.md`
 - **MoE components:** `.agents/skills/moe-models/SKILL.md`
 - **Writing tests:** `.agents/skills/writing-tests/SKILL.md`
-- **Rewrite rules:** `.agents/skills/writing-rewrite-rules/SKILL.md`

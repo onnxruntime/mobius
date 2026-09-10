@@ -12,7 +12,7 @@ They serve as:
    can expand the function body and execute via standard ops
 
 Each function returns an ``ir.Function`` that can be attached to an
-``ir.Model`` or used as a rewrite target.
+``ir.Model`` or consumed by a graph transform.
 
 Naming convention:
     Python factory functions are snake_case (e.g. ``causal_conv_nd_with_state``,
@@ -75,10 +75,9 @@ def get_function(op_id: ir.OperatorIdentifier) -> ir.Function | None:
     """Return a fresh ``ir.Function`` for *op_id*, or ``None``.
 
     Each call returns a **new** function object so that models cannot
-    accidentally share mutable function bodies.  Rewrite passes (e.g.
-    onnxscript's ``RewriteRuleSet.apply_to_model``) process function bodies
-    in-place; sharing a single instance across models would corrupt it when
-    one model's rewrite mutates the body.
+    accidentally share mutable function bodies. Graph transforms process
+    function bodies in-place; sharing a single instance across models would
+    corrupt it when one model's transform mutates the body.
     """
     builder = _FUNCTION_BUILDERS.get(op_id)
     if builder is None:

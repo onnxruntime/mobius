@@ -82,18 +82,18 @@ pkg = build("meta-llama/Llama-3.2-1B", task=task)
 pkg.save("output/llama-3.2-1b-static/")
 ```
 
-**EP-aware optimization** generates graphs tuned for a specific runtime execution
-provider. Pass `execution_provider` to target CUDA, DirectML, WebGPU, and more —
-each with the right set of fused kernels and lowering passes applied automatically:
+`execution_provider` selects construction-time operator contracts and runtime
+packaging defaults. Mobius does not apply post-export fusion or lowering;
+use Olive for those graph transformations:
 
 ```python
 from mobius import build
 
-# CUDA: GQA fusion, SkipLayerNorm, PackQKV
+# CUDA construction contract
 pkg = build("meta-llama/Llama-3.2-1B",
             execution_provider="cuda", dtype="f16")
 
-# WebGPU: GQA fusion, Shape ops replaced with portable alternatives
+# WebGPU construction and runtime contract
 pkg = build("meta-llama/Llama-3.2-1B",
             execution_provider="webgpu", dtype="f16")
 ```
@@ -202,4 +202,3 @@ and the developer skills in `.agents/skills/`:
 | `moe-models` | Adding a Mixture-of-Experts model |
 | `multimodal-models` | Adding a vision-language model |
 | `writing-tests` | Writing unit or integration tests |
-| `writing-rewrite-rules` | Adding ONNX graph rewrite rules |

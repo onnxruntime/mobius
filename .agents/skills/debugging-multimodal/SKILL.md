@@ -290,11 +290,9 @@ the model will fail to run on CUDA EP.
 
 ### EP-aware building
 
-`--ep` flag drives both graph construction and optimization (e.g. GQA
-fusion with `do_rotary=1`). `--optimize` is for post-hoc rewrite rules
-only (separate from EP). After EP-aware optimization, unused graph inputs
-(e.g. `position_ids` absorbed by GQA) are removed by
-`RemoveDeadGraphInputsPass`.
+`--ep` drives Mobius graph construction and runtime packaging. Mobius does
+not expose post-hoc rewrite rules; apply graph fusion and EP-specific lowering
+with Olive. Export finalization still removes unused graph inputs.
 
 ## Tolerance guidelines
 

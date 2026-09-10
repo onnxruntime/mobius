@@ -1,22 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""EP-aware model optimization pipeline.
+"""Model finalization passes.
 
-Exposes :func:`optimize_model` which applies a four-stage pass pipeline to an
-ONNX IR model:
-
-1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
-   folding, shape inference. EP-agnostic; always applied.
-2. **Fusion** — promote standard ops to EP-supported fused ops
-   (GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and ``model_role``.
-3. **Lowering** — decompose ops the EP cannot execute
-   (SeparateRoPE).
-4. **Fold** — final dead-node removal and constant folding.
-
-All EP knowledge is encoded in :class:`~mobius._execution_providers.EpCapabilities`
-entries in the :data:`~mobius._execution_providers.ep_registry`. Adding EP
-support requires only a new registry entry — no changes to this module.
+Exposes :func:`optimize_model`, which applies exporter-owned cleanup and
+function inlining to an ONNX IR model. Graph fusions and EP-specific lowerings
+are intentionally not performed here; those transformations are owned by
+Olive after export.
 
 Post-weight passes
 ------------------
@@ -47,7 +37,6 @@ __all__ = [
 ]
 
 import contextlib
-import dataclasses
 import logging
 import warnings
 
@@ -55,9 +44,8 @@ import onnx_ir as ir
 import onnx_shape_inference
 import onnxscript.optimizer._constant_folding
 from onnx_ir.passes import common as common_passes
-from onnxscript.rewriter import rewrite
 
-from mobius._execution_providers import EpCapabilities, ep_registry
+from mobius._execution_providers import ep_registry
 from mobius._flags import flags
 from mobius._passes import (
     FoldConcatInitializersPass,
@@ -65,23 +53,7 @@ from mobius._passes import (
     Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
 )
-from mobius._pipeline_contract import requires_arbitrary_attention_mask
 from mobius.functions import register_function_bodies
-from mobius.rewrite_rules import (
-    clip_to_min_max_rules,
-    decompose_attention_pass,
-    decompose_rope_rules,
-    gelu_fusion_rules,
-    group_query_attention_rules,
-    htp_rank4_rmsnorm_rules,
-    pack_qkv_for_gqa_rules,
-    separate_rope_rules,
-    skip_layer_norm_rules,
-    skip_norm_rules,
-    static_empty_kv_rules,
-    tensor_scatter_to_scatternd_rules,
-    unpack_qkv_rules,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +128,7 @@ class StripDebugMetadataPass(ir.passes.InPlacePass):
 
     ``onnxscript`` annotates each node with the ``nn.Module`` path that produced
     it (``namespace``, ``pkg.onnxscript.class_hierarchy``,
-    ``pkg.onnxscript.name_scopes``), which rewrite rule created it
+    ``pkg.onnxscript.name_scopes``), which graph transform created it
     (``pkg.onnxscript.rewriter.rule_name``), and symbolic-inference internals on
     values (``pkg.onnx_shape_inference.sym_data``). That is exactly what you want
     when reading a graph in Netron and tracing a node back to the source module,
@@ -268,187 +240,7 @@ def _count_all_ops(model: ir.Model) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Trace infrastructure
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class _TraceEntry:
-    """Per-stage diagnostic data collected during traced optimization."""
-
-    name: str
-    added: dict[str, int]  # op_type → count added
-    removed: dict[str, int]  # op_type → count removed (positive values)
-
-    @property
-    def nodes_added(self) -> int:
-        return sum(self.added.values())
-
-    @property
-    def nodes_removed(self) -> int:
-        return sum(self.removed.values())
-
-    @property
-    def matched(self) -> int:
-        """Nodes consumed/replaced by this stage (proxy for 'rules matched')."""
-        return self.nodes_removed
-
-
-def _make_trace_entry(name: str, before: dict[str, int], after: dict[str, int]) -> _TraceEntry:
-    all_ops = set(before) | set(after)
-    added = {
-        op: after.get(op, 0) - before.get(op, 0)
-        for op in all_ops
-        if after.get(op, 0) > before.get(op, 0)
-    }
-    removed = {
-        op: before.get(op, 0) - after.get(op, 0)
-        for op in all_ops
-        if before.get(op, 0) > after.get(op, 0)
-    }
-    return _TraceEntry(name=name, added=added, removed=removed)
-
-
-def _apply_stage(model: ir.Model, rules_or_pass: list | ir.passes.InPlacePass) -> None:
-    """Apply a single optimization stage — either a rewrite-rule list or an IR pass."""
-    if isinstance(rules_or_pass, ir.passes.InPlacePass):
-        rules_or_pass(model)
-    elif rules_or_pass:
-        rewrite(model, pattern_rewrite_rules=rules_or_pass)
-
-
-def _log_trace_entry(entry: _TraceEntry) -> None:
-    if not entry.added and not entry.removed:
-        logger.info("[EP Trace]   %-25s: no matches (0 nodes affected)", entry.name)
-        return
-    parts = [f"+{count} {op}" for op, count in sorted(entry.added.items())]
-    parts += [f"-{count} {op}" for op, count in sorted(entry.removed.items())]
-    logger.info("[EP Trace]   %-25s: %s", entry.name, ", ".join(parts))
-
-
-def _log_trace_summary(entries: list[_TraceEntry]) -> None:
-    if not entries:
-        return
-    logger.info("[EP Trace] Summary:")
-    logger.info("[EP Trace]   %-25s | %7s | %6s | %6s", "Rule", "Matched", "+Nodes", "-Nodes")
-    logger.info("[EP Trace]   %s", "-" * 57)
-    for e in entries:
-        logger.info(
-            "[EP Trace]   %-25s | %7d | %6d | %6d",
-            e.name,
-            e.matched,
-            e.nodes_added,
-            e.nodes_removed,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Optimization pass selection
-# ---------------------------------------------------------------------------
-
-
-def _get_optimization_passes(
-    caps: EpCapabilities,
-    dtype: ir.DataType,
-    model_role: str = "decoder",
-) -> tuple[list[tuple[str, list]], list[tuple[str, list | ir.passes.InPlacePass]]]:
-    """Return ``(fuse_stages, lower_stages)`` for the given capabilities.
-
-    Queries the :class:`EpCapabilities` object rather than branching on EP
-    name strings. Adding a new EP requires only a new registry entry —
-    no changes to this function.
-
-    Args:
-        caps: EP capability descriptor from :data:`~mobius._execution_providers.ep_registry`.
-        dtype: Model dtype for GQA/PackedAttn support checks.
-        model_role: Semantic role. GQA fusion only applies to ``"decoder"``.
-
-    Returns:
-        ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``
-        tuples where payload is a rule list or IR pass.
-    """
-    fuse: list[tuple[str, list]] = []
-    lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
-
-    # --- Attention fusion (decoder only) ---
-    if model_role == "decoder" and dtype in caps.gqa_dtypes:
-        fuse.append(
-            (
-                "GQAFusion",
-                list(group_query_attention_rules()),
-            )
-        )
-
-    # --- QKV packing (decoder only, gated by qkv_pack_dtypes) ---
-    if model_role == "decoder" and dtype in caps.qkv_pack_dtypes:
-        fuse.append(("PackQKV", list(pack_qkv_for_gqa_rules())))
-
-    # --- Normalization fusions (all roles, all dtypes) ---
-    # When supports_skip_layer_norm=False (e.g. trt-rtx), fusion is skipped;
-    # InlinePass in optimize_model() expands any pre-existing nodes instead.
-    if caps.supports_skip_layer_norm:
-        fuse.append(("SkipNorm", list(skip_norm_rules())))
-        fuse.append(("SkipLayerNorm", list(skip_layer_norm_rules())))
-
-    # --- Activation fusions (all roles, all dtypes) ---
-    fuse.append(("GeluFusion", list(gelu_fusion_rules())))
-
-    # --- Lowering passes ---
-    # SkipLayerNorm/SimplifiedLayerNorm decomposition is handled by InlinePass
-    # using registered ir.Function bodies — not rewrite rules.
-    if not caps.supports_fused_rope:
-        lower.append(("SeparateRoPE", list(separate_rope_rules())))
-        lower.append(("UnpackQKV", list(unpack_qkv_rules())))
-
-    # Reshape rank-4 RMSNorm (q/k norm) to rank-3 for the QNN HTP, which miscomputes it.
-    if not caps.supports_rank4_rmsnorm:
-        lower.append(("HtpRank4RMSNorm", list(htp_rank4_rmsnorm_rules())))
-
-    # Decompose the opset-24 RotaryEmbedding op into rotate-half primitives for
-    # EPs without a RotaryEmbedding kernel (QNN HTP), where the op falls to CPU.
-    if not caps.supports_rotary_embedding:
-        lower.append(("DecomposeRotaryEmbedding", list(decompose_rope_rules())))
-
-    # Rewrite the static-cache TensorScatter KV write into ScatterND for EPs
-    # without a TensorScatter kernel (QNN HTP), where it falls to CPU.
-    if not caps.supports_tensor_scatter:
-        lower.append(("TensorScatterToScatterND", list(tensor_scatter_to_scatternd_rules())))
-
-    # Decompose the fused opset-24 Attention op into SDPA primitives for EPs
-    # without an Attention kernel (QNN HTP), where the fused op falls to CPU.
-    # An IR pass (not a rewrite rule) so it can rewire the op's 3 outputs, whose
-    # KV-cache present tensors are graph outputs on some layers and dead on
-    # shared-KV layers. Runs after the batched rewrite rules (lower_ir_passes).
-    if not caps.supports_attention:
-        lower.append(("DecomposeAttention", decompose_attention_pass()))
-
-    # NOTE: MatMulNBits → QDQ lowering is handled by the InlinePass mechanism
-    # (a registered com.microsoft::MatMulNBits function body), not a rewrite
-    # rule — see optimize_model()'s _should_inline and mobius.functions. It is
-    # gated by ``supports_matmul_nbits`` there.
-
-    # --- Graph-capture rewrite ---
-    # Supports graph capture for shared-KV layer models on WebGPU EP
-    # (currently Gemma4). Pattern-based: only fires on models that emit the
-    # dynamic Shape → ConstantOfShape → Cast empty-KV pattern. Gated by
-    # requires_graph_capture_rewrite rather than enable_graph_capture because
-    # not all graph-capture EPs need it — e.g. CUDA EP's Shape kernel is
-    # already graph-capture-safe.
-    if caps.requires_graph_capture_rewrite:
-        lower.append(("StaticEmptyKV", list(static_empty_kv_rules())))
-
-    # --- bfloat16 Clip lowering (all EPs) ---
-    # ORT has no bfloat16 Clip kernel and expands the op's ONNX function body
-    # into Less/Where, which also lack bfloat16 kernels — the unassigned nodes
-    # abort session creation. Min/Max are kernel-backed and exactly equivalent.
-    if dtype == ir.DataType.BFLOAT16:
-        lower.append(("ClipToMinMax", list(clip_to_min_max_rules())))
-
-    return fuse, lower
-
-
-# ---------------------------------------------------------------------------
-# Main optimization entry point
+# Main finalization entry point
 # ---------------------------------------------------------------------------
 
 
@@ -461,33 +253,23 @@ def optimize_model(
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
 ) -> None:
-    """Apply EP-aware optimization passes to *model* in-place.
+    """Apply exporter-owned finalization passes to *model* in-place.
 
-    Runs a five-stage pipeline:
-
-    1. **Cleanup** — identity elimination, CSE, dead-code removal, constant
-       folding, shape inference (EP-agnostic; always applied).
-    2. **Fusion** — promote standard ops to EP-supported fused ops
-       (e.g. GQA, SkipNorm, GeluFusion). Gated by ``(ep, dtype)`` and role.
-    3. **Lowering** — decompose ops the EP cannot execute
-       (e.g. SeparateRoPE for DML).
-    4. **Fold** — final dead-node removal and constant folding.
-
-    After fusion, if GQA was expected for ``(ep, dtype)`` but zero
-    ``GroupQueryAttention`` nodes were produced while ``Attention`` nodes
-    remain, a warning is emitted. This catches silent rule-match failures.
+    Mobius performs graph cleanup, expands registered local functions that the
+    selected EP cannot consume, and applies FP8 KV-cache typing when requested.
+    Olive owns all post-export fusions and EP-specific graph lowerings.
 
     Args:
         model: The ONNX IR model to optimize in-place.
         ep: Target execution provider. Must be registered in
             :data:`~mobius._execution_providers.ep_registry`.
-        dtype: Model dtype for support-matrix lookups.
+        dtype: Model dtype for FP8 KV-cache capability checks.
         model_role: Semantic role of this model component.
         trace: When ``True``, emit per-stage diagnostic logs at INFO level.
         fp8_kv_cache: When ``True``, convert decoder
             ``GroupQueryAttention`` KV caches to ``FLOAT8E4M3FN`` (per-tensor
             E4M3) via :class:`~mobius._passes.Fp8KvCachePass`. Only applied
-            when GQA fusion is active for ``(ep, dtype)``,
+            when the exported graph contains GroupQueryAttention,
             ``model_role == "decoder"``, and the EP ships the FP8 GQA kernel
             (``caps.supports_fp8_kv_cache`` — currently CUDA only); otherwise a
             warning is emitted and the request is ignored.
@@ -499,7 +281,13 @@ def optimize_model(
     Raises:
         ValueError: If *ep* is not a registered execution provider.
     """
-    # Stage 1: Base cleanup (EP-agnostic — always applied).
+    caps = ep_registry.get(ep)
+    if caps is None:
+        raise ValueError(
+            f"Unknown execution provider {ep!r}. Supported: {sorted(ep_registry)}"
+        )
+
+    # Stage 1: Base cleanup.
     if trace:
         before_total = sum(_count_all_ops(model).values())
         logger.info("[EP Trace] Target: %s, dtype: %s, role: %s", ep, dtype, model_role)
@@ -521,40 +309,12 @@ def optimize_model(
             after_total - before_total,
         )
 
-    # Stage 2+3: Fusion + InlinePass + Lowering — gated by EP capabilities.
-    caps = ep_registry.get(ep)
-    if caps is None:
-        raise ValueError(
-            f"Unknown execution provider {ep!r}. Supported: {sorted(ep_registry)}"
-        )
-
-    gqa_allowed = model_role == "decoder" and not requires_arbitrary_attention_mask(
-        model.graph
-    )
-    optimization_role = (
-        model_role if gqa_allowed or model_role != "decoder" else "masked-decoder"
-    )
-    fuse_stages, lower_stages = _get_optimization_passes(
-        caps,
-        dtype,
-        optimization_role,
-    )
-
-    # Register standard-ONNX ir.Function bodies for all known custom ops.
-    # InlinePass below uses these to expand ops the EP cannot execute.
+    # Stage 2: Expand registered local functions that the target cannot consume.
     register_function_bodies(model)
 
-    # Build InlinePass criteria: expand custom ops this EP doesn't support.
     def _should_inline(func: ir.Function) -> bool:
-        # onnx-standard EP: inline every function whose domain is not a standard
-        # ONNX domain. This covers both the well-known ops below AND parametric
-        # ops like CausalConvWithState and LinearAttention registered per-model.
         if caps.name == "onnx-standard" and func.domain not in _STANDARD_ONNX_DOMAINS:
             return True
-        # ORT's CUDA EP has no CausalConvWithState kernel. Keeping the local
-        # function call causes TransformerMemcpy to inspect a node without a
-        # provider assignment and abort session initialization. Inline its
-        # standard Conv-based body so hybrid decoders run on CUDA.
         if (
             caps.name == "cuda"
             and func.domain == "com.microsoft"
@@ -568,82 +328,38 @@ def optimize_model(
             return not caps.supports_skip_layer_norm
         if func.domain == "com.microsoft" and func.name == "PackedMultiHeadAttention":
             return not caps.supports_packed_multi_head_attention
-        # MatMulNBits (blockwise-INT4) → QDQ (DequantizeLinear + MatMul) for EPs
-        # without a MatMulNBits kernel (QNN HTP). Supported EPs (CPU/CUDA/…) keep
-        # the compact contrib op and its native kernel; the function body stays
-        # registered but uninlined (kernels take precedence over local functions).
         if func.domain == "com.microsoft" and func.name == "MatMulNBits":
             return not caps.supports_matmul_nbits
         return False
 
     inline_pass = common_passes.InlinePass(criteria=_should_inline)
-
-    trace_entries: list[_TraceEntry] = []
-
     if trace:
-        logger.info("[EP Trace] Stage 2: Fusion (%d rule groups)", len(fuse_stages))
-        for name, rules_or_pass in fuse_stages:
-            before = _count_all_ops(model)
-            _apply_stage(model, rules_or_pass)
-            after = _count_all_ops(model)
-            entry = _make_trace_entry(name, before, after)
-            trace_entries.append(entry)
-            _log_trace_entry(entry)
-
-        logger.info("[EP Trace] Stage 2b: InlinePass (expand unsupported custom ops)")
-        before = _count_all_ops(model)
-        inline_pass(model)
-        after = _count_all_ops(model)
-        trace_entries.append(_make_trace_entry("InlinePass", before, after))
-        _log_trace_entry(trace_entries[-1])
-
+        before_inline = sum(_count_all_ops(model).values())
+        logger.info("[EP Trace] Stage 2: Inline unsupported local functions")
+    inline_pass(model)
+    if trace:
+        after_inline = sum(_count_all_ops(model).values())
         logger.info(
-            "[EP Trace] Stage 3: Lowering (%d rule groups for %s)", len(lower_stages), ep
+            "[EP Trace]   Inline: %d → %d nodes (%+d)",
+            before_inline,
+            after_inline,
+            after_inline - before_inline,
         )
-        for name, rules_or_pass in lower_stages:
-            before = _count_all_ops(model)
-            _apply_stage(model, rules_or_pass)
-            after = _count_all_ops(model)
-            entry = _make_trace_entry(name, before, after)
-            trace_entries.append(entry)
-            _log_trace_entry(entry)
-    else:
-        # Batch all rewrite rules for efficiency; apply IR passes separately.
-        all_fuse_rules = [r for _, rp in fuse_stages if isinstance(rp, list) for r in rp]
-        all_lower_rules = [r for _, rp in lower_stages if isinstance(rp, list) for r in rp]
-        lower_ir_passes = [(n, rp) for n, rp in lower_stages if not isinstance(rp, list)]
 
-        if all_fuse_rules:
-            rewrite(model, pattern_rewrite_rules=all_fuse_rules)
-
-        # Expand unsupported custom ops via registered ir.Function bodies.
-        inline_pass(model)
-
-        if all_lower_rules:
-            rewrite(model, pattern_rewrite_rules=all_lower_rules)
-
-        for _, ir_pass in lower_ir_passes:
-            ir_pass(model)
-
-    # Stage 4: Final dead-node removal, constant folding, and dead input
-    # cleanup after rewrites.
+    # Stage 3: Final dead-node removal, constant folding, and dead input cleanup.
     if trace:
         before_fold = sum(_count_all_ops(model).values())
-        logger.info("[EP Trace] Stage 4: Constant folding")
+        logger.info("[EP Trace] Stage 3: Constant folding")
 
     fold_pass = ir.passes.PassManager(
         [
             common_passes.RemoveUnusedNodesPass(),
-            # CSE after lowering collapses duplicate Gather(cos/sin, position_ids)
-            # nodes introduced by SeparateRoPE in Stage 3 (2 per layer → 2 total).
             common_passes.CommonSubexpressionEliminationPass(),
             onnxscript.optimizer._constant_folding.FoldConstantsPass(
                 shape_inference=False,
                 input_size_limit=8192,
                 output_size_limit=_FOLD_OUTPUT_SIZE_LIMIT,
             ),
-            # Remove graph inputs whose consumers were all eliminated by
-            # fusion (e.g. position_ids when GQA absorbs RoPE).
             RemoveDeadGraphInputsPass(),
         ]
     )
@@ -664,25 +380,10 @@ def optimize_model(
             dtype.name,
         )
 
-    # Fusion assertion: warn if GQA was expected but no GQA nodes produced.
-    if gqa_allowed and dtype in caps.gqa_dtypes:
-        gqa_count = _count_ops(model, "GroupQueryAttention")
-        attn_count = _count_ops(model, "Attention")
-        if gqa_count == 0 and attn_count > 0:
-            warnings.warn(
-                f"GQA fusion expected for ep={ep!r}/dtype={dtype} but found "
-                f"0 GroupQueryAttention and {attn_count} Attention nodes. "
-                f"The model may run slower than expected on this EP. "
-                f"Check that the attention pattern matches the GQA rewrite rule.",
-                stacklevel=4,
-            )
-
     # FP8 KV cache: convert GroupQueryAttention KV caches to FLOAT8E4M3FN.
-    # Runs after fusion so the GQA nodes exist. Requires GQA (a decoder on a
-    # GQA-capable EP/dtype); otherwise there is no KV-cache op to convert.
     if fp8_kv_cache:
-        gqa_active = gqa_allowed and dtype in caps.gqa_dtypes
-        if not gqa_active or not caps.supports_fp8_kv_cache:
+        gqa_expected = model_role == "decoder" and dtype in caps.gqa_dtypes
+        if not gqa_expected or not caps.supports_fp8_kv_cache:
             warnings.warn(
                 f"fp8_kv_cache=True was requested but the FP8 GQA KV-cache kernel "
                 f"is not available for ep={ep!r}/dtype={dtype}/role={model_role!r}. "
@@ -695,27 +396,17 @@ def optimize_model(
             fp8_pass = Fp8KvCachePass(kv_cache_scales)
             fp8_pass(model)
             if fp8_pass.converted == 0:
-                # The gate above tests the *intent* to fuse GQA; only the pass
-                # knows the outcome. FP8 KV storage is a property of the
-                # attention operator, because the scales that dequantize the
-                # cache on read are node inputs: GroupQueryAttention has
-                # ``k_scale``/``v_scale``, ai.onnx ``Attention`` has no such
-                # slot. Retyping a cache that no operator can dequantize would
-                # declare FP8 over data that is read as fp16 — silently wrong
-                # numerics — and quietly leaving the cache at the model dtype
-                # would hand back a package that does not do what was asked.
                 raise ValueError(
-                    "fp8_kv_cache=True was requested but the optimized graph "
+                    "fp8_kv_cache=True was requested but the exported graph "
                     "exposes no GroupQueryAttention KV cache to convert. FP8 KV "
                     "storage needs an attention operator with k_scale/v_scale "
                     "inputs to dequantize the cache on read; a static-cache "
                     "export scatters into fixed buffers read by ai.onnx "
                     "Attention, which has no such inputs. Build without "
-                    "--features fp8-kv-cache, or without --features static-cache "
-                    "so the decoder fuses to GroupQueryAttention."
+                    "--features fp8-kv-cache, or without --features static-cache."
                 )
 
-    # Rewrites may insert producers after existing consumers.
+    # Passes may insert producers after existing consumers.
     model.graph.sort()
 
 
@@ -726,7 +417,7 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     :class:`~mobius._passes.FoldConcatInitializersPass`,
     :class:`~mobius._passes.FoldTransposedInitializerPass`, and
     :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` in order.
-    FoldConcat must precede FoldTranspose so that packed QKV initializers are
+    FoldConcat must precede FoldTranspose so concatenated initializers are
     visible before the Transpose fold runs.
     """
     ir.passes.PassManager(

@@ -28,7 +28,7 @@ class GlmAsrSpeechLanguageTask(ModelTask):
     model_roles: ClassVar[dict[str, str]] = {
         "audio_encoder": "encoder",
         "embedding": "embedding",
-        # Keep standard Attention for this checkpoint. CUDA GQA fusion changes
+        # Keep standard Attention for this checkpoint. Direct CUDA GQA changes
         # the FP16 greedy transcript, while the portable graph matches HF exactly.
         "decoder": "decoder_no_gqa",
     }

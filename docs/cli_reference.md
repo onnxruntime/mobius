@@ -43,25 +43,24 @@ multi-component packages.
 --ep EP, --execution-provider EP
 ```
 
-Target execution provider for EP-aware optimizations. Default: `default`
-(portable ONNX with no vendor-specific fusions).
-
-EP-aware building drives the **entire** build pipeline — graph construction,
-operator fusion, dead input removal, and KV cache sizing are all tailored
-for the target EP. This is the recommended way to optimize for a specific
-runtime or hardware target.
+Target execution provider for graph-construction and runtime-packaging
+contracts. Default: `default`. Post-export graph transformations are handled
+by Olive.
 
 #### Available Execution Providers
 
 | EP | Typical dtype | Description |
 |----|---------------|-------------|
-| `default` | any | Portable ONNX — no EP-specific vendor fusions (e.g. no GQA/PackQKV). Standard fusions are emitted as model local functions. |
-| `cpu` | `f32` | ORT CPU inference — GQA fusion for FP32. |
-| `cuda` | `f16` or `bf16` | NVIDIA GPU — GQA fusion, SkipNorm, PackQKV. |
-| `dml` | `f16` | DirectML (Windows GPU) — GQA without fused RoPE. |
-| `trt-rtx` | `f16` or `bf16` | NVIDIA TensorRT-RTX — GQA, no SkipLayerNorm. |
-| `webgpu` | `f16` or `f32` | Browser / WebAssembly — Shape ops replaced with portable alternatives. |
+| `default` | any | Portable construction path with local function bodies retained. |
+| `cpu` | `f32` | ORT CPU construction contract; compatible decoders may emit GQA directly. |
+| `cuda` | `f16` or `bf16` | CUDA construction and runtime contract. |
+| `dml` | `f16` | DirectML construction and runtime contract. |
+| `trt-rtx` | `f16` or `bf16` | TensorRT-RTX construction and runtime contract. |
+| `webgpu` | `f16` or `f32` | WebGPU buffer and graph-capture constraints. |
+| `mlx` | `f32`, `f16`, or `bf16` | MLX plugin construction and runtime contract. |
 | `onnx-standard` | any | Strict ONNX standard — zero custom-domain ops; safe for any conformant ONNX runtime. |
+| `openvino` | any | OpenVINO portable construction and runtime defaults. |
+| `qnn` | any | QNN HTP construction constraints and local-function inlining. |
 
 Run `mobius list eps` to see all registered execution providers and their
 capabilities.
@@ -69,19 +68,19 @@ capabilities.
 #### Examples
 
 ```bash
-# Default (portable ONNX with standard fusions as model local functions)
+# Default portable construction contract
 mobius build --model meta-llama/Llama-3.2-1B --output output/
 
-# CPU (GQA fusion for f32)
+# CPU construction contract
 mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep cpu
 
-# CUDA GPU (GQA, SkipNorm, PackQKV fusions for f16/bf16)
+# CUDA GPU construction and runtime contract
 mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep cuda --dtype f16
 
-# DirectML (GQA without fused RoPE)
+# DirectML construction and runtime contract
 mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep dml --dtype f16
 
-# TensorRT-RTX (GQA, no SkipLayerNorm)
+# TensorRT-RTX construction and runtime contract
 mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep trt-rtx --dtype f16
 
 # WebGPU
@@ -91,59 +90,8 @@ mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep webgpu --dtyp
 mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep onnx-standard
 ```
 
-### Optimization Rules (`--optimize`)
-
-```
---optimize [RULES]
-```
-
-Apply rewrite rules after building. Use without a value to apply all
-available rules, or specify a comma-separated list of rule names.
-
-**Use `--optimize` only** for manual, targeted rewrite rule application.
-Rules are applied post-hoc and do not affect graph construction. This is
-useful for experimentation or when `--ep` doesn't cover a specific
-optimization.
-
-#### Available Rules
-
-| Rule | Description |
-|------|-------------|
-| `group_query_attention` | Fuse multi-head attention into GroupQueryAttention. |
-| `packed_attention` | Pack Q/K/V projections into a single MatMul. |
-| `skip_norm` | Fuse skip connections with normalization. |
-| `skip_layer_norm` | Fuse skip connections with LayerNorm. |
-| `bias_gelu` | Fuse bias addition with GELU activation. |
-
-#### Examples
-
-```bash
-# Apply specific rules
-mobius build --model meta-llama/Llama-3.2-1B --output output/ \
-    --optimize=group_query_attention,skip_norm
-
-# Apply all available rules
-mobius build --model meta-llama/Llama-3.2-1B --output output/ --optimize
-
-# Combine EP-aware building with additional post-hoc rules
-mobius build --model meta-llama/Llama-3.2-1B --output output/ \
-    --ep cuda --dtype f16 --optimize=bias_gelu
-```
-
-### `--ep` vs `--optimize`: When to Use Which
-
-**Prefer `--ep`** for production builds. It affects both graph construction
-and optimization (EP-aware KV cache sizing, dead input removal, operator
-fusion), while `--optimize` only applies rewrite rules after the graph is
-built.
-
-They can be combined when you need both EP-aware construction and additional
-post-hoc rules:
-
-```bash
-mobius build --model meta-llama/Llama-3.2-1B --output output/ \
-    --ep cuda --dtype f16 --optimize=bias_gelu
-```
+Mobius performs exporter cleanup and local-function inlining only. Apply
+post-export fusion and EP-specific graph lowering with Olive.
 
 ### ORT GenAI Runtime (`--runtime`)
 
@@ -263,7 +211,7 @@ mobius build --model meta-llama/Llama-3.2-1B --output output/ \
 
 Reduce saved model size by removing build-time debug and provenance
 metadata immediately before serialization. This includes source module paths,
-class hierarchies, name scopes, originating rewrite rules, and
+class hierarchies, name scopes, originating graph transforms, and
 symbolic-shape-inference internals. Functional metadata whose keys begin with
 `mobius.` is preserved.
 
@@ -376,7 +324,7 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 | `--dequantize` | Explicitly dequantize all mapped GGUF weights to float storage and report no quantized-storage claim. |
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
-| `--ep EP` | Target execution provider for EP-aware optimization. |
+| `--ep EP` | Target execution provider for graph construction and runtime packaging. |
 | `--runtime RUNTIME` | Request `onnx-genai` or `ort-genai` metadata. Exact architecture, tokenizer, runtime, and final-package evidence marks the output validated. Downstream runtime, version, registry, or executor gaps preserve the model with an explicit unvalidated report; intrinsic graph, tensor, source-identity, and storage failures still fail closed. |
 | `--runtime-version VERSION` | Selected runtime version. An exact evidence match marks the package validated; other versions are exported with runtime status unvalidated rather than inferred compatible. |
 | `--mmproj PATH` | Exact companion `clip` GGUF. Pairing validates source identity, target architecture, modality, tensor closure, and dimensions before graph construction. |

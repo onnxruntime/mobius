@@ -40,7 +40,6 @@ mobius build \
 |------|-------------|
 | `--model <id>` | HuggingFace model ID (e.g. `google/gemma-4-27b-it`) |
 | `--dtype <f16\|bf16>` | Model precision — `f16` (float16) or `bf16` (bfloat16) |
-| `--optimize [RULES]` | Apply mobius rewrite rules after building (e.g. `group_query_attention`, `packed_attention`, `skip_norm`). Use without value for all rules, or specify comma-separated names. Not needed for basic exports. |
 | `--ep <variant>` | Execution provider variant (see below) |
 | `--runtime ort-genai` | Generate `genai_config.json` and copy tokenizer files for ORT GenAI runtime |
 | `--external-data safetensors` | Store weights externally in safetensors format |
@@ -48,13 +47,13 @@ mobius build \
 
 ### Execution provider (EP) variants
 
-Build separate ONNX models per EP because each applies different graph
-rewrites and fused ops:
+Build separate ONNX models per EP when graph construction or runtime
+configuration differs:
 
 | EP | Flag | When to use |
 |----|------|-------------|
-| `default` | `--ep default` | Portable ONNX — no vendor-specific fusions. Compatible with all execution providers and runtimes. This is the default if `--ep` is omitted. |
-| `cuda` | `--ep cuda` | NVIDIA GPU inference. Emits `com.microsoft` fused ops (GroupQueryAttention, MoE, etc.) for maximum CUDA performance. |
+| `default` | `--ep default` | Portable construction path. This is the default if `--ep` is omitted. |
+| `cuda` | `--ep cuda` | NVIDIA GPU construction and runtime contract. |
 | `onnx-standard` | `--ep onnx-standard` | Strict ONNX-only — inlines all custom-domain functions into standard ONNX ops. Use when targeting runtimes that don't support `com.microsoft` ops. |
 
 Other EPs are available (`cpu`, `dml`, `webgpu`, `trt-rtx`). Run

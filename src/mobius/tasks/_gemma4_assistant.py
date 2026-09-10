@@ -63,11 +63,11 @@ class Gemma4AssistantTask(ModelTask):
         position_ids = builder.input(
             "position_ids", dtype=ir.DataType.INT64, shape=[batch, q_len]
         )
-        # ``attention_mask`` is REQUIRED by the GQA fusion path (used to
+        # ``attention_mask`` is required by the direct GQA path (used to
         # compute seqlens_k / total_seq_len).  The non-GQA fallback path
         # ignores it; we still expose it so a single ONNX graph covers both
-        # the standard-Attention build (CPU) and the GQA build (CUDA/CPU
-        # fp32 with GQA fusion).  Shape ``[batch, kv_len_full]`` — assumes
+        # standard-Attention and direct-GQA builds. Shape
+        # ``[batch, kv_len_full]`` — assumes
         # full attention's KV length governs the buffer; the assistant only
         # uses sliding for masking by reading the SAME mask (positions
         # outside the sliding window are still in the buffer but masked by

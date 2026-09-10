@@ -23,7 +23,7 @@ from typing import Any
 import onnx_ir as ir
 import pytest
 
-from mobius import registry
+from mobius import build_from_module, registry
 from mobius._configs import ArchitectureConfig
 from mobius._constants import (
     STATIC_CACHE_KV_SEQUENCE_LENGTH,
@@ -383,18 +383,17 @@ class TestFp8KvCacheMetadata:
     @staticmethod
     @pytest.fixture(scope="class")
     def fp8_workflow():
-        import onnx_ir as ir
-
-        from mobius._optimizations import optimize_model
-
-        config = _text_config()
-        module = registry.get("qwen2")(config)
-        pkg = CausalLMTask().build(module, config)
-        optimize_model(
-            pkg["model"],
-            ep="cuda",
+        config = _text_config(
             dtype=ir.DataType.FLOAT16,
-            model_role="decoder",
+            rope_type="default",
+            rope_theta=10_000.0,
+        )
+        module = registry.get("qwen2")(config)
+        pkg = build_from_module(
+            module,
+            config,
+            task=CausalLMTask(),
+            execution_provider="cuda",
             fp8_kv_cache=True,
         )
         return pkg, build_decoder_workflow_metadata(pkg, config)
@@ -456,8 +455,8 @@ class TestFeatureCombinations:
                 fp8_kv_cache=True,
             )
 
-    def test_static_cache_survives_cuda_optimization(self):
-        # Optimizing must not rewrite the scatter into an appending cache.
+    def test_static_cache_survives_cuda_finalization(self):
+        # Finalization must not replace the scatter with an appending cache.
         import onnx_ir as ir
 
         from mobius._optimizations import optimize_model

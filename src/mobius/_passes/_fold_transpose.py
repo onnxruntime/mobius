@@ -116,7 +116,7 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
 
                 # Derive shape of the transposed tensor from the Transpose output.
                 # Fall back to computing from the input shape if shape inference
-                # did not propagate to this new node (e.g. after stage-2 rewrites).
+                # did not propagate to this new node.
                 t_shape = out_val.shape
                 if t_shape is None and inp.shape is not None:
                     perm = list(perm_attr.value)

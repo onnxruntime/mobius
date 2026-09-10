@@ -293,9 +293,8 @@ use custom per-layer `GQAContext`s instead.
 
 > Note: `local_window_size` only *masks* attention; it does not shrink the
 > physical KV buffer, so bounding memory still needs a circular/static
-> cache. Also, the post-hoc GQA rewrite (`RotaryAttentionToGQA`) cannot
-> recover a window from an already-baked float mask, so sliding windows
-> must be set on the **direct** GQA path (GQAContext), not via the rewrite.
+> cache. Sliding windows must be set on the **direct** GQA path
+> (`GQAContext`); Mobius does not recover them with post-export rewrites.
 >
 > Decode trade-off: a non-default `local_window_size != -1` disqualifies the
 > dedicated `seq==1` **XQA** decode kernel (which requires `local_window==-1`,

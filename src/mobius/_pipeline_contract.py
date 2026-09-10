@@ -77,7 +77,7 @@ def optional_input_contract(value: Any) -> dict[str, Any] | None:
 
 
 def declare_arbitrary_attention_mask(graph: ir.Graph) -> None:
-    """Prevent attention fusions that only support prefix-valid masks."""
+    """Declare that downstream optimization must preserve the full attention mask."""
     graph.metadata_props[_ARBITRARY_ATTENTION_MASK] = "true"
 
 

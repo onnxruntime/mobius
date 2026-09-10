@@ -55,7 +55,7 @@ class Gemma4AssistantAttention(nn.Module):
       ``is_causal=0``.  Works on every EP and any dtype.
 
     * **GroupQueryAttention** — when ``gqa_ctx`` is given (active EP supports
-      GQA fusion for the build dtype).  Routes the shared K/V as
+      direct GQA emission for the build dtype). Routes the shared K/V as
       ``past_key`` / ``past_value`` directly in BNSH (no transpose), passes an
       empty new K/V (``kv_sequence_length=0`` so nothing is appended), and
       lets GQA's ``seqlens_k`` + ``do_rotary`` handle masking and RoPE on Q

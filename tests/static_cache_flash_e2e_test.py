@@ -181,7 +181,7 @@ def build_static_cache_model(
     """Build a tiny static-cache qwen2 graph and serialise it to ``tmp_dir``.
 
     Built with ``execution_provider="default"`` so the static-cache
-    ``Attention`` stays an ONNX-domain op (no CUDA GQA fusion) — that is the op
+    ``Attention`` stays an ONNX-domain op (no direct CUDA GQA emission) — that is the op
     microsoft/onnxruntime#28958 fixes and the one whose kernel selection this
     test asserts.  The model is loaded later on the CUDA EP at session time.
 

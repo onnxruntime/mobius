@@ -341,12 +341,12 @@ class TestFoldConcatInitializersPass:
 
 
 class TestConcatThenTransposeFolding:
-    """Verify FoldConcat + FoldTranspose eliminates the Concat+Transpose pattern from PackQKV."""
+    """Verify FoldConcat + FoldTranspose eliminates a packed-weight pattern."""
 
     def test_concat_then_transpose_fully_folded(self):
         """FoldConcat followed by FoldTranspose eliminates Concat AND Transpose.
 
-        PackQKV emits: Concat(W_q, W_k, W_v) → Transpose(concat_out).
+        The input graph contains Concat(W_q, W_k, W_v) → Transpose(concat_out).
         Running FoldConcat first folds Concat → packed_init.
         Running FoldTranspose second folds Transpose(packed_init) → packed_t_init.
         No runtime Concat or Transpose should remain.

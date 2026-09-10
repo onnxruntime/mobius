@@ -112,8 +112,7 @@ def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTas
     )
 
 
-# Map ModelPackage entry names to semantic model roles. GQA fusion is only
-# applied to decoder-role models.
+# Map ModelPackage entry names to semantic roles used during finalization.
 _MODEL_ROLE_MAP: dict[str, str] = {
     "model": "decoder",
     "decoder": "decoder",
@@ -146,7 +145,7 @@ def build_from_module(
         config: Architecture configuration. Its ``dtype`` controls model
             precision and its ``validate`` method runs before build.
         task: Task name or :class:`ModelTask` instance.
-        execution_provider: Target for EP-aware optimizations.
+        execution_provider: Target for graph construction and runtime packaging.
         trace_optimization: Log optimization diagnostics when true.
         fp8_kv_cache: Store supported decoder KV caches as FLOAT8E4M3FN.
         kv_cache_scales: Optional per-layer FP8 key/value scales.

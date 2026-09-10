@@ -1,233 +1,48 @@
 ---
 name: mobius-onnx-export-gotchas
-description: Use when building/exporting ONNX models with the `mobius build` CLI (especially Phi-3 / Phi-3.5 or any model with `--execution-provider cuda` GQA fusion and/or `--static-cache`). Covers the current CLI syntax, the dtype flag values, the GQA-vs-static-cache interaction, how to verify fp16 GQA exports load in onnxruntime (the historical packed-QKV FLOAT32 load bug is fixed by the fp16 GQA fold-fix), and why fp16 GQA exports need VALUE-based weight checks (corr≈1.0 / norm), not just initializer count/dtype, to catch silently-zeroed packed-QKV weights.
+description: Use when building ONNX models with the Mobius CLI, especially when selecting an execution provider or static KV cache.
 ---
 
-# mobius ONNX export gotchas
+# Mobius ONNX export gotchas
 
-## 1. CLI syntax (editable repo differs from older docs)
-`mobius build` requires `--model <hf_id>` and takes the **output dir as a POSITIONAL** arg.
-There is **no `-o` flag for `build`** (`-o` exists only on `build-gguf`).
+## CLI syntax
+
+`mobius build` requires `--model <hf_id>` and accepts `--output` / `-o` for the
+output directory.
 
 ```bash
 mobius build --model microsoft/Phi-3.5-mini-instruct \
   --dtype f16 --execution-provider cuda \
   --external-data onnx --trust-remote-code \
-  /path/to/output_dir
+  --output /path/to/output_dir
 ```
 
-- `--dtype` choices: `f16`/`float16`, `bf16`/`bfloat16`, `f32`/`float32`. **`fp16` is INVALID.**
-- `--execution-provider` is an alias of `--ep`. `cuda` + fp16/bf16 triggers GQA fusion;
-  `default` keeps plain ONNX `Attention`.
+Valid dtype aliases include `f16`/`float16`, `bf16`/`bfloat16`, and
+`f32`/`float32`. `fp16` is not accepted.
 
-## 2. `--static-cache` is incompatible with GQA fusion
-`--static-cache` wraps each attention with `TensorScatter` (in-place KV cache for the **ONNX Attention**
-op). That breaks the pattern the GQA rewrite matches, so combining
-`--execution-provider cuda --static-cache` yields **0 GroupQueryAttention + N Attention + 2N TensorScatter**
-(mobius prints: "GQA fusion expected … but found 0 GroupQueryAttention and N Attention nodes").
+## EP selection is not post-export optimization
 
-- **GQA model:** `--execution-provider cuda` **alone**. GQA's shared KV buffer
-  (`past_present_share_buffer`) is enabled at **runtime** via IO-binding past & present to the same
-  OrtValue — NOT via `--static-cache`.
-- **ONNX-Attention + in-place cache:** `--execution-provider default --static-cache --max-seq-len N`.
+`--execution-provider` is an alias of `--ep`. It selects construction-time
+operator contracts and runtime packaging defaults. Mobius performs exporter
+cleanup and local-function inlining, but no longer applies post-export rewrite
+rules.
 
-## 3. FIXED: fp16 GQA export previously left packed-QKV weights as FLOAT32 → model wouldn't load
-**Status: fixed (the fp16 GQA fold-fix).** Native fp16 Phi-3.5 GQA export now loads directly in the ORT
-CUDA EP with **no manual post-cast** (32 GroupQueryAttention nodes, all-fp16 initializers). If you are on
-that commit or later, you should not hit this — skip to the verification snippet below. The history is
-kept here because old artifacts exported before the fix still carry fp32 packed weights.
+Apply graph fusions and EP-specific lowerings with Olive after export.
 
-### Symptom (pre-fix)
-For an fp16 GQA export, a folded per-layer packed QKV weight
-(`..q_proj.weight__k_proj.weight__v_proj.weight__axis_0__concat`) was emitted as **FLOAT32**, while its
-MatMul's other input was fp16. onnxruntime then rejected the model at load on both CPU and CUDA EPs:
+## Static cache and direct GQA emission
 
-```
-Type Error: Type parameter (T) of Optype (MatMul) bound to different types
-(tensor(float16) and tensor(float)) in node (node_MatMul_*)
-```
+Static-cache graphs use standard ONNX Attention with explicit TensorScatter KV
+updates. The direct GroupQueryAttention construction path uses the runtime's
+shared past/present KV buffer instead.
 
-You'd also see at save time: `The value type for shape [H, 3H] is not known. Skipping serialization`.
+- For direct GQA-capable exports, select the appropriate EP without
+  `--features static-cache`.
+- For explicit fixed-size KV buffers, use
+  `--features static-cache --max-seq-len N`.
 
-### Root cause
-`_cast_module_dtype` casts module params to fp16, but the resulting initializer `Value`s lose their
-declared `.dtype` (it becomes `None`) while their `const_value` stays fp16. The fold passes
-`FoldConcatInitializersPass` (`src/mobius/_passes/_fold_concat.py`) and `FoldTransposedInitializerPass`
-(`src/mobius/_passes/_fold_transpose.py`) then defaulted the folded initializer's dtype to `FLOAT`,
-serializing the packed QKV / transposed weights as fp32.
+## Validate the saved artifact
 
-### The fix
-A shared helper `initializer_dtype()` (`src/mobius/_passes/_dtype_utils.py`) resolves the effective dtype
-from the declared type, **falling back to `const_value` when the type annotation was dropped** (preferring
-the data dtype and warning on stale-metadata disagreement). Both fold passes use it to stamp the correct
-dtype on the new initializer's `TensorType` and `LazyTensor`, and `FoldConcatInitializersPass` now also
-skips folding before weights are loaded (mirroring `FoldTransposedInitializerPass`). A regression test
-loads the fp16 GQA export in the ORT CPU EP to lock this in.
-
-### Verify (still worth running on any fp16 build)
-```python
-import onnx
-m = onnx.load("model.onnx", load_external_data=False)
-fp32 = [i.name for i in m.graph.initializer if i.data_type == onnx.TensorProto.FLOAT]
-print(len(fp32), "FLOAT32 initializers (should be 0 for fp16)")
-```
-
-### Convention (prevents the whole class from reappearing)
-Any pass that **materializes a new initializer** must resolve its dtype via
-`initializer_dtype()` (`src/mobius/_passes/_dtype_utils.py`), **never** `value.dtype or ir.DataType.FLOAT`.
-The bug class originates in `_cast_module_dtype` dropping a `Value`'s declared `.dtype` (→ `None`) while its
-`const_value` stays fp16; a bare `.dtype or FLOAT` fallback then silently mis-types the result as fp32. Fold
-passes (`_fold_concat.py`, `_fold_transpose.py`) already follow this; mirror it in any future
-initializer-producing pass. Siblings still reading `.dtype` directly remain exposed — a follow-up should
-grep `_passes/` for `.dtype or ir.DataType` and consider re-stamping the type in `_cast_module_dtype` to kill
-the class at source.
-
-### Salvaging a stale pre-fix artifact (only if re-exporting is not an option)
-Prefer re-exporting on the fixed code. If you must repair an old model, cast its FLOAT32 initializers to
-fp16 and re-save. **Gotcha when re-saving with external data:** if you save with `location="X.data"` and
-then rename the file, the references inside `model.onnx` still point to `X.data`. Either save directly
-with `location="model.onnx.data"`, or rewrite each initializer's `external_data` `location` entry.
-
-**Do not re-save with `onnx.save(..., save_as_external_data=True)` into an existing `.data` file.**
-`onnx.save_model` reaches `onnx.external_data_helper.save_external_data`, which opens the target
-`"r+b"` and then `seek(0, 2)` — it **appends**. The previous copy of the weights is never truncated,
-the offsets in `model.onnx` are rewritten to point at the newly appended copy, and the original copy
-stays on disk referenced by nothing. The model still loads and still produces byte-identical output,
-so nothing fails; the file is simply twice the size it should be. A Qwen2.5-14B int4 export was
-measured at 16.652 GB of which only 8.330 GB (50.02%) was referenced, in a single contiguous
-orphaned prefix `[0, 8322547712)`. That cost 2x disk and download, 2x pinned host RAM on
-memory-mapped weight paths, and produced a wrong weight-budget figure downstream in a consumer that
-reasonably sized from file length (justinchuby/onnx-genai#853).
-
-Use `ir.save`, which is what the rest of mobius uses. It writes the blob with `"wb"` and overwrites
-unconditionally, so there is no second copy to orphan:
-
-```python
-import numpy as np
-import onnx_ir as ir
-
-model = ir.load("model.onnx")
-for name, value in model.graph.initializers.items():
-    if value.const_value is not None and value.const_value.dtype == ir.DataType.FLOAT:
-        value.const_value = ir.tensor(value.const_value.numpy().astype(np.float16), name=name)
-ir.save(model, "model.onnx", external_data="model.onnx.data")
-```
-
-Note `ir.save` invalidates any existing external tensor that references the path it is writing, so
-load the values you intend to keep before saving over their backing file.
-
-Because this failure is silent, assert the post-condition rather than eyeballing the file size:
-
-```python
-import onnx, pathlib
-
-m = onnx.load("model.onnx", load_external_data=False)
-referenced = sum(
-    int(dict((kv.key, kv.value) for kv in t.external_data)["length"])
-    for t in m.graph.initializer
-    if t.data_location == onnx.TensorProto.EXTERNAL
-)
-size = pathlib.Path("model.onnx.data").stat().st_size
-assert referenced >= 0.99 * size, (
-    f"external data blob is {size:,} bytes but only {referenced:,} are referenced"
-)
-```
-
-## 4. Always validate the export in ORT before profiling
-Load the model on `CUDAExecutionProvider` and run one prefill + one decode `session.run`. Confirm:
-(a) the expected attention op (`com.microsoft::GroupQueryAttention` vs `ai.onnx::Attention`),
-(b) finite fp16 logits, (c) no FLOAT32 initializers for an fp16 build.
-
-These checks are **necessary but NOT sufficient** for a fp16 GQA export — see §5. A model can pass all
-three and still have silently-zeroed packed-QKV weights.
-
-## 5. Verifying a fp16 GQA export: use VALUE-based weight checks, NOT initializer count/dtype
-**A fp16 GQA export can be all-fp16, right-count, and still all-zeros — only a corr≈1.0 / norm≈126 VALUE
-check on the packed QKV proves the weights are real.**
-
-### Symptom
-The GQA model loads cleanly (32 `GroupQueryAttention` nodes, all-fp16, finite logits) but generates
-garbage (e.g. `holdou_(...artersarters`). Prefill logits come out ~3× the reference scale, with
-`max|Δlogit|` ~50+ versus the reference.
-
-### Root cause
-The packed-QKV initializer is `Transpose(Concat(q, k, v, axis=0))`. If the fold passes
-(`FoldConcatInitializersPass` / `FoldTransposedInitializerPass`) leave the packed-Concat output dtype
-UNKNOWN / defaulted-to-fp32 while the data is fp16, the serializer **skips** it and it loads as
-**near-zero** — the weights are silently dead. (This is the §3 failure mode; the upstream fix in
-The fp16 GQA fold-fix stamps the fp16 dtype at the fold-pass source. A post-hoc cast is NOT a fix — it re-corrupts.)
-
-### Why count/dtype checks fail (the trap)
-The BROKEN export and the FIXED export can have the **same initializer count and the same fp16/fp32 dtype
-ratio**, so neither is a validity signal. Worse, the fp16-init count is **not even stable across fixes**
-— on Phi-3.5 it moved from ~293 down to ~197 (an unstripped intermediate carries the packed-QKV plus the
-now-dead unpacked q/k/v source initializers; a safe dead-weight strip then removes the ~96 dead pre-pack
-inits), with no bearing on correctness. Note the OLD broken export was *also* 197 fp16, so even a "right"
-final count proves nothing. Counting initializers or checking "0 fp32 / all fp16" does **not** distinguish a
-healthy model from a zeroed-weight one. §4(c) alone will pass a dead model. **Never gate on the count;
-use the VALUE gate below.**
-
-### Canonical verification (load-bearing, not optional)
-VALUE-based per-slice check on each packed-QKV initializer against its source q/k/v weights:
-- per-slice correlation **≈ 1.000** (broken ≈ 0.000), AND
-- packed-QKV L2 norm **≈ 126.6** at layer 0 / mean(|abs|) **≈ 0.015** (broken ≈ 0.80 / ≈ 5e-6).
-
-> ⚠️ **Use mean-of-ABS or norm — NEVER the signed mean.** The good model's *signed* mean is ~2.6e-6
-> (near zero, because the weights are symmetric ±), which coincidentally looks just like the broken
-> model's mean(|abs|) ~5e-6. Checking signed mean would **falsely flag the good model as broken** — this
-> exact confusion has already caused a false alarm in this crew. Valid discriminators: mean(|abs|)
-> (good ≈ 0.015 vs broken ≈ 5e-6) or L2 norm (good ≈ 126.6 vs broken ≈ 0.80).
-
-Plus an end-to-end next-token greedy-argmax parity check vs the `attn_dynamic` reference (expect
-**~19–20 / 20**). Isolated single-token divergences are fp16 dead-ties (reference top1−top2 gap = 0.0000),
-not bugs. Optional hardening: assert **0 unused initializers** and that all N packed-QKV initializers are
-present, to catch dead-weight OVER-stripping.
-
-QA's `gqa_weight_integrity_gate.py` (`--self-check --strip-audit --scan-all`, per-layer corr/norm)
-implements exactly this gate.
-
-## 6. FIXED: GQA `present.*` KV-cache outputs declared the wrong `head_dim`
-**Status: fixed (the GQA present-KV shape fix).** A native fp16 GQA export now declares
-`present.{i}.{key,value}` with the correct `head_dim`, symmetric to its `past_key_values.{i}.*` inputs.
-
-### Symptom (pre-fix)
-The graph **output** `present.{i}.key/value` declared the wrong `head_dim` (e.g. `32` instead of the real
-`96` on Phi-3.5) while the matching `past_key_values.{i}.*` **input** was correct (`96`). At load ORT logged
-(once per key+value per layer — 64 on Phi-3.5):
-
-```
-[W ...MergeShapeInfo] Error merging shape info for output. 'present.0.key'
-source:{-1,32,-1,96} target:{-1,32,-1,32}. Falling back to lenient merge.
-```
-
-Runtime still produced correct (96-wide) arrays via lenient merge, but any consumer that **trusts declared
-shapes** (e.g. `onnxruntime-genai`) would see inconsistent past-vs-present KV cache types.
-
-### Root cause
-`GroupQueryAttention`'s contrib-op shape inference mis-derives the present `head_dim` (it does **not**
-reproduce on the plain `Attention` op, which infers correctly). `_register_kv_cache_outputs`
-(`src/mobius/tasks/_cache_utils.py`) added the present outputs with **no explicit shape**, so the buggy
-inference won.
-
-### The fix
-`_register_kv_cache_outputs` now opt-in **stamps** `present.{i}.{key,value}` shape+dtype symmetric to the
-past inputs when the caller passes `batch`/`num_kv_heads`/`key_head_dim`/`value_head_dim`/`total_seq_len`/
-`dtype` (wired from `_causal_lm.py`). Omitting them preserves inference-only behavior, so the other ~10
-callers are unaffected. The stamp survives `SymbolicShapeInferencePass` (policy `refine` only tightens
-unknown dims; it won't replace a concrete `96` with a conflicting `32`).
-
-### Verify
-```python
-import onnx
-m = onnx.load("model.onnx", load_external_data=False)
-d = lambda vi: [(x.dim_param or x.dim_value) for x in vi.type.tensor_type.shape.dim]
-o = {v.name: v for v in m.graph.output}
-print("present.0.key:", d(o["present.0.key"]))   # head_dim must equal the past input's (e.g. 96, NOT 32)
-```
-
-### Known remaining (separate, pre-existing, harmless)
-ORT still logs ~32 `Error merging shape info ... source:{-1,-1,3072} target:{-1,-1,1024}` warnings on the
-GQA op's **internal hidden-state output** value_info (`v_*.GroupQueryAttention_*_0`, `1024`=32×32 vs the
-correct `3072`=32×96). That value is **not** a declared graph I/O — runtime is correct and `onnxruntime-genai`
-does not trust it — so it does not bite shape-trusting consumers the way the present-output bug did. Tracked
-as a follow-up in the GQA rewrite emission path (not the KV-cache output path).
+Always load the saved ONNX model with the intended runtime before profiling.
+Check operator domains, graph inputs and outputs, initializer dtypes, and one
+representative inference result. HTTP or serialization success alone does not
+prove that the runtime accepts the graph.

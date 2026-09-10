@@ -2,12 +2,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""EP comparison example — see how the optimization pipeline differs per EP.
+"""EP comparison example — inspect construction differences across EPs.
 
 Builds a small Qwen3.5 model (graph only, no weights) for each registered
-execution provider and uses ``trace_optimization=True`` to show exactly which
-fusions and lowering passes fire.  Useful for understanding what the mobius
-builder does differently for each deployment target.
+execution provider and shows construction-time operator differences. The
+finalization trace covers cleanup and local-function inlining, not downstream
+Olive graph transformations.
 
 Usage::
 
@@ -27,7 +27,7 @@ Design notes
 ------------
 - ``--no-weights`` (default) avoids downloading large checkpoints.
   The graph structure is identical with or without weights.
-- ``trace_optimization=True`` logs each optimization stage at INFO level.
+- ``trace_optimization=True`` logs each finalization stage at INFO level.
   Set ``--verbose`` to see the full per-stage log.
 - ``ep_registry.names()`` is the live registry — any EP registered via
   ``register_ep()`` automatically appears in ``--ep`` choices.
@@ -61,17 +61,16 @@ from mobius._execution_providers import ep_registry
 # ---------------------------------------------------------------------------
 
 _EP_NOTES: dict[str, str] = {
-    "default": "Portable ONNX. No vendor fusions. Custom ops kept as function bodies.",
-    "cpu": "CPU EP. GQA fusion for FLOAT. No special lowering.",
-    "cuda": "CUDA EP. GQA + PackedAttention for FLOAT16/BFLOAT16.",
-    "dml": "DirectML EP. GQA for FLOAT16 only. RoPE + QKV unpacked (no fused rope/packed QKV).",
+    "default": "Portable construction path; local function bodies are retained.",
+    "cpu": "CPU contract; compatible FLOAT decoders emit GQA directly.",
+    "cuda": "CUDA contract; compatible decoders and vision models emit fused ops directly.",
+    "dml": "DirectML contract; standard Attention is retained when fused RoPE is unavailable.",
     "webgpu": (
-        "WebGPU EP. GQA for FLOAT/FLOAT16. "
-        "Shape ops eliminated (no Shape operator in graph capture mode)."
+        "WebGPU contract; compatible decoders emit GQA directly and "
+        "graph construction avoids unsupported dynamic empty-KV shapes."
     ),
     "trt-rtx": (
-        "TensorRT-RTX EP. GQA for FLOAT16/BFLOAT16. "
-        "SkipLayerNorm decomposed to primitives (no native kernel)."
+        "TensorRT-RTX contract; compatible FLOAT16/BFLOAT16 decoders emit GQA directly."
     ),
 }
 
@@ -142,7 +141,7 @@ def main() -> None:
     all_eps = sorted(ep_registry.names())
 
     parser = argparse.ArgumentParser(
-        description="Compare mobius optimization output across execution providers.",
+        description="Compare Mobius graph construction across execution providers.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -168,15 +167,15 @@ def main() -> None:
         help=(
             "Override model dtype (e.g. 'bfloat16', 'float16', 'float32'). "
             "Without this, dtype is auto-detected from the HuggingFace config. "
-            "Useful when the HF config dtype is fp32 but you want to test "
-            "GPU EP fusions that require fp16/bf16."
+            "Useful when the HF config dtype is fp32 but you want to inspect "
+            "GPU construction paths that require fp16/bf16."
         ),
     )
     parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
-        help="Show full DEBUG-level optimization trace.",
+        help="Show the full DEBUG-level finalization trace.",
     )
     args = parser.parse_args()
 

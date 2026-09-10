@@ -751,7 +751,7 @@ class TestBuildGraphVisionLanguage:
         The multimodal ``gemma4_unified`` decoder uses the bidirectional
         vision-block overlay (float-bias ``Attention``), but the text-only
         export strips ``image_token_id`` / ``use_bidirectional_attention`` so
-        the decoder is pure causal and fuses to ``GroupQueryAttention`` on a
+        the decoder is pure causal and emits ``GroupQueryAttention`` on a
         GQA-capable execution provider. This mirrors what
         ``build(text_only=True)`` produces, without network access.
         """

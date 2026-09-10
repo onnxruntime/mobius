@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 import tqdm
 
 if TYPE_CHECKING:
-    import onnx_ir as ir
     import torch
 
 from mobius._builder import (
@@ -111,45 +110,6 @@ def _load_weights_from_dir(model_dir: str) -> dict[str, torch.Tensor]:
     for path in tqdm.tqdm(paths, desc="Loading weights"):
         state_dict.update(safetensors.torch.load_file(path))
     return state_dict
-
-
-def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
-    """Apply rewrite rules if --optimize is specified."""
-    if not optimize:
-        return
-
-    from onnxscript.rewriter import rewrite
-
-    from mobius.rewrite_rules import (
-        bias_gelu_rules,
-        group_query_attention_rules,
-        packed_attention_rules,
-        skip_layer_norm_rules,
-        skip_norm_rules,
-    )
-
-    rule_map = {
-        "bias_gelu": bias_gelu_rules,
-        "group_query_attention": group_query_attention_rules,
-        "packed_attention": packed_attention_rules,
-        "skip_layer_norm": skip_layer_norm_rules,
-        "skip_norm": skip_norm_rules,
-    }
-
-    if optimize == "all":
-        rule_names = list(rule_map)
-    else:
-        rule_names = [r.strip() for r in optimize.split(",")]
-        for name in rule_names:
-            if name not in rule_map:
-                raise ValueError(
-                    f"Unknown rewrite rule '{name}'. Available: {sorted(rule_map)}"
-                )
-
-    for name in rule_names:
-        rules = rule_map[name]()
-        rewrite(model, pattern_rewrite_rules=rules)
-        print(f"Applied rewrite rule: {name}")
 
 
 def _cmd_build(args: argparse.Namespace) -> None:
@@ -331,7 +291,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
-    optimize = args.optimize
     component_filter = args.component
     execution_provider = args.execution_provider
 
@@ -367,7 +326,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 components=pipeline_components,
                 execution_provider=execution_provider,
             )
-            _save_package(pkg, output_dir, args, optimize, component_filter)
+            _save_package(pkg, output_dir, args, component_filter)
             return
 
     # Auto-detect NeMo .nemo archives (local file or HF ref like
@@ -383,7 +342,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             dtype=dtype_override,
             execution_provider=execution_provider,
         )
-        _save_package(pkg, output_dir, args, optimize, component_filter)
+        _save_package(pkg, output_dir, args, component_filter)
         return
 
     # Build from HuggingFace model ID or local config
@@ -414,7 +373,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 input_sampling_rate=input_sampling_rate,
                 bwe_sampling_rate=bwe_sampling_rate,
             )
-            _save_package(pkg, output_dir, args, optimize, component_filter)
+            _save_package(pkg, output_dir, args, component_filter)
             return
 
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
@@ -435,7 +394,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 input_sampling_rate=input_sampling_rate,
                 bwe_sampling_rate=bwe_sampling_rate,
             )
-            _save_package(pkg, output_dir, args, optimize, component_filter)
+            _save_package(pkg, output_dir, args, component_filter)
             return
         import onnx_ir as ir
         import transformers
@@ -613,7 +572,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             bwe_sampling_rate=bwe_sampling_rate,
         )
 
-    _save_package(pkg, output_dir, args, optimize, component_filter)
+    _save_package(pkg, output_dir, args, component_filter)
 
 
 def _runtime_source_revision(pkg, explicit_revision: str | None) -> str | None:
@@ -629,21 +588,17 @@ def _runtime_source_revision(pkg, explicit_revision: str | None) -> str | None:
     return next(iter(revisions)) if len(revisions) == 1 else None
 
 
-def _save_package(
-    pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
-) -> None:
-    """Save a ModelPackage to disk, applying optimizations and runtime configs."""
+def _save_package(pkg, output_dir: str, args, component_filter: str | None) -> None:
+    """Save a ModelPackage to disk with runtime configuration."""
     runtime = getattr(args, "runtime", None)
 
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
             continue
-        _apply_optimize(model, optimize)
         if args.release:
-            # Last thing before saving, so metadata that later stages read (and
-            # that rewrite rules add as they run) is still present while they
-            # need it.
+            # Last thing before saving so metadata remains available to all
+            # packaging stages that read it.
             strip_debug_metadata(model)
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
@@ -1262,7 +1217,7 @@ def _add_release_argument(parser: argparse.ArgumentParser) -> None:
         help=(
             "Strip build-time debug metadata from the graph before saving. "
             "Removes the per-node provenance onnxscript records (source module "
-            "path, class hierarchy, name scopes, originating rewrite rule) and "
+            "path, class hierarchy, name scopes, originating graph transform) and "
             "symbolic-shape-inference internals — roughly 35-40%% of the "
             "serialized graph, weights excluded. Nothing reads it at inference "
             "time; keep it off while debugging a graph in Netron."
@@ -1368,8 +1323,8 @@ def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
         default="default",
         metavar="EP",
         help=(
-            "Target execution provider for EP-aware optimizations "
-            "(default: 'default' → portable ONNX, no vendor fusions). "
+            "Target execution provider for graph construction and runtime packaging "
+            "(default: 'default' → portable ONNX). "
             "Use 'mobius list eps' to see available EPs. "
             "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
         ),
@@ -1432,19 +1387,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Immutable HuggingFace revision used for config, weights, tokenizer, "
             "and processor assets."
-        ),
-    )
-    build_parser.add_argument(
-        "--optimize",
-        nargs="?",
-        const="all",
-        default=None,
-        metavar="RULES",
-        help=(
-            "Apply rewrite rules after building. "
-            "Use without value for all rules, or specify comma-separated rule names "
-            "(e.g. --optimize=group_query_attention,skip_norm). "
-            "Available: group_query_attention, packed_attention, skip_norm."
         ),
     )
     build_parser.add_argument(
@@ -1823,8 +1765,8 @@ def build_parser() -> argparse.ArgumentParser:
         "preflight-gguf",
         help="Metadata-only preflight of a GGUF file or split set (local path "
         "or Hugging Face 'owner/repo[:file]'). Reports exact files, bytes, "
-        "checksums, resolved architecture, and export blockers (notably the "
-        "sparse-MoE fusion blocker) WITHOUT downloading tensor payloads.",
+        "checksums, resolved architecture, and semantic/runtime export blockers "
+        "WITHOUT downloading tensor payloads.",
     )
     preflight_parser.add_argument(
         "source",

@@ -91,7 +91,7 @@ def _build_q1_0(gguf_ref: str, output_dir: Path) -> None:
     from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
     print(f"Building Q1_0 from {gguf_ref} -> {output_dir}")
-    # ep='cpu' applies the GroupQueryAttention rewrite. With standard
+    # ep='cpu' selects direct GroupQueryAttention construction. With standard
     # opset 23 Attention (ep='default'), ORT GenAI's
     # past_present_share_buffer mode cannot be used; mobius's
     # write_ort_genai_config inspects the resulting graph and turns

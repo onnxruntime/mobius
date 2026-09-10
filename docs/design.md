@@ -384,12 +384,10 @@ src/mobius/
 │   ├── _controlnet.py       # ControlNetTask
 │   ├── _denoising.py        # DenoisingTask
 │   └── _vae.py              # VAETask
-├── rewrite_rules/
-│   ├── __init__.py          # Rule exports
-│   └── _packed_attention.py # PackedAttention rewrite rule
 └── _testing/
     ├── __init__.py          # Test utilities
     ├── comparison.py        # assert_logits_close, assert_generation_match
+    ├── model.py             # Shared ONNX model test helpers
     ├── ort_inference.py     # OnnxModelSession, OnnxGenerator
     └── torch_reference.py   # HF model loading + forward helpers
 ```

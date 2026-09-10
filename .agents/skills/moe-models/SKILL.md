@@ -271,8 +271,9 @@ See `tests/moe_integration_test.py` for the complete pattern.
 ## Direct MoE op emission (com.microsoft.MoE)
 
 OnnxRuntime ships a fused `com.microsoft.MoE` contrib op (CUDA float32/fp16/bf16,
-CPU float32/fp16). For new model architectures, **emit it directly** — like
-`com.microsoft.GroupQueryAttention` — rather than relying on a rewrite rule.
+CPU float32/fp16). Emit it directly only when it is part of the selected
+construction contract; otherwise emit the standard expert graph for Olive to
+optimize downstream.
 
 ### When to use
 

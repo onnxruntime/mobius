@@ -115,8 +115,8 @@ graph = onnx.helper.make_graph(nodes, "my_graph", inputs, outputs)
 tensor = onnx.TensorProto()
 ```
 
-This rule applies to all code: models, components, tasks, rewrite rules,
-tests, fixtures, and utilities. No exceptions.
+This rule applies to all code: models, components, tasks, tests, fixtures,
+and utilities. No exceptions.
 
 ### Model architecture modules
 

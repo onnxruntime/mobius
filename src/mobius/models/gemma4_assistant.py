@@ -159,7 +159,7 @@ class Gemma4AssistantCausalLMModel(nn.Module):
             op: onnxscript OpBuilder.
             inputs_embeds: ``[B, q_len, 2 * backbone_hidden_size]``.
             position_ids: ``[B, q_len]`` INT64.  Drives the RoPE on Q in the
-                non-GQA path; unused under GQA fusion (positions are derived
+                non-GQA path; unused with direct GQA emission (positions are derived
                 internally from seqlens_k).
             shared_kv: dict keyed by layer type (``"full_attention"``,
                 ``"sliding_attention"``) → ``(key, value)`` ir.Values in

@@ -9,8 +9,7 @@ KV-cache memory footprint at long context. The kernel keeps the ``query`` /
 ``key`` / ``value`` node inputs at the model dtype and quantizes the new K/V to
 FP8 internally on write, dequantizing on read, using a per-tensor scale.
 
-This pass runs **after** the GQA fusion rules (see
-:func:`~mobius._optimizations.optimize_model`). For every decoder
+This pass runs after graph construction and exporter cleanup. For every decoder
 ``GroupQueryAttention`` node whose ``past_key`` / ``past_value`` inputs are
 graph inputs it:
 

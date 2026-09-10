@@ -204,8 +204,8 @@ def test_mage_vl_decode_embedding_accepts_no_new_media(tmp_path):
     )
 
 
-def test_mage_vl_cuda_graph_is_fused_and_post_weight_optimized():
-    """FP16 CUDA builds fuse hot paths and fold weight transposes after loading."""
+def test_mage_vl_cuda_graph_uses_direct_fusions_and_folds_weights():
+    """FP16 CUDA builds emit supported fused ops and fold weight transposes."""
     overrides = next(overrides for mt, overrides, _ in VL_CONFIGS if mt == "mage_vl")
     config = dataclasses.replace(_base_config(**overrides), dtype=ir.DataType.FLOAT16)
     package = build_from_module(
@@ -220,10 +220,12 @@ def test_mage_vl_cuda_graph_is_fused_and_post_weight_optimized():
     assert count_op_type(decoder.graph, "GroupQueryAttention") == 2
     assert count_op_type(decoder.graph, "Attention") == 0
     assert count_op_type(decoder.graph, "Swish") == 2
-    assert count_op_type(decoder.graph, "SkipSimplifiedLayerNormalization") == 4
+    assert count_op_type(decoder.graph, "SkipSimplifiedLayerNormalization") == 0
+    assert count_op_type(decoder.graph, "RMSNormalization") == 9
     assert count_op_type(vision.graph, "PackedMultiHeadAttention") == 2
     assert count_op_type(vision.graph, "Attention") == 0
-    assert count_op_type(vision.graph, "SkipLayerNormalization") == 4
+    assert count_op_type(vision.graph, "SkipLayerNormalization") == 0
+    assert count_op_type(vision.graph, "LayerNormalization") == 6
     assert count_op_type(vision.graph, "GreaterOrEqual") == 0
 
     for model in (decoder, vision):

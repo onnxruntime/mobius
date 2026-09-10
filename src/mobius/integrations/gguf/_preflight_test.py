@@ -330,11 +330,11 @@ def test_report_json_roundtrip_is_resumable(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Sparse-MoE fusion assessment (the honesty blocker, metadata-level)
+# Downstream sparse-MoE capability assessment
 # --------------------------------------------------------------------------- #
 
 
-def test_assess_sparse_moe_blocks_iq1_moe():
+def test_assess_sparse_moe_rejects_quantized_glm_dsa_import():
     ok, blockers = _assess_sparse_moe(
         model_type="glm_moe_dsa",
         num_experts=160,
@@ -343,8 +343,8 @@ def test_assess_sparse_moe_blocks_iq1_moe():
     )
     assert ok is False
     assert len(blockers) == 1
-    assert "sparse" in blockers[0].lower()
-    assert "dense-all-expert" in blockers[0]
+    assert "does not support quantization-preserving GLM-DSA import" in blockers[0]
+    assert "keep_quantized=False" in blockers[0]
 
 
 def test_assess_sparse_moe_allows_non_moe():
@@ -359,7 +359,7 @@ def test_assess_sparse_moe_allows_non_moe():
 
 
 def test_assess_sparse_moe_allows_int4_moe():
-    # int4 experts repack to MatMulNBits and fuse into QMoE.
+    # Downstream tooling can fuse the exported MatMulNBits expert pattern.
     ok, blockers = _assess_sparse_moe(
         model_type="glm_moe_dsa",
         num_experts=160,
@@ -510,9 +510,11 @@ def test_hf_preflight_metadata_only(monkeypatch):
     assert report.total_files == 6
     assert report.total_bytes == sum(sizes.values())
     assert all(f.sha256 for f in report.files)
-    # The IQ1 MoE honesty blocker must be present.
     assert not report.exportable
-    assert any("sparse-MoE" in b for b in report.blockers)
+    assert not report.sparse_moe_fusion_supported
+    assert len(report.blockers) == 1
+    assert "does not support quantization-preserving GLM-DSA import" in report.blockers[0]
+    assert "keep_quantized=False" in report.blockers[0]
     # And nothing was downloaded.
     assert fake.downloaded == []
 
@@ -612,15 +614,9 @@ def test_budget_reflects_real_artifacts_only_no_second_copy(tmp_path):
     assert _json.loads(report.to_json())["output_bytes"] == report.output_bytes
 
 
-def test_sparse_iq1_moe_is_the_remaining_blocker_not_sharding(tmp_path):
-    # Flagship GLM-5.2 UD-IQ1_S composition: a *sharded*, MoE, IQ1_S set whose
-    # ONLY honesty blocker must be sparse-MoE fusion — never sharding or the
-    # architecture. The fixture is faithful to the three signals production
-    # actually consumes, so the gate is exercised end-to-end and the positive
-    # assertions below fail if either filename quant detection or the
-    # sparse-MoE gate is bypassed (a fixture that put IQ1_S into no
-    # production-consumed candidate — the prior bug — leaves quantization=None,
-    # fusion_supported=True and no blocker, failing this test).
+def test_sparse_iq1_glm_moe_reports_import_blocker_not_sharding(tmp_path):
+    # Flagship GLM-5.2 UD-IQ1_S composition: a sharded MoE model whose native
+    # expert blocks are preserved for downstream sparse-MoE optimization.
     shards = _write_glm_moe_iq1_sharded_gguf(tmp_path, num_experts=8)
 
     # -- Preconditions, proved explicitly (not assumed) ----------------------
@@ -643,24 +639,19 @@ def test_sparse_iq1_moe_is_the_remaining_blocker_not_sharding(tmp_path):
     # MoE + IQ1_S quant are detected from the real metadata/filename.
     assert report.num_experts == 8
     assert report.quantization == "IQ1_S"
-    # The routed experts are physically IQ1_S and losslessly preserved, so the
-    # only remaining concern is fusion — not a lossy/unsupported-qtype blocker.
+    # The routed experts are physically IQ1_S and losslessly preserved.
     iq1_stats = [s for s in report.type_stats if s.type_name == "IQ1_S"]
     assert iq1_stats, report.type_stats
     assert all(s.disposition == "native-preserve" for s in iq1_stats)
     assert report.unsupported_types == []
 
-    # -- The gate under test: sparse-MoE fusion is the remaining blocker ------
-    assert report.sparse_moe_fusion_supported is False
+    assert not report.sparse_moe_fusion_supported
+    assert not report.exportable
     assert len(report.blockers) == 1
-    blocker = report.blockers[0]
-    assert "sparse-MoE fusion blocker" in blocker
-    assert "dense-all-expert" in blocker
-    assert "BlockQuantizedMoE" in blocker
-    assert "glm_moe_dsa" in blocker
-    assert "IQ1_S" in blocker
+    assert "does not support quantization-preserving GLM-DSA import" in report.blockers[0]
+    assert "keep_quantized=False" in report.blockers[0]
 
-    # -- Sharding is explicitly NOT the blocker ------------------------------
+    # Sharding is explicitly not a blocker.
     joined = " ".join(report.blockers).lower()
     for forbidden in ("shard", "split", "merge", "double-copy", "second"):
         assert forbidden not in joined, report.blockers

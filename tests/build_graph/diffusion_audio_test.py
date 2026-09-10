@@ -267,9 +267,9 @@ class TestBuildMMSGraph:
         """Build and run MMS through OnnxRuntime end-to-end."""
         import numpy as np
 
+        from mobius._testing.model import fill_random_weights
         from mobius._testing.ort_inference import OnnxModelSession
         from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
-        from mobius.rewrite_rules._testing_utils import fill_random_weights
         from mobius.tasks import CTCAsrTask
 
         config = self._mms_config()

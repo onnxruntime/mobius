@@ -128,7 +128,7 @@ which generates the complete mapping for any supported architecture.
 llama.cpp is excellent for CPU and GPU inference but:
 - No execution provider ecosystem (TensorRT EP, QNN EP, OpenVINO EP, etc.)
 - Limited NPU/mobile deployment (no standard deployment format)
-- No graph optimization pipeline (our rewrite rules, ORT graph transformers)
+- No downstream graph optimization pipeline (for example Olive or ORT graph transformers)
 - No integration with broader ONNX tooling (Olive, model zoo)
 
 ONNX Runtime has 15+ execution providers. Converting GGUF → ONNX
@@ -934,7 +934,7 @@ class QDQLinear(nn.Module):
 > inserting a Transpose may prevent fusion. Two mitigations:
 > 1. Store weights as `(K, N)` with `axis=0` quantization → direct
 >    `MatMul(x, dq_weight)` with no Transpose
-> 2. Use a rewrite rule to fold the Transpose before EP compilation
+> 2. Use downstream graph surgery to fold the Transpose before EP compilation
 >
 > Benchmark both layouts before committing to a storage convention.
 

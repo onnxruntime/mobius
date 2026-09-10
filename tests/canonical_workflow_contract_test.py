@@ -36,9 +36,8 @@ import onnx_ir as ir
 import pytest
 import yaml
 
-from mobius import registry
+from mobius import build_from_module, registry
 from mobius._configs import ArchitectureConfig
-from mobius._optimizations import optimize_model
 from mobius.integrations.onnx_genai._workflow_contract import (
     published_value_references,
 )
@@ -104,13 +103,16 @@ def _static_cache_decoder() -> tuple[Any, dict[str, Any]]:
 
 def _fp8_decoder() -> tuple[Any, dict[str, Any]]:
     """One ONNX file whose cache buffers are FP8 rather than the compute dtype."""
-    config = _text_config()
-    pkg = CausalLMTask().build(registry.get("qwen2")(config), config)
-    optimize_model(
-        pkg["model"],
-        ep="cuda",
+    config = _text_config(
         dtype=ir.DataType.FLOAT16,
-        model_role="decoder",
+        rope_type="default",
+        rope_theta=10_000.0,
+    )
+    pkg = build_from_module(
+        registry.get("qwen2")(config),
+        config,
+        task=CausalLMTask(),
+        execution_provider="cuda",
         fp8_kv_cache=True,
     )
     return pkg, build_decoder_workflow_metadata(pkg, config)

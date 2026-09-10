@@ -270,163 +270,6 @@ def _raise_for_sharded_gguf(
     )
 
 
-class SparseMoEExportError(NotImplementedError):
-    """Routed MoE experts have no sparse fusion for their quantization.
-
-    Raised before export when a checkpoint's routed experts lower to per-expert
-    native ``pkg.nxrt::BlockQuantizedMatMul`` nodes (e.g. GLM-5.2 UD-IQ1_{S,M})
-    for which no sparse top-k ``BlockQuantizedMoE`` fusion exists — exporting
-    anyway would recompute every expert for every token (dense-all-expert
-    compute) with no performance guarantee.
-    """
-
-
-def _routed_dense_block_expert_paths(module) -> list[str]:
-    """Return module paths of routed experts lowered as native block linears.
-
-    A routed expert is a :class:`BlockQuantizedLinear` whose qualified name
-    contains a ``.moe.experts.`` (or bare ``.experts.``) segment but is *not* a
-    ``shared_expert``. These are the modules that, absent a sparse top-k MoE
-    fusion, force a dense loop over all experts.
-    """
-    from mobius.components import BlockQuantizedLinear
-
-    paths: list[str] = []
-    for name, mod in module.named_modules():
-        if not isinstance(mod, BlockQuantizedLinear):
-            continue
-        if "shared_expert" in name:
-            continue
-        if ".experts." not in name:
-            continue
-        paths.append(name)
-    return paths
-
-
-def _assert_sparse_moe_capability(module, config, *, source: str, allow_dense: bool) -> None:
-    """Fail closed when routed IQ-block experts have no sparse MoE fusion.
-
-    The int4 ``MatMulNBits`` dense-fallback → ``com.microsoft::QMoE`` rewrite is
-    the only sparse MoE path today; native IQ/MXFP4 block experts stay as
-    per-expert ``BlockQuantizedMatMul`` nodes. Exporting those yields a graph
-    that evaluates every expert for every token. Refuse by default; only proceed
-    (with a loud warning) when the caller explicitly opts in.
-    """
-    num_experts = int(getattr(config, "num_local_experts", 0) or 0)
-    if num_experts <= 0:
-        return
-    dense_paths = _routed_dense_block_expert_paths(module)
-    if not dense_paths:
-        return
-
-    example = ", ".join(sorted(dense_paths)[:3])
-    detail = (
-        f"{len(dense_paths)} routed expert projections (e.g. {example}) in "
-        f"{source!r} lower to per-expert native BlockQuantizedMatMul nodes."
-    )
-    if allow_dense:
-        logger.warning(
-            "allow_dense_moe: exporting %d routed MoE expert(s) as independent "
-            "BlockQuantizedMatMul nodes for %s. This recomputes EVERY expert for "
-            "every token (dense-all-expert compute); it is NOT a performance path "
-            "and makes no throughput claim. %s",
-            len(dense_paths),
-            source,
-            detail,
-        )
-        return
-
-    raise SparseMoEExportError(
-        "Sparse-MoE export blocker: "
-        f"{detail} No sparse top-k BlockQuantizedMoE fusion exists for these "
-        "block formats — only int4 MatMulNBits experts are fused into "
-        "com.microsoft::QMoE. Exporting anyway would build a dense-all-expert "
-        "graph (every expert evaluated for every token) with no performance "
-        "guarantee, so the build fails closed. To study the dense fallback, "
-        "re-run with allow_dense_moe=True (or set "
-        "MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this makes no throughput claim. "
-        "The supported fix is a sparse IQ-block BlockQuantizedMoE fusion "
-        "(top-k gather over native-block expert weights)."
-    )
-
-
-def _fuse_native_block_moe(pkg, *, allow_dense: bool) -> int:
-    """Collapse routed native-block expert storms into sparse ``BlockQuantizedMoE``.
-
-    Runs on the final, fully-weighted graph so the fusion can stack each layer's
-    per-expert native blocks byte-for-byte into one expert-major bank. Every
-    candidate layer is validated before any node is emitted, so an unfusable
-    layer (per-expert bias, ragged/incomplete group, ...) raises
-    :class:`SparseMoEExportError` atomically with the graph untouched, unless
-    ``allow_dense`` downgrades it to a warning + dense keep.
-
-    A layer that mixes native formats across its fc1/fc2/fc3 banks (GLM-5.2
-    UD-IQ1) can only be expressed with the ``block_layout_version=2``
-    per-projection ABI, which no shipped onnx-genai runtime executes yet. The
-    production builder therefore never enables v2: such layers always
-    typed-reject here rather than emit an unrunnable node. There is no
-    environment or CLI opt-in -- v2 stays a schema-construction test path until a
-    real typed runtime-capability handshake exists.
-    """
-    # Imported lazily: the generic rewrite lives in the rewrite_rules package and
-    # must not be pulled into the GGUF import graph at module load time.
-    from mobius.rewrite_rules import fuse_block_quantized_moe
-
-    fused = 0
-    for model in pkg.values():
-        # No ``_allow_perproj_v2_schema`` argument: the production authority path
-        # always fails closed for mixed-format v2 (fail-safe default).
-        fused += fuse_block_quantized_moe(model, allow_dense_moe=allow_dense)
-    return fused
-
-
-def _routed_dense_block_matmul_nodes(model) -> list:
-    """Routed per-expert ``BlockQuantizedMatMul`` nodes surviving in a graph.
-
-    A routed expert projection is a ``pkg.nxrt::BlockQuantizedMatMul`` whose
-    packed-weight initializer path carries an ``.experts.`` segment and is not a
-    ``shared_expert``. After :func:`_fuse_native_block_moe` runs, any that remain
-    are an un-collapsed dense-all-expert storm.
-    """
-    hits = []
-    for node in model.graph:
-        if node.op_type != "BlockQuantizedMatMul":
-            continue
-        weight = node.inputs[1] if len(node.inputs) > 1 else None
-        name = getattr(weight, "name", None) or ""
-        if ".experts." in name and "shared_expert" not in name:
-            hits.append(node)
-    return hits
-
-
-def _assert_sparse_moe_graph(pkg, *, source: str, allow_dense: bool) -> None:
-    """Sparse-MoE honesty gate over the final (post-fusion) graph state.
-
-    :func:`_fuse_native_block_moe` already fails closed with a precise reason for
-    every routed native-block storm it recognises. This backstop catches any
-    routed per-expert ``BlockQuantizedMatMul`` storm that survived fusion (e.g. a
-    dispatch shape the rewrite did not recognise): shipping it silently would be
-    a dense-all-expert graph with no throughput guarantee. Opting into the dense
-    fallback (``allow_dense``) is already warned about by the fusion, so this
-    gate only enforces the fail-closed default.
-    """
-    if allow_dense:
-        return
-    storm = [n for model in pkg.values() for n in _routed_dense_block_matmul_nodes(model)]
-    if not storm:
-        return
-    raise SparseMoEExportError(
-        "Sparse-MoE export blocker: "
-        f"{len(storm)} routed expert projection(s) in {source!r} remain as "
-        "per-expert pkg.nxrt::BlockQuantizedMatMul nodes after native-block MoE "
-        "fusion (no sparse top-k BlockQuantizedMoE was applied). Exporting anyway "
-        "would build a dense-all-expert graph (every expert evaluated for every "
-        "token) with no performance guarantee, so the build fails closed. To "
-        "study the dense fallback, re-run with allow_dense_moe=True (or set "
-        "MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this makes no throughput claim."
-    )
-
-
 def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
     """Use Hub metadata to reject known-bad inputs before a multi-GB download."""
     source = f"{repo_id}:{filename}"
@@ -6741,7 +6584,6 @@ def build_from_gguf(
     image_token_id: int | None = None,
     static_cache: bool = False,
     max_seq_len: int | None = None,
-    allow_dense_moe: bool | None = None,
     reuse_gguf_weights: bool = False,
     target_config: str | Path | Mapping[str, object] | None = None,
     output_layer_indices: Sequence[int] | None = None,
@@ -6788,10 +6630,10 @@ def build_from_gguf(
             classified as lossy dequantize/requantize conversions. This does not
             guarantee source-byte or source-value fidelity. Set to ``False`` to
             dequantize all weights to float.
-        execution_provider: Target execution provider for EP-aware
-            optimisations (e.g. ``"cpu"`` to apply the
-            GroupQueryAttention rewrite). Defaults to ``"default"``
-            (portable, no vendor fusions).
+        execution_provider: Target EP for graph construction and runtime
+            packaging (for example, ``"cpu"`` selects direct
+            GroupQueryAttention construction for compatible decoders).
+            Defaults to ``"default"``.
         mmproj: Optional path (or HF ref) to a companion ``clip``
             multimodal-projector GGUF. When set, this becomes the single
             entry point for a multimodal build: the text GGUF and the
@@ -6810,14 +6652,6 @@ def build_from_gguf(
         max_seq_len: Maximum sequence length for the static cache buffers.
             Only used when ``static_cache=True``. Defaults to the model's
             ``max_position_embeddings``.
-        allow_dense_moe: Opt in to exporting routed MoE experts that have no
-            sparse top-k fusion (they lower to per-expert native
-            ``BlockQuantizedMatMul`` nodes, i.e. dense-all-expert compute with
-            no performance guarantee). When ``None`` (default), the value of
-            the ``allow_dense_moe_experts`` flag is used, which defaults to
-            ``False`` — the build fails closed with a typed capability error
-            rather than silently shipping a dense graph. This is a research /
-            correctness knob and makes no throughput claim.
         reuse_gguf_weights: Reuse compatible tensor payloads directly from the
             original GGUF via ONNX external-data ranges. The GGUF must be a real
             file in the final flat output directory. Converted tensors are
@@ -6966,11 +6800,6 @@ def build_from_gguf(
             "static_cache=True cannot be combined with an explicit task "
             "override; the static cache is wired through CausalLMTask."
         )
-
-    from mobius._flags import flags as _mobius_flags
-
-    if allow_dense_moe is None:
-        allow_dense_moe = _mobius_flags.allow_dense_moe_experts
 
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]").
     #    A ``-000i-of-000N.gguf`` split set is assembled directly from its shards
@@ -7479,12 +7308,8 @@ def build_from_gguf(
             dequantize_float_linear_types=float_linear_dequantization_types,
         )
         _replace_native_block_linears(module, gguf_model, gguf_arch)
-        # The sparse-MoE honesty gate runs post-export on the final graph state
-        # (see step 9b): routed native-block experts are first collapsed into a
-        # sparse top-k pkg.nxrt::BlockQuantizedMoE by fuse_block_quantized_moe,
-        # then the gate fails closed if any per-expert dense storm survives.
-        # Enforcing here (pre-export, module level) would reject the very layers
-        # the fusion can now collapse, so the authority moved to the graph.
+        # Routed native-block experts remain explicit in the exported graph.
+        # Downstream tooling owns sparse-MoE fusion.
     quantization_report = _preflight_quantization_report(
         gguf_model,
         gguf_arch,
@@ -7644,15 +7469,6 @@ def build_from_gguf(
             if id(tensor) in reuse_candidates_by_id
         }
         attach_reused_initializers(pkg, gguf_path, final_candidates, gguf_model)
-
-    # 9b. Sparse-MoE fusion + honesty gate (final graph state).
-    # Now that every native block carries its real packed bytes, collapse the
-    # routed per-expert BlockQuantizedMatMul storm into one sparse top-k
-    # pkg.nxrt::BlockQuantizedMoE per layer (byte-for-byte, no requantization),
-    # then fail closed if any dense-all-expert storm still survives.
-    if preserve_quantization:
-        _fuse_native_block_moe(pkg, allow_dense=allow_dense_moe)
-        _assert_sparse_moe_graph(pkg, source=str(gguf_path), allow_dense=allow_dense_moe)
 
     # 10. Build the trailing MTP / "nextn" self-speculative head sidecar from
     # the GGUF's ``blk.<nextn>.*`` tensors (dropped by the backbone build) and
