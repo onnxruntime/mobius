@@ -415,9 +415,9 @@ parameters between the loaded model and the safetensors checkpoint.
 
 ### 7. `AttributeError: '<X>TextModel' object has no attribute 'config'`
 
-**Symptom:** Building (or running build-graph / GQA export tests for)
-a model raises `AttributeError: '…TextModel' object has no attribute
-'config'` from inside `TextModel.forward` (e.g. `_gqa_local_window_size`).
+**Symptom:** Building a model raises `AttributeError: '…TextModel' object has
+no attribute 'config'` from inside `TextModel.forward` (e.g.
+`_gqa_local_window_size`).
 
 **Root cause:** The base `TextModel.__init__` sets `self.config = config`,
 and `TextModel.forward` relies on it (sliding-window detection, etc.). A
