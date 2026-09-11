@@ -531,7 +531,8 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         # fused expert-major tensors and route them through the QMoE repacker
         # instead of un-fusing into per-expert MLPs. Uses the same predicate
         # as MoELayer so the weights and the emitted graph never disagree.
-        use_qmoe = supported_qmoe_quantization(_decoder_quantization(self.config)) is not None
+        quantization = _decoder_quantization(self.config)
+        use_qmoe = supported_qmoe_quantization(quantization) is not None
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):
@@ -581,10 +582,14 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
         return preprocess_quantized_weights(
             cleaned,
-            _decoder_quantization(self.config),
+            quantization,
             tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=".mlp",
             qmoe_quant_methods=("gptq", "awq", "olive"),
+            defer_non_expert_sidecars=(
+                self.config.component_quantization is not None
+                or (quantization is not None and quantization.has_module_plan)
+            ),
         )
 
 
@@ -718,6 +723,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=None,
                 reject_quantized_embeddings_lm_head=True,
+                defer_non_expert_sidecars=True,
             )
             result.update(other_weights)
         else:
@@ -1001,6 +1007,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 qmoe_target_path=".mlp",
                 qmoe_quant_methods=("olive",),
                 reject_quantized_embeddings_lm_head=True,
+                defer_non_expert_sidecars=True,
             )
             result.update(other_weights)
         else:

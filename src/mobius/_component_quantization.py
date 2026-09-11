@@ -22,11 +22,13 @@ from onnxscript import nn
 
 from mobius._component_manifest import ComponentDescriptor, ComponentManifest
 from mobius._configs import BaseModelConfig, QuantizationConfig
+from mobius._weight_utils import is_packed_quant_key
 from mobius.components import (
     ClippableLinear,
     ClippableQuantizedLinear,
     Embedding,
     Linear,
+    MoELayer,
     QuantizedEmbedding,
     QuantizedLinear,
     make_clippable_quantized_linear_factory,
@@ -36,6 +38,9 @@ from mobius.tasks import ModelTask, get_task
 from mobius.weights import FloatWeight, PackedWeight, codec_registry
 
 _AFFINE_METHODS = frozenset({"olive", "gptq", "awq"})
+_TOKEN_EMBEDDING_NAMES = frozenset(
+    {"embed_in", "embed_tokens", "shared", "word_embeddings", "wte"}
+)
 _KNOWN_SPLIT_COMPONENTS = frozenset(
     {
         "decoder",
@@ -91,6 +96,14 @@ def _component_quantization(
     if component == "decoder":
         return mapping.get("model")
     return None
+
+
+def _uses_global_module_rules(
+    config: BaseModelConfig,
+    manifest: ComponentManifest,
+) -> bool:
+    quantization = getattr(config, "quantization", None)
+    return len(manifest) == 1 and quantization is not None and quantization.has_module_plan
 
 
 def _linear_factory(
@@ -244,15 +257,12 @@ def _configure_component_module(
             for prefix in owned_by_other_components
         ):
             continue
+        source_names = _source_module_names(descriptor, local_path, child)
         quantization = _effective_module_quantization(
             component_quantization,
             descriptor,
             local_path,
-            source_module_names=_source_module_names(
-                descriptor,
-                local_path,
-                child,
-            ),
+            source_module_names=source_names,
             component_module=component_module,
             output_head_paths=output_head_paths,
         )
@@ -347,6 +357,9 @@ def _configure_component_module(
             embedding_dim = int(child.weight.shape[1])
             if (
                 quantization.quantize_embeddings
+                and any(
+                    name.rsplit(".", 1)[-1] in _TOKEN_EMBEDDING_NAMES for name in source_names
+                )
                 and embedding_dim % quantization.group_size == 0
             ):
                 num_embeddings = int(child.weight.shape[0])
@@ -424,13 +437,7 @@ def configure_component_quantization(
     """Apply authoritative component plans to graph parameter scaffolding."""
     manifest = manifest or _default_manifest(module, config, task)
     mapping = getattr(config, "component_quantization", None)
-    root_quantization = getattr(config, "quantization", None)
-    single_component_rules = (
-        manifest.names == ("model",)
-        and root_quantization is not None
-        and (root_quantization.modules_to_not_convert or root_quantization.overrides)
-    )
-    if mapping is None and not single_component_rules:
+    if mapping is None and not _uses_global_module_rules(config, manifest):
         return manifest
 
     unresolved = set(mapping) - set(manifest) if mapping is not None else set()
@@ -475,8 +482,30 @@ def configure_component_quantization(
     return manifest
 
 
-def _raw_qweight_key(name: str) -> bool:
-    return name.endswith(("_qweight", ".qweight"))
+def _quantized_parameter_groups(
+    module: nn.Module,
+) -> Iterable[tuple[str, dict[str, nn.Parameter]]]:
+    if isinstance(module, MoELayer) and module.experts is None:
+        for prefix in ("fc1", "fc2"):
+            weight_name = f"{prefix}_experts_weights"
+            parameters = {
+                weight_name: getattr(module, weight_name),
+                f"{prefix}_scales": getattr(module, f"{prefix}_scales"),
+            }
+            zero_points_name = f"{prefix}_experts_zero_points"
+            zero_points = getattr(module, zero_points_name)
+            if zero_points is not None:
+                parameters[zero_points_name] = zero_points
+            yield weight_name, parameters
+    elif isinstance(module, (QuantizedEmbedding, QuantizedLinear)):
+        weight_name = "qweight" if isinstance(module, QuantizedEmbedding) else "weight"
+        parameters = {
+            weight_name: getattr(module, weight_name),
+            "scales": module.scales,
+        }
+        if module.zero_points is not None:
+            parameters["zero_points"] = module.zero_points
+        yield weight_name, parameters
 
 
 def _canonical_component_parameter_keys(
@@ -502,33 +531,23 @@ def _canonical_component_parameter_keys(
         stems = {
             f"{prefix}.{local_path}" if prefix else local_path for prefix in (*prefixes, "")
         }
-        if isinstance(child, QuantizedEmbedding):
-            weight_name = "qweight"
-            weight_parameter = child.qweight
-        elif isinstance(child, QuantizedLinear):
-            weight_name = "weight"
-            weight_parameter = child.weight
-        else:
-            continue
-        parameters = {weight_name: weight_parameter, "scales": child.scales}
-        if child.zero_points is not None:
-            parameters["zero_points"] = child.zero_points
-        for stem in stems:
-            packed_key = f"{stem}.{weight_name}"
-            if packed_key not in weights or weights[packed_key].dtype != torch.uint8:
-                continue
-            if any(
-                parameter.shape is None
-                or f"{stem}.{name}" not in weights
-                or tuple(weights[f"{stem}.{name}"].shape) != tuple(parameter.shape)
-                for name, parameter in parameters.items()
-            ):
-                continue
-            if isinstance(child, QuantizedLinear) and any(
-                key in weights for key in (f"{stem}.qweight", f"{stem}.weight_qweight")
-            ):
-                continue
-            keys.update(f"{stem}.{name}" for name in parameters)
+        for weight_name, parameters in _quantized_parameter_groups(child):
+            for stem in stems:
+                packed_key = f"{stem}.{weight_name}"
+                if packed_key not in weights or weights[packed_key].dtype != torch.uint8:
+                    continue
+                if any(
+                    parameter.shape is None
+                    or f"{stem}.{name}" not in weights
+                    or tuple(weights[f"{stem}.{name}"].shape) != tuple(parameter.shape)
+                    for name, parameter in parameters.items()
+                ):
+                    continue
+                if isinstance(child, QuantizedLinear) and any(
+                    key in weights for key in (f"{stem}.qweight", f"{stem}.weight_qweight")
+                ):
+                    continue
+                keys.update(f"{stem}.{name}" for name in parameters)
     return frozenset(keys)
 
 
@@ -605,16 +624,10 @@ def normalize_component_quantized_weights(
 ) -> dict[str, Any]:
     """Normalize existing packed sidecars with each component's own plan."""
     component_names = tuple(component_names)
-    mapping = getattr(config, "component_quantization", None)
-    root_quantization = getattr(config, "quantization", None)
-    single_component_rules = (
-        len(component_names) == 1
-        and root_quantization is not None
-        and (root_quantization.modules_to_not_convert or root_quantization.overrides)
-    )
-    if mapping is None and not single_component_rules:
-        return state_dict
     manifest = manifest or _default_manifest(module, config, task)
+    mapping = getattr(config, "component_quantization", None)
+    if mapping is None and not _uses_global_module_rules(config, manifest):
+        return state_dict
     routed = _route_component_weights(state_dict, manifest, component_names)
     result = dict(state_dict)
 
@@ -628,7 +641,7 @@ def normalize_component_quantized_weights(
         source_weights = {
             key: value for key, value in weights.items() if key not in canonical_keys
         }
-        if not any(_raw_qweight_key(key) for key in source_weights):
+        if not any(is_packed_quant_key(key) for key in source_weights):
             continue
 
         descriptor = manifest[component]
@@ -636,7 +649,7 @@ def normalize_component_quantized_weights(
         output_head_paths = _component_output_head_paths(module, component)
         component_quantization = _component_quantization(config, component)
         if component_quantization is None:
-            packed_key = next(key for key in weights if _raw_qweight_key(key))
+            packed_key = next(key for key in source_weights if is_packed_quant_key(key))
             raise ValueError(
                 f"Component {component!r} is floating point but checkpoint "
                 f"contains packed weight {packed_key!r}"
@@ -726,7 +739,7 @@ def normalize_component_quantized_weights(
         )
     )
     remaining = next(
-        (key for key in result if _raw_qweight_key(key) and key not in canonical_keys),
+        (key for key in result if is_packed_quant_key(key) and key not in canonical_keys),
         None,
     )
     if remaining is not None:
@@ -742,16 +755,11 @@ def validate_quantized_component_bindings(
     config: BaseModelConfig,
 ) -> None:
     """Require every affine quantized op input to carry a bound value."""
-    if getattr(config, "component_quantization", None) is None:
-        return
-
     quantized_input_slots = {
         "MatMulNBits": (1, 2, 3),
         "GatherBlockQuantized": (0, 2, 3),
     }
     for component, model in models.items():
-        if _component_quantization(config, component) is None:
-            continue
         for node in ir.traversal.RecursiveGraphIterator(model.graph):
             slots = quantized_input_slots.get(node.op_type)
             if slots is None:

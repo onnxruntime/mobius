@@ -241,6 +241,11 @@ with `re:` continue to use full-match regular expressions.
 Different packed layouts inside one component require per-module overrides and
 must be represented explicitly rather than inferred from a root plan.
 
+Legacy model-wide module rules apply when the resolved manifest owns one
+component, regardless of its package key. Graph construction and normalization
+use the same manifest-based decision; passing a one-component subset of a
+multi-component package does not enable those rules.
+
 ## 3. Component-specific construction
 
 The component configuration is selected before creating its parameters:
@@ -269,6 +274,9 @@ module policy. Model-declared `COMPONENT_OUTPUT_HEADS` stay float unless
 `quantize_lm_head` is enabled. A module's
 `component_quantization_excluded_methods` applies to that module and all its
 descendants; selecting a quantized component must not override this invariant.
+This includes the deliberately floating-point shared-expert gates in Qwen2-MoE
+and Qwen3-Next. `quantize_embeddings` converts input token tables identified by
+their local or aliased source names, not learned positional embeddings.
 
 This replaces post-construction scanning that tries to swap `Linear` instances
 after a model has already encoded architecture-specific choices.
@@ -337,15 +345,20 @@ Format-specific layout handling lives in a registry:
 class QuantizationCodec(Protocol):
     method: str
 
-    def decode_metadata(self, value: object) -> QuantizationConfig: ...
+    def group(
+        self,
+        component: ComponentDescriptor,
+        state_dict: Mapping[str, torch.Tensor],
+        config: QuantizationConfig,
+    ) -> WeightBundle: ...
 
     def normalize(
         self,
         record: WeightRecord,
-        target: QuantizationConfig,
+        config: QuantizationConfig,
         *,
         kind: Literal["linear", "embedding"] = "linear",
-    ) -> WeightRecord: ...
+    ) -> dict[str, torch.Tensor]: ...
 ```
 
 Initial codecs:
@@ -369,20 +382,38 @@ two-dimensional `GatherBlockQuantized` layout. A shared `.scales` suffix alone
 does not identify a canonical group; the packed tensor, scales, and required
 zero points must all match the target parameters before normalization is
 skipped.
+The component normalizer also retains complete canonical QMoE expert groups.
+When component plans or single-component module rules are active, it rejects
+unconsumed raw sidecars even when no qweight is present or no component owns
+them; valid canonical scales must not be mistaken for orphan checkpoint data.
 
 ## 6. ModelWeightAdapter
 
-The model adapter receives one already-routed component bundle:
+The current implementation retains a raw-state compatibility adapter for
+architecture-specific name mapping, tying, and expert transformations:
 
 ```python
+@dataclasses.dataclass(frozen=True)
+class WeightAdapterContext:
+    config: BaseModelConfig
+    manifest: ComponentManifest
+
+
 class ModelWeightAdapter(Protocol):
     def adapt(
         self,
-        component: ComponentDescriptor,
-        weights: WeightBundle,
-        config: BaseModelConfig,
-    ) -> WeightBundle: ...
+        module: nn.Module,
+        state_dict: Mapping[str, torch.Tensor],
+        context: WeightAdapterContext,
+    ) -> dict[str, torch.Tensor]: ...
 ```
+
+Routing and codec grouping happen after this adapter. With component plans or
+single-component module rules, ordinary packed sidecars stay raw until the
+shared loader resolves their per-projection layouts. The shared legacy
+preprocessor can still pack QMoE expert banks and tie floating-point tables.
+A per-component `WeightBundle` adapter is a future migration target, not the
+currently implemented interface.
 
 Appropriate model-specific operations include:
 
@@ -395,9 +426,9 @@ Appropriate model-specific operations include:
 
 The adapter must not:
 
-- choose a component quantization configuration;
-- read unrelated component weights;
-- dispatch Olive/GPTQ/AWQ formats;
+- override the producer's per-projection quantization policy;
+- eagerly repack ordinary sidecars using one model-wide or component-wide layout;
+- duplicate generic Olive/GPTQ/AWQ format conversion;
 - bind graph initializers;
 - silently drop unrecognized packed tensors.
 
@@ -423,12 +454,18 @@ Required invariants:
 
 These checks happen before save or runtime metadata generation.
 
+The loading-time binding gate scans emitted `MatMulNBits` and
+`GatherBlockQuantized` nodes regardless of whether configuration came from a
+component mapping or a legacy root plan. `build(load_weights=False)` still
+returns an unbound skeleton. Independently, `ModelPackage.save()` checks all
+initializers by default.
+
 ## Ordering of normalization and model transforms
 
 Some transforms operate on logical tensors while others depend on a source
-packing layout. The pipeline therefore distinguishes:
+packing layout. The target typed pipeline distinguishes:
 
-1. **sidecar grouping** — always first;
+1. **sidecar grouping**;
 2. **semantic routing/name mapping** — typed records remain packed;
 3. **architecture transform planning** — split/fuse intent is declared;
 4. **codec normalization** — source layout becomes canonical target layout;
@@ -437,6 +474,10 @@ packing layout. The pipeline therefore distinguishes:
 
 A transform unsupported for packed storage fails explicitly. It must not
 silently dequantize and requantize.
+
+The current compatibility path performs raw semantic name mapping before
+grouping, as described above. It preserves ordinary sidecars rather than
+claiming that the full typed transform-planning pipeline is already implemented.
 
 ## Compatibility plan
 

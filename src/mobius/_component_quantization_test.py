@@ -11,6 +11,7 @@ import pytest
 import torch
 from onnxscript import nn
 
+from mobius import build_from_module
 from mobius._component_quantization import (
     configure_component_quantization,
     normalize_component_quantized_weights,
@@ -20,6 +21,7 @@ from mobius._component_quantization import (
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._model_package import ModelPackage
 from mobius.components import (
+    Embedding,
     Linear,
     QuantizedEmbedding,
     QuantizedLinear,
@@ -52,6 +54,9 @@ class _Projection(nn.Module):
     def __init__(self, linear_class: type[nn.Module] = Linear):
         super().__init__()
         self.proj = linear_class(64, 32, bias=False)
+
+    def forward(self, op, x):
+        return self.proj(op, x)
 
 
 class _Composite(nn.Module):
@@ -211,6 +216,137 @@ class _SingleTask(ModelTask):
 
     def build(self, module, config) -> ModelPackage:
         raise NotImplementedError
+
+
+@pytest.mark.parametrize("token_name", ["embed_tokens", "word_embeddings", "tokens"])
+def test_quantize_embeddings_only_rewrites_input_token_table(token_name):
+    class _EmbeddingModule(nn.Module):
+        HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
+            "model": {"tokens": "model.embed_tokens"}
+        }
+
+        def __init__(self):
+            super().__init__()
+            setattr(self, token_name, Embedding(256, 64))
+            self.embed_positions = Embedding(128, 64)
+
+    quantization = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_embeddings=True
+    )
+    module = _EmbeddingModule()
+    configure_component_quantization(
+        module,
+        ArchitectureConfig(component_quantization={"model": quantization}),
+        _SingleTask(),
+    )
+
+    assert isinstance(getattr(module, token_name), QuantizedEmbedding)
+    assert type(module.embed_positions) is Embedding
+
+
+@pytest.mark.parametrize("component", ["model", "decoder", "vision_encoder"])
+def test_global_override_is_independent_of_single_component_name(component):
+    from mobius._configs import QuantizationOverride
+    from mobius._testing import create_test_input, make_config
+    from mobius.tasks._base import _make_graph, _make_model
+
+    class _NamedSingleTask(ModelTask):
+        model_roles: ClassVar[dict[str, str]] = {component: "decoder"}
+        components = ComponentSpec(**{component: "projection"})
+
+        def build(self, module, config):
+            graph, builder = _make_graph(name=component)
+            x = create_test_input(builder, "x", [1, 64])
+            builder.add_output(module.projection(builder.op, x), "y")
+            return ModelPackage({component: _make_model(graph)}, config=config)
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        overrides={"proj": QuantizationOverride(bits=8, group_size=32)},
+    )
+    config = make_config(quantization=quantization)
+    module = nn.Module()
+    module.projection = _Projection(make_quantized_linear_factory(bits=4, block_size=16))
+    task = _NamedSingleTask()
+    package = build_from_module(module, config, task)
+    packed = torch.arange(2048).reshape(32, 64).to(torch.uint8)
+    scales = torch.ones(32, 2)
+    weights = normalize_component_quantized_weights(
+        {
+            "projection.proj.weight_qweight": packed,
+            "projection.proj.weight_scales": scales,
+        },
+        module,
+        config,
+        package.keys(),
+        task=task,
+    )
+    package.apply_weights(weights, fold_constants=False)
+
+    assert (module.projection.proj._bits, module.projection.proj._block_size) == (8, 32)
+    value = package[component].graph.initializers["projection.proj.weight"]
+    assert value.const_value is not None
+    torch.testing.assert_close(
+        torch.from_numpy(value.const_value.numpy()), packed.reshape(32, 2, 32)
+    )
+
+
+def test_partial_package_does_not_activate_global_rules_for_a_multicomponent_manifest():
+    from mobius._configs import QuantizationOverride
+
+    module = _Composite()
+    task = _CompositeTask()
+    config = ArchitectureConfig(
+        quantization=QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            overrides={"model.layers.0.q_proj": QuantizationOverride(bits=8)},
+        )
+    )
+    manifest = configure_component_quantization(module, config, task)
+    state_dict = {
+        "decoder.model.layers.0.q_proj.weight_qweight": torch.zeros(64, 64, dtype=torch.uint8),
+        "decoder.model.layers.0.q_proj.weight_scales": torch.ones(64, 4),
+    }
+
+    result = normalize_component_quantized_weights(
+        state_dict, module, config, ("decoder",), manifest=manifest, task=task
+    )
+
+    assert module.decoder.model.layers[0].q_proj._bits == 4
+    assert result is state_dict
+
+
+@pytest.mark.parametrize(
+    ("orphan", "include_valid_group"),
+    [
+        ("decoder.model.layers.0.q_proj.weight_scales", False),
+        ("decoder.model.layers.0.q_proj.qzeros", False),
+        ("unowned.layer.scales", True),
+        ("unowned.layer.weight_qzeros", True),
+    ],
+)
+def test_normalizer_rejects_orphan_sidecars(orphan, include_valid_group):
+    module, config, task = _Composite(), _config(), _CompositeTask()
+    manifest = configure_component_quantization(module, config, task)
+    weights = {orphan: torch.ones(64, 4)}
+    if include_valid_group:
+        weights.update(
+            {
+                "decoder.model.layers.0.q_proj.weight_qweight": torch.zeros(
+                    64, 32, dtype=torch.uint8
+                ),
+                "decoder.model.layers.0.q_proj.weight_scales": torch.ones(64, 4),
+            }
+        )
+
+    with pytest.raises(ValueError, match=r"sidecar|Packed"):
+        normalize_component_quantized_weights(
+            weights, module, config, manifest.names, manifest=manifest, task=task
+        )
 
 
 @pytest.mark.parametrize("component_plan", [None, {}, {"model": QuantizationConfig()}])
@@ -398,7 +534,8 @@ def test_canonical_quantized_embedding_is_not_treated_as_raw_sidecars():
     assert result["proj.scales"] is state_dict["proj.scales"]
 
 
-def test_binding_validator_rejects_unfilled_quantized_parameters():
+@pytest.mark.parametrize("plan", ["component", "global", "absent"])
+def test_binding_validator_rejects_unfilled_quantized_parameters(plan):
     from mobius._testing import create_test_builder, create_test_input
     from mobius.tasks._base import _make_model
 
@@ -423,7 +560,9 @@ def test_binding_validator_rejects_unfilled_quantized_parameters():
         validate_quantized_component_bindings(
             {"model": _make_model(graph)},
             ArchitectureConfig(
-                quantization=quantization,
-                component_quantization={"model": quantization},
+                quantization=quantization if plan != "absent" else None,
+                component_quantization={"model": quantization}
+                if plan == "component"
+                else None,
             ),
         )

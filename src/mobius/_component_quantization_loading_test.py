@@ -27,7 +27,14 @@ from mobius._testing import make_config
 from mobius.components import Linear, QuantizedLinear
 from mobius.models import CausalLMModel
 from mobius.models.gemma4 import Gemma4Model
-from mobius.models.qwen35 import Qwen35MoECausalLMModel, Qwen35VL3ModelCausalLMModel
+from mobius.models.moe import Qwen2MoECausalLMModel
+from mobius.models.qwen3_next import Qwen3NextCausalLMModel
+from mobius.models.qwen35 import (
+    Qwen35CausalLMModel,
+    Qwen35MoECausalLMModel,
+    Qwen35MoEVL3ModelCausalLMModel,
+    Qwen35VL3ModelCausalLMModel,
+)
 from mobius.models.t5 import T5ForConditionalGeneration
 from mobius.models.whisper import WhisperForConditionalGeneration
 from mobius.tasks import get_task
@@ -53,6 +60,15 @@ def _floats(*shape: int) -> torch.Tensor:
 
 def _build(module):
     return build_from_module(module, module.config, task=module.default_task)
+
+
+def _canonical_checkpoint(package):
+    return {
+        name: torch.from_numpy(np.ones(tuple(value.shape), dtype=value.dtype.numpy()))
+        for model in package.values()
+        for name, value in model.graph.initializers.items()
+        if value.const_value is None
+    }
 
 
 def _load(module, package, state_dict):
@@ -380,10 +396,16 @@ def test_public_transformers_build_loads_global_olive_rules_without_component_pl
         "_load_transformers_config",
         lambda *args, **kwargs: (hf_config, False),
     )
+    checkpoint = _canonical_checkpoint(
+        build("test/tiny-llama-global-olive", dtype="f32", load_weights=False)
+    )
+    del checkpoint[f"{target}.weight"]
+    del checkpoint[f"{target}.scales"]
+    checkpoint.update(state_dict)
     monkeypatch.setattr(
         transformers_builder,
         "_download_weights",
-        lambda *args, **kwargs: dict(state_dict),
+        lambda *args, **kwargs: dict(checkpoint),
     )
 
     package = build("test/tiny-llama-global-olive", dtype="f32")
@@ -697,3 +719,265 @@ def test_t5_exact_hf_projection_exclusion_keeps_only_that_projection_float():
     _assert_bound(
         package, "encoder", "encoder.block.0.self_attn.k_proj.scales", sibling_scales
     )
+
+
+def _tiny_decoder_config(quantization, component_plan, **overrides):
+    return make_config(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        layer_types=["full_attention"],
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        tie_word_embeddings=False,
+        quantization=quantization,
+        component_quantization=component_plan,
+        **overrides,
+    )
+
+
+def _tiny_qwen_vision_config():
+    return VisionConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        patch_size=2,
+        in_channels=3,
+        out_hidden_size=32,
+        num_position_embeddings=4,
+    )
+
+
+@pytest.mark.parametrize("method", ["olive", "gptq", "awq"])
+@pytest.mark.parametrize("model_class", [Qwen2MoECausalLMModel, Qwen3NextCausalLMModel])
+@pytest.mark.parametrize("component_plan", [False, True], ids=["legacy", "component"])
+def test_shared_expert_gate_float_checkpoint_binds(model_class, component_plan, method):
+    quantization = _quantization(quant_method=method)
+    config = _tiny_decoder_config(
+        quantization, {"model": quantization} if component_plan else None
+    )
+    module = model_class(config)
+    assert type(module.model.layers[0].mlp.shared_expert_gate) is Linear
+    package = _build(module)
+    target = "model.layers.0.mlp.shared_expert_gate.weight"
+    value = _floats(1, 32)
+
+    _load(module, package, {target: value})
+
+    assert type(module.model.layers[0].mlp.shared_expert_gate) is Linear
+    _assert_bound(package, "model", target, value)
+
+
+@pytest.mark.parametrize("quantize_embeddings", [False, True])
+def test_whisper_float_position_table_still_binds(quantize_embeddings):
+    quantization = _quantization(quantize_embeddings=quantize_embeddings)
+    config = WhisperConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=16,
+        hidden_act="gelu",
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        encoder_layers=1,
+        encoder_attention_heads=4,
+        encoder_ffn_dim=128,
+        num_mel_bins=16,
+        max_source_positions=16,
+        max_target_positions=16,
+        quantization=quantization,
+        component_quantization={"decoder": quantization},
+    )
+    module = WhisperForConditionalGeneration(config)
+    package = _build(module)
+    positions = _floats(16, 64)
+
+    _load(module, package, {"model.decoder.embed_positions.weight": positions})
+
+    _assert_bound(package, "decoder", "decoder.embed_positions.weight", positions)
+
+
+@pytest.mark.parametrize(
+    ("model_class", "component_plan"),
+    [
+        (CausalLMModel, False),
+        (CausalLMModel, True),
+        (Qwen35CausalLMModel, False),
+        (Qwen35CausalLMModel, True),
+        (Qwen35MoECausalLMModel, False),
+        (Qwen35MoECausalLMModel, True),
+        (Qwen35VL3ModelCausalLMModel, True),
+        (Qwen35MoEVL3ModelCausalLMModel, True),
+    ],
+)
+@pytest.mark.parametrize("override", [False, True], ids=["root-layout", "leaf-override"])
+def test_projection_sidecars_follow_graph_layout(model_class, component_plan, override):
+    split = model_class in (Qwen35VL3ModelCausalLMModel, Qwen35MoEVL3ModelCausalLMModel)
+    source = (
+        "model.language_model.layers.0.self_attn.q_proj"
+        if split
+        else "model.layers.0.self_attn.q_proj"
+    )
+    quantization = _quantization(
+        overrides={source: QuantizationOverride(bits=8, group_size=32)} if override else {}
+    )
+    component = "decoder" if split else "model"
+    config = _tiny_decoder_config(
+        quantization,
+        {component: quantization} if component_plan else None,
+        image_token_id=99,
+        temporal_patch_size=1,
+        vision=_tiny_qwen_vision_config(),
+    )
+    module = model_class(config)
+    package = _build(module)
+    backbone = module.decoder.model if split else module.model
+    projection = backbone.layers[0].self_attn.q_proj
+    bits, group_size = (8, 32) if override else (4, 16)
+    packed = _bytes(projection._n, projection._k * bits // 8)
+    scales = _floats(projection._n, projection._k // group_size)
+    target = (
+        "decoder.model.layers.0.self_attn.q_proj"
+        if split
+        else "model.layers.0.self_attn.q_proj"
+    )
+
+    result = _load(
+        module,
+        package,
+        {f"{source}.weight_qweight": packed, f"{source}.weight_scales": scales},
+    )
+
+    _assert_layout(package, component, f"{target}.weight", bits, group_size)
+    _assert_bound(
+        package, component, f"{target}.weight", packed.reshape(tuple(projection.weight.shape))
+    )
+    _assert_bound(package, component, f"{target}.scales", scales)
+    assert not any(name.endswith("_qweight") for name in result)
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["text", "vl"])
+@pytest.mark.parametrize("sym", [False, True], ids=["asymmetric", "symmetric"])
+def test_qwen35_component_override_preserves_canonical_qmoe_groups(split, sym):
+    source = "model.language_model.layers.0" if split else "model.layers.0"
+    quantization = _quantization(
+        sym=sym,
+        overrides={
+            f"{source}.self_attn.q_proj": QuantizationOverride(bits=8, group_size=32, sym=True)
+        },
+    )
+    component = "decoder" if split else "model"
+    config = _tiny_decoder_config(
+        quantization,
+        {component: quantization},
+        image_token_id=99,
+        temporal_patch_size=1,
+        vision=_tiny_qwen_vision_config(),
+    )
+    model_class = Qwen35MoEVL3ModelCausalLMModel if split else Qwen35MoECausalLMModel
+    module = model_class(config)
+    package = _build(module)
+    fc1 = _bytes(2, 64, 16)
+    fc2 = _bytes(2, 32, 16, offset=19)
+    fc1_scales = _floats(2, 64, 2)
+    fc2_scales = _floats(2, 32, 2)
+    projection = _bytes(64, 32, offset=37)
+    weights = {
+        f"{source}.mlp.experts.gate_up_proj_qweight": fc1,
+        f"{source}.mlp.experts.gate_up_proj_scales": fc1_scales,
+        f"{source}.mlp.experts.down_proj_qweight": fc2,
+        f"{source}.mlp.experts.down_proj_scales": fc2_scales,
+        f"{source}.self_attn.q_proj.weight_qweight": projection,
+        f"{source}.self_attn.q_proj.weight_scales": _floats(64, 1),
+    }
+    if not sym:
+        weights[f"{source}.mlp.experts.gate_up_proj_qzeros"] = _bytes(2, 64, 1)
+        weights[f"{source}.mlp.experts.down_proj_qzeros"] = _bytes(2, 32, 1)
+
+    result = _load(module, package, weights)
+
+    target = "decoder.model.layers.0" if split else "model.layers.0"
+    for suffix, expected in (
+        ("fc1_experts_weights", fc1),
+        ("fc2_experts_weights", fc2),
+        ("fc1_scales", fc1_scales),
+        ("fc2_scales", fc2_scales),
+    ):
+        _assert_bound(package, component, f"{target}.mlp.{suffix}", expected)
+    if not sym:
+        for name, rows in (("fc1", 64), ("fc2", 32)):
+            _assert_bound(
+                package,
+                component,
+                f"{target}.mlp.{name}_experts_zero_points",
+                _bytes(2, rows, 1),
+            )
+    _assert_bound(
+        package, component, f"{target}.self_attn.q_proj.weight", projection.reshape(64, 1, 32)
+    )
+    task = get_task(module.default_task)
+    canonical = normalize_component_quantized_weights(
+        result, module, config, package.keys(), task=task
+    )
+    assert canonical.keys() == result.keys()
+    assert all(canonical[name] is value for name, value in result.items())
+    incomplete = dict(result)
+    del incomplete[f"{target}.mlp.fc1_experts_weights"]
+    with pytest.raises(ValueError, match="no matching qweight"):
+        normalize_component_quantized_weights(
+            incomplete, module, config, package.keys(), task=task
+        )
+
+
+@pytest.mark.parametrize("missing", ["weight", "scales"])
+@pytest.mark.parametrize("module_rules", [False, True])
+def test_public_global_build_rejects_missing_packed_parameter(
+    monkeypatch, missing, module_rules
+):
+    from transformers import LlamaConfig
+
+    from mobius.integrations.transformers import _builder as transformers_builder
+
+    hf_config = LlamaConfig(
+        vocab_size=100,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=False,
+        quantization_config={
+            "quant_method": "olive",
+            "bits": 4,
+            "group_size": 16,
+            "sym": True,
+            "modules_to_not_convert": ["lm_head"] if module_rules else [],
+        },
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    weights = _canonical_checkpoint(
+        build("test/tiny-llama-global-missing-weight", dtype="f32", load_weights=False)
+    )
+    target = f"model.layers.0.self_attn.q_proj.{missing}"
+    del weights[target]
+    monkeypatch.setattr(
+        transformers_builder, "_download_weights", lambda *args, **kwargs: dict(weights)
+    )
+
+    with pytest.raises(ValueError, match=r"unbound|no matching qweight") as error:
+        build("test/tiny-llama-global-missing-weight", dtype="f32")
+    assert "model.layers.0.self_attn.q_proj" in str(error.value)

@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Fixed
 
+- Component rewrites preserve learned positional embeddings and deliberately
+  floating-point shared-expert gates. Input token-table selection respects
+  source aliases rather than quantizing every embedding module.
+- Ordinary decoder sidecars, including Qwen3.5 text, MoE, and VL weights, remain
+  raw until per-projection overrides are resolved. QMoE expert packing and
+  float table tying remain in the shared compatibility preprocessor.
+- Graph construction and normalization agree on legacy module rules for any
+  single-component manifest, not only packages using the `model` key.
+- The binding gate also covers model-wide affine configurations. Orphan packed
+  sidecars are rejected without rejecting complete canonical affine or QMoE groups.
 - Dynamic component source resolvers use the available HuggingFace model type
   instead of receiving an empty identifier. Configs without a model type retain
   static component metadata and config-based aliases, including T5 layer mappings.
