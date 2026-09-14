@@ -22,6 +22,7 @@ from mobius._registry import registry
 from mobius.integrations._weight_loading import (
     _download_weights,
     stream_preprocessed_safetensors_to_model,
+    stream_preprocessed_safetensors_to_package,
     stream_qdq_safetensors_to_model,
 )
 from mobius.integrations.compressed_tensors import (
@@ -361,6 +362,27 @@ def build_transformers_model(
         # processor contract. Keep config detection and weight loading pinned.
         revision = VIBEVOICE_ASR_REVISION
         detection_revision = VIBEVOICE_ASR_REVISION
+
+    from mobius.integrations._vibeasr_bitnet import (
+        VIBEVOICE_ASR_BITNET_REPOSITORY,
+        VIBEVOICE_ASR_BITNET_REVISION,
+        build_vibeasr_bitnet_dense_weight_plan,
+        is_vibeasr_bitnet_conversion_source,
+        normalize_vibeasr_bitnet_config_for_inference,
+    )
+
+    if model_id == VIBEVOICE_ASR_BITNET_REPOSITORY:
+        if detection_revision is None:
+            # The release mixes dense F32 conversion weights with VibeASR.cpp-native
+            # GGUFs. Pin config and weight retrieval to the audited dense source.
+            revision = VIBEVOICE_ASR_BITNET_REVISION
+            detection_revision = VIBEVOICE_ASR_BITNET_REVISION
+        elif detection_revision != VIBEVOICE_ASR_BITNET_REVISION:
+            raise ValueError(
+                f"{VIBEVOICE_ASR_BITNET_REPOSITORY} is supported only at the audited "
+                f"revision {VIBEVOICE_ASR_BITNET_REVISION}; got {detection_revision!r}."
+            )
+    is_vibeasr_bitnet_dense_source = is_vibeasr_bitnet_conversion_source(model_id, revision)
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -374,6 +396,16 @@ def build_transformers_model(
         revision=detection_revision,
         trust_remote_code=trust_remote_code,
     )
+    if is_vibeasr_bitnet_dense_source:
+        if hf_config is None:
+            raise ValueError(
+                "The pinned VibeVoice ASR BitNet conversion source is missing a config."
+            )
+        # The BitNet release retains the legacy training config identity, while
+        # its dense source weights are converted through the native HF-only ASR
+        # topology. Validate and translate only this audited source before the
+        # parent's strict architecture guard dispatches the native model.
+        hf_config = normalize_vibeasr_bitnet_config_for_inference(hf_config)
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
@@ -577,17 +609,36 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
-        if model_type in _QWEN4_MODEL_TYPES | {
-            "vibevoice",
-            "vibevoice_streaming",
-            "vibevoice_asr",
-        }:
+        if (
+            model_type
+            in _QWEN4_MODEL_TYPES
+            | {
+                "vibevoice",
+                "vibevoice_streaming",
+                "vibevoice_asr",
+            }
+            or is_vibeasr_bitnet_dense_source
+        ):
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
-        _reject_unsupported_affine_qwen4(model_type, config)
-        if config.block_quant_scheme is not None and hasattr(
-            model_module, "build_fp8_streaming_plan"
+        if is_vibeasr_bitnet_dense_source:
+            package.weight_loading_report = stream_preprocessed_safetensors_to_package(
+                package,
+                model_id,
+                lambda source_tensors, initializers: build_vibeasr_bitnet_dense_weight_plan(
+                    model_module,
+                    source_tensors,
+                    initializers,
+                ),
+                revision=revision,
+            )
+        else:
+            _reject_unsupported_affine_qwen4(model_type, config)
+        if (
+            not is_vibeasr_bitnet_dense_source
+            and config.block_quant_scheme is not None
+            and hasattr(model_module, "build_fp8_streaming_plan")
         ):
             if len(package) != 1:
                 raise ValueError(
@@ -618,7 +669,7 @@ def build_transformers_model(
                     "native FP8 was not preserved. See weight-loading-report.json.",
                     model_id,
                 )
-        elif model_type in _QWEN4_MODEL_TYPES:
+        elif not is_vibeasr_bitnet_dense_source and model_type in _QWEN4_MODEL_TYPES:
             from mobius.integrations.transformers._qwen4_exp_weights import (
                 stream_qwen4_exp_safetensors_to_package,
             )
@@ -629,7 +680,7 @@ def build_transformers_model(
                 config,
                 revision=revision,
             )
-        elif compressed_tensors_config is not None:
+        elif not is_vibeasr_bitnet_dense_source and compressed_tensors_config is not None:
             stream_compressed_tensors_to_package(
                 package,
                 model_id,
@@ -639,7 +690,7 @@ def build_transformers_model(
                 fp8_kv_cache=fp8_kv_cache,
                 keep_quantized=keep_quantized,
             )
-        else:
+        elif not is_vibeasr_bitnet_dense_source:
             state_dict = _download_weights(model_id, revision=revision)
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)
