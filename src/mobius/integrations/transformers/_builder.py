@@ -149,10 +149,9 @@ def _load_transformers_config(
             kwargs["revision"] = revision
         return transformers.AutoConfig.from_pretrained(model_id, **kwargs), False
     except (ValueError, KeyError, OSError, strict_validation_error):
-        # Official VibeVoice-ASR intentionally reuses the VibeVoice model_type
-        # with a different architecture. Current Transformers rejects that
-        # composite during strict TTS validation, so preserve its raw config for
-        # architecture-specific dispatch below.
+        # Legacy VibeVoice-ASR reused the TTS model type and needs an inference-
+        # native conversion. The supported HF release has model_type
+        # ``vibevoice_asr`` and never reaches this compatibility fallback.
         return _try_load_config_json(model_id, revision=revision), True
 
 
@@ -165,18 +164,7 @@ def _select_primary_config(hf_config):
     parent_config = hf_config
     model_type = hf_config.model_type
 
-    if model_type == "vibevoice" and "VibeVoiceForASRTraining" in set(
-        getattr(hf_config, "architectures", None) or []
-    ):
-        # The original Microsoft checkpoint nests its Qwen2 decoder in
-        # ``decoder_config`` while reusing the TTS model_type. Retain the
-        # composite parent for audio configuration and let architecture routing
-        # select the distinct staged ASR export.
-        decoder = getattr(hf_config, "decoder_config", None)
-        if decoder is None:
-            raise ValueError("VibeVoiceForASRTraining config is missing decoder_config")
-        hf_config = decoder
-    elif hasattr(hf_config, "talker_config"):
+    if hasattr(hf_config, "talker_config"):
         hf_config = hf_config.talker_config
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
@@ -220,7 +208,6 @@ def _resolve_module_class(
     if model_type == "vibevoice":
         supported_architectures = {
             "VibeVoiceForConditionalGeneration",
-            "VibeVoiceForASRTraining",
         }
         unknown = set(architectures) - supported_architectures
         if unknown or len(architectures) != 1:
@@ -355,7 +342,12 @@ def build_transformers_model(
         # raw-config probe and every subsequent Hub operation to one checkpoint.
         revision = VIBEVOICE_STREAMING_REVISION
         detection_revision = VIBEVOICE_STREAMING_REVISION
-    if model_id == "microsoft/VibeVoice-ASR" and detection_revision is None:
+    if model_id == "microsoft/VibeVoice-ASR":
+        raise ValueError(
+            "microsoft/VibeVoice-ASR is a legacy training checkpoint; use "
+            "microsoft/VibeVoice-ASR-HF instead."
+        )
+    if model_id == "microsoft/VibeVoice-ASR-HF" and detection_revision is None:
         from mobius.models.vibevoice_asr import VIBEVOICE_ASR_REVISION
 
         # ASR shares VibeVoice's model_type but has a different source and
@@ -581,7 +573,7 @@ def build_transformers_model(
         if model_type in _QWEN4_MODEL_TYPES | {
             "vibevoice",
             "vibevoice_streaming",
-            "VibeVoiceForASRTraining",
+            "vibevoice_asr",
         }:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 

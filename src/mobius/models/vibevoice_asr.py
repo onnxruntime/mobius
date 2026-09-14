@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Staged offline ASR for the original ``VibeVoiceForASRTraining`` checkpoint.
+"""Staged offline ASR for the native ``VibeVoiceAsrForConditionalGeneration`` checkpoint.
 
 The model is not VibeVoice TTS. It runs 64-D acoustic and 128-D semantic
 causal waveform encoders, sums their independent connectors, replaces audio
@@ -26,8 +26,8 @@ from mobius.models.vibevoice import (
     VibeVoiceTokenizerEncoder,
 )
 
-VIBEVOICE_ASR_MODEL_ID = "microsoft/VibeVoice-ASR"
-VIBEVOICE_ASR_REVISION = "d0c9efdb8d614685062c04425d91e01b6f37d944"
+VIBEVOICE_ASR_MODEL_ID = "microsoft/VibeVoice-ASR-HF"
+VIBEVOICE_ASR_REVISION = "f22241c2062b3b25272bf117397e03d73381037a"
 VIBEVOICE_ASR_TRANSFORMERS_REVISION = "f62dc9bf2c90353b442a56e74391fbb8c689b55e"
 VIBEVOICE_ASR_MICROSOFT_REVISION = "1541f590c7099820f10ea012f48d2399282df69f"
 
@@ -217,10 +217,10 @@ def _map_original_tokenizer_encoder_key(
 
 
 class VibeVoiceASRForConditionalGeneration(nn.Module):
-    """Offline VibeVoice ASR/diarization stages for ``VibeVoiceForASRTraining``.
+    """Offline VibeVoice ASR/diarization stages for ``VibeVoiceAsrForConditionalGeneration``.
 
     Mobius selects this model only when the shared ``vibevoice`` configuration
-    declares ``VibeVoiceForASRTraining``. VibeVoice TTS remains
+    declares ``VibeVoiceAsrForConditionalGeneration``. VibeVoice TTS remains
     ``VibeVoiceForConditionalGeneration``; unknown, streaming, and ambiguous
     VibeVoice architectures fail closed.
 
@@ -283,7 +283,7 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
     this inference package. ONNX Runtime GenAI cannot orchestrate the dual
     cached encoders and host protocol, so its export metadata is advisory rather
     than a runnable ``genai_config.json`` contract. The default checkpoint is
-    pinned to ``microsoft/VibeVoice-ASR@d0c9efdb8d614685062c04425d91e01b6f37d944``.
+    pinned to ``microsoft/VibeVoice-ASR-HF@f22241c2062b3b25272bf117397e03d73381037a``.
     """
 
     default_task: str = "vibevoice-asr"
@@ -329,6 +329,14 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
                 routed[source_key] = value
                 continue
 
+            if source_key.startswith("acoustic_tokenizer_encoder."):
+                suffix = source_key.removeprefix("acoustic_tokenizer_encoder.")
+                routed[f"acoustic_encoder.encoder.{suffix}"] = value
+                continue
+            if source_key.startswith("semantic_tokenizer_encoder."):
+                suffix = source_key.removeprefix("semantic_tokenizer_encoder.")
+                routed[f"semantic_encoder.encoder.{suffix}"] = value
+                continue
             acoustic_key = _map_original_tokenizer_encoder_key(
                 source_key,
                 source="model.acoustic_tokenizer.encoder.",
@@ -365,35 +373,45 @@ class VibeVoiceASRForConditionalGeneration(nn.Module):
                     .replace("fc2.", "linear_2.")
                 )
                 routed[f"connectors.semantic_connector.{suffix}"] = value
-            elif source_key.startswith("model.multi_modal_projector.acoustic_"):
+            elif source_key.startswith(
+                ("model.multi_modal_projector.acoustic_", "multi_modal_projector.acoustic_")
+            ):
                 suffix = source_key.removeprefix("model.multi_modal_projector.acoustic_")
+                suffix = suffix.removeprefix("multi_modal_projector.acoustic_")
                 suffix = (
                     suffix.replace("linear_1.", "linear_1.")
                     .replace("norm.", "act.")
                     .replace("linear_2.", "linear_2.")
                 )
                 routed[f"connectors.acoustic_connector.{suffix}"] = value
-            elif source_key.startswith("model.multi_modal_projector.semantic_"):
+            elif source_key.startswith(
+                ("model.multi_modal_projector.semantic_", "multi_modal_projector.semantic_")
+            ):
                 suffix = source_key.removeprefix("model.multi_modal_projector.semantic_")
+                suffix = suffix.removeprefix("multi_modal_projector.semantic_")
                 suffix = (
                     suffix.replace("linear_1.", "linear_1.")
                     .replace("norm.", "act.")
                     .replace("linear_2.", "linear_2.")
                 )
                 routed[f"connectors.semantic_connector.{suffix}"] = value
-            elif source_key.startswith("model.language_model.embed_tokens."):
+            elif source_key.startswith(
+                ("model.language_model.embed_tokens.", "language_model.model.embed_tokens.")
+            ):
                 suffix = source_key.removeprefix("model.language_model.embed_tokens.")
+                suffix = suffix.removeprefix("language_model.model.embed_tokens.")
                 routed[f"embedding.embed_tokens.{suffix}"] = value
             elif source_key.startswith(
-                ("model.language_model.layers.", "model.language_model.norm.")
+                (
+                    "model.language_model.layers.",
+                    "model.language_model.norm.",
+                    "language_model.model.layers.",
+                    "language_model.model.norm.",
+                )
             ):
                 suffix = source_key.removeprefix("model.language_model.")
+                suffix = suffix.removeprefix("language_model.model.")
                 routed[f"decoder.{suffix}"] = value
-            elif source_key == "lm_head.weight":
+            elif source_key in ("language_model.lm_head.weight", "lm_head.weight"):
                 routed["decoder.lm_head.weight"] = value
-            elif source_key.startswith("model.acoustic_tokenizer.decoder."):
-                # VibeVoiceForASRTraining loads a shared acoustic VAE, but only
-                # calls its encoder. Waveform-decoder weights are not inference
-                # stages and must not be exported as ASR components.
-                continue
         return routed

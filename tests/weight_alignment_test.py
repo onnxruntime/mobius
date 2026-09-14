@@ -174,8 +174,8 @@ def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
 
 
 @pytest.mark.arch_validation
-def test_vibevoice_asr_checkpoint_index_classifies_every_tensor_once(tmp_path):
-    """The pinned original ASR checkpoint routes only source-executed tensors."""
+def test_vibevoice_asr_checkpoint_index_routes_every_native_tensor_once(tmp_path):
+    """The pinned native ASR index routes every inference tensor without exclusions."""
     import json
 
     from huggingface_hub import hf_hub_download
@@ -184,9 +184,9 @@ def test_vibevoice_asr_checkpoint_index_classifies_every_tensor_once(tmp_path):
     from mobius.models.vibevoice_test import _make_tiny_hf_config
 
     index_path = hf_hub_download(
-        "microsoft/VibeVoice-ASR",
+        "microsoft/VibeVoice-ASR-HF",
         filename="model.safetensors.index.json",
-        revision="d0c9efdb8d614685062c04425d91e01b6f37d944",
+        revision="f22241c2062b3b25272bf117397e03d73381037a",
         cache_dir=tmp_path,
     )
     with open(index_path, encoding="utf-8") as handle:
@@ -194,51 +194,37 @@ def test_vibevoice_asr_checkpoint_index_classifies_every_tensor_once(tmp_path):
 
     categories = {
         "acoustic_encoder": {
-            name
-            for name in checkpoint_names
-            if name.startswith("model.acoustic_tokenizer.encoder.")
-        },
-        "acoustic_decoder_unused": {
-            name
-            for name in checkpoint_names
-            if name.startswith("model.acoustic_tokenizer.decoder.")
+            name for name in checkpoint_names if name.startswith("acoustic_tokenizer_encoder.")
         },
         "semantic_encoder": {
-            name
-            for name in checkpoint_names
-            if name.startswith("model.semantic_tokenizer.encoder.")
+            name for name in checkpoint_names if name.startswith("semantic_tokenizer_encoder.")
         },
         "connectors": {
-            name
-            for name in checkpoint_names
-            if name.startswith(("model.acoustic_connector.", "model.semantic_connector."))
+            name for name in checkpoint_names if name.startswith("multi_modal_projector.")
         },
         "embedding": {
             name
             for name in checkpoint_names
-            if name.startswith("model.language_model.embed_tokens.")
+            if name.startswith("language_model.model.embed_tokens.")
         },
         "decoder": {
             name
             for name in checkpoint_names
-            if name.startswith(("model.language_model.layers.", "model.language_model.norm."))
-            or name == "lm_head.weight"
+            if name.startswith(("language_model.model.layers.", "language_model.model.norm."))
+            or name == "language_model.lm_head.weight"
         },
     }
     assert set().union(*categories.values()) == checkpoint_names
-    assert sum(map(len, categories.values())) == len(checkpoint_names) == 1_177
+    assert sum(map(len, categories.values())) == len(checkpoint_names) == 901
     assert {name: len(values) for name, values in categories.items()} == {
         "acoustic_encoder": 276,
-        "acoustic_decoder_unused": 276,
         "semantic_encoder": 276,
         "connectors": 10,
         "embedding": 1,
         "decoder": 338,
     }
 
-    # A tiny canonical source proves the same router accepts current
-    # Transformers names, while the index census proves every original name
-    # is either routed or intentionally omitted.
+    # Native HF names must map directly to all five exported components.
     from mobius._configs import VibeVoiceASRConfig
 
     hf_config = _make_tiny_hf_config()
@@ -247,7 +233,7 @@ def test_vibevoice_asr_checkpoint_index_classifies_every_tensor_once(tmp_path):
     )
     module = VibeVoiceASRForConditionalGeneration(config)
     routed = module.preprocess_weights({name: torch.empty(0) for name in checkpoint_names})
-    assert len(routed) == len(checkpoint_names) - len(categories["acoustic_decoder_unused"])
+    assert len(routed) == len(checkpoint_names)
     assert all(
         name.startswith(
             ("acoustic_encoder.", "semantic_encoder.", "connectors.", "embedding.", "decoder.")

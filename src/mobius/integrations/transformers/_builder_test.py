@@ -211,26 +211,25 @@ def test_qwen38_multimodal_config_keeps_parent_fields(monkeypatch) -> None:
     assert built_configs[0].image_token_id == 248056
 
 
-def test_vibevoice_architecture_dispatch_is_explicit_and_fail_closed() -> None:
-    """The shared VibeVoice model_type cannot select ASR by accident."""
+def test_vibevoice_architecture_dispatch_keeps_native_asr_separate() -> None:
+    """Native ASR has its own model_type and cannot fall through to VibeVoice TTS."""
     from mobius.models import (
         VibeVoiceASRForConditionalGeneration,
         VibeVoiceForConditionalGeneration,
     )
 
     asr_parent = SimpleNamespace(
-        model_type="vibevoice",
-        architectures=["VibeVoiceForASRTraining"],
-        decoder_config=SimpleNamespace(model_type="qwen2"),
+        model_type="vibevoice_asr",
+        architectures=["VibeVoiceAsrForConditionalGeneration"],
     )
     primary, parent, model_type = transformers_builder._select_primary_config(asr_parent)
     module, task, resolved = transformers_builder._resolve_module_class(
         model_type, parent, None, None
     )
-    assert primary is asr_parent.decoder_config
+    assert primary is asr_parent
     assert module is VibeVoiceASRForConditionalGeneration
     assert task is None
-    assert resolved == "VibeVoiceForASRTraining"
+    assert resolved == "vibevoice_asr"
 
     tts_parent = SimpleNamespace(
         model_type="vibevoice",
@@ -242,34 +241,13 @@ def test_vibevoice_architecture_dispatch_is_explicit_and_fail_closed() -> None:
     assert module is VibeVoiceForConditionalGeneration
     assert resolved == "vibevoice"
 
-    with pytest.raises(ValueError, match="Unsupported VibeVoice architecture"):
-        transformers_builder._resolve_module_class(
-            "vibevoice",
-            SimpleNamespace(
-                model_type="vibevoice",
-                architectures=["VibeVoiceForStreamingASR"],
-            ),
-            None,
-            None,
-        )
-    with pytest.raises(ValueError, match="Unsupported VibeVoice architecture"):
-        transformers_builder._resolve_module_class(
-            "vibevoice",
-            SimpleNamespace(
-                model_type="vibevoice",
-                architectures=["VibeVoiceForConditionalGeneration", "VibeVoiceForASRTraining"],
-            ),
-            None,
-            None,
-        )
-
 
 @pytest.mark.arch_validation
-def test_vibevoice_asr_pinned_raw_config_builds_through_public_builder() -> None:
-    """The official raw ASR config reaches the architecture-specific five-stage task."""
+def test_vibevoice_asr_pinned_native_config_builds_through_public_builder() -> None:
+    """The official native ASR config reaches the architecture-specific five-stage task."""
     package = transformers_builder.build_transformers_model(
-        "microsoft/VibeVoice-ASR",
-        revision="d0c9efdb8d614685062c04425d91e01b6f37d944",
+        "microsoft/VibeVoice-ASR-HF",
+        revision="f22241c2062b3b25272bf117397e03d73381037a",
         load_weights=False,
     )
     assert set(package) == {
@@ -280,7 +258,7 @@ def test_vibevoice_asr_pinned_raw_config_builds_through_public_builder() -> None
         "decoder",
     }
     assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
-        "d0c9efdb8d614685062c04425d91e01b6f37d944"
+        "f22241c2062b3b25272bf117397e03d73381037a"
     }
 
 
@@ -376,6 +354,19 @@ def test_vibevoice_asr_none_revision_pins_first_config_probe(monkeypatch) -> Non
             },
         )
     ]
+
+
+def test_legacy_vibevoice_asr_is_rejected_before_config_loading(monkeypatch) -> None:
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *_args, **_kwargs: pytest.fail("legacy checkpoint must not be fetched"),
+    )
+
+    with pytest.raises(ValueError, match="legacy training checkpoint"):
+        transformers_builder.build_transformers_model(
+            "microsoft/VibeVoice-ASR", load_weights=False
+        )
 
 
 def test_vibevoice_streaming_none_revision_pins_first_config_probe(monkeypatch) -> None:

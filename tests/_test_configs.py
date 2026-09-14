@@ -3775,7 +3775,7 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     # --- Original VibeVoice offline ASR (dual cached audio encoders + Qwen2) ---
     (
-        "VibeVoiceForASRTraining",
+        "vibevoice_asr",
         {
             "_config_cls": VibeVoiceASRConfig,
             "hidden_size": 16,

@@ -932,10 +932,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         family="vibevoice",
         variant="realtime",
     ),
-    # VibeVoice's shared model_type is insufficient to choose a graph
-    # contract. The builder permits this architecture key only when the
-    # checkpoint declares the original, offline ASR implementation.
-    "VibeVoiceForASRTraining": ModelRegistration(
+    "vibevoice_asr": ModelRegistration(
         VibeVoiceASRForConditionalGeneration,
         task="vibevoice-asr",
         config_class=VibeVoiceASRConfig,
