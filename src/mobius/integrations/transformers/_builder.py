@@ -215,6 +215,13 @@ def _resolve_module_class(
                 "Unsupported VibeVoice architecture. Expected exactly one of "
                 f"{sorted(supported_architectures)}, got {architectures!r}."
             )
+    if model_type == "vibevoice_asr":
+        supported_architectures = {"VibeVoiceAsrForConditionalGeneration"}
+        if set(architectures) != supported_architectures:
+            raise ValueError(
+                "Unsupported VibeVoice ASR architecture. Expected exactly "
+                f"{sorted(supported_architectures)}, got {architectures!r}."
+            )
     if allow_parent_architecture_override and architectures and architectures[0] in registry:
         architecture_key = architectures[0]
         model_type_class = registry.get(model_type) if model_type in registry else None

@@ -231,6 +231,17 @@ def test_vibevoice_architecture_dispatch_keeps_native_asr_separate() -> None:
     assert task is None
     assert resolved == "vibevoice_asr"
 
+    with pytest.raises(ValueError, match="Unsupported VibeVoice ASR architecture"):
+        transformers_builder._resolve_module_class(
+            "vibevoice_asr",
+            SimpleNamespace(
+                model_type="vibevoice_asr",
+                architectures=["VibeVoiceForConditionalGeneration"],
+            ),
+            None,
+            None,
+        )
+
     tts_parent = SimpleNamespace(
         model_type="vibevoice",
         architectures=["VibeVoiceForConditionalGeneration"],
