@@ -13,6 +13,7 @@ from pathlib import Path
 import onnx_ir as ir
 import pytest
 import torch
+from onnx_ir import tensor_adapters
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
@@ -21,6 +22,7 @@ from mobius._model_package import (
     ModelPackage,
     _make_progress_callback,
     _namespaced_symbolic_dimensions,
+    _save_safetensors,
 )
 from mobius._testing import make_config
 from mobius.generation import build_greedy_sampler
@@ -33,6 +35,14 @@ def _make_simple_model(name: str = "test") -> ir.Model:
     """Create a minimal ir.Model for testing."""
     graph = ir.Graph([], [], nodes=[], name=name)
     return ir.Model(graph, ir_version=10)
+
+
+def _make_e8m0_model() -> ir.Model:
+    scale = ir.val("scale")
+    scale.const_value = ir.tensor([0], dtype=ir.DataType.FLOAT8E8M0)
+    graph = ir.Graph([], [], nodes=[], name="e8m0")
+    graph.register_initializer(scale)
+    return ir.Model(graph, ir_version=12)
 
 
 def _partial_export_report() -> ComponentExportReport:
@@ -124,6 +134,29 @@ class TestModelPackageDict:
         pkg = ModelPackage({"m": _make_simple_model()}, config=config)
         assert pkg.config is config
 
+    def test_lazy_source_registration_normalizes_and_unions_paths(self, tmp_path, monkeypatch):
+        pkg = ModelPackage()
+        monkeypatch.chdir(tmp_path)
+
+        pkg.register_lazy_source_artifacts(
+            files=["weights/a.safetensors"],
+            directories=["weights"],
+        )
+        pkg.register_lazy_source_artifacts(
+            files=[tmp_path / "weights" / ".." / "b.safetensors"],
+            directories=[tmp_path],
+        )
+
+        assert pkg._native_streaming_source_files == frozenset(
+            {
+                (tmp_path / "weights/a.safetensors").resolve(),
+                (tmp_path / "b.safetensors").resolve(),
+            }
+        )
+        assert pkg._native_streaming_source_directories == frozenset(
+            {(tmp_path / "weights").resolve(), tmp_path.resolve()}
+        )
+
 
 class TestWeightLoadingReport:
     def test_roundtrips_with_package(self, tmp_path):
@@ -203,10 +236,105 @@ class TestWeightLoadingReport:
             "largest_source_cast_overlap_bytes": 4096,
         }
 
-        pkg.save(str(tmp_path), progress_bar=False)
+        pkg.save(str(tmp_path / "output"), progress_bar=False)
 
         assert pkg.weight_loading_report["largest_reconstruction_working_set_bytes"] == 4096
         assert pkg.weight_loading_report["serializer_max_workers"] == 1
+
+    def test_streaming_save_rolls_back_failed_lazy_materialization_and_retries(
+        self, tmp_path, monkeypatch
+    ):
+        should_fail = True
+
+        def materialize():
+            if should_fail:
+                raise RuntimeError("lazy transform failed")
+            return tensor_adapters.TorchTensor(torch.ones(1), name="weight")
+
+        weight = ir.Value(
+            name="weight",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([1]),
+            const_value=ir.LazyTensor(
+                materialize,
+                dtype=ir.DataType.FLOAT,
+                shape=ir.Shape([1]),
+                name="weight",
+            ),
+        )
+        graph = ir.Graph([], [], nodes=[], name="streaming")
+        graph.register_initializer(weight)
+        pkg = ModelPackage({"model": ir.Model(graph, ir_version=12)})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        output = tmp_path / "output"
+
+        def save(model, path, **_kwargs):
+            Path(path).write_bytes(b"partial")
+            model.graph.initializers["weight"].const_value.numpy()
+
+        monkeypatch.setattr(ir, "save", save)
+        with pytest.raises(RuntimeError, match="lazy transform failed"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+        should_fail = False
+        pkg.save(str(output), progress_bar=False)
+
+        assert (output / "model.onnx").read_bytes() == b"partial"
+        assert (output / "weight-loading-report.json").is_file()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_streaming_save_refuses_existing_source_destination_without_mutation(
+        self, tmp_path
+    ):
+        output = tmp_path / "checkpoint"
+        output.mkdir()
+        source = output / "source.safetensors"
+        source.write_bytes(b"source")
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        pkg.register_lazy_source_artifacts(
+            files=[source],
+            directories=[output],
+        )
+
+        with pytest.raises(FileExistsError, match="destination already exists"):
+            pkg.save(str(output), external_data="onnx", progress_bar=False)
+
+        assert source.read_bytes() == b"source"
+        assert tuple(output.iterdir()) == (source,)
+        assert not list(tmp_path.glob(".checkpoint.*.tmp"))
+
+    def test_streaming_mtp_source_sidecar_is_never_removed(self, tmp_path):
+        output = tmp_path / "output"
+        source_sidecar = output / ".mobius-mtp"
+        source_sidecar.mkdir(parents=True)
+        sentinel = source_sidecar / "source.safetensors"
+        sentinel.write_bytes(b"source")
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+        pkg.mtp_head.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        pkg.mtp_head.register_lazy_source_artifacts(
+            files=[sentinel],
+            directories=[source_sidecar],
+        )
+
+        with pytest.raises(FileExistsError, match="destination already exists"):
+            pkg.save(str(output), external_data="onnx", progress_bar=False)
+
+        assert sentinel.read_bytes() == b"source"
+        assert not list(tmp_path.glob(".output.*.tmp"))
 
     def test_ordinary_resave_removes_stale_report(self, tmp_path):
         pkg = ModelPackage({"model": _make_simple_model()})
@@ -493,7 +621,7 @@ class TestOnnxShardedSave:
             callback,
             max_workers,
         ):
-            calls.append(max_workers)
+            calls.append((max_shard_size_bytes, max_workers))
 
         monkeypatch.setattr(ir, "save", save)
 
@@ -501,7 +629,7 @@ class TestOnnxShardedSave:
             str(tmp_path), progress_bar=False, check_weights=False
         )
 
-        assert calls == [8]
+        assert calls == [(None, 8)]
 
     def test_forwards_serial_worker_override(self, tmp_path, monkeypatch):
         calls = []
@@ -691,6 +819,95 @@ class TestModelPackageSaveLoad:
         assert (tmp_path / "text_decoder" / "model.onnx").exists()
         assert (tmp_path / "vision_encoder" / "model.onnx").exists()
 
+    def test_e8m0_safetensors_saves_serialize_compatibility_map_access(self, monkeypatch):
+        from onnx_ir import _safetensors as onnx_ir_safetensors
+
+        dtype_mapping = onnx_ir_safetensors._IR_DTYPE_TO_SAFETENSORS_DTYPE
+        monkeypatch.setitem(
+            dtype_mapping,
+            ir.DataType.FLOAT8E8M0,
+            "float8_e8m0",
+        )
+        first_save_entered = threading.Event()
+        release_first_save = threading.Event()
+        second_lock_attempted = threading.Event()
+        second_save_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        class ObservedLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._counter_lock = threading.Lock()
+                self._attempts = 0
+
+            def __enter__(self):
+                with self._counter_lock:
+                    self._attempts += 1
+                    if self._attempts == 2:
+                        second_lock_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                self._lock.release()
+
+        def fake_save(_model, path, **_kwargs):
+            assert dtype_mapping[ir.DataType.FLOAT8E8M0] == "float8_e8m0fnu"
+            if path == "first.onnx":
+                first_save_entered.set()
+                assert release_first_save.wait(timeout=5)
+            else:
+                second_save_entered.set()
+
+        def save(path):
+            try:
+                _save_safetensors(_make_e8m0_model(), path)
+            except Exception as error:
+                errors.append(error)
+
+        monkeypatch.setitem(
+            _save_safetensors.__globals__,
+            "_SAFETENSORS_SAVE_LOCK",
+            ObservedLock(),
+        )
+        monkeypatch.setattr(ir, "save_safetensors", fake_save)
+        first = threading.Thread(target=save, args=("first.onnx",))
+        second = threading.Thread(target=save, args=("second.onnx",))
+
+        first.start()
+        assert first_save_entered.wait(timeout=5)
+        second.start()
+        assert second_lock_attempted.wait(timeout=5)
+        assert not second_save_entered.is_set()
+        release_first_save.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert not errors
+        assert second_save_entered.is_set()
+        assert dtype_mapping[ir.DataType.FLOAT8E8M0] == "float8_e8m0"
+
+    def test_non_e8m0_safetensors_save_does_not_require_private_dtype_map(self, monkeypatch):
+        from onnx_ir import _safetensors as onnx_ir_safetensors
+
+        calls = []
+        monkeypatch.delattr(
+            onnx_ir_safetensors,
+            "_IR_DTYPE_TO_SAFETENSORS_DTYPE",
+        )
+        monkeypatch.setattr(
+            ir,
+            "save_safetensors",
+            lambda model, path, **kwargs: calls.append((model, path, kwargs)),
+        )
+        model = _make_simple_model()
+
+        _save_safetensors(model, "model.onnx")
+
+        assert calls == [(model, "model.onnx", {})]
+
     def test_roundtrip(self, tmp_path):
         config = make_config()
         module = CausalLMModel(config)
@@ -753,6 +970,64 @@ class TestModelPackageSaveLoad:
         assert sorted(loaded) == ["decoder", "embedding"]
         assert loaded.mtp_head is not None
         assert sorted(loaded.mtp_head) == ["model"]
+
+    def test_component_filter_is_evaluated_once_and_does_not_filter_mtp(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "decoder": _make_simple_model("decoder"),
+                "embedding": _make_simple_model("embedding"),
+            }
+        )
+        pkg.mtp_head = ModelPackage(
+            {
+                "draft": _make_simple_model("draft"),
+                "auxiliary": _make_simple_model("auxiliary"),
+            }
+        )
+        calls: list[str] = []
+
+        def select_decoder(name: str) -> bool:
+            calls.append(name)
+            return name == "decoder"
+
+        pkg.save(
+            str(tmp_path),
+            components=select_decoder,
+            progress_bar=False,
+        )
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert calls == ["decoder", "embedding"]
+        assert sorted(loaded) == ["model"]
+        assert loaded["model"].graph.name == "decoder"
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["auxiliary", "draft"]
+
+    def test_streaming_collision_uses_sources_from_entire_mtp_chain(self, tmp_path):
+        output = tmp_path / "output"
+        source = output / "model"
+        source.mkdir(parents=True)
+        marker = source / "source.safetensors"
+        marker.write_bytes(b"unchanged")
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                "auxiliary": _make_simple_model("auxiliary"),
+            }
+        )
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+        pkg.mtp_head.register_lazy_source_artifacts(directories=[source])
+        listing_before = tuple(sorted(path.name for path in output.iterdir()))
+
+        with pytest.raises(ValueError, match="still read lazily"):
+            pkg.save(
+                str(output),
+                external_data="safetensors",
+                progress_bar=False,
+            )
+
+        assert marker.read_bytes() == b"unchanged"
+        assert tuple(sorted(path.name for path in output.iterdir())) == listing_before
 
     def test_legitimate_mtp_component_roundtrip(self, tmp_path):
         pkg = ModelPackage(

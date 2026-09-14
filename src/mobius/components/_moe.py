@@ -13,7 +13,9 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import supported_qmoe_quantization as _supported_qmoe_quantization
+from mobius._weight_utils import (
+    supported_qmoe_quantization as _supported_qmoe_quantization,
+)
 from mobius.components._mlp import MLP
 
 
@@ -53,6 +55,27 @@ def _flatten_to_2d(op: OpBuilder, tensor: ir.Value) -> ir.Value:
     last_dim = op.Shape(tensor, start=-1)
     flat_shape = op.Concat(op.Constant(value_ints=[-1]), last_dim, axis=0)
     return op.Reshape(tensor, flat_shape)
+
+
+def _realize_gate_and_get_qmoe_routing(
+    op: OpBuilder, gate: nn.Module, hidden_states: ir.Value, *gate_args
+):
+    """Realize a gate in module scope and invoke its QMoE routing adapter.
+
+    ``qmoe_routing`` is called directly because it returns several tensors
+    rather than following a module's usual ``forward`` signature. Bypassing
+    ``Module.__call__`` would normally leave gate parameters with unqualified
+    initializer names, so mirror its direct-parameter realization here.
+    """
+    op.builder.push_module(gate.name or "gate", type(gate).__qualname__)
+    try:
+        # Direct-only realization mirrors ``Module.__call__`` and avoids
+        # double-registering parameters if a gate gains child modules.
+        for param in gate.parameters(recurse=False):
+            param._realize(op.builder)  # pylint: disable=protected-access
+        return gate.qmoe_routing(op, hidden_states, *gate_args)
+    finally:
+        op.builder.pop_module()
 
 
 def _scatter_selected_to_full(
@@ -522,30 +545,9 @@ class MoELayer(nn.Module):
     def _qmoe_forward(self, op: OpBuilder, hidden_states: ir.Value, *gate_args):
         quantization = self._qmoe_quantization
         assert quantization is not None
-        # ``qmoe_routing`` is called directly (not via ``self.gate(op, ...)``)
-        # because it returns multiple routing tensors rather than following
-        # the standard forward() signature. ``Module.__call__`` only realizes
-        # parameters (qualifying their initializer names, e.g.
-        # "<prefix>.gate.weight") for the module actually invoked through
-        # ``__call__`` -- see onnxscript/nn/_module.py -- so bypassing it here
-        # would leave ``self.gate.weight`` registered as a bare, unqualified
-        # "weight" initializer. Manually push the gate's module scope and
-        # realize its parameters first, mirroring the pattern used for the
-        # sparse LM head in gemma4_assistant.py.
-        op.builder.push_module(self.gate.name or "gate", type(self.gate).__qualname__)
-        try:
-            # ``recurse=False``: mirror ``Module.__call__``'s direct-only
-            # realization. Gate classes are currently leaf modules with no
-            # child modules, but recursing here would double-register any
-            # nested module's parameters under this pushed scope if one were
-            # ever added.
-            for param in self.gate.parameters(recurse=False):
-                param._realize(op.builder)  # pylint: disable=protected-access
-            router_probs, router_weights, normalize, output_scale = self.gate.qmoe_routing(
-                op, hidden_states, *gate_args
-            )
-        finally:
-            op.builder.pop_module()
+        router_probs, router_weights, normalize, output_scale = (
+            _realize_gate_and_get_qmoe_routing(op, self.gate, hidden_states, *gate_args)
+        )
 
         router_probs = _flatten_to_2d(op, router_probs)
         if router_weights is not None:
