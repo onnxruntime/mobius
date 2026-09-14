@@ -138,6 +138,24 @@ def _make_session_options(
     }
 
 
+def _resolve_decoder_graph_capture(
+    requested: bool | None,
+    *,
+    search: dict[str, Any],
+    emitted_model_type: str,
+) -> bool | None:
+    """Resolve graph capture against the final decoder KV-cache contract."""
+    past_present_share_buffer = search["past_present_share_buffer"]
+    if not isinstance(past_present_share_buffer, bool):
+        raise TypeError("past_present_share_buffer must be a boolean")
+    num_beams = search["num_beams"]
+    if isinstance(num_beams, bool) or not isinstance(num_beams, int):
+        raise TypeError(f"num_beams must be an integer, got {num_beams!r}")
+    if not past_present_share_buffer or (num_beams != 1 and emitted_model_type != "whisper"):
+        return False
+    return requested
+
+
 class GenaiConfigGenerator:
     """Generates genai_config.json dicts for onnxruntime-genai.
 
@@ -556,17 +574,36 @@ class GenaiConfigGenerator:
         else:
             emitted_model_type = "decoder"
 
+        search = _default_search_params(
+            ep=self.ep,
+            context_length=self.context_length,
+            supports_in_place_kv_cache=self._supports_in_place_kv_cache,
+        )
+        if self.model_type in {"lfm2", "lfm2_vl"}:
+            # ORT GenAI's LFM2 cache mixes fixed convolution windows with
+            # dynamic attention KV; shared in-place KV buffers are unsupported.
+            search["past_present_share_buffer"] = False
+        search.update(self._search_overrides)
+
         # Decoder section — use explicit inputs when available (from
         # graph introspection), otherwise fall back to defaults.
         if self._decoder_inputs is not None:
             decoder_inputs = dict(self._decoder_inputs)
         else:
             decoder_inputs = _default_decoder_inputs(is_vlm=is_multimodal)
+        # ORT GenAI rejects CUDA graph capture with dynamically growing
+        # past/present tensors, so resolve capture only after model-specific
+        # rules and caller overrides finalize the shared-buffer setting.
+        decoder_graph_capture = _resolve_decoder_graph_capture(
+            self._decoder_graph_capture,
+            search=search,
+            emitted_model_type=emitted_model_type,
+        )
         decoder_filename = "decoder/model.onnx" if is_multimodal else "model.onnx"
         decoder: dict[str, Any] = {
             "session_options": _make_session_options(
                 self.ep,
-                enable_graph_capture=self._decoder_graph_capture,
+                enable_graph_capture=decoder_graph_capture,
             ),
             "filename": self._decoder_filename or decoder_filename,
             "head_size": self.head_dim,
@@ -620,17 +657,6 @@ class GenaiConfigGenerator:
         if self._audio is not None:
             model["speech"] = self._audio
         model.update(self._vlm_token_ids)
-
-        search = _default_search_params(
-            ep=self.ep,
-            context_length=self.context_length,
-            supports_in_place_kv_cache=self._supports_in_place_kv_cache,
-        )
-        if self.model_type in {"lfm2", "lfm2_vl"}:
-            # ORT GenAI's LFM2 cache mixes fixed convolution windows with
-            # dynamic attention KV; shared in-place KV buffers are unsupported.
-            search["past_present_share_buffer"] = False
-        search.update(self._search_overrides)
 
         return {
             "model": model,

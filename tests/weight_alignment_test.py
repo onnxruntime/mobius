@@ -87,6 +87,9 @@ _FILTERING_PREPROCESS_MODELS: set[str] = {
     "opt",
     # ModernBert decoder: expects model.layers.* HF format with renames
     "modernbert-decoder",
+    # Realtime maps the Microsoft multi-stage checkpoint namespace, rather
+    # than accepting ONNX initializer names as an input format.
+    "vibevoice_streaming",
 }
 
 

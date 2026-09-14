@@ -329,7 +329,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
         revision = REUSE_REVISION
     output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
     optimize = args.optimize
     component_filter = args.component
@@ -437,41 +436,31 @@ def _cmd_build(args: argparse.Namespace) -> None:
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
-        import onnx_ir as ir
-        import transformers
-
         if input_sampling_rate is not None or bwe_sampling_rate is not None:
             raise SystemExit(
                 "Error: --input-sample-rate and --bwe-sample-rate are only "
                 "supported for RE-USE speech-enhancement checkpoints."
             )
-        try:
-            hf_config = transformers.AutoConfig.from_pretrained(
-                config_path, trust_remote_code=trust_remote_code
-            )
-        except (ValueError, KeyError, OSError):
-            # A checkpoint predating the mandatory ``model_type`` key still
-            # names its architecture; resolve it the same way the HF-id path
-            # does rather than refusing a directory Mobius can build.
-            from mobius.integrations.transformers._config_resolver import (
-                _try_load_config_json,
-            )
-
-            hf_config = _try_load_config_json(config_path)
-            if hf_config is None:
-                raise
-        model_type = hf_config.model_type
-        parent_config = hf_config
         from mobius.integrations.transformers._builder import (
             _is_qwen4_exp_composite,
+            _load_transformers_config,
             _reject_unsupported_affine_qwen4,
         )
 
+        parent_config, _loaded_from_raw_json = _load_transformers_config(
+            config_path,
+            revision=None,
+            trust_remote_code=trust_remote_code,
+        )
+        if parent_config is None:
+            raise ValueError(f"Could not load a Transformers config from {config_path!r}.")
+        model_type = parent_config.model_type
         if _is_qwen4_exp_composite(parent_config):
             raise SystemExit(
                 "Error: local Qwen4-Exp composite configs cannot be silently "
                 "exported as text-only. Use --model <hf-id> --features text-only."
             )
+        hf_config = parent_config
         if hasattr(hf_config, "text_config"):
             hf_config = hf_config.text_config
         from mobius.integrations.compressed_tensors import (
@@ -1561,8 +1550,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--dequantize",
         action="store_true",
         help=(
-            "Explicitly reconstruct supported compressed-tensors weights as dense "
-            "floating point. By default their FP8/NVFP4 storage is preserved."
+            "Explicitly reconstruct supported compressed-tensors and GPT-OSS "
+            "MXFP4 weights as dense floating point. Dense GPT-OSS reconstruction "
+            "is eager and memory-intensive; the default preserves MXFP4 with "
+            "bounded native streaming."
         ),
     )
     _add_shared_build_arguments(build_parser)

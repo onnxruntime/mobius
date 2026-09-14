@@ -6,8 +6,21 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import re
 from collections.abc import Mapping
+
+
+class QuantizedWeightFormat(str, enum.Enum):
+    """Storage semantics of quantized checkpoint weights.
+
+    ``INTEGER_AFFINE`` is the existing GPTQ/AWQ/Olive representation. ``MXFP4``
+    denotes native E2M1 codes with one E8M0 scale per 32-value block; it must
+    never be interpreted as affine INT4.
+    """
+
+    INTEGER_AFFINE = "integer_affine"
+    MXFP4 = "mxfp4"
 
 
 def _compile_pattern(pattern: str) -> re.Pattern[str]:
@@ -90,6 +103,26 @@ class QuantizationConfig:
     # The same path/regex matching rules apply to per-module overrides.
     # Insertion order is significant: the first matching override wins.
     overrides: dict[str, QuantizationOverride] = dataclasses.field(default_factory=dict)
+    # Keep this field last: QuantizationConfig has historically supported
+    # positional construction, so inserting a field earlier would silently
+    # change the meaning of existing callers' arguments.
+    weight_format: QuantizedWeightFormat = QuantizedWeightFormat.INTEGER_AFFINE
+
+    def __post_init__(self) -> None:
+        """Normalize serialized enum values without inferring storage semantics."""
+        if isinstance(self.weight_format, str):
+            try:
+                self.weight_format = QuantizedWeightFormat(self.weight_format)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unknown quantized weight format {self.weight_format!r}; "
+                    f"expected one of {[item.value for item in QuantizedWeightFormat]}"
+                ) from exc
+        elif not isinstance(self.weight_format, QuantizedWeightFormat):
+            raise TypeError(
+                "weight_format must be a QuantizedWeightFormat or its serialized "
+                f"string value, got {type(self.weight_format).__name__}"
+            )
 
     @classmethod
     def from_value(
@@ -182,6 +215,14 @@ class QuantizationConfig:
         # fp8 was already routed to the typed blocker above.)
         if method == "fp8":
             return None
+        if method == "mxfp4":
+            return cls(
+                bits=4,
+                group_size=32,
+                quant_method="mxfp4",
+                sym=True,
+                weight_format=QuantizedWeightFormat.MXFP4,
+            )
         raw_exclusions = qc.get("modules_to_not_convert") or ()
         if not isinstance(raw_exclusions, (list, tuple)):
             raise TypeError(
