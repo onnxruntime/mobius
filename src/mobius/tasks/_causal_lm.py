@@ -115,6 +115,8 @@ class CausalLMTask(ModelTask):
 
         # --- Static-cache pre-validation ---
         if static:
+            if getattr(module, "_supports_static_cache", True) is False:
+                raise ValueError(f"{type(module).__name__} does not support static cache.")
             max_seq_len = self._max_seq_len
             if max_seq_len is None:
                 max_seq_len = getattr(config, "max_position_embeddings", None)

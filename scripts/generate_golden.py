@@ -241,6 +241,22 @@ def _get_model_device(model: object, device: str):
 # transformers) are deferred to avoid import cost when --dry-run.
 
 
+# HuggingFace ``model_type`` values whose reference must run the eager attention
+# kernel.  GraniteSWA's learnable per-head sink is an extra logit inside the
+# softmax denominator, which SDPA cannot express — upstream sets
+# ``GraniteSWAPreTrainedModel._supports_sdpa = False`` for exactly this reason.
+# Pin it explicitly so the golden reference can never drift onto a kernel that
+# silently drops the sink.
+_EAGER_ATTENTION_MODEL_TYPES = frozenset({"granite_swa"})
+
+
+def _forced_attn_implementation(case: TestCase) -> str | None:
+    """Return the attention backend to pin for this case, or ``None``."""
+    if case.model_type in _EAGER_ATTENTION_MODEL_TYPES:
+        return "eager"
+    return None
+
+
 def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a causal-lm (text-generation) model."""
     from mobius._testing.golden import save_generation_json, save_golden_ref
@@ -271,6 +287,7 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
             device=device,
             trust_remote_code=case.trust_remote_code,
             revision=case.revision,
+            attn_implementation=_forced_attn_implementation(case),
         )
 
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)

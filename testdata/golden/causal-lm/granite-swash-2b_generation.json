@@ -1,0 +1,27 @@
+{
+  "model_id": "ibm-granite/granite-swash-2b",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    330,
+    791,
+    8155,
+    315,
+    279,
+    20409,
+    38473,
+    1,
+    555,
+    7957,
+    45406,
+    22096,
+    24421,
+    13,
+    1102,
+    374,
+    264,
+    33894,
+    922,
+    279
+  ],
+  "generated_text": " \"The Last of the Mohicans\" by James Fenimore Cooper. It is a poem about the"
+}

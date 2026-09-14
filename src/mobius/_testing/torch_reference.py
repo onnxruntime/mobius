@@ -201,6 +201,7 @@ def load_torch_model(
     device: str = "cpu",
     trust_remote_code: bool = True,
     revision: str | None = None,
+    attn_implementation: str | None = None,
 ):
     """Load a HuggingFace causal LM model for reference inference.
 
@@ -214,8 +215,15 @@ def load_torch_model(
             natively supported by the installed transformers, so the
             transformers-5.x-compatible implementation is used instead of an
             older bundled ``modeling_*.py`` that relies on removed cache APIs.
-        revision: Immutable HuggingFace revision used for the tokenizer,
-            config, weights, and any Nemotron-H weight repair.
+        revision: Optional immutable HuggingFace revision (commit SHA) applied
+            to the tokenizer, config, and weight downloads alike, so a single
+            pin covers every Hub artifact the reference depends on, including
+            any Nemotron-H weight repair.
+        attn_implementation: Optional HuggingFace attention backend to force
+            (e.g. ``"eager"``).  Needed for architectures whose attention is
+            not SDPA-expressible — GraniteSWA's learnable sink is an extra
+            logit inside the softmax denominator, so only the eager kernel
+            reproduces the published semantics.
 
     Returns:
         Tuple of (model, tokenizer).
@@ -224,27 +232,37 @@ def load_torch_model(
 
     _install_dynamic_cache_legacy_shims()
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_id, revision=revision, trust_remote_code=trust_remote_code
-    )
+    hub_kwargs: dict = {"trust_remote_code": trust_remote_code}
+    if revision is not None:
+        hub_kwargs["revision"] = revision
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, **hub_kwargs)
 
     # NemotronH: disable rescale_prenorm_residual before loading to
     # prevent _init_weights from corrupting out_proj.weight with
     # random kaiming_uniform_ initialization after checkpoint loading.
-    config = transformers.AutoConfig.from_pretrained(
-        model_id, revision=revision, trust_remote_code=trust_remote_code
-    )
+    config = transformers.AutoConfig.from_pretrained(model_id, **hub_kwargs)
     if getattr(config, "model_type", None) == "nemotron_h":
         config.rescale_prenorm_residual = False
+
+    model_kwargs: dict = dict(hub_kwargs)
+    if attn_implementation is not None:
+        model_kwargs["attn_implementation"] = attn_implementation
 
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_id,
         config=config,
         dtype=dtype,
         device_map=device,
-        revision=revision,
-        trust_remote_code=trust_remote_code,
+        **model_kwargs,
     )
+    if attn_implementation is not None:
+        actual = model.config._attn_implementation
+        if actual != attn_implementation:
+            raise RuntimeError(
+                f"Requested attn_implementation={attn_implementation!r} for "
+                f"{model_id} but transformers resolved {actual!r}."
+            )
     _fix_nemotron_h_dt_bias(model, model_id, revision)
     model.eval()
 

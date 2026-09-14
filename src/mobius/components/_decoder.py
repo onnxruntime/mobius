@@ -44,6 +44,12 @@ class DecoderLayer(nn.Module):
             Pass :class:`~mobius.components.FusedGateUpMLP` for models that store
             the gate and up projections as a single fused ``gate_up_proj`` weight
             (e.g. Phi-3, Phi-4, GLM).
+        attention_class: Attention module class to use (default:
+            :class:`~mobius.components.Attention`).  Must accept the same
+            ``(config, rms_norm_class=..., scale=..., linear_class=...)``
+            constructor signature.  Pass
+            :class:`~mobius.components.SinkAttention` for models with learnable
+            per-head attention sinks (GraniteSWA, GPT-OSS).
     """
 
     def __init__(
@@ -56,17 +62,20 @@ class DecoderLayer(nn.Module):
         post_norm: bool = False,
         linear_class: type | None = None,
         mlp_class: type | None = None,
+        attention_class: type[nn.Module] | None = None,
     ):
         super().__init__()
         if norm_class is None:
             norm_class = RMSNorm
         if mlp_class is None:
             mlp_class = MLP
+        if attention_class is None:
+            attention_class = Attention
 
         self._post_norm = post_norm
         self._residual_multiplier = residual_multiplier
 
-        self.self_attn = Attention(
+        self.self_attn = attention_class(
             config,
             rms_norm_class=norm_class,
             scale=attention_scale,
@@ -192,6 +201,7 @@ def create_decoder_layer(
     post_norm: bool = False,
     linear_class: type | None = None,
     mlp_class: type | None = None,
+    attention_class: type[nn.Module] | None = None,
 ) -> DecoderLayer:
     """Config-driven factory for creating decoder layers.
 
@@ -209,6 +219,8 @@ def create_decoder_layer(
             factory for LoRA-adapted layers.
         mlp_class: MLP module class override (default: MLP). Pass
             FusedGateUpMLP for models with fused gate_up_proj weights.
+        attention_class: Attention module class override (default: Attention).
+            Pass SinkAttention for models with learnable attention sinks.
 
     Returns:
         A configured DecoderLayer instance.
@@ -224,6 +236,7 @@ def create_decoder_layer(
         post_norm=post_norm,
         linear_class=linear_class,
         mlp_class=mlp_class,
+        attention_class=attention_class,
     )
 
 
