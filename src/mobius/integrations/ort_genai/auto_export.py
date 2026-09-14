@@ -179,6 +179,7 @@ _CACHE_NAME = re.compile(
     r"index_key|ple_conv_state|ple_context)$"
 )
 _QWEN4_EXP_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
+_GLM5_NEXT_MODEL_TYPES = frozenset({"glm5_next", "glm5_next_text"})
 
 
 @dataclass(frozen=True)
@@ -1495,6 +1496,23 @@ def _write_genai_config(
     decoder_key = "decoder" if "decoder" in pkg else "model"
     decoder_model = pkg.get(decoder_key)
     decoder_abi: _DecoderAbi | None = None
+    if (
+        getattr(config, "model_type", None) in _GLM5_NEXT_MODEL_TYPES
+        and decoder_model is not None
+    ):
+        decoder_input_names = {
+            value.name for value in decoder_model.graph.inputs if value.name is not None
+        }
+        if any(
+            name.endswith((".recurrent_state", ".indexer_state"))
+            for name in decoder_input_names
+        ):
+            raise ValueError(
+                "onnxruntime-genai 0.15.2 cannot represent GLM-5.3's heterogeneous "
+                "KDA conv/recurrent state plus pooled-DSA indexer state. The ONNX "
+                "package is valid, but emitting generic key/value cache templates "
+                "would be incorrect."
+            )
     if _is_single_model_decoder_package(pkg):
         if decoder_model is None:
             raise ValueError("ORT GenAI text packages require a decoder ONNX graph")
