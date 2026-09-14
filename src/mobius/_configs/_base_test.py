@@ -7,7 +7,153 @@ from __future__ import annotations
 
 import types
 
-from mobius._configs import ArchitectureConfig, NemotronParseConfig
+import pytest
+
+from mobius._configs import (
+    ArchitectureConfig,
+    KimiLinearConfig,
+    MiniMaxConfig,
+    NemotronParseConfig,
+)
+
+
+def _kimi_linear_hf_config(**overrides):
+    values = {
+        "model_type": "kimi_linear",
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 48,
+        "vocab_size": 64,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "linear_attn_config": {
+            "kda_layers": [1, 2, 3],
+            "full_attn_layers": [4],
+            "num_heads": 2,
+            "head_dim": 32,
+            "short_conv_kernel_size": 4,
+        },
+        "mla_use_nope": True,
+        "q_lora_rank": None,
+        "qk_nope_head_dim": 32,
+        "qk_rope_head_dim": 16,
+        "v_head_dim": 32,
+        "kv_lora_rank": 32,
+        "first_k_dense_replace": 1,
+        "moe_intermediate_size": 32,
+        "moe_layer_freq": 1,
+        "moe_renormalize": True,
+        "moe_router_activation_func": "sigmoid",
+        "num_experts": 2,
+        "num_experts_per_token": 1,
+        "num_expert_group": 1,
+        "topk_group": 1,
+        "num_shared_experts": 1,
+        "num_nextn_predict_layers": 0,
+        "routed_scaling_factor": 2.446,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def test_kimi_linear_config_extracts_exact_schedule() -> None:
+    config = KimiLinearConfig.from_transformers(_kimi_linear_hf_config())
+
+    assert config.layer_types == [
+        "kimi_linear_attention",
+        "kimi_linear_attention",
+        "kimi_linear_attention",
+        "full_attention",
+    ]
+    assert config.linear_key_head_dim == 32
+    assert config.qk_nope_head_dim == 32
+    assert config.qk_rope_head_dim == 16
+
+
+def test_kimi_linear_config_uses_top_level_head_count_when_nested_value_is_absent() -> None:
+    config = _kimi_linear_hf_config()
+    del config.linear_attn_config["num_heads"]
+
+    extracted = KimiLinearConfig.from_transformers(config)
+
+    assert extracted.linear_num_key_heads == config.num_attention_heads
+
+
+def test_kimi_linear_config_rejects_empty_convolution_history() -> None:
+    config = _kimi_linear_hf_config()
+    config.linear_attn_config["short_conv_kernel_size"] = 1
+
+    with pytest.raises(ValueError, match="at least 2"):
+        KimiLinearConfig.from_transformers(config)
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        (
+            {
+                "linear_attn_config": {
+                    "kda_layers": [1, 2],
+                    "full_attn_layers": [4],
+                    "num_heads": 2,
+                    "head_dim": 32,
+                    "short_conv_kernel_size": 4,
+                }
+            },
+            "exactly partition",
+        ),
+        ({"num_expert_group": 2}, "single expert-group"),
+    ],
+)
+def test_kimi_linear_config_rejects_non_authoritative_profiles(
+    override: dict, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        KimiLinearConfig.from_transformers(_kimi_linear_hf_config(**override))
+
+
+def test_minimax_config_extracts_exact_schedule_head_geometry_and_residuals():
+    config = types.SimpleNamespace(
+        model_type="MiniMaxText01",
+        hidden_size=48,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rotary_dim=8,
+        rope_theta=10_000_000.0,
+        vocab_size=64,
+        attn_type_list=[0, 1],
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        rms_norm_eps=1e-5,
+        postnorm=True,
+        shared_intermediate_size=0,
+        layernorm_full_attention_alpha=3.5,
+        layernorm_full_attention_beta=1.0,
+        layernorm_linear_attention_alpha=3.5,
+        layernorm_linear_attention_beta=1.0,
+        layernorm_mlp_alpha=3.5,
+        layernorm_mlp_beta=1.0,
+    )
+
+    extracted = MiniMaxConfig.from_transformers(config)
+
+    assert extracted.model_type == "minimax"
+    assert extracted.head_dim == 16
+    assert extracted.partial_rotary_factor == pytest.approx(0.5)
+    assert extracted.layer_types == ["lightning_attention", "full_attention"]
+    assert extracted.lightning_norm_eps == pytest.approx(1e-6)
+    assert extracted.full_attn_alpha_factor == pytest.approx(3.5)
+    assert extracted.linear_attn_alpha_factor == pytest.approx(3.5)
+    assert extracted.mlp_alpha_factor == pytest.approx(3.5)
+    assert extracted.disable_qmoe
 
 
 def test_nemotron_parse_maps_raw_mbart_decoder_attention_heads():
@@ -50,6 +196,81 @@ class _FakeHFConfig:
         self.__dict__.update(kwargs)
 
 
+def test_codeshell_config_normalizes_published_hf_fields_and_biases():
+    from mobius._configs import CodeShellConfig
+
+    cfg = _FakeHFConfig(
+        model_type="kclgpt",
+        vocab_size=70144,
+        n_positions=8192,
+        n_embd=4096,
+        n_layer=42,
+        n_head=32,
+        n_inner=16384,
+        activation_function="gelu_pytorch_tanh",
+        layer_norm_epsilon=1e-5,
+        group_query_attention=True,
+        num_query_groups=8,
+        position_embedding_type="rope",
+        rope_scaling=None,
+    )
+    out = CodeShellConfig.from_transformers(cfg)
+    assert (out.hidden_size, out.num_hidden_layers) == (4096, 42)
+    assert (out.num_attention_heads, out.num_key_value_heads) == (32, 8)
+    assert out.intermediate_size == 16384
+    assert out.max_position_embeddings == 8192
+    assert out.attn_qkv_bias and out.attn_o_bias and out.mlp_bias
+    assert out.tie_word_embeddings
+    assert out.rope is not None
+    assert out.rope_theta == pytest.approx(10_000.0)
+
+
+def test_xverse_config_supplies_source_rope_default():
+    from mobius._configs import XverseConfig
+
+    cfg = _FakeHFConfig(
+        model_type="xverse",
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        max_position_embeddings=32,
+        rms_norm_eps=1e-6,
+    )
+    out = XverseConfig.from_transformers(cfg)
+    assert out.rope is not None
+    assert out.rope_theta == pytest.approx(10_000.0)
+
+
+def test_jais2_config_preserves_published_bias_and_norm_fields():
+    from mobius._configs import Jais2Config
+
+    cfg = _FakeHFConfig(
+        model_type="jais2",
+        vocab_size=150272,
+        hidden_size=3328,
+        intermediate_size=26624,
+        num_hidden_layers=32,
+        num_attention_heads=26,
+        num_key_value_heads=26,
+        head_dim=128,
+        hidden_act="relu2",
+        max_position_embeddings=8192,
+        rope_parameters={"rope_theta": 10_000.0, "rope_type": "default"},
+        attention_bias=True,
+        mlp_bias=True,
+        layer_norm_eps=1e-5,
+        tie_word_embeddings=False,
+    )
+    out = Jais2Config.from_transformers(cfg)
+
+    assert out.attn_qkv_bias and out.attn_o_bias
+    assert out.mlp_bias
+    assert out.rms_norm_eps == pytest.approx(1e-5)
+    assert not out.tie_word_embeddings
+
+
 def test_scalar_intermediate_size_passes_through():
     cfg = _FakeHFConfig(
         hidden_size=2048,
@@ -79,3 +300,108 @@ def test_list_intermediate_size_collapses_to_first_element():
     out = ArchitectureConfig.from_transformers(cfg)
     assert out.intermediate_size == 8192
     assert isinstance(out.intermediate_size, int)
+
+
+def _codec_hf_config(**encoder_overrides):
+    """A Qwen3-TTS-Tokenizer-style HF config with nested encoder/decoder."""
+    encoder = {
+        "codebook_dim": 256,
+        "codebook_size": 2048,
+        "hidden_size": 512,
+        "intermediate_size": 2048,
+        "num_hidden_layers": 8,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "num_quantizers": 32,
+        "num_semantic_quantizers": 1,
+        "audio_channels": 1,
+        "num_filters": 64,
+        "num_residual_layers": 1,
+        "kernel_size": 7,
+        "last_kernel_size": 3,
+        "residual_kernel_size": 3,
+        "compress": 2,
+        "upsampling_ratios": [8, 6, 5, 4],
+    }
+    encoder.update(encoder_overrides)
+    return _FakeHFConfig(
+        model_type="qwen3_tts_tokenizer_12hz",
+        hidden_size=512,
+        num_attention_heads=8,
+        num_hidden_layers=8,
+        vocab_size=2048,
+        decoder_config={"hidden_size": 512, "codebook_dim": 512},
+        encoder_config=encoder,
+    )
+
+
+def test_codec_encoder_conv_fields_extracted_from_nested_config():
+    """Nested ``encoder_config`` values drive the derived conv stack.
+
+    These fields are read with ``getattr`` off a nested config, so a wrong
+    key or default would silently fall back to the checkpoint defaults and
+    build the wrong architecture.
+    """
+    out = ArchitectureConfig.from_transformers(_codec_hf_config())
+
+    enc = out.codec_encoder
+    assert enc is not None
+    assert enc.audio_channels == 1
+    assert enc.num_filters == 64
+    assert enc.num_residual_layers == 1
+    assert enc.kernel_size == 7
+    assert enc.last_kernel_size == 3
+    assert enc.residual_kernel_size == 3
+    assert enc.compress == 2
+    assert enc.upsampling_ratios == [8, 6, 5, 4]
+
+
+def test_codec_encoder_conv_fields_honor_non_default_values():
+    """Non-default nested values must survive extraction unchanged."""
+    out = ArchitectureConfig.from_transformers(
+        _codec_hf_config(
+            hidden_size=64,
+            audio_channels=2,
+            num_filters=8,
+            num_residual_layers=3,
+            kernel_size=5,
+            last_kernel_size=1,
+            residual_kernel_size=7,
+            compress=4,
+            upsampling_ratios=[4, 2],
+        )
+    )
+
+    enc = out.codec_encoder
+    assert enc is not None
+    assert enc.hidden_size == 64
+    assert enc.audio_channels == 2
+    assert enc.num_filters == 8
+    assert enc.num_residual_layers == 3
+    assert enc.kernel_size == 5
+    assert enc.last_kernel_size == 1
+    assert enc.residual_kernel_size == 7
+    assert enc.compress == 4
+    assert enc.upsampling_ratios == [4, 2]
+
+
+def test_codec_encoder_conv_fields_fall_back_to_checkpoint_defaults():
+    """A config omitting the conv fields still yields the real architecture."""
+    out = ArchitectureConfig.from_transformers(
+        _FakeHFConfig(
+            model_type="qwen3_tts_tokenizer_12hz",
+            hidden_size=512,
+            num_attention_heads=8,
+            num_hidden_layers=8,
+            vocab_size=2048,
+            decoder_config={"hidden_size": 512},
+            encoder_config={"hidden_size": 512},
+        )
+    )
+
+    enc = out.codec_encoder
+    assert enc is not None
+    assert enc.num_filters == 64
+    assert enc.upsampling_ratios == [8, 6, 5, 4]
+    assert enc.num_residual_layers == 1

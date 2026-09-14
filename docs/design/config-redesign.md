@@ -495,7 +495,7 @@ unmigrated models. There is never a broken intermediate state.
 attribute on the module class is sufficient — `_config_from_hf()` reads
 it automatically. No need to update 267 registry entries.
 
-**Tests verify both paths.** Existing `build_graph_test.py` parametrized
+**Tests verify both paths.** Existing L1 graph-test parametrization
 tests continue to work regardless of which config path a model uses.
 The output (ONNX graph) is identical — only the config construction
 path changes.
@@ -554,7 +554,7 @@ def test_falcon_config_migration():
             f"Field {f.name} differs: {getattr(new_config, f.name)} vs {getattr(old_config, f.name)}"
 ```
 
-Additionally, the existing `build_graph_test.py` parametrized tests
+Additionally, the existing L1 graph-test parametrization
 serve as integration tests — if the migrated config produces a
 different ONNX graph, the test will fail.
 

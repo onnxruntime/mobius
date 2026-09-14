@@ -71,7 +71,17 @@ def _round_trip(file_path: Path, ne0: int, ne1: int, codes: np.ndarray, scales: 
                     _make_tencent_q1_0_block(float(scales[n, b]), codes[n, start:end].tolist())
                 )
     tensor = _FakeTensor("w", (ne0, ne1), offset=0)
-    return parse_tencent_q1_0_tensor(file_path, data_section_offset=0, tensor=tensor)
+
+    def read_source_range(offset: int, length: int) -> bytes:
+        with file_path.open("rb") as stream:
+            stream.seek(offset)
+            return stream.read(length)
+
+    return parse_tencent_q1_0_tensor(
+        read_source_range,
+        data_section_offset=0,
+        tensor=tensor,
+    )
 
 
 class TestTencentQ10DefaultInflated4Bit:
@@ -212,4 +222,4 @@ class TestTencentQ10Shared:
         """K not divisible by 512 raises in both modes."""
         tensor = _FakeTensor("w", (256, 1), offset=0)
         with pytest.raises(ValueError, match="not divisible"):
-            parse_tencent_q1_0_tensor(tmp_path / "t.bin", 0, tensor)
+            parse_tencent_q1_0_tensor(lambda _offset, _length: b"", 0, tensor)

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import types
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -20,15 +22,19 @@ from mobius.integrations.ort_genai.auto_export import (
     _count_cache_layer_slots,
     _fix_chat_template,
     _fix_tokenizer_config,
+    _get_static_graph_input_dim,
     _graph_input_names,
+    _inspect_decoder_abi,
     _introspect_outputs,
+    _is_single_model_decoder_package,
+    _make_trt_rtx_embedding_provider_options,
     _resolve_ort_genai_model_type,
     _select_ort_model_type,
+    _uses_compact_sliding_kv_cache,
     _write_audio_processor_config,
     _write_genai_config,
     _write_vision_processor_config,
     auto_export,
-    export_package,
     write_ort_genai_config,
 )
 
@@ -56,23 +62,35 @@ def _mock_model_with_outputs(names: list[str]) -> ir.Model:
     return _mock_model(outputs=names)
 
 
-def test_moonshine_native_runtime_is_rejected(tmp_path):
-    from mobius._model_package import ModelPackage
-
-    config = mock.MagicMock()
-    config.model_type = "moonshine"
-    package = ModelPackage(
-        {"encoder": _mock_model(), "decoder": _mock_model()},
-        config=config,
+def test_compact_sliding_kv_cache_requires_matching_graph_contract():
+    model = _mock_model()
+    gqa = ir.Node(
+        op_type="GroupQueryAttention",
+        domain="com.microsoft",
+        inputs=[],
+        num_outputs=1,
     )
+    model.graph.append(gqa)
 
-    with pytest.raises(
-        NotImplementedError,
-        match="variable-length raw-waveform encoder",
-    ) as error:
-        write_ort_genai_config(package, str(tmp_path))
-    assert "onnx-genai" not in str(error.value)
-    assert "ONNX Runtime" in str(error.value)
+    assert not _uses_compact_sliding_kv_cache(model, "cpu")
+    gqa.attributes["sliding_window_cache"] = ir.AttrInt64("sliding_window_cache", 1)
+    assert _uses_compact_sliding_kv_cache(model, "cpu")
+    assert _uses_compact_sliding_kv_cache(model, "cuda")
+    assert not _uses_compact_sliding_kv_cache(model, "dml")
+    assert _uses_compact_sliding_kv_cache(None, "trt-rtx")
+
+
+def _mock_decoder_model(
+    *,
+    semantic_inputs: list[str] | None = None,
+    layer_indices: tuple[int, ...] = (0, 1),
+) -> ir.Model:
+    inputs = list(semantic_inputs or ["input_ids", "attention_mask", "position_ids"])
+    outputs = ["logits"]
+    for index in layer_indices:
+        inputs.extend([f"past_key_values.{index}.key", f"past_key_values.{index}.value"])
+        outputs.extend([f"present.{index}.key", f"present.{index}.value"])
+    return _mock_model(inputs=inputs, outputs=outputs)
 
 
 def _make_fake_llm_pkg(model_type: str = "qwen2"):
@@ -93,7 +111,7 @@ def _make_fake_llm_pkg(model_type: str = "qwen2"):
         max_position_embeddings: int = 128
 
     return ModelPackage(
-        {"model": _mock_model()},
+        {"model": _mock_decoder_model()},
         config=FakeConfig(model_type=model_type),
     )
 
@@ -109,6 +127,9 @@ class TestResolveOrtGenaiModelType:
         # decoder-only causal LM not in its built-in registry.
         assert _resolve_ort_genai_model_type("hunyuan_v1_dense") == "decoder"
 
+    def test_plamo2_maps_to_generic_decoder(self):
+        assert _resolve_ort_genai_model_type("plamo2") == "decoder"
+
     def test_unknown_model_type_passthrough(self):
         assert _resolve_ort_genai_model_type("my_custom") == "my_custom"
 
@@ -122,6 +143,17 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("phi4_multimodal") == "phi4mm"
         assert _resolve_ort_genai_model_type("phi") == "phi"
 
+    def test_qwen3_moe_maps_to_supported_decoder_type(self):
+        # ORT GenAI's LLM type registry has no "qwen3_moe" entry, so passing
+        # the HF type through fails to load with "Unsupported model_type in
+        # config.json: qwen3_moe". Qwen3-MoE maps to the accepted "qwen3" type
+        # (not the dense "qwen3" -> "qwen2" alias) so ORT GenAI's tokenizer tag
+        # fallback still supplies the Qwen3 reasoning-token IDs.
+        assert _resolve_ort_genai_model_type("qwen3_moe") == "qwen3"
+
+    def test_qwen25_text_subconfig_maps_to_multimodal_runtime(self):
+        assert _resolve_ort_genai_model_type("qwen2_5_vl_text") == "qwen2_5_vl"
+
     def test_gemma4_unified_model_types(self):
         # The gemma-4-12B unified checkpoint (model_type "gemma4_unified")
         # reuses the multimodal "gemma4" ORT GenAI pipeline; its standalone
@@ -132,18 +164,31 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("gemma4") == "gemma4"
         assert _resolve_ort_genai_model_type("gemma4_text") == "gemma4_text"
 
+    @pytest.mark.parametrize(
+        ("source_type", "expected"),
+        [
+            ("qwen3_5_text", "qwen3_5_text"),
+            ("qwen3_5_moe_text", "qwen3_5_moe_text"),
+            ("qwen3_5", "qwen3_5"),
+            ("qwen3_5_vl", "qwen3_5"),
+            ("qwen3_5_vl_text", "qwen3_5"),
+            ("qwen3_5_moe", "qwen3_5_moe"),
+            ("qwen3_5_moe_vl", "qwen3_5_moe"),
+        ],
+    )
+    def test_qwen35_source_and_multimodal_model_type_mapping(self, source_type, expected):
+        assert _resolve_ort_genai_model_type(source_type) == expected
+
 
 class TestSelectOrtModelType:
     """Text-only / multimodal ORT model type selection (PR: text_only export)."""
 
-    def test_decoder_only_prefers_config_type(self):
-        # Text-only gemma-4-12B: package config carries the text sibling, HF
-        # reports the multimodal type. Decoder-only -> follow the package.
+    def test_decoder_only_uses_generic_decoder(self):
         assert (
             _select_ort_model_type(
                 "gemma4_unified_text", "gemma4_unified", is_decoder_only=True
             )
-            == "gemma4_text"
+            == "decoder"
         )
 
     def test_multimodal_keeps_hf_type(self):
@@ -158,14 +203,71 @@ class TestSelectOrtModelType:
         )
 
     def test_decoder_only_falls_back_to_hf_when_config_missing(self):
-        assert _select_ort_model_type(None, "qwen3", is_decoder_only=True) == "qwen2"
+        assert _select_ort_model_type(None, "qwen3", is_decoder_only=True) == "decoder"
 
-    def test_decoder_only_unknown_config_falls_back_to_hf(self):
-        # An unrecognised config.model_type (not in _ORT_GENAI_MODEL_TYPE) must
-        # not pass straight through as an invalid ORT type; fall back to the
-        # known HF-derived mapping instead.
+    def test_decoder_only_unknown_config_uses_generic_decoder(self):
         assert (
-            _select_ort_model_type("not_a_real_type", "qwen3", is_decoder_only=True) == "qwen2"
+            _select_ort_model_type("not_a_real_type", "qwen3", is_decoder_only=True)
+            == "decoder"
+        )
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+    def test_decoder_only_qwen35_uses_released_generic_decoder(self, model_type):
+        assert (
+            _select_ort_model_type(model_type, "qwen3_5_moe", is_decoder_only=True)
+            == "decoder"
+        )
+
+    @pytest.mark.parametrize(
+        ("config_model_type", "hf_model_type", "expected"),
+        [
+            ("qwen3_5_text", "qwen3_5", "qwen3_5"),
+            ("qwen3_5_moe_text", "qwen3_5_moe", "qwen3_5_moe"),
+        ],
+    )
+    def test_multimodal_qwen35_preserves_parent_vlm_runtime_type(
+        self, config_model_type, hf_model_type, expected
+    ):
+        assert (
+            _select_ort_model_type(
+                config_model_type,
+                hf_model_type,
+                is_decoder_only=False,
+            )
+            == expected
+        )
+
+    def test_decoder_only_preserves_specialized_hf_fallback(self):
+        assert (
+            _select_ort_model_type("not_a_real_type", "lfm2", is_decoder_only=True) == "lfm2"
+        )
+
+    @pytest.mark.parametrize(
+        ("model_type", "expected"),
+        [
+            ("lfm2", "lfm2"),
+            ("lfm2_vl", "lfm2"),
+        ],
+    )
+    def test_specialized_decoder_type_is_preserved(self, model_type, expected):
+        assert _select_ort_model_type(model_type, model_type, is_decoder_only=True) == expected
+
+    @pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
+    def test_phi3_family_uses_generic_decoder_without_longrope(self, model_type):
+        assert (
+            _select_ort_model_type(model_type, model_type, is_decoder_only=True) == "decoder"
+        )
+
+    @pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
+    def test_phi3_family_preserves_specialized_type_for_longrope(self, model_type):
+        assert (
+            _select_ort_model_type(
+                model_type,
+                model_type,
+                is_decoder_only=True,
+                rope_type="longrope",
+            )
+            == model_type
         )
 
 
@@ -209,6 +311,43 @@ class TestWriteProcessorConfig:
         norm_attrs = transforms[3]["operation"]["attrs"]
         assert len(norm_attrs["mean"]) == 3
         assert len(norm_attrs["std"]) == 3
+
+    def test_qwen25_text_config_writes_packed_patch_processor(self, tmp_path):
+        vision = types.SimpleNamespace(
+            image_size=448,
+            patch_size=14,
+            spatial_merge_size=2,
+            model_type="qwen2_5_vl",
+        )
+        config = types.SimpleNamespace(
+            vision=vision,
+            model_type="qwen2_5_vl_text",
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+        assert data["processor"]["name"] == "qwen2_5_image_processor"
+        transforms = data["processor"]["transforms"]
+        assert transforms[-1]["operation"] == {
+            "name": "patch_image",
+            "type": "PatchImage",
+            "attrs": {
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+            },
+        }
+        normalize = next(
+            transform["operation"]
+            for transform in transforms
+            if transform["operation"]["type"] == "Normalize"
+        )
+        assert normalize["attrs"]["qwen2_5_vl"] == 1
 
     def test_mage_vl_writes_packed_patch_processor(self, tmp_path):
         vision = types.SimpleNamespace(
@@ -369,6 +508,40 @@ class TestWriteProcessorConfig:
         assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
         assert transforms[4]["operation"]["attrs"] == {
             "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
+
+    def test_qwen35_moe_text_uses_packed_qwen_image_pipeline(self, tmp_path):
+        """Qwen3.6 VL builds unwrap to the MoE text config before processor export."""
+        vision = mock.MagicMock()
+        vision.image_size = 16_777_216
+        vision.patch_size = 16
+        vision.spatial_merge_size = 2
+        config = mock.MagicMock()
+        config.vision = vision
+        config.model_type = "qwen3_5_moe_text"
+        config.spatial_merge_size = 2
+        config.temporal_patch_size = 2
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+
+        proc = data["processor"]
+        assert proc["name"] == "qwen2_5_image_processor"
+        transforms = proc["transforms"]
+        assert [t["operation"]["type"] for t in transforms] == [
+            "DecodeImage",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "PatchImage",
+        ]
+        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert transforms[4]["operation"]["attrs"] == {
+            "patch_size": 16,
             "temporal_patch_size": 2,
             "merge_size": 2,
         }
@@ -756,10 +929,20 @@ class TestFixChatTemplate:
         with mock.patch(
             "transformers.AutoTokenizer.from_pretrained",
             return_value=fake_tokenizer,
-        ):
-            result = _fix_chat_template(str(tmp_path), "fake/model")
+        ) as from_pretrained:
+            result = _fix_chat_template(
+                str(tmp_path),
+                "fake/model",
+                revision="immutable-revision",
+                trust_remote_code=True,
+            )
 
         assert result is True
+        from_pretrained.assert_called_once_with(
+            "fake/model",
+            revision="immutable-revision",
+            trust_remote_code=True,
+        )
         fixed = json.loads((tmp_path / "tokenizer_config.json").read_text())
         assert fixed["chat_template"] == "{{ bos_token }}"
 
@@ -821,6 +1004,30 @@ class TestFixChatTemplate:
         assert attrs["hop_length_ms"] == 10.0  # noqa: RUF069
         assert attrs["mel_floor"] == 0.001  # noqa: RUF069
 
+    def test_audio_glmasr_writes_whisper_feature_extraction_json(self, tmp_path):
+        config = mock.MagicMock()
+        config.audio = mock.MagicMock()
+        config.model_type = "glmasr"
+
+        path = _write_audio_processor_config(config, str(tmp_path))
+
+        assert path is not None
+        assert path.endswith("audio_processor.json")
+        with open(path) as f:
+            data = json.load(f)
+        operations = data["feature_extraction"]["sequence"]
+        assert [item["operation"]["type"] for item in operations] == [
+            "AudioDecoder",
+            "STFTNorm",
+            "LogMelSpectrum",
+        ]
+        assert operations[1]["operation"]["attrs"] == {
+            "n_fft": 400,
+            "frame_length": 400,
+            "hop_length": 160,
+        }
+        assert operations[2]["operation"]["attrs"]["n_mel"] == 128
+
     def test_handles_tokenizer_load_error(self, tmp_path):
         """Gracefully handles AutoTokenizer.from_pretrained raising."""
         tc = {"tokenizer_class": "LlamaTokenizer"}
@@ -847,20 +1054,133 @@ class TestCopyTokenizerFiles:
         (fake_src / "chat_template.jinja").write_text("{{ messages }}")
 
         with mock.patch("huggingface_hub.hf_hub_download") as mock_dl:
-            mock_dl.side_effect = lambda model_id, filename: (
+            from huggingface_hub.utils import LocalEntryNotFoundError
+
+            mock_dl.side_effect = lambda model_id, filename, **_kwargs: (
                 str(fake_src / filename)
                 if (fake_src / filename).exists()
-                else (_ for _ in ()).throw(OSError("not found"))
+                else (_ for _ in ()).throw(LocalEntryNotFoundError("not cached"))
             )
 
             dst = tmp_path / "output"
             dst.mkdir()
-            copied = _copy_tokenizer_files("fake/model", str(dst))
+            copied = _copy_tokenizer_files(
+                "fake/model",
+                str(dst),
+                local_files_only=True,
+            )
 
         assert "tokenizer.json" in copied
         assert (dst / "tokenizer.json").exists()
         assert "chat_template.jinja" in copied
         assert (dst / "chat_template.jinja").exists()
+
+    def test_local_cache_miss_is_best_effort(self, tmp_path):
+        from huggingface_hub.utils import LocalEntryNotFoundError
+
+        with mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=LocalEntryNotFoundError("not cached"),
+        ):
+            copied = _copy_tokenizer_files(
+                "fake/model",
+                str(tmp_path),
+                local_files_only=True,
+            )
+
+        assert copied == []
+        assert not list(tmp_path.iterdir())
+
+    def test_online_cache_miss_propagates(self, tmp_path):
+        from huggingface_hub.utils import LocalEntryNotFoundError
+
+        with (
+            mock.patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=LocalEntryNotFoundError("unexpected online miss"),
+            ),
+            pytest.raises(LocalEntryNotFoundError, match="unexpected online miss"),
+        ):
+            _copy_tokenizer_files("fake/model", str(tmp_path))
+
+    def test_online_missing_optional_file_is_skipped(self, tmp_path):
+        from huggingface_hub import errors as hub_errors
+
+        remote_entry_not_found = getattr(
+            hub_errors,
+            "RemoteEntryNotFoundError",
+            None,
+        )
+        if remote_entry_not_found is None:
+            pytest.skip("RemoteEntryNotFoundError is available in huggingface_hub >= 1.0")
+
+        response = mock.Mock()
+        response.status_code = 404
+        response.headers = {}
+        with mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=remote_entry_not_found(
+                "optional file absent",
+                response=response,
+            ),
+        ):
+            copied = _copy_tokenizer_files("fake/model", str(tmp_path))
+
+        assert copied == []
+
+    def test_hub_zero_x_remote_missing_falls_back_to_entry_not_found(
+        self, tmp_path, monkeypatch
+    ):
+        from huggingface_hub import errors as hub_errors
+        from huggingface_hub.utils import EntryNotFoundError
+
+        monkeypatch.delattr(hub_errors, "RemoteEntryNotFoundError")
+        with mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=EntryNotFoundError("optional file absent"),
+        ):
+            copied = _copy_tokenizer_files("fake/model", str(tmp_path))
+
+        assert copied == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            PermissionError("denied"),
+            OSError("disk full"),
+            RuntimeError("network failure"),
+        ],
+    )
+    def test_operational_failures_propagate(self, tmp_path, error):
+        with (
+            mock.patch("huggingface_hub.hf_hub_download", side_effect=error),
+            pytest.raises(type(error), match=str(error)),
+        ):
+            _copy_tokenizer_files(
+                "fake/model",
+                str(tmp_path),
+                local_files_only=True,
+            )
+
+    def test_destination_write_failure_propagates(self, tmp_path):
+        source = tmp_path / "tokenizer.json"
+        source.write_text("{}")
+        with (
+            mock.patch(
+                "huggingface_hub.hf_hub_download",
+                return_value=str(source),
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export.shutil.copy2",
+                side_effect=PermissionError("destination denied"),
+            ),
+            pytest.raises(PermissionError, match="destination denied"),
+        ):
+            _copy_tokenizer_files(
+                "fake/model",
+                str(tmp_path),
+                local_files_only=True,
+            )
 
 
 class TestCopyTokenizerFilesFromLocal:
@@ -871,7 +1191,9 @@ class TestCopyTokenizerFilesFromLocal:
         src = tmp_path / "model"
         src.mkdir()
         (src / "tokenizer.json").write_text('{"test": true}')
+        (src / "tokenizer.jsonl").write_text('["token", 0.0, "NORMAL"]\n')
         (src / "tokenizer_config.json").write_text('{"model_type": "llama"}')
+        (src / "tokenization_plamo.py").write_text("class Plamo2Tokenizer: pass\n")
         (src / "chat_template.jinja").write_text("{{ messages }}")
 
         dst = tmp_path / "output"
@@ -880,7 +1202,9 @@ class TestCopyTokenizerFilesFromLocal:
 
         assert set(copied) == {
             "tokenizer.json",
+            "tokenizer.jsonl",
             "tokenizer_config.json",
+            "tokenization_plamo.py",
             "chat_template.jinja",
         }
         assert (dst / "tokenizer.json").read_text() == '{"test": true}'
@@ -931,6 +1255,18 @@ class TestWriteOrtGenaiConfigLocalDir:
     def _make_pkg():
         return _make_fake_llm_pkg("llama")
 
+    def test_qwen35_moe_text_emits_standalone_llm_config(self, tmp_path):
+        pkg = _make_fake_llm_pkg("qwen3_5_moe_text")
+
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+        assert model["type"] == "decoder"
+        assert model["decoder"]["filename"] == "model.onnx"
+        assert "vision" not in model
+        assert "embedding" not in model
+
     def test_local_config_dir_copies_tokenizer_files(self, tmp_path):
         """When local_config_dir is set, tokenizer files are copied from it."""
         src = tmp_path / "local_model"
@@ -979,6 +1315,10 @@ class TestWriteOrtGenaiConfigLocalDir:
                     eos_token_id=2,
                     pad_token_id=0,
                 ),
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
             ),
         ):
             (out / "tokenizer.json").write_text("{}")  # pretend HF copy happened
@@ -1040,30 +1380,8 @@ class TestExportForOrtGenai:
         with open(result["genai_config"]) as f:
             data = json.load(f)
         assert "model" in data
-        assert data["model"]["type"] == "qwen2"
-
-    def test_rejects_generic_vision_encoder_decoder_package(self, tmp_path):
-        import dataclasses
-
-        from mobius._model_package import ModelPackage
-
-        @dataclasses.dataclass
-        class FakeConfig:
-            model_type: str = "nemotron_parse"
-
-        pkg = ModelPackage(
-            {
-                "vision_encoder": _mock_model(),
-                "decoder": _mock_model(),
-            },
-            config=FakeConfig(),
-        )
-        with pytest.raises(
-            NotImplementedError,
-            match="does not support generic vision encoder-decoder",
-        ):
-            write_ort_genai_config(pkg, str(tmp_path))
-        assert not (tmp_path / "genai_config.json").exists()
+        assert data["model"]["type"] == "decoder"
+        assert data["model"]["decoder"]["inputs"]["position_ids"] == "position_ids"
 
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""
@@ -1145,9 +1463,22 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "decoder": _mock_model(),
-                "vision_encoder": _mock_model(),
-                "embedding": _mock_model(),
+                "decoder": _mock_model(
+                    inputs=[
+                        "inputs_embeds",
+                        "attention_mask",
+                        "position_ids",
+                        "per_layer_inputs",
+                    ]
+                ),
+                "vision_encoder": _mock_model(
+                    inputs=["pixel_values", "image_grid_thw"],
+                    outputs=["image_features"],
+                ),
+                "embedding": _mock_model(
+                    inputs=["input_ids", "image_features"],
+                    outputs=["inputs_embeds", "per_layer_inputs"],
+                ),
             },
             config=FakeConfig(),
         )
@@ -1163,8 +1494,254 @@ class TestExportForOrtGenai:
         assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
+        assert model["decoder"]["inputs"]["per_layer_inputs"] == "per_layer_inputs"
+        assert model["embedding"]["outputs"]["per_layer_inputs"] == "per_layer_inputs"
+        assert model["vision"]["outputs"] == {"image_features": "image_features"}
+        assert "deepstack" not in json.dumps(data)
 
-    def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):
+    def test_qwen35_vl_uses_native_qwen35_runtime_type(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+            window_size: int = 112
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "qwen3_5_vl"
+            vocab_size: int = 248064
+            hidden_size: int = 2048
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 248056
+            vision_start_token_id: int = 248053
+            video_token_id: int = 248057
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        embedding = _mock_model(
+            inputs=["input_ids", "image_features"],
+            outputs=["inputs_embeds", "per_layer_inputs"],
+        )
+        embedding.graph.inputs[1].shape = ir.Shape(["num_tokens", 4096])
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model(),
+                "vision_encoder": _mock_model(),
+                "embedding": embedding,
+            },
+            config=FakeConfig(),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="trt-rtx")
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        model = data["model"]
+        assert model["type"] == "qwen3_5"
+        assert model["image_token_id"] == 248056
+        assert model["vision_start_token_id"] == 248053
+        assert model["video_token_id"] == 248057
+        assert model["vision"]["patch_size"] == 16
+        assert model["vision"]["window_size"] == 112
+        assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
+        assert (
+            model["decoder"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert data["search"]["past_present_share_buffer"] is False
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "enable_cuda_graph"
+            ]
+            == "0"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_min_shapes"
+            ]
+            == "input_ids:1x1,image_features:0x4096"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_opt_shapes"
+            ]
+            == "input_ids:1x226,image_features:192x4096"
+        )
+        assert (
+            model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_max_shapes"
+            ]
+            == "input_ids:1x1024,image_features:2520x4096"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_min_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_opt_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+        assert (
+            model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
+                "nv_profile_max_shapes"
+            ]
+            == "pixel_values:600x1536"
+        )
+
+    def test_glm_ocr_writes_qwen_runtime_and_packed_processor_contract(self, tmp_path):
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 336
+            patch_size: int = 14
+            spatial_merge_size: int = 2
+            model_type: str = "glm_ocr_vision"
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "glm_ocr_text"
+            vocab_size: int = 59392
+            hidden_size: int = 1536
+            num_hidden_layers: int = 16
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            image_token_id: int = 59280
+            vision_start_token_id: int = 59256
+            temporal_patch_size: int = 2
+            spatial_merge_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model(
+                    inputs=["inputs_embeds", "attention_mask", "position_ids"],
+                    outputs=["logits"],
+                ),
+                "vision_encoder": _mock_model(
+                    inputs=["pixel_values", "image_grid_thw"],
+                    outputs=["image_features"],
+                ),
+                "embedding": _mock_model(
+                    inputs=["input_ids", "image_features"],
+                    outputs=["inputs_embeds"],
+                ),
+            },
+            config=FakeConfig(),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
+
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+        assert model["type"] == "qwen2_5_vl"
+        assert model["image_token_id"] == 59280
+        assert model["vision_start_token_id"] == 59256
+        assert model["vision"]["spatial_merge_size"] == 2
+        assert model["vision"]["config_filename"] == "processor_config.json"
+        assert model["vision"]["inputs"] == {
+            "pixel_values": "pixel_values",
+            "image_grid_thw": "image_grid_thw",
+        }
+
+        with open(result["processor_config"]) as f:
+            processor = json.load(f)["processor"]
+        assert processor["name"] == "qwen2_5_image_processor"
+        patch_image = processor["transforms"][-1]["operation"]
+        assert patch_image == {
+            "name": "patch_image",
+            "type": "PatchImage",
+            "attrs": {
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+            },
+        }
+
+    def test_glm_ocr_pixel_bounds_are_not_used_as_image_dimensions(self, tmp_path):
+        """GLM-OCR's longest_edge is a pixel-count ceiling, not a side length."""
+        import dataclasses
+
+        from mobius.integrations.ort_genai.auto_export import _write_vision_processor_config
+
+        revision = "ca5d8b3e287e52589e37c28385d9655ee4372f9d"
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 336
+            patch_size: int = 14
+            spatial_merge_size: int = 2
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str = "glm_ocr_text"
+            temporal_patch_size: int = 2
+            spatial_merge_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        image_processor = mock.MagicMock()
+        image_processor.image_mean = [0.48145466, 0.4578275, 0.40821073]
+        image_processor.image_std = [0.26862954, 0.26130258, 0.27577711]
+        image_processor.rescale_factor = 1.0 / 255.0
+        image_processor.resample = 3
+        image_processor.size = {
+            "shortest_edge": 12544,
+            "longest_edge": 9633792,
+        }
+        hf_processor = mock.MagicMock(image_processor=image_processor)
+
+        with mock.patch(
+            "transformers.AutoProcessor.from_pretrained",
+            return_value=hf_processor,
+        ) as mock_from_pretrained:
+            path = _write_vision_processor_config(
+                FakeConfig(),
+                str(tmp_path),
+                hf_model_id="zai-org/GLM-OCR",
+                revision=revision,
+            )
+
+        mock_from_pretrained.assert_called_once_with(
+            "zai-org/GLM-OCR",
+            revision=revision,
+            trust_remote_code=False,
+        )
+        assert path is not None
+        with open(path) as f:
+            transforms = json.load(f)["processor"]["transforms"]
+        resize = transforms[1]["operation"]["attrs"]
+        assert resize["height"] == 336
+        assert resize["width"] == 336
+        assert resize["min_pixels"] == 12544
+        assert resize["max_pixels"] == 9633792
+
+    def test_qwen36_vl_hf_parent_type_maps_to_qwen35_moe_runtime(self, tmp_path):
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -1178,15 +1755,21 @@ class TestExportForOrtGenai:
 
         @dataclasses.dataclass
         class FakeConfig:
-            model_type: str = "mage_vl"
-            vocab_size: int = 151936
-            hidden_size: int = 2560
-            num_hidden_layers: int = 1
-            num_attention_heads: int = 32
+            # build_transformers_model unwraps Qwen3.6 VL to the text sub-config,
+            # but write_ort_genai_config must preserve the multimodal HF parent
+            # type and map it to ORT GenAI's native qwen3_5_moe VLM runtime.
+            model_type: str = "qwen3_5_moe_text"
+            vocab_size: int = 248064
+            hidden_size: int = 2048
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 16
             num_key_value_heads: int = 8
             head_dim: int = 128
-            image_token_id: int = 151655
-            temporal_patch_size: int = 1
+            image_token_id: int = 248056
+            vision_start_token_id: int = 248053
+            video_token_id: int = 248057
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
             vision: FakeVision = dataclasses.field(default_factory=FakeVision)
 
         pkg = ModelPackage(
@@ -1198,13 +1781,34 @@ class TestExportForOrtGenai:
             config=FakeConfig(),
         )
 
-        output_dir = tmp_path / "ort-genai"
-        with pytest.raises(
-            ValueError,
-            match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
+        hf_config = mock.MagicMock(
+            model_type="qwen3_5_moe",
+            bos_token_id=248044,
+            eos_token_id=248044,
+            pad_token_id=248044,
+        )
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+            mock.patch("transformers.AutoProcessor.from_pretrained", side_effect=OSError),
         ):
-            write_ort_genai_config(pkg, str(output_dir))
-        assert not output_dir.exists()
+            result = write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="Qwen/Qwen3.6-35B-A3B",
+            )
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["type"] == "qwen3_5_moe"
+        assert data["model"]["vision"]["patch_size"] == 16
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
@@ -1243,7 +1847,7 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": _mock_model(),
+                "model": _mock_decoder_model(),
                 "vision": _mock_model(),
                 "embedding": _mock_model(),
             },
@@ -1353,7 +1957,7 @@ class TestExportForOrtGenai:
             num_key_value_heads: int = 1
             head_dim: int = 256
 
-        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_decoder_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path))
 
         assert "audio_processor" not in result
@@ -1423,6 +2027,45 @@ class TestExportForOrtGenai:
             write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
         mock_copy.assert_not_called()
 
+    def test_hub_artifacts_use_pinned_revision(self, tmp_path):
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        revision = "61ba4e0b3309b6656edea3e93e419f7bd5c61957"
+        fake_hf = mock.MagicMock(
+            model_type="llama",
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+        )
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=fake_hf,
+            ) as mock_config,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as mock_copy,
+        ):
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="zai-org/GLM-ASR-Nano-2512",
+                revision=revision,
+            )
+
+        mock_config.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            revision=revision,
+            trust_remote_code=False,
+        )
+        mock_copy.assert_called_once_with(
+            "zai-org/GLM-ASR-Nano-2512",
+            str(tmp_path),
+            revision=revision,
+        )
+
     def test_tokenizer_copied_when_model_id_provided(self, tmp_path):
         """Tokenizer files are copied when hf_model_id is provided."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
@@ -1434,6 +2077,10 @@ class TestExportForOrtGenai:
                 return_value=["tokenizer.json"],
             ) as mock_copy,
             mock.patch("transformers.AutoConfig.from_pretrained") as mock_hf,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
         ):
             mock_hf.return_value = mock.MagicMock(
                 model_type="qwen2", bos_token_id=1, eos_token_id=2, pad_token_id=0
@@ -1454,6 +2101,10 @@ class TestExportForOrtGenai:
                 return_value=[],
             ),
             mock.patch("transformers.AutoConfig.from_pretrained") as mock_hf,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
         ):
             mock_hf.return_value = mock.MagicMock(
                 model_type="mage_vl", bos_token_id=1, eos_token_id=2, pad_token_id=0
@@ -1466,6 +2117,78 @@ class TestExportForOrtGenai:
             )
 
         mock_hf.assert_called_once_with("microsoft/Mage-VL", trust_remote_code=True)
+
+    def test_generation_config_multi_eos_overrides_model_config(self, tmp_path):
+        """generation_config.json stop tokens take precedence over the model config."""
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        hf_config = mock.MagicMock(
+            model_type="qwen3_5_moe",
+            bos_token_id=248044,
+            eos_token_id=248044,
+            pad_token_id=None,
+        )
+        generation_config = mock.MagicMock(
+            bos_token_id=248044,
+            eos_token_id=[248046, 248044],
+            pad_token_id=248044,
+        )
+        with (
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=generation_config,
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+        ):
+            result = write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="Qwen/Qwen3.6-35B-A3B",
+            )
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["eos_token_id"] == [248046, 248044]
+        assert data["model"]["pad_token_id"] == 248044
+
+    def test_hf_revision_is_used_for_config_and_tokenizer_assets(self, tmp_path):
+        """A pinned export never mixes config and tokenizer revisions."""
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = self._make_pkg()
+        revision = "0123456789abcdef"
+        with (
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as mock_copy,
+            mock.patch("transformers.AutoConfig.from_pretrained") as mock_hf,
+        ):
+            mock_hf.return_value = mock.MagicMock(
+                model_type="qwen2", bos_token_id=1, eos_token_id=2, pad_token_id=0
+            )
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="fake/model",
+                revision=revision,
+            )
+
+        mock_hf.assert_called_once_with(
+            "fake/model",
+            revision=revision,
+            trust_remote_code=False,
+        )
+        mock_copy.assert_called_once_with(
+            "fake/model",
+            str(tmp_path),
+            revision=revision,
+        )
 
     def test_ep_default_normalizes_to_cpu(self, tmp_path):
         """ep='default' is normalized to cpu (provider_options=[])."""
@@ -1547,13 +2270,23 @@ class TestExportForOrtGenai:
             head_dim: int = 16
             max_position_embeddings: int = 128
 
-        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_decoder_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
-        # "gemma2" maps to "gemma" in _ORT_GENAI_MODEL_TYPE
-        assert data["model"]["type"] == "gemma"
+        assert data["model"]["type"] == "decoder"
+
+    def test_config_mode_qwen3_moe_emits_generic_decoder_type(self, tmp_path):
+        """Qwen3-MoE uses the graph-driven generic decoder contract."""
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        pkg = _make_fake_llm_pkg("qwen3_moe")
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            data = json.load(f)
+        assert data["model"]["type"] == "decoder"
 
     def test_config_mode_gemma3_text_vlm_uses_multimodal_model_type(self, tmp_path):
         """Gemma3 VLM --config exports use ORT's multimodal gemma3 type."""
@@ -1643,6 +2376,67 @@ class TestExportForOrtGenai:
         with open(result["genai_config"]) as f:
             data = json.load(f)
         assert data["model"]["type"] == "gemma3n"
+
+    @pytest.mark.parametrize(
+        ("text_model_type", "expected_runtime_type"),
+        [
+            ("qwen3_5_text", "qwen3_5"),
+            ("qwen3_5_vl_text", "qwen3_5"),
+            ("qwen3_5_moe_text", "qwen3_5_moe"),
+        ],
+    )
+    def test_config_mode_qwen35_text_vlm_recovers_multimodal_type(
+        self,
+        tmp_path,
+        text_model_type,
+        expected_runtime_type,
+    ):
+        """Unwrapped Qwen3.5/3.6 VLM configs retain their VLM runtime pipeline."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+            window_size: int = 112
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str
+            vocab_size: int = 248064
+            hidden_size: int = 2048
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            max_position_embeddings: int = 128
+            image_token_id: int = 248056
+            vision_start_token_id: int = 248053
+            video_token_id: int = 248057
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(["inputs_embeds", "attention_mask"]),
+                "vision_encoder": _mock_model_with_inputs(["pixel_values"]),
+                "embedding": _mock_model_with_inputs(["input_ids", "image_features"]),
+            },
+            config=FakeConfig(model_type=text_model_type),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+        assert model["type"] == expected_runtime_type
+        assert model["vision"]["filename"] == "vision_encoder/model.onnx"
+        assert model["embedding"]["filename"] == "embedding/model.onnx"
 
     def test_gemma3n_references_only_processor_files_that_exist(self, tmp_path):
         """Every processor file genai_config.json names must be on disk.
@@ -1868,7 +2662,7 @@ class TestExportForOrtGenai:
             eos_token_id: int = 2
             pad_token_id: int = 0
 
-        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_decoder_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -1876,6 +2670,194 @@ class TestExportForOrtGenai:
         assert data["model"]["bos_token_id"] == 1
         assert data["model"]["eos_token_id"] == 2
         assert data["model"]["pad_token_id"] == 0
+
+    @pytest.mark.parametrize(
+        ("tokens", "vocab_size", "expected", "filename", "key"),
+        [
+            (
+                {"<tool_call>": 151657, "</tool_call>": 151658},
+                151936,
+                {"bot_token_id": 151657, "eot_token_id": 151658},
+                "tokenizer_config.json",
+                "added_tokens_decoder",
+            ),
+            (
+                {
+                    "<tool_call>": 151657,
+                    "</tool_call>": 151658,
+                    "<think>": 151667,
+                    "</think>": 151668,
+                },
+                151936,
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+                "tokenizer.json",
+                "added_tokens",
+            ),
+            (
+                {"<|tool_call|>": 200025, "<|/tool_call|>": 200026},
+                200064,
+                {"bot_token_id": 200025, "eot_token_id": 200026},
+                "tokenizer.json",
+                "added_tokens",
+            ),
+            ({}, 256, {}, "tokenizer_config.json", "added_tokens_decoder"),
+            (
+                {"<tool_call>": 151657, "</tool_call>": 151658},
+                151658,
+                {"bot_token_id": 151657},
+                "tokenizer.json",
+                "added_tokens",
+            ),
+        ],
+    )
+    def test_tool_call_special_tokens_read_from_tokenizer_metadata(
+        self, tmp_path, tokens, vocab_size, expected, filename, key
+    ):
+        """Tool and reasoning delimiters are read from both tokenizer metadata formats."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        tokenizer_config = (
+            {str(token_id): {"content": token} for token, token_id in tokens.items()}
+            if key == "added_tokens_decoder"
+            else [{"id": token_id, "content": token} for token, token_id in tokens.items()]
+        )
+        (tokenizer_dir / filename).write_text(json.dumps({key: tokenizer_config}))
+
+        pkg = _make_fake_llm_pkg("llama")
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(
+            pkg, str(tmp_path / "output"), local_config_dir=str(tokenizer_dir)
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert {name: model[name] for name in expected} == expected
+        for name in {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} - set(
+            expected
+        ):
+            assert name not in model
+
+    def test_invalid_tokenizer_added_tokens_are_ignored(self, tmp_path):
+        """A malformed added_tokens_decoder does not prevent exporting."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps({"added_tokens_decoder": None})
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert (
+            not {"bot_token_id", "eot_token_id", "bor_token_id", "eor_token_id"} & model.keys()
+        )
+
+    def test_ambiguous_tool_tokens_are_ignored(self, tmp_path):
+        """Conflicting tool delimiter spellings do not choose an arbitrary ID."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps(
+                {
+                    "added_tokens_decoder": {
+                        "10": {"content": "<tool_call>"},
+                        "11": {"content": "<|tool_call|>"},
+                    }
+                }
+            )
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert "bot_token_id" not in model
+
+    def test_conflicting_tokenizer_metadata_is_ignored(self, tmp_path):
+        """Conflicting IDs across tokenizer metadata files do not choose an arbitrary ID."""
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        (tokenizer_dir / "tokenizer_config.json").write_text(
+            json.dumps({"added_tokens_decoder": {"10": {"content": "<tool_call>"}}})
+        )
+        (tokenizer_dir / "tokenizer.json").write_text(
+            json.dumps({"added_tokens": [{"id": 11, "content": "<tool_call>"}]})
+        )
+
+        result = write_ort_genai_config(
+            _make_fake_llm_pkg("llama"),
+            str(tmp_path / "output"),
+            local_config_dir=str(tokenizer_dir),
+        )
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+
+        assert "bot_token_id" not in model
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("model_id", "model_type", "vocab_size", "expected"),
+        [
+            (
+                "Qwen/Qwen3-0.6B",
+                "qwen3",
+                151936,
+                {
+                    "bot_token_id": 151657,
+                    "eot_token_id": 151658,
+                    "bor_token_id": 151667,
+                    "eor_token_id": 151668,
+                },
+            ),
+            (
+                "Qwen/Qwen2.5-0.5B-Instruct",
+                "qwen2",
+                151936,
+                {"bot_token_id": 151657, "eot_token_id": 151658},
+            ),
+            (
+                "microsoft/Phi-4-mini-instruct",
+                "phi3",
+                200064,
+                {"bot_token_id": 200025, "eot_token_id": 200026},
+            ),
+        ],
+    )
+    def test_real_hf_tokenizers_emit_tool_call_tokens(
+        self, tmp_path, model_id, model_type, vocab_size, expected
+    ):
+        """Real Hub tokenizer metadata produces the expected ORT-GenAI token IDs."""
+        from huggingface_hub import hf_hub_download
+
+        tokenizer_dir = tmp_path / "tokenizer"
+        tokenizer_dir.mkdir()
+        for filename in ("tokenizer_config.json", "tokenizer.json"):
+            source = hf_hub_download(model_id, filename)
+            shutil.copyfile(source, tokenizer_dir / filename)
+
+        pkg = _make_fake_llm_pkg(model_type)
+        pkg.config.vocab_size = vocab_size
+        result = write_ort_genai_config(
+            pkg, str(tmp_path / "output"), local_config_dir=str(tokenizer_dir)
+        )
+        with open(result["genai_config"], encoding="utf-8") as f:
+            model = json.load(f)["model"]
+
+        assert {name: model[name] for name in expected} == expected
 
     def test_config_mode_eos_token_id_as_list(self, tmp_path):
         """eos_token_id can be a list[int] (e.g. Gemma multi-stop tokens)."""
@@ -1898,7 +2880,7 @@ class TestExportForOrtGenai:
             eos_token_id: list = dataclasses.field(default_factory=lambda: [1, 106])
             pad_token_id: int = 0
 
-        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_decoder_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -1936,18 +2918,6 @@ class TestExportPackage:
         # ONNX path is in the manifest (single-component package)
         assert result["model"] == os.path.join(str(tmp_path), "model.onnx")
 
-    def test_mage_vl_is_rejected_before_saving_onnx(self, tmp_path):
-        pkg = self._make_pkg()
-        pkg.config.model_type = "mage_vl"
-
-        with (
-            mock.patch.object(pkg, "save") as save,
-            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
-        ):
-            export_package(pkg, str(tmp_path))
-
-        save.assert_not_called()
-
     def test_propagates_save_kwargs(self, tmp_path, monkeypatch):
         """external_data and progress_bar are forwarded to pkg.save."""
         from mobius.integrations.ort_genai.auto_export import export_package
@@ -1969,6 +2939,22 @@ class TestExportPackage:
 
         assert save_calls[0]["external_data"] == "safetensors"
         assert save_calls[0]["progress_bar"] is False
+
+    def test_streaming_package_can_transactionally_create_output(self, tmp_path):
+        from mobius.integrations.ort_genai.auto_export import export_package
+
+        pkg = self._make_pkg()
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        output = tmp_path / "output"
+
+        result = export_package(pkg, str(output), progress_bar=False)
+
+        assert (output / "model.onnx").is_file()
+        assert (output / "weight-loading-report.json").is_file()
+        assert result["genai_config"] == str(output / "genai_config.json")
 
     def test_propagates_genai_config_kwargs(self, tmp_path, monkeypatch):
         """The ep and context_length kwargs reach the generated genai_config.json."""
@@ -2267,9 +3253,29 @@ class TestHybridAttentionShareBufferGuard:
             ir.Node(op_type=op_type, domain=domain, inputs=[], num_outputs=1)
             for op_type, domain in node_op_types
         ]
+        inputs = [
+            ir.Value(name=name)
+            for name in (
+                "input_ids",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "past_key_values.1.conv_state",
+                "past_key_values.1.recurrent_state",
+            )
+        ]
+        outputs = [
+            ir.Value(name=name)
+            for name in (
+                "logits",
+                "present.0.key",
+                "present.0.value",
+                "present.1.conv_state",
+                "present.1.recurrent_state",
+            )
+        ]
         graph = ir.Graph(
-            inputs=[ir.Value(name="input_ids")],
-            outputs=[ir.Value(name="logits")],
+            inputs=inputs,
+            outputs=outputs,
             nodes=nodes,
             name="decoder",
         )
@@ -2291,13 +3297,14 @@ class TestHybridAttentionShareBufferGuard:
             has_speech=False,
         )
 
-    def test_recurrent_state_with_standard_attention_and_no_gqa_raises(self, tmp_path):
-        """LinearAttention + standard Attention + no GQA is an unrunnable config."""
+    def test_recurrent_state_with_standard_attention_exports_metadata(self, tmp_path):
         pkg = self._make_pkg(
             [("LinearAttention", "com.microsoft"), ("Attention", "")],
         )
-        with pytest.raises(ValueError, match="past_present_share_buffer"):
-            self._write(pkg, tmp_path)
+        path = self._write(pkg, tmp_path)
+        assert (
+            json.loads(Path(path).read_text())["search"]["past_present_share_buffer"] is True
+        )
 
     def test_recurrent_state_with_gqa_does_not_raise(self, tmp_path):
         """LinearAttention + GQA (no standard Attention) is a valid hybrid config."""
@@ -2312,7 +3319,7 @@ class TestHybridAttentionShareBufferGuard:
             data = json.load(f)
         assert data["search"]["past_present_share_buffer"] is True
 
-    def test_recurrent_state_with_standard_attention_and_gqa_raises(self, tmp_path):
+    def test_recurrent_state_with_standard_attention_and_gqa_exports(self, tmp_path):
         """Partial GQA fusion still leaves an incompatible standard Attention node.
 
         Regression test: the guard previously read
@@ -2329,8 +3336,10 @@ class TestHybridAttentionShareBufferGuard:
                 ("Attention", ""),
             ],
         )
-        with pytest.raises(ValueError, match="past_present_share_buffer"):
-            self._write(pkg, tmp_path)
+        path = self._write(pkg, tmp_path)
+        assert (
+            json.loads(Path(path).read_text())["search"]["past_present_share_buffer"] is True
+        )
 
     def test_recurrent_state_only_does_not_raise(self, tmp_path):
         """LinearAttention with no full-attention layers at all is unaffected."""
@@ -2359,16 +3368,16 @@ class TestGraphInputNames:
         result = _graph_input_names(model)
         assert result == ["input_ids", "attention_mask"]
 
-    def test_filters_past_prefix(self):
-        """Inputs starting with 'past_' are also filtered out."""
+    def test_preserves_semantic_past_inputs(self):
+        """Semantic state inputs stay explicit while indexed caches use templates."""
         model = _mock_model_with_inputs(
             [
                 "input_ids",
-                "past_something",
+                "past_position_ids",
             ]
         )
         result = _graph_input_names(model)
-        assert result == ["input_ids"]
+        assert result == ["input_ids", "past_position_ids"]
 
     def test_skips_none_names(self):
         """Inputs with name=None are skipped."""
@@ -2400,26 +3409,54 @@ class TestGraphInputNames:
         ]
 
 
-class TestIntrospectVisionOutputs:
-    """_introspect_outputs surfaces extra vision outputs (DeepStack)."""
+class TestTrtRtxProfileHelpers:
+    def test_static_graph_input_dimension_is_component_agnostic(self):
+        from mobius._model_package import ModelPackage
 
-    def test_vision_deepstack_output_is_surfaced(self):
-        """A Qwen3-VL vision encoder's deepstack_features output is mapped."""
+        encoder = _mock_model(inputs=["features"])
+        encoder.graph.inputs[0].shape = ir.Shape(["tokens", 3072])
+        pkg = ModelPackage({"encoder": encoder}, config=mock.MagicMock())
+
+        assert _get_static_graph_input_dim(pkg, "encoder", "features", -1) == 3072
+
+    def test_symbolic_graph_input_dimension_is_rejected(self):
+        from mobius._model_package import ModelPackage
+
+        encoder = _mock_model(inputs=["features"])
+        encoder.graph.inputs[0].shape = ir.Shape(["tokens", "width"])
+        pkg = ModelPackage({"encoder": encoder}, config=mock.MagicMock())
+
+        with pytest.raises(TypeError, match="must be static"):
+            _get_static_graph_input_dim(pkg, "encoder", "features", -1)
+
+    def test_embedding_profiles_use_supplied_bounds(self):
+        options = _make_trt_rtx_embedding_provider_options(
+            image_feature_width=4096,
+            input_id_lengths=(1, 128, 512),
+            image_feature_lengths=(0, 64, 1024),
+        )
+
+        assert options == {
+            "nv_profile_min_shapes": "input_ids:1x1,image_features:0x4096",
+            "nv_profile_opt_shapes": "input_ids:1x128,image_features:64x4096",
+            "nv_profile_max_shapes": "input_ids:1x512,image_features:1024x4096",
+        }
+
+
+class TestIntrospectVisionOutputs:
+    """_introspect_outputs surfaces graph outputs."""
+
+    def test_vision_image_output_is_surfaced(self):
         from mobius._model_package import ModelPackage
 
         pkg = ModelPackage(
             {
-                "vision_encoder": _mock_model_with_outputs(
-                    ["image_features", "deepstack_features"]
-                ),
+                "vision_encoder": _mock_model_with_outputs(["image_features"]),
             },
             config=mock.MagicMock(),
         )
         mapping = _introspect_outputs(pkg, "vision_encoder")
-        assert mapping == {
-            "image_features": "image_features",
-            "deepstack_features": "deepstack_features",
-        }
+        assert mapping == {"image_features": "image_features"}
 
     def test_missing_key_returns_none(self):
         from mobius._model_package import ModelPackage
@@ -2465,15 +3502,483 @@ class TestCountCacheLayerSlots:
         assert _count_cache_layer_slots(None) is None
 
 
+class TestGenericDecoderAbi:
+    def test_requires_a_single_decoder_graph(self):
+        from mobius._model_package import ModelPackage
+
+        decoder = _mock_decoder_model()
+        assert _is_single_model_decoder_package(ModelPackage({"model": decoder}))
+        assert not _is_single_model_decoder_package(
+            ModelPackage({"model": decoder, "encoder": _mock_model()})
+        )
+
+    def test_sparse_cache_indices_preserve_global_slots_and_exact_names(self):
+        model = _mock_model(
+            inputs=[
+                "input_ids",
+                "attention_mask",
+                "cache.1.k",
+                "cache.1.v",
+                "cache.3.k",
+                "cache.3.v",
+            ],
+            outputs=[
+                "logits",
+                "next.1.k",
+                "next.1.v",
+                "next.3.k",
+                "next.3.v",
+            ],
+        )
+        # Rename suffixes to the released semantic key/value vocabulary while
+        # retaining non-default prefixes.
+        for value in model.graph.inputs:
+            if value.name is not None:
+                value.name = value.name.replace(".k", ".key").replace(".v", ".value")
+        for value in model.graph.outputs:
+            if value.name is not None:
+                value.name = value.name.replace(".k", ".key").replace(".v", ".value")
+
+        abi = _inspect_decoder_abi(model, model_type="decoder")
+
+        assert abi.cache_slots == 4
+        assert abi.inputs["past_key_names"] == "cache.%d.key"
+        assert abi.outputs["present_value_names"] == "next.%d.value"
+
+    def test_omits_optimized_away_optional_inputs(self):
+        abi = _inspect_decoder_abi(
+            _mock_decoder_model(semantic_inputs=["input_ids"]), model_type="decoder"
+        )
+        assert set(abi.inputs) == {"input_ids", "past_key_names", "past_value_names"}
+
+    def test_accepts_released_recurrent_state_pair(self):
+        model = _mock_decoder_model(layer_indices=(1,))
+        model.graph.inputs.extend(
+            [
+                ir.Value(name="past_key_values.0.conv_state"),
+                ir.Value(name="past_key_values.0.recurrent_state"),
+            ]
+        )
+        model.graph.outputs.extend(
+            [
+                ir.Value(name="present.0.conv_state"),
+                ir.Value(name="present.0.recurrent_state"),
+            ]
+        )
+        abi = _inspect_decoder_abi(model, model_type="decoder")
+        assert abi.has_recurrent_state
+        assert abi.cache_slots == 2
+
+    def test_accepts_paired_sequence_length_inputs(self):
+        abi = _inspect_decoder_abi(
+            _mock_decoder_model(
+                semantic_inputs=[
+                    "input_ids",
+                    "current_sequence_length",
+                    "past_sequence_length",
+                ]
+            ),
+            model_type="decoder",
+        )
+        assert abi.inputs["current_sequence_length"] == "current_sequence_length"
+        assert abi.inputs["past_sequence_length"] == "past_sequence_length"
+
+    def test_rejects_unpaired_sequence_length_input(self):
+        with pytest.raises(ValueError, match="only as a pair"):
+            _inspect_decoder_abi(
+                _mock_decoder_model(semantic_inputs=["input_ids", "past_sequence_length"]),
+                model_type="decoder",
+            )
+
+    def test_rejects_mobius_gpt2_separate_cache_abi(self):
+        with pytest.raises(ValueError, match="rank-5 combined KV-cache"):
+            _inspect_decoder_abi(_mock_decoder_model(), model_type="gpt2")
+
+    def test_preserves_additional_semantic_input(self):
+        abi = _inspect_decoder_abi(
+            _mock_decoder_model(
+                semantic_inputs=["input_ids", "cache_position"],
+                layer_indices=(0,),
+            ),
+            model_type="decoder",
+        )
+        assert abi.inputs["cache_position"] == "cache_position"
+
+    def test_heterogeneous_state_does_not_block_abi_inspection(self):
+        abi = _inspect_decoder_abi(
+            _mock_model(
+                inputs=[
+                    "input_ids",
+                    "past_key_values.0.key",
+                    "past_key_values.0.value",
+                    "past_key_values.1.ssm_state",
+                ],
+                outputs=["logits", "present.0.key", "present.0.value", "present.1.ssm_state"],
+            ),
+            model_type="decoder",
+        )
+        assert abi.cache_slots == 2
+
+
+def test_heterogeneous_decoder_state_preserves_graph_contract():
+    decoder = _mock_model(
+        inputs=[
+            "input_ids",
+            "cache_position",
+            "past_key_values.0.key",
+            "past_key_values.0.value",
+            "past_key_values.1.ssm_state",
+        ],
+        outputs=[
+            "logits",
+            "present.0.key",
+            "present.0.value",
+            "present.1.ssm_state",
+        ],
+    )
+
+    abi = _inspect_decoder_abi(decoder, model_type="decoder")
+    assert abi.cache_slots == 2
+    assert abi.inputs["cache_position"] == "cache_position"
+
+
+def test_decoder_sidecar_preserves_model_type(tmp_path):
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg.config.num_nextn_predict_layers = 1
+    pkg["mtp"] = _mock_model(inputs=["hidden_states"], outputs=["draft_logits"])
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+    assert config["model"]["type"] == "qwen2"
+    assert result["mtp_config"].endswith("mtp_config.json")
+
+
+def test_attached_mtp_sidecar_emits_component_qualified_cache_contract(tmp_path):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg["model"] = _mock_decoder_model(layer_indices=(0,))
+    pkg.mtp_head = ModelPackage(
+        {
+            "model": _mock_model(
+                inputs=[
+                    "inputs_embeds",
+                    "hidden_states",
+                    "past_key_values.0.key",
+                    "past_key_values.0.value",
+                ],
+                outputs=["mtp_hidden", "present.0.key", "present.0.value"],
+            )
+        },
+        config=types.SimpleNamespace(
+            num_hidden_layers=1,
+            num_nextn_predict_layers=1,
+            use_dedicated_embeddings=False,
+            use_dedicated_lm_head=False,
+        ),
+    )
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["mtp_config"], encoding="utf-8") as handle:
+        mtp = json.load(handle)
+
+    assert mtp["status"] == "runtime_unvalidated"
+    assert mtp["model"]["filename"] == ".mobius-mtp/model.onnx"
+    assert mtp["conditioning"] == {
+        "target_hidden_output": "mtp_seed",
+        "target_hidden_input": "hidden_states",
+        "embedding": "shared_target",
+        "lm_head": "shared_target",
+    }
+    assert mtp["cache_namespaces"] == {
+        "target": {
+            "namespace": "target",
+            "ports": [
+                {
+                    "input": "past_key_values.0.key",
+                    "output": "present.0.key",
+                },
+                {
+                    "input": "past_key_values.0.value",
+                    "output": "present.0.value",
+                },
+            ],
+        },
+        "mtp": {
+            "namespace": "mtp",
+            "ports": [
+                {
+                    "input": "past_key_values.0.key",
+                    "output": "present.0.key",
+                },
+                {
+                    "input": "past_key_values.0.value",
+                    "output": "present.0.value",
+                },
+            ],
+        },
+    }
+
+
+def test_gguf_mtp_count_overrides_architecture_config_default_zero(tmp_path):
+    from mobius._model_package import ModelPackage
+    from mobius._testing import make_config
+
+    config = make_config(num_nextn_predict_layers=0)
+    config._gguf_nextn_predict_layers = 1
+    pkg = ModelPackage(
+        {"model": _mock_decoder_model(layer_indices=(0,))},
+        config=config,
+    )
+    pkg.mtp_head = ModelPackage(
+        {"model": _mock_model(inputs=["hidden_states"], outputs=["mtp_hidden"])},
+        config=make_config(num_nextn_predict_layers=0),
+    )
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["mtp_config"], encoding="utf-8") as handle:
+        mtp = json.load(handle)
+
+    assert mtp["num_nextn_predict_layers"] == 1
+
+
+@pytest.mark.parametrize(
+    ("authoritative", "error"),
+    [
+        (0, "requires positive"),
+        (-1, "requires positive"),
+        (None, "must be an integer"),
+        ("one", "must be an integer"),
+    ],
+)
+def test_attached_mtp_rejects_invalid_authoritative_gguf_count(tmp_path, authoritative, error):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg.config._gguf_nextn_predict_layers = authoritative
+    pkg.config.num_nextn_predict_layers = 1
+    pkg.mtp_head = ModelPackage(
+        {"model": _mock_model(inputs=["hidden_states"], outputs=["mtp_hidden"])},
+        config=types.SimpleNamespace(num_nextn_predict_layers=1),
+    )
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        write_ort_genai_config(pkg, str(tmp_path))
+
+
+def test_explicit_target_mtp_count_precedes_proposer_declaration(tmp_path):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg.config.num_nextn_predict_layers = 2
+    pkg.mtp_head = ModelPackage(
+        {"model": _mock_model(inputs=["hidden_states"], outputs=["mtp_hidden"])},
+        config=types.SimpleNamespace(num_nextn_predict_layers=1),
+    )
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["mtp_config"], encoding="utf-8") as handle:
+        mtp = json.load(handle)
+
+    assert mtp["num_nextn_predict_layers"] == 2
+
+
+@pytest.mark.parametrize(
+    ("target_count", "proposer_count", "error"),
+    [
+        (0, 0, "explicit positive"),
+        (-1, 1, "must be positive"),
+        (0, "one", "must be an integer"),
+    ],
+)
+def test_attached_mtp_requires_valid_positive_prediction_count(
+    tmp_path, target_count, proposer_count, error
+):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg.config.num_nextn_predict_layers = target_count
+    pkg.mtp_head = ModelPackage(
+        {"model": _mock_model(inputs=["hidden_states"], outputs=["mtp_hidden"])},
+        config=types.SimpleNamespace(num_nextn_predict_layers=proposer_count),
+    )
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        write_ort_genai_config(pkg, str(tmp_path))
+
+
+@pytest.mark.parametrize("order", ["config-before-save", "save-before-config"])
+@pytest.mark.parametrize("stale_layout", ["same", "different", "extra"])
+def test_attached_mtp_uses_current_package_sidecar_despite_stale_manifest(
+    tmp_path, order, stale_layout
+):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg["model"] = _mock_decoder_model(layer_indices=(0,))
+    pkg.mtp_head = ModelPackage(
+        {
+            "model": _mock_model(
+                inputs=[
+                    "hidden_states",
+                    "past_key_values.0.key",
+                    "past_key_values.0.value",
+                ],
+                outputs=["mtp_hidden", "present.0.key", "present.0.value"],
+            )
+        },
+        config=types.SimpleNamespace(
+            num_hidden_layers=9,
+            num_nextn_predict_layers=1,
+            use_dedicated_embeddings=False,
+            use_dedicated_lm_head=False,
+        ),
+    )
+    stale_name = ".mobius-mtp" if stale_layout == "same" else ".stale-mtp"
+    (tmp_path / ".mobius-package.json").write_text(
+        json.dumps(
+            {
+                "format": "mobius.model-package.v1",
+                "mtp_head": stale_name,
+            }
+        )
+    )
+    (tmp_path / stale_name).mkdir()
+    (tmp_path / stale_name / "stale.txt").write_text("stale")
+    if stale_layout == "extra":
+        (tmp_path / ".mobius-mtp").mkdir()
+        (tmp_path / ".mobius-mtp" / "orphan.txt").write_text("orphan")
+
+    if order == "config-before-save":
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        pkg.save(str(tmp_path), progress_bar=False, check_weights=False)
+    else:
+        pkg.save(str(tmp_path), progress_bar=False, check_weights=False)
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+    with open(result["mtp_config"], encoding="utf-8") as handle:
+        mtp = json.load(handle)
+    with open(tmp_path / ".mobius-package.json", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    assert manifest["mtp_head"] == ".mobius-mtp"
+    assert mtp["model"]["filename"] == ".mobius-mtp/model.onnx"
+    assert mtp["num_nextn_predict_layers"] == 1
+    assert (tmp_path / ".mobius-mtp" / "model.onnx").is_file()
+    assert not (tmp_path / ".mobius-mtp" / "stale.txt").exists()
+    assert not (tmp_path / ".mobius-mtp" / "orphan.txt").exists()
+    assert not (tmp_path / ".stale-mtp").exists()
+
+
+@pytest.mark.parametrize(
+    ("model_type", "config_overrides"),
+    [
+        pytest.param("llama", {}, id="dense"),
+        pytest.param("qwen3_moe", {}, id="moe"),
+        pytest.param("gemma", {"tie_word_embeddings": True}, id="tied"),
+        pytest.param(
+            "qwen2",
+            {"quantization_config": {"quant_method": "matmul_nbits"}},
+            id="quantized",
+        ),
+    ],
+)
+def test_generic_decoder_schema_is_architecture_and_weight_agnostic(
+    tmp_path, model_type, config_overrides
+):
+    pkg = _make_fake_llm_pkg(model_type)
+    for name, value in config_overrides.items():
+        setattr(pkg.config, name, value)
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    assert config["model"]["type"] == "decoder"
+    assert config["model"]["vocab_size"] == 256
+    assert config["model"]["context_length"] == 4096
+    assert config["model"]["decoder"]["num_hidden_layers"] == 2
+    assert config["model"]["decoder"]["inputs"] == {
+        "input_ids": "input_ids",
+        "attention_mask": "attention_mask",
+        "position_ids": "position_ids",
+        "past_key_names": "past_key_values.%d.key",
+        "past_value_names": "past_key_values.%d.value",
+    }
+    assert config["model"]["decoder"]["outputs"] == {
+        "logits": "logits",
+        "present_key_names": "present.%d.key",
+        "present_value_names": "present.%d.value",
+    }
+    assert config["search"]["past_present_share_buffer"] is False
+
+
+@pytest.mark.parametrize(
+    ("has_gqa", "share_buffer", "enable_cuda_graph"),
+    [
+        (True, True, "1"),
+        (False, False, "0"),
+    ],
+)
+def test_cuda_decoder_capture_tracks_graph_kv_cache_contract(
+    tmp_path, has_gqa, share_buffer, enable_cuda_graph
+):
+    pkg = _make_fake_llm_pkg("gpt_oss")
+    if has_gqa:
+        pkg["model"].graph.append(
+            ir.Node(
+                op_type="GroupQueryAttention",
+                domain="com.microsoft",
+                inputs=[],
+                num_outputs=1,
+            )
+        )
+
+    result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+    assert config["search"]["past_present_share_buffer"] is share_buffer
+    assert cuda_options["enable_cuda_graph"] == enable_cuda_graph
+
+
+def test_gpt2_separate_cache_graph_uses_generic_decoder(tmp_path):
+    write_ort_genai_config(_make_fake_llm_pkg("gpt2"), str(tmp_path))
+    generated = json.loads((tmp_path / "genai_config.json").read_text())
+    assert generated["model"]["type"] == "decoder"
+
+
+@pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
+def test_phi3_longrope_runtime_type_is_preserved(tmp_path, model_type):
+    pkg = _make_fake_llm_pkg(model_type)
+    pkg.config.rope_type = "longrope"
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+    assert config["model"]["type"] == model_type
+
+
+@pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
+def test_phi3_without_longrope_emits_generic_decoder(tmp_path, model_type):
+    result = write_ort_genai_config(_make_fake_llm_pkg(model_type), str(tmp_path))
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+    assert config["model"]["type"] == "decoder"
+
+
 class TestGemma4RealModel:
     """Build a real tiny Gemma4 model and verify genai config inputs."""
 
     def test_gemma4_genai_config_from_real_model(self, tmp_path):
         """Build tiny Gemma4 VLM, generate genai config, verify inputs."""
         from mobius._builder import build_from_module
-        from mobius._config_resolver import _default_task_for_model
         from mobius._configs import Gemma4Config, VisionConfig
         from mobius._registry import registry
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
         from mobius.tasks import get_task
 
         config = Gemma4Config(
@@ -2554,10 +4059,13 @@ class TestGemma4RealModel:
         (``gemma4_text``), NOT the multimodal HF config (``gemma4_unified``),
         and that no vision/audio sections or processor files are written.
         """
-        from mobius._builder import _strip_to_text_only, build_from_module
-        from mobius._config_resolver import _default_task_for_model
+        from mobius._builder import build_from_module
         from mobius._configs import Gemma4Config
         from mobius._registry import registry
+        from mobius.integrations.transformers._builder import _strip_to_text_only
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
         from mobius.tasks import get_task
 
         # Start from a multimodal-flavoured config and strip to text-only, the
@@ -2611,6 +4119,10 @@ class TestGemma4RealModel:
         with (
             mock.patch("transformers.AutoConfig.from_pretrained", return_value=fake_hf),
             mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
+            mock.patch(
                 "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
                 return_value=[],
             ),
@@ -2622,13 +4134,12 @@ class TestGemma4RealModel:
         with open(result["genai_config"]) as f:
             data = json.load(f)
 
-        # ORT-GenAI type resolved from pkg.config.model_type (gemma4_text),
-        # NOT the multimodal HF gemma4_unified -> gemma4.
-        assert data["model"]["type"] == "gemma4_text"
+        assert data["model"]["type"] == "decoder"
         # Decoder-only: input_ids decoder, no multimodal sections.
         assert "vision" not in data["model"]
         assert "audio" not in data["model"]
         assert "input_ids" in data["model"]["decoder"]["inputs"]
+        assert "sliding_window" not in data["model"]["decoder"]
         # No multimodal processor artifacts.
         assert "processor_config" not in result
         assert "audio_processor" not in result
@@ -2652,7 +4163,7 @@ class TestGemma4RealModel:
             return {"genai_config": os.path.join(output_dir, "genai_config.json")}
 
         with (
-            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
             mock.patch(
                 "mobius.integrations.ort_genai.auto_export.export_package",
                 side_effect=fake_export_package,
@@ -2664,7 +4175,7 @@ class TestGemma4RealModel:
 
         captured.clear()
         with (
-            mock.patch("mobius._builder.build", side_effect=fake_build),
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
             mock.patch(
                 "mobius.integrations.ort_genai.auto_export.export_package",
                 side_effect=fake_export_package,
@@ -2675,17 +4186,70 @@ class TestGemma4RealModel:
         assert captured["execution_provider"] == "default"
         assert captured["text_only"] is False
 
-    def test_auto_export_rejects_mage_vl_before_saving(self, tmp_path):
-        pkg = _make_fake_llm_pkg("mage_vl")
+    def test_auto_export_pins_every_remote_stage(self, tmp_path):
+        revision = "5a414ead75d45db003906d06fb62bd5b6846cec0"
+        build_kwargs: dict[str, object] = {}
+        export_kwargs: dict[str, object] = {}
+
+        def fake_build(model_id, **kwargs):
+            build_kwargs.update(kwargs)
+            return _make_fake_llm_pkg("lfm2_vl")
+
+        def fake_export_package(pkg, output_dir, **kwargs):
+            export_kwargs.update(kwargs)
+            return {"genai_config": os.path.join(output_dir, "genai_config.json")}
 
         with (
-            mock.patch("mobius._builder.build", return_value=pkg),
-            mock.patch.object(pkg, "save") as save,
-            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
+            mock.patch("mobius.integrations.transformers.build", side_effect=fake_build),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export.export_package",
+                side_effect=fake_export_package,
+            ),
         ):
-            auto_export("microsoft/Mage-VL", str(tmp_path))
+            auto_export(
+                "LiquidAI/LFM2.5-VL-3B",
+                str(tmp_path),
+                revision=revision,
+            )
 
-        save.assert_not_called()
+        assert build_kwargs["revision"] == revision
+        assert export_kwargs["revision"] == revision
+
+    def test_write_config_pins_remote_assets(self, tmp_path):
+        revision = "5a414ead75d45db003906d06fb62bd5b6846cec0"
+        pkg = _make_fake_llm_pkg("lfm2_vl")
+        fake_hf = mock.MagicMock(
+            model_type="lfm2_vl",
+            bos_token_id=124894,
+            eos_token_id=124900,
+            pad_token_id=124893,
+        )
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained", return_value=fake_hf
+            ) as config_loader,
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ) as tokenizer_copy,
+        ):
+            write_ort_genai_config(
+                pkg,
+                str(tmp_path),
+                hf_model_id="LiquidAI/LFM2.5-VL-3B",
+                revision=revision,
+            )
+
+        config_loader.assert_called_once_with(
+            "LiquidAI/LFM2.5-VL-3B",
+            trust_remote_code=False,
+            revision=revision,
+        )
+        tokenizer_copy.assert_called_once_with(
+            "LiquidAI/LFM2.5-VL-3B",
+            str(tmp_path),
+            revision=revision,
+        )
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""
@@ -2730,7 +4294,7 @@ class TestGemma4RealModel:
         genai_config = gen.generate()
 
         assert "model" in genai_config
-        assert genai_config["model"]["type"] == "qwen2"
+        assert genai_config["model"]["type"] == "decoder"
         assert genai_config["model"]["vocab_size"] == 256
         assert genai_config["model"]["decoder"]["num_hidden_layers"] == 2
 
@@ -2745,7 +4309,7 @@ class TestGemma4RealModel:
 
         with open(os.path.join(output_dir, "genai_config.json")) as f:
             saved = json.load(f)
-        assert saved["model"]["type"] == "qwen2"
+        assert saved["model"]["type"] == "decoder"
 
     def test_phi4mm_detection_and_config(self, tmp_path):
         """Simulate phi4mm auto-export: verify detection and config."""

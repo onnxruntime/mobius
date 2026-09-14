@@ -5,12 +5,14 @@ from __future__ import annotations
 
 __all__ = [
     "ApertusCausalLMModel",
+    "ArcticGGUFCausalLMModel",
     "ArceeCausalLMModel",
     "AutoencoderKLModel",
     "AutoencoderKLQwenImageModel",
     "BambaCausalLMModel",
     "BartForConditionalGeneration",
     "BertModel",
+    "BitNetCausalLMModel",
     "Blip2Model",
     "BloomCausalLMModel",
     "CLIPVisionModel",
@@ -20,7 +22,10 @@ __all__ = [
     "FusedGateUpCausalLMModel",
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
+    "CodeShellCausalLMModel",
+    "AutoencoderKLCogVideoXModel",
     "CogVideoXTransformer3DModel",
+    "CogVideoXVAEConfig",
     "CohereCausalLMModel",
     "ControlNetModel",
     "Cosmos3AVAEAudioDecoderOnlyTokenizer",
@@ -32,24 +37,32 @@ __all__ = [
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
     "DeepSeekV4CausalLMModel",
+    "DbrxGGUFCausalLMModel",
     "DFlashDraftModel",
     "Eagle3DraftModel",
     "DiTTransformer2DModel",
     "DiffLlamaCausalLMModel",
     "DistilBertModel",
+    "EsmConfig",
+    "EsmModel",
     "DogeCausalLMModel",
     "EncDecRNNTModel",
     "Ernie45MoECausalLMModel",
+    "Ernie45MoEGGUFCausalLMModel",
     "ErnieCausalLMModel",
     "ExaOne4CausalLMModel",
     "FalconCausalLMModel",
+    "FalconH1ForCausalLM",
     "FluxTransformer2DModel",
     "FunASRForConditionalGeneration",
     "GPT2CausalLMModel",
     "GPTJCausalLMModel",
     "GPTNeoXCausalLMModel",
     "GPTNeoXJapaneseCausalLMModel",
+    "ExactLegacyGGUFCausalLMModel",
+    "PlamoGGUFCausalLMModel",
     "GPTOSSCausalLMModel",
+    "EuroBertGGUFModel",
     "Gemma2CausalLMModel",
     "Gemma3CausalLMModel",
     "Gemma3MultiModalModel",
@@ -60,14 +73,25 @@ __all__ = [
     "Gemma4Model",
     "Gemma4UnifiedModel",
     "GemmaCausalLMModel",
+    "GemmaEmbeddingGGUFModel",
+    "MiniMaxM2GGUFCausalLMModel",
+    "Mistral4GGUFCausalLMModel",
     "Glm4CausalLMModel",
+    "GlmAsrForConditionalGeneration",
     "Glm4MoECausalLMModel",
     "GlmCausalLMModel",
+    "GlmMoeDsaCausalLMModel",
+    "GlmOcrForConditionalGeneration",
     "GraniteCausalLMModel",
     "GraniteMoECausalLMModel",
     "GraniteMoeHybridCausalLMModel",
+    "GrokGGUFCausalLMModel",
+    "GroveMoEGGUFCausalLMModel",
+    "HunyuanMoEGGUFCausalLMModel",
     "HunYuanMoEV1CausalLMModel",
     "HunYuanV1DenseCausalLMModel",
+    "HyV3CausalLMModel",
+    "HyV3MtpModel",
     "HunYuanVLMoTModel",
     "HunyuanDiT2DModel",
     "IPAdapterModel",
@@ -75,29 +99,52 @@ __all__ = [
     "InternVL2Model",
     "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
+    "JinaBertV2GGUFModel",
+    "JinaBertV3GGUFModel",
+    "Jais2CausalLMModel",
     "JetMoeCausalLMModel",
+    "KimiK3CausalLMModel",
+    "KimiLinearCausalLMModel",
     "Llama4CausalLMModel",
+    "LlamaEmbedGGUFModel",
+    "DreamModel",
     "LLaDAModel",
+    "LLaDAMoEModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
+    "LegacyLayerNormCausalLMModel",
     "Lfm2CausalLMModel",
+    "Lfm2MoECausalLMModel",
+    "Lfm2VlForConditionalGeneration",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
     "MLPLatentDynamicsModel",
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
+    "MaincoderCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MiniCPM3CausalLMModel",
+    "MiniCPMCausalLMModel",
     "MiniCPMV46ForConditionalGeneration",
     "MoonshineForConditionalGeneration",
+    "MoonshineStreamingForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
     "MuseGlimmerTextCausalLMModel",
     "MimiModel",
     "MoshiDepformerModel",
     "MoshiTemporalModel",
+    "MiniMaxMusic3ConditionEncoder",
+    "MiniMaxMusic3LanguageModel",
+    "MiniMaxMusic3RVQDepthDecoder",
+    "MiniMaxMusic3Transformer1DModel",
+    "MiniMaxMusic3Vocoder",
     "MoECausalLMModel",
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
+    "NeoBertGGUFModel",
+    "NomicBertGGUFModel",
+    "NomicBertMoEGGUFModel",
     "NemotronParseForConditionalGeneration",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
@@ -106,6 +153,7 @@ __all__ = [
     "PersimmonCausalLMModel",
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
+    "PhiMoEGGUFCausalLMModel",
     "Phi3SmallCausalLMModel",
     "Phi3VModel",
     "Phi4MMCausalLMModel",
@@ -130,7 +178,11 @@ __all__ = [
     "Qwen3ASRForConditionalGeneration",
     "Qwen3CausalLMModel",
     "Qwen3NextCausalLMModel",
+    "Qwen4ExpCausalLMModel",
+    "SenseNovaU1Model",
     "SenseVoiceSmallModel",
+    "ReUseConfig",
+    "SEMambaSpeechEnhancementModel",
     "SortformerConfig",
     "SortformerDiarizationModel",
     "Qwen3TTSCodePredictorModel",
@@ -138,6 +190,7 @@ __all__ = [
     "Qwen3TTSCodecEncoderModel",
     "Qwen3TTSEmbeddingModel",
     "Qwen3TTSForConditionalGeneration",
+    "RND1Model",
     "Qwen3TTSSpeakerEncoderModel",
     "Qwen3TTSTalkerDecoderModel",
     "Qwen3TTSTokenizerV2Model",
@@ -150,25 +203,31 @@ __all__ = [
     "QwenCausalLMModel",
     "QwenImageTransformer2DModel",
     "SD3Transformer2DModel",
+    "SmallThinkerGGUFCausalLMModel",
     "SmolLM3CausalLMModel",
     "StarCoder2CausalLMModel",
     "T2IAdapterModel",
     "T5ForConditionalGeneration",
+    "T5EncoderModel",
     "UNet2DConditionModel",
     "load_unet_lora_safetensors",
     "remap_diffusers_unet_lora",
     "ViTModel",
     "VideoAutoencoderModel",
     "AutoencoderKLWanModel",
+    "VibeVoiceForConditionalGeneration",
+    "VibeVoiceStreamingForConditionalGeneration",
     "Wav2Vec2ForCTCModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
     "MLPWorldModel",
     "XLMCausalLMModel",
+    "XverseCausalLMModel",
     "Zamba2CausalLMModel",
-    "mimi_default_config",
-    "moshi_depformer_config",
-    "moshi_temporal_config",
+    "Plamo2ForCausalLM",
+    "PLMCausalLMModel",
+    "TalkieForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -182,10 +241,15 @@ from mobius.models.base import (
     LayerNormCausalLMModel,
 )
 from mobius.models.bert import BertModel
+from mobius.models.bitnet import BitNetCausalLMModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
+from mobius.models.cogvideox_vae import (
+    AutoencoderKLCogVideoXModel,
+    CogVideoXVAEConfig,
+)
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
 from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel
@@ -206,12 +270,14 @@ from mobius.models.dit import DiTTransformer2DModel
 from mobius.models.doge import DogeCausalLMModel
 from mobius.models.eagle3 import Eagle3DraftModel
 from mobius.models.ernie import ErnieCausalLMModel
+from mobius.models.esm import EsmConfig, EsmModel
 from mobius.models.exaone4 import ExaOne4CausalLMModel
 from mobius.models.falcon import (
     BloomCausalLMModel,
     FalconCausalLMModel,
     MPTCausalLMModel,
 )
+from mobius.models.falcon_h1 import FalconH1ForCausalLM
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
@@ -224,7 +290,23 @@ from mobius.models.gemma4 import (
     Gemma4UnifiedModel,
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
+from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGUFModel
+from mobius.models.gguf_encoders import (
+    EuroBertGGUFModel,
+    JinaBertV2GGUFModel,
+    JinaBertV3GGUFModel,
+    NeoBertGGUFModel,
+    NomicBertGGUFModel,
+    NomicBertMoEGGUFModel,
+)
+from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
+from mobius.models.gguf_minimax_m2 import MiniMaxM2GGUFCausalLMModel
+from mobius.models.gguf_mistral4 import Mistral4GGUFCausalLMModel
+from mobius.models.gguf_plamo import PlamoGGUFCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
+from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
+from mobius.models.glm_ocr import GlmOcrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -234,34 +316,61 @@ from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
 from mobius.models.hunyuan_dit import HunyuanDiT2DModel
 from mobius.models.hunyuan_v1 import HunYuanV1DenseCausalLMModel
 from mobius.models.hunyuan_vl_mot import HunYuanVLMoTModel
+from mobius.models.hy_v3 import HyV3CausalLMModel, HyV3MtpModel
 from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
-from mobius.models.lfm2 import Lfm2CausalLMModel
-from mobius.models.llada import LLaDAModel
+from mobius.models.kimi_k3 import KimiK3CausalLMModel
+from mobius.models.kimi_linear import KimiLinearCausalLMModel
+from mobius.models.legacy_decoder import (
+    CodeShellCausalLMModel,
+    Jais2CausalLMModel,
+    LegacyLayerNormCausalLMModel,
+    XverseCausalLMModel,
+)
+from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
+from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
+from mobius.models.llada import DreamModel, LLaDAModel, LLaDAMoEModel, RND1Model
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mage_vl import MageVLForConditionalGeneration
+from mobius.models.maincoder import MaincoderCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
-from mobius.models.mimi import MimiModel, mimi_default_config
+from mobius.models.mimi import MimiModel
+from mobius.models.minicpm import MiniCPM3CausalLMModel, MiniCPMCausalLMModel
 from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
+from mobius.models.minimax_music3 import (
+    MiniMaxMusic3ConditionEncoder,
+    MiniMaxMusic3LanguageModel,
+    MiniMaxMusic3RVQDepthDecoder,
+    MiniMaxMusic3Transformer1DModel,
+    MiniMaxMusic3Vocoder,
+)
 from mobius.models.moe import (
+    ArcticGGUFCausalLMModel,
+    DbrxGGUFCausalLMModel,
     Ernie45MoECausalLMModel,
+    Ernie45MoEGGUFCausalLMModel,
     Glm4MoECausalLMModel,
+    GrokGGUFCausalLMModel,
+    GroveMoEGGUFCausalLMModel,
+    HunyuanMoEGGUFCausalLMModel,
     HunYuanMoEV1CausalLMModel,
     MoECausalLMModel,
     Phi3MoECausalLMModel,
+    PhiMoEGGUFCausalLMModel,
     Qwen2MoECausalLMModel,
 )
 from mobius.models.moonshine import MoonshineForConditionalGeneration
+from mobius.models.moonshine_streaming import (
+    MoonshineStreamingForConditionalGeneration,
+)
 from mobius.models.moshi import (
     MoshiDepformerModel,
     MoshiTemporalModel,
-    moshi_depformer_config,
-    moshi_temporal_config,
 )
 from mobius.models.muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
@@ -285,6 +394,8 @@ from mobius.models.phi import (
 from mobius.models.phi3 import Phi3CausalLMModel
 from mobius.models.phi3_v import Phi3VModel
 from mobius.models.phi4_siglip import Phi4SigLIPModel
+from mobius.models.plamo2 import Plamo2ForCausalLM
+from mobius.models.plm import PLMCausalLMModel
 from mobius.models.qwen import (
     Qwen3CausalLMModel,
     QwenCausalLMModel,
@@ -304,6 +415,10 @@ from mobius.models.qwen3_tts_tokenizer import (
     Qwen3TTSCodecDecoderModel,
     Qwen3TTSCodecEncoderModel,
     Qwen3TTSTokenizerV2Model,
+)
+from mobius.models.qwen4_exp import (
+    Qwen4ExpCausalLMModel,
+    Qwen4ExpForConditionalGeneration,
 )
 from mobius.models.qwen35 import (
     Qwen35CausalLMModel,
@@ -331,17 +446,26 @@ from mobius.models.qwen_vl import (
     Qwen25VLTextModel,
     Qwen25VLVisionEncoderModel,
 )
+from mobius.models.reuse import (
+    ReUseConfig,
+    SEMambaSpeechEnhancementModel,
+)
+from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
+from mobius.models.smallthinker import SmallThinkerGGUFCausalLMModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.sortformer import SortformerConfig, SortformerDiarizationModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
-from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
+from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.unet import (
     UNet2DConditionModel,
     load_unet_lora_safetensors,
     remap_diffusers_unet_lora,
 )
 from mobius.models.vae import AutoencoderKLModel
+from mobius.models.vibevoice import VibeVoiceForConditionalGeneration
+from mobius.models.vibevoice_streaming import VibeVoiceStreamingForConditionalGeneration
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
 from mobius.models.wan_vae import AutoencoderKLWanModel

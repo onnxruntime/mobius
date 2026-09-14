@@ -31,6 +31,7 @@ execution_providers
 :caption: Reference
 
 api/index
+gguf-capability-catalog
 feature-flags
 ```
 

@@ -10,6 +10,9 @@ Public API documentation for `mobius`.
 - [`build_world_model()`](build_world_model.md) — Build a complete compositional world model
 - [`apply_weights()`](apply_weights.md) — Apply weights to a built model
 
+The generated [GGUF capability and evidence catalog](../gguf-capability-catalog.md)
+tracks exhaustive import, quantization, tokenizer, projector, and runtime verdicts.
+
 ## Core Classes
 
 - [`ModelPackage`](model_package.md) — Collection of named ONNX models

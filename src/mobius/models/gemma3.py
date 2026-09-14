@@ -12,13 +12,15 @@ Splits the Gemma3 architecture into three ONNX models:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import (
+    is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
     vlm_decoder_weights,
     vlm_embedding_weights,
     vlm_vision_weights,
@@ -29,6 +31,7 @@ from mobius.components import (
     OffsetRMSNorm,
     VisionModel,
 )
+from mobius.models.base import effective_tie_word_embeddings
 from mobius.models.gemma3_text import (
     Gemma3TextModel,
     Gemma3TextScaledWordEmbedding,
@@ -91,6 +94,10 @@ class _Gemma3VisionEncoderModel(nn.Module):
         )
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
+        pixel_values = op.CastLike(
+            pixel_values,
+            self.vision_tower.vision_model.embeddings.patch_embedding,
+        )
         vision_features = self.vision_tower(op, pixel_values)
         image_features = self.multi_modal_projector(op, vision_features)
         # Projector returns (batch, tokens, hidden); squeeze the leading
@@ -130,18 +137,29 @@ class _Gemma3EmbeddingModel(nn.Module):
         self.image_token_id = config.image_token_id or 0
 
     def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
-        text_embeds = self.embed_tokens(op, input_ids)
-
         image_mask = op.Equal(
             input_ids,
             op.Constant(value_int=self.image_token_id),
         )
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
 
+        # Gemma 3's <image_soft_token> is one past the text embedding table.
+        # Substitute a valid row before Gather; image positions are replaced below.
+        safe_input_ids = op.Where(
+            image_mask,
+            op.Constant(value_int=self.config.pad_token_id or 0),
+            input_ids,
+        )
+        text_embeds = self.embed_tokens(op, safe_input_ids)
+
+        # Number image placeholders over the flattened batch so row 2 starts
+        # after row 1's features rather than reusing feature row zero.
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, 1)
+        flat_mask = op.Reshape(mask_int, op.Constant(value_ints=[-1]))
+        cumsum = op.CumSum(flat_mask, 0)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
+        indices = op.Reshape(indices, op.Shape(input_ids))
 
         # Decode steps may pass empty image features ([0, hidden]); append one
         # zero row so the Gather below has a valid row that Where will not use.
@@ -168,8 +186,20 @@ class Gemma3MultiModalModel(nn.Module):
     - embedding: token embedding + image feature fusion
     """
 
-    default_task: str = "vision-language"
+    default_task: str = "gemma3-vision-language"
     category: str = "Multimodal"
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_tower", "model.multi_modal_projector"),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
@@ -198,7 +228,16 @@ class Gemma3MultiModalModel(nn.Module):
         is duplicated into ``embedding.embed_tokens.weight`` so that both
         the decoder and the embedding sub-model receive it.
         """
-        if self.config.tie_word_embeddings:
+        tied_embeddings = effective_tie_word_embeddings(self.config)
+        if tied_embeddings and self.config.component_quantization is not None:
+            materialize_split_tied_olive_lm_head(
+                state_dict,
+                embed_key="language_model.model.embed_tokens.weight",
+                head_key="language_model.lm_head.weight",
+                embedding_quantization=self.config.quantization_for("embedding"),
+                head_quantization=self.config.quantization_for("decoder"),
+            )
+        if tied_embeddings:
             embed_key = "language_model.model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
@@ -208,10 +247,16 @@ class Gemma3MultiModalModel(nn.Module):
         for key, value in state_dict.items():
             if key.startswith("language_model."):
                 new_key = "decoder." + key[len("language_model.") :]
-                renamed[new_key] = value
-                # Duplicate embed_tokens for the embedding sub-model
-                if key == "language_model.model.embed_tokens.weight":
-                    renamed["embedding.embed_tokens.weight"] = value
+                is_embedding = key.startswith("language_model.model.embed_tokens.")
+                if not (
+                    is_embedding
+                    and self.config.component_quantization is not None
+                    and is_packed_quant_key(key)
+                ):
+                    renamed[new_key] = value
+                if is_embedding:
+                    suffix = key[len("language_model.model.") :]
+                    renamed[f"embedding.{suffix}"] = value
             elif key.startswith("vision_tower."):
                 # Vision MLP uses ``fc1``/``fc2`` in HF; rename to the
                 # ``FCMLP`` component naming (``up_proj``/``down_proj``).

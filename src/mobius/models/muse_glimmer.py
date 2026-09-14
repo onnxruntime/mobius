@@ -20,12 +20,88 @@ from mobius.components import (
     Embedding,
     Linear,
     MuseGlimmerVisionModel,
+    QuantizedEmbedding,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
+    make_quantized_linear_factory,
 )
 from mobius.components._attention import StaticCacheState
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
+
+# The media placeholder ids belong to the tokenizer, so a config assembled from
+# anything but a full HF checkpoint -- a GGUF import, say -- arrives with them
+# unset. The published Muse Glimmer values stand in, because the embedding
+# graph has to compare ``input_ids`` against a number.
+IMAGE_TOKEN_ID = 200092
+VIDEO_TOKEN_ID = 200091
+
+# ---------------------------------------------------------------------------
+# Weight-quantization helpers
+#
+# Muse Glimmer is a VLM whose text decoder and token embeddings may be
+# weight-quantized (MatMulNBits / GatherBlockQuantized) while the vision tower
+# and its projector stay float. The vision modules deliberately never consult
+# ``config.quantization``; these helpers are the single place the text path
+# reads it, which keeps the "text quantized, vision float" contract explicit.
+# ---------------------------------------------------------------------------
+
+
+def _text_quantization_config(config: ArchitectureConfig):
+    """Return the active weight-quantization config, or ``None`` when off."""
+    quantization_config = getattr(config, "quantization", None)
+    if quantization_config is None or quantization_config.quant_method == "none":
+        return None
+    return quantization_config
+
+
+def _text_linear_class(config: ArchitectureConfig) -> type | None:
+    """Return a QuantizedLinear factory for text projections, or ``None``."""
+    quantization_config = _text_quantization_config(config)
+    if quantization_config is None:
+        return None
+    zero_point_dtype = (
+        config.dtype
+        if getattr(quantization_config, "float_zero_point", False)
+        else ir.DataType.UINT8
+    )
+    return make_quantized_linear_factory(
+        bits=quantization_config.bits,
+        block_size=quantization_config.group_size,
+        has_zero_point=not quantization_config.sym,
+        zero_point_dtype=zero_point_dtype,
+    )
+
+
+def _make_text_embedding(config: ArchitectureConfig) -> nn.Module:
+    """Build the token embedding, quantized when the config requests it."""
+    quantization_config = _text_quantization_config(config)
+    if (
+        quantization_config is not None
+        and getattr(quantization_config, "quantize_embeddings", False)
+        and config.hidden_size % quantization_config.group_size == 0
+    ):
+        return QuantizedEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            bits=quantization_config.bits,
+            block_size=quantization_config.group_size,
+            has_zero_point=not quantization_config.sym,
+            padding_idx=config.pad_token_id,
+        )
+    return Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+
+
+def _make_lm_head(config: ArchitectureConfig) -> nn.Module:
+    """Build the LM head projection, quantized (MatMulNBits) when requested."""
+    quantization_config = _text_quantization_config(config)
+    if quantization_config is not None and getattr(
+        quantization_config, "quantize_lm_head", False
+    ):
+        linear_cls = _text_linear_class(config)
+        if linear_cls is not None:
+            return linear_cls(config.hidden_size, config.vocab_size, bias=False)
+    return Linear(config.hidden_size, config.vocab_size, bias=False)
 
 
 class MuseGlimmerScaleFreeRMSNorm(nn.Module):
@@ -84,27 +160,28 @@ class MuseGlimmerTextAttention(nn.Module):
         self._num_kv_heads = config.num_key_value_heads
         self._scale = config.head_dim**-0.5
         self._qk_scale_factor = getattr(config, "qk_scale_factor", 1.0)
-        self.q_proj = Linear(
+        linear_class = _text_linear_class(config) or Linear
+        self.q_proj = linear_class(
             config.hidden_size,
             config.num_attention_heads * config.head_dim,
             bias=False,
         )
-        self.k_proj = Linear(
+        self.k_proj = linear_class(
             config.hidden_size,
             config.num_key_value_heads * config.head_dim,
             bias=False,
         )
-        self.v_proj = Linear(
+        self.v_proj = linear_class(
             config.hidden_size,
             config.num_key_value_heads * config.head_dim,
             bias=False,
         )
-        self.o_proj = Linear(
+        self.o_proj = linear_class(
             config.num_attention_heads * config.head_dim,
             config.hidden_size,
             bias=False,
         )
-        self.gate_proj = Linear(
+        self.gate_proj = linear_class(
             config.hidden_size,
             config.num_attention_heads * config.head_dim,
             bias=False,
@@ -199,7 +276,7 @@ class MuseGlimmerTextDecoderLayer(nn.Module):
         super().__init__()
         post_norm_eps = getattr(config, "post_norm_eps", 1e-8)
         self.self_attn = MuseGlimmerTextAttention(config)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, linear_class=_text_linear_class(config))
         self.input_layernorm = MuseGlimmerCenteredRMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
@@ -244,6 +321,25 @@ class MuseGlimmerTextDecoderLayer(nn.Module):
         return op.Add(residual, hidden_states), present_key_value
 
 
+def _resolve_layer_rope_theta(config: ArchitectureConfig) -> list[float | int]:
+    """Return the per-layer RoPE base, with 0 marking a NoPE layer.
+
+    ``layer_rope_theta`` is an optional field, so it is present and ``None``
+    whenever a source config did not carry it -- a shape that ``getattr`` with
+    a default cannot see. ``no_rope_layers`` names the same set of layers, so
+    prefer it before falling back to rotating every layer.
+    """
+    layer_rope_theta = getattr(config, "layer_rope_theta", None)
+    if layer_rope_theta:
+        return list(layer_rope_theta)
+
+    no_rope_layers = set(config.no_rope_layers or ())
+    return [
+        0 if index in no_rope_layers else config.rope_theta
+        for index in range(config.num_hidden_layers)
+    ]
+
+
 class MuseGlimmerTextModel(nn.Module):
     """Muse language backbone with mixed sliding/full attention and NoPE layers."""
 
@@ -253,17 +349,9 @@ class MuseGlimmerTextModel(nn.Module):
         self._layer_types = (
             config.layer_types or ["sliding_attention"] * config.num_hidden_layers
         )
-        self._layer_rope_theta = getattr(
-            config,
-            "layer_rope_theta",
-            [config.rope_theta] * config.num_hidden_layers,
-        )
+        self._layer_rope_theta = _resolve_layer_rope_theta(config)
         self._sliding_window = config.sliding_window
-        self.embed_tokens = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            config.pad_token_id,
-        )
+        self.embed_tokens = _make_text_embedding(config)
         self.embed_norm = MuseGlimmerScaleFreeRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.layers = nn.ModuleList(
             [MuseGlimmerTextDecoderLayer(config) for _ in range(config.num_hidden_layers)]
@@ -327,7 +415,7 @@ class MuseGlimmerDecoderModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.model = MuseGlimmerTextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = _make_lm_head(config)
         self._output_multiplier = getattr(config, "output_multiplier", 1.0)
         self._softcap = getattr(config, "final_logit_softcapping", 0.0)
 
@@ -490,15 +578,11 @@ class MuseGlimmerEmbeddingModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.embed_tokens = Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            config.pad_token_id,
-        )
+        self.embed_tokens = _make_text_embedding(config)
         self.embed_norm = MuseGlimmerScaleFreeRMSNorm(config.hidden_size, config.rms_norm_eps)
         self._hidden_size = config.hidden_size
-        self._image_token_id = config.image_token_id or 200092
-        self._video_token_id = getattr(config, "video_token_id", 200091)
+        self._image_token_id = config.image_token_id or IMAGE_TOKEN_ID
+        self._video_token_id = config.video_token_id or VIDEO_TOKEN_ID
 
     def forward(
         self,

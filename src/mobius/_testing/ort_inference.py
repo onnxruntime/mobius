@@ -189,6 +189,11 @@ class OnnxModelSession:
     def input_names(self) -> list[str]:
         return self._input_names
 
+    @property
+    def providers(self) -> list[str]:
+        """Execution providers in their runtime priority order."""
+        return self._session.get_providers()
+
     def get_input_shape(self, name: str) -> list[int | str] | None:
         """Return the declared shape of an input, or ``None`` if not found.
 
@@ -256,6 +261,12 @@ class OnnxModelSession:
         return dict(zip(self._output_names, (_ort_value_to_numpy(o) for o in raw_outputs)))
 
     def close(self) -> None:
+        # Release ORT resources eagerly (not only at Python GC time) so
+        # long-running GPU test suites do not accumulate session memory. This is
+        # also required for staged CUDA pipelines, where each component's weights
+        # must leave device memory before the next large component is loaded.
+        if hasattr(self, "_session"):
+            del self._session
         self._tmpdir.cleanup()
 
     def __del__(self) -> None:

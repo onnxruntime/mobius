@@ -15,8 +15,11 @@ from mobius._configs import (
     DEFAULT_INT,
     ArchitectureConfig,
     AudioConfig,
+    GlmAsrConfig,
     MuseGlimmerConfig,
     QuantizationConfig,
+    QuantizationOverride,
+    QuantizedWeightFormat,
     VisionConfig,
     _extract_audio_config,
     _extract_mrope_fields,
@@ -754,6 +757,62 @@ class TestExtractAudioConfig:
         assert result["audio"].encoder_layers == 32
         assert result["audio"].audio_token_id == 151646
 
+    def test_glmasr_nested_config(self):
+        """GLM-ASR unwraps its Llama text config and preserves audio metadata."""
+        text_config = SimpleNamespace(
+            model_type="llama",
+            vocab_size=59264,
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            head_dim=128,
+            hidden_act="silu",
+            max_position_embeddings=32768,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
+            tie_word_embeddings=True,
+            pad_token_id=59263,
+        )
+        audio_config = SimpleNamespace(
+            hidden_size=1280,
+            intermediate_size=5120,
+            num_hidden_layers=32,
+            num_attention_heads=20,
+            num_key_value_heads=20,
+            head_dim=64,
+            partial_rotary_factor=0.5,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+            layer_norm_eps=1e-5,
+            num_mel_bins=128,
+            max_position_embeddings=1500,
+            hidden_act="gelu",
+        )
+        parent = SimpleNamespace(
+            model_type="glmasr",
+            text_config=text_config,
+            audio_config=audio_config,
+            audio_token_id=59260,
+            projector_hidden_act="gelu",
+            tie_word_embeddings=True,
+            dtype="bfloat16",
+        )
+
+        config = GlmAsrConfig.from_transformers(parent)
+
+        assert config.model_type == "glmasr"
+        assert config.hidden_size == 2048
+        assert config.num_hidden_layers == 28
+        assert config.num_key_value_heads == 4
+        assert config.audio_token_id == 59260
+        assert config.audio is not None
+        assert config.audio.d_model == 1280
+        assert config.audio.encoder_head_dim == 64
+        assert config.audio.encoder_partial_rotary_factor == pytest.approx(0.5)
+        assert config.audio.encoder_rope_theta == pytest.approx(10000.0)
+        assert config.audio.output_dim == 2048
+
     def test_phi4mm_audio_token_id(self):
         """phi4mm extracts audio_token_id from audio_config attr."""
 
@@ -861,6 +920,29 @@ class TestQuantizationConfig:
         assert qc.group_size == 128
         assert qc.quant_method == "none"
         assert qc.sym is True
+
+    def test_new_weight_format_preserves_existing_positional_arguments(self):
+        qc = QuantizationConfig(8, 64, "olive", False, True, True, False, True, True)
+
+        assert qc.float_zero_point is True
+        assert qc.quantize_embeddings is True
+        assert qc.quantize_lm_head is False
+        assert qc.quantize_vision is True
+        assert qc.tie_word_embeddings is True
+        assert qc.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
+
+    def test_serialized_weight_format_is_normalized_to_enum(self):
+        qc = QuantizationConfig(
+            quant_method="manual",
+            weight_format="mxfp4",  # type: ignore[arg-type]
+        )
+
+        assert qc.weight_format is QuantizedWeightFormat.MXFP4
+
+    def test_quant_method_alone_does_not_infer_native_storage(self):
+        qc = QuantizationConfig(quant_method="mxfp4")
+
+        assert qc.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
 
     def test_from_transformers_gptq_dict(self):
         """Parse a GPTQ quantization_config dict."""
@@ -979,8 +1061,8 @@ class TestQuantizationConfig:
         assert qc is not None
         assert qc.sym is False
 
-    def test_from_transformers_olive_embeds_and_lm_head(self):
-        """Olive RTN exports flag quantized embeddings and LM head."""
+    def test_from_transformers_olive_component_flags(self):
+        """Olive RTN exports flags for quantized tables and vision projections."""
         hf = type(
             "HFConfig",
             (),
@@ -991,6 +1073,7 @@ class TestQuantizationConfig:
                     "group_size": 32,
                     "embeds": True,
                     "lm_head": True,
+                    "quantize_vision": True,
                 }
             },
         )()
@@ -998,11 +1081,157 @@ class TestQuantizationConfig:
         assert qc is not None
         assert qc.quantize_embeddings is True
         assert qc.quantize_lm_head is True
+        assert qc.quantize_vision is True
 
-    def test_quantize_embed_lm_head_default_false(self):
+    def test_from_transformers_olive_module_plan(self):
+        hf = SimpleNamespace(
+            quantization_config={
+                "quant_method": "olive",
+                "bits": 4,
+                "group_size": 32,
+                "symmetric": False,
+                "modules_to_not_convert": ["model.embed_tokens"],
+                "overrides": {
+                    "model.vision_tower": {
+                        "bits": 8,
+                        "group_size": 64,
+                        "symmetric": True,
+                    }
+                },
+            }
+        )
+
+        qc = QuantizationConfig.from_transformers(hf)
+
+        assert qc is not None
+        assert qc.modules_to_not_convert == ("model.embed_tokens",)
+        assert qc.has_module_plan is True
+        vision = qc.for_source_paths(
+            ("model.vision_tower",),
+            component="vision_encoder",
+        )
+        assert vision is not None
+        assert (vision.bits, vision.group_size, vision.sym) == (8, 64, True)
+        assert vision.modules_to_not_convert is None
+        assert vision.overrides == {}
+
+    def test_module_plan_keeps_excluded_component_float(self):
+        qc = QuantizationConfig(
+            quant_method="olive",
+            modules_to_not_convert=("model.audio_tower",),
+        )
+
+        assert (
+            qc.for_source_paths(
+                ("model.audio_tower",),
+                component="audio_encoder",
+            )
+            is None
+        )
+
+    def test_module_plan_rejects_partial_component_override(self):
+        qc = QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="olive",
+            overrides={"model.audio_tower.layers.0.q_proj": QuantizationOverride(bits=8)},
+        )
+
+        with pytest.raises(ValueError, match="mixes the default layout"):
+            qc.for_source_paths(
+                ("model.audio_tower",),
+                component="audio_encoder",
+            )
+
+    def test_architecture_config_parses_explicit_component_quantization(self):
+        text = SimpleNamespace(
+            model_type="llama",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            hidden_act="silu",
+            max_position_embeddings=128,
+        )
+        parent = SimpleNamespace(
+            model_type="composite",
+            component_quantization={
+                "text": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                },
+                "vision": {
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 64,
+                },
+                "audio": {
+                    "quant_method": "gptq",
+                    "bits": 2,
+                    "group_size": 16,
+                },
+            },
+        )
+
+        config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+
+        assert config.component_quantization is not None
+        assert config.quantization_for("decoder").bits == 4
+        assert config.quantization_for("vision_encoder").bits == 8
+        assert config.quantization_for("audio_encoder").bits == 2
+        assert config.quantization is config.quantization_for("decoder")
+
+    def test_architecture_config_parses_nested_component_quantization(self):
+        text = SimpleNamespace(
+            model_type="llama",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            hidden_act="silu",
+            max_position_embeddings=128,
+            quantization_config={
+                "quant_method": "olive",
+                "bits": 4,
+                "group_size": 32,
+            },
+        )
+        parent = SimpleNamespace(
+            model_type="composite",
+            vision_config=SimpleNamespace(
+                quantization_config={
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 64,
+                }
+            ),
+            audio_config=SimpleNamespace(
+                quantization_config={
+                    "quant_method": "olive",
+                    "bits": 2,
+                    "group_size": 16,
+                }
+            ),
+        )
+
+        config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+
+        assert config.component_quantization is not None
+        assert config.quantization_for("decoder").bits == 4
+        assert config.quantization_for("embedding").bits == 4
+        assert config.quantization_for("vision_encoder").bits == 8
+        assert config.quantization_for("audio_encoder").bits == 2
+
+    def test_quantize_component_flags_default_false(self):
         qc = QuantizationConfig()
         assert qc.quantize_embeddings is False
         assert qc.quantize_lm_head is False
+        assert qc.quantize_vision is False
 
     def test_architecture_config_has_quantization_field(self):
         config = ArchitectureConfig()
@@ -1124,6 +1353,93 @@ class TestArchitectureConfigValidate:
 
 class TestGemma4Config:
     """Tests for Gemma4Config.from_transformers."""
+
+    @staticmethod
+    def _heterogeneous_config(*head_dims, layer_types=None, kv_heads=None):
+        class FakeConfig:
+            model_type = "gemma4_text"
+            num_attention_heads = 8
+            num_hidden_layers = len(head_dims)
+            vocab_size = 262144
+            hidden_size = 1536
+            intermediate_size = 6144
+            hidden_act = "silu"
+            max_position_embeddings = 131072
+            rms_norm_eps = 1e-6
+            rope_theta = 10_000.0
+
+            def __init__(self):
+                layer_kv_heads = kv_heads or [1] * len(head_dims)
+                self.per_layer_config = [
+                    type(
+                        "LayerConfig",
+                        (),
+                        {
+                            "head_dim": head_dim,
+                            "num_key_value_heads": num_kv_heads,
+                        },
+                    )()
+                    for head_dim, num_kv_heads in zip(head_dims, layer_kv_heads, strict=True)
+                ]
+                self.layer_types = layer_types
+
+            @property
+            def head_dim(self):
+                raise RuntimeError("global per-layer attribute access is ambiguous")
+
+            @property
+            def num_key_value_heads(self):
+                raise RuntimeError("global per-layer attribute access is ambiguous")
+
+        return FakeConfig()
+
+    def test_uniform_per_layer_head_dim_avoids_ambiguous_global_access(self):
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config.from_transformers(self._heterogeneous_config(256, 256))
+
+        assert config.head_dim == 256
+
+    def test_heterogeneous_per_layer_head_dim_fails_loudly(self):
+        from mobius._configs import Gemma4Config
+
+        with pytest.raises(ValueError, match="heterogeneous per-layer head_dim"):
+            Gemma4Config.from_transformers(self._heterogeneous_config(128, 256))
+
+    def test_dual_head_dim_maps_sliding_and_full_attention(self):
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config.from_transformers(
+            self._heterogeneous_config(
+                256,
+                512,
+                layer_types=["sliding_attention", "full_attention"],
+                kv_heads=[8, 2],
+            )
+        )
+
+        assert config.head_dim == 256
+        assert config.global_head_dim == 512
+        assert config.num_key_value_heads == 8
+        assert config.num_global_key_value_heads == 2
+
+    def test_unsupported_third_heterogeneous_layer_type_fails(self):
+        from mobius._configs import Gemma4Config
+
+        with pytest.raises(ValueError, match="heterogeneous per-layer head_dim"):
+            Gemma4Config.from_transformers(
+                self._heterogeneous_config(
+                    256,
+                    512,
+                    128,
+                    layer_types=[
+                        "sliding_attention",
+                        "full_attention",
+                        "window_attention",
+                    ],
+                    kv_heads=[8, 2, 4],
+                )
+            )
 
     def test_boa_token_id_extracted_from_parent(self):
         """boa_token_id lives on the parent HF config, not text_config."""

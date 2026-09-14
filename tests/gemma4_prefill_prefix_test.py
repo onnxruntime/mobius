@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import numpy as np
+import onnx_ir as ir
+import pytest
 import torch
 
 from mobius import build_from_module
 from mobius._configs import Gemma4Config, VisionConfig
 from mobius._registry import registry
+from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.gemma4 import _split_per_layer_projection_weight
 
 
@@ -133,3 +137,258 @@ def test_splits_per_layer_projection_weight() -> None:
         state_dict["model.per_layer_model_projection_consumer.weight"],
         original[16:],
     )
+
+
+# ---------------------------------------------------------------------------
+# Numerical parity: pruned package must reproduce the unpruned final row
+# ---------------------------------------------------------------------------
+
+
+def _parity_config() -> Gemma4Config:
+    """Tiny hybrid config with a KV-shared tail and two distinct head sizes."""
+    return Gemma4Config(
+        num_hidden_layers=6,
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        vocab_size=256,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        attn_qk_norm=True,
+        layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        sliding_window=8,
+        # Distinct global head size: full-attention layers cache 32-wide K/V,
+        # sliding layers cache 16-wide K/V.
+        global_head_dim=32,
+        global_rope_theta=10_000.0,
+        global_partial_rotary_factor=0.25,
+        final_logit_softcapping=30.0,
+        hidden_size_per_layer_input=8,
+        vocab_size_per_layer_input=64,
+        split_per_layer_embedding=True,
+        max_position_embeddings=256,
+        pad_token_id=0,
+        tie_word_embeddings=False,
+        num_kv_shared_layers=2,
+    )
+
+
+def _build_text_model(config: Gemma4Config, *, execution_provider: str, prune: bool):
+    module = registry.get("gemma4_text")(config)
+    return build_from_module(
+        module,
+        config,
+        task="gemma4-text-generation",
+        execution_provider=execution_provider,
+        prune_prefill_prefix=prune,
+    )["model"]
+
+
+def _fill_random_weights(model, seed: int = 0) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    weights: dict[str, np.ndarray] = {}
+    for initializer in model.graph.initializers.values():
+        if initializer.const_value is None:
+            array = (rng.standard_normal(tuple(initializer.shape)) * 0.05).astype(np.float32)
+            initializer.const_value = ir.tensor(array, name=initializer.name)
+        weights[initializer.name] = initializer.const_value.numpy()
+    return weights
+
+
+def _copy_weights(model, weights: dict[str, np.ndarray]) -> None:
+    for initializer in model.graph.initializers.values():
+        if initializer.name in weights:
+            initializer.const_value = ir.tensor(
+                weights[initializer.name], name=initializer.name
+            )
+        elif initializer.const_value is None:
+            raise AssertionError(
+                f"pruned graph declares weight {initializer.name!r} that the "
+                "unpruned graph does not"
+            )
+
+
+def _feeds(config: Gemma4Config, seq_len: int) -> dict[str, np.ndarray]:
+    feeds: dict[str, np.ndarray] = {
+        "input_ids": (np.arange(1, seq_len + 1, dtype=np.int64) % config.vocab_size)[None],
+        "attention_mask": np.ones((1, seq_len), dtype=np.int64),
+        "position_ids": np.arange(seq_len, dtype=np.int64)[None],
+    }
+    # Cache-owning layers are the contiguous prefix before the KV-shared tail;
+    # each carries its own head size (global layers are double-wide).
+    kv_layers = config.num_hidden_layers - (config.num_kv_shared_layers or 0)
+    for index in range(kv_layers):
+        head_dim = 32 if config.layer_types[index] == "full_attention" else 16
+        empty = np.zeros((1, config.num_key_value_heads, 0, head_dim), dtype=np.float32)
+        feeds[f"past_key_values.{index}.key"] = empty
+        feeds[f"past_key_values.{index}.value"] = empty.copy()
+    return feeds
+
+
+@pytest.mark.parametrize(
+    "execution_provider",
+    # "default" exercises the opset-24 Attention + RotaryEmbedding path;
+    # "cpu" exercises the fused GroupQueryAttention path.
+    ["default", "cpu"],
+)
+@pytest.mark.parametrize("seq_len", [5, 12])
+def test_pruned_prefill_matches_unpruned_final_row(
+    execution_provider: str, seq_len: int
+) -> None:
+    """Prefill-prefix pruning must be a pure graph-surface optimisation.
+
+    Regression guard for the Gemma 4 mid-stack truncation: at the first
+    KV-shared layer the hidden states narrow to a single query position, so the
+    per-layer RoPE ``(cos, sin)`` caches and the additive attention bias must
+    narrow with them.  Without that, the ``RotaryEmbedding``/``Attention`` path
+    fails outright at load/run time; ``seq_len=12`` additionally reaches past
+    the 8-token sliding window so global (full-attention) layers exercise a
+    different key extent from the sliding ones.
+    """
+    config = _parity_config()
+    base = _build_text_model(config, execution_provider=execution_provider, prune=False)
+    pruned = _build_text_model(config, execution_provider=execution_provider, prune=True)
+
+    weights = _fill_random_weights(base)
+    _copy_weights(pruned, weights)
+
+    feeds = _feeds(config, seq_len)
+    base_out = OnnxModelSession(base).run(feeds)
+    pruned_out = OnnxModelSession(pruned).run(feeds)
+
+    assert set(base_out) == set(pruned_out), "pruning changed the model's output surface"
+
+    # Logits: the pruned package emits only the final row.
+    expected_logits = base_out["logits"][:, -1:, :]
+    assert pruned_out["logits"].shape == expected_logits.shape
+    np.testing.assert_allclose(pruned_out["logits"], expected_logits, atol=1e-4, rtol=0)
+    assert np.argmax(pruned_out["logits"][0, 0]) == np.argmax(expected_logits[0, 0])
+
+    # KV cache: pruning must not touch cache-owning layers at all.
+    kv_layers = config.num_hidden_layers - (config.num_kv_shared_layers or 0)
+    present_names = sorted(name for name in base_out if name.startswith("present."))
+    assert len(present_names) == 2 * kv_layers, (
+        f"expected {kv_layers} cache-owning layers, got {present_names}"
+    )
+    for name in present_names:
+        np.testing.assert_allclose(pruned_out[name], base_out[name], atol=1e-5, rtol=0)
+
+    # Double head size survives pruning: global layers stay twice as wide.
+    assert base_out["present.0.key"].shape[-1] == config.head_dim
+    assert base_out["present.1.key"].shape[-1] == config.global_head_dim
+
+
+def _dual_head_dim_config() -> Gemma4Config:
+    """A Gemma 4 text config whose global layers use a wider head than sliding ones."""
+    config = _make_config()
+    config.global_head_dim = 32
+    return config
+
+
+def test_metadata_splits_cache_groups_by_attention_kind() -> None:
+    """Gemma 4's two cache geometries must surface as two declared state groups.
+
+    Local/sliding layers store ``head_dim``-wide entries and are prefix-evictable;
+    global/full-attention layers store ``global_head_dim``-wide entries and keep
+    the entire history. A single undifferentiated group would let a runtime apply
+    sliding-window eviction to the global layers and corrupt them.
+    """
+    from mobius.integrations.onnx_genai.workflow_metadata import (
+        build_decoder_workflow_metadata,
+    )
+
+    config = _dual_head_dim_config()
+    module = registry.get("gemma4_text")(config)
+    pkg = build_from_module(module, config, task="gemma4-text-generation")
+
+    metadata = build_decoder_workflow_metadata(pkg, config)
+    workflow = metadata["pipeline"]["workflow"]
+    groups = workflow["serving"]["state_service"]["groups"]
+
+    assert set(groups) == {
+        "decoder_cache_sliding_attention",
+        "decoder_cache_full_attention",
+    }
+    assert groups["decoder_cache_sliding_attention"]["kind"] == "sliding_attention"
+    assert groups["decoder_cache_full_attention"]["kind"] == "full_attention"
+    # Only the sliding layers may drop their prefix.
+    assert groups["decoder_cache_sliding_attention"]["reuse"]["evictable_prefix"] is True
+    assert groups["decoder_cache_full_attention"]["reuse"]["evictable_prefix"] is False
+
+    head_dims: dict[str, set[int]] = {}
+    for name, group in groups.items():
+        cells = {cell for ports in group["ports"].values() for cell in ports}
+        head_dims[name] = {workflow["state"][cell]["contract"]["shape"][-1] for cell in cells}
+    assert head_dims["decoder_cache_sliding_attention"] == {config.head_dim}
+    assert head_dims["decoder_cache_full_attention"] == {config.global_head_dim}
+
+
+def test_metadata_declares_no_cache_for_kv_shared_layers() -> None:
+    """KV-shared layers borrow K/V and must not own phantom cache slots."""
+    from mobius.integrations.onnx_genai.workflow_metadata import (
+        build_decoder_workflow_metadata,
+    )
+
+    config = _dual_head_dim_config()
+    module = registry.get("gemma4_text")(config)
+    pkg = build_from_module(module, config, task="gemma4-text-generation")
+
+    metadata = build_decoder_workflow_metadata(pkg, config)
+    workflow = metadata["pipeline"]["workflow"]
+    groups = workflow["serving"]["state_service"]["groups"]
+    cells = {
+        cell
+        for group in groups.values()
+        for ports in group["ports"].values()
+        for cell in ports
+    }
+
+    cache_owning_layers = config.num_hidden_layers - config.num_kv_shared_layers
+    assert len(cells) == 2 * cache_owning_layers
+
+    present_outputs = [
+        value.name for value in pkg["model"].graph.outputs if value.name.startswith("present.")
+    ]
+    assert len(present_outputs) == 2 * cache_owning_layers
+    assert max(int(name.split(".")[1]) for name in present_outputs) == cache_owning_layers - 1
+
+
+def test_metadata_cache_cells_are_runtime_managed_and_request_aligned() -> None:
+    """Cache cells the runtime allocates must declare ownership and a row axis."""
+    from mobius.integrations.onnx_genai.workflow_metadata import (
+        build_decoder_workflow_metadata,
+    )
+
+    config = _dual_head_dim_config()
+    module = registry.get("gemma4_text")(config)
+    pkg = build_from_module(module, config, task="gemma4-text-generation")
+
+    workflow = build_decoder_workflow_metadata(pkg, config)["pipeline"]["workflow"]
+    groups = workflow["serving"]["state_service"]["groups"]
+    for group in groups.values():
+        # Runtime-private storage: no allocator/paging/slot policy is serialized.
+        assert "storage" not in group
+        assert "paging" not in group
+        # This package is exported on the opset-24 ``Attention`` path, whose
+        # cache grows by concatenation, so ``present`` is a fresh tensor rather
+        # than a view onto ``past``.
+        assert group["aliasing"] == "forbidden"
+        for ports in group["ports"].values():
+            for cell in ports:
+                state = workflow["state"][cell]
+                assert state["management"] == "runtime"
+                assert state["release_boundary"] == "invocation"
+                assert state["contract"]["batch_layout"] == {
+                    "kind": "request_aligned",
+                    "axis": 0,
+                }
+    assert "slot_ids" not in workflow["serving"]

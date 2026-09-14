@@ -25,16 +25,21 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities
-from mobius._configs import ArchitectureConfig, Gemma4Config
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
+from mobius._configs import ArchitectureConfig, Gemma4Config, QuantizationConfig
+from mobius._weight_utils import (
+    is_packed_quant_key,
+    preprocess_quantized_weights,
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+)
 from mobius.components import (
     MLP,
     ClippableLinear,
@@ -46,6 +51,7 @@ from mobius.components import (
     ScaleFreeRMSNorm,
     create_attention_bias,
     initialize_rope,
+    make_clippable_quantized_linear_factory,
     make_quantized_linear_factory,
 )
 from mobius.components._activations import get_activation
@@ -61,14 +67,28 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Mixed-precision quantization helpers
 #
-# Gemma4 is a multimodal model whose text decoder + token embeddings may be
-# weight-quantized (MatMulNBits / GatherBlockQuantized) while its vision and
-# audio encoders stay float.  The vision/audio encoder modules deliberately do
-# NOT consult ``config.quantization`` — they always build plain ``Linear``
-# layers — so enabling quantization only affects the text path.  The helpers
-# below are the single place the text components read the quantization config,
-# which keeps that "text quantized, vision/audio float" contract explicit.
+# Gemma4's decoder, embedding, vision, and audio graphs can carry independent
+# packed-weight layouts. Keep component selection in one place so graph
+# construction and weight preprocessing cannot disagree about a component.
 # ---------------------------------------------------------------------------
+
+
+_GEMMA4_COMPONENT_SOURCES: dict[str, tuple[str, ...]] = {
+    "decoder": (
+        "model.language_model.layers",
+        "model.language_model.norm",
+        "model.language_model.rotary_emb",
+        "lm_head",
+    ),
+    "vision_encoder": ("model.vision_tower", "model.embed_vision"),
+    "audio_encoder": ("model.audio_tower", "model.embed_audio"),
+    "embedding": (
+        "model.language_model.embed_tokens",
+        "model.language_model.embed_tokens_per_layer",
+        "model.language_model.per_layer_model_projection",
+        "model.language_model.per_layer_projection_norm",
+    ),
+}
 
 
 def _split_per_layer_projection_weight(
@@ -101,51 +121,161 @@ def _typed_scalar_constant(op: OpBuilder, value: float, dtype: ir.DataType) -> i
     return op.Constant(value=ir.tensor(np.asarray(value, dtype=dtype.numpy())))
 
 
-def _text_quantization_config(config: Gemma4Config):
-    """Return the active weight-quantization config, or ``None`` when off."""
-    quantization_config = getattr(config, "quantization", None)
-    if quantization_config is None or quantization_config.quant_method == "none":
-        return None
-    return quantization_config
+def _retain_last_position_embedding(
+    op: OpBuilder, position_embeddings: tuple[ir.Value, ir.Value] | None
+) -> tuple[ir.Value, ir.Value] | None:
+    """Narrow a RoPE ``(cos, sin)`` pair to its final sequence position.
 
-
-def _text_linear_class(config: Gemma4Config) -> type | None:
-    """Return a QuantizedLinear factory for text projections, or ``None``.
-
-    ``None`` means "use a plain float :class:`Linear`". Only the text decoder
-    projections (attention Q/K/V/O + MLP + LM head) use this; vision and audio
-    linears are always float.
+    Both caches are ``[B, S, rot_dim]`` and are indexed by query position, so
+    they must shrink in lockstep with the hidden states when prefill-prefix
+    pruning drops every position but the last.  ``RotaryEmbedding`` requires
+    the cache sequence length to equal the query sequence length exactly.
     """
-    quantization_config = _text_quantization_config(config)
-    if quantization_config is None:
+    if position_embeddings is None:
+        return None
+    narrowed = []
+    for cache in position_embeddings:
+        # (B, S, rot_dim) -> gather last position -> (B, rot_dim) -> (B, 1, rot_dim)
+        last = op.Gather(cache, op.Constant(value_int=-1), axis=1)
+        narrowed.append(op.Unsqueeze(last, op.Constant(value_ints=[1])))
+    return (narrowed[0], narrowed[1])
+
+
+def _retain_last_bias_query_row(op: OpBuilder, bias: ir.Value | None) -> ir.Value | None:
+    """Narrow a ``[B, 1, S_q, S_kv]`` additive attention bias to its last query row.
+
+    The key axis is left untouched: a pruned query still attends over the whole
+    key/value prefix, it just contributes a single query row.
+    """
+    if bias is None:
+        return None
+    # (B, 1, S_q, S_kv) -> gather last query row -> (B, 1, S_kv) -> (B, 1, 1, S_kv)
+    last = op.Gather(bias, op.Constant(value_int=-1), axis=2)
+    return op.Unsqueeze(last, op.Constant(value_ints=[2]))
+
+
+def _active_quantization(
+    quantization: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    if quantization is None or quantization.quant_method == "none":
+        return None
+    return quantization
+
+
+def _component_quantization_config(
+    config: Gemma4Config,
+    component: str,
+) -> QuantizationConfig | None:
+    """Return the effective packed-linear layout for one Gemma4 component."""
+    if config.component_quantization is not None:
+        quantization = config.quantization_for_source_paths(
+            component,
+            _GEMMA4_COMPONENT_SOURCES.get(component, ()),
+        )
+        return _active_quantization(quantization)
+
+    quantization = config.quantization_for(component)
+    quantization = _active_quantization(quantization)
+    if quantization is None:
+        return None
+
+    # A top-level module plan does not opt package components into quantization.
+    # Only legacy flags or an explicit component mapping do that.
+    if component == "vision_encoder" and not quantization.quantize_vision:
+        return None
+    if component in {"audio_encoder", "embedding"}:
+        return None
+    return quantization
+
+
+def _table_quantization_config(
+    config: Gemma4Config,
+    component: str,
+) -> QuantizationConfig | None:
+    """Return the config controlling embedding tables in *component*."""
+    if config.component_quantization is None:
+        return _active_quantization(config.quantization)
+    return _active_quantization(config.quantization_for(component))
+
+
+def _quantized_linear_class(
+    config: Gemma4Config,
+    quantization: QuantizationConfig | None,
+) -> type | None:
+    """Return a QuantizedLinear factory for one effective layout."""
+    if quantization is None:
         return None
     zero_point_dtype = (
-        config.dtype
-        if getattr(quantization_config, "float_zero_point", False)
-        else ir.DataType.UINT8
+        config.dtype if getattr(quantization, "float_zero_point", False) else ir.DataType.UINT8
     )
     return make_quantized_linear_factory(
-        bits=quantization_config.bits,
-        block_size=quantization_config.group_size,
-        has_zero_point=not quantization_config.sym,
+        bits=quantization.bits,
+        block_size=quantization.group_size,
+        has_zero_point=not quantization.sym,
         zero_point_dtype=zero_point_dtype,
     )
 
 
-def _text_embeddings_quantized(config: Gemma4Config) -> bool:
-    """Whether the text token-embedding tables use GatherBlockQuantized."""
-    quantization_config = _text_quantization_config(config)
-    return quantization_config is not None and bool(
-        getattr(quantization_config, "quantize_embeddings", False)
+def _text_linear_class(config: Gemma4Config) -> type | None:
+    """Return a QuantizedLinear factory for text projections, or ``None``."""
+    return _quantized_linear_class(
+        config,
+        _component_quantization_config(config, "decoder"),
+    )
+
+
+def _embedding_linear_class(config: Gemma4Config) -> type | None:
+    """Return a QuantizedLinear factory for embedding-graph projections."""
+    return _quantized_linear_class(
+        config,
+        _component_quantization_config(config, "embedding"),
+    )
+
+
+def _vision_linear_classes(config: Gemma4Config) -> tuple[type, type]:
+    """Return plain and activation-clipped Linear classes for the vision graph."""
+    quantization = _component_quantization_config(config, "vision_encoder")
+    quantized_linear = _quantized_linear_class(config, quantization)
+    if quantization is None or quantized_linear is None:
+        return Linear, ClippableLinear
+    zero_point_dtype = (
+        config.dtype if getattr(quantization, "float_zero_point", False) else ir.DataType.UINT8
+    )
+    return (
+        quantized_linear,
+        make_clippable_quantized_linear_factory(
+            bits=quantization.bits,
+            block_size=quantization.group_size,
+            has_zero_point=not quantization.sym,
+            zero_point_dtype=zero_point_dtype,
+        ),
+    )
+
+
+def _audio_linear_classes(config: Gemma4Config) -> tuple[type, type]:
+    """Return plain and activation-clipped classes for the audio graph."""
+    quantization = _component_quantization_config(config, "audio_encoder")
+    quantized_linear = _quantized_linear_class(config, quantization)
+    if quantization is None or quantized_linear is None:
+        return Linear, ClippableLinear
+    zero_point_dtype = (
+        config.dtype if getattr(quantization, "float_zero_point", False) else ir.DataType.UINT8
+    )
+    return (
+        quantized_linear,
+        make_clippable_quantized_linear_factory(
+            bits=quantization.bits,
+            block_size=quantization.group_size,
+            has_zero_point=not quantization.sym,
+            zero_point_dtype=zero_point_dtype,
+        ),
     )
 
 
 def _text_lm_head_quantized(config: Gemma4Config) -> bool:
     """Whether the text LM head projection uses MatMulNBits."""
-    quantization_config = _text_quantization_config(config)
-    return quantization_config is not None and bool(
-        getattr(quantization_config, "quantize_lm_head", False)
-    )
+    quantization = _component_quantization_config(config, "decoder")
+    return quantization is not None and bool(getattr(quantization, "quantize_lm_head", False))
 
 
 def _make_scaled_word_embedding(
@@ -153,6 +283,8 @@ def _make_scaled_word_embedding(
     num_embeddings: int,
     embedding_dim: int,
     embed_scale: float,
+    *,
+    component: str = "decoder",
 ):
     """Build a scaled token embedding, quantized when the config requests it.
 
@@ -160,9 +292,10 @@ def _make_scaled_word_embedding(
     lookup) when embedding quantization is enabled and the embedding dimension
     is block-aligned, otherwise a float :class:`Gemma3TextScaledWordEmbedding`.
     """
-    quantization_config = _text_quantization_config(config)
+    quantization_config = _table_quantization_config(config, component)
     if (
-        _text_embeddings_quantized(config)
+        quantization_config is not None
+        and quantization_config.quantize_embeddings
         and embedding_dim % quantization_config.group_size == 0
     ):
         return Gemma4ScaledQuantizedWordEmbedding(
@@ -195,6 +328,119 @@ def _make_lm_head(config: Gemma4Config) -> nn.Module:
         if linear_cls is not None:
             return linear_cls(config.hidden_size, config.vocab_size, bias=False)
     return Linear(config.hidden_size, config.vocab_size, bias=False)
+
+
+def _validate_component_quantization(
+    config: Gemma4Config,
+    *,
+    has_audio: bool,
+) -> None:
+    """Reject component declarations that this package cannot materialize."""
+    if config.component_quantization is None:
+        return
+    available = {"decoder", "vision_encoder", "embedding"}
+    if has_audio:
+        available.add("audio_encoder")
+    unknown = set(config.component_quantization) - available
+    if unknown:
+        raise ValueError(
+            "Gemma4 component_quantization contains components not produced by "
+            f"this package: {sorted(unknown)}. Available components: {sorted(available)}"
+        )
+
+
+def _preprocess_component_quantized_weights(
+    state_dict: dict[str, torch.Tensor],
+    config: Gemma4Config,
+) -> dict[str, torch.Tensor]:
+    """Convert packed weights with each package component's own layout."""
+    root_quantization = _active_quantization(config.quantization)
+    component_mode = config.component_quantization is not None
+    if not component_mode:
+        if root_quantization is None or root_quantization.quant_method not in {
+            "olive",
+            "gptq",
+            "awq",
+        }:
+            return state_dict
+        tie = config.tie_word_embeddings
+        apply_tie = tie and any(
+            key in state_dict
+            for key in (
+                "embedding.embed_tokens.weight",
+                "decoder.lm_head.weight",
+            )
+        )
+        return preprocess_quantized_weights(
+            state_dict,
+            root_quantization,
+            tie_embeddings=apply_tie,
+            embed_key="embedding.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+            qmoe_target_path=None,
+            reject_quantized_embeddings_lm_head=True,
+        )
+
+    result = {
+        key: value
+        for key, value in state_dict.items()
+        if key.split(".", 1)[0]
+        not in {"decoder", "embedding", "vision_encoder", "audio_encoder"}
+    }
+    for component in ("decoder", "embedding", "vision_encoder", "audio_encoder"):
+        component_weights = {
+            key: value for key, value in state_dict.items() if key.startswith(f"{component}.")
+        }
+        if not component_weights:
+            continue
+
+        quantization = _component_quantization_config(config, component)
+        if component == "embedding":
+            table_quantization = _table_quantization_config(config, component)
+            if table_quantization is not None and table_quantization.quantize_embeddings:
+                if quantization is not None and (
+                    quantization.bits,
+                    quantization.group_size,
+                    quantization.sym,
+                ) != (
+                    table_quantization.bits,
+                    table_quantization.group_size,
+                    table_quantization.sym,
+                ):
+                    raise ValueError(
+                        "Gemma4 embedding tables and projections use different "
+                        "quantization layouts inside one component."
+                    )
+                quantization = table_quantization
+
+        if quantization is None:
+            packed_key = next(
+                (key for key in component_weights if is_packed_quant_key(key)),
+                None,
+            )
+            if packed_key is not None:
+                raise ValueError(
+                    f"Component {component!r} is configured as floating point, "
+                    f"but packed checkpoint weight {packed_key!r} was found."
+                )
+            result.update(component_weights)
+            continue
+
+        if quantization.quant_method not in {"olive", "gptq", "awq"}:
+            result.update(component_weights)
+            continue
+        result.update(
+            preprocess_quantized_weights(
+                component_weights,
+                quantization,
+                tie_embeddings=False,
+                embed_key="embedding.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=None,
+                reject_quantized_embeddings_lm_head=True,
+            )
+        )
+    return result
 
 
 class Gemma4ScaledWordEmbedding(Gemma3TextScaledWordEmbedding):
@@ -274,6 +520,30 @@ def _remap_moe_expert_weights(
     Shared by ``Gemma4CausalLMModel`` and ``Gemma4Model`` to avoid
     duplicating the rename/fold logic.
     """
+    packed_expert_key = next(
+        (
+            key
+            for key in state_dict
+            if is_packed_quant_key(key)
+            and any(
+                expert_name in key
+                for expert_name in (
+                    ".experts.gate_up_proj",
+                    ".experts.down_proj",
+                    ".fc1_experts_weights",
+                    ".fc2_experts_weights",
+                )
+            )
+        ),
+        None,
+    )
+    if packed_expert_key is not None:
+        raise NotImplementedError(
+            "Quantized Gemma4 MoE experts are not yet supported: the graph "
+            "currently requires float fc1_experts_weights and fc2_experts_weights "
+            f"parameters, but packed checkpoint key {packed_expert_key!r} was found."
+        )
+
     # experts.gate_up_proj → fc1_experts_weights
     # experts.down_proj    → fc2_experts_weights
     for key in list(state_dict.keys()):
@@ -287,9 +557,38 @@ def _remap_moe_expert_weights(
     # Fold hidden_size^-0.5 into router.scale
     if config.enable_moe_block:
         scale_factor = float(config.hidden_size**-0.5)
+        pes_by_prefix: dict[str, torch.Tensor] = {}
         for key in list(state_dict.keys()):
             if ".router.scale" in key and ".per_expert_scale" not in key:
                 state_dict[key] = state_dict[key] * scale_factor
+            if key.endswith(".router.per_expert_scale"):
+                pes_by_prefix[key[: -len(".router.per_expert_scale")]] = state_dict[key]
+        # Fold per_expert_scale into the expert down projection (fc2). HF's router
+        # applies ``top_k_weights *= per_expert_scale[top_k_index]`` after
+        # renormalization; the fused ``com.microsoft::MoE`` op has no per-expert
+        # output scaling, so bake each expert's scalar into its output weights:
+        # ``fc2[e] *= per_expert_scale[e]``. (Equivalent because both scale the
+        # per-expert contribution by the same scalar before the weighted sum.)
+        folded_prefixes: set[str] = set()
+        for key in list(state_dict.keys()):
+            if key.endswith(".fc2_experts_weights"):
+                prefix = key[: -len(".fc2_experts_weights")]
+                pes = pes_by_prefix.get(prefix)
+                if pes is not None:
+                    fc2 = state_dict[key]
+                    state_dict[key] = fc2 * pes.to(fc2.dtype).reshape(-1, 1, 1)
+                    folded_prefixes.add(prefix)
+        # per_expert_scale is now baked into fc2. Neutralize ONLY the router
+        # copies we actually folded, so the unfused fallback path — which reads
+        # ``self.router.per_expert_scale`` and multiplies it into the routing
+        # weights — does not apply the scale a second time. The fused path never
+        # reads it. A partial state_dict that supplies ``router.per_expert_scale``
+        # without the matching ``fc2_experts_weights`` is left untouched: its
+        # scale is neither double-applied nor silently dropped. The parameter is
+        # kept, not popped, so weight loading still binds it.
+        for prefix in folded_prefixes:
+            pes_key = f"{prefix}.router.per_expert_scale"
+            state_dict[pes_key] = torch.ones_like(state_dict[pes_key])
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +619,12 @@ class Gemma4VisionSelfAttention(nn.Module):
         rope_theta: float = 100.0,
         max_position: int = 128,
         use_clipped_linears: bool = True,
+        linear_class: type | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        linear_class = ClippableLinear if use_clipped_linears else Linear
+        linear_class = linear_class or (ClippableLinear if use_clipped_linears else Linear)
         self.q_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
         self.k_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
         self.v_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
@@ -488,8 +788,10 @@ class Gemma4VisionEncoderLayer(nn.Module):
         rope_theta: float = 100.0,
         max_position: int = 128,
         use_clipped_linears: bool = True,
+        linear_class: type | None = None,
     ):
         super().__init__()
+        linear_class = linear_class or (ClippableLinear if use_clipped_linears else Linear)
         self.self_attn = Gemma4VisionSelfAttention(
             hidden_size,
             num_heads,
@@ -497,6 +799,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
             rope_theta=rope_theta,
             max_position=max_position,
             use_clipped_linears=use_clipped_linears,
+            linear_class=linear_class,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
@@ -505,7 +808,6 @@ class Gemma4VisionEncoderLayer(nn.Module):
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
         # Use ClippableLinear only when the checkpoint has clipping weights.
-        linear_class = ClippableLinear if use_clipped_linears else Linear
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
@@ -653,9 +955,15 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
     - ``position_embedding_table`` (Parameter ``[2, pos_emb_size, hidden_size]``)
     """
 
-    def __init__(self, patch_size: int, hidden_size: int, position_embedding_size: int):
+    def __init__(
+        self,
+        patch_size: int,
+        hidden_size: int,
+        position_embedding_size: int,
+        linear_class: type = Linear,
+    ):
         super().__init__()
-        self.input_proj = Linear(3 * patch_size * patch_size, hidden_size, bias=False)
+        self.input_proj = linear_class(3 * patch_size * patch_size, hidden_size, bias=False)
         # Position embedding table: [2, pos_emb_size, hidden] — x and y tables
         self.position_embedding_table = nn.Parameter([2, position_embedding_size, hidden_size])
         self.position_embedding_size = position_embedding_size
@@ -716,10 +1024,12 @@ class _Gemma4VisionEncoderCore(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         vc = config.vision  # VisionConfig for the SigLIP encoder
+        linear_class, clippable_linear_class = _vision_linear_classes(config)
         self.patch_embedder = _Gemma4VisionPatchEmbedder(
             patch_size=vc.patch_size or 16,
             hidden_size=vc.hidden_size,
             position_embedding_size=vc.position_embedding_size or 128,
+            linear_class=linear_class,
         )
         self.layers = nn.ModuleList(
             [
@@ -732,6 +1042,9 @@ class _Gemma4VisionEncoderCore(nn.Module):
                     rope_theta=vc.rope_theta or 100.0,
                     max_position=vc.position_embedding_size or 128,
                     use_clipped_linears=vc.use_clipped_linears,
+                    linear_class=(
+                        clippable_linear_class if vc.use_clipped_linears else linear_class
+                    ),
                 )
                 for _ in range(vc.num_hidden_layers)
             ]
@@ -953,8 +1266,15 @@ class Gemma4TextAttention(nn.Module):
             # ``o_proj``'s MatMul fail shape inference at model-load time. The
             # source shares the same KV-head/head-dim configuration as this
             # layer, so pin the known 4D BNSH shape to restore inference.
+            #
+            # Only an UNKNOWN shape may be pinned. A static-cache source hands
+            # over its rank-3 ``[batch, capacity, kv_heads * head_dim]`` scatter
+            # buffer, which is fully known; overwriting that with a 4D BNSH
+            # guess both mislabels the graph's declared cache output and defeats
+            # the rank-3 test below, which would then transpose a rank-3 tensor
+            # as if it were BNSH.
             for _kv in (src_key, src_value):
-                if _kv.shape is None or len(_kv.shape) != 4:
+                if _kv.shape is None:
                     _kv.shape = ir.Shape(
                         [
                             "batch",
@@ -1358,6 +1678,23 @@ class Gemma4DecoderLayer(nn.Module):
             self._num_experts = config.num_local_experts
             self._moe_intermediate_size = config.moe_intermediate_size
             self._hidden_size = config.hidden_size
+            # The fused com.microsoft::MoE op's only GATED activation is
+            # ``swiglu`` = ``x * sigmoid(activation_alpha * x) * up``. Gemma 4
+            # experts use ``act_fn(gate) * up`` where ``act_fn`` is the config's
+            # ``hidden_act`` (``gelu_pytorch_tanh`` for the 26B-A4B / 31B MoE
+            # checkpoints), NOT silu. Since ``x * sigmoid(1.702 * x)`` closely
+            # approximates gelu, gelu-family activations map to
+            # ``activation_alpha=1.702``; a genuine silu expert maps to 1.0.
+            _moe_act = (config.hidden_act or "").lower()
+            self._moe_swiglu_alpha = 1.702 if "gelu" in _moe_act else 1.0
+            # The unfused fallback (EPs without a fused MoE op) uses explicit
+            # ONNX ops, so it applies the EXACT expert activation via the shared
+            # ACT2FN mapping instead of the swiglu approximation. This keeps
+            # ``gelu`` (erf) distinct from the tanh-approx variants
+            # (``gelu_pytorch_tanh``/``gelu_new``/``gelu_fast``) and ``silu`` ->
+            # Swish, faithfully matching HuggingFace's ``act_fn(gate) * up`` for
+            # whatever ``hidden_act`` the checkpoint declares.
+            self._moe_act_fn = get_activation(config.hidden_act)
             moe_inter = config.moe_intermediate_size
 
             self.router = _Gemma4MoeRouter(
@@ -1457,12 +1794,16 @@ class Gemma4DecoderLayer(nn.Module):
                 # microsoft/onnxruntime#28467, MoE GEMM Refactor) which
                 # plumbs the SwiGLU schema attributes to the kernel.
                 #
-                # Gemma 4 SwiGLU semantics (vs GPT-OSS):
-                #   activation_alpha=1.0   — silu(gate) (no GPT-OSS alpha=1.702)
-                #   activation_beta=0.0    — linear * gate (no GPT-OSS "+1" bias)
-                #   swiglu_limit=inf       — no clipping (≤0 disables the clamp)
-                #   swiglu_fusion=1        — interleaved layout
-                #                            [g_0, u_0, g_1, u_1, ...].
+                # Gemma 4 gated-FFN semantics via the fused SwiGLU schema:
+                #   activation_type=swiglu   — x * sigmoid(activation_alpha*x) * up
+                #   activation_alpha=1.702   — approximates gelu_pytorch_tanh, the
+                #                              activation Gemma 4 experts actually
+                #                              use (act_fn(gate)*up); a silu expert
+                #                              would use 1.0. (See _moe_swiglu_alpha.)
+                #   activation_beta=0.0      — linear * gate (no GPT-OSS "+1" bias)
+                #   swiglu_limit=inf         — no clipping (≤0 disables the clamp)
+                #   swiglu_fusion=1          — interleaved layout
+                #                              [g_0, u_0, g_1, u_1, ...].
                 #
                 # mobius stores ``fc1_experts_weights`` chunked as
                 # ``[E, 2*inter, H]`` (first ``inter`` rows = gate,
@@ -1506,7 +1847,7 @@ class Gemma4DecoderLayer(nn.Module):
                         activation_type="swiglu",
                         k=self._top_k,
                         normalize_routing_weights=1,
-                        activation_alpha=1.0,
+                        activation_alpha=self._moe_swiglu_alpha,
                         activation_beta=0.0,
                         swiglu_limit=float("inf"),
                         swiglu_fusion=1,
@@ -1549,16 +1890,18 @@ class Gemma4DecoderLayer(nn.Module):
         normed_flat: ir.Value,
         router_probs: ir.Value,
     ) -> ir.Value:
-        """Fallback expert dispatch (static unroll) when fused MoE op is unavailable.
+        """Fallback expert dispatch when the fused MoE op is unavailable.
 
-        Iterates over each expert (outer loop), accumulates the routing weight for
-        all k slots that select that expert (inner loop), applies the SwiGLU MLP,
-        and accumulates into the output tensor.
+        Vectorized dense evaluation: every expert is evaluated for every token
+        with batched ``Einsum`` GEMMs, then masked by a scattered top-K routing
+        weight. This emits O(1) ONNX nodes per layer (independent of expert
+        count), unlike a per-expert static unroll which produces O(E x K) nodes
+        (~6k per layer at E=128/K=8 — impractical for large MoE checkpoints).
 
-        This produces O(E x K) ONNX nodes (e.g. Gemma4 26B: 256 experts x 2 top-k =
-        512 per layer).  The primary path uses a fused MoE op for supported EPs
-        (CUDA/DML); this fallback is only invoked for CPU/other EPs where the fused
-        op is absent.
+        Standard ``MatMul``/``Einsum`` accumulate in fp32 on CUDA even for fp16
+        inputs, so this path is numerically faithful to HuggingFace — unlike the
+        released-ORT fused ``com.microsoft::MoE`` kernel, which fp16-accumulates
+        the expert GEMMs and loses accuracy at large hidden size.
 
         Args:
             normed_flat: [T, H] — pre-normed input for the experts (T = B*S).
@@ -1567,7 +1910,9 @@ class Gemma4DecoderLayer(nn.Module):
         Returns:
             [T, H] — weighted sum of expert outputs.
         """
-        # Top-K selection: top_weights/top_indices both [T, K]
+        moe_inter = self._moe_intermediate_size
+
+        # Top-K selection: top_weights_raw/top_indices both [T, K]
         top_weights_raw, top_indices = op.TopK(
             router_probs, op.Constant(value_ints=[self._top_k]), axis=-1, _outputs=2
         )
@@ -1575,63 +1920,44 @@ class Gemma4DecoderLayer(nn.Module):
         top_weights = op.Div(
             top_weights_raw, op.ReduceSum(top_weights_raw, [1], keepdims=1)
         )  # [T, K]
-
-        # Scale routing weights by per_expert_scale for each selected expert
-        # Gather from [E] using [T, K] indices → result [T, K]
+        # Scale routing weights by per_expert_scale for each selected expert.
+        # (For Gemma 4 this is a no-op — per_expert_scale is baked into fc2 and
+        # neutralized to ones in preprocess_weights — but kept for generality.)
         pes_topk = op.Gather(self.router.per_expert_scale, top_indices, axis=0)  # [T, K]
         top_weights = op.Mul(top_weights, op.CastLike(pes_topk, top_weights))  # [T, K]
 
-        # Build output accumulator, matching dtype of the input
-        out_shape = op.Shape(normed_flat)  # [T, H] shape vec
-        output = op.CastLike(
-            op.ConstantOfShape(out_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
-            normed_flat,
+        # Scatter the renormalized top-K weights back to a dense [T, E] vector.
+        num_tokens = op.Shape(normed_flat, start=0, end=1)  # [1]
+        dense_shape = op.Concat(
+            num_tokens, op.Constant(value_ints=[self._num_experts]), axis=0
+        )  # [T, E]
+        dense_w = op.CastLike(
+            op.ConstantOfShape(dense_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
+            top_weights,
         )
+        dense_w = op.ScatterElements(dense_w, top_indices, top_weights, axis=1)  # [T, E]
 
-        # T_shape: 1-D tensor [T] used for per-expert weight accumulation
-        t_shape = op.Shape(normed_flat, start=0, end=1)  # shape vec of length 1
+        # fc1_experts_weights [E, 2*moe_inter, H] stores gate rows then up rows.
+        gate_w = op.Slice(self.fc1_experts_weights, [0], [moe_inter], [1])  # [E, moe_inter, H]
+        up_w = op.Slice(
+            self.fc1_experts_weights, [moe_inter], [2 * moe_inter], [1]
+        )  # [E, moe_inter, H]
 
-        for e_idx in range(self._num_experts):
-            # Gather this expert's weight matrices
-            fc1 = op.Squeeze(
-                op.Gather(self.fc1_experts_weights, [e_idx], axis=0), [0]
-            )  # [2*moe_inter, H]
-            fc2 = op.Squeeze(
-                op.Gather(self.fc2_experts_weights, [e_idx], axis=0), [0]
-            )  # [H, moe_inter]
+        # Dense per-expert gate/up projections: [T, H] x [E, moe_inter, H] -> [T, E, moe_inter]
+        gate = op.Einsum(normed_flat, gate_w, equation="th,eih->tei")
+        up = op.Einsum(normed_flat, up_w, equation="th,eih->tei")
+        # Exact expert activation via ACT2FN: ``gelu_pytorch_tanh`` -> tanh-approx
+        # GELU, bare ``gelu`` -> erf GELU, ``silu``/``swish`` -> Swish, etc. This
+        # avoids the swiglu approximation used on the fused path.
+        activated = self._moe_act_fn(op, gate)
+        inter = op.Mul(activated, up)  # [T, E, moe_inter]
 
-            # Gated SiLU MLP: fc1 produces gate+up concatenated → SwiGLU
-            proj = op.MatMul(normed_flat, op.Transpose(fc1))  # [T, 2*moe_inter]
-            half = op.Shape(fc2, start=1, end=2)  # [moe_inter]
-            gate = op.Slice(proj, [0], half, [1])  # [T, moe_inter] first half
-            up = op.Slice(proj, half, op.Shape(proj, start=1, end=2), [1])  # second half
-            expert_out = op.MatMul(
-                op.Mul(op.Swish(gate), up),  # [T, moe_inter]
-                op.Transpose(fc2),  # → [T, H]
-            )
+        # Down projection: [T, E, moe_inter] x [E, H, moe_inter] -> [T, E, H]
+        expert_out = op.Einsum(inter, self.fc2_experts_weights, equation="tei,ehi->teh")
 
-            # Accumulate routing weight for expert e_idx across all k slots
-            e_weight = op.CastLike(
-                op.ConstantOfShape(t_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
-                top_weights,
-            )
-            for k_idx in range(self._top_k):
-                # idx_k: [T] — which expert was selected at slot k_idx
-                idx_k = op.Squeeze(op.Slice(top_indices, [k_idx], [k_idx + 1], [1]), [1])
-                # w_k: [T] — routing weight for slot k_idx
-                w_k = op.Squeeze(op.Slice(top_weights, [k_idx], [k_idx + 1], [1]), [1])
-                # Add w_k only for tokens routed to expert e_idx at this slot
-                is_expert = op.CastLike(op.Equal(idx_k, op.Constant(value_int=e_idx)), w_k)
-                e_weight = op.Add(e_weight, op.Mul(is_expert, w_k))
-
-            # Weight expert output by aggregated routing weight and add to output
-            e_weight_2d = op.Reshape(
-                e_weight,
-                op.Concat(t_shape, op.Constant(value_ints=[1]), axis=0),  # [T, 1]
-            )
-            output = op.Add(output, op.Mul(expert_out, op.CastLike(e_weight_2d, expert_out)))
-
-        return output
+        # Weight by the dense routing vector and sum over experts.
+        weighted = op.Mul(expert_out, op.Unsqueeze(dense_w, [2]))  # [T, E, H] * [T, E, 1]
+        return op.ReduceSum(weighted, [1], keepdims=0)  # [T, H]
 
 
 # ---------------------------------------------------------------------------
@@ -2210,6 +2536,30 @@ class Gemma4TextModel(nn.Module):
         ):
             if i == self._first_kv_shared_layer and i < len(self.layers):
                 hidden_states = _retain_last_sequence_token(op, hidden_states)
+                if is_prefill_prefix_pruning_enabled():
+                    # The stack has just narrowed to a single query position.
+                    # Every per-layer tensor indexed by query position must
+                    # narrow with it or the KV-shared layers receive an S-row
+                    # RoPE cache / attention bias for a 1-row query.  The GQA
+                    # path is exempt: GroupQueryAttention derives its rotary
+                    # offset from total_seq_len - q_len and takes a full-length
+                    # cos/sin cache, so it already handles the narrowed query.
+                    shared_pos_dict = fallback_pos_dict is position_embeddings_dict
+                    position_embeddings_dict = {
+                        key: _retain_last_position_embedding(op, value)
+                        for key, value in position_embeddings_dict.items()
+                    }
+                    if shared_pos_dict:
+                        fallback_pos_dict = position_embeddings_dict
+                    else:
+                        fallback_pos_dict = {
+                            key: _retain_last_position_embedding(op, value)
+                            for key, value in fallback_pos_dict.items()
+                        }
+                    fallback_bias_dict = {
+                        key: _retain_last_bias_query_row(op, value)
+                        for key, value in fallback_bias_dict.items()
+                    }
             per_layer_input = per_layer_list[i] if per_layer_list is not None else None
 
             # Per-layer cache/attention dispatch:
@@ -2256,6 +2606,59 @@ class Gemma4TextModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _validate_gemma4_output_layer_indices(config: Gemma4Config) -> list[int] | None:
+    """Validate ``config.output_layer_indices`` for the Gemma4 text model.
+
+    Unlike the generic :class:`~mobius.models.base.TextModel` — which captures a
+    distinct *pre*-final-norm tensor for every requested decoder layer — Gemma4's
+    ``forward`` exposes only the FINAL post-final-norm hidden state (the exact
+    ``lm_head`` input, == HuggingFace ``output_hidden_states=True``
+    ``hidden_states[-1]``). A borrowed-KV speculative drafter consumes that value
+    as its folded-carry seed. It is faithful ONLY for the last decoder layer, so
+    rather than pretending general per-layer support, Gemma4 accepts exactly one
+    index equal to ``num_hidden_layers - 1``.
+
+    Index convention follows :attr:`ArchitectureConfig.output_layer_indices`:
+    non-negative, 0-based, where ``hidden_states.{k}`` == HF
+    ``hidden_states[k + 1]`` (so the post-norm final slot ``hidden_states[-1]``
+    is ``k = num_hidden_layers - 1``). Duplicate, out-of-range (including
+    negative), multiple, or non-last indices are rejected with a clear error.
+    ``None``/empty returns ``None`` and preserves the legacy 2-tuple output
+    contract (existing exports stay byte-identical).
+
+    Returns:
+        ``[num_hidden_layers - 1]`` for a valid request, else ``None``.
+
+    Raises:
+        ValueError: on duplicate, out-of-range/negative, multiple, or non-last
+            indices, naming the only supported value.
+    """
+    raw = getattr(config, "output_layer_indices", None)
+    if not raw:
+        return None
+    indices = list(raw)
+    num_layers = config.num_hidden_layers
+    # Match the generic TextModel validation order: duplicates, then range.
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"output_layer_indices must not contain duplicates: {indices}")
+    out_of_range = [i for i in indices if not 0 <= i < num_layers]
+    if out_of_range:
+        raise ValueError(
+            f"output_layer_indices {out_of_range} out of range [0, {num_layers}) "
+            "(negative indices are not supported)"
+        )
+    last = num_layers - 1
+    if indices != [last]:
+        raise ValueError(
+            "Gemma4 exposes only the post-final-norm last hidden state "
+            "(== HuggingFace output_hidden_states[-1], the lm_head input) as the "
+            "speculative folded-carry seed; per-layer pre-norm hidden states are "
+            f"not available. output_layer_indices must be exactly [{last}] "
+            f"(num_hidden_layers - 1), got {indices}."
+        )
+    return indices
+
+
 class Gemma4CausalLMModel(CausalLMModel):
     """Gemma 4 text-only causal language model.
 
@@ -2278,6 +2681,17 @@ class Gemma4CausalLMModel(CausalLMModel):
         self.config = config
         self.model = Gemma4TextModel(config)
         self.lm_head = _make_lm_head(config)
+        # Speculative folded-carry seed: when requested, additionally emit the
+        # post-final-norm hidden state (the lm_head input, == HF
+        # ``output_hidden_states[-1]``) as ``hidden_states.{idx}``. Gemma4 exposes
+        # only this final normalized hidden (not per-layer pre-norm), so a valid
+        # request is exactly one index == ``num_hidden_layers - 1``; the helper
+        # validates and rejects duplicate/out-of-range/negative/multiple/non-last
+        # indices. ``None``/empty keeps the legacy 2-tuple contract (existing
+        # exports byte-identical).
+        self.output_layer_indices: list[int] | None = _validate_gemma4_output_layer_indices(
+            config
+        )
 
     def forward(
         self,
@@ -2287,7 +2701,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
-    ) -> tuple[ir.Value, list]:
+    ) -> tuple[ir.Value, list] | tuple[ir.Value, list, list]:
         hidden_states, present_key_values = self.model(
             op,
             input_ids=input_ids,
@@ -2296,6 +2710,8 @@ class Gemma4CausalLMModel(CausalLMModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
         )
+        # ``hidden_states`` here is post-final-norm (``Gemma4TextModel`` applies
+        # ``self.norm`` before returning) — i.e. the exact lm_head input.
         hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
         # Optional final logit soft-capping (tanh scaled): logit_cap * tanh(x / logit_cap)
@@ -2304,6 +2720,15 @@ class Gemma4CausalLMModel(CausalLMModel):
                 op, self.config.final_logit_softcapping, self.config.dtype
             )
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
+        if self.output_layer_indices:
+            # Materialize a distinct Identity per requested index so each graph
+            # output owns a unique name and never renames the internal lm_head
+            # input value in place (a shared Value passed to ``add_output`` twice
+            # would collapse). Validation restricts this to exactly the last-layer
+            # index, but the per-index Identity keeps the contract robust and
+            # mirrors the generic "one distinct Value per output" shape.
+            hidden_outputs = [op.Identity(hidden_states) for _ in self.output_layer_indices]
+            return logits, present_key_values, hidden_outputs
         return logits, present_key_values
 
     def preprocess_weights(
@@ -2433,7 +2858,8 @@ class _Gemma4VisionEncoderModel(nn.Module):
         # Reduces N patches to N/9 before projection.
         self.pooler = Gemma4VisionPooler(vc.hidden_size, vc.pooling_kernel_size or 3)
         self.projector_norm = ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
-        self.projector = Linear(vc.hidden_size, config.hidden_size, bias=False)
+        linear_class, _ = _vision_linear_classes(config)
+        self.projector = linear_class(vc.hidden_size, config.hidden_size, bias=False)
 
     def forward(
         self,
@@ -2472,8 +2898,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
                 # exposes its layers as "layers" directly, so strip the extra prefix.
                 new_key = new_key.replace("encoder.encoder.", "encoder.", 1)
                 # Flatten Gemma4ClippableLinear's .linear. wrapper
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
+                new_key = new_key.replace(".linear.", ".")
                 renamed[new_key] = value
             elif key.startswith("embed_vision.embedding_projection."):
                 suffix = key[len("embed_vision.embedding_projection.") :]
@@ -2517,6 +2942,7 @@ class Gemma4EmbeddingModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             embed_scale,
+            component="embedding",
         )
         self.image_token_id = config.image_token_id or 0
         # Audio token ID is only set when the model has an audio encoder.
@@ -2536,8 +2962,10 @@ class Gemma4EmbeddingModel(nn.Module):
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
                 float(self._per_layer_dim**0.5),
+                component="embedding",
             )
-            self.per_layer_model_projection = Linear(
+            linear_class = _embedding_linear_class(config) or Linear
+            self.per_layer_model_projection = linear_class(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,
                 bias=False,
@@ -2702,6 +3130,7 @@ class _Gemma4AudioEncoderModel(nn.Module):
     def __init__(self, config: Gemma4Config):
         super().__init__()
         self.config = config
+        linear_class, clippable_linear_class = _audio_linear_classes(config)
         ac = config.audio  # Gemma4AudioConfig (guaranteed non-None when used)
         input_size = (ac.input_size if ac else None) or 128
         hidden_size = (ac.hidden_size if ac else None) or 1024
@@ -2716,13 +3145,15 @@ class _Gemma4AudioEncoderModel(nn.Module):
         self.encoder = Gemma4AudioEncoder(
             input_size=input_size,
             hidden_size=hidden_size,
-            num_heads=8,  # fixed per Gemma4 audio_config
+            num_heads=(ac.attention_heads if ac and ac.attention_heads else 8),
             num_layers=num_layers,
             conv_kernel_size=5,  # fixed per Gemma4 audio_config
             conv_channels=conv_channels,
             attention_context_left=13,  # fixed per Gemma4 audio_config
             output_proj_dims=output_proj_dims,
             rms_norm_eps=rms_norm_eps,
+            linear_cls=linear_class,
+            clippable_linear_cls=clippable_linear_class,
         )
         # Scale-free RMSNorm applied before the projection (HF embed_audio.embedding_pre_projection_norm).
         # with_scale=False in HF → no learnable weight → no checkpoint key, no ONNX initializer.
@@ -2732,7 +3163,7 @@ class _Gemma4AudioEncoderModel(nn.Module):
         self._rms_norm_eps = rms_norm_eps
         # Learned projection from encoder output space → text hidden size.
         # Corresponds to HF's embed_audio.embedding_projection (no bias).
-        self.projector = Linear(output_proj_dims, config.hidden_size, bias=False)
+        self.projector = linear_class(output_proj_dims, config.hidden_size, bias=False)
 
     def forward(
         self,
@@ -3022,11 +3453,11 @@ class Gemma4Model(nn.Module):
 
     Always produced:
     - ``decoder``: Gemma4 text decoder taking ``inputs_embeds``
-    - ``vision``: SigLIP-style encoder + projector
+    - ``vision_encoder``: SigLIP-style encoder + projector
     - ``embedding``: scaled word embedding + multimodal feature fusion
 
     Added when ``config.audio is not None``:
-    - ``speech``: Conformer audio encoder + projection to text hidden size
+    - ``audio_encoder``: Conformer audio encoder + projection to text hidden size
 
     Covers all Gemma4 variants:
     - Vision-language (26B-A4B, 31B): ``audio=None``
@@ -3038,8 +3469,15 @@ class Gemma4Model(nn.Module):
     default_task: str = "gemma4"
     category: str = "Multimodal"
 
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = _GEMMA4_COMPONENT_SOURCES
+
     def __init__(self, config: Gemma4Config):
         super().__init__()
+        _validate_component_quantization(
+            config,
+            has_audio=config.audio is not None,
+        )
         self.config = config
         self.decoder = _Gemma4DecoderModel(config)
         self.vision_encoder = _Gemma4VisionEncoderModel(config)
@@ -3128,6 +3566,9 @@ class Gemma4Model(nn.Module):
                         # embeddings route correctly.
                         renamed["embedding." + suffix] = value
 
+            elif key.startswith("lm_head."):
+                renamed["decoder." + key] = value
+
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
                 # HF wraps encoder layers under an extra "encoder." sub-module; strip it
@@ -3135,8 +3576,7 @@ class Gemma4Model(nn.Module):
                     "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
                 )
                 # HF uses Gemma4ClippableLinear which adds a ".linear." infix; strip it
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
+                new_key = new_key.replace(".linear.", ".")
                 renamed[new_key] = value
 
             elif key.startswith("embed_vision.embedding_projection."):
@@ -3149,8 +3589,7 @@ class Gemma4Model(nn.Module):
             elif key.startswith("audio_tower."):
                 new_key = "audio_encoder.encoder." + key[len("audio_tower.") :]
                 # HF Conformer linear layers use a ".linear." infix; strip it
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
+                new_key = new_key.replace(".linear.", ".")
                 # HF subsample_conv_projection uses "layerN.conv" / "layerN.norm" names;
                 # our ONNX module uses "convN" / "normN" directly.
                 new_key = new_key.replace(
@@ -3188,6 +3627,8 @@ class Gemma4Model(nn.Module):
 
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
+
+        renamed = _preprocess_component_quantized_weights(renamed, self.config)
 
         # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 256 MiB
         # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.
@@ -3251,6 +3692,19 @@ class Gemma4UnifiedModel(nn.Module):
 
     default_task: str = "gemma4-unified"
     category: str = "Multimodal"
+
+    # Runtime HF sub-trees for the encoder-free unified layout.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_embedder", "model.embed_vision"),
+        "audio_encoder": ("model.embed_audio",),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()

@@ -113,6 +113,33 @@ class TestConv2d:
         assert conv._strides == (1, 4)
         assert conv._pads == [0, 2, 0, 2]
 
+    def test_dilation_defaults_to_one(self):
+        conv = Conv2d(3, 16, kernel_size=3, padding=1)
+        assert conv._dilations == (1, 1)
+
+    def test_dilation_accepts_int_and_pair(self):
+        assert Conv2d(3, 16, kernel_size=3, dilation=2)._dilations == (2, 2)
+        assert Conv2d(3, 16, kernel_size=3, dilation=(4, 1))._dilations == (4, 1)
+
+    def test_positional_call_is_unchanged_by_dilation(self):
+        """``dilation`` was appended, so existing positional calls still work."""
+        conv = Conv2d(3, 16, 3, 2, 1, 1)
+        assert list(conv.weight.shape) == [16, 3, 3, 3]
+        assert conv._strides == (2, 2)
+        assert conv._pads == [1, 1, 1, 1]
+        assert conv._groups == 1
+        assert conv._dilations == (1, 1)
+
+    def test_dilation_reaches_the_conv_node(self):
+        conv = Conv2d(4, 4, kernel_size=(3, 3), padding=(2, 1, 2, 1), dilation=(2, 1))
+        test_builder, op, graph = create_test_builder()
+        x = create_test_input(test_builder, "x", [1, 4, 8, 8])
+
+        conv(op, x)
+
+        node = next(n for n in graph if n.op_type == "Conv")
+        assert list(node.attributes["dilations"].value) == [2, 1]
+
 
 class TestConv2dNoBias:
     """Tests for 2D convolution without bias."""

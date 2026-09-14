@@ -28,7 +28,7 @@ from mobius._testing.torch_reference import (
     torch_whisper_decoder_forward,
     torch_whisper_encoder_forward,
 )
-from mobius._weight_loading import _download_weights
+from mobius.integrations._weight_loading import _download_weights
 from mobius.models.whisper import WhisperForConditionalGeneration
 from mobius.tasks import SpeechToTextTask
 

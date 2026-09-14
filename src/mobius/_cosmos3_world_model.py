@@ -28,7 +28,6 @@ from typing import Any
 
 import onnx_ir as ir
 
-from mobius._builder import build as build_model
 from mobius._builder import build_from_module
 from mobius._configs import (
     Cosmos3AudioConfig,
@@ -49,12 +48,13 @@ from mobius._pipeline import (
     PipelinePackage,
     register_transform,
 )
-from mobius._weight_loading import iter_weight_shards
 from mobius._world_model_config import (
     WorldModelBuildConfig,
     WorldModelGenerationConfig,
     WorldModelPipelineConfig,
 )
+from mobius.integrations._weight_loading import iter_weight_shards
+from mobius.integrations.transformers import build as build_model
 from mobius.models.cosmos3_audio import create_cosmos3_avae_audio_tokenizer
 from mobius.models.cosmos3_omni import Cosmos3OmniReasonerModel
 from mobius.models.cosmos3_omni_generator import Cosmos3OmniGeneratorModel

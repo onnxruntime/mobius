@@ -59,31 +59,38 @@ class LightningAttention(nn.Module):
         layer_idx: Zero-based layer index, used to compute slope_rate.
     """
 
-    def __init__(self, config: ArchitectureConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        layer_idx: int,
+        linear_class: type | None = None,
+    ):
         super().__init__()
+        linear_class = linear_class or Linear
         self.num_heads = config.num_attention_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = config.head_dim
         self.hidden_size = config.hidden_size
         self._dtype = config.dtype
 
         # Fused QKV projection — SiLU applied to all 3*H*d_k before split
-        self.qkv_proj = Linear(
+        self.qkv_proj = linear_class(
             config.hidden_size,
             self.num_heads * self.head_dim * 3,
             bias=False,
         )
-        self.out_proj = Linear(
+        self.o_proj = linear_class(
             self.num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
         )
         # output_gate: sigmoid gate applied to the normalized attention output
-        self.output_gate = Linear(
+        self.output_gate = linear_class(
             config.hidden_size,
             self.num_heads * self.head_dim,
             bias=False,
         )
-        self.norm = RMSNorm(self.num_heads * self.head_dim, eps=config.rms_norm_eps)
+        norm_eps = config.lightning_norm_eps or config.rms_norm_eps
+        self.norm = RMSNorm(self.num_heads * self.head_dim, eps=norm_eps)
 
         # Per-head log-space decay values (negative, so exp < 1)
         # HF: slope_rate[h] = base^(h+1) * factor
@@ -97,6 +104,7 @@ class LightningAttention(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         recurrent_state: ir.Value,
+        attention_mask: ir.Value | None = None,
     ):
         """Lightning Attention forward.
 
@@ -117,14 +125,28 @@ class LightningAttention(nn.Module):
         qkv = self.qkv_proj(op, hidden_states)
         qkv = op.Swish(qkv)
 
-        # Split into Q, K, V: each (B, T, num_heads * head_dim)
-        head_total = self.num_heads * self.head_dim
+        # MiniMax stores Q/K/V adjacent within each head:
+        # (B, T, H * 3D) -> (B, T, H, 3D) -> three (B, T, H, D) tensors.
+        qkv = op.Reshape(qkv, [0, 0, self.num_heads, 3 * self.head_dim])
         query, key, value = op.Split(
             qkv,
-            op.Constant(value_ints=[head_total, head_total, head_total]),
+            op.Constant(value_ints=[self.head_dim, self.head_dim, self.head_dim]),
             axis=-1,
             _outputs=3,
         )
+        query = op.Reshape(query, [0, 0, -1])
+        key = op.Reshape(key, [0, 0, -1])
+        value = op.Reshape(value, [0, 0, -1])
+        if attention_mask is not None:
+            # Only newly processed tokens contribute to the recurrent state.
+            current_mask = op.Slice(
+                attention_mask,
+                op.Neg(seq_dim),
+                op.Constant(value_ints=[9223372036854775807]),
+                op.Constant(value_ints=[1]),
+            )
+            current_mask = op.Unsqueeze(op.CastLike(current_mask, value), [2])
+            value = op.Mul(value, current_mask)
 
         # Static decay tensor: (B, T, num_heads) with constant per-head values.
         # Each decay[h] = -slope_rate[h] in log-space → exp(decay[h]) < 1.
@@ -144,8 +166,6 @@ class LightningAttention(nn.Module):
         decay = op.Expand(decay_1, expand_to)  # (B, T, num_heads)
 
         # LinearAttention "gated": S_t = exp(g_t) * S_{t-1} + k_t ⊗ v_t
-        # scale = 1/sqrt(head_dim) for proper scaling
-        scale = 1.0 / math.sqrt(self.head_dim)
         attn_out, new_state = op.LinearAttention(
             query,
             key,
@@ -155,7 +175,7 @@ class LightningAttention(nn.Module):
             update_rule="gated",
             q_num_heads=self.num_heads,
             kv_num_heads=self.num_heads,
-            scale=scale,
+            scale=1.0,
             _domain=DOMAIN,
             _outputs=2,
         )
@@ -166,7 +186,7 @@ class LightningAttention(nn.Module):
         gate = op.Sigmoid(self.output_gate(op, hidden_states))
         attn_out = op.Mul(gate, attn_out)
 
-        output = self.out_proj(op, attn_out)
+        output = self.o_proj(op, attn_out)
         return output, new_state
 
 
@@ -174,8 +194,14 @@ def _compute_decay_log(layer_idx: int, num_layers: int, num_heads: int) -> list[
     """Compute per-head log-space decay values for Lightning Attention.
 
     Returns negative values so that exp(decay[h]) = exp(-slope_rate[h]) < 1.
-    Matches HF ``MiniMaxLightningAttention.get_slope_rate()``.
+    Matches the pinned llama.cpp MiniMax-01 slope calculation.
     """
-    base = 1.0 / (2.0 ** (8.0 / num_heads))
-    factor = 1.0 - layer_idx / (num_layers - 1.0 + 1e-5) + 1e-5
-    return [-(base ** (h + 1)) * factor for h in range(num_heads)]
+    if num_layers <= 1:
+        raise ValueError("MiniMax Lightning Attention requires at least two layers")
+
+    if num_heads <= 0:
+        raise ValueError("MiniMax Lightning Attention requires at least one head")
+    start = 2.0 ** (-(2.0 ** -(math.log2(num_heads) - 3.0)))
+    slopes = [start ** (head + 1) for head in range(num_heads)]
+    factor = 1.0 - layer_idx / (num_layers - 1.0) + 1e-5
+    return [-slope * factor for slope in slopes]

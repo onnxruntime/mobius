@@ -77,6 +77,7 @@ class Conv2d(nn.Module):
         stride: int | tuple[int, int] = 1,
         padding: int | tuple[int, int, int, int] = 0,
         groups: int = 1,
+        dilation: int | tuple[int, int] = 1,
     ):
         super().__init__()
         kernel_h, kernel_w = _pair(kernel_size, "kernel_size")
@@ -87,6 +88,7 @@ class Conv2d(nn.Module):
         self._strides = _pair(stride, "stride")
         self._pads = _resolve_pads(padding)
         self._groups = groups
+        self._dilations = _pair(dilation, "dilation")
 
     def forward(self, op: OpBuilder, x: ir.Value):
         return op.Conv(
@@ -96,6 +98,7 @@ class Conv2d(nn.Module):
             kernel_shape=list(self._kernel_size),
             strides=list(self._strides),
             pads=self._pads,
+            dilations=list(self._dilations),
             group=self._groups,
         )
 

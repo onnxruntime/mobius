@@ -49,7 +49,7 @@ reason — before the PR is merged.
       for VLM / audio models)
 - [ ] `is_representative=True` if the model has unique behaviour (custom
       class, special attention, MoE, hybrid layers, etc.)
-- [ ] `python -m pytest tests/build_graph_test.py -k "<model_type>"` passes
+- [ ] `python -m pytest tests/build_graph -k "<model_type>"` passes
 - [ ] Weight-alignment test passes:
       `python -m pytest tests/weight_alignment_test.py -k "<model_type>"`
 
@@ -67,8 +67,9 @@ reason — before the PR is merged.
       `_test_configs.py`; added automatically for text-generation models)
 - [ ] `python -m pytest tests/synthetic_parity_test.py -k "<model>"` passes
       with `atol=1e-3` / `rtol=1e-3` (or `1e-2` for multimodal)
-- [ ] Real-weight parity also checked via `tests/integration_test.py` (add
-      model to `_TEXT_MODELS` or equivalent if a small checkpoint is available)
+- [ ] Real-weight parity also checked via a focused integration suite (add
+      generic causal LMs to `TEXT_MODELS` in `tests/integration/_support.py`
+      if a small checkpoint is available)
 
 ### 5. L4 — Golden match
 
@@ -165,9 +166,13 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 
 Downstream evidence:
 
-- [ ] If ORT GenAI load/generation is run, record the exact runtime version and
-      result. Failures document limitations but never gate Mobius export based
-      on the runtime registry, topology support, or cache executor capability.
+- [ ] The network-free generic decoder test passes with the pinned latest stable
+      `onnxruntime-genai==0.15.2`.
+- [ ] Every runtime-supported real route has an `ort_genai` YAML marker with an
+      immutable evidence ID, exact tokenizer provenance, bounded download size,
+      CPU provider claim, and explicit released-version capabilities.
+- [ ] Real generation asserts the full generated length before token equality
+      and runs with an isolated Hub/Xet cache that is deleted after the test.
 - [ ] If ORT GenAI validation is run for a model with dual head dimensions,
       determine whether that runtime requires
       `search.past_present_share_buffer=false` for its uniform KV-cache
@@ -183,7 +188,9 @@ Waiver needed if any of the steps are not possible.
 Run the ORT GenAI integration test:
 
 ```bash
-python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
+python -m pytest tests/ort_genai_e2e_test.py -m ort_genai_fast -v
+python -m pytest tests/gguf_small_model_runtime_integration_test.py \
+  -m ort_genai_real -v
 ```
 
 ### 10. Foundry Local package check
@@ -263,7 +270,7 @@ lintrunner f --output oneline --all-files
 lintrunner -a
 
 # L1 – graph build
-python -m pytest tests/build_graph_test.py -k "<model_type>"
+python -m pytest tests/build_graph -k "<model_type>"
 
 # L1 – weight alignment
 python -m pytest tests/weight_alignment_test.py -k "<model_type>"
@@ -275,7 +282,7 @@ python -m pytest tests/yaml_schema_test.py
 python -m pytest tests/synthetic_parity_test.py -k "<model>" -sv
 
 # L3 – real-weight integration (if small checkpoint available)
-python -m pytest tests/integration_test.py -m integration -k "<model>" -sv
+python -m pytest tests/integration -m integration -k "<model>" -sv
 
 # L4 – generate golden
 python scripts/generate_golden.py --level L4 --filter '<model>*'

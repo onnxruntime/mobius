@@ -97,10 +97,21 @@ Key decoder fields: `filename`, `hidden_size`, `head_size`,
 ### LLM (decoder-only → `DecoderOnly_Model`)
 
 ```
-chatglm, decoder, ernie4_5, gemma, gemma2, gemma3_text, gpt2,
-gptoss, granite, internlm2, llama, mistral, nemotron, olmo,
-phi, phimoe, phi3, phi3small, qwen2, qwen3, smollm3
+decoder
 ```
+
+Mobius emits `model.type = "decoder"` for every graph-representable,
+single-model decoder-only package, regardless of the HuggingFace architecture
+name. The optimized graph and config mappings define the runtime contract.
+
+Specialized decoder-only exceptions are explicit:
+
+- `gpt2`: selects `Gpt_Model`; Mobius rejects its separate key/value cache ABI
+  because the runtime requires combined rank-5 cache tensors.
+- `lfm2`: selects `LFM2_Model` and its convolution-cache implementation.
+- `phi3`, `phi3small`, `phimoe`: used only for LongRoPE configs whose runtime
+  must recompute caches after crossing the short-context threshold. Non-LongRoPE
+  exports use `decoder`.
 
 ### VLM (vision-language → `MultiModalLanguageModel`)
 
@@ -141,7 +152,7 @@ phi3small_pipeline, qwen2_5_vl_pipeline
 ```json
 {
   "model": {
-    "type": "llama",
+    "type": "decoder",
     "vocab_size": 32000,
     "context_length": 4096,
     "eos_token_id": 2,

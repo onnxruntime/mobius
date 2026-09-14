@@ -14,6 +14,8 @@ INT64_MAX = 9223372036854775807
 class Linear(nn.Module):
     """Linear (fully-connected) layer using ONNX ops."""
 
+    component_quantization_excluded_methods: frozenset[str] = frozenset()
+
     def __init__(
         self,
         in_features: int,

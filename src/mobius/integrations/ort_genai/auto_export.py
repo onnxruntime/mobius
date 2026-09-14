@@ -23,6 +23,9 @@ Three entry points, in order of increasing convenience:
   HF-model-id → ORT-GenAI-directory case.
 
 All three produce a directory that ``onnxruntime-genai`` can load directly.
+Packages with an MTP sidecar additionally emit an external coordination contract;
+the target remains loadable while combined target/MTP execution is marked
+``runtime_unvalidated``.
 
 Example::
 
@@ -51,8 +54,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from mobius.upstream_patches import apply_asset_patches
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -61,12 +68,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _revision_kwargs(revision: str | None) -> dict[str, str]:
+    """Return an optional HuggingFace revision keyword without passing ``None``."""
+    return {"revision": revision} if revision is not None else {}
+
+
 # ORT-GenAI model type overrides for model types whose ORT-GenAI name
 # differs from the HuggingFace model_type.
 _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "llama": "llama",
     "qwen2": "qwen2",
     "qwen3": "qwen2",
+    # Qwen3-MoE shares the dense Qwen3 decoder contract (same inputs, position
+    # IDs and KV cache layout); only the MLP differs, and that is fused into
+    # the exported graph. ORT GenAI has no "qwen3_moe" entry in its LLM type
+    # registry (see onnxruntime-genai/src/models/model_type.h), so passing the
+    # HF type through fails to load with "Unsupported model_type in
+    # config.json: qwen3_moe". It maps to "qwen3" rather than reusing the dense
+    # "qwen3" -> "qwen2" alias: both types dispatch to DecoderOnly_Model, but
+    # ORT GenAI's tokenizer tag fallback (tokenizer_tag_utils.cpp) only supplies
+    # Qwen3 reasoning-token IDs (bor 151667 / eor 151668) for "qwen3"; under
+    # "qwen2" those are absent and tokenizer.bor_token_id/eor_token_id throws.
+    "qwen3_moe": "qwen3",
     "phi3": "phi3",
     "phi": "phi",
     "phi4mm": "phi4mm",
@@ -84,21 +108,86 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "mistral": "mistral",
     "mistral3": "mistral3",
     "lfm2": "lfm2",
+    "lfm2_vl": "lfm2_vl",
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
     "deepseek_v4": "decoder",
+    # PLaMo2 is a decoder-only hybrid. Released ORT GenAI does not have a
+    # model-specific registry entry, so emit its generic decoder type.
+    "plamo2": "decoder",
     # Qwen VL model families have separate ORT GenAI model types.
     "qwen2_vl": "qwen2_5_vl",
+    "qwen2_vl_text": "qwen2_5_vl",
+    "qwen2_5_vl_text": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    "qwen3_5": "qwen2_5_vl",
-    "qwen3_5_vl": "qwen2_5_vl",
+    # Preserve Qwen3.5 / Qwen3.6 source architecture identities here so package
+    # topology selection can distinguish standalone text from dense and MoE
+    # multimodal parents. Standalone text packages are normalized later to the
+    # released generic "decoder" type; multimodal variants retain the matching
+    # Qwen-VL type so the runtime constructs the vision+embedding pipeline.
+    "qwen3_5": "qwen3_5",
+    "qwen3_5_text": "qwen3_5_text",
+    "qwen3_5_vl": "qwen3_5",
+    "qwen3_5_vl_text": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5_moe",
+    "qwen3_5_moe_text": "qwen3_5_moe_text",
+    "qwen3_5_moe_vl": "qwen3_5_moe",
+    # GLM-OCR uses the Qwen2.5-VL three-model runtime contract: packed image
+    # patches, M-RoPE position IDs, an embedding mixer, and a cached decoder.
+    "glm_ocr": "qwen2_5_vl",
+    "glm_ocr_text": "qwen2_5_vl",
     # MiniCPM uses standard 1D decoder position IDs (unlike Qwen-VL MRoPE).
     # The phi3v multimodal runtime provides that contract; callers supply
     # HF-preprocessed packed pixels through Generator.set_inputs().
     "minicpmv4_6": "phi3v",
 }
+
+# These text types select runtime implementations with semantics that are not
+# described by the ordinary decoder graph ABI. All other compatible, single-
+# model decoder packages use ORT GenAI's released generic DecoderOnly_Model.
+_ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
+    "lfm2": "lfm2",
+    "lfm2_vl": "lfm2",
+}
+# Composite configs are unwrapped to their text sub-config during config-mode
+# builds. Recover the parent runtime type when the exported package still has
+# the full multimodal topology.
+_UNWRAPPED_VLM_MODEL_TYPES = {
+    "gemma3_text": "gemma3",
+    # Gemma3n must retain its own pipeline: it binds per-layer inputs that the
+    # Gemma3 runtime does not support.
+    "gemma3n_text": "gemma3n",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_vl_text": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5_moe",
+}
+_LONGROPE_TEXT_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
+_DECODER_SEMANTIC_INPUTS = frozenset(
+    {
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "past_sequence_length",
+        "current_sequence_length",
+    }
+)
+_CACHE_NAME = re.compile(
+    r"^(?P<prefix>.+\.)(?P<index>[0-9]+)\.(?P<kind>"
+    r"key|value|conv_state|recurrent_state|ssm_state|"
+    r"index_key|ple_conv_state|ple_context)$"
+)
+_QWEN4_EXP_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
+
+
+@dataclass(frozen=True)
+class _DecoderAbi:
+    inputs: dict[str, str]
+    outputs: dict[str, str]
+    cache_slots: int
+    has_recurrent_state: bool
+
 
 _GEMMA4_MODEL_TYPES = frozenset(
     {"gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"}
@@ -112,7 +201,9 @@ _GEMMA4_MODEL_TYPES = frozenset(
 # must preprocess with the HuggingFace processor and feed tensors via
 # ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
+_GLMASR_MODEL_TYPES = frozenset({"glmasr"})
 _MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
+_LFM2_VL_MODEL_TYPES = frozenset({"lfm2_vl"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
 # "gemma3").
@@ -130,19 +221,44 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "muse_glimmer",
         "muse_glimmer_text",
         "qwen2_vl",
+        "qwen2_vl_text",
         "qwen2_5_vl",
+        "qwen2_5_vl_text",
         "qwen3_vl",
         "mage_vl",
+        "glm_ocr",
+        "glm_ocr_text",
         "qwen3_vl_text",
         "qwen3_5",
         "qwen3_5_vl",
+        "qwen3_5_vl_text",
         "qwen3_5_moe",
+        "qwen3_5_moe_vl",
+        "qwen3_5_moe_text",
         "videochat_flash_qwen",
+        "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
+_QWEN35_VL_MODEL_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_vl",
+        "qwen3_5_vl_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "qwen3_5_moe_vl",
+    }
+)
+_QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS = {
+    "nv_profile_min_shapes": "pixel_values:600x1536",
+    "nv_profile_opt_shapes": "pixel_values:600x1536",
+    "nv_profile_max_shapes": "pixel_values:600x1536",
+}
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
+    "tokenizer.jsonl",  # PLaMo2 scored vocabulary
     "tokenizer_config.json",
     "special_tokens_map.json",
     "tokenizer.model",  # SentencePiece
@@ -150,9 +266,11 @@ _TOKENIZER_FILES = [
     "merges.txt",  # BPE
     "vocab.json",  # BPE
     "chat_template.jinja",  # Chat template for ORT GenAI
+    "tokenization_plamo.py",  # PLaMo2's exact custom tokenizer implementation
     # Preserve HuggingFace processor metadata for VLMs whose preprocessing
     # cannot be represented by an ort-extensions image_processor.json.
     "preprocessor_config.json",
+    "processor_config.json",
 ]
 
 
@@ -166,40 +284,197 @@ def _select_ort_model_type(
     hf_model_type: str | None,
     *,
     is_decoder_only: bool,
+    rope_type: str | None = None,
 ) -> str:
     """Choose the ORT-GenAI model type for an exported package.
 
-    Decoder-only packages prefer the built package's ``config.model_type`` so
-    text-only / overridden builds (e.g. ``gemma4_unified -> gemma4_unified_text``)
-    resolve to the decoder-only ORT type. Multimodal packages keep the HF
-    parent ``model_type``: ``build()`` unwraps composite configs to their text
-    sub-config, so ``config.model_type`` would otherwise be the text type even
-    for a full multimodal export.
+    Released ORT GenAI dispatches ``decoder`` to its generic
+    ``DecoderOnly_Model``. Decoder-only packages therefore use that type unless
+    the runtime has genuinely different behavior: ``gpt2`` selects ``Gpt_Model``,
+    ``lfm2`` selects ``LFM2_Model``/``LFM2Cache``, and Phi-3 family names are
+    retained only for LongRoPE cache recomputation after the short-context
+    threshold. Standalone Qwen3.5 text configs also normalize to ``decoder``:
+    their specialized names dispatch to the same ``DecoderOnly_Model`` and are
+    not available in the latest released ORT GenAI. Mobius GPT-2 graphs also
+    normalize to ``decoder`` because they expose the generic separate-key/value
+    cache ABI rather than ``Gpt_Model``'s rank-5 combined cache.
 
-    The ``config.model_type`` preference only applies when it resolves to a
-    *known* ORT-GenAI type (a key in :data:`_ORT_GENAI_MODEL_TYPE`). An
-    unrecognised ``config.model_type`` would otherwise pass straight through as
-    an invalid ORT type and mask a valid HF-derived mapping, so in that case we
-    fall back to ``hf_model_type``.
+    Multimodal and encoder-decoder packages retain their architecture-specific
+    type because those values select distinct runtime pipelines and position-ID
+    semantics.
     """
-    if is_decoder_only and config_model_type in _ORT_GENAI_MODEL_TYPE:
-        return _ORT_GENAI_MODEL_TYPE[config_model_type]
+    if is_decoder_only:
+        for source_type in (config_model_type, hf_model_type):
+            resolved = _resolve_ort_genai_model_type(source_type or "unknown")
+            if resolved in _ARCHITECTURE_SPECIFIC_TEXT_TYPES:
+                return _ARCHITECTURE_SPECIFIC_TEXT_TYPES[resolved]
+            if resolved in _LONGROPE_TEXT_TYPES and rope_type == "longrope":
+                return resolved
+        return "decoder"
     return _resolve_ort_genai_model_type(hf_model_type or "unknown")
+
+
+def _cache_names(names: list[str]) -> dict[str, dict[int, str]]:
+    result: dict[str, dict[int, str]] = {}
+    for name in names:
+        match = _CACHE_NAME.fullmatch(name)
+        if match is None:
+            continue
+        result.setdefault(match["kind"], {})[int(match["index"])] = name
+    return result
+
+
+def _name_template(names: dict[int, str], *, label: str) -> str:
+    templates: set[str] = set()
+    for name in names.values():
+        match = _CACHE_NAME.fullmatch(name)
+        if match is None:
+            raise ValueError(f"Invalid {label} cache name {name!r}")
+        templates.add(f"{match['prefix']}%d.{match['kind']}")
+    if len(templates) != 1:
+        raise ValueError(f"ORT GenAI requires one consistent {label} name template")
+    return templates.pop()
+
+
+def _is_single_model_decoder_package(pkg: ModelPackage) -> bool:
+    if set(pkg) != {"model"}:
+        return False
+    model = pkg.get("model")
+    if model is None:
+        return False
+    input_names = {value.name for value in model.graph.inputs}
+    output_names = {value.name for value in model.graph.outputs}
+    return "input_ids" in input_names and "logits" in output_names
+
+
+def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
+    """Validate intrinsic decoder semantics and describe the graph contract."""
+    input_names = [value.name for value in model.graph.inputs if value.name is not None]
+    output_names = [value.name for value in model.graph.outputs if value.name is not None]
+    if "input_ids" not in input_names:
+        raise ValueError("Generic ORT GenAI decoder graphs must expose an input_ids input")
+    if "logits" not in output_names:
+        raise ValueError("Generic ORT GenAI decoder graphs must expose a logits output")
+    if model_type == "gpt2":
+        raise ValueError(
+            "ORT GenAI's gpt2 runtime requires one rank-5 combined KV-cache tensor per "
+            "layer, but Mobius GPT-2 graphs expose separate key/value tensors; refusing "
+            "to emit an incompatible specialized-runtime config"
+        )
+
+    input_cache = _cache_names(input_names)
+    output_cache = _cache_names(output_names)
+    cache_input_names = {name for values in input_cache.values() for name in values.values()}
+    unknown_inputs = set(input_names) - cache_input_names - _DECODER_SEMANTIC_INPUTS
+    has_current_length = "current_sequence_length" in input_names
+    has_past_length = "past_sequence_length" in input_names
+    if has_current_length != has_past_length:
+        raise ValueError(
+            "ORT GenAI supplies current_sequence_length and past_sequence_length only "
+            "as a pair"
+        )
+    key_indices = set(input_cache.get("key", {}))
+    value_indices = set(input_cache.get("value", {}))
+    present_key_indices = set(output_cache.get("key", {}))
+    present_value_indices = set(output_cache.get("value", {}))
+    if not key_indices or key_indices != value_indices:
+        raise ValueError("ORT GenAI decoder graphs require paired key/value cache inputs")
+    if key_indices != present_key_indices or key_indices != present_value_indices:
+        raise ValueError(
+            "ORT GenAI decoder cache outputs must match the graph's key/value inputs"
+        )
+
+    recurrent_indices = set(input_cache.get("conv_state", {}))
+    has_recurrent_state = bool(input_cache.get("recurrent_state"))
+    if model_type == "lfm2":
+        if recurrent_indices != set(output_cache.get("conv_state", {})):
+            raise ValueError("LFM2 conv_state outputs must match its conv_state inputs")
+    elif recurrent_indices or has_recurrent_state:
+        expected = set(input_cache.get("recurrent_state", {}))
+        if not recurrent_indices or recurrent_indices != expected:
+            raise ValueError(
+                "Generic recurrent state requires paired conv_state/recurrent_state inputs"
+            )
+        if recurrent_indices != set(
+            output_cache.get("conv_state", {})
+        ) or recurrent_indices != set(output_cache.get("recurrent_state", {})):
+            raise ValueError(
+                "Generic recurrent state outputs must match conv_state/recurrent_state inputs"
+            )
+
+    decoder_inputs = {
+        name: name
+        for name in input_names
+        if name in _DECODER_SEMANTIC_INPUTS or name in unknown_inputs
+    }
+    decoder_inputs["past_key_names"] = _name_template(input_cache["key"], label="past-key")
+    decoder_inputs["past_value_names"] = _name_template(
+        input_cache["value"], label="past-value"
+    )
+    decoder_outputs = {
+        "logits": "logits",
+        "present_key_names": _name_template(output_cache["key"], label="present-key"),
+        "present_value_names": _name_template(output_cache["value"], label="present-value"),
+    }
+    if model_type == "lfm2" and recurrent_indices:
+        decoder_inputs["past_conv_names"] = _name_template(
+            input_cache["conv_state"], label="past-convolution"
+        )
+        decoder_outputs["present_conv_names"] = _name_template(
+            output_cache["conv_state"], label="present-convolution"
+        )
+    elif recurrent_indices:
+        expected_input_prefix = decoder_inputs["past_key_names"].rsplit(".", 1)[0]
+        expected_output_prefix = decoder_outputs["present_key_names"].rsplit(".", 1)[0]
+        recurrent_templates = {
+            _name_template(input_cache["conv_state"], label="past-convolution"),
+            _name_template(input_cache["recurrent_state"], label="past-recurrent"),
+        }
+        present_templates = {
+            _name_template(output_cache["conv_state"], label="present-convolution"),
+            _name_template(output_cache["recurrent_state"], label="present-recurrent"),
+        }
+        # Preserve graph-derived names even when a runtime derives different
+        # names from the key-cache templates.
+        del (
+            expected_input_prefix,
+            expected_output_prefix,
+            recurrent_templates,
+            present_templates,
+        )
+    all_indices = set().union(*(set(indices) for indices in input_cache.values()))
+    return _DecoderAbi(
+        inputs=decoder_inputs,
+        outputs=decoder_outputs,
+        cache_slots=max(all_indices) + 1,
+        has_recurrent_state=has_recurrent_state,
+    )
+
+
+def _load_generation_config(model_id: str):
+    """Load optional Hugging Face generation settings without requiring the file."""
+    import transformers
+
+    try:
+        return transformers.GenerationConfig.from_pretrained(model_id)
+    except OSError:
+        logger.debug(
+            "No generation_config.json found for %s; using model config token IDs", model_id
+        )
+        return None
 
 
 def _graph_input_names(model: ir.Model) -> list[str]:
     """Return non-KV-cache input names from an ONNX model graph.
 
-    Filters out KV cache inputs (``past_key_values.*`` and ``past_*``)
-    since those are represented as template patterns in genai_config.json,
-    not as literal graph input names.
+    Filters out indexed cache inputs (``past_key_values.*``), since those
+    are represented as template patterns in genai_config.json. Semantic state
+    such as ``past_position_ids`` remains explicit and graph-derived.
     """
     return [
         inp.name
         for inp in model.graph.inputs
-        if inp.name is not None
-        and not inp.name.startswith("past_key_values.")
-        and not inp.name.startswith("past_")
+        if inp.name is not None and not inp.name.startswith("past_key_values.")
     ]
 
 
@@ -250,25 +525,98 @@ def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     return {out.name: out.name for out in model.graph.outputs if out.name is not None}
 
 
+def _get_static_graph_input_dim(
+    pkg: ModelPackage,
+    component_name: str,
+    input_name: str,
+    axis: int,
+) -> int:
+    component = pkg.get(component_name)
+    if component is None:
+        raise ValueError(f"Component {component_name!r} is required.")
+    value = next(
+        (value for value in component.graph.inputs if value.name == input_name),
+        None,
+    )
+    if value is None or value.shape is None:
+        raise ValueError(
+            f"Component {component_name!r} requires input {input_name!r} with a known rank."
+        )
+    normalized_axis = axis if axis >= 0 else len(value.shape) + axis
+    if not 0 <= normalized_axis < len(value.shape):
+        raise ValueError(
+            f"Axis {axis} is out of range for {component_name!r} input "
+            f"{input_name!r} with rank {len(value.shape)}."
+        )
+    dimension = value.shape[normalized_axis]
+    if not isinstance(dimension, int):
+        raise TypeError(
+            f"Component {component_name!r} input {input_name!r} axis {axis} must be static."
+        )
+    return dimension
+
+
+def _make_trt_rtx_embedding_provider_options(
+    *,
+    image_feature_width: int,
+    input_id_lengths: tuple[int, int, int],
+    image_feature_lengths: tuple[int, int, int],
+) -> dict[str, str]:
+    return {
+        f"nv_profile_{profile}_shapes": (
+            f"input_ids:1x{input_length},image_features:{feature_length}x{image_feature_width}"
+        )
+        for profile, input_length, feature_length in zip(
+            ("min", "opt", "max"),
+            input_id_lengths,
+            image_feature_lengths,
+            strict=True,
+        )
+    }
+
+
 def _copy_tokenizer_files(
     model_id: str,
     output_dir: str,
+    *,
+    revision: str | None = None,
+    local_files_only: bool = False,
 ) -> list[str]:
     """Download and copy tokenizer files from HuggingFace Hub.
 
     Returns list of copied filenames.
     """
+    from huggingface_hub import errors as hub_errors
     from huggingface_hub import hf_hub_download
-    from huggingface_hub.utils import EntryNotFoundError
+    from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+
+    remote_entry_not_found = getattr(
+        hub_errors,
+        "RemoteEntryNotFoundError",
+        EntryNotFoundError,
+    )
 
     copied: list[str] = []
     for filename in _TOKENIZER_FILES:
         try:
-            src = hf_hub_download(model_id, filename)
+            download_kwargs: dict[str, Any] = _revision_kwargs(revision)
+            if local_files_only:
+                download_kwargs["local_files_only"] = True
+            src = hf_hub_download(
+                model_id,
+                filename,
+                **download_kwargs,
+            )
             dst = os.path.join(output_dir, filename)
             shutil.copy2(src, dst)
             copied.append(filename)
-        except (EntryNotFoundError, OSError):
+        except LocalEntryNotFoundError:
+            if local_files_only:
+                continue
+            raise
+        except remote_entry_not_found:
+            # Tokenizer formats are alternatives; a repository is not expected
+            # to contain every filename in _TOKENIZER_FILES.
             continue
     return copied
 
@@ -341,7 +689,69 @@ def _fix_tokenizer_config(output_dir: str) -> bool:
     return True
 
 
-def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
+_SPECIAL_TOKEN_FIELDS = {
+    "<tool_call>": "bot_token_id",
+    "</tool_call>": "eot_token_id",
+    "<|tool_call|>": "bot_token_id",
+    "<|/tool_call|>": "eot_token_id",
+    "<think>": "bor_token_id",
+    "</think>": "eor_token_id",
+}
+
+
+def _special_token_ids_from_tokenizer_config(
+    output_dir: str, vocab_size: int
+) -> dict[str, int]:
+    """Read delimiter IDs from copied tokenizer_config.json or tokenizer.json."""
+    special_token_ids: dict[str, int] = {}
+    ambiguous_fields: set[str] = set()
+    token_sources = (
+        ("tokenizer_config.json", "added_tokens_decoder"),
+        ("tokenizer.json", "added_tokens"),
+    )
+    for filename, added_tokens_key in token_sources:
+        path = os.path.join(output_dir, filename)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                added_tokens = json.load(f).get(added_tokens_key, {})
+        except (OSError, json.JSONDecodeError, AttributeError):
+            logger.warning("Could not read special tokens from %s", path, exc_info=True)
+            continue
+        if isinstance(added_tokens, dict):
+            entries = added_tokens.items()
+        elif isinstance(added_tokens, list):
+            entries = (
+                (token.get("id"), token) for token in added_tokens if isinstance(token, dict)
+            )
+        else:
+            continue
+        for raw_token_id, token in entries:
+            if not isinstance(token, dict):
+                continue
+            field = _SPECIAL_TOKEN_FIELDS.get(token.get("content"))
+            try:
+                token_id = int(raw_token_id)
+            except (TypeError, ValueError):
+                continue
+            if field is None or not 0 <= token_id < vocab_size or field in ambiguous_fields:
+                continue
+            if field in special_token_ids and special_token_ids[field] != token_id:
+                special_token_ids.pop(field)
+                ambiguous_fields.add(field)
+            else:
+                special_token_ids[field] = token_id
+    return special_token_ids
+
+
+def _fix_chat_template(
+    output_dir: str,
+    hf_model_id: str | None,
+    *,
+    revision: str | None = None,
+    trust_remote_code: bool = False,
+) -> bool:
     """Ensure chat_template is present in tokenizer_config.json.
 
     Some HuggingFace models don't store ``chat_template`` in the
@@ -370,7 +780,11 @@ def _fix_chat_template(output_dir: str, hf_model_id: str | None) -> bool:
     try:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(hf_model_id)
+        tokenizer = AutoTokenizer.from_pretrained(
+            hf_model_id,
+            trust_remote_code=trust_remote_code,
+            **_revision_kwargs(revision),
+        )
         template = getattr(tokenizer, "chat_template", None)
         if template:
             tc["chat_template"] = template
@@ -509,6 +923,7 @@ def _write_vision_processor_config(
     output_dir: str,
     *,
     hf_model_id: str | None = None,
+    revision: str | None = None,
     trust_remote_code: bool = False,
 ) -> str | None:
     """Write the vision processor config file for VLM models.
@@ -574,6 +989,17 @@ def _write_vision_processor_config(
         logger.info(
             "Skipping image_processor.json for %s "
             "(use MiniCPMV4_6Processor + Generator.set_inputs)",
+            model_type,
+        )
+        return None
+    if model_type in _LFM2_VL_MODEL_TYPES:
+        # LFM2-VL uses adaptive tiling, thumbnail insertion, NaFlex patchification,
+        # and prompt-token expansion. No ort-extensions transform implements that
+        # contract; preserve the pinned HF processor_config.json copied above and
+        # require callers to feed its three tensors through set_inputs().
+        logger.info(
+            "Skipping generated image processor for %s "
+            "(use Lfm2VlProcessor + Generator.set_inputs)",
             model_type,
         )
         return None
@@ -644,6 +1070,7 @@ def _write_vision_processor_config(
                 hf_proc = AutoProcessor.from_pretrained(
                     hf_model_id,
                     trust_remote_code=trust_remote_code,
+                    **_revision_kwargs(revision),
                 )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
@@ -731,14 +1158,16 @@ def _write_vision_processor_config(
             or 2
         )
 
-        # CLIP-standard normalization defaults
-        image_mean = [0.48145466, 0.4578275, 0.40821073]
-        image_std = [0.26862954, 0.26130258, 0.27577711]
+        is_qwen4_exp = model_type in _QWEN4_EXP_MODEL_TYPES
+        # Qwen4-Exp is pinned to the checkpoint's Qwen processor constants.
+        # Other generic VLMs retain the CLIP-standard fallback.
+        image_mean = [0.5, 0.5, 0.5] if is_qwen4_exp else [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.5, 0.5, 0.5] if is_qwen4_exp else [0.26862954, 0.26130258, 0.27577711]
         rescale_factor = 1.0 / 255.0
-        min_pixels = 784
-        max_pixels = 2371600
+        min_pixels = 65_536 if is_qwen4_exp else 784
+        max_pixels = 16_777_216 if is_qwen4_exp else 2_371_600
         image_size = getattr(vision, "image_size", None)
-        resample = None
+        resample = 3 if is_qwen4_exp else None
 
         if hf_model_id is not None:
             try:
@@ -747,6 +1176,7 @@ def _write_vision_processor_config(
                 hf_proc = AutoProcessor.from_pretrained(
                     hf_model_id,
                     trust_remote_code=trust_remote_code,
+                    **_revision_kwargs(revision),
                 )
                 ip = getattr(hf_proc, "image_processor", None)
                 if ip is not None:
@@ -760,15 +1190,33 @@ def _write_vision_processor_config(
                             image_size = size
                         else:
                             size = _size_mapping(size)
-                            if size.get("longest_edge") is not None:
-                                image_size = size["longest_edge"]
+                            # Qwen-style processors encode shortest_edge and
+                            # longest_edge as pixel-count bounds, not side lengths.
+                            # Keep the vision config's nominal image size for the
+                            # Resize metadata and preserve those values below as
+                            # smart-resize bounds.
+                            if size.get("height") is not None:
+                                image_size = size["height"]
+                            elif size.get("width") is not None:
+                                image_size = size["width"]
                             min_pixels = size.get("shortest_edge") or min_pixels
                             max_pixels = size.get("longest_edge") or max_pixels
             except Exception:
+                if is_qwen4_exp:
+                    image_mean = [0.5, 0.5, 0.5]
+                    image_std = [0.5, 0.5, 0.5]
+                    rescale_factor = 1.0 / 255.0
+                    resample = 3
+                    min_pixels = 65_536
+                    max_pixels = 16_777_216
                 logger.warning(
-                    "Could not load HF processor for %s; "
-                    "using CLIP-standard normalization defaults",
+                    "Could not load HF processor for %s; using %s",
                     hf_model_id,
+                    (
+                        "pinned Qwen4-Exp processor constants"
+                        if is_qwen4_exp
+                        else "CLIP-standard normalization defaults"
+                    ),
                     exc_info=True,
                 )
 
@@ -954,6 +1402,46 @@ def _write_audio_processor_config(
             }
         }
         proc_filename = "audio_feature_extraction.json"
+    elif model_type in _GLMASR_MODEL_TYPES:
+        # GLM-ASR uses the standard Whisper log-mel contract with 128 mel
+        # bins and a fixed 30-second window. These operation names and attrs
+        # are consumed by OrtxCreateSpeechFeatureExtractor.
+        processor = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "stft",
+                            "type": "STFTNorm",
+                            "attrs": {
+                                "n_fft": 400,
+                                "frame_length": 400,
+                                "hop_length": 160,
+                            },
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "log_mel",
+                            "type": "LogMelSpectrum",
+                            "attrs": {
+                                "chunk_size": 30,
+                                "hop_length": 160,
+                                "n_fft": 400,
+                                "n_mel": 128,
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_processor.json"
     else:
         # Generic audio processor — add model-specific branches as needed.
         return None
@@ -962,6 +1450,21 @@ def _write_audio_processor_config(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(processor, f, indent=4)
     return path
+
+
+def _uses_compact_sliding_kv_cache(decoder_model: ir.Model | None, ep: str) -> bool:
+    """Whether the graph and EP can keep sliding layers in a compact KV cache."""
+    if ep == "trt-rtx":
+        return True
+    if decoder_model is None or ep not in {"cpu", "cuda"}:
+        return False
+    return any(
+        node.op_type == "GroupQueryAttention"
+        and node.domain == "com.microsoft"
+        and (attribute := node.attributes.get("sliding_window_cache")) is not None
+        and attribute.as_int() == 1
+        for node in decoder_model.graph
+    )
 
 
 def _write_genai_config(
@@ -990,11 +1493,21 @@ def _write_genai_config(
 
     # --- Discover decoder inputs from the ONNX graph ---
     decoder_key = "decoder" if "decoder" in pkg else "model"
-    decoder_inputs = _introspect_inputs(pkg, decoder_key)
-    if decoder_inputs is not None:
-        # KV cache entries are template-based, not per-input
-        decoder_inputs["past_key_names"] = "past_key_values.%d.key"
-        decoder_inputs["past_value_names"] = "past_key_values.%d.value"
+    decoder_model = pkg.get(decoder_key)
+    decoder_abi: _DecoderAbi | None = None
+    if _is_single_model_decoder_package(pkg):
+        if decoder_model is None:
+            raise ValueError("ORT GenAI text packages require a decoder ONNX graph")
+        decoder_abi = _inspect_decoder_abi(decoder_model, model_type=ort_model_type)
+        decoder_inputs = decoder_abi.inputs
+        decoder_outputs = decoder_abi.outputs
+    else:
+        decoder_inputs = _introspect_inputs(pkg, decoder_key)
+        decoder_outputs = None
+        if decoder_inputs is not None:
+            # Multimodal runtime types retain their architecture-specific cache contract.
+            decoder_inputs["past_key_names"] = "past_key_values.%d.key"
+            decoder_inputs["past_value_names"] = "past_key_values.%d.value"
 
     # Derive decoder filename from the actual package key
     decoder_filename = (
@@ -1029,7 +1542,6 @@ def _write_genai_config(
     # mismatch rather than at load time. Rather than silently emit a broken
     # config, raise a clear error so the caller picks an EP/dtype combination
     # (e.g. fp32 on CPU) that lowers full attention to GQA.
-    decoder_model = pkg.get(decoder_key)
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
         has_gqa = any(
@@ -1045,22 +1557,36 @@ def _write_genai_config(
             for node in decoder_model.graph
         )
         if has_recurrent_state and has_standard_attention:
-            # A GQA node elsewhere in the graph does NOT make a co-existing
-            # standard Attention node compatible with a shared buffer --
-            # each op instance is independently (in)compatible, so this
-            # must reject on the mere presence of standard Attention, not
-            # only when GQA is completely absent (partial GQA fusion still
-            # leaves the unfused standard Attention layers broken).
-            raise ValueError(
-                "This decoder graph mixes com.microsoft.LinearAttention "
-                "(recurrent state, requires past_present_share_buffer=True) "
-                "with standard (non-GQA) Attention (incompatible with "
-                "past_present_share_buffer=True). This EP/dtype combination "
-                "cannot produce a runnable genai_config -- pick an EP/dtype "
-                "that lowers *all* full-attention layers to "
-                "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
-            )
-        supports_in_place_kv_cache = has_gqa or has_recurrent_state
+            supports_in_place_kv_cache = True
+        else:
+            supports_in_place_kv_cache = has_gqa or has_recurrent_state
+
+    sliding_window = None
+    window_size = getattr(config, "sliding_window", None)
+    # ORT GenAI uses this block to allocate a compact present cache. A
+    # local_window_size mask alone does not compact GQA outputs.
+    if (
+        isinstance(window_size, int)
+        and window_size > 0
+        and _uses_compact_sliding_kv_cache(decoder_model, ep)
+    ):
+        layer_types = getattr(config, "layer_types", None)
+        local_types = {"local", "sliding_attention", "window_attention"}
+        layers = (
+            [
+                index
+                for index, layer_type in enumerate(layer_types)
+                if layer_type in local_types
+            ]
+            if layer_types
+            else list(range(config.num_hidden_layers))
+        )
+        sliding_window = {
+            "window_size": window_size,
+            "slide_key_value_cache": False,
+            "slide_inputs": False,
+            "layers": layers,
+        }
 
     generator = GenaiConfigGenerator.from_config(
         config,
@@ -1071,9 +1597,19 @@ def _write_genai_config(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         decoder_inputs=decoder_inputs,
+        decoder_outputs=decoder_outputs,
         decoder_filename=decoder_filename,
         supports_in_place_kv_cache=supports_in_place_kv_cache,
-        num_cache_layer_slots=_count_cache_layer_slots(decoder_model),
+        num_cache_layer_slots=(
+            decoder_abi.cache_slots
+            if decoder_abi is not None
+            else _count_cache_layer_slots(decoder_model)
+        ),
+        sliding_window=sliding_window,
+        has_specialized_topology=not _is_single_model_decoder_package(pkg),
+    )
+    generator.with_special_tokens(
+        **_special_token_ids_from_tokenizer_config(output_dir, config.vocab_size)
     )
 
     if is_vlm:
@@ -1100,6 +1636,11 @@ def _write_genai_config(
                 # MiniCPM performs both 2x2 merges inside the ONNX vision
                 # graph and consumes HF-prepacked pixels, not Qwen grid_thw.
                 vision_kwargs["spatial_merge_size"] = None
+            elif model_type in _LFM2_VL_MODEL_TYPES:
+                # Pixel unshuffle is already part of the ONNX vision encoder;
+                # ORT GenAI must not perform another spatial merge.
+                vision_kwargs["spatial_merge_size"] = None
+                vision_kwargs["config_filename"] = "processor_config.json"
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None
                 # Gemma3n shares gemma3's fixed-resize branch in
@@ -1133,7 +1674,11 @@ def _write_genai_config(
                     if model_type == "mage_vl"
                     else "processor_config.json"
                 )
-                if model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}:
+                if (
+                    model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}
+                    or model_type in _QWEN35_VL_MODEL_TYPES
+                    or model_type in _QWEN4_EXP_MODEL_TYPES
+                ):
                     patch_size = getattr(vision_cfg, "patch_size", None)
                     window_size = getattr(vision_cfg, "window_size", None)
                     if patch_size is not None:
@@ -1143,13 +1688,29 @@ def _write_genai_config(
                     vision_kwargs["tokens_per_second"] = float(
                         getattr(config, "tokens_per_second", 2.0)
                     )
+                if ep == "trt-rtx" and model_type in _QWEN35_VL_MODEL_TYPES:
+                    image_feature_width = _get_static_graph_input_dim(
+                        pkg,
+                        "embedding",
+                        "image_features",
+                        -1,
+                    )
+                    vision_kwargs["embedding_provider_options"] = (
+                        _make_trt_rtx_embedding_provider_options(
+                            image_feature_width=image_feature_width,
+                            input_id_lengths=(1, 226, 1024),
+                            image_feature_lengths=(0, 192, 2520),
+                        )
+                    )
+                    vision_kwargs["vision_provider_options"] = (
+                        _QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS
+                    )
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
-            # Introspect vision outputs so extra maps (e.g. Qwen3-VL
-            # ``deepstack_features``) are forwarded to the embedding model
-            # via genai_config.json; defaulting to ``image_features`` alone
-            # would silently drop DeepStack at runtime.
+            # Introspect runtime-semantic vision outputs from the ONNX graph.
+            # Model-specific auxiliary features must be packed into a supported
+            # output by the task rather than emitted as arbitrary config keys.
             vision_output_mapping = _introspect_outputs(pkg, "vision_encoder")
             if vision_output_mapping is not None:
                 vision_kwargs["output_names"] = vision_output_mapping
@@ -1209,6 +1770,12 @@ def _write_genai_config(
                 "audio_embeds": "input_features",
                 "attention_mask": "input_features_mask",
             }
+        elif model_type in _GLMASR_MODEL_TYPES:
+            audio_kwargs["config_filename"] = "audio_processor.json"
+            audio_kwargs["input_names"] = {
+                "audio_embeds": "input_features",
+                "attention_mask": "input_features_mask",
+            }
         else:
             if audio_input_mapping is not None:
                 audio_kwargs["input_names"] = audio_input_mapping
@@ -1217,32 +1784,139 @@ def _write_genai_config(
             boa_token_id=boa_token_id,
             **audio_kwargs,
         )
+        embedding_inputs = _introspect_inputs(pkg, "embedding")
+        embedding_outputs = _introspect_outputs(pkg, "embedding")
+        if embedding_inputs is not None:
+            generator.with_embedding(
+                input_names=embedding_inputs,
+                output_names=embedding_outputs,
+            )
 
     return generator.write(output_dir)
 
 
-def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
-    """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
-    config = getattr(pkg, "config", None)
-    if getattr(config, "model_type", None) == "parakeet_ctc":
-        raise ValueError(
-            "ORT GenAI does not define a feature-input CTC ASR pipeline; "
-            "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
+def _mtp_state_ports(model: Any) -> list[dict[str, str]]:
+    """Return exact local cache port pairs from one target or MTP graph."""
+    output_names = {value.name for value in model.graph.outputs if value.name is not None}
+    pairs: list[dict[str, str]] = []
+    for value in model.graph.inputs:
+        name = value.name
+        if name is None or not name.startswith("past_key_values."):
+            continue
+        output = "present." + name.removeprefix("past_key_values.")
+        if output not in output_names:
+            raise ValueError(
+                f"MTP runtime metadata cannot pair cache input {name!r} with {output!r}"
+            )
+        pairs.append({"input": name, "output": output})
+    return sorted(pairs, key=lambda pair: pair["input"])
+
+
+def _mtp_sidecar_model(pkg: ModelPackage) -> tuple[Any, str, Any] | None:
+    """Resolve an attached or legacy component MTP graph and its canonical saved path."""
+    attached = getattr(pkg, "mtp_head", None)
+    if attached is not None:
+        if set(attached) != {"model"}:
+            raise ValueError(
+                "ORT GenAI MTP metadata requires one sidecar component named 'model'"
+            )
+        from mobius._model_package import _mtp_sidecar_name
+
+        # ModelPackage.save() uses this same in-memory selector. An existing
+        # destination manifest may describe an older package and is never authoritative.
+        sidecar_name = _mtp_sidecar_name(pkg)
+        return attached["model"], f"{sidecar_name}/model.onnx", attached.config
+    if "mtp" in pkg:
+        return pkg["mtp"], "mtp/model.onnx", getattr(pkg, "config", None)
+    return None
+
+
+def _mtp_prediction_count(pkg: ModelPackage, proposer_config: Any) -> int:
+    """Resolve an explicit MTP prediction count without inferring model depth."""
+    missing = object()
+    target_config = getattr(pkg, "config", None)
+    authoritative = getattr(target_config, "_gguf_nextn_predict_layers", missing)
+    if authoritative is missing:
+        authoritative = getattr(
+            proposer_config,
+            "_gguf_nextn_predict_layers",
+            missing,
         )
-    if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
-        model_type = getattr(config, "model_type", "unknown")
-        raise NotImplementedError(
-            "onnxruntime-genai does not support generic vision encoder-decoder "
-            f"packages such as {model_type!r}. Run the vision_encoder and decoder "
-            "ONNX sessions directly; emitting genai_config.json would create an "
-            "artifact that the runtime cannot load."
-        )
-    if getattr(config, "model_type", None) == "mage_vl":
-        raise ValueError(
-            "ORT GenAI does not support Mage-VL's required patch_positions vision "
-            "input or its 1D decoder position_ids contract. Export without "
-            "--runtime ort-genai to save the runnable direct three-model ONNX package."
-        )
+    if authoritative is not missing:
+        if isinstance(authoritative, bool) or not isinstance(authoritative, int):
+            raise TypeError(
+                f"_gguf_nextn_predict_layers must be an integer, got {authoritative!r}"
+            )
+        if authoritative <= 0:
+            raise ValueError(
+                "An attached MTP sidecar requires positive _gguf_nextn_predict_layers metadata"
+            )
+        return authoritative
+
+    for config, field in (
+        (target_config, "target num_nextn_predict_layers"),
+        (proposer_config, "proposer num_nextn_predict_layers"),
+    ):
+        if config is None or not hasattr(config, "num_nextn_predict_layers"):
+            continue
+        value = config.num_nextn_predict_layers
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{field} must be an integer, got {value!r}")
+        # Zero is the dataclass default and therefore does not prove explicit
+        # MTP width. Keep looking for a positive declaration on the proposer.
+        if value > 0:
+            return value
+        if value < 0:
+            raise ValueError(f"{field} must be positive, got {value}")
+    raise ValueError(
+        "An attached MTP sidecar requires an explicit positive "
+        "num_nextn_predict_layers declaration"
+    )
+
+
+def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
+    """Write the external target/MTP coordination contract without claiming OGA support."""
+    resolved = _mtp_sidecar_model(pkg)
+    if resolved is None:
+        return None
+    mtp_model, model_filename, proposer_config = resolved
+    target_model = pkg.get("decoder") or pkg.get("model")
+    if target_model is None:
+        raise ValueError("MTP runtime metadata requires a target decoder graph")
+    dedicated_embeddings = bool(getattr(proposer_config, "use_dedicated_embeddings", False))
+    dedicated_lm_head = bool(getattr(proposer_config, "use_dedicated_lm_head", False))
+    payload = {
+        "schema_version": 1,
+        "status": "runtime_unvalidated",
+        "model": {"filename": model_filename},
+        "inputs": [value.name for value in mtp_model.graph.inputs if value.name is not None],
+        "outputs": [value.name for value in mtp_model.graph.outputs if value.name is not None],
+        "conditioning": {
+            "target_hidden_output": "mtp_seed",
+            "target_hidden_input": "hidden_states",
+            "embedding": "dedicated" if dedicated_embeddings else "shared_target",
+            "lm_head": "dedicated" if dedicated_lm_head else "shared_target",
+        },
+        "cache_namespaces": {
+            "target": {
+                "namespace": "target",
+                "ports": _mtp_state_ports(target_model),
+            },
+            "mtp": {
+                "namespace": "mtp",
+                "ports": _mtp_state_ports(mtp_model),
+            },
+        },
+        "num_nextn_predict_layers": _mtp_prediction_count(pkg, proposer_config),
+        "shared_embedding": None if dedicated_embeddings else "model.embed_tokens",
+        "shared_lm_head": None if dedicated_lm_head else "lm_head",
+        "runtime_orchestration": "external",
+    }
+    path = os.path.join(directory, "mtp_config.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return path
 
 
 def write_ort_genai_config(
@@ -1250,6 +1924,7 @@ def write_ort_genai_config(
     directory: str,
     *,
     hf_model_id: str | None = None,
+    revision: str | None = None,
     ep: str = "cpu",
     context_length: int = 4096,
     local_config_dir: str | None = None,
@@ -1269,10 +1944,14 @@ def write_ort_genai_config(
         directory: Output directory (created if needed).
         hf_model_id: HuggingFace model ID or local model directory. When provided,
             used to fetch token IDs (``bos``/``eos``/``pad``) and copy tokenizer files.
+            Token IDs from ``generation_config.json`` take precedence over model config
+            values because generation configs may define additional stop tokens.
             When ``None``, token IDs are read from ``pkg.config`` fields
             (``bos_token_id``, ``eos_token_id``, ``pad_token_id``) populated
             by :meth:`~mobius._configs.ArchitectureConfig.from_transformers`,
             and tokenizer files are not copied unless ``local_config_dir`` is set.
+        revision: Immutable HuggingFace revision used for the config, tokenizer,
+            processor, and copied assets.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"trt-rtx"``). Defaults to ``"cpu"``.
@@ -1307,16 +1986,17 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
-    _validate_ort_genai_compatibility(pkg)
-
-    if getattr(config, "model_type", None) == "moonshine":
-        raise NotImplementedError(
-            "onnxruntime-genai does not support Moonshine's variable-length raw-waveform "
-            "encoder. Run the exported encoder and cached decoder directly with "
-            "ONNX Runtime."
+    if getattr(config, "model_type", None) == "vibevoice_streaming":
+        raise ValueError(
+            "VibeVoice Realtime requires host-owned text windowing, positive/negative "
+            "KV caches, DPM-Solver sampling, and prefilled voice-prompt caches; it "
+            "cannot be represented by an ONNX Runtime GenAI configuration."
         )
-
     os.makedirs(directory, exist_ok=True)
+    if set(pkg) in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
+        pkg, "gguf_projector_type", None
+    ):
+        return {}
 
     # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes
     # that carry no EP-specific session options → treat as CPU.
@@ -1329,25 +2009,29 @@ def write_ort_genai_config(
     pad_token_id: int | None = None
     ort_model_type: str
 
-    # Detect multimodal capabilities from the package keys. Needed before
-    # resolving the ORT model type so decoder-only (text-only) packages can
-    # prefer their own config.model_type (see below).
+    # Generic decoder dispatch is intentionally limited to one-graph text packages.
+    # Auxiliary encoder, pipeline, and sidecar graphs require their own runtime contract.
     is_vlm = "vision_encoder" in pkg and "embedding" in pkg
     has_speech = "audio_encoder" in pkg
-    is_decoder_only = not is_vlm and not has_speech
+    is_decoder_only = _is_single_model_decoder_package(pkg)
 
     if hf_model_id is not None:
         import transformers
 
         hf_config = transformers.AutoConfig.from_pretrained(
-            hf_model_id, trust_remote_code=trust_remote_code
+            hf_model_id,
+            trust_remote_code=trust_remote_code,
+            **_revision_kwargs(revision),
         )
         model_type = hf_config.model_type
         cfg_model_type = getattr(config, "model_type", None)
         # See _select_ort_model_type: decoder-only packages prefer the package's
         # own config.model_type; multimodal packages keep the HF parent type.
         ort_model_type = _select_ort_model_type(
-            cfg_model_type, model_type, is_decoder_only=is_decoder_only
+            cfg_model_type,
+            model_type,
+            is_decoder_only=is_decoder_only,
+            rope_type=getattr(config, "rope_type", None),
         )
         # Token IDs may live on the parent config or the text sub-config
         # (e.g. Gemma4Config has text_config with bos_token_id=2).
@@ -1371,25 +2055,14 @@ def write_ort_genai_config(
         # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
         # This path is taken when hf_model_id is not provided (e.g. --config mode).
         raw_type = getattr(config, "model_type", None) or "unknown"
-        if is_vlm and raw_type == "gemma3_text":
-            # Gemma3 multimodal configs are unwrapped to the text sub-config
-            # during build, but ORT GenAI needs the multimodal parent type.
-            ort_model_type = "gemma3"
-        elif is_vlm and raw_type == "gemma3n_text":
-            # Same unwrapping for Gemma3n, whose parent type is "gemma3n".
-            # Deliberately *not* aliased to "gemma3": the package threads
-            # per_layer_inputs (and optional audio) that gemma3's ORT pipeline
-            # does not bind, so borrowing that type would mis-wire the graph.
-            ort_model_type = "gemma3n"
+        if is_vlm and raw_type in _UNWRAPPED_VLM_MODEL_TYPES:
+            ort_model_type = _UNWRAPPED_VLM_MODEL_TYPES[raw_type]
         else:
-            ort_model_type = _resolve_ort_genai_model_type(raw_type)
-        if ort_model_type == "unknown":
-            logger.warning(
-                "Could not determine ORT-GenAI model type: pkg.config.model_type "
-                "is missing, None, or not mapped to an ORT-GenAI type (got %r). "
-                "Pass hf_model_id to resolve it from the HuggingFace config, or "
-                "the generated genai_config.json may not load correctly.",
+            ort_model_type = _select_ort_model_type(
                 raw_type,
+                raw_type,
+                is_decoder_only=is_decoder_only,
+                rope_type=getattr(config, "rope_type", None),
             )
         # Read token IDs from ArchitectureConfig (populated by from_transformers()
         # when --config is used with a local directory).
@@ -1400,55 +2073,29 @@ def write_ort_genai_config(
         _pad = getattr(config, "pad_token_id", None)
         pad_token_id = None if (_pad is None or _pad < 0) else _pad
 
+    generation_config_source = hf_model_id or local_config_dir
+    if generation_config_source and (
+        generation_config := _load_generation_config(generation_config_source)
+    ):
+        generation_bos_token_id = getattr(generation_config, "bos_token_id", None)
+        generation_eos_token_id = getattr(generation_config, "eos_token_id", None)
+        generation_pad_token_id = getattr(generation_config, "pad_token_id", None)
+        if generation_bos_token_id is not None:
+            bos_token_id = generation_bos_token_id
+        if generation_eos_token_id is not None:
+            eos_token_id = generation_eos_token_id
+        if generation_pad_token_id is not None:
+            pad_token_id = generation_pad_token_id
+
     # Phi4MM quirk: HF reports model_type='phi' but the model package
     # includes an 'audio_encoder' component that distinguishes it from plain Phi.
     # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"
+    result: dict[str, str] = {}
 
-    logger.info("Generating genai_config.json for %s (ep=%s)", ort_model_type, ep)
-    genai_path = _write_genai_config(
-        config,
-        directory,
-        pkg=pkg,
-        ort_model_type=ort_model_type,
-        ep=ep,
-        context_length=context_length,
-        bos_token_id=bos_token_id,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        is_vlm=is_vlm,
-        has_speech=has_speech,
-    )
-
-    result: dict[str, str] = {"genai_config": genai_path}
-
-    if "mtp" in pkg:
-        mtp_model = pkg["mtp"]
-        mtp_path = os.path.join(directory, "mtp_config.json")
-        with open(mtp_path, "w") as f:
-            json.dump(
-                {
-                    "model": {"filename": "mtp/model.onnx"},
-                    "inputs": [
-                        value.name
-                        for value in mtp_model.graph.inputs
-                        if value.name is not None
-                    ],
-                    "outputs": [
-                        value.name
-                        for value in mtp_model.graph.outputs
-                        if value.name is not None
-                    ],
-                    "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
-                    "shared_embedding": "model.embed_tokens",
-                    "shared_lm_head": "lm_head",
-                    "runtime_orchestration": "external",
-                },
-                f,
-                indent=2,
-            )
-            f.write("\n")
+    mtp_path = _write_mtp_config(pkg, directory)
+    if mtp_path is not None:
         result["mtp_config"] = mtp_path
 
     # Copy tokenizer files. A local hf_model_id is a local model directory, not a
@@ -1459,7 +2106,11 @@ def write_ort_genai_config(
             tokenizer_files = _copy_tokenizer_files_from_local(hf_model_id, directory)
         else:
             logger.info("Copying tokenizer files from %s", hf_model_id)
-            tokenizer_files = _copy_tokenizer_files(hf_model_id, directory)
+            tokenizer_files = (
+                _copy_tokenizer_files(hf_model_id, directory, revision=revision)
+                if revision is not None
+                else _copy_tokenizer_files(hf_model_id, directory)
+            )
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
     elif local_config_dir is not None:
@@ -1475,12 +2126,29 @@ def write_ort_genai_config(
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
 
+    logger.info("Generating genai_config.json for %s (ep=%s)", ort_model_type, ep)
+    genai_path = _write_genai_config(
+        config,
+        directory,
+        pkg=pkg,
+        ort_model_type=ort_model_type,
+        ep=ep,
+        context_length=context_length,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        is_vlm=is_vlm,
+        has_speech=has_speech,
+    )
+    result["genai_config"] = genai_path
+
     # Write processor config for VLMs
     processor_path = _write_vision_processor_config(
         config,
         directory,
         hf_model_id=hf_model_id,
         trust_remote_code=trust_remote_code,
+        revision=revision,
     )
     if processor_path:
         result["processor_config"] = processor_path
@@ -1494,7 +2162,15 @@ def write_ort_genai_config(
     _fix_tokenizer_config(directory)
 
     # Ensure chat_template is in tokenizer_config.json
-    _fix_chat_template(directory, hf_model_id)
+    _fix_chat_template(
+        directory,
+        hf_model_id,
+        revision=revision,
+        trust_remote_code=trust_remote_code,
+    )
+
+    # Correct assets that ship broken from upstream
+    apply_asset_patches(directory)
 
     logger.info("ORT-GenAI artifacts written: %d files", len(result))
     return result
@@ -1505,6 +2181,7 @@ def export_package(
     output_dir: str,
     *,
     hf_model_id: str | None = None,
+    revision: str | None = None,
     ep: str = "cpu",
     context_length: int = 4096,
     local_config_dir: str | None = None,
@@ -1538,6 +2215,8 @@ def export_package(
             resolution.  When ``None``, token IDs are read from ``pkg.config``
             and tokenizer files are not copied (unless ``local_config_dir``
             is provided).
+        revision: Immutable HuggingFace revision used for all downloaded
+            configuration, tokenizer, processor, and asset files.
         ep: Execution provider written to ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"webgpu"``, ``"trt-rtx"``).
@@ -1548,6 +2227,8 @@ def export_package(
             when ``hf_model_id`` is ``None``.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
+        revision: Optional immutable HuggingFace revision used for remote
+            configuration, tokenizer, and processor requests.
         external_data: External-data format passed to :meth:`ModelPackage.save`
             (``"onnx"`` or ``"safetensors"``).
         progress_bar: Whether to show the save progress bar.
@@ -1584,10 +2265,6 @@ def export_package(
             "Diffusion models (which have no config) are not supported — "
             "use ModelPackage.save() directly for those."
         )
-    _validate_ort_genai_compatibility(pkg)
-
-    os.makedirs(output_dir, exist_ok=True)
-
     # 1. Save ONNX models + weights
     logger.info("Saving ONNX models to %s", output_dir)
     pkg.save(
@@ -1601,6 +2278,7 @@ def export_package(
         pkg,
         output_dir,
         hf_model_id=hf_model_id,
+        revision=revision,
         ep=ep,
         context_length=context_length,
         local_config_dir=local_config_dir,
@@ -1622,6 +2300,7 @@ def auto_export(
     model_id: str,
     output_dir: str,
     *,
+    revision: str | None = None,
     dtype: str | None = None,
     task: str | None = None,
     external_data: str = "onnx",
@@ -1636,7 +2315,7 @@ def auto_export(
     This is the end-to-end convenience function for producing ORT-GenAI-ready
     model directories. It:
 
-    1. Builds the ONNX graph(s) via :func:`~mobius._builder.build`
+    1. Builds the ONNX graph(s) via :func:`mobius.integrations.transformers.build`
     2. Downloads and applies HuggingFace weights
     3. Saves ONNX model(s) with external data
     4. Calls :func:`write_ort_genai_config` to write ``genai_config.json``,
@@ -1645,11 +2324,14 @@ def auto_export(
     Args:
         model_id: HuggingFace model repository ID.
         output_dir: Directory to write all output files.
+        revision: Immutable HuggingFace revision used for all downloads.
         dtype: Override model dtype (``"f32"``, ``"f16"``, ``"bf16"``).
         task: Override model task (auto-detected if ``None``).
         external_data: External data format (``"onnx"`` or
             ``"safetensors"``).
         trust_remote_code: Trust remote code for HuggingFace config.
+        revision: Optional immutable HuggingFace revision used for all Hub
+            configuration, weight, tokenizer, and processor requests.
         context_length: Minimum context length for genai_config.json.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json``. Defaults to ``"cpu"``. For non-CPU providers
@@ -1661,7 +2343,8 @@ def auto_export(
         progress_bar: Show progress bar during save.
         text_only: When ``True``, export the text backbone of a multimodal
             checkpoint as a standalone decoder-only LLM (see
-            :func:`~mobius._builder.build`). Produces a single ``model.onnx``
+            :func:`mobius.integrations.transformers.build`). Produces a single
+            ``model.onnx``
             with a decoder-only ``genai_config.json`` (no vision/audio
             sections). Currently supported for ``gemma4_unified``
             (``google/gemma-4-12B``).
@@ -1675,9 +2358,7 @@ def auto_export(
                 "tokenizer.json": "/output/tokenizer.json",
             }
     """
-    from mobius._builder import build
-
-    os.makedirs(output_dir, exist_ok=True)
+    from mobius.integrations.transformers import build
 
     # Build ONNX graph(s) with weights. The runtime EP (``ep``) also drives
     # EP-aware graph construction so fused ops (e.g. GroupQueryAttention on
@@ -1689,6 +2370,7 @@ def auto_export(
     pkg = build(
         model_id,
         task=task,
+        revision=revision,
         dtype=dtype,
         load_weights=True,
         trust_remote_code=trust_remote_code,
@@ -1709,6 +2391,7 @@ def auto_export(
         pkg,
         output_dir,
         hf_model_id=model_id,
+        revision=revision,
         ep=ep,
         context_length=context_length,
         trust_remote_code=trust_remote_code,

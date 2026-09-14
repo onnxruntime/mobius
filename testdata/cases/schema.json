@@ -62,6 +62,7 @@
         "seq2seq",
         "speech-language",
         "speech-to-text",
+        "text-to-speech",
         "text-generation"
       ],
       "description": "Task type string matching the mobius registry."
@@ -74,6 +75,257 @@
         "bfloat16"
       ],
       "description": "Weight and activation dtype."
+    },
+    "gguf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "revision",
+        "filename",
+        "size",
+        "lfs_sha256",
+        "tensor_count",
+        "tensor_qtypes",
+        "execution_provider",
+        "config_sha256",
+        "preserve_quantization",
+        "tokenizer"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "description": "HuggingFace repository containing the GGUF artifact."
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Immutable GGUF repository revision."
+        },
+        "filename": {
+          "type": "string",
+          "pattern": "\\.gguf$",
+          "description": "Exact Hub-relative GGUF filename."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Expected GGUF byte size."
+        },
+        "lfs_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Expected LFS object SHA-256."
+        },
+        "tensor_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Expected number of GGUF tensors."
+        },
+        "tensor_qtypes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "Expected GGUF tensor census keyed by qtype name."
+        },
+        "execution_provider": {
+          "type": "string",
+          "enum": [
+            "cpu",
+            "cuda",
+            "dml",
+            "default"
+          ],
+          "description": "Exact execution provider used when constructing the evidenced route."
+        },
+        "config_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Expected canonical hash of the config extracted from GGUF metadata."
+        },
+        "preserve_quantization": {
+          "type": "boolean",
+          "description": "Expected import-route result after considering the source qtypes."
+        },
+        "keep_quantized": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to preserve supported GGUF quantization."
+        },
+        "tokenizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository",
+            "revision",
+            "metadata_sha256",
+            "assets",
+            "identity_status"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "identity_status": {
+                    "const": "rejected"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "rejection_reason"
+                ]
+              },
+              "else": {
+                "not": {
+                  "required": [
+                    "rejection_reason"
+                  ]
+                }
+              }
+            }
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "pattern": "^[^/]+/[^/]+$"
+            },
+            "revision": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "metadata_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "assets": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "filename": {
+                    "const": "tokenizer.json"
+                  }
+                },
+                "required": [
+                  "filename"
+                ]
+              },
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "filename",
+                  "size",
+                  "sha256"
+                ],
+                "properties": {
+                  "filename": {
+                    "type": "string",
+                    "enum": [
+                      "added_tokens.json",
+                      "chat_template.jinja",
+                      "special_tokens_map.json",
+                      "tokenizer.json",
+                      "tokenizer_config.json"
+                    ]
+                  },
+                  "size": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                }
+              }
+            },
+            "identity_status": {
+              "type": "string",
+              "enum": [
+                "exact",
+                "rejected"
+              ]
+            },
+            "rejection_reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      },
+      "description": "Pinned GGUF import source. The top-level model_id remains the independent HuggingFace reference."
+    },
+    "ort_genai": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tier",
+        "runtime_versions",
+        "model_type",
+        "runtime_evidence_id",
+        "execution_provider",
+        "max_download_bytes",
+        "released_capabilities"
+      ],
+      "properties": {
+        "tier": {
+          "const": "real",
+          "description": "Enroll this case in the pinned real-artifact ORT GenAI lane."
+        },
+        "runtime_versions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "0.15.2"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true,
+          "description": "Released onnxruntime-genai versions validated for this route."
+        },
+        "model_type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Expected model.type in the generated genai_config.json."
+        },
+        "runtime_evidence_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Structured runtime evidence record proving this exact artifact route."
+        },
+        "execution_provider": {
+          "const": "cpu",
+          "description": "Required CI currently makes only a CPU execution-provider claim."
+        },
+        "max_download_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 17179869184,
+          "description": "Hard per-case aggregate artifact download budget."
+        },
+        "released_capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "0.15.2"
+          ],
+          "properties": {
+            "0.15.2": {
+              "$ref": "#/$defs/ortGenaiCapabilities"
+            }
+          },
+          "description": "Explicit released-runtime capability expectations."
+        }
+      }
     },
     "level": {
       "type": "string",
@@ -152,9 +404,23 @@
           "type": "boolean",
           "description": "Whether to use sampling. false = greedy decoding (required for reproducible golden tests)."
         },
+        "num_diffusion_steps": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of deterministic diffusion scheduler steps for continuous-token TTS."
+        },
+        "guidance_scale": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Classifier-free guidance scale for continuous-token TTS."
+        },
         "eos_token_id": {
           "type": "integer",
           "description": "End-of-sequence token ID. Overrides the model's default to ensure generation stops correctly."
+        },
+        "exact_match": {
+          "type": "boolean",
+          "description": "Require the generated token IDs, sequence length, and decoded text to match the L5 golden exactly."
         },
         "lang": {
           "type": "string",
@@ -206,9 +472,93 @@
       "type": "string",
       "description": "Human-readable description of the test case. Not parsed by the test runner."
     },
+    "real_weight_validation": {
+      "type": "object",
+      "description": "Record of an out-of-band validation run against the official checkpoint, for cases whose checked-in golden is a reduced-config reference and whose real weights are too large for CI. Not parsed by the test runner; it documents evidence a reviewer would otherwise have to take on trust.",
+      "required": [
+        "status",
+        "checkpoint"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "partial"
+          ],
+          "description": "Outcome of the official-weight run."
+        },
+        "checkpoint": {
+          "type": "string",
+          "description": "Checkpoint and revision the run used, including its size."
+        },
+        "hardware": {
+          "type": "string",
+          "description": "Accelerator, driver, and peak memory the run needed."
+        },
+        "upstream": {
+          "type": "string",
+          "description": "Reference implementation and the exact generation settings it ran with."
+        },
+        "export": {
+          "type": "string",
+          "description": "Mobius export configuration under test (dtype, execution provider, sub-models)."
+        },
+        "component_parity": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Per-component agreement with the reference, keyed by sub-model name."
+        },
+        "end_to_end": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Whole-pipeline agreement with the reference, keyed by the execution path measured."
+        }
+      },
+      "additionalProperties": false
+    },
     "architecture": {
       "type": "string",
       "description": "Optional registry architecture key (e.g. Qwen35MtpModel) forcing a specific module class + task at build time. Needed for auxiliary heads (DFlash, MTP) that share a base checkpoint whose architectures field would otherwise auto-route to the base model."
+    }
+  },
+  "$defs": {
+    "ortGenaiCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "generic_decoder": {
+          "const": true
+        },
+        "specialized_lfm2": {
+          "const": true
+        },
+        "hybrid_conv_kv_state": {
+          "const": true
+        },
+        "state_groups": {
+          "const": false
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "generic_decoder",
+            "state_groups"
+          ]
+        },
+        {
+          "required": [
+            "specialized_lfm2",
+            "hybrid_conv_kv_state",
+            "state_groups"
+          ]
+        }
+      ]
     }
   }
 }

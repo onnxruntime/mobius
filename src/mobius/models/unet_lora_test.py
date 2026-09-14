@@ -89,7 +89,7 @@ def test_lora_gate_holder_applies_runtime_gate():
 def test_full_unet_declares_lora_gate_inputs():
     # Build a small full UNet with a baked adapter through the denoising task and
     # assert the runtime gate input + adapter params are present end-to-end.
-    from mobius._diffusers_configs import UNet2DConfig
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import UNet2DConditionModel
     from mobius.tasks._denoising import DenoisingTask
 
@@ -116,7 +116,7 @@ def test_full_unet_declares_lora_gate_inputs():
 
 
 def test_full_unet_without_lora_has_no_gate_inputs():
-    from mobius._diffusers_configs import UNet2DConfig
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import UNet2DConditionModel
     from mobius.tasks._denoising import DenoisingTask
 
@@ -159,7 +159,7 @@ def test_remap_diffusers_lora_keys():
 
 def test_remapped_keys_match_baked_unet_param_names():
     # The remapped keys must land on real baked LoRALinear params of the UNet.
-    from mobius._diffusers_configs import UNet2DConfig
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import UNet2DConditionModel, remap_diffusers_unet_lora
     from mobius.tasks._denoising import DenoisingTask
 

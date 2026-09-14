@@ -1,0 +1,26 @@
+model_id: "Qwen/Qwen3.8-Flash-Next"
+model_type: "qwen4_exp"
+revision: "f5d08274bafd880402bd16f5e3e6c514136ec06c"
+task_type: "image-text-to-text"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Describe this image in one short sentence."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 24
+  do_sample: false
+  eos_token_id: 248044
+
+ci_skip_reason: "The 512-expert checkpoint requires a large GPU and its pinned Transformers implementation is newer than the CI environment."
+notes: |
+  Qwen3.8 Flash-Next/Qwen4Exp composite. The 3-model package reuses the
+  no-DeepStack Qwen3.5 vision tower and 2560-wide merger, while the decoder
+  preserves separate PLE token IDs, four-channel QSA/M-RoPE positions, and all
+  heterogeneous recurrent, sparse-index, and PLE states. L4/L5 require a
+  large-GPU run at the pinned checkpoint and Transformers revisions.

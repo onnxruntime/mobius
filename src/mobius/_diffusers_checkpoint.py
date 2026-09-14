@@ -39,8 +39,8 @@ from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from safetensors import safe_open
 
-from mobius._diffusers_builder import _download_diffusers_component_weights
-from mobius._weight_loading import _dequantize_fp8_weights
+from mobius.integrations._weight_loading import _dequantize_fp8_weights
+from mobius.integrations.diffusers._builder import _download_diffusers_component_weights
 
 #: Weight-index basenames used by diffusers and transformers components.
 _INDEX_NAMES: tuple[str, ...] = (

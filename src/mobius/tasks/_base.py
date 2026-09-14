@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
@@ -15,6 +15,9 @@ import mobius
 from mobius._configs import BaseModelConfig
 from mobius._constants import OPSET_VERSION
 from mobius._model_package import ModelPackage
+
+if TYPE_CHECKING:
+    from mobius._component_manifest import ComponentManifest
 
 
 class ComponentSpec:
@@ -124,7 +127,7 @@ def _make_graph(
 
 def _make_model(graph: ir.Graph) -> ir.Model:
     """Create an ``ir.Model`` with standard producer metadata."""
-    model = ir.Model(graph, ir_version=11)
+    model = ir.Model(graph, ir_version=12)
     model.producer_name = "mobius"
     model.producer_version = mobius.__version__
     return model
@@ -158,6 +161,23 @@ class ModelTask(ABC):
     #: :meth:`_validate_components` checks that all declared attributes
     #: exist on the module before building begins.
     components: ClassVar[ComponentSpec | None] = None
+
+    def component_manifest(
+        self,
+        *,
+        module_class: type | None = None,
+        model_type: str | None = None,
+        hf_config: object | None = None,
+    ) -> ComponentManifest:
+        """Resolve canonical metadata for every component produced by this task."""
+        from mobius._component_manifest import resolve_component_manifest
+
+        return resolve_component_manifest(
+            self,
+            module_class=module_class,
+            model_type=model_type,
+            hf_config=hf_config,
+        )
 
     def _validate_components(self, module: nn.Module) -> None:
         """Validate that *module* exposes all attributes declared in :attr:`components`.
@@ -221,9 +241,9 @@ def build_decoder_from_embeds(
         hybrid: If ``True``, uses hybrid KV + DeltaNet cache inputs/outputs
             (for Qwen3.5-VL and similar).  Requires ``config.layer_types``.
         deepstack: If ``True`` (Qwen3-VL family with
-            ``deepstack_visual_indexes``), adds a ``deepstack_embeds`` input
-            ``[D, batch, seq_len, hidden_size]`` that the decoder injects into
-            its first ``D`` layers.
+            ``deepstack_visual_indexes``), adds a ``per_layer_inputs`` input
+            ``[batch, seq_len, D * hidden_size]`` that the decoder reshapes and
+            injects into its first ``D`` layers.
 
     Returns:
         A built :class:`ir.Model` for the decoder.
@@ -262,15 +282,16 @@ def build_decoder_from_embeds(
         shape=[3, batch, seq_len] if mrope else [batch, seq_len],
     )
 
-    # DeepStack intermediate vision features, pre-scattered to full sequence
-    # length by the embedding model.  Shape [D, batch, seq_len, hidden_size].
-    deepstack_embeds = None
+    # DeepStack intermediate vision features, pre-scattered and flattened by
+    # the embedding model. Shape [batch, seq_len, D * hidden_size], matching
+    # ORT GenAI's generic per_layer_inputs contract.
+    per_layer_inputs = None
     num_deepstack = len(getattr(config, "deepstack_visual_indexes", None) or [])
     if deepstack and num_deepstack > 0:
-        deepstack_embeds = builder.input(
-            "deepstack_embeds",
+        per_layer_inputs = builder.input(
+            "per_layer_inputs",
             dtype=config.dtype,
-            shape=[num_deepstack, batch, seq_len, config.hidden_size],
+            shape=[batch, seq_len, num_deepstack * config.hidden_size],
         )
 
     if hybrid:
@@ -293,8 +314,8 @@ def build_decoder_from_embeds(
         )
 
     decoder_kwargs = {}
-    if deepstack_embeds is not None:
-        decoder_kwargs["deepstack_embeds"] = deepstack_embeds
+    if per_layer_inputs is not None:
+        decoder_kwargs["per_layer_inputs"] = per_layer_inputs
 
     logits, present_key_values = decoder(
         builder.op,
@@ -342,9 +363,11 @@ def build_embedding_from_features(
             ``"audio_features"``).
         feature_dim: Feature dimension for the second input's last axis.
         deepstack: If ``True`` (Qwen3-VL family with
-            ``deepstack_visual_indexes``), adds a ``deepstack_features`` input
-            ``[D, num_feature_tokens, feature_dim]`` and emits a second
-            ``deepstack_embeds`` output ``[D, batch, seq_len, hidden_size]``.
+            ``deepstack_visual_indexes``), expects ``image_features`` to pack
+            the final and intermediate maps as
+            ``[num_feature_tokens, (D + 1) * feature_dim]`` and emits a second
+            ``per_layer_inputs`` output
+            ``[batch, seq_len, D * hidden_size]``.
 
     Returns:
         A built :class:`ir.Model` for the embedding model.
@@ -359,21 +382,40 @@ def build_embedding_from_features(
         dtype=ir.DataType.INT64,
         shape=[batch, seq_len],
     )
-    features = builder.input(
+    num_deepstack = len(getattr(config, "deepstack_visual_indexes", None) or [])
+    has_deepstack = deepstack and num_deepstack > 0
+    packed_feature_dim = (num_deepstack + 1) * feature_dim if has_deepstack else feature_dim
+    packed_features = builder.input(
         feature_name,
         dtype=config.dtype,
-        shape=[num_feature_tokens, feature_dim],
+        shape=[num_feature_tokens, packed_feature_dim],
     )
 
-    embedding_kwargs = {feature_name: features}
-    num_deepstack = len(getattr(config, "deepstack_visual_indexes", None) or [])
-    if deepstack and num_deepstack > 0:
-        deepstack_features = builder.input(
-            "deepstack_features",
-            dtype=config.dtype,
-            shape=[num_deepstack, num_feature_tokens, feature_dim],
+    embedding_kwargs = {}
+    if has_deepstack:
+        features = builder.op.Slice(
+            packed_features,
+            builder.op.Constant(value_ints=[0]),
+            builder.op.Constant(value_ints=[feature_dim]),
+            builder.op.Constant(value_ints=[1]),
+        )
+        deepstack_flat = builder.op.Slice(
+            packed_features,
+            builder.op.Constant(value_ints=[feature_dim]),
+            builder.op.Constant(value_ints=[packed_feature_dim]),
+            builder.op.Constant(value_ints=[1]),
+        )
+        deepstack_features = builder.op.Transpose(
+            builder.op.Reshape(
+                deepstack_flat,
+                builder.op.Constant(value_ints=[0, num_deepstack, feature_dim]),
+            ),
+            perm=[1, 0, 2],
         )
         embedding_kwargs["deepstack_features"] = deepstack_features
+    else:
+        features = packed_features
+    embedding_kwargs[feature_name] = features
 
     outputs = embedding(
         builder.op,
@@ -384,7 +426,11 @@ def build_embedding_from_features(
     if isinstance(outputs, tuple):
         inputs_embeds, deepstack_embeds = outputs
         builder.add_output(inputs_embeds, "inputs_embeds")
-        builder.add_output(deepstack_embeds, "deepstack_embeds")
+        per_layer_inputs = builder.op.Reshape(
+            builder.op.Transpose(deepstack_embeds, perm=[1, 2, 0, 3]),
+            builder.op.Constant(value_ints=[0, 0, num_deepstack * config.hidden_size]),
+        )
+        builder.add_output(per_layer_inputs, "per_layer_inputs")
     else:
         builder.add_output(outputs, "inputs_embeds")
     return _make_model(graph)

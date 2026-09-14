@@ -620,7 +620,7 @@ def _single_block_graph(block, torch_input, dtype=ir.DataType.FLOAT):
 def _reference_and_package(config_dict: dict):
     """Instantiate the diffusers reference and a weight-loaded mobius package."""
     torch = pytest.importorskip("torch")
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
 
     autoencoder_kl_wan = _wan_module("AutoencoderKLWan")
     torch.manual_seed(0)
@@ -649,7 +649,7 @@ class TestParity:
     def test_causal_conv3d_matches_diffusers(self):
         pytest.importorskip("onnxruntime")
         torch = pytest.importorskip("torch")
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
         from mobius.models.wan_vae import _WanCausalConv3d
 
         wan_causal_conv3d = _wan_module("WanCausalConv3d")
@@ -672,7 +672,7 @@ class TestParity:
     def test_residual_block_matches_diffusers(self):
         pytest.importorskip("onnxruntime")
         torch = pytest.importorskip("torch")
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
         from mobius.models.wan_vae import _WanResidualBlock
 
         wan_residual_block = _wan_module("WanResidualBlock")
@@ -694,7 +694,7 @@ class TestParity:
         """Whole-sequence ``downsample3d`` == upstream's cached chunk loop."""
         pytest.importorskip("onnxruntime")
         torch = pytest.importorskip("torch")
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
         from mobius.models.wan_vae import _WanResample
 
         wan_resample = _wan_module("WanResample")
@@ -722,7 +722,7 @@ class TestParity:
         """Whole-sequence ``upsample3d`` == upstream's per-frame cached loop."""
         pytest.importorskip("onnxruntime")
         torch = pytest.importorskip("torch")
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
         from mobius.models.wan_vae import _WanResample
 
         wan_resample = _wan_module("WanResample")
@@ -755,7 +755,7 @@ class TestParity:
         """A lone frame is chunk 0, whose ``time_conv`` upstream never runs."""
         pytest.importorskip("onnxruntime")
         torch = pytest.importorskip("torch")
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
         from mobius.models.wan_vae import _WanResample
 
         wan_resample = _wan_module("WanResample")
@@ -781,7 +781,7 @@ class TestParity:
         """Upstream caches chunk 0 verbatim instead of striding over it."""
         pytest.importorskip("onnxruntime")
         torch = pytest.importorskip("torch")
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
         from mobius.models.wan_vae import _WanResample
 
         wan_resample = _wan_module("WanResample")
@@ -806,7 +806,7 @@ class TestParity:
     def test_encoder_and_decoder_match_diffusers(self, config_dict):
         pytest.importorskip("onnxruntime")
         torch = pytest.importorskip("torch")
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
 
         autoencoder_kl_wan = _wan_module("AutoencoderKLWan")
         torch.manual_seed(0)
@@ -869,7 +869,7 @@ class TestParity:
         """A 9-frame clip spans three encode chunks, exercising the cache seam."""
         pytest.importorskip("onnxruntime")
         torch = pytest.importorskip("torch")
-        from mobius._weight_loading import apply_weights
+        from mobius.integrations._weight_loading import apply_weights
 
         autoencoder_kl_wan = _wan_module("AutoencoderKLWan")
         torch.manual_seed(0)

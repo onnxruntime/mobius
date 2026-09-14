@@ -36,14 +36,21 @@ from _test_configs import (
     _base_config,
 )
 
-from mobius._config_resolver import _default_task_for_model
 from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
 from mobius._testing.parity import ParityResult, compare_synthetic
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)
+
+
+def test_vibevoice_synthetic_pipeline_parity():
+    """Run the dedicated eight-stage continuous-token parity harness."""
+    from mobius.models.vibevoice_test import run_vibevoice_synthetic_stage_parity
+
+    run_vibevoice_synthetic_stage_parity()
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +91,17 @@ _SKIP_REASONS: dict[str, str] = {
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
+    # GLM-5.2's default (config.use_dsa=True) DSA/IndexShare path emits
+    # pkg.nxrt::IndexShare -- a custom onnx-genai-runtime domain with no
+    # stock-ORT registration, so this generic OnnxModelSession-based harness
+    # can never execute it (unlike com.microsoft::QMoE, a real ORT contrib
+    # op). DSA numeric correctness is covered instead by the dedicated
+    # GlmMoeDsaIndexer-vs-transformers parity test in glm_moe_dsa_test.py and
+    # by onnx-genai's native-CPU/CUDA e2e regression
+    # (glm_tiny_qmoe_native_cuda_e2e.rs); the config.use_dsa=False
+    # (--glm-full-attention) dense-MLA fallback has no custom ops and would
+    # be exercised by this harness if the tiny config defaulted to it.
+    "glm_moe_dsa": "DSA/IndexShare emits pkg.nxrt::IndexShare, unsupported by stock ORT",
 }
 
 # Per-model atol overrides for L3 synthetic parity.
@@ -104,6 +122,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Bloom: LayerNorm accumulation differs after eps alignment → ~0.019 max diff.
     # Argmax correct, cosine=0.9998 — model is functionally correct.
     "bloom": 0.02,
+    # Jais2 combines LayerNorm with squared-ReLU; ORT/PyTorch accumulation differs
+    # by ~0.0025 while retaining the same argmax and cosine >= 0.99999.
+    "jais2": 0.003,
     # Jamba MoE+Mamba: FP accumulation differences from sequential vs batched expert
     # dispatch, plus Mamba1 SSM single-token decode FP path differences.
     # Argmax correct, cosine=0.998 — model is functionally correct.
@@ -160,10 +181,22 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
-    # DeepSeek-V3: sigmoid-gated MoE with fused expert weights. Sequential vs batched
-    # expert dispatch produces FP accumulation differences → ~0.034 max diff.
-    # Near-tie argmax, cosine=0.996 — functionally correct.
-    "deepseek_v3": 0.04,
+    # DeepSeek-V3: previously carried a 0.04 override attributed to "MoE
+    # dispatch FP accumulation", but that was masking a real bug: the
+    # DeepSeek-V2/V3 MLA softmax scale was missing the YaRN
+    # mscale_all_dim^2 correction HF applies (see
+    # ``mobius.components._rotary_embedding.yarn_apply_mscale``). Fixed in
+    # ``_deepseek_mla.py``. Post-fix, remaining diff is genuine FP-order
+    # noise from parallel MoE dispatch: ~3.5e-5 measured via a standalone
+    # interpreter, ~1.2e-3 measured under this pytest process (both
+    # reproducible in their own harness — the residual gap is ORT
+    # intra-op thread-schedule dependent, not seed-dependent). 0.0025
+    # keeps ~2x headroom over the higher measurement while staying 16x
+    # tighter than the old 0.04.
+    "deepseek_v3": 0.0025,
+    # HYV3 uses fused expert banks in Transformers and sequential experts in ONNX.
+    # With identical weights this changes only float32 accumulation order (~0.0014).
+    "hy_v3": 0.002,
     # dots1: same DeepSeek V3 architecture (sigmoid routing + shared experts).
     # MoE dispatch accumulation differences → similar tolerance needed.
     "dots1": 0.04,
@@ -208,11 +241,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # DeepSeek MLA: deepseek_v2_0 uses group_limited_greedy routing which hits a
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
-    # Additional divergences (newly registered models)
-    # NemotronH Mamba2 layers diverge (cos=0.65): LinearAttention gated-SSM
-    # recurrence on CPU produces different results than HF's naive Mamba2.
-    # Attention-only layers match perfectly (cos=0.9999).
-    "nemotron_h": "Mamba2 SSM recurrence diverges on CPU (LinearAttention vs HF naive)",
 }
 
 # Fields that are properties in HF configs and cannot be set directly,
@@ -242,15 +270,21 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         "exaone",  # real HF type is exaone4
         "phi3small",  # real HF type is phi3
         "mistral3",  # our implementation maps to mistral; real mistral3 is different
+        "grok_gguf",
+        "grovemoe_gguf",
+        "hunyuan_moe_gguf",
+        "minimax_m2_gguf",
+        "mistral4_gguf",
         # gemma4_unified_text: mobius-internal alias for the gemma-4-12B text
         # backbone (reuses Gemma4CausalLMModel). No matching HF model_type is
         # registered with AutoModelForCausalLM, so a reference model cannot be
         # constructed here.  Text parity is covered by the real-weight
         # integration test (test_gemma4_unified_12b_text_prefill).
         "gemma4_unified_text",
-        # falcon_h1: our ONNX uses FalconCausalLMModel (ALiBi attention), not the
-        # real HF FalconH1 (Mamba2+SSM hybrid).  Comparing against HF would be apples-to-oranges.
-        "falcon_h1",
+        # The composite and architecture alias share qwen4_exp_text's graph.
+        # Run parity once through the canonical standalone text model type.
+        "qwen4_exp",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 
@@ -399,6 +433,7 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     },
     # HunYuanMoEV1 requires head_dim (defaults to None, causing pow(None, float) error).
     "hunyuan_v1_moe": {"head_dim": TINY_HEAD_DIM},
+    "hy_v3": {"head_dim": TINY_HEAD_DIM},
     # Llama4Text requires head_dim to match our tiny num_heads x head_dim = hidden_size.
     # Disable MoE (we use dense CausalLMModel) and Llama4-specific attention features
     # (QK-norm and temperature tuning) not implemented in CausalLMModel.
@@ -479,8 +514,50 @@ def _adapt_muse_glimmer_text_config(hf_kwargs: dict) -> None:
     hf_kwargs.pop("no_rope_layers", None)
 
 
+def _adapt_qwen4_exp_text_config(hf_kwargs: dict) -> None:
+    """Translate flat Mobius RoPE/expert fields to the strict HF config."""
+    hf_kwargs["head_dim"] = hf_kwargs["hidden_size"] // hf_kwargs["num_attention_heads"]
+    hf_kwargs["num_experts"] = hf_kwargs.pop("num_local_experts")
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": 10_000.0,
+        "partial_rotary_factor": hf_kwargs.pop("partial_rotary_factor", 1.0),
+    }
+
+
+def _adapt_hy_v3_config(hf_kwargs: dict) -> None:
+    """Translate Mobius' explicit routing fields to native Transformers HYV3."""
+    num_experts = hf_kwargs.pop("num_local_experts")
+    expert_width = hf_kwargs["moe_intermediate_size"]
+    shared_width = hf_kwargs.pop("shared_expert_intermediate_size")
+    dense_prefix = hf_kwargs.pop("first_k_dense_replace")
+    num_layers = hf_kwargs["num_hidden_layers"]
+    hf_kwargs["num_experts"] = num_experts
+    hf_kwargs["num_shared_experts"] = shared_width // expert_width
+    hf_kwargs["mlp_layer_types"] = ["dense"] * dense_prefix + ["sparse"] * (
+        num_layers - dense_prefix
+    )
+    hf_kwargs["router_scaling_factor"] = hf_kwargs.pop("routed_scaling_factor")
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": hf_kwargs.pop("rope_type", "default"),
+        "rope_theta": hf_kwargs.pop("rope_theta", 10_000.0),
+    }
+    for field in (
+        "disable_qmoe",
+        "norm_topk_prob",
+        "routing_weight_normalization_epsilon",
+        "routing_weight_normalization_floor",
+        "scoring_func",
+        "topk_method",
+        "use_expert_bias",
+    ):
+        hf_kwargs.pop(field, None)
+
+
 _HF_CONFIG_ADAPTERS = {
+    "hy_v3": _adapt_hy_v3_config,
     "muse_glimmer_text": _adapt_muse_glimmer_text_config,
+    "qwen4_exp_text": _adapt_qwen4_exp_text_config,
 }
 
 
@@ -512,7 +589,9 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     for key, value in config_overrides.items():
         if key == "_config_cls":
             continue
-        if key in _HF_READONLY_FIELDS:
+        if key in _HF_READONLY_FIELDS and not (
+            model_type == "falcon_h1" and key == "mlp_bias"
+        ):
             continue
         hf_kwargs[key] = value
 
@@ -531,7 +610,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             i for i, lt in enumerate(layer_types) if lt in ("full_attention", "attention")
         ]
 
-    if hf_model_type == "lfm2":
+    if hf_model_type in {"lfm2", "lfm2_moe"}:
         hf_kwargs["conv_L_cache"] = hf_kwargs.pop("short_conv_kernel", 3)
         hf_kwargs["conv_bias"] = hf_kwargs.pop("short_conv_bias", False)
         hf_kwargs["norm_eps"] = hf_kwargs.pop("rms_norm_eps")
@@ -539,6 +618,8 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "rope_type": "default",
             "rope_theta": 10_000.0,
         }
+        if hf_model_type == "lfm2_moe":
+            hf_kwargs["num_experts"] = hf_kwargs.pop("num_local_experts")
 
     # Jamba uses attn_layer_offset/attn_layer_period
     if hf_model_type in ("jamba",) and "layer_types" in hf_kwargs:
@@ -570,23 +651,24 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             for lt in hf_kwargs["layer_types"]
         ]
 
-    # GraniteMoeHybrid uses layers_block_type (HF field) with layer-type values.
-    # Convert our internal "mamba2"/"full_attention" names to the current HF values
-    # ("linear_attention"/"full_attention"); the legacy "mamba"/"attention" names
-    # are no longer accepted by HF's layer-type validator.
+    # GraniteMoeHybrid's current constructor consumes layer_types and selects
+    # the recurrent path only for the literal "mamba" layer type.
     if hf_model_type in ("granitemoehybrid",) and "layer_types" in hf_kwargs:
-        layer_types = hf_kwargs.pop("layer_types")
-        hf_kwargs["layers_block_type"] = [
-            "full_attention" if lt in ("full_attention", "attention") else "linear_attention"
-            for lt in layer_types
+        hf_kwargs["layer_types"] = [
+            "attention" if lt in ("full_attention", "attention") else "mamba"
+            for lt in hf_kwargs["layer_types"]
         ]
 
-    # NemotronH uses layers_block_type with HF values {"mamba", "attention", "moe"}.
-    # Convert our internal layer_types names (mamba2, full_attention, mlp) to HF names.
+    # NemotronH uses its public layer-type vocabulary rather than Mobius names.
     # Also translate mobius Mamba field names to HF NemotronHConfig field names.
     if hf_model_type in ("nemotron_h",) and "layer_types" in hf_kwargs:
         layer_types = hf_kwargs.pop("layer_types")
-        _nemotron_type_map = {"mamba2": "mamba", "full_attention": "attention", "mlp": "moe"}
+        _nemotron_type_map = {
+            "mamba2": "mamba",
+            "full_attention": "attention",
+            "mlp": "mlp",
+            "moe": "moe",
+        }
         hf_kwargs["layers_block_type"] = [_nemotron_type_map.get(lt, lt) for lt in layer_types]
         # Mobius NemotronHConfig → HF NemotronHConfig field name mapping
         _nemotron_field_map = {
@@ -596,10 +678,17 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "mamba_n_groups": "n_groups",
             "mamba_d_conv": "conv_kernel",
             "mamba_expand": "expand",
+            "rms_norm_eps": "layer_norm_epsilon",
         }
         for old_name, new_name in _nemotron_field_map.items():
             if old_name in hf_kwargs:
                 hf_kwargs[new_name] = hf_kwargs.pop(old_name)
+        if "hidden_act" in hf_kwargs:
+            hf_kwargs["mlp_hidden_act"] = hf_kwargs.pop("hidden_act")
+        if "shared_expert_intermediate_size" in hf_kwargs:
+            hf_kwargs["moe_shared_expert_intermediate_size"] = hf_kwargs.pop(
+                "shared_expert_intermediate_size"
+            )
         # HF NemotronH has an explicit head_dim (default 128) that is not
         # derived from hidden_size / num_attention_heads. Set it to match.
         if "head_dim" not in hf_kwargs:
@@ -665,6 +754,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "num_experts_per_tok": "moe_topk",
             "moe_intermediate_size": "expert_ffn_hidden_size",
         },
+        "nemotron_h": {"num_local_experts": "n_routed_experts"},
     }
     if hf_model_type in expert_field_aliases:
         for src_field, dst_field in expert_field_aliases[hf_model_type].items():
@@ -1150,6 +1240,23 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
     # 3. Create HF model
     hf_config = _create_hf_config(model_type, config_overrides)
     hf_model = _create_hf_model(model_type, hf_config, seed)
+    if model_type == "nemotron_h":
+        # Force correction bias to determine the selected experts. This catches
+        # implementations that incorrectly use biased scores as final weights.
+        for layer in hf_model.model.layers:
+            if getattr(layer, "block_type", None) != "moe":
+                continue
+            bias = layer.mixer.gate.e_score_correction_bias
+            with torch.no_grad():
+                bias.copy_(
+                    torch.linspace(
+                        4.0,
+                        1.0,
+                        bias.numel(),
+                        dtype=bias.dtype,
+                        device=bias.device,
+                    )
+                )
 
     # 4. Transfer HF weights to ONNX
     try:
@@ -1157,6 +1264,8 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         for onnx_model in pkg.values():
             apply_weights(onnx_model, preprocessed)
     except Exception as e:
+        if model_type == "qwen4_exp_text":
+            raise
         pytest.skip(f"Weight transfer failed for {model_type}: {type(e).__name__}: {e}")
 
     # Fill any remaining unset initializers (ONNX constants, etc.)
@@ -1164,12 +1273,8 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         _fill_random_weights(onnx_model, rng)
 
     # 5. Prepare inputs
-    # Mamba1 (layer_type="mamba") only supports single-token decode (seq_len=1)
-    # because SelectiveScan uses a sequential recurrence that squeezes the seq
-    # dimension.  Mamba2 and attention layers handle arbitrary seq_len.
-    layer_types = getattr(config, "layer_types", None) or []
-    has_mamba1 = "mamba" in layer_types
-    prefill_seq_len = 1 if has_mamba1 else 3
+    # Exercise multi-token prefill for both recurrent and attention architectures.
+    prefill_seq_len = 3
     input_ids = rng.integers(1, config.vocab_size, size=(1, prefill_seq_len)).astype(np.int64)
     attention_mask = np.ones_like(input_ids)
     position_ids = np.arange(input_ids.shape[1], dtype=np.int64)[np.newaxis, :]
@@ -1199,6 +1304,11 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "position_ids": position_ids,
+        **(
+            {"past_position_ids": np.zeros((1, 0), dtype=np.int64)}
+            if model_type == "qwen4_exp_text"
+            else {}
+        ),
     }
     # Add zero-valued past KV cache feeds with correct shapes:
     # batch=1, past_sequence_len=0, other dims from model spec
@@ -1218,12 +1328,14 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
                 shape.append(1)
             else:
                 shape.append(0)
-        feeds[name] = np.zeros(shape, dtype=np.float32)
+        feeds[name] = np.zeros(shape, dtype=inp.dtype.numpy())
 
     try:
         onnx_out = session.run(feeds)
     except Exception as e:
         session.close()
+        if model_type == "qwen4_exp_text":
+            raise
         pytest.skip(f"ONNX inference failed for {model_type}: {type(e).__name__}: {e}")
     onnx_logits = onnx_out["logits"]
     session.close()

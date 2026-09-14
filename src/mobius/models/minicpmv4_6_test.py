@@ -11,7 +11,7 @@ import torch
 
 from mobius._configs import ArchitectureConfig, VisionConfig
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.tasks import MiniCPMVLTask
 

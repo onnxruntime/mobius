@@ -31,78 +31,83 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from mobius.integrations.gguf._quant_registry import iter_quant_specs, quant_spec_by_name
+from mobius.integrations.gguf._spec import NativeBlockSpec
+
+__all__ = [
+    "NATIVE_BLOCK_BYTE_SIZES",
+    "NativeBlockSpec",
+    "RepackedTensor",
+    "can_repack",
+    "native_block_spec",
+    "preserve_native_blocks",
+    "repack_dequantized_tensor",
+    "repack_gguf_tensor",
+    "repack_quant_params",
+]
+
 _BLOCK_SIZE = 32
 
-# GGUF quantization type IDs (from gguf.GGMLQuantizationType enum)
-_GGUF_Q4_0 = 2
-_GGUF_Q4_1 = 3
-_GGUF_Q8_0 = 8
-_GGUF_Q4_K = 12
-_GGUF_IQ2_XXS = 16
-_GGUF_IQ2_XS = 17
-_GGUF_IQ3_XXS = 18
-_GGUF_IQ1_S = 19
-_GGUF_IQ4_NL = 20
-_GGUF_IQ3_S = 21
-_GGUF_IQ2_S = 22
-_GGUF_IQ4_XS = 23
-_GGUF_IQ1_M = 29
-_GGUF_MXFP4 = 39
-_GGUF_Q1_0 = 41
 
-# Block byte sizes per GGUF type
-_BLOCK_BYTES = {
-    _GGUF_Q4_0: 18,  # 2B scale + 16B quants
-    _GGUF_Q4_1: 20,  # 2B scale + 2B min + 16B quants
-    _GGUF_Q8_0: 34,  # 2B scale + 32B int8 values
-    _GGUF_Q4_K: 144,  # 2B d + 2B dmin + 12B scales + 128B quants
-    _GGUF_Q1_0: 18,  # 2B scale + 16B packed bits (128 elements)
+def _type_id(name: str) -> int:
+    """Return the pinned ``ggml_type`` id for an upper-case type name."""
+    spec = quant_spec_by_name(name)
+    if spec is None:
+        raise ValueError(f"GGML type {name!r} is not in the pinned llama.cpp census")
+    return spec.ggml_type_id
+
+
+# GGUF quantization type IDs, resolved from the pinned llama.cpp census rather
+# than hand-typed, so they cannot drift from ``gguf.GGMLQuantizationType``.
+_GGUF_Q4_0 = _type_id("Q4_0")
+_GGUF_Q4_1 = _type_id("Q4_1")
+_GGUF_Q8_0 = _type_id("Q8_0")
+_GGUF_Q4_K = _type_id("Q4_K")
+_GGUF_Q6_K = _type_id("Q6_K")
+_GGUF_Q1_0 = _type_id("Q1_0")
+
+# Block geometry, repack targets, and native layouts are all derived from
+# ``_quant_registry``. They used to be four literal dicts here plus three more
+# in ``_builder``, kept in sync by hand; a type present in one and missing from
+# another raised ``KeyError`` partway through a build.
+#
+# Block byte sizes:
+#   Q4_0  18 = 2B scale + 16B quants
+#   Q4_1  20 = 2B scale + 2B min + 16B quants
+#   Q8_0  34 = 2B scale + 32B int8 values
+#   Q4_K 144 = 2B d + 2B dmin + 12B sub-scales + 128B quants
+#   Q6_K 210 = 128B low nibbles + 64B high bits + 16B scales + 2B d
+#   Q1_0  18 = 2B scale + 16B packed bits (128 elements)
+_BLOCK_BYTES: dict[int, int] = {
+    spec.ggml_type_id: spec.block_bytes
+    for spec in iter_quant_specs()
+    if spec.affine_repack is not None
 }
 
-# Elements per GGUF block. Q4_K uses 256-element "super-blocks"
-# that decompose into 8 sub-blocks of 32 for MatMulNBits. Q1_0 uses
-# 128-element blocks (QK1_0 from llama.cpp).
-_GGUF_BLOCK_ELEMENTS = {
-    _GGUF_Q4_0: 32,
-    _GGUF_Q4_1: 32,
-    _GGUF_Q8_0: 32,
-    _GGUF_Q4_K: 256,
-    _GGUF_Q1_0: 128,
+# Elements per GGUF block. Q4_K/Q6_K use 256-element "super-blocks" that
+# decompose into 8 sub-blocks of 32 for MatMulNBits; Q1_0 uses 128-element
+# blocks (QK1_0 from llama.cpp).
+_GGUF_BLOCK_ELEMENTS: dict[int, int] = {
+    spec.ggml_type_id: spec.block_elements
+    for spec in iter_quant_specs()
+    if spec.affine_repack is not None
 }
 
-_SUPPORTED_TYPES = frozenset(_BLOCK_BYTES.keys())
+_SUPPORTED_TYPES = frozenset(_BLOCK_BYTES)
 
 # MatMulNBits representation produced for each supported GGUF type.
-_REPACK_PARAMS = {
-    _GGUF_Q4_0: (4, 32),
-    _GGUF_Q4_1: (4, 32),
-    _GGUF_Q8_0: (8, 32),
-    _GGUF_Q4_K: (4, 32),
-    _GGUF_Q1_0: (2, 128),
+_REPACK_PARAMS: dict[int, tuple[int, int]] = {
+    spec.ggml_type_id: spec.affine_repack.as_params()
+    for spec in iter_quant_specs()
+    if spec.affine_repack is not None
 }
 
-
-@dataclass(frozen=True)
-class NativeBlockSpec:
-    """Serialized GGUF block layout accepted directly by the runtime."""
-
-    format: str
-    elements: int
-    bytes: int
-
-
-_NATIVE_BLOCK_SPECS = {
-    _GGUF_MXFP4: NativeBlockSpec("mxfp4", 32, 17),
-    _GGUF_IQ4_NL: NativeBlockSpec("iq4_nl", 32, 18),
-    _GGUF_IQ4_XS: NativeBlockSpec("iq4_xs", 256, 136),
-    _GGUF_IQ3_S: NativeBlockSpec("iq3_s", 256, 110),
-    _GGUF_IQ3_XXS: NativeBlockSpec("iq3_xxs", 256, 98),
-    _GGUF_IQ2_XXS: NativeBlockSpec("iq2_xxs", 256, 66),
-    _GGUF_IQ2_XS: NativeBlockSpec("iq2_xs", 256, 74),
-    _GGUF_IQ2_S: NativeBlockSpec("iq2_s", 256, 82),
-    _GGUF_IQ1_S: NativeBlockSpec("iq1_s", 256, 50),
-    _GGUF_IQ1_M: NativeBlockSpec("iq1_m", 256, 56),
+_NATIVE_BLOCK_SPECS: dict[int, NativeBlockSpec] = {
+    spec.ggml_type_id: spec.native_preserve
+    for spec in iter_quant_specs()
+    if spec.native_preserve is not None
 }
+
 NATIVE_BLOCK_BYTE_SIZES = frozenset(spec.bytes for spec in _NATIVE_BLOCK_SPECS.values())
 
 
@@ -199,11 +204,11 @@ def repack_gguf_tensor(
     block_bytes = _BLOCK_BYTES[gguf_type]
     gguf_block_elems = _GGUF_BLOCK_ELEMENTS[gguf_type]
     n_blocks_per_row = math.ceil(k_in / gguf_block_elems)
-    if gguf_type == _GGUF_Q4_K:
+    if gguf_type in (_GGUF_Q4_K, _GGUF_Q6_K):
         # K-quant super-blocks are laid out over the flattened tensor, not
         # independently padded at each logical row boundary. This matters for
         # dimensions such as Qwen2's K=896: rows end halfway through a
-        # 256-element Q4_K super-block, while they still align perfectly to
+        # 256-element super-block, while they still align perfectly to
         # MatMulNBits' 32-element blocks.
         total_blocks = math.ceil(n_out * k_in / gguf_block_elems)
     else:
@@ -226,6 +231,8 @@ def repack_gguf_tensor(
         return _repack_q4_1(blocks, n_out, n_blocks_per_row)
     elif gguf_type == _GGUF_Q4_K:
         return _repack_q4_k(blocks, n_out, k_in)
+    elif gguf_type == _GGUF_Q6_K:
+        return _repack_q6_k(blocks, n_out, k_in)
     elif gguf_type == _GGUF_Q1_0:
         return _repack_q1_0(blocks, n_out, n_blocks_per_row)
     else:
@@ -496,6 +503,96 @@ def _repack_q4_k(
     if dequantized.size < logical_elements:
         raise ValueError(
             f"Q4_K data has {dequantized.size} elements, "
+            f"but shape ({n_out}, {k_in}) requires {logical_elements}"
+        )
+
+    values = dequantized[:logical_elements].reshape(n_out, k_in)
+    return repack_dequantized_tensor(values, bits=4, block_size=_BLOCK_SIZE)
+
+
+def _dequantize_q6_k(blocks: np.ndarray) -> np.ndarray:
+    """Reconstruct float values from Q6_K super-blocks.
+
+    Q6_K stores 256-element super-blocks as
+    ``[ql: 128B][qh: 64B][scales: 16B int8][d: 2B fp16]`` and reconstructs
+    ``value = d * scales[is] * (q - 32)`` where the 6-bit ``q`` is assembled
+    from a low nibble in ``ql`` and a high 2-bit field in ``qh``.
+
+    The element interleave follows ggml's ``dequantize_row_q6_K`` exactly: each
+    128-element half consumes 64 ``ql`` bytes, 32 ``qh`` bytes and 8 scales,
+    and emits four 32-element groups whose scales are ``sc[is], sc[is+2],
+    sc[is+4], sc[is+6]`` with ``is = l // 16``.
+
+    Split out from [`_repack_q6_k`] so the interleave can be compared against
+    the reference dequantizer *exactly*. Every plausible-but-wrong permutation
+    of this layout still yields finite values of the right magnitude, so an
+    approximate check cannot tell a correct unpack from a transposed one, and
+    the lossy requantization that follows would mask the difference.
+
+    Args:
+        blocks: uint8 array, shape ``(total_super_blocks, 210)``.
+
+    Returns:
+        Flat float32 array of ``total_super_blocks * 256`` values.
+    """
+    total = blocks.shape[0]
+
+    ql = blocks[:, :128]  # (total, 128)
+    qh = blocks[:, 128:192]  # (total, 64)
+    scales = blocks[:, 192:208].copy().view(np.int8).astype(np.float32)
+    d = blocks[:, 208:210].copy().view(np.float16).astype(np.float32).ravel()
+
+    # Two 128-element halves per super-block; each takes 64 ql, 32 qh, 8 scales.
+    ql_h = ql.reshape(total, 2, 64)
+    qh_h = qh.reshape(total, 2, 32)
+    sc_h = scales.reshape(total, 2, 8)
+
+    lo = ql_h[:, :, :32]  # ql[l +  0]
+    hi = ql_h[:, :, 32:]  # ql[l + 32]
+
+    q1 = (lo & 0x0F) | (((qh_h >> 0) & 0x03) << 4)
+    q2 = (hi & 0x0F) | (((qh_h >> 2) & 0x03) << 4)
+    q3 = (lo >> 4) | (((qh_h >> 4) & 0x03) << 4)
+    q4 = (hi >> 4) | (((qh_h >> 6) & 0x03) << 4)
+
+    # (total, 2, 4, 32) in emission order y[l+0], y[l+32], y[l+64], y[l+96].
+    q = np.stack([q1, q2, q3, q4], axis=2).astype(np.float32) - 32.0
+
+    # `is = l // 16` splits each 32-element group into two 16-element halves
+    # taking consecutive scales; group g uses sc[is + 2*g].
+    sc_idx = np.array([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=np.intp)
+    sub_scales = np.repeat(sc_h[:, :, sc_idx], 16, axis=3)  # (total, 2, 4, 32)
+
+    return (d[:, None, None, None] * sub_scales * q).reshape(-1)
+
+
+def _repack_q6_k(
+    blocks: np.ndarray,
+    n_out: int,
+    k_in: int,
+) -> RepackedTensor:
+    """Dequantize Q6_K super-blocks and requantize to MatMulNBits.
+
+    The 6-bit width has no MatMulNBits equivalent, and a mixed preset such as
+    Q4_K_M must use one MatMulNBits configuration across the whole graph, so
+    the super-blocks are reference-dequantized (see [`_dequantize_q6_k`]) and
+    affine-requantized to the model's common 4-bit/32 layout — the same
+    treatment Q4_K already receives. The requantization is lossy.
+
+    Args:
+        blocks: uint8 array, shape ``(total_super_blocks, 210)``.
+        n_out: Number of output rows (N dimension).
+        k_in: Number of input columns (K dimension).
+
+    Returns:
+        A ``RepackedTensor`` with ``block_size=32`` and ``bits=4``.
+    """
+    dequantized = _dequantize_q6_k(blocks)
+
+    logical_elements = n_out * k_in
+    if dequantized.size < logical_elements:
+        raise ValueError(
+            f"Q6_K data has {dequantized.size} elements, "
             f"but shape ({n_out}, {k_in}) requires {logical_elements}"
         )
 

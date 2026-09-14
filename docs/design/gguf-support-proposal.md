@@ -30,7 +30,9 @@ created by the ggml/llama.cpp ecosystem. It stores:
 - **Model metadata** as key-value pairs (architecture, hyperparameters,
   RoPE config, vocabulary, tokenizer)
 - **Tensor data** with per-tensor quantization type annotations
-- **Tokenizer** (vocabulary, merges, special tokens) — fully self-contained
+- **Tokenizer metadata** (vocabulary, merges, special tokens). This is not a
+  complete tokenizer pipeline: `tokenizer.ggml.pre` selects compiled llama.cpp
+  behavior that the file does not serialize.
 
 GGUF is the successor to GGML/GGMF/GGJT formats and is the standard
 for quantized model distribution on HuggingFace (>50,000 GGUF models
@@ -443,9 +445,9 @@ construction. The only new code is the GGUF → HF bridge.
 
 ### 5.2 Optional
 
-- **`transformers`** (already optional dep): For tokenizer extraction
-  from GGUF. GGUF embeds the tokenizer, but constructing a proper
-  `tokenizer.json` requires HF's converter classes.
+- **`tokenizers`** (via the transformers extra): validates an exact embedded
+  `tokenizer.huggingface.json`. Mobius does not use Transformers' generic GGUF
+  conversion because it does not reproduce the pinned `pre` dispatch.
 
 ### 5.3 Dependency Strategy
 
@@ -856,11 +858,11 @@ Neither QDQ nor MatMulNBits can natively represent:
 
 ### 8.7 Implemented Direct-Import Policy
 
-Direct GGUF import preserves supported quantization by default, with an
-explicit fully float path:
+Direct GGUF import uses quantized target storage by default, with an explicit
+fully float path and a persistent fidelity report:
 
 ```python
-# Default: preserve supported quantization
+# Default: quantized target storage where supported
 pkg = build_from_gguf("model.gguf")
 
 # Explicitly dequantize all weights
@@ -870,9 +872,11 @@ pkg = build_from_gguf("model.gguf", keep_quantized=False)
 The quantized path is classified per tensor: supported affine blocks are
 repacked for `MatMulNBits`; in text-only builds, supported native IQ/MXFP4
 projection blocks retain their bytes for `BlockQuantizedMatMul`; and multimodal
-or mixed source qtypes may require dequantization/requantization or produce a
-clear unsupported-layout error. F32-, F16-, and BF16-only files use the float
-path automatically because there is no quantization to preserve.
+or mixed source qtypes may require lossy dequantization/requantization or produce
+a clear unsupported-layout error. One deterministic warning summarizes lossy
+qtypes, counts, and bytes, while `quantization_report.json` records storage and
+compute semantics separately. F32-, F16-, and BF16-only files use the float path
+automatically because there is no quantized storage to convert.
 
 ### 8.8 Historical Alternative: QDQLinear (Not Implemented)
 
@@ -1097,10 +1101,10 @@ Apache-2.0 licensed, and actively maintained.
    `internlm2`). We need a mapping from GGUF architecture names to our
    registry's `model_type` values.
 
-3. **Tokenizer extraction**: GGUF embeds the tokenizer. Should we
-   extract and convert it to `tokenizer.json` format, or require the
-   user to provide a tokenizer separately? HF Transformers extracts the
-   tokenizer. We should do the same.
+3. **Tokenizer extraction**: resolved. Mobius copies a complete embedded
+   `tokenizer.huggingface.json` only after ordered-vocabulary validation.
+   Ordinary GGUF tokenizer metadata remains graph-only/deferred because it
+   cannot reproduce the full tokenizer pipeline.
 
 4. **K-quant precision**: The super-block → single-block flattening
    for Q4_K is lossy. How much quality do we lose? This needs

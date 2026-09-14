@@ -95,6 +95,52 @@ class VisionLanguageTask(ModelTask):
         return _make_model(graph)
 
 
+class GGUFProjectorVisionLanguageTask(VisionLanguageTask):
+    """Generic sidecar split with the processor-native float image boundary."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build one image per call and expose rank-2 projected feature rows."""
+        image_size = (config.vision.image_size if config.vision else None) or 224
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[1, 3, image_size, image_size],
+        )
+        image_features = vision(builder.op, pixel_values=pixel_values)
+        image_features = builder.op.Squeeze(image_features, [0])
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
+class Gemma3VisionLanguageTask(VisionLanguageTask):
+    """Gemma 3 split with the processor-native, single-image vision boundary."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build one Gemma 3 image per invocation; callers split processor image rows."""
+        image_size = (config.vision.image_size if config.vision else None) or 896
+
+        graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[1, 3, image_size, image_size],
+        )
+        image_features = vision(op, pixel_values=pixel_values)
+
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class Cosmos3EdgeVLTask(VisionLanguageTask):
     """NVIDIA Cosmos3-Edge VL 3-model split.
 
@@ -225,9 +271,9 @@ class QwenVLTask(VisionLanguageTask):
     ) -> ir.Model:
         """Build Qwen VL vision encoder with packed patches and grid_thw.
 
-        When ``deepstack_visual_indexes`` is set (Qwen3-VL family), the vision
-        encoder emits an extra ``deepstack_features`` output stacking the
-        intermediate DeepStack maps: ``[D, num_merged_patches, out_hidden]``.
+        When ``deepstack_visual_indexes`` is set (Qwen3-VL family), the final
+        and intermediate maps are packed into the single ``image_features``
+        output as ``[num_merged_patches, (D + 1) * out_hidden]``.
         """
         total_patches = ir.SymbolicDim("total_patches")
         num_images = ir.SymbolicDim("num_images")
@@ -241,7 +287,7 @@ class QwenVLTask(VisionLanguageTask):
         op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[total_patches, pixel_dim],
         )
         image_grid_thw = builder.input(
@@ -258,10 +304,108 @@ class QwenVLTask(VisionLanguageTask):
 
         if isinstance(outputs, tuple):
             image_features, deepstack_features = outputs
-            builder.add_output(image_features, "image_features")
-            builder.add_output(deepstack_features, "deepstack_features")
+            num_deepstack = len(config.deepstack_visual_indexes or [])
+            deepstack_flat = op.Reshape(
+                op.Transpose(deepstack_features, perm=[1, 0, 2]),
+                op.Constant(value_ints=[0, num_deepstack * config.hidden_size]),
+            )
+            packed_features = op.Concat(image_features, deepstack_flat, axis=1)
+            builder.add_output(packed_features, "image_features")
         else:
             builder.add_output(outputs, "image_features")
+        return _make_model(graph)
+
+
+class Qwen2VLMultimediaTask(QwenVLTask):
+    """Qwen2/Qwen2.5 task preserving independent image and video streams."""
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models = {
+            "decoder": build_decoder_from_embeds(module.decoder, config, mrope=True),
+            "vision_encoder": self._build_vision(module.vision_encoder, config),
+            "embedding": self._build_multimedia_embedding(module.embedding, config),
+        }
+        return ModelPackage(models, config=config)
+
+    @staticmethod
+    def _build_multimedia_embedding(
+        embedding: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        num_image_tokens = ir.SymbolicDim("num_image_tokens")
+        num_video_tokens = ir.SymbolicDim("num_video_tokens")
+
+        graph, builder = _make_graph(name="embedding")
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
+        )
+        image_features = builder.input(
+            "image_features",
+            dtype=config.dtype,
+            shape=[num_image_tokens, config.hidden_size],
+        )
+        video_features = builder.input(
+            "video_features",
+            dtype=config.dtype,
+            shape=[num_video_tokens, config.hidden_size],
+        )
+        inputs_embeds = embedding(
+            builder.op,
+            input_ids=input_ids,
+            image_features=image_features,
+            video_features=video_features,
+        )
+        builder.add_output(inputs_embeds, "inputs_embeds")
+        return _make_model(graph)
+
+
+class GlmOcrVLTask(QwenVLTask):
+    """GLM-OCR packed vision task with a float32 processor boundary."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        total_patches = ir.SymbolicDim("total_patches")
+        num_images = ir.SymbolicDim("num_images")
+        vision_config = config.vision
+        assert vision_config is not None
+        patch_size = vision_config.patch_size or 14
+        pixel_dim = (
+            vision_config.in_channels
+            * vision_config.temporal_patch_size
+            * patch_size
+            * patch_size
+        )
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[total_patches, pixel_dim],
+        )
+        image_grid_thw = builder.input(
+            "image_grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 3],
+        )
+        model_pixels = builder.op.Cast(pixel_values, to=config.dtype)
+        image_features = vision(
+            builder.op,
+            pixel_values=model_pixels,
+            image_grid_thw=image_grid_thw,
+        )
+        builder.add_output(image_features, "image_features")
         return _make_model(graph)
 
 
@@ -355,6 +499,77 @@ class HybridQwenVLTask(QwenVLTask):
             deepstack=deepstack,
         )
         return ModelPackage(models, config=config)
+
+
+class Lfm2VlTask(VisionLanguageTask):
+    """LFM2-VL split: SigLIP2 NaFlex vision with an LFM2 hybrid decoder.
+
+    The decoder mixes ``"conv"`` (gated short convolution) and
+    ``"full_attention"`` layers, so it uses the hybrid cache contract.  The
+    vision encoder takes the NaFlex triple emitted by the image processor:
+    pre-patchified pixels, a per-patch padding mask, and the per-image patch
+    grid, and returns the flat ``[num_image_tokens, text_hidden]`` stream that
+    the embedding model scatters onto the image placeholder tokens.
+    """
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = build_decoder_from_embeds(
+            module.decoder,
+            config,
+            hybrid=True,
+        )
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        return ModelPackage(models, config=config)
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build the NaFlex vision encoder: patchified pixels -> image features."""
+        num_images = ir.SymbolicDim("num_images")
+        max_patches = ir.SymbolicDim("max_num_patches")
+        vision_config = config.vision
+        assert vision_config is not None
+        patch_size = vision_config.patch_size or 16
+        patch_dim = vision_config.in_channels * patch_size * patch_size
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=config.dtype,
+            shape=[num_images, max_patches, patch_dim],
+        )
+        pixel_attention_mask = builder.input(
+            "pixel_attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, max_patches],
+        )
+        spatial_shapes = builder.input(
+            "spatial_shapes",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 2],
+        )
+        image_features = vision(
+            builder.op,
+            pixel_values=pixel_values,
+            pixel_attention_mask=pixel_attention_mask,
+            spatial_shapes=spatial_shapes,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
 
 
 class MiniCPMVLTask(VisionLanguageTask):

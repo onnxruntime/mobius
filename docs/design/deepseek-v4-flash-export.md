@@ -33,12 +33,21 @@ Hyper-Connections. A separate model module avoids forcing those semantics
 into `DeepSeekMLA`.
 
 This increment exports the V4 projections, full Hyper-Connections, V4 MoE
-routing/shared experts, and KV-cache-compatible **dense causal attention**.
-The fallback includes the official per-head attention sinks. It follows the
-checkpoint's `compress_ratios` schedule and retains every learned compressor
-and ratio-4 indexer tensor in the ONNX graph, but does not yet execute
-compressed-history selection. The dense path is therefore correct as causal
-attention, while not numerically equivalent to CSA/HCA at long context.
+routing/shared experts, and KV-cache-compatible **dense, `sliding_window`-
+restricted causal attention** (`local_window_size` on the fused GQA path,
+an explicit float bias on the decomposed path — see
+`DeepSeekV4Attention.local_window_size`). The reference model
+unconditionally restricts every layer, regardless of `compress_ratio`, to
+its most recent `sliding_window` (128) positions; this window is applied
+uniformly here too. The fallback includes the official per-head attention
+sinks. It follows the checkpoint's `compress_ratios` schedule and retains
+every learned compressor and ratio-4 indexer tensor in the ONNX graph, but
+does not yet execute compressed-history selection: ratio>0 layers get the
+correct windowed local component but are still missing the additional
+compressed/indexer-selected positions the reference unions into the same
+softmax. The dense path is therefore exactly correct for `compress_ratio=0`
+layers, and partially correct (window right, compressed history missing)
+for `compress_ratio>0` layers at long context.
 
 The official single MTP block is exported as `mtp/model.onnx`. It consumes the
 target's raw Hyper-Connection state plus the next-token embedding, runs the

@@ -21,6 +21,13 @@ quirks need bridging into :class:`~mobius._configs.VisionConfig`:
 - The text decoder uses **interleaved** 3D M-RoPE (T, H, W, T, H, W, ...)
   rather than the contiguous ``mrope_section`` chunking used by Qwen-VL. HF
   reference: ``Cosmos3EdgeTextRotaryEmbedding.compute_default_rope_parameters``.
+
+Registered for ``cosmos3_edge_text`` as well as the composite and vision types.
+Callers resolve the composite down to its ``text_config`` before building, which
+renames the model type; a hook registered only on ``cosmos3_edge`` then never
+matches and every field above silently stays ``None`` until an assertion fires
+in the vision tower. ``_muse_glimmer_vision`` registers its ``_text`` variant
+for the same reason.
 """
 
 from __future__ import annotations

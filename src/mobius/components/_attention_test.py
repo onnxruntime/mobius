@@ -14,7 +14,7 @@ from mobius._testing import (
     create_test_input,
     make_config,
 )
-from mobius.components._attention import Attention, Qwen35Attention
+from mobius.components._attention import Attention, FusedQKVAttention, Qwen35Attention
 
 
 class TestAttention:
@@ -147,6 +147,33 @@ class TestAttention:
         params = list(attn.parameters())
         # 4 weights + 4 biases = 8
         assert len(params) == 8
+
+
+class TestFusedQKVAttention:
+    def test_clamps_fused_projection_before_split(self):
+        config = make_config(
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+        )
+        attention = FusedQKVAttention(config, clamp=8.0)
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 2, 8])
+
+        query, key, value = attention._project_qkv(op, hidden)
+        builder._adapt_outputs([query, key, value], "")
+
+        split = query.producer()
+        assert split is key.producer() is value.producer()
+        assert split.op_type == "Split"
+        assert split.inputs[0].producer().op_type == "Clip"
+        assert split.inputs[0].producer().inputs[0].producer().op_type == "MatMul"
+        assert {name for name, _ in attention.named_parameters()} == {
+            "qkv_proj.weight",
+            "o_proj.weight",
+        }
+        assert graph.num_nodes() > 0
 
 
 class TestQwen35Attention:

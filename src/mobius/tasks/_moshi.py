@@ -100,16 +100,17 @@ class MoshiTemporalTask(ModelTask):
 
 
 class MoshiDepformerTask(ModelTask):
-    """Moshi depformer: one autoregressive substep with intra-frame KV cache.
+    """Moshi/PersonaPlex depformer substep with intra-frame KV cache.
 
     The module's ``forward()`` must accept
     ``(op, hidden, prev_token, substep_index, past_key_values)`` and return
-    ``(logits, list_of_(key, value)_tuples)``.
+    ``(logits, list_of_(key, value)_tuples)``. The graph is invoked 8 times
+    per frame for public Moshi/Moshiko or 16 times for PersonaPlex.
 
     Inputs:
         - hidden: [batch, 1, temporal_dim] FLOAT (temporal transformer output)
         - prev_token: [batch, 1] INT64 (token sampled at the previous substep)
-        - substep_index: scalar INT64 in [0, 15]
+        - substep_index: scalar INT64 in [0, config.max_position_embeddings - 1]
         - past_key_values.{i}.key / .value: [batch, num_heads, past_len,
           head_dim] FLOAT
     Outputs:

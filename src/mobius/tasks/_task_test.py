@@ -38,6 +38,22 @@ from mobius.tasks import (
     build_embedding_from_features,
     get_task,
 )
+from mobius.tasks._base import _make_model
+
+
+def test_make_model_uses_universal_ir12():
+    graph = ir.Graph(
+        [ir.val("input", ir.DataType.FLOAT, [1])],
+        [],
+        nodes=[],
+        name="universal_ir",
+        opset_imports={"": 24, "com.microsoft": 1},
+    )
+
+    model = _make_model(graph)
+
+    assert model.ir_version == 12
+    assert dict(model.graph.opset_imports) == {"": 24, "com.microsoft": 1}
 
 
 class TestGetTask:
@@ -334,6 +350,28 @@ class TestSeq2SeqTask:
         assert "past_key_values.0.cross.key" in input_names
         assert "past_key_values.0.cross.value" in input_names
 
+    @pytest.mark.parametrize(
+        ("use_cross_attention_cache", "expected_shape"),
+        [
+            (False, "[batch,encoder_sequence_len]"),
+            (True, "[batch,cross_past_sequence_len + encoder_sequence_len]"),
+        ],
+    )
+    def test_encoder_attention_mask_matches_cross_cache_contract(
+        self, use_cross_attention_cache, expected_shape
+    ):
+        from mobius.models.t5 import T5ForConditionalGeneration
+
+        config, _ = self._make_seq2seq()
+        module = T5ForConditionalGeneration(config)
+        task = Seq2SeqTask(
+            use_attention_masks=True,
+            use_cross_attention_cache=use_cross_attention_cache,
+        )
+        decoder = task.build(module, config)["decoder"]
+        inputs = {value.name: value for value in decoder.graph.inputs}
+        assert str(inputs["encoder_attention_mask"].shape) == expected_shape
+
     def test_decoder_outputs(self):
         config, module = self._make_seq2seq()
         task = Seq2SeqTask()
@@ -410,7 +448,7 @@ class TestDenoisingTask:
         model = pkg["model"]
         inputs_by_name = {v.name: v for v in model.graph.inputs}
         assert inputs_by_name["sample"].dtype == ir.DataType.FLOAT
-        assert inputs_by_name["timestep"].dtype == ir.DataType.INT64
+        assert inputs_by_name["timestep"].dtype == ir.DataType.FLOAT
         assert inputs_by_name["encoder_hidden_states"].dtype == ir.DataType.FLOAT
 
     def test_outputs(self):
@@ -434,7 +472,7 @@ class TestDenoisingTask:
 
 class TestVAETask:
     def _make_vae(self):
-        from mobius._diffusers_configs import VAEConfig
+        from mobius.integrations.diffusers._configs import VAEConfig
         from mobius.models.vae import AutoencoderKLModel
 
         config = VAEConfig(
@@ -749,6 +787,7 @@ class TestSSMCausalLMTask:
         assert "past_states.0.conv_state" in input_names
         assert "past_states.0.ssm_state" in input_names
         assert "past_states.1.conv_state" in input_names
+        assert str(tuple(model.graph.inputs[0].shape)[1]) == "1"
 
     def test_no_kv_cache(self):
         config, module = self._make_mamba()
@@ -819,6 +858,7 @@ class TestSSM2CausalLMTask:
         assert "input_ids" in input_names
         assert "past_states.0.conv_state" in input_names
         assert "past_states.0.ssm_state" in input_names
+        assert str(tuple(model.graph.inputs[0].shape)[1]) == "sequence_len"
 
     def test_outputs(self):
         config, module = self._make_mamba2()

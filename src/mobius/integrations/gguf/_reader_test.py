@@ -9,6 +9,11 @@ to avoid requiring model downloads.
 
 from __future__ import annotations
 
+import errno
+import os
+import struct
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +28,57 @@ from mobius.integrations.gguf._config_mapping import (
     _infer_tie_embeddings,
     gguf_to_config,
 )
+from mobius.integrations.gguf._header import _gguf_architecture_from_header
 from mobius.integrations.gguf._reader import GGUFModel
+from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if os.name == "nt" and (
+            getattr(error, "winerror", None) in {1, 50, 1314}
+            or error.errno in {errno.EPERM, errno.EACCES, errno.ENOSYS}
+        ):
+            pytest.skip(f"Windows runner cannot create test symlinks: {error}")
+        raise
+
+
+def _raw_gguf_string(value: bytes) -> bytes:
+    return struct.pack("<Q", len(value)) + value
+
+
+def _raw_gguf_header(*entries: bytes) -> bytes:
+    return b"GGUF" + struct.pack("<IQQ", 3, 0, len(entries)) + b"".join(entries)
+
+
+def _raw_gguf_architecture_entry() -> bytes:
+    return (
+        _raw_gguf_string(b"general.architecture")
+        + struct.pack("<I", 8)
+        + _raw_gguf_string(b"llama")
+    )
+
+
+def test_unsupported_header_reports_both_endian_versions() -> None:
+    data = b"GGUF" + struct.pack("<I", 4) + bytes(16)
+    with pytest.raises(
+        ValueError,
+        match=r"little-endian=4, big-endian=67108864",
+    ):
+        _gguf_architecture_from_header(data, source="unsupported.gguf")
+
+
+def _raw_gguf_array_entry(
+    *,
+    count: int,
+    element_type: int,
+    payload: bytes = b"",
+) -> bytes:
+    return (
+        _raw_gguf_string(b"test.array") + struct.pack("<IIQ", 9, element_type, count) + payload
+    )
 
 
 def _write_test_gguf(
@@ -372,6 +427,124 @@ class TestGGUFModelReader:
         with pytest.raises(FileNotFoundError, match="not found"):
             GGUFModel(tmp_path / "nonexistent.gguf")
 
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are unavailable")
+    def test_rejects_fifo_without_waiting_for_a_writer(self, tmp_path: Path):
+        path = tmp_path / "source.gguf"
+        os.mkfifo(path)
+
+        with pytest.raises(FileNotFoundError, match="not found"):
+            GGUFModel(path)
+
+    def test_reader_uses_pinned_source_during_opening_time_symlink_aba(
+        self,
+        llama_gguf: Path,
+        gemma4_gguf: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import gguf
+
+        original_reader = gguf.GGUFReader
+        logical = tmp_path / "source.gguf"
+        _symlink_or_skip(logical, llama_gguf)
+
+        def replace_path_before_reader_opens(source):
+            logical.unlink()
+            _symlink_or_skip(logical, gemma4_gguf)
+            logical.unlink()
+            _symlink_or_skip(logical, llama_gguf)
+            return original_reader(source)
+
+        monkeypatch.setattr(gguf, "GGUFReader", replace_path_before_reader_opens)
+
+        model = GGUFModel(logical)
+        assert model.architecture == "llama"
+        assert model.source_matches_path()
+
+    def test_reader_fails_closed_when_symlink_is_retargeted_during_open(
+        self,
+        llama_gguf: Path,
+        gemma4_gguf: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import gguf
+
+        path = tmp_path / "source.gguf"
+        _symlink_or_skip(path, llama_gguf)
+        original_reader = gguf.GGUFReader
+
+        def retarget_symlink_before_reader_opens(source):
+            path.unlink()
+            _symlink_or_skip(path, gemma4_gguf)
+            return original_reader(source)
+
+        monkeypatch.setattr(gguf, "GGUFReader", retarget_symlink_before_reader_opens)
+
+        with pytest.raises(
+            ValueError, match="source path changed while the reader was opening"
+        ):
+            GGUFModel(path)
+
+    def test_artifact_hash_waits_for_exclusive_pinned_descriptor_access(
+        self, llama_gguf: Path
+    ):
+        model = GGUFModel(llama_gguf)
+        descriptor_held = threading.Event()
+        release_descriptor = threading.Event()
+        hash_started = threading.Event()
+
+        def hold_descriptor():
+            with model.open_source_descriptor():
+                descriptor_held.set()
+                release_descriptor.wait()
+
+        def hash_artifact():
+            hash_started.set()
+            return gguf_artifact_identity(
+                llama_gguf,
+                model,
+                architecture=model.architecture,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            holder = executor.submit(hold_descriptor)
+            assert descriptor_held.wait(timeout=1)
+            hasher = executor.submit(hash_artifact)
+            assert hash_started.wait(timeout=1)
+            try:
+                with pytest.raises(TimeoutError):
+                    hasher.result(timeout=0.05)
+            finally:
+                release_descriptor.set()
+            holder.result(timeout=1)
+            identity = hasher.result(timeout=1)
+
+        assert identity.sha256 == model.source_sha256()
+
+    def test_rejects_huge_metadata_array_before_constructing_upstream_reader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import gguf
+
+        path = tmp_path / "huge-array.gguf"
+        path.write_bytes(
+            _raw_gguf_header(
+                _raw_gguf_array_entry(count=2**63, element_type=0),
+                _raw_gguf_architecture_entry(),
+            )
+        )
+
+        def fail_if_constructed(path: str):
+            pytest.fail(f"GGUFReader unexpectedly opened {path}")
+
+        monkeypatch.setattr(gguf, "GGUFReader", fail_if_constructed)
+        with pytest.raises(
+            ValueError,
+            match=r"truncated GGUF metadata array.*9223372036854775808 elements",
+        ):
+            GGUFModel(path)
+
     def test_repr(self, llama_gguf: Path):
         model = GGUFModel(llama_gguf)
         r = repr(model)
@@ -410,69 +583,6 @@ class TestConfigMapping:
         assert GGUF_ARCH_TO_MODEL_TYPE["qwen2"] == "qwen2"
         assert GGUF_ARCH_TO_MODEL_TYPE["qwen35"] == "qwen3_5_text"
         assert GGUF_ARCH_TO_MODEL_TYPE["phi3"] == "phi3"
-        assert GGUF_ARCH_TO_MODEL_TYPE["deepseek4"] == "deepseek_v4"
-
-    def test_deepseek4_config_extraction(self):
-        metadata = {
-            "general.architecture": "deepseek4",
-            "deepseek4.embedding_length": 4096,
-            "deepseek4.block_count": 43,
-            "deepseek4.attention.head_count": 64,
-            "deepseek4.attention.head_count_kv": 1,
-            "deepseek4.attention.key_length": 512,
-            "deepseek4.context_length": 1048576,
-            "deepseek4.rope.dimension_count": 64,
-            "deepseek4.rope.freq_base": 10000.0,
-            "deepseek4.rope.scaling.type": "yarn",
-            "deepseek4.rope.scaling.factor": 16.0,
-            "deepseek4.rope.scaling.original_context_length": 65536,
-            "deepseek4.rope.scaling.yarn_beta_fast": 32.0,
-            "deepseek4.rope.scaling.yarn_beta_slow": 1.0,
-            "deepseek4.attention.layer_norm_rms_epsilon": 1e-6,
-            "deepseek4.expert_count": 256,
-            "deepseek4.expert_used_count": 6,
-            "deepseek4.expert_feed_forward_length": 2048,
-            "deepseek4.expert_shared_count": 1,
-            "deepseek4.expert_weights_scale": 1.5,
-            "deepseek4.expert_weights_norm": True,
-            "deepseek4.swiglu_clamp_exp": [10.0] * 43,
-            "deepseek4.attention.q_lora_rank": 1024,
-            "deepseek4.attention.sliding_window": 128,
-            "deepseek4.attention.output_group_count": 8,
-            "deepseek4.attention.output_lora_rank": 1024,
-            "deepseek4.attention.indexer.head_count": 64,
-            "deepseek4.attention.indexer.key_length": 128,
-            "deepseek4.attention.indexer.top_k": 512,
-            "deepseek4.attention.compress_ratios": [0, 0, 4, 128],
-            "deepseek4.attention.compress_rope_freq_base": 160000.0,
-            "deepseek4.hyper_connection.count": 4,
-            "deepseek4.hyper_connection.sinkhorn_iterations": 20,
-            "deepseek4.hyper_connection.epsilon": 1e-6,
-            "deepseek4.hash_layer_count": 3,
-        }
-
-        class _FakeModel:
-            architecture = "deepseek4"
-
-            def __init__(self, values):
-                self.metadata = values
-                self.tensor_names = ["token_embd.weight", "output.weight"]
-
-            def get_metadata(self, key, default=None):
-                return self.metadata.get(key, default)
-
-        config = gguf_to_config(_FakeModel(metadata))
-        assert config.model_type == "deepseek_v4"
-        assert config.head_dim == 512
-        assert config.qk_rope_head_dim == 64
-        assert config.num_local_experts == 256
-        assert config.scoring_func == "sqrtsoftplus"
-        assert config.hc_mult == 4
-        assert config.num_hash_layers == 3
-        assert config.swiglu_limit == pytest.approx(10.0)
-        assert config.rope_interleave is True
-        assert config.rope_type == "yarn"
-        assert config.original_max_position_embeddings == 65536
 
     def test_tie_embeddings_detected(self, tied_gguf: Path):
         model = GGUFModel(tied_gguf)

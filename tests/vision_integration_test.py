@@ -19,7 +19,7 @@ from mobius import build_from_module, models
 from mobius._configs import ArchitectureConfig
 from mobius._testing.comparison import assert_logits_close
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 
 # ---------------------------------------------------------------------------
 # Shared tiny config values

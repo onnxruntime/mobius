@@ -156,3 +156,27 @@ def deterministic_seed():
     random.seed(seed)
     np.random.seed(seed)
     return seed
+
+
+@pytest.fixture(scope="session")
+def materialized_workflow_packages(tmp_path_factory) -> str:
+    """Build the conformance packages once, with their ONNX artifacts.
+
+    Only the metadata of these packages is committed: it is the contract under
+    review, and a diff of it is readable. The graphs are a deterministic
+    function of the generator, so committing them would store ~14 MB of bytes
+    no one reads to restate what the script already says — and one of them is a
+    5 MB weight blob.
+
+    Tests that need to resolve a declaration against the graph that really
+    exposes a port get the artifacts from here. Generation takes a few seconds
+    and is shared across the whole session.
+    """
+    import sys
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from generate_onnx_genai_validation_packages import generate_packages
+
+    directory = tmp_path_factory.mktemp("workflow_packages")
+    generate_packages(directory)
+    return str(directory)

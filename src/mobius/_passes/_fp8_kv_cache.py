@@ -140,6 +140,10 @@ class Fp8KvCachePass(ir.passes.InPlacePass):
     def __init__(self, scales: dict[int, tuple[float, float]] | None = None) -> None:
         super().__init__()
         self._scales = _validate_scales(scales or {})
+        #: Number of KV caches retyped by the last :meth:`call`. A caller that
+        #: asked for FP8 needs to know it actually happened; a graph whose
+        #: attention operator carries no KV-scale inputs leaves this at zero.
+        self.converted = 0
 
     def call(self, model: ir.Model) -> ir.passes.PassResult:
         graph = model.graph
@@ -211,6 +215,7 @@ class Fp8KvCachePass(ir.passes.InPlacePass):
             modified = True
             converted += 1
 
+        self.converted = converted
         if converted:
             logger.info(
                 "Fp8KvCachePass: converted %d GroupQueryAttention KV cache(s) to FP8",

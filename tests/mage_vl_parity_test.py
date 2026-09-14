@@ -18,7 +18,7 @@ from torch.nn import functional
 from mobius import build_from_module
 from mobius._registry import registry
 from mobius._testing import count_op_type
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 from mobius.tasks import get_task
 
 

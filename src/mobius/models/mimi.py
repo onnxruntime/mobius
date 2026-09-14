@@ -636,7 +636,7 @@ class MimiModel(nn.Module):
         return _preprocess_mimi_weights(state_dict)
 
 
-def mimi_default_config() -> ArchitectureConfig:
+def _mimi_default_config() -> ArchitectureConfig:
     """Return the fixed :class:`ArchitectureConfig` for the Mimi codec.
 
     The Mimi checkpoint ships no ``config.json``; all dimensions are fixed by

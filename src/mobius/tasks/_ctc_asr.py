@@ -30,8 +30,14 @@ class CTCAsrTask(ModelTask):
                              required graph input; callers with no
                              padding should pass an all-ones mask.
 
-    Output:
-        ``logits`` — (batch, num_frames, vocab_size) CTC logit scores  FLOAT
+    Outputs:
+        ``logits``        — (batch, num_frames, vocab_size) CTC logit scores
+        ``frame_lengths`` — (batch,) INT64 count of non-padded frames per row
+
+    ``frame_lengths`` is emitted so a padded batch can be segmented back into
+    per-row transcripts without the caller re-deriving the convolutional
+    downsampling ratio.  It is only emitted when the module knows how to compute
+    it, keeping the task usable for encoders with a different contract.
     """
 
     name = "ctc-asr"
@@ -59,6 +65,11 @@ class CTCAsrTask(ModelTask):
 
         logits = module(builder.op, input_values=input_values, attention_mask=attention_mask)
         builder.add_output(logits, "logits")
+
+        frame_lengths_fn = getattr(module, "frame_lengths", None)
+        if callable(frame_lengths_fn):
+            frame_lengths = frame_lengths_fn(builder.op, attention_mask)
+            builder.add_output(frame_lengths, "frame_lengths")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
 

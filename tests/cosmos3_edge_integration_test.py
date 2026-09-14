@@ -74,7 +74,7 @@ def edge_package(tmp_path_factory):
     import onnxruntime as ort
 
     import mobius
-    from mobius._weight_loading import iter_weight_shards
+    from mobius.integrations._weight_loading import iter_weight_shards
     from mobius.models.cosmos import Cosmos3EdgeVLModel
 
     snapshot = _checkpoint_dir()

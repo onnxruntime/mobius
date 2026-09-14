@@ -30,9 +30,11 @@ class DFlashDraftTask(ModelTask):
           shape ``[batch, num_kv_heads, past_seq_len, head_dim]``.
 
     Graph outputs:
-        - ``draft_hidden`` : ``[batch, q_len, hidden]`` (model dtype) — the
-          drafter's final hidden states.  Decode them through the target's
-          ``lm_head`` to get draft token logits.
+        - ``draft_hidden`` : ``[batch, q_len, hidden]`` (model dtype) when
+          ``use_draft_lm_head`` is false. Decode these final hidden states
+          through the target's ``lm_head``.
+        - ``draft_logits`` : ``[batch, q_len, vocab]`` (model dtype) when
+          ``use_draft_lm_head`` is true.
         - ``present.{i}.key`` / ``.value`` : updated KV cache with shape
           ``[batch, num_kv_heads, past_seq_len + ctx_len + q_len, head_dim]``.
 
@@ -92,7 +94,7 @@ class DFlashDraftTask(ModelTask):
             past_seq_len,
         )
 
-        draft_hidden, present_key_values = module(
+        draft_output, present_key_values = module(
             op,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
@@ -101,7 +103,10 @@ class DFlashDraftTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        builder.add_output(draft_hidden, "draft_hidden")
+        builder.add_output(
+            draft_output,
+            "draft_logits" if config.use_draft_lm_head else "draft_hidden",
+        )
         _register_kv_cache_outputs(
             builder,
             present_key_values,

@@ -75,7 +75,7 @@ def _build_multimodal_onnx(model_id: str):
     a 3-model package (decoder, vision, embedding).
     """
     from mobius import apply_weights, build_from_module
-    from mobius._weight_loading import _download_weights
+    from mobius.integrations._weight_loading import _download_weights
     from mobius.models.gemma3 import Gemma3MultiModalModel
     from mobius.tasks import VisionLanguageTask
 

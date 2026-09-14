@@ -3,14 +3,16 @@
 
 """Qwen3-TTS: Text-to-speech with Qwen3-like talker and code predictor.
 
-Architecture (4-model split for full TTS):
+Architecture (five required models plus an optional speaker encoder):
   1. **Talker**: Qwen3 decoder with MRoPE 3D, QK norm. Outputs logits
      (first code group) and last_hidden_state (for code predictor).
   2. **Code Predictor**: Small 5-layer decoder with 1D RoPE.
      Per-step lm_heads and embeddings selected by step_index.
   3. **Embedding**: text_embedding → text_projection + codec_embedding.
      Additive fusion of text and codec embeddings.
-  4. **Speaker Encoder**: ECAPA-TDNN extracting speaker embedding from mel.
+  4. **Talker Step Embedder**: Previous frame codes + text embedding.
+  5. **Talker Prefill Embedder**: Prompt text ids → talker prefill embeddings.
+  6. **Speaker Encoder**: Optional ECAPA-TDNN speaker embedding extraction.
 
 Config comparison (0.6B vs 1.7B):
   - talker.hidden_size: 1024 vs 2048
@@ -26,7 +28,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -675,13 +677,15 @@ class Qwen3TTSSpeakerEncoderModel(nn.Module):
 
 
 class Qwen3TTSForConditionalGeneration(nn.Module):
-    """Qwen3-TTS composite model for full 4-model TTS pipeline.
+    """Qwen3-TTS composite model for the full multi-model TTS pipeline.
 
     Contains:
       - ``talker``: Talker decoder (inputs_embeds → logits + hidden)
       - ``code_predictor``: Code predictor (hidden → 15 code groups)
       - ``embedding``: Text + codec embedding model
-      - ``speaker_encoder``: ECAPA-TDNN speaker encoder
+      - ``talker_step_embedder``: Per-frame talker input construction
+      - ``talker_prefill_embedder``: Prompt prefill/trailing-text construction
+      - ``speaker_encoder``: Optional ECAPA-TDNN speaker encoder
 
     HuggingFace class: ``Qwen3TTSForConditionalGeneration``
     """
@@ -689,6 +693,33 @@ class Qwen3TTSForConditionalGeneration(nn.Module):
     default_task: str = "tts"
     category: str = "Audio"
     config_class: type = ArchitectureConfig
+
+    # Runtime HF sub-trees for the talker/code-predictor/embedding split.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "talker": ("talker.model.layers", "talker.model.norm", "talker.codec_head"),
+        "code_predictor": ("talker.code_predictor",),
+        "embedding": (
+            "talker.model.text_embedding",
+            "talker.text_projection",
+            "talker.model.codec_embedding",
+        ),
+        "talker_step_embedder": (
+            "talker.model.codec_embedding",
+            "talker.code_predictor.model.codec_embedding",
+        ),
+        "talker_prefill_embedder": (
+            "talker.model.text_embedding",
+            "talker.text_projection",
+            "talker.model.codec_embedding",
+        ),
+        "speaker_encoder": ("speaker_encoder",),
+        # Loop-wiring graphs mobius authors itself; no HuggingFace sub-module
+        # backs them, so there is no runtime path to report.
+        "code_predictor_prefill": (),
+        "code_predictor_step_embedder": (),
+        "code_predictor_indices": (),
+        "talker_text_step": (),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

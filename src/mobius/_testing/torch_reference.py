@@ -113,7 +113,9 @@ def _install_dynamic_cache_legacy_shims() -> None:
         transformers.DynamicCache.get_usable_length = _get_usable_length  # type: ignore[method-assign]
 
 
-def _fix_nemotron_h_init_weights(model: torch.nn.Module, model_id: str) -> None:
+def _fix_nemotron_h_dt_bias(
+    model: torch.nn.Module, model_id: str, revision: str | None = None
+) -> None:
     """Restore Mamba2 params from checkpoint after HF clobbers them.
 
     The NemotronH remote-code ``_init_weights`` re-initialises several
@@ -145,7 +147,7 @@ def _fix_nemotron_h_init_weights(model: torch.nn.Module, model_id: str) -> None:
     # Resolve the exact snapshot directory used by HF for this model,
     # avoiding lexicographic guessing across multiple cached revisions.
     try:
-        snapshot = snapshot_download(model_id, local_files_only=True)
+        snapshot = snapshot_download(model_id, revision=revision, local_files_only=True)
     except Exception:
         logger.warning(
             "NemotronH init_weights fix: could not resolve snapshot for %s",
@@ -198,6 +200,7 @@ def load_torch_model(
     dtype: torch.dtype = torch.float32,
     device: str = "cpu",
     trust_remote_code: bool = True,
+    revision: str | None = None,
 ):
     """Load a HuggingFace causal LM model for reference inference.
 
@@ -211,6 +214,8 @@ def load_torch_model(
             natively supported by the installed transformers, so the
             transformers-5.x-compatible implementation is used instead of an
             older bundled ``modeling_*.py`` that relies on removed cache APIs.
+        revision: Immutable HuggingFace revision used for the tokenizer,
+            config, weights, and any Nemotron-H weight repair.
 
     Returns:
         Tuple of (model, tokenizer).
@@ -220,14 +225,14 @@ def load_torch_model(
     _install_dynamic_cache_legacy_shims()
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_id, trust_remote_code=trust_remote_code
+        model_id, revision=revision, trust_remote_code=trust_remote_code
     )
 
     # NemotronH: disable rescale_prenorm_residual before loading to
     # prevent _init_weights from corrupting out_proj.weight with
     # random kaiming_uniform_ initialization after checkpoint loading.
     config = transformers.AutoConfig.from_pretrained(
-        model_id, trust_remote_code=trust_remote_code
+        model_id, revision=revision, trust_remote_code=trust_remote_code
     )
     if getattr(config, "model_type", None) == "nemotron_h":
         config.rescale_prenorm_residual = False
@@ -237,9 +242,10 @@ def load_torch_model(
         config=config,
         dtype=dtype,
         device_map=device,
+        revision=revision,
         trust_remote_code=trust_remote_code,
     )
-    _fix_nemotron_h_init_weights(model, model_id)
+    _fix_nemotron_h_dt_bias(model, model_id, revision)
     model.eval()
 
     if tokenizer.pad_token is None:
@@ -252,6 +258,7 @@ def load_torch_multimodal_model(
     model_id: str,
     dtype: torch.dtype = torch.float32,
     device: str = "cpu",
+    revision: str | None = None,
 ):
     """Load a HuggingFace multimodal model for reference inference.
 
@@ -261,23 +268,29 @@ def load_torch_multimodal_model(
         model_id: HuggingFace model identifier.
         dtype: Model dtype (default float32 for numerical comparison).
         device: Device to load on.
+        revision: Optional immutable HuggingFace revision used for tokenizer,
+            processor, config, and weight loading.
 
     Returns:
         Tuple of (model, tokenizer, image_processor).
     """
     import transformers
 
+    hub_kwargs: dict[str, object] = {"trust_remote_code": True}
+    if revision is not None:
+        hub_kwargs["revision"] = revision
+
     tokenizer = _load_mage_compatible(
         model_id,
         transformers.AutoTokenizer.from_pretrained,
         model_id,
-        trust_remote_code=True,
+        **hub_kwargs,
     )
     processor = _load_mage_compatible(
         model_id,
         transformers.AutoProcessor.from_pretrained,
         model_id,
-        trust_remote_code=True,
+        **hub_kwargs,
     )
 
     # Shim: transformers 5.x removed DynamicCache.from_legacy_cache and
@@ -293,7 +306,7 @@ def load_torch_multimodal_model(
         model_id,
         transformers.AutoConfig.from_pretrained,
         model_id,
-        trust_remote_code=True,
+        **hub_kwargs,
     )
     config._attn_implementation = "eager"
 
@@ -304,7 +317,7 @@ def load_torch_multimodal_model(
     # The weight-dtype keyword was renamed from ``torch_dtype`` to ``dtype`` in
     # transformers 5.x; support both so offline golden generation also works on
     # the older transformers (e.g. 4.43) required by 4.x-era remote-code models.
-    base_kwargs = dict(config=config, device_map=device, trust_remote_code=True)
+    base_kwargs = dict(config=config, device_map=device, **hub_kwargs)
 
     def _load_from_pretrained(auto_cls):
         try:
