@@ -110,6 +110,9 @@ from mobius._configs._world_model import WorldModelConfig
 from mobius._configs.vibevoice import (
     VibeVoiceConfig,
     VibeVoiceDiffusionConfig,
+    VibeVoiceStreamingConfig,
+    VibeVoiceStreamingDiffusionConfig,
+    VibeVoiceStreamingTokenizerConfig,
     VibeVoiceTokenizerConfig,
 )
 
@@ -177,6 +180,9 @@ __all__ = [
     "VisionLanguageConfig",
     "VibeVoiceConfig",
     "VibeVoiceDiffusionConfig",
+    "VibeVoiceStreamingConfig",
+    "VibeVoiceStreamingDiffusionConfig",
+    "VibeVoiceStreamingTokenizerConfig",
     "VibeVoiceTokenizerConfig",
     "WhisperConfig",
     "XverseConfig",

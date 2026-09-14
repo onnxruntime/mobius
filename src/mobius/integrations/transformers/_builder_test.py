@@ -272,6 +272,41 @@ def test_vibevoice_none_revision_pins_first_config_probe(monkeypatch) -> None:
     ]
 
 
+def test_vibevoice_streaming_none_revision_pins_first_config_probe(monkeypatch) -> None:
+    from mobius.models.vibevoice_streaming import (
+        VIBEVOICE_STREAMING_MODEL_ID,
+        VIBEVOICE_STREAMING_REVISION,
+    )
+
+    calls = []
+
+    def stop_after_config(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        raise RuntimeError("stop after revision assertion")
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        stop_after_config,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after revision assertion"):
+        transformers_builder.build_transformers_model(
+            VIBEVOICE_STREAMING_MODEL_ID,
+            load_weights=False,
+        )
+
+    assert calls == [
+        (
+            VIBEVOICE_STREAMING_MODEL_ID,
+            {
+                "revision": VIBEVOICE_STREAMING_REVISION,
+                "trust_remote_code": False,
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize("revision", [None, "feature/revision"])
 def test_transformers_config_forwards_only_explicit_revision(monkeypatch, revision) -> None:
     import transformers

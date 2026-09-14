@@ -158,6 +158,10 @@ _COVERAGE_SKIP: dict[str, str] = {
     "llada_moe": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
     "non-standard bidirectional I/O has no generic golden-data path",
     "LLaDAMoEModel": "Alias for llada_moe — covered by src/mobius/models/llada_test.py",
+    "VibeVoiceStreamingForConditionalGenerationInference": (
+        "Architecture-discriminating alias for vibevoice_streaming — covered by "
+        "src/mobius/models/vibevoice_streaming_test.py."
+    ),
     "rnd1": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
     "non-standard bidirectional I/O has no generic golden-data path",
     "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "

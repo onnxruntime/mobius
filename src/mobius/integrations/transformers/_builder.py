@@ -309,6 +309,13 @@ def build_transformers_model(
         # first config probe and every later processor/weight call together.
         revision = VIBEVOICE_REVISION
         detection_revision = VIBEVOICE_REVISION
+    if model_id == "microsoft/VibeVoice-Realtime-0.5B" and detection_revision is None:
+        from mobius.models.vibevoice_streaming import VIBEVOICE_STREAMING_REVISION
+
+        # Transformers has no native ``vibevoice_streaming`` entry yet. Pin the
+        # raw-config probe and every subsequent Hub operation to one checkpoint.
+        revision = VIBEVOICE_STREAMING_REVISION
+        detection_revision = VIBEVOICE_STREAMING_REVISION
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -525,7 +532,7 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
-        if model_type in _QWEN4_MODEL_TYPES | {"vibevoice"}:
+        if model_type in _QWEN4_MODEL_TYPES | {"vibevoice", "vibevoice_streaming"}:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
