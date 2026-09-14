@@ -32,8 +32,8 @@ __all__ = [
 ]
 
 import math
-from copy import copy
 from collections.abc import Mapping
+from copy import copy
 from dataclasses import dataclass
 from pathlib import PurePath
 from typing import TYPE_CHECKING
@@ -159,9 +159,8 @@ def normalize_vibeasr_bitnet_config_for_inference(config: object) -> object:
     """
     source_model_type = getattr(config, "model_type", None)
     source_architectures = tuple(getattr(config, "architectures", None) or ())
-    if (
-        source_model_type != "vibevoice"
-        or source_architectures != ("VibeVoiceForASRTraining",)
+    if source_model_type != "vibevoice" or source_architectures != (
+        "VibeVoiceForASRTraining",
     ):
         raise ValueError(
             "Unsupported VibeVoice ASR BitNet architecture. Expected the pinned "

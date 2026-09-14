@@ -22,6 +22,7 @@ from mobius.integrations._vibeasr_bitnet import (
     VIBEVOICE_ASR_BITNET_REVISION,
     build_vibeasr_bitnet_dense_weight_plan,
     find_vibeasr_bitnet_gguf_artifact,
+    normalize_vibeasr_bitnet_config_for_inference,
 )
 from mobius.integrations.gguf._errors import VibeASRBitNetGGUFImportError
 from mobius.integrations.gguf._header import (
@@ -299,7 +300,7 @@ def test_pinned_dense_f32_index_classifies_all_asr_source_tensors() -> None:
 
     assert len(plan.targets) == 901
     assert len(plan.ignored) == 276
-    assert set(plan.targets).issubset(initializers)
+    assert set(plan.targets) == set(initializers)
     assert all(
         source.expected_dtype == "F32" and source.mode == "direct"
         for source in plan.targets.values()
@@ -319,8 +320,11 @@ def test_builder_pins_and_selects_dense_streaming_route(
     from mobius.integrations import _vibeasr_bitnet
     from mobius.integrations.transformers import _builder, _config_resolver
 
-    parent_config = SimpleNamespace(model_type="qwen2")
-    config = make_config(model_type="qwen2")
+    parent_config = SimpleNamespace(
+        model_type="vibevoice",
+        architectures=["VibeVoiceForASRTraining"],
+    )
+    config = make_config(model_type="vibevoice_asr")
     model = ir.Model(
         ir.Graph([], [], nodes=[], name="model"),
         ir_version=11,
@@ -338,15 +342,17 @@ def test_builder_pins_and_selects_dense_streaming_route(
         return parent_config, False
 
     monkeypatch.setattr(_builder, "_load_transformers_config", load_config)
-    monkeypatch.setattr(
-        _builder,
-        "_select_primary_config",
-        lambda value: (value, value, "qwen2"),
-    )
+
+    def select_primary_config(value):
+        assert value.model_type == "vibevoice_asr"
+        assert value.architectures == ["VibeVoiceAsrForConditionalGeneration"]
+        return value, value, "vibevoice_asr"
+
+    monkeypatch.setattr(_builder, "_select_primary_config", select_primary_config)
     monkeypatch.setattr(
         _builder,
         "_resolve_module_class",
-        lambda *args, **kwargs: (Module, "text-generation", "qwen2"),
+        lambda *args, **kwargs: (Module, "vibevoice-asr", "vibevoice_asr"),
     )
     monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
     monkeypatch.setattr(_builder, "build_from_module", lambda *args, **kwargs: package)
@@ -384,6 +390,29 @@ def test_builder_pins_and_selects_dense_streaming_route(
     assert streaming_calls[0][1]["revision"] == VIBEVOICE_ASR_BITNET_REVISION
     assert package.weight_loading_report == report
     assert model.metadata_props["mobius.source_revision"] == VIBEVOICE_ASR_BITNET_REVISION
+
+
+def test_bitnet_config_normalization_requires_the_audited_legacy_architecture() -> None:
+    source = SimpleNamespace(
+        model_type="vibevoice",
+        architectures=["VibeVoiceForASRTraining"],
+    )
+
+    normalized = normalize_vibeasr_bitnet_config_for_inference(source)
+
+    assert normalized is not source
+    assert source.model_type == "vibevoice"
+    assert source.architectures == ["VibeVoiceForASRTraining"]
+    assert normalized.model_type == "vibevoice_asr"
+    assert normalized.architectures == ["VibeVoiceAsrForConditionalGeneration"]
+
+    with pytest.raises(ValueError, match="Unsupported VibeVoice ASR BitNet architecture"):
+        normalize_vibeasr_bitnet_config_for_inference(
+            SimpleNamespace(
+                model_type="vibevoice",
+                architectures=["VibeVoiceForConditionalGeneration"],
+            )
+        )
 
 
 def test_builder_rejects_an_unpinned_bitnet_revision(monkeypatch: pytest.MonkeyPatch) -> None:
