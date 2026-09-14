@@ -9,8 +9,7 @@ import pytest
 import yaml
 
 from mobius import build_from_module
-from mobius.integrations.mattergen import MatterGenConfig, MatterGenModel
-from mobius.integrations.mattergen import _builder
+from mobius.integrations.mattergen import MatterGenConfig, MatterGenModel, _builder
 from mobius.integrations.mattergen._contract import (
     MATTERGEN_HUB_ID,
     MATTERGEN_HUB_REVISION,
@@ -51,7 +50,9 @@ def _tiny_hydra_config(*, adapter: bool = False) -> dict[str, object]:
                 "conditional_embedding_module": {
                     "_target_": "mattergen.property_embeddings.NoiseLevelEncoding"
                 },
-                "scaler": {"_target_": "mattergen.common.utils.data_utils.StandardScalerTorch"},
+                "scaler": {
+                    "_target_": "mattergen.common.utils.data_utils.StandardScalerTorch"
+                },
             }
         }
         gemnet = model["gemnet"]
@@ -97,7 +98,10 @@ class TestMatterGenGraphTask:
         assert model.metadata_props["mobius.checkpoint_family"] == "mattergen_base"
         assert package.export_report is not None
         assert package.export_report.status == "partial"
-        assert package.export_report.component("score_core").runtime_validation_status == "validated"
+        assert (
+            package.export_report.component("score_core").runtime_validation_status
+            == "validated"
+        )
 
 
 class TestMatterGenBuilder:
@@ -126,7 +130,9 @@ class TestMatterGenBuilder:
         assert (output / "model.onnx").is_file()
         assert (output / "export_report.json").is_file()
 
-    def test_resolves_the_immutable_hub_revision_for_config_download(self, tmp_path, monkeypatch) -> None:
+    def test_resolves_the_immutable_hub_revision_for_config_download(
+        self, tmp_path, monkeypatch
+    ) -> None:
         config_path = tmp_path / "config.yaml"
         config_path.write_text(yaml.safe_dump(_tiny_hydra_config()), encoding="utf-8")
         download = mock.Mock(return_value=str(config_path))
@@ -156,11 +162,15 @@ class TestMatterGenBuilder:
         with pytest.raises(ValueError, match="default/CPU"):
             _builder.build_mattergen(execution_provider="cuda", load_weights=False)
 
-    def test_rejects_a_local_config_with_the_wrong_declared_family_conditions(self, tmp_path) -> None:
+    def test_rejects_a_local_config_with_the_wrong_declared_family_conditions(
+        self, tmp_path
+    ) -> None:
         root = tmp_path / "mattergen"
         config_path = root / "checkpoints" / "mp_20_base" / "config.yaml"
         config_path.parent.mkdir(parents=True)
-        config_path.write_text(yaml.safe_dump(_tiny_hydra_config(adapter=True)), encoding="utf-8")
+        config_path.write_text(
+            yaml.safe_dump(_tiny_hydra_config(adapter=True)), encoding="utf-8"
+        )
 
         with pytest.raises(ValueError, match="expected the pinned contract"):
             _builder.build_mattergen(root, load_weights=False)

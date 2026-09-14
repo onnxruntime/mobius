@@ -89,7 +89,9 @@ class TestMatterGenWeightLoading:
             {"trained.weight": torch.ones((2, 3), dtype=torch.float32)},
         )
 
-    def test_report_accounts_for_validated_checkpoint_aliases(self, monkeypatch, tmp_path) -> None:
+    def test_report_accounts_for_validated_checkpoint_aliases(
+        self, monkeypatch, tmp_path
+    ) -> None:
         package = _Package()
         source_tensors = {
             "trained.weight": torch.ones((2, 3), dtype=torch.float32),

@@ -14,8 +14,8 @@ from onnxscript import nn
 from mobius._export_report import ComponentExportDisposition, ComponentExportReport
 from mobius._model_package import ModelPackage
 from mobius.integrations.mattergen._configs import MatterGenConfig
-from mobius.integrations.mattergen._contract import HOST_OWNED_STEPS
 from mobius.integrations.mattergen._contract import (
+    HOST_OWNED_STEPS,
     MAX_ATOMS,
     OFFICIAL_CHECKPOINT_CONDITIONS,
     SELECTED_ATOMIC_NUMBERS,
@@ -52,12 +52,8 @@ class MatterGenScoreTask(ModelTask):
         # The source basis and fitted scalar encoders are always float32, even
         # when a future export introduces a separately assessed compute dtype.
         timestep = builder.input("timestep", dtype=ir.DataType.FLOAT, shape=[crystals])
-        edge_index = builder.input(
-            "edge_index", dtype=ir.DataType.INT64, shape=[2, edges]
-        )
-        edge_distance = builder.input(
-            "edge_distance", dtype=ir.DataType.FLOAT, shape=[edges]
-        )
+        edge_index = builder.input("edge_index", dtype=ir.DataType.INT64, shape=[2, edges])
+        edge_distance = builder.input("edge_distance", dtype=ir.DataType.FLOAT, shape=[edges])
         edge_direction = builder.input(
             "edge_direction", dtype=ir.DataType.FLOAT, shape=[edges, 3]
         )

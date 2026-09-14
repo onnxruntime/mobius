@@ -267,7 +267,9 @@ def chemical_system_multihot(chemical_system: str | Sequence[str]) -> np.ndarray
     disallowed element would make the host's mandatory sampling logit mask
     unsatisfiable.
     """
-    symbols = chemical_system.split("-") if isinstance(chemical_system, str) else chemical_system
+    symbols = (
+        chemical_system.split("-") if isinstance(chemical_system, str) else chemical_system
+    )
     if not symbols:
         raise ValueError("chemical_system must contain at least one element.")
 

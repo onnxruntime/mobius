@@ -83,7 +83,9 @@ def _assert_exact_tensor_routing(
         if missing:
             details.append(f"missing {len(missing)} graph tensor(s): {missing[:5]}")
         if unexpected:
-            details.append(f"unrouted {len(unexpected)} checkpoint tensor(s): {unexpected[:5]}")
+            details.append(
+                f"unrouted {len(unexpected)} checkpoint tensor(s): {unexpected[:5]}"
+            )
         raise ValueError("MatterGen checkpoint routing is incomplete; " + "; ".join(details))
 
     shape_mismatches = []
@@ -127,7 +129,9 @@ def apply_mattergen_checkpoint(
         isinstance(name, str) and isinstance(tensor, torch.Tensor)
         for name, tensor in normalized.items()
     ):
-        raise TypeError("MatterGen preprocess_weights() must return a string-to-tensor mapping.")
+        raise TypeError(
+            "MatterGen preprocess_weights() must return a string-to-tensor mapping."
+        )
     normalized_tensors = dict(normalized)
     _assert_exact_tensor_routing(package, normalized_tensors)
     package.apply_weights(normalized_tensors)
@@ -145,4 +149,6 @@ def apply_mattergen_checkpoint(
         "routing": "exact-post-preprocess-with-validated-outputblock-aliases",
     }
     package.weight_loading_report = report
-    package["model"].metadata_props["mobius.weight_loading"] = json.dumps(report, sort_keys=True)
+    package["model"].metadata_props["mobius.weight_loading"] = json.dumps(
+        report, sort_keys=True
+    )

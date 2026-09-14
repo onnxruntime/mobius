@@ -719,7 +719,9 @@ class _GemNetT(nn.Module):
                     or self.cond_adapt_layers is None
                     or self.cond_mixin_layers is None
                 ):
-                    raise RuntimeError("MatterGen adapter layers require condition embeddings and masks.")
+                    raise RuntimeError(
+                        "MatterGen adapter layers require condition embeddings and masks."
+                    )
                 adaptation = op.Mul(atoms, 0.0)
                 for condition_name in self._config.condition_on_adapt:
                     condition = adapter_embeddings[condition_name]
@@ -794,7 +796,7 @@ class _ScalarNoiseLevelEncoding(nn.Module):
         self.div_term = nn.Parameter([hidden_dim // 2])
         # Source registers div_term as a float32 buffer.  It must not be
         # demoted with model weights when the exporter requests fp16/bf16.
-        setattr(self.div_term, "_keep_float32", True)
+        self.div_term._keep_float32 = True
         self._hidden_dim = hidden_dim
 
     def forward(self, op: OpBuilder, value: ir.Value) -> ir.Value:

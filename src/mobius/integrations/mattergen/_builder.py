@@ -31,7 +31,9 @@ def _validate_checkpoint_family(family: str) -> str:
     """Return a declared official family or reject a path-like/checkpoint typo."""
     if family not in OFFICIAL_CHECKPOINT_CONDITIONS:
         options = ", ".join(sorted(OFFICIAL_CHECKPOINT_CONDITIONS))
-        raise ValueError(f"Unknown MatterGen checkpoint family {family!r}. Available: {options}.")
+        raise ValueError(
+            f"Unknown MatterGen checkpoint family {family!r}. Available: {options}."
+        )
     return family
 
 
@@ -39,7 +41,9 @@ def _local_checkpoint_file(root: Path, family: str, name: str) -> Path:
     """Resolve one local checkpoint artifact without following a link outside *root*."""
     candidate = root / "checkpoints" / family / name
     if candidate.is_symlink() or not candidate.is_file():
-        raise FileNotFoundError(f"MatterGen local artifact must be a regular file: {candidate}")
+        raise FileNotFoundError(
+            f"MatterGen local artifact must be a regular file: {candidate}"
+        )
     resolved = candidate.resolve(strict=True)
     if root not in resolved.parents:
         raise ValueError(f"MatterGen local artifact escapes its checkpoint root: {candidate}")
