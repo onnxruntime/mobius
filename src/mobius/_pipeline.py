@@ -109,6 +109,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, TypeAlias
 
 import onnx_ir as ir
@@ -2806,6 +2807,11 @@ class PipelinePackage(ModelPackage):
             "manifest": self.manifest.to_dict(),
             "component_files": dict(sorted(self.component_files().items())),
         }
+
+    def _model_for_save(self, name: str, model: ir.Model) -> AbstractContextManager[ir.Model]:
+        # pipeline.json already declares exact graph signatures and their symbols.
+        # Renaming only the serialized graph would invalidate that contract.
+        return nullcontext(model)
 
     def save(
         self,

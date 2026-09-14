@@ -30,7 +30,7 @@ import tempfile
 import threading
 from collections import UserDict
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -649,6 +649,10 @@ class ModelPackage(UserDict[str, ir.Model]):
 
     # -- Persistence -------------------------------------------------------
 
+    def _model_for_save(self, name: str, model: ir.Model) -> AbstractContextManager[ir.Model]:
+        """Prepare component-local symbolic dimensions for serialization."""
+        return _namespaced_symbolic_dimensions(model, f"component.{name}")
+
     def save(
         self,
         directory: str,
@@ -891,7 +895,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             if use_subfolders:
                 os.makedirs(model_dir, exist_ok=True)
             path = os.path.join(model_dir, "model.onnx")
-            with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
+            with self._model_for_save(name, model) as saved_model:
                 if reuse_plan is not None:
                     from mobius.integrations.gguf._reuse import save_reuse_package
 

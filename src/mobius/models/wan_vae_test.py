@@ -1036,7 +1036,7 @@ class TestSingleFrame:
         # The saved graph keeps latent_frames symbolic, so nothing pins it to 1.
         latent_input = session.get_inputs()[0]
         assert latent_input.name == "latent"
-        assert latent_input.shape[2] == "latent_frames"
+        assert latent_input.shape[2] == "component.decoder.latent_frames"
 
         (sample,) = session.run(None, {"latent": normalized})
         with torch.no_grad():

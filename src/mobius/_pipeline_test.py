@@ -1063,6 +1063,9 @@ class TestPackagePersistence:
         assert loaded.manifest == pkg.manifest
         assert sorted(loaded) == ["decoder", "encoder"]
         assert loaded.manifest.component("encoder").model is loaded["encoder"]
+        for name in loaded:
+            for original, saved in zip(pkg[name].graph.inputs, loaded[name].graph.inputs):
+                assert tuple(original.shape) == tuple(saved.shape)
 
     def test_component_filenames_round_trip_exactly(self, tmp_path):
         pkg = _simple_pipeline().build()

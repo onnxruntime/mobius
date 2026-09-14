@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The original fixed four-output world-model API is now accurately named
   `LatentDynamicsTask` / `LatentDynamicsConfig` /
   `MLPLatentDynamicsModel`. The original `WorldModel*` names remain aliases.
+
 ### GPT-OSS MXFP4 export
 
 #### Added
