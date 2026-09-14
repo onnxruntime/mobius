@@ -131,6 +131,35 @@ class TestCLIBuild:
         }
         save_package.assert_called_once()
 
+    def test_mattergen_existing_output_directory_reports_clean_error(self, tmp_path):
+        """Partial MatterGen packages cannot replace an existing destination."""
+        output_dir = tmp_path / "existing-output"
+        output_dir.mkdir()
+        package = mock.MagicMock()
+        package.items.return_value = []
+        package.save.side_effect = FileExistsError(
+            "Component-report package destination already exists; refusing "
+            "non-atomic replacement."
+        )
+
+        with (
+            mock.patch(
+                "mobius.integrations.mattergen._builder.build_mattergen",
+                return_value=package,
+            ),
+            pytest.raises(SystemExit, match="destination already exists"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "microsoft/mattergen",
+                    "--no-weights",
+                    "--output",
+                    str(output_dir),
+                ]
+            )
+
     def test_mattergen_rejects_onnx_genai_metadata(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,

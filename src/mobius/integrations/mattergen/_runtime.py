@@ -152,7 +152,8 @@ class _OnnxRuntimeSession(Protocol):
 
     def run(
         self, output_names: Sequence[str] | None, input_feed: Mapping[str, np.ndarray]
-    ) -> Sequence[np.ndarray]: ...
+    ) -> Sequence[np.ndarray]:
+        pass
 
 
 def create_onnxruntime_score_callback(session: _OnnxRuntimeSession) -> MatterGenScoreCallback:

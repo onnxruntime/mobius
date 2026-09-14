@@ -392,7 +392,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
             )
         except ValueError as error:
             raise SystemExit(f"Error: {error}") from error
-        _save_package(pkg, output_dir, args, optimize, component_filter)
+        try:
+            _save_package(pkg, output_dir, args, optimize, component_filter)
+        except FileExistsError as error:
+            raise SystemExit(f"Error: {error}") from error
         return
 
     # Auto-detect diffusers pipelines. Skipped when the text-only feature is set:

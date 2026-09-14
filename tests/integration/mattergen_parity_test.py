@@ -154,12 +154,22 @@ def _required_artifact(environment_variable: str) -> Path:
     if raw_path is None:
         pytest.skip(f"set {environment_variable} to run MatterGen source parity")
     path = Path(raw_path)
-    if not path.is_file() and environment_variable == _SOURCE_DIR_ENV:
+    if environment_variable == _SOURCE_DIR_ENV:
         if not path.is_dir():
             pytest.skip(f"{environment_variable} is not a readable source directory: {path}")
     elif not path.is_file():
         pytest.skip(f"{environment_variable} is not a readable checkpoint: {path}")
     return path
+
+
+def test_source_artifact_requires_directory(monkeypatch, tmp_path) -> None:
+    """A source-path typo skips before the fixture attempts ``git -C``."""
+    source_file = tmp_path / "not-a-source-directory"
+    source_file.write_text("not a MatterGen source checkout", encoding="utf-8")
+    monkeypatch.setenv(_SOURCE_DIR_ENV, str(source_file))
+
+    with pytest.raises(pytest.skip.Exception, match="not a readable source directory"):
+        _required_artifact(_SOURCE_DIR_ENV)
 
 
 def _source_revision(source_dir: Path) -> str:
