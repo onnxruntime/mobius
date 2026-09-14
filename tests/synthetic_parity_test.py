@@ -333,6 +333,14 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "ministral3": {"head_dim": TINY_HEAD_DIM},
     # Helium defaults head_dim=None in HF (causes pow(None,float) error)
     "helium": {"head_dim": TINY_HEAD_DIM},
+    # HRM-Text: head_dim is an explicit config param (HF default 128), and
+    # rope settings live under rope_parameters rather than rope_theta.
+    # num_hidden_layers stays at the tiny *per-stack* depth so that HF's
+    # HrmTextConfig.__post_init__ inflates it the same way ours does.
+    "hrm_text": {
+        "head_dim": TINY_HEAD_DIM,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10_000.0},
+    },
     # seed_oss defaults head_dim=128 in HF; override to match tiny config
     "seed_oss": {"head_dim": TINY_HEAD_DIM},
     # HunYuan V1 dense defaults head_dim=None in HF (causes pow(None,float) error)
@@ -1310,6 +1318,12 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
             else {}
         ),
     }
+    # PrefixLM models (HRM-Text) take an extra ``token_type_ids`` input. The HF
+    # reference above runs without ``token_type_ids``, i.e. fully causal, so
+    # feed all zeros here — block id -1 makes the bidirectional overlay a no-op
+    # and the two sides compare the same masking contract.
+    if "token_type_ids" in {inp.name for inp in onnx_model.graph.inputs}:
+        feeds["token_type_ids"] = np.zeros_like(input_ids)
     # Add zero-valued past KV cache feeds with correct shapes:
     # batch=1, past_sequence_len=0, other dims from model spec
     for inp in onnx_model.graph.inputs:

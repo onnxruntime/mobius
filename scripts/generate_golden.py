@@ -244,6 +244,10 @@ def _get_model_device(model: object, device: str):
 def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a causal-lm (text-generation) model."""
     from mobius._testing.golden import save_generation_json, save_golden_ref
+    from mobius._testing.prefix_lm import (
+        model_type_uses_prefix_lm,
+        prompt_token_type_ids,
+    )
     from mobius._testing.torch_reference import (
         load_torch_model,
         load_torch_multimodal_model,
@@ -279,6 +283,13 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     seq_len = input_ids.shape[1]
     position_ids = np.arange(seq_len).reshape(1, -1)
 
+    # PrefixLM models (HRM-Text) must run the reference with the same
+    # ``token_type_ids`` contract the exported graph is fed: the whole prompt is
+    # one bidirectional prefix block. Omitting it silently falls back to causal
+    # masking, which the model card warns does not match pre-training.
+    uses_prefix_lm = model_type_uses_prefix_lm(case.model_type)
+    prefix_token_type_ids = prompt_token_type_ids(input_ids) if uses_prefix_lm else None
+
     # L4: single forward pass → last-token logits
     if uses_multimodal_reference:
         with torch.no_grad():
@@ -290,7 +301,13 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
             )
         logits = outputs.logits.float().cpu().numpy()
     else:
-        logits, _ = torch_forward(model, input_ids, attention_mask, position_ids)
+        logits, _ = torch_forward(
+            model,
+            input_ids,
+            attention_mask,
+            position_ids,
+            token_type_ids=prefix_token_type_ids,
+        )
     last_logits = logits[0, -1, :]  # (vocab_size,)
     golden = _extract_logits_golden(last_logits)
 
@@ -304,9 +321,19 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         model_device = _get_model_device(model, device)
         gen_ids = torch.from_numpy(input_ids).to(model_device)
         max_new = case.generation_params.get("max_new_tokens", 20)
+        gen_kwargs: dict = {"max_new_tokens": max_new, "do_sample": False}
+        if prefix_token_type_ids is not None:
+            # HF's HrmTextForCausalLM.create_masks_for_generate applies the
+            # PrefixLM overlay only on the first iteration, so marking the whole
+            # prompt as one prefix block is exactly the model card's
+            # ``token_type_ids = ones_like(input_ids)`` call.
+            gen_kwargs["attention_mask"] = torch.from_numpy(attention_mask).to(model_device)
+            gen_kwargs["token_type_ids"] = torch.from_numpy(prefix_token_type_ids).to(
+                model_device
+            )
         with torch.no_grad():
             try:
-                gen_output = model.generate(gen_ids, max_new_tokens=max_new, do_sample=False)
+                gen_output = model.generate(gen_ids, **gen_kwargs)
             except ValueError as e:
                 # All-attention GraniteMoeHybrid variants (e.g. granite-4.0-1b)
                 # trip transformers' hybrid Mamba/attention generation cache,
@@ -316,9 +343,7 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
                 # the (slower) cache-free path.
                 if "has_previous_state" not in str(e):
                     raise
-                gen_output = model.generate(
-                    gen_ids, max_new_tokens=max_new, do_sample=False, use_cache=False
-                )
+                gen_output = model.generate(gen_ids, use_cache=False, **gen_kwargs)
         generated_ids = gen_output[0, seq_len:].cpu().numpy()
 
     provenance = (

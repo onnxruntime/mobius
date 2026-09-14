@@ -1,0 +1,31 @@
+{
+  "model_id": "sapientinc/HRM-Text-1B",
+  "prompt": "<|im_start|><|quad_end|><|object_ref_end|>Explain why the sky is blue.<|im_end|>",
+  "generated_tokens": [
+    341,
+    7884,
+    2166,
+    3288,
+    1794,
+    309,
+    236,
+    114,
+    102,
+    99,
+    19173,
+    301,
+    10404,
+    431,
+    1817,
+    6264,
+    44,
+    1172,
+    5613,
+    15436,
+    301,
+    2282,
+    395,
+    23618
+  ],
+  "generated_text": "The sky appears blue due to the scattering of sunlight by air molecules. Shorter wavelengths of light (blue"
+}

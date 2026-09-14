@@ -58,6 +58,7 @@ from mobius._testing.golden import (
 )
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius._testing.parity import ParityResult, compare_golden
+from mobius._testing.prefix_lm import prompt_token_type_ids
 
 
 @functools.cache
@@ -768,9 +769,20 @@ def _prepare_prefill_feeds(
         "position_ids": np.arange(seq_len, dtype=np.int64).reshape(1, -1),
     }
 
-    # Provide token_type_ids for models that need it (BERT, ALBERT, etc.)
+    # Provide token_type_ids for models that need it.
+    #
+    # Two different meanings share this input name:
+    #   * BERT/ALBERT-style segment ids — a single-segment prompt is all zeros.
+    #   * PrefixLM block markers (HRM-Text, ``config.prefix_lm``) — the whole
+    #     prompt is one bidirectional prefix block, i.e. all ones. This must
+    #     match the contract the golden reference was generated with (see
+    #     ``mobius._testing.prefix_lm``), otherwise the graph runs a fully
+    #     causal mask against a PrefixLM golden.
     if "token_type_ids" in session.input_names:
-        feeds["token_type_ids"] = np.zeros_like(input_ids)
+        if getattr(config, "prefix_lm", False):
+            feeds["token_type_ids"] = prompt_token_type_ids(input_ids)
+        else:
+            feeds["token_type_ids"] = np.zeros_like(input_ids)
 
     # Fill KV cache inputs with zero-length tensors.
     # Shape: (batch=1, num_kv_heads, past_seq_len=0, head_dim)
