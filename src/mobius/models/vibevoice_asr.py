@@ -217,7 +217,74 @@ def _map_original_tokenizer_encoder_key(
 
 
 class VibeVoiceASRForConditionalGeneration(nn.Module):
-    """Offline VibeVoice ASR/diarization stages for ``VibeVoiceForASRTraining``."""
+    """Offline VibeVoice ASR/diarization stages for ``VibeVoiceForASRTraining``.
+
+    Mobius selects this model only when the shared ``vibevoice`` configuration
+    declares ``VibeVoiceForASRTraining``. VibeVoice TTS remains
+    ``VibeVoiceForConditionalGeneration``; unknown, streaming, and ambiguous
+    VibeVoice architectures fail closed.
+
+    ## Architecture and package contract
+
+    The offline model uses 24 kHz waveform input with 3200-sample framing. Its
+    64-D acoustic and 128-D semantic cached causal encoders feed independent
+    connectors whose projected outputs are summed, flattened to valid frames,
+    and substituted for audio-placeholder embeddings before Qwen2 decoding.
+    The exported package has five stages: ``acoustic_encoder``,
+    ``semantic_encoder``, ``connectors``, ``embedding``, and ``decoder``.
+
+    ```mermaid
+    flowchart LR
+        WAV["24 kHz mono waveform"] --> AC["Acoustic encoder: cached 64-D latents"]
+        WAV --> SE["Semantic encoder: cached 128-D latents"]
+        AC --> C["Acoustic connector"]
+        SE --> SC["Semantic connector"]
+        C --> SUM["sum and select valid frames"]
+        SC --> SUM
+        P["Chat prompt and audio placeholders"] --> E["Embedding mixer"]
+        SUM --> E
+        E --> D["Qwen2 decoder with left-padded causal cache"]
+        D --> J["JSON diarization records"]
+    ```
+
+    A host owns waveform normalization, 60-second chunking, encoder cache
+    propagation, deterministic acoustic noise, fixed prompt construction, and
+    JSON diarization parsing. It passes ``is_final_chunk`` only for each true
+    terminal window; each causal convolution then performs the source's
+    intermediate right padding. Right-padded variable-length batches are
+    finalized per utterance. The decoder's ordinary prefix-valid left-padded
+    causal mask remains eligible for normal Qwen2 GQA optimizations.
+
+    ## Processor and evidence
+
+    The prompt uses fixed Qwen turns and encloses one ``<|box_start|>`` audio
+    placeholder per ``ceil(samples / 3200)`` frame with
+    ``<|object_ref_start|>`` and ``<|object_ref_end|>``. ``context_info`` is
+    source-provided background or hotword text; there is no separate hotword
+    input. Output JSON records are normalized to ``start_time``, ``end_time``,
+    ``speaker_id``, and ``text``.
+
+    Microsoft publishes support for 51 language codes: ``en, zh, es, pt, de,
+    ja, ko, fr, ru, id, sv, it, he, nl, pl, no, tr, th, ar, hu, ca, cs, da, fa,
+    af, hi, fi, et, aa, el, ro, vi, bg, is, sl, sk, lt, sw, uk, kl, lv, hr, ne,
+    sr, tl, yi, ms, ur, mn, hy, jv``. This records the upstream claim only; it
+    does not make an independent quality claim.
+
+    L1 builds every stage and cache ABI; L2 checks the pinned raw config and
+    checkpoint index; L3 compares the staged package with the pinned
+    Transformers source (``f62dc9bf2c90353b442a56e74391fbb8c689b55e``),
+    including batch chunking, terminal frames, seeded sampling, replacement,
+    and left padding. L4/L5 real-weight transcription and diarization are
+    unverified because the approximately 8.67B BF16 checkpoint requires a
+    suitable CUDA host.
+
+    The checkpoint includes acoustic VAE waveform-decoder tensors, but the ASR
+    source never executes that decoder. They are deliberately excluded from
+    this inference package. ONNX Runtime GenAI cannot orchestrate the dual
+    cached encoders and host protocol, so its export metadata is advisory rather
+    than a runnable ``genai_config.json`` contract. The default checkpoint is
+    pinned to ``microsoft/VibeVoice-ASR@d0c9efdb8d614685062c04425d91e01b6f37d944``.
+    """
 
     default_task: str = "vibevoice-asr"
     category: str = "Speech-to-Text"

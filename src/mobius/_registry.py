@@ -232,11 +232,11 @@ from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
+from mobius.models.vibevoice_asr import VIBEVOICE_ASR_MODEL_ID, VIBEVOICE_ASR_REVISION
 from mobius.models.vibevoice_streaming import (
     VIBEVOICE_STREAMING_MODEL_ID,
     VIBEVOICE_STREAMING_REVISION,
 )
-from mobius.models.vibevoice_asr import VIBEVOICE_ASR_MODEL_ID, VIBEVOICE_ASR_REVISION
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel

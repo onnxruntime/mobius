@@ -187,7 +187,7 @@ def test_vibevoice_asr_checkpoint_index_classifies_every_tensor_once(tmp_path):
         "microsoft/VibeVoice-ASR",
         filename="model.safetensors.index.json",
         revision="d0c9efdb8d614685062c04425d91e01b6f37d944",
-        local_dir=tmp_path,
+        cache_dir=tmp_path,
     )
     with open(index_path, encoding="utf-8") as handle:
         checkpoint_names = set(json.load(handle)["weight_map"])
