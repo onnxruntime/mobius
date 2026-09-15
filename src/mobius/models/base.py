@@ -121,8 +121,8 @@ class TextModel(nn.Module):
 
         # Sliding-window models declare a local-attention span; it drives the
         # optional static-cache float bias (flags.static_cache_bias). Standard
-        # full-attention models leave this None, so the bias path is a no-op
-        # for them even when the flag is set.
+        # full-attention models leave this None, but still need a causal bias
+        # when the EP cannot consume native static-cache valid lengths.
         self._sliding_window: int | None = getattr(config, "sliding_window", None)
 
     def _maybe_static_cache_bias(
@@ -133,10 +133,9 @@ class TextModel(nn.Module):
     ) -> ir.Value | None:
         """Optionally build the static-cache float additive attention bias.
 
-        Returns ``None`` (maskless ``is_causal=1`` default) unless ALL hold:
-          * ``flags.static_cache_bias`` is set, AND
-          * the model declares a bias need (``self._sliding_window`` is set), AND
-          * the cache is the opset-24 external cache (``StaticCacheState``).
+            Requires an external ``StaticCacheState`` and either an EP without
+            native Attention valid-length support, or ``flags.static_cache_bias``
+            together with a declared sliding window. Otherwise returns ``None``.
 
         When emitted, the bias is a ``(B, 1, S_q, max_seq_len)`` additive mask
         keyed on absolute query positions with KV validity
@@ -151,7 +150,9 @@ class TextModel(nn.Module):
                 this instead of ``input_ids`` keeps the bias enabled for
                 ``inputs_embeds``-driven forwards (where ``input_ids`` is None).
         """
-        if not flags.static_cache_bias or self._sliding_window is None:
+        requires_explicit_bias = not ep_capabilities().supports_attention_nonpad_kv_seqlen
+        requested_sliding_bias = flags.static_cache_bias and self._sliding_window is not None
+        if not (requires_explicit_bias or requested_sliding_bias):
             return None
         if not past_key_values:
             return None

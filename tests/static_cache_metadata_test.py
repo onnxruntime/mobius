@@ -20,16 +20,25 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import onnx_ir as ir
 import pytest
+from onnxscript import GraphBuilder
 
 from mobius import registry
+from mobius._build_context import build_context
 from mobius._configs import ArchitectureConfig
 from mobius._constants import (
+    OPSET_VERSION,
     STATIC_CACHE_KV_SEQUENCE_LENGTH,
     STATIC_CACHE_SEQUENCE_AXIS,
     STATIC_CACHE_WRITE_INDICES,
 )
+from mobius._execution_providers import get_ep
+from mobius._flags import override_flags
+from mobius._testing.ort_inference import OnnxModelSession
+from mobius.components import create_static_cache_attention_bias
+from mobius.components._attention import StaticCacheState, _apply_attention
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_decoder_workflow_metadata,
 )
@@ -60,6 +69,121 @@ def _static_package(**overrides):
     module = registry.get("qwen2")(config)
     task = CausalLMTask(static_cache=True, max_seq_len=CAPACITY)
     return task.build(module, config), config
+
+
+@pytest.mark.parametrize("ep_name", ["default", "tensorrt"])
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+@pytest.mark.parametrize("static_cache", [False, True])
+def test_attention_cache_mask_ep_contract(ep_name, dtype, static_cache):
+    config = _text_config(dtype=dtype)
+    with build_context(get_ep(ep_name), dtype=dtype), override_flags(static_cache_bias=False):
+        module = registry.get("qwen2")(config)
+        package = CausalLMTask(static_cache=static_cache, max_seq_len=CAPACITY).build(
+            module, config
+        )
+    graph = package["model"].graph
+    attentions = [node for node in graph if node.op_type == "Attention"]
+    assert len(attentions) == 2
+    explicit_bias = static_cache and ep_name == "tensorrt"
+    for node in attentions:
+        if static_cache:
+            assert (node.inputs[3] is not None) == explicit_bias
+        assert node.attributes["is_causal"].as_int() == (0 if explicit_bias else 1)
+        native_nonpad = node.inputs[6] if len(node.inputs) > 6 else None
+        assert (native_nonpad is not None) == (static_cache and not explicit_bias)
+        if explicit_bias:
+            assert node.inputs[3].dtype == dtype
+            assert len(node.outputs) == 1
+            assert "q_num_heads" not in node.attributes
+            assert "kv_num_heads" not in node.attributes
+        if static_cache:
+            assert node.inputs[4] is None and node.inputs[5] is None
+            cache_input = next(value for value in graph.inputs if value.name == "key_cache.0")
+            assert len(cache_input.shape) == (4 if ep_name == "tensorrt" else 3)
+        else:
+            assert node.inputs[4] is not None and node.inputs[5] is not None
+            assert len(node.outputs) == 3
+    if explicit_bias:
+        assert attentions[0].inputs[3] is attentions[1].inputs[3]
+        graph_inputs = {value.name: value for value in graph.inputs}
+        assert graph_inputs["nonpad_kv_seqlen"].uses()
+        assert graph_inputs["write_indices"].uses()
+
+
+@pytest.mark.parametrize("write,length,nonpad", [(0, 4, 4), (4, 1, 5), (4, 3, 7), (4, 3, 6)])
+def test_tensorrt_static_bias_slot_geometry(write, length, nonpad):
+    def input_value(name):
+        return ir.Value(name=name, shape=ir.Shape([1]), type=ir.TensorType(ir.DataType.INT64))
+
+    cursor = input_value("write_indices")
+    valid_length = input_value("nonpad_kv_seqlen")
+    graph = ir.Graph(
+        inputs=[cursor, valid_length],
+        outputs=[],
+        nodes=[],
+        opset_imports={"": OPSET_VERSION},
+        name="static_bias_geometry",
+    )
+    op = GraphBuilder(graph).op
+    with build_context(get_ep("tensorrt")):
+        bias = create_static_cache_attention_bias(
+            op,
+            write_indices=cursor,
+            seq_len=op.Constant(value_ints=[length]),
+            nonpad_kv_seqlen=valid_length,
+            max_seq_len=8,
+        )
+    bias.name = "bias"
+    graph.outputs.append(bias)
+    model = ir.Model(graph, ir_version=10)
+    actual = OnnxModelSession(model).run(
+        {
+            "write_indices": np.asarray([write], dtype=np.int64),
+            "nonpad_kv_seqlen": np.asarray([nonpad], dtype=np.int64),
+        }
+    )["bias"]
+    key_slots = np.arange(8)[None, :]
+    query_slots = write + np.arange(length)[:, None]
+    allowed = (key_slots <= query_slots) & (key_slots < nonpad)
+    expected = np.where(allowed, 0, np.finfo(np.float32).min).astype(np.float32)[None, None]
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_tensorrt_static_attention_rejects_missing_bias():
+    def value(name, shape):
+        return ir.Value(
+            name=name, shape=ir.Shape(shape), type=ir.TensorType(ir.DataType.FLOAT)
+        )
+
+    query = value("query", [1, 1, 64])
+    key = value("key", [1, 1, 32])
+    cache = value("cache", [1, 2, 8, 16])
+    index = ir.Value(name="index", shape=ir.Shape([1]), type=ir.TensorType(ir.DataType.INT64))
+    graph = ir.Graph(
+        inputs=[query, key, cache, index],
+        outputs=[],
+        nodes=[],
+        opset_imports={"": OPSET_VERSION},
+    )
+    with (
+        build_context(get_ep("tensorrt")),
+        pytest.raises(ValueError, match="explicit static-cache"),
+    ):
+        _apply_attention(
+            GraphBuilder(graph).op,
+            query,
+            key,
+            key,
+            None,
+            None,
+            None,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            scale=0.25,
+            static_cache=StaticCacheState(cache, cache, index, index),
+        )
 
 
 def _cache_cells(workflow) -> list[str]:
