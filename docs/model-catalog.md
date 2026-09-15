@@ -82,7 +82,7 @@ Models that route tokens to a subset of expert MLPs.
 | `deepseek_v2` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V2-Lite` |
 | `deepseek_v3` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V3` |
 | `phimoe` | `Phi3MoECausalLMModel` | `microsoft/Phi-3.5-MoE-instruct` |
-| `gptoss` | `GPTOSSCausalLMModel` | — |
+| `gpt_oss` | `GPTOSSCausalLMModel` | `openai/gpt-oss-20b` (native MXFP4/QMoE on CUDA) |
 
 Also registered with `MoECausalLMModel`: `arctic`, `dbrx`,
 `ernie4_5_moe`, `flex_olmo`, `glm4_moe`, `granitemoe`,
@@ -197,6 +197,7 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | `qwen3_tts` | `Qwen3TTSForConditionalGeneration` | `tts` | — |
 | `qwen3_tts_tokenizer_12hz` | `Qwen3TTSTokenizerV2Model` | `codec` | — |
 | `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `vibevoice/VibeVoice-1.5B-hf` |
+| `vibevoice_asr` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr` | `microsoft/VibeVoice-ASR-HF` |
 
 ### Audio Feature Extraction
 

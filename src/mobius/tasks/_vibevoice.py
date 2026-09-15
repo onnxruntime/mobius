@@ -19,30 +19,11 @@ from mobius._pipeline_contract import (
 )
 from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 from mobius.tasks._cache_utils import (
+    _make_conv_cache_inputs,
     _make_kv_cache_inputs,
+    _register_conv_cache_outputs,
     _register_kv_cache_outputs,
 )
-
-
-def _make_conv_cache_inputs(
-    builder,
-    specs: tuple[tuple[int, int], ...],
-    batch: ir.SymbolicDim,
-    dtype: ir.DataType,
-) -> list[ir.Value]:
-    return [
-        builder.input(
-            f"past_conv.{index}",
-            dtype=dtype,
-            shape=[batch, channels, left_pad],
-        )
-        for index, (channels, left_pad) in enumerate(specs)
-    ]
-
-
-def _register_conv_cache_outputs(builder, values: list[ir.Value]) -> None:
-    for index, value in enumerate(values):
-        builder.add_output(value, f"present_conv.{index}")
 
 
 class VibeVoiceTask(ModelTask):

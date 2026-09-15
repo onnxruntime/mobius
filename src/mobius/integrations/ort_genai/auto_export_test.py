@@ -1558,8 +1558,9 @@ class TestExportForOrtGenai:
             model["decoder"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "enable_cuda_graph"
             ]
-            == "1"
+            == "0"
         )
+        assert data["search"]["past_present_share_buffer"] is False
         assert (
             model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "enable_cuda_graph"
@@ -2939,6 +2940,22 @@ class TestExportPackage:
         assert save_calls[0]["external_data"] == "safetensors"
         assert save_calls[0]["progress_bar"] is False
 
+    def test_streaming_package_can_transactionally_create_output(self, tmp_path):
+        from mobius.integrations.ort_genai.auto_export import export_package
+
+        pkg = self._make_pkg()
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        output = tmp_path / "output"
+
+        result = export_package(pkg, str(output), progress_bar=False)
+
+        assert (output / "model.onnx").is_file()
+        assert (output / "weight-loading-report.json").is_file()
+        assert result["genai_config"] == str(output / "genai_config.json")
+
     def test_propagates_genai_config_kwargs(self, tmp_path, monkeypatch):
         """The ep and context_length kwargs reach the generated genai_config.json."""
         from mobius.integrations.ort_genai.auto_export import export_package
@@ -3895,6 +3912,36 @@ def test_generic_decoder_schema_is_architecture_and_weight_agnostic(
         "present_value_names": "present.%d.value",
     }
     assert config["search"]["past_present_share_buffer"] is False
+
+
+@pytest.mark.parametrize(
+    ("has_gqa", "share_buffer", "enable_cuda_graph"),
+    [
+        (True, True, "1"),
+        (False, False, "0"),
+    ],
+)
+def test_cuda_decoder_capture_tracks_graph_kv_cache_contract(
+    tmp_path, has_gqa, share_buffer, enable_cuda_graph
+):
+    pkg = _make_fake_llm_pkg("gpt_oss")
+    if has_gqa:
+        pkg["model"].graph.append(
+            ir.Node(
+                op_type="GroupQueryAttention",
+                domain="com.microsoft",
+                inputs=[],
+                num_outputs=1,
+            )
+        )
+
+    result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+    assert config["search"]["past_present_share_buffer"] is share_buffer
+    assert cuda_options["enable_cuda_graph"] == enable_cuda_graph
 
 
 def test_gpt2_separate_cache_graph_uses_generic_decoder(tmp_path):
