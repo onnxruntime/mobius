@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 
+import onnx_ir as ir
 import pytest
 
 from mobius._build_context import build_context
@@ -16,7 +17,12 @@ from mobius._testing import (
     create_test_builder,
     create_test_input,
 )
-from mobius.components._quantized_linear import BlockQuantizedLinear, QuantizedLinear
+from mobius.components._quantized_linear import (
+    BlockQuantizedLinear,
+    ClippableQuantizedLinear,
+    NVFP4QuantizedLinear,
+    QuantizedLinear,
+)
 
 # Test dimensions
 IN_FEATURES = 64
@@ -260,6 +266,62 @@ class TestQuantizedLinearForward:
         assert "bias" in names
 
 
+class TestNVFP4QuantizedLinear:
+    def test_exact_parameter_abi(self):
+        linear = NVFP4QuantizedLinear(IN_FEATURES, OUT_FEATURES)
+
+        assert linear.weight.shape == [OUT_FEATURES, IN_FEATURES // 2]
+        assert linear.weight.dtype.name == "UINT8"
+        assert linear.weight_scale.shape == [OUT_FEATURES, IN_FEATURES // 16]
+        assert linear.weight_scale.dtype.name == "UINT8"
+        assert linear.weight_scale_2.shape == [1]
+        assert linear.weight_scale_2.dtype.name == "FLOAT"
+
+    @pytest.mark.parametrize(("in_features", "block_size"), [(63, 16), (64, 32)])
+    def test_rejects_unsupported_layout(self, in_features, block_size):
+        with pytest.raises(ValueError, match="requires"):
+            NVFP4QuantizedLinear(
+                in_features,
+                OUT_FEATURES,
+                block_size=block_size,
+            )
+
+    def test_emits_exact_native_node_and_separate_bias(self):
+        linear = NVFP4QuantizedLinear(
+            IN_FEATURES,
+            OUT_FEATURES,
+            bias=True,
+        )
+        builder, op, graph = create_test_builder()
+        x = create_test_input(
+            builder,
+            "x",
+            [2, 3, IN_FEATURES],
+            dtype=ir.DataType.FLOAT16,
+        )
+
+        result = linear(op, x)
+        builder._adapt_outputs([result], "")
+
+        native = next(
+            node for node in graph if node.op_type == "MatMulBlockQuantizedFp4Weight"
+        )
+        assert native.domain == "com.microsoft"
+        assert len(native.inputs) == 4
+        assert native.attributes["block_size"].value == 16
+        assert native.outputs[0].shape == [2, 3, OUT_FEATURES]
+        assert count_op_type(graph, "Add") == 1
+        assert graph.opset_imports["com.microsoft"] == 1
+
+    def test_rejects_non_fp16_activation_abi(self):
+        linear = NVFP4QuantizedLinear(IN_FEATURES, OUT_FEATURES)
+        builder, op, _graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, IN_FEATURES])
+
+        with pytest.raises(ValueError, match="requires FLOAT16 activations"):
+            linear(op, x)
+
+
 class TestBlockQuantizedLinear:
     @pytest.mark.parametrize(
         ("format_name", "block_elements", "block_bytes"),
@@ -313,6 +375,35 @@ class TestBlockQuantizedLinear:
             BlockQuantizedLinear(IN_FEATURES, OUT_FEATURES, format="q4_k")
 
 
+class TestClippableQuantizedLinear:
+    def test_keeps_clipping_parameters(self):
+        linear = ClippableQuantizedLinear(IN_FEATURES, OUT_FEATURES)
+        names = {name for name, _ in linear.named_parameters()}
+        assert {
+            "weight",
+            "scales",
+            "input_min",
+            "input_max",
+            "output_min",
+            "output_max",
+        } <= names
+
+    def test_graph_clips_around_matmulnbits(self):
+        linear = ClippableQuantizedLinear(
+            IN_FEATURES,
+            OUT_FEATURES,
+            bits=8,
+            block_size=32,
+        )
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+        result = linear(op, x)
+        b._adapt_outputs([result], "")
+
+        assert count_op_type(graph, "MatMulNBits") == 1
+        assert count_op_type(graph, "Clip") == 2
+
+
 class TestMakeQuantizedLinearFactory:
     """Tests for the make_quantized_linear_factory closure."""
 
@@ -347,6 +438,22 @@ class TestMakeQuantizedLinearFactory:
         assert instance._k == 32
         assert instance._n == 64
         assert instance.bias is None
+
+    def test_clippable_factory_uses_requested_layout(self):
+        from mobius.components._quantized_linear import (
+            make_clippable_quantized_linear_factory,
+        )
+
+        factory = make_clippable_quantized_linear_factory(
+            bits=8,
+            block_size=32,
+            has_zero_point=True,
+        )
+        linear = factory(IN_FEATURES, OUT_FEATURES, bias=False)
+
+        assert isinstance(linear, ClippableQuantizedLinear)
+        assert linear.weight.shape == [OUT_FEATURES, 2, 32]
+        assert linear.zero_points is not None
 
 
 class TestQuantizedEmbeddingInit:

@@ -35,6 +35,8 @@ __all__ = [
     "build_context",
     "ep_capabilities",
     "get_build_dtype",
+    "is_prefill_prefix_pruning_enabled",
+    "prefill_prefix_pruning",
 ]
 
 _DEFAULT_CAPABILITIES = EpCapabilities(name="default")
@@ -44,6 +46,9 @@ _current_ep: contextvars.ContextVar[EpCapabilities] = contextvars.ContextVar(
 )
 _current_dtype: contextvars.ContextVar[ir.DataType] = contextvars.ContextVar(
     "mobius_build_dtype", default=ir.DataType.FLOAT
+)
+_prune_prefill_prefix: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mobius_prune_prefill_prefix", default=False
 )
 
 
@@ -113,3 +118,18 @@ def get_build_dtype() -> ir.DataType:
             ...
     """
     return _current_dtype.get()
+
+
+@contextmanager
+def prefill_prefix_pruning(enabled: bool) -> Iterator[None]:
+    """Enable or disable prefill token-prefix pruning during graph construction."""
+    token = _prune_prefill_prefix.set(enabled)
+    try:
+        yield
+    finally:
+        _prune_prefill_prefix.reset(token)
+
+
+def is_prefill_prefix_pruning_enabled() -> bool:
+    """Return whether the active task discards prefill tokens before the final token."""
+    return _prune_prefill_prefix.get()

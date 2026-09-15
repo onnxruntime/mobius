@@ -51,6 +51,10 @@ an underscore prefix for local use:
 from mobius.components import Conv2d as _Conv2d, SiLU as _SiLU
 ```
 
+Inside `src/mobius/components/_*.py`, import sibling primitives directly
+(`mobius.components._common`, etc.) so a partially initialized public package
+cannot create a circular import.
+
 Model-specific compound blocks (e.g. `_TimestepEmbedding`, `_DiTBlock`,
 `_ResNetBlock2D`) remain in the model files they belong to.
 
@@ -209,6 +213,17 @@ position IDs instead of an explicit mask.
    (`exp`, `softplus`, RMSNorm variance), upcast to float32 with
    `op.Cast(to=ir.DataType.FLOAT)`, compute, then cast back with `op.CastLike(result, input)`.
    For dtype-adaptive parameters, use `op.CastLike(param, reference)`.
+
+8. **Prefer canonical ONNX operators.** Emit standard `BatchNormalization`,
+   `RMSNormalization`, and activation ops when semantics match so ORT can fold
+   and fuse them. Scale-free RMSNorm still needs a schema-valid 1-D scale and
+   must preserve HF's fp32 variance semantics before casting back. Prefer
+   `stash_type=FLOAT` over a decomposed graph when it matches HF, and verify
+   normalize-in-fp32 → cast activation → apply gamma ordering. Keep a manual
+   form when preventing an incorrect provider fusion is intentional and tested.
+
+9. **Preserve public call compatibility.** Append new optional arguments after
+   existing positional parameters and add a positional-call regression test.
 
 ## ONNX op patterns overview
 

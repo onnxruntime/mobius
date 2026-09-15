@@ -6,14 +6,26 @@
 from __future__ import annotations
 
 import logging
+import threading
+import types
+from pathlib import Path
 
 import onnx_ir as ir
+import pytest
 import torch
+from onnx_ir import tensor_adapters
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
-from mobius._model_package import ModelPackage
+from mobius._export_report import ComponentExportDisposition, ComponentExportReport
+from mobius._model_package import (
+    ModelPackage,
+    _make_progress_callback,
+    _namespaced_symbolic_dimensions,
+    _save_safetensors,
+)
 from mobius._testing import make_config
+from mobius.generation import build_greedy_sampler
 from mobius.models.base import CausalLMModel
 from mobius.models.gemma3 import Gemma3MultiModalModel
 from mobius.tasks import CausalLMTask, VisionLanguageTask
@@ -23,6 +35,44 @@ def _make_simple_model(name: str = "test") -> ir.Model:
     """Create a minimal ir.Model for testing."""
     graph = ir.Graph([], [], nodes=[], name=name)
     return ir.Model(graph, ir_version=10)
+
+
+def _make_e8m0_model() -> ir.Model:
+    scale = ir.val("scale")
+    scale.const_value = ir.tensor([0], dtype=ir.DataType.FLOAT8E8M0)
+    graph = ir.Graph([], [], nodes=[], name="e8m0")
+    graph.register_initializer(scale)
+    return ir.Model(graph, ir_version=12)
+
+
+def _partial_export_report() -> ComponentExportReport:
+    return ComponentExportReport.create(
+        (
+            ComponentExportDisposition(
+                name="model",
+                route="llama",
+                requested=True,
+                discovered=True,
+                support="supported",
+                output="exported",
+            ),
+            ComponentExportDisposition(
+                name="tokenizer",
+                route="blocked-pre",
+                requested=True,
+                discovered=True,
+                support="blocked",
+                output="omitted",
+                runtime_validation_status="unvalidated",
+                blocker_category="semantic-mismatch",
+                reason="the pinned tokenizer differs",
+                evidence_id="tokenizer-evidence",
+                impact="the package is not runnable",
+                remediation="provide and validate a tokenizer",
+            ),
+        ),
+        end_to_end_runnable=False,
+    )
 
 
 class TestModelPackageDict:
@@ -36,6 +86,14 @@ class TestModelPackageDict:
         m = _make_simple_model()
         pkg["new"] = m
         assert pkg["new"] is m
+
+    def test_rejects_component_without_graph(self):
+        with pytest.raises(TypeError, match=r"must be an ir\.Model with a graph"):
+            ModelPackage({"invalid": object()})  # type: ignore[arg-type]
+
+        pkg = ModelPackage()
+        with pytest.raises(TypeError, match=r"must be an ir\.Model with a graph"):
+            pkg["invalid"] = object()  # type: ignore[assignment]
 
     def test_delitem(self):
         pkg = ModelPackage({"a": _make_simple_model()})
@@ -76,6 +134,678 @@ class TestModelPackageDict:
         pkg = ModelPackage({"m": _make_simple_model()}, config=config)
         assert pkg.config is config
 
+    def test_lazy_source_registration_normalizes_and_unions_paths(self, tmp_path, monkeypatch):
+        pkg = ModelPackage()
+        monkeypatch.chdir(tmp_path)
+
+        pkg.register_lazy_source_artifacts(
+            files=["weights/a.safetensors"],
+            directories=["weights"],
+        )
+        pkg.register_lazy_source_artifacts(
+            files=[tmp_path / "weights" / ".." / "b.safetensors"],
+            directories=[tmp_path],
+        )
+
+        assert pkg._native_streaming_source_files == frozenset(
+            {
+                (tmp_path / "weights/a.safetensors").resolve(),
+                (tmp_path / "b.safetensors").resolve(),
+            }
+        )
+        assert pkg._native_streaming_source_directories == frozenset(
+            {(tmp_path / "weights").resolve(), tmp_path.resolve()}
+        )
+
+
+class TestWeightLoadingReport:
+    def test_roundtrips_with_package(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        pkg.save(str(tmp_path), progress_bar=False)
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert loaded.weight_loading_report == pkg.weight_loading_report
+        assert loaded.weight_loading_report["external_data_shard_limit_bytes"] == 1 << 30
+        assert loaded.weight_loading_report["largest_dense_tensor_bytes"] == 0
+        assert loaded.weight_loading_report["serializer_max_workers"] == 1
+        assert (tmp_path / "weight-loading-report.json").is_file()
+
+    def test_dense_streaming_forces_serial_external_data_save(self, tmp_path, monkeypatch):
+        workers = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            workers.append(max_workers)
+
+        monkeypatch.setattr(ir, "save", save)
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        pkg.save(
+            str(tmp_path),
+            max_workers=8,
+            progress_bar=False,
+            check_weights=False,
+        )
+
+        assert workers == [1]
+        assert pkg.weight_loading_report["serializer_max_workers"] == 1
+        assert (
+            "forced to one worker" in pkg.weight_loading_report["serialization_memory_bound"]
+        )
+
+    def test_rejects_unbounded_dense_streaming_shard(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        with pytest.raises(ValueError, match="serializer buffers one output shard"):
+            pkg.save(
+                str(tmp_path),
+                max_shard_size_bytes=5_000_000_001,
+                progress_bar=False,
+            )
+
+    def test_qdq_report_includes_source_cast_overlap(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "fp8_qdq",
+            "streaming_external_data": True,
+            "largest_source_cast_overlap_bytes": 4096,
+        }
+
+        pkg.save(str(tmp_path / "output"), progress_bar=False)
+
+        assert pkg.weight_loading_report["largest_reconstruction_working_set_bytes"] == 4096
+        assert pkg.weight_loading_report["serializer_max_workers"] == 1
+
+    def test_streaming_save_rolls_back_failed_lazy_materialization_and_retries(
+        self, tmp_path, monkeypatch
+    ):
+        should_fail = True
+
+        def materialize():
+            if should_fail:
+                raise RuntimeError("lazy transform failed")
+            return tensor_adapters.TorchTensor(torch.ones(1), name="weight")
+
+        weight = ir.Value(
+            name="weight",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([1]),
+            const_value=ir.LazyTensor(
+                materialize,
+                dtype=ir.DataType.FLOAT,
+                shape=ir.Shape([1]),
+                name="weight",
+            ),
+        )
+        graph = ir.Graph([], [], nodes=[], name="streaming")
+        graph.register_initializer(weight)
+        pkg = ModelPackage({"model": ir.Model(graph, ir_version=12)})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        output = tmp_path / "output"
+
+        def save(model, path, **_kwargs):
+            Path(path).write_bytes(b"partial")
+            model.graph.initializers["weight"].const_value.numpy()
+
+        monkeypatch.setattr(ir, "save", save)
+        with pytest.raises(RuntimeError, match="lazy transform failed"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+        should_fail = False
+        pkg.save(str(output), progress_bar=False)
+
+        assert (output / "model.onnx").read_bytes() == b"partial"
+        assert (output / "weight-loading-report.json").is_file()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_streaming_save_refuses_existing_source_destination_without_mutation(
+        self, tmp_path
+    ):
+        output = tmp_path / "checkpoint"
+        output.mkdir()
+        source = output / "source.safetensors"
+        source.write_bytes(b"source")
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        pkg.register_lazy_source_artifacts(
+            files=[source],
+            directories=[output],
+        )
+
+        with pytest.raises(FileExistsError, match="destination already exists"):
+            pkg.save(str(output), external_data="onnx", progress_bar=False)
+
+        assert source.read_bytes() == b"source"
+        assert tuple(output.iterdir()) == (source,)
+        assert not list(tmp_path.glob(".checkpoint.*.tmp"))
+
+    def test_streaming_mtp_source_sidecar_is_never_removed(self, tmp_path):
+        output = tmp_path / "output"
+        source_sidecar = output / ".mobius-mtp"
+        source_sidecar.mkdir(parents=True)
+        sentinel = source_sidecar / "source.safetensors"
+        sentinel.write_bytes(b"source")
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+        pkg.mtp_head.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+        pkg.mtp_head.register_lazy_source_artifacts(
+            files=[sentinel],
+            directories=[source_sidecar],
+        )
+
+        with pytest.raises(FileExistsError, match="destination already exists"):
+            pkg.save(str(output), external_data="onnx", progress_bar=False)
+
+        assert sentinel.read_bytes() == b"source"
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_ordinary_resave_removes_stale_report(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+        }
+        pkg.save(str(tmp_path), progress_bar=False)
+
+        pkg.weight_loading_report = None
+        pkg.save(str(tmp_path), progress_bar=False)
+
+        assert not (tmp_path / "weight-loading-report.json").exists()
+
+    def test_load_rejects_invalid_report(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.save(str(tmp_path), progress_bar=False)
+        (tmp_path / "weight-loading-report.json").write_text('{"format": "unknown"}')
+
+        with pytest.raises(ValueError, match="Invalid weight-loading report"):
+            ModelPackage.load(str(tmp_path))
+
+    def test_report_path_is_validated_before_model_serialization(self, tmp_path):
+        external = tmp_path / "external-report"
+        external.write_text("unchanged")
+        (tmp_path / "weight-loading-report.json").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "fp8_qdq",
+            "streaming_external_data": True,
+        }
+
+        with pytest.raises(ValueError, match="weight-loading report output"):
+            pkg.save(str(tmp_path), progress_bar=False)
+
+        assert external.read_text() == "unchanged"
+        assert not (tmp_path / "model.onnx").exists()
+
+
+class TestComponentExportReport:
+    def test_partial_report_roundtrips_deterministically(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+
+        pkg.save(str(output), progress_bar=False)
+        report_bytes = (output / "export_report.json").read_bytes()
+        loaded = ModelPackage.load(str(output))
+
+        assert loaded.export_report == pkg.export_report
+        loaded_report = loaded.export_report
+        assert loaded_report is not None
+        assert loaded_report.status == "partial"
+        assert loaded_report.runtime_validation_status == "unvalidated"
+        tokenizer = loaded_report.component("tokenizer")
+        assert tokenizer is not None
+        assert tokenizer.exported is False
+        assert report_bytes == pkg.export_report.to_json().encode()
+        payload = pkg.export_report.to_dict()
+        assert payload["export_status"] == "partial"
+        assert payload["runtime_validation_status"] == "unvalidated"
+        components = payload["components"]
+        assert isinstance(components, dict)
+        assert components["tokenizer"]["export_status"] == "omitted"
+        assert components["tokenizer"]["runtime_validation_status"] == "unvalidated"
+
+    def test_report_write_preserves_lf_when_text_writes_translate_newlines(
+        self, tmp_path, monkeypatch
+    ):
+        report = _partial_export_report()
+        report_path = tmp_path / "export_report.json"
+
+        def write_text_with_windows_newlines(
+            path: Path, data: str, encoding: str | None = None, **_kwargs
+        ) -> int:
+            encoded = data.replace("\n", "\r\n").encode(encoding or "utf-8")
+            return path.write_bytes(encoded)
+
+        monkeypatch.setattr(Path, "write_text", write_text_with_windows_newlines)
+        report.write_json(report_path)
+
+        assert report_path.read_bytes() == report.to_bytes()
+        assert b"\r\n" not in report_path.read_bytes()
+
+    def test_save_without_report_rejects_stale_report(self, tmp_path):
+        report_path = tmp_path / "export_report.json"
+        report_path.write_text(_partial_export_report().to_json(), encoding="utf-8")
+        pkg = ModelPackage({"model": _make_simple_model()})
+
+        with pytest.raises(ValueError, match=r"stale export_report.json"):
+            pkg.save(str(tmp_path), progress_bar=False)
+
+        assert not (tmp_path / "model.onnx").exists()
+
+    def test_partial_report_rejects_stale_omitted_component_assets(self, tmp_path):
+        stale_tokenizer = tmp_path / "tokenizer.json"
+        stale_tokenizer.write_text('{"unverified": true}', encoding="utf-8")
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+
+        with pytest.raises(FileExistsError, match="unverified components cannot survive"):
+            pkg.save(str(tmp_path), progress_bar=False)
+
+        assert stale_tokenizer.read_text(encoding="utf-8") == '{"unverified": true}'
+        assert not (tmp_path / "model.onnx").exists()
+
+    def test_report_is_written_only_after_model_serialization(self, tmp_path, monkeypatch):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+
+        def fail_save(*_args, **_kwargs):
+            raise OSError("serialization failed")
+
+        monkeypatch.setattr(ir, "save", fail_save)
+        with pytest.raises(OSError, match="serialization failed"):
+            pkg.save(str(tmp_path / "output"), progress_bar=False)
+
+        assert not (tmp_path / "output" / "export_report.json").exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_report_write_failure_publishes_nothing(self, tmp_path, monkeypatch):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+
+        def fail_report(*_args, **_kwargs):
+            raise OSError("report disk full")
+
+        monkeypatch.setattr(ComponentExportReport, "write_json", fail_report)
+        with pytest.raises(OSError, match="report disk full"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_draft_manifest_failure_publishes_nothing(self, tmp_path, monkeypatch):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        pkg.draft_manifest = {"architecture": "eagle3"}
+        output = tmp_path / "output"
+
+        def fail_manifest(*_args, **_kwargs):
+            raise OSError("draft manifest disk full")
+
+        monkeypatch.setattr(
+            "mobius.integrations.gguf._draft.write_draft_manifest",
+            fail_manifest,
+        )
+        with pytest.raises(OSError, match="draft manifest disk full"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_report_save_refuses_existing_destination_without_mutation(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+        output.mkdir()
+        sentinel = output / "sentinel.bin"
+        sentinel.write_bytes(b"unchanged")
+
+        with pytest.raises(FileExistsError, match="omitted or unverified components"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert sentinel.read_bytes() == b"unchanged"
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_atomic_report_publish_failure_rolls_back_stage(self, tmp_path, monkeypatch):
+        from mobius.integrations.gguf import _runtime_package
+
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+
+        def fail_publish(*_args, **_kwargs):
+            raise PermissionError("destination permission denied")
+
+        monkeypatch.setattr(_runtime_package, "_publish_directory_no_replace", fail_publish)
+        with pytest.raises(PermissionError, match="permission denied"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_atomic_report_publish_refuses_concurrent_destination(self, tmp_path, monkeypatch):
+        from mobius.integrations.gguf import _runtime_package
+
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+        publish = _runtime_package._publish_directory_no_replace
+
+        def create_concurrent_destination(stage, destination):
+            destination.mkdir()
+            (destination / "sentinel.bin").write_bytes(b"concurrent")
+            publish(stage, destination)
+
+        monkeypatch.setattr(
+            _runtime_package,
+            "_publish_directory_no_replace",
+            create_concurrent_destination,
+        )
+        with pytest.raises(OSError):
+            pkg.save(str(output), progress_bar=False)
+
+        assert (output / "sentinel.bin").read_bytes() == b"concurrent"
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_report_rejects_component_filtered_save(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+
+        with pytest.raises(ValueError, match="Component-filtered saves"):
+            pkg.save(
+                str(tmp_path),
+                components=lambda _name: False,
+                progress_bar=False,
+            )
+
+        assert not (tmp_path / "model.onnx").exists()
+        assert not (tmp_path / "export_report.json").exists()
+
+    def test_report_rejects_contradictory_status_booleans(self):
+        payload = _partial_export_report().to_dict()
+        components = payload["components"]
+        assert isinstance(components, dict)
+        tokenizer = components["tokenizer"]
+        assert isinstance(tokenizer, dict)
+        tokenizer["exported"] = True
+
+        with pytest.raises(ValueError, match="contradictory status booleans"):
+            ComponentExportReport.from_dict(payload)
+
+
+class TestOnnxShardedSave:
+    def test_onnx_external_data_is_sharded(self, tmp_path):
+        graph = ir.Graph([], [], nodes=[], name="m")
+        for index in range(6):
+            name = f"weight_{index}"
+            graph.register_initializer(
+                ir.Value(
+                    name=name,
+                    const_value=ir.Tensor(
+                        torch.full((1024,), index, dtype=torch.float32),
+                        name=name,
+                        dtype=ir.DataType.FLOAT,
+                    ),
+                )
+            )
+        pkg = ModelPackage({"m": ir.Model(graph, ir_version=10)})
+
+        pkg.save(
+            str(tmp_path),
+            external_data="onnx",
+            max_shard_size_bytes=8192,
+            progress_bar=False,
+        )
+
+        shards = sorted(
+            [
+                *tmp_path.glob("model-*-of-*.onnx.data"),
+                # onnx_ir 1.0.0 did not yet recognize .onnx.data as a
+                # compound suffix.
+                *tmp_path.glob("model.onnx-*-of-*.data"),
+            ]
+        )
+        assert len(shards) == 3
+        assert all(shard.stat().st_size <= 8192 for shard in shards)
+        loaded = ModelPackage.load(str(tmp_path))
+        assert set(loaded.data) == {"model"}
+
+    def test_defaults_to_eight_workers_when_supported(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            calls.append((max_shard_size_bytes, max_workers))
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path), progress_bar=False, check_weights=False
+        )
+
+        assert calls == [(None, 8)]
+
+    def test_forwards_serial_worker_override(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            calls.append(max_workers)
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path),
+            max_workers=1,
+            progress_bar=False,
+            check_weights=False,
+        )
+
+        assert calls == [1]
+
+    def test_omits_max_workers_for_onnx_ir_1_0(self, tmp_path, monkeypatch):
+        calls = []
+
+        def save(model, path, *, external_data, max_shard_size_bytes, callback):
+            calls.append((model, path))
+
+        monkeypatch.setattr(ir, "save", save)
+
+        ModelPackage({"m": _make_simple_model()}).save(
+            str(tmp_path), progress_bar=False, check_weights=False
+        )
+
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("max_workers", [0, -1])
+    def test_rejects_non_positive_max_workers(self, tmp_path, max_workers):
+        with pytest.raises(ValueError, match="max_workers must be positive"):
+            ModelPackage({"m": _make_simple_model()}).save(
+                str(tmp_path),
+                max_workers=max_workers,
+                progress_bar=False,
+                check_weights=False,
+            )
+
+
+class TestProgressCallback:
+    class _Tensor:
+        name = "w"
+        shape = (2, 2)
+
+        class dtype:  # noqa: N801
+            @staticmethod
+            def short_name():
+                return "f32"
+
+    class _Bar:
+        def __init__(self, *, total, desc, position, leave):
+            self.total = total
+            self.desc = desc
+            self.position = position
+            self.leave = leave
+            self.n = 0
+            self.postfix = ""
+            self.closed = False
+
+        def update(self):
+            self.n += 1
+
+        def set_postfix_str(self, value):
+            self.postfix = value
+
+        def close(self):
+            self.closed = True
+
+    def test_orders_progress_bars_by_shard_number(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
+        callback = _make_progress_callback()
+        for filename in (
+            "model-00002-of-00002.onnx.data",
+            "model-00001-of-00002.onnx.data",
+        ):
+            for shard_index in reversed(range(2)):
+                callback(
+                    self._Tensor(),
+                    types.SimpleNamespace(
+                        total=4,
+                        index=shard_index,
+                        offset=0,
+                        filename=filename,
+                        shard_total=2,
+                        shard_index=shard_index,
+                    ),
+                )
+
+        assert len(bars) == 2
+        assert [bar.position for bar in bars] == [1, 0]
+        assert all(bar.total == 2 and bar.n == 2 and bar.closed for bar in bars)
+        assert "model-00002-of-00002.onnx.data" in bars[0].desc
+        assert "model-00001-of-00002.onnx.data" in bars[1].desc
+
+    def test_falls_back_to_one_bar_with_onnx_ir_1_0(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
+        callback = _make_progress_callback()
+        for index in range(4):
+            callback(
+                self._Tensor(),
+                types.SimpleNamespace(
+                    total=4,
+                    index=index,
+                    offset=0,
+                    filename=f"model-{index}.data",
+                ),
+            )
+
+        assert len(bars) == 1
+        assert bars[0].total == 4
+        assert bars[0].n == 4
+        assert bars[0].position == 0
+        assert bars[0].closed
+
+    def test_is_thread_safe(self, monkeypatch):
+        bars = []
+
+        def make_bar(**kwargs):
+            bar = self._Bar(**kwargs)
+            bars.append(bar)
+            return bar
+
+        monkeypatch.setattr("mobius._model_package.tqdm.tqdm", make_bar)
+        callback = _make_progress_callback()
+        total = 200
+
+        def invoke(index):
+            callback(
+                self._Tensor(),
+                types.SimpleNamespace(
+                    total=total,
+                    index=index,
+                    offset=0,
+                    filename="model.onnx.data",
+                    shard_total=total,
+                    shard_index=index,
+                ),
+            )
+
+        threads = [threading.Thread(target=invoke, args=(index,)) for index in range(total)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(bars) == 1
+        assert bars[0].total == total
+        assert bars[0].n == total
+        assert bars[0].closed
+
 
 class TestModelPackageSaveLoad:
     def test_save_creates_files(self, tmp_path):
@@ -89,6 +819,95 @@ class TestModelPackageSaveLoad:
         assert (tmp_path / "text_decoder" / "model.onnx").exists()
         assert (tmp_path / "vision_encoder" / "model.onnx").exists()
 
+    def test_e8m0_safetensors_saves_serialize_compatibility_map_access(self, monkeypatch):
+        from onnx_ir import _safetensors as onnx_ir_safetensors
+
+        dtype_mapping = onnx_ir_safetensors._IR_DTYPE_TO_SAFETENSORS_DTYPE
+        monkeypatch.setitem(
+            dtype_mapping,
+            ir.DataType.FLOAT8E8M0,
+            "float8_e8m0",
+        )
+        first_save_entered = threading.Event()
+        release_first_save = threading.Event()
+        second_lock_attempted = threading.Event()
+        second_save_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        class ObservedLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._counter_lock = threading.Lock()
+                self._attempts = 0
+
+            def __enter__(self):
+                with self._counter_lock:
+                    self._attempts += 1
+                    if self._attempts == 2:
+                        second_lock_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                self._lock.release()
+
+        def fake_save(_model, path, **_kwargs):
+            assert dtype_mapping[ir.DataType.FLOAT8E8M0] == "float8_e8m0fnu"
+            if path == "first.onnx":
+                first_save_entered.set()
+                assert release_first_save.wait(timeout=5)
+            else:
+                second_save_entered.set()
+
+        def save(path):
+            try:
+                _save_safetensors(_make_e8m0_model(), path)
+            except Exception as error:
+                errors.append(error)
+
+        monkeypatch.setitem(
+            _save_safetensors.__globals__,
+            "_SAFETENSORS_SAVE_LOCK",
+            ObservedLock(),
+        )
+        monkeypatch.setattr(ir, "save_safetensors", fake_save)
+        first = threading.Thread(target=save, args=("first.onnx",))
+        second = threading.Thread(target=save, args=("second.onnx",))
+
+        first.start()
+        assert first_save_entered.wait(timeout=5)
+        second.start()
+        assert second_lock_attempted.wait(timeout=5)
+        assert not second_save_entered.is_set()
+        release_first_save.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert not errors
+        assert second_save_entered.is_set()
+        assert dtype_mapping[ir.DataType.FLOAT8E8M0] == "float8_e8m0"
+
+    def test_non_e8m0_safetensors_save_does_not_require_private_dtype_map(self, monkeypatch):
+        from onnx_ir import _safetensors as onnx_ir_safetensors
+
+        calls = []
+        monkeypatch.delattr(
+            onnx_ir_safetensors,
+            "_IR_DTYPE_TO_SAFETENSORS_DTYPE",
+        )
+        monkeypatch.setattr(
+            ir,
+            "save_safetensors",
+            lambda model, path, **kwargs: calls.append((model, path, kwargs)),
+        )
+        model = _make_simple_model()
+
+        _save_safetensors(model, "model.onnx")
+
+        assert calls == [(model, "model.onnx", {})]
+
     def test_roundtrip(self, tmp_path):
         config = make_config()
         module = CausalLMModel(config)
@@ -99,7 +918,19 @@ class TestModelPackageSaveLoad:
 
         assert len(loaded) == 1
         assert "model" in loaded
+        assert pkg["model"].graph is not None
         assert loaded["model"].graph.num_nodes() == pkg["model"].graph.num_nodes()
+
+    def test_save_without_report_rejects_stale_report(self, tmp_path):
+        report_path = tmp_path / "quantization_report.json"
+        report_path.write_text('{"user": "owned"}\n', encoding="utf-8")
+        pkg = ModelPackage({"model": _make_simple_model("model")})
+
+        with pytest.raises(ValueError, match=r"stale quantization_report.json"):
+            pkg.save(str(tmp_path))
+
+        assert report_path.read_text(encoding="utf-8") == '{"user": "owned"}\n'
+        assert not (tmp_path / "model.onnx").exists()
 
     def test_load_multiple(self, tmp_path):
         pkg = ModelPackage(
@@ -112,11 +943,500 @@ class TestModelPackageSaveLoad:
         loaded = ModelPackage.load(str(tmp_path))
         assert sorted(loaded) == ["a", "b"]
 
+    def test_mtp_head_roundtrip_with_flat_target(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("mtp")})
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == ["model"]
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["model"]
+        assert (tmp_path / ".mobius-mtp" / "model.onnx").exists()
+
+    def test_mtp_head_roundtrip_with_multicomponent_target(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "decoder": _make_simple_model("decoder"),
+                "embedding": _make_simple_model("embedding"),
+            }
+        )
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("mtp")})
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == ["decoder", "embedding"]
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["model"]
+
+    def test_component_filter_is_evaluated_once_and_does_not_filter_mtp(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "decoder": _make_simple_model("decoder"),
+                "embedding": _make_simple_model("embedding"),
+            }
+        )
+        pkg.mtp_head = ModelPackage(
+            {
+                "draft": _make_simple_model("draft"),
+                "auxiliary": _make_simple_model("auxiliary"),
+            }
+        )
+        calls: list[str] = []
+
+        def select_decoder(name: str) -> bool:
+            calls.append(name)
+            return name == "decoder"
+
+        pkg.save(
+            str(tmp_path),
+            components=select_decoder,
+            progress_bar=False,
+        )
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert calls == ["decoder", "embedding"]
+        assert sorted(loaded) == ["model"]
+        assert loaded["model"].graph.name == "decoder"
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["auxiliary", "draft"]
+
+    def test_streaming_collision_uses_sources_from_entire_mtp_chain(self, tmp_path):
+        output = tmp_path / "output"
+        source = output / "model"
+        source.mkdir(parents=True)
+        marker = source / "source.safetensors"
+        marker.write_bytes(b"unchanged")
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                "auxiliary": _make_simple_model("auxiliary"),
+            }
+        )
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+        pkg.mtp_head.register_lazy_source_artifacts(directories=[source])
+        listing_before = tuple(sorted(path.name for path in output.iterdir()))
+
+        with pytest.raises(ValueError, match="still read lazily"):
+            pkg.save(
+                str(output),
+                external_data="safetensors",
+                progress_bar=False,
+            )
+
+        assert marker.read_bytes() == b"unchanged"
+        assert tuple(sorted(path.name for path in output.iterdir())) == listing_before
+
+    def test_legitimate_mtp_component_roundtrip(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                "mtp": _make_simple_model("mtp"),
+            }
+        )
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == ["model", "mtp"]
+        assert loaded.mtp_head is None
+
+    def test_mtp_sidecar_directory_collision_is_encoded(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                ".mobius-mtp": _make_simple_model("legitimate-component"),
+                "mtp": _make_simple_model("mtp-component"),
+            }
+        )
+        pkg.mtp_head = ModelPackage(
+            {
+                "draft": _make_simple_model("draft"),
+                "auxiliary": _make_simple_model("auxiliary"),
+            }
+        )
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == [".mobius-mtp", "model", "mtp"]
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["auxiliary", "draft"]
+        assert (tmp_path / ".mobius-mtp-1" / "draft" / "model.onnx").is_file()
+
+    def test_mtp_sidecar_case_insensitive_collision_is_encoded(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                ".MOBIUS-MTP": _make_simple_model("legitimate-component"),
+            }
+        )
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == [".MOBIUS-MTP", "model"]
+        assert loaded.mtp_head is not None
+        assert (tmp_path / ".mobius-mtp-1" / "model.onnx").is_file()
+
+    def test_nested_mtp_sidecars_roundtrip(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage(
+            {
+                "draft": _make_simple_model("draft"),
+                "auxiliary": _make_simple_model("auxiliary"),
+            }
+        )
+        pkg.mtp_head.mtp_head = ModelPackage(
+            {
+                "next": _make_simple_model("next"),
+                "next_auxiliary": _make_simple_model("next-auxiliary"),
+            }
+        )
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["auxiliary", "draft"]
+        assert loaded.mtp_head.mtp_head is not None
+        assert sorted(loaded.mtp_head.mtp_head) == ["next", "next_auxiliary"]
+
+    def test_self_referential_mtp_head_fails_before_writing(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = pkg
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="must not contain a cycle"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_cyclic_nested_mtp_heads_fail_before_writing(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        sidecar = ModelPackage({"model": _make_simple_model("draft")})
+        pkg.mtp_head = sidecar
+        sidecar.mtp_head = pkg
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="must not contain a cycle"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_reserved_manifest_component_fails_before_writing(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                ".mobius-package.json": _make_simple_model("collision"),
+            }
+        )
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="reserved for package metadata"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    @pytest.mark.parametrize("name", ["", ".", "..", "../outside", "nested/model"])
+    def test_unsafe_component_name_fails_before_writing(self, tmp_path, name):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                name: _make_simple_model("unsafe"),
+            }
+        )
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="must be a non-empty path segment"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_removing_mtp_head_removes_stale_sidecar(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+        pkg.save(str(tmp_path))
+
+        pkg.mtp_head = None
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == ["model"]
+        assert loaded.mtp_head is None
+        assert not (tmp_path / ".mobius-mtp").exists()
+
+    def test_manifest_artifact_collision_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        (output / ".mobius-package.json").write_text(
+            '{"format": "mobius.model-package.v1", "mtp_head": "policies"}\n'
+        )
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.add_policy_component("sample", build_greedy_sampler())
+
+        with pytest.raises(ValueError, match="collides with an active artifact namespace"):
+            pkg.save(str(output))
+
+        assert not (output / "model.onnx").exists()
+
+    def test_resaving_mtp_head_replaces_stale_components(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage(
+            {
+                "draft": _make_simple_model("draft"),
+                "stale": _make_simple_model("stale"),
+            }
+        )
+        pkg.save(str(tmp_path))
+
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("replacement")})
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["model"]
+        assert not (tmp_path / ".mobius-mtp" / "stale").exists()
+
+    def test_sidecar_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        (output / ".mobius-mtp").symlink_to(external, target_is_directory=True)
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+
+        with pytest.raises(ValueError, match="must be a real directory"):
+            pkg.save(str(output))
+
+        assert not (output / "model.onnx").exists()
+        assert not list(external.iterdir())
+
+    def test_manifest_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external.json"
+        external.write_text("unchanged")
+        (output / ".mobius-package.json").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+
+        with pytest.raises(ValueError, match="manifest must not be a symlink"):
+            pkg.save(str(output))
+
+        assert not (output / "model.onnx").exists()
+        assert external.read_text() == "unchanged"
+
+    def test_component_directory_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        (output / "decoder").symlink_to(external, target_is_directory=True)
+        pkg = ModelPackage(
+            {
+                "decoder": _make_simple_model("decoder"),
+                "embedding": _make_simple_model("embedding"),
+            }
+        )
+
+        with pytest.raises(ValueError, match=r"component 'decoder'.*real directory"):
+            pkg.save(str(output))
+
+        assert not (output / "embedding").exists()
+        assert not list(external.iterdir())
+
+    def test_flat_model_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external.onnx"
+        external.write_text("unchanged")
+        (output / "model.onnx").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+
+        with pytest.raises(ValueError, match="model output must not be a symlink"):
+            pkg.save(str(output))
+
+        assert external.read_text() == "unchanged"
+
+    @pytest.mark.parametrize("name", ["policies", "adapters"])
+    def test_artifact_namespace_component_fails_before_writing(self, tmp_path, name):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                name: _make_simple_model(name),
+            }
+        )
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="reserved for package artifacts"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_case_insensitive_component_collision_fails_before_writing(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("lower"),
+                "MODEL": _make_simple_model("upper"),
+            }
+        )
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="distinct when compared case-insensitively"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_flat_safetensors_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external.safetensors"
+        external.write_text("unchanged")
+        (output / "model.safetensors").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+
+        with pytest.raises(ValueError, match="model output must not be a symlink"):
+            pkg.save(str(output), external_data="safetensors")
+
+        assert external.read_text() == "unchanged"
+
+    @pytest.mark.parametrize("sidecar_name", [".", ".."])
+    def test_load_rejects_escaping_sidecar_name(self, tmp_path, sidecar_name):
+        (tmp_path / ".mobius-package.json").write_text(
+            f'{{"format": "mobius.model-package.v1", "mtp_head": "{sidecar_name}"}}\n'
+        )
+
+        with pytest.raises(ValueError, match="Invalid ModelPackage manifest"):
+            ModelPackage.load(str(tmp_path))
+
     def test_save_creates_directory(self, tmp_path):
         outdir = tmp_path / "nested" / "dir"
         pkg = ModelPackage({"m": _make_simple_model()})
         pkg.save(str(outdir))
         assert (outdir / "model.onnx").exists()
+
+    def test_policy_components_roundtrip(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.add_policy_component("sample", build_greedy_sampler())
+        pkg.save(str(tmp_path))
+
+        assert (tmp_path / "policies" / "sample.onnx").exists()
+        loaded = ModelPackage.load(str(tmp_path))
+        assert loaded.policy_components["sample"].contract_id == "onnx-genai.token-sampler@1"
+
+    def test_save_namespaces_component_symbols_without_mutating_package(self, tmp_path):
+        input_value = ir.Value(
+            name="input",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        input_value.shape.set_denotation(0, "DATA_BATCH")
+        intermediate = ir.Value(
+            name="intermediate",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        output_value = ir.Value(
+            name="output",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        model = ir.Model(
+            ir.Graph(
+                [input_value],
+                [output_value],
+                nodes=[
+                    ir.Node("", "Identity", [input_value], outputs=[intermediate]),
+                    ir.Node("", "Identity", [intermediate], outputs=[output_value]),
+                ],
+                name="symbolic",
+            ),
+            ir_version=10,
+        )
+        pkg = ModelPackage({"decoder": model})
+
+        pkg.save(str(tmp_path))
+
+        saved = ir.load(tmp_path / "model.onnx")
+        assert [str(dimension) for dimension in saved.graph.inputs[0].shape] == [
+            "component.decoder.batch",
+            "component.decoder.sequence",
+        ]
+        assert saved.graph.inputs[0].shape.get_denotation(0) == "DATA_BATCH"
+        assert all(
+            dimension.value is None for dimension in next(iter(saved.graph)).outputs[0].shape
+        )
+        assert [str(dimension) for dimension in model.graph.inputs[0].shape] == [
+            "batch",
+            "sequence",
+        ]
+
+    def test_save_anonymizes_nested_graph_intermediate_symbols(self):
+        condition = ir.Value(
+            name="condition",
+            type=ir.TensorType(ir.DataType.BOOL),
+            shape=ir.Shape([]),
+        )
+        data = ir.Value(
+            name="data",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        branch_output = ir.Value(
+            name="branch_output",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "branch_sequence"]),
+        )
+        branch = ir.Graph(
+            [],
+            [branch_output],
+            nodes=[ir.Node("", "Identity", [data], outputs=[branch_output])],
+        )
+        output = ir.Value(
+            name="output",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape(["batch", "sequence"]),
+        )
+        model = ir.Model(
+            ir.Graph(
+                [condition, data],
+                [output],
+                nodes=[
+                    ir.Node(
+                        "",
+                        "If",
+                        [condition],
+                        attributes={
+                            "then_branch": ir.AttrGraph("then_branch", branch),
+                            "else_branch": ir.AttrGraph("else_branch", branch),
+                        },
+                        outputs=[output],
+                    )
+                ],
+            ),
+            ir_version=10,
+        )
+
+        with _namespaced_symbolic_dimensions(model, "component.decoder"):
+            assert all(dimension.value is None for dimension in branch_output.shape)
+
+        assert str(branch_output.shape[1]) == "branch_sequence"
+
+    def test_save_preserves_public_policy_symbols(self, tmp_path):
+        sampler = build_greedy_sampler()
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.add_policy_component("sample", sampler)
+
+        pkg.save(str(tmp_path))
+
+        saved = ir.load(tmp_path / "policies" / "sample.onnx")
+        assert str(saved.graph.inputs[0].shape[0]) == "batch"
+        assert str(saved.graph.inputs[0].shape[1]) == "vocabulary"
+        assert str(sampler.model.graph.inputs[0].shape[0]) == "batch"
 
 
 class TestModelPackageApplyWeights:

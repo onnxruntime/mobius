@@ -1,0 +1,1 @@
+{"base_model_name_or_path":"synthetic/adapter-base","lora_alpha":1.0,"r":1,"revision":"synthetic-revision","target_modules":["projection"]}

@@ -182,8 +182,13 @@ def extract_vision_config(config, parent_config, model_type: str) -> dict:
     for shared in (
         "mm_tokens_per_image",
         "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
         "spatial_merge_size",
         "temporal_patch_size",
+        "frame_windows_size",
+        "tokens_per_second",
         "deepstack_visual_indexes",
         "fullatt_block_indexes",
         "window_size",

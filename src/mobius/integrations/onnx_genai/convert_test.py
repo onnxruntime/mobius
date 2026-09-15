@@ -48,17 +48,17 @@ def test_reconciles_workflow_sampler_with_checkpoint_schedule():
     wf = parse_comfyui_workflow(_WF)
     fake_ts = [float(x) for x in range(25)]
     meta = build_pipeline_metadata_for_workflow(wf, _SCHEDULER, timesteps=fake_ts)
-    strat = meta["pipeline"]["strategy"]
-    # sampler kind/steps/cfg from the ComfyUI graph ...
-    assert strat["num_steps"] == 25
-    assert strat["scheduler_config"]["kind"] == "ddim"
-    assert strat["guidance_scale"] == pytest.approx(6.5)
-    assert strat["timesteps"] == fake_ts
-    # ... betas from the checkpoint (never present in the ComfyUI JSON).
-    assert strat["scheduler_config"]["beta_start"] == pytest.approx(0.00085)
-    assert strat["scheduler_config"]["beta_schedule"] == "scaled_linear"
-    models = meta["pipeline"]["models"]
-    assert {"denoiser", "vae", "text_encoder"} <= set(models)
+    workflow = meta["pipeline"]["workflow"]
+    # sampler steps/cfg from the ComfyUI graph ...
+    assert workflow["inputs"]["request.max_iterations"]["default"] == 25
+    assert workflow["inputs"]["request.guidance_scale"]["default"] == pytest.approx(6.5)
+    assert {"denoiser", "vae", "text_encoder"} <= set(workflow["components"])
+    # ... and the checkpoint-derived timestep table (never present in the
+    # ComfyUI JSON) is materialized as a constant component rather than a
+    # scheduler_config block the runtime would have to interpret.
+    assert workflow["components"]["diffusion_timesteps"]["implementation"]["kind"] == "onnx"
+    # DDIM consumes the latent unscaled; only Euler pre-scales it.
+    assert "model_input_scale" not in workflow["components"]
 
 
 def test_run_params_capture_prompt_and_dims():
@@ -74,15 +74,25 @@ def test_cfg_one_reconciles_without_guidance():
     wf_json["3"]["inputs"]["cfg"] = 1.0
     wf = parse_comfyui_workflow(wf_json)
     meta = build_pipeline_metadata_for_workflow(wf, _SCHEDULER)
-    assert "guidance_scale" not in meta["pipeline"]["strategy"]
+    workflow = meta["pipeline"]["workflow"]
+    assert "guidance_combine" not in workflow["components"]
+    assert "request.guidance_scale" not in workflow["inputs"]
 
 
 def test_sdxl_exported_routes_dual_conditioning():
     wf = parse_comfyui_workflow(_WF)
     meta = build_pipeline_metadata_for_workflow(wf, _SCHEDULER, sdxl=True)
-    flow = meta["pipeline"]["dataflow"]
-    assert {
-        "from": "text_encoder.encoder_hidden_states",
-        "to": "denoiser.encoder_hidden_states",
-    } in flow
-    assert {"from": "text_encoder.text_embeds", "to": "denoiser.text_embeds"} in flow
+    loop = next(
+        step for step in meta["pipeline"]["workflow"]["steps"] if step["kind"] == "loop"
+    )
+    encoder = next(step for step in loop["setup"] if step.get("component") == "text_encoder")
+    assert encoder["outputs"] == {
+        "encoder_hidden_states": "conditioning.encoder_hidden_states",
+        "text_embeds": "conditioning.text_embeds",
+    }
+    # CFG runs the denoiser twice; the second call carries the positive prompt.
+    denoiser = [step for step in loop["steps"] if step.get("component") == "denoiser"][-1]
+    assert denoiser["inputs"]["encoder_hidden_states"] == (
+        "conditioning.encoder_hidden_states"
+    )
+    assert denoiser["inputs"]["text_embeds"] == "conditioning.text_embeds"

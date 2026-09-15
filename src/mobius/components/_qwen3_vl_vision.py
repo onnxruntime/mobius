@@ -95,7 +95,7 @@ class Qwen3VLVisionRotaryEmbedding(nn.Module):
         dim = head_dim // 2
         inv_freq = 1.0 / (10000.0 ** (np.arange(0, dim, 2, dtype=np.float32) / dim))
 
-        pos = np.arange(0, max_grid_size, dtype=np.float32)
+        pos: np.ndarray = np.arange(0, max_grid_size, dtype=np.float32)
         angles = np.outer(pos, inv_freq)
         cos_table = np.cos(angles).astype(np.float32)
         sin_table = np.sin(angles).astype(np.float32)
@@ -337,13 +337,19 @@ class Qwen3VLVisionBlock(nn.Module):
     Structure: LayerNorm → Attention → Residual → LayerNorm → MLP → Residual.
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        *,
+        activation: str = "gelu_new",
+    ):
         super().__init__()
         self.norm1 = LayerNorm(hidden_size, eps=1e-6)
         self.attn = Qwen3VLVisionAttention(hidden_size, num_heads)
         self.norm2 = LayerNorm(hidden_size, eps=1e-6)
-        # GELU (tanh approx) MLP with bias (HF linear_fc1/linear_fc2 → up_proj/down_proj)
-        self.mlp = FCMLP(hidden_size, intermediate_size, activation="gelu_new", bias=True)
+        self.mlp = FCMLP(hidden_size, intermediate_size, activation=activation, bias=True)
 
     def forward(
         self,
@@ -378,10 +384,12 @@ class Qwen3VLPatchMerger(nn.Module):
         out_hidden_size: int,
         spatial_merge_size: int = 2,
         use_postshuffle_norm: bool = False,
+        gelu_approximate: str = "none",
     ):
         super().__init__()
         self.merged_size = hidden_size * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
+        self.gelu_approximate = gelu_approximate
 
         norm_dim = self.merged_size if use_postshuffle_norm else hidden_size
         self.norm = LayerNorm(norm_dim, eps=1e-6)
@@ -399,7 +407,7 @@ class Qwen3VLPatchMerger(nn.Module):
             x = op.Reshape(x, [-1, self.merged_size])
 
         x = self.linear_fc1(op, x)
-        x = op.Gelu(x, approximate="none")
+        x = op.Gelu(x, approximate=self.gelu_approximate)
         return self.linear_fc2(op, x)
 
 
@@ -500,6 +508,8 @@ class Qwen3VLVisionModel(nn.Module):
         spatial_merge_size: int = 2,
         num_position_embeddings: int = 2304,
         deepstack_visual_indexes: list[int] | None = None,
+        block_activation: str = "gelu_new",
+        merger_gelu_approximate: str = "none",
     ):
         super().__init__()
         if out_hidden_size is None:
@@ -534,7 +544,12 @@ class Qwen3VLVisionModel(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                Qwen3VLVisionBlock(hidden_size, intermediate_size, num_heads)
+                Qwen3VLVisionBlock(
+                    hidden_size,
+                    intermediate_size,
+                    num_heads,
+                    activation=block_activation,
+                )
                 for _ in range(depth)
             ]
         )
@@ -544,6 +559,7 @@ class Qwen3VLVisionModel(nn.Module):
             out_hidden_size=out_hidden_size,
             spatial_merge_size=spatial_merge_size,
             use_postshuffle_norm=False,
+            gelu_approximate=merger_gelu_approximate,
         )
 
         self.deepstack_merger_list = nn.ModuleList(
@@ -553,6 +569,7 @@ class Qwen3VLVisionModel(nn.Module):
                     out_hidden_size=out_hidden_size,
                     spatial_merge_size=spatial_merge_size,
                     use_postshuffle_norm=True,
+                    gelu_approximate=merger_gelu_approximate,
                 )
                 for _ in range(len(deepstack_visual_indexes))
             ]

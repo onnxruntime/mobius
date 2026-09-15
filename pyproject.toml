@@ -14,12 +14,14 @@ requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
     "huggingface_hub",
+    "ml_dtypes",
     "numpy>=1.24.0",
-    "onnx_ir>=0.1.0",
+    "onnx_ir>=1.0.0",
     "onnx-shape-inference>=0.3.1",
     "onnxscript>=0.7.1",
+    "rfc8785",
     "safetensors",
-    "torch>=2.1.0",
+    "torch>=2.10.0",
     "tqdm",
     "transformers",  # >5.0 recommended
 ]
@@ -51,17 +53,22 @@ testing = [
     "jsonschema>=4.0",
 ]
 ort-genai = ["onnxruntime-genai", "Pillow"]
-docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton"]
+docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton", "sphinxcontrib-mermaid"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"mobius.upstream_patches" = ["data/*/*/*.patch", "data/*/*/*.json", "data/*/*/*.md"]
+"mobius.integrations.onnx_genai" = ["_schema/*.json"]
+"mobius.integrations.gguf._upstream_data" = ["*.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "mobius.__version__" }
 
 [tool.pytest.ini_options]
 addopts = "--tb=short --color=yes"
-testpaths = ["src", "tests"]
+testpaths = ["src", "tests", "scripts"]
 python_files = ["*_test.py"]
 markers = [
     "integration: integration tests requiring model downloads and GPU/CPU inference (deselect with '-m \"not integration\"')",
@@ -71,6 +78,8 @@ markers = [
     "arch_validation: L2 architecture validation tests that download real HF configs (no weights) and build full-size ONNX graphs (deselect with '-m \"not arch_validation\"')",
     "golden: L4 checkpoint-verified golden comparison tests (deselect with '-m \"not golden\"')",
     "generation: L5 generation end-to-end golden tests (deselect with '-m \"not generation\"')",
+    "ort_genai_fast: network-free end-to-end tests against released onnxruntime-genai wheels",
+    "ort_genai_real: pinned real-artifact onnxruntime-genai generation tests",
 ]
 
 [tool.mypy]
@@ -136,6 +145,7 @@ ignore = [
     "RUF031",
     "RUF052",
     "RUF067",
+    "RUF105",
     "SIM102",
     "SIM108",
     "SIM114",

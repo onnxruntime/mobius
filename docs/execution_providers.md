@@ -136,7 +136,7 @@ Built-in EPs are registered by `_register_builtins()` at module import:
 EpCapabilities(name="default", gqa_dtypes=frozenset(), ...)
 EpCapabilities(name="cpu",     gqa_dtypes={FLOAT}, default_int4_accuracy_level=4)
 EpCapabilities(name="cuda",    gqa_dtypes={FLOAT16, BFLOAT16},
-               provider_options={"enable_cuda_graph": "0", ...})
+               enable_graph_capture=True, provider_options={...})
 EpCapabilities(name="dml",     gqa_dtypes={FLOAT16},
                supports_fused_rope=False)
 EpCapabilities(name="webgpu",  gqa_dtypes={FLOAT, FLOAT16},

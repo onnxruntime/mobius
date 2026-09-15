@@ -40,7 +40,7 @@ from pathlib import Path
 
 import pytest
 
-from mobius._registry import _TEST_MODEL_IDS, registry
+from mobius._registry import registry
 from mobius._testing.golden import (
     discover_test_cases,
     golden_path_for_case,
@@ -123,7 +123,9 @@ def _all_registered() -> list[str]:
 def _all_registered_with_test_id() -> dict[str, str]:
     """Return {model_type: test_model_id} for registered models with one."""
     return {
-        arch: model_id for arch, model_id in _TEST_MODEL_IDS.items() if arch in registry._map
+        arch: registration.test_model_id
+        for arch, registration in registry._map.items()
+        if registration.test_model_id is not None
     }
 
 
@@ -144,20 +146,123 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #
 _COVERAGE_SKIP: dict[str, str] = {
     # --- Specialized-test models (covered by a co-located test class) ---
+    "neo_chat": "SenseNova U1.5 is a 17.5B (~50 GB) five-component package; "
+    "L1-L3 use the tiny config and co-located tests, while pinned L4/L5 text, "
+    "image, and edit evidence requires the documented H200 validation.",
     "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
     "(graph build + diffusers-parity + bidirectionality); no small public "
     "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
+    "dream": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "Dream": "Alias for dream — covered by src/mobius/models/llada_test.py",
+    "llada_moe": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "LLaDAMoEModel": "Alias for llada_moe — covered by src/mobius/models/llada_test.py",
+    "VibeVoiceStreamingForConditionalGenerationInference": (
+        "Architecture-discriminating alias for vibevoice_streaming — covered by "
+        "src/mobius/models/vibevoice_streaming_test.py."
+    ),
+    "rnd1": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
+    "KDA/MLA state ABI; L1-L2 and synthetic GGUF execution are covered, while "
+    "real-weight L4/L5 parity remains pending.",
+    "kimi_k3": "Registered tiny checkpoint uses selective MXFP4 compressed-tensors "
+    "unsupported by the generic loader; dedicated model/GGUF tests exist, and "
+    "real-weight L4/L5 awaits an unquantized or supported checkpoint.",
+    "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
+    "and GGUF integration tests; generic encoder tests require token_type_ids",
+    "HyV3MtpModel": "Internal GGUF-only auxiliary head with target-hidden-state and "
+    "independent-cache inputs that the generic L1/L3 and Hugging Face L2 harnesses "
+    "cannot drive; its graph execution, weight paths, and one-layer cache ABI are "
+    "covered by src/mobius/models/hy_v3_test.py and GGUF MTP integration tests.",
+    "hy_v3": "L1 graph construction, native Transformers L2 config loading, and "
+    "payload-free L3 trunk parity are covered; the immutable official checkpoint is "
+    "597,578,239,288 bytes, so L4/L5 real-weight goldens exceed the 16 GiB policy.",
+    "reuse": "RE-USE / SEMamba speech enhancement — L1/L3 run from "
+    "SPEECH_CONFIGS and src/mobius/models/reuse_test.py. No L2: the published "
+    "nvidia/RE-USE config.json is a bespoke model_cfg/stft_cfg document with no "
+    "model_type field, which arch_validation_test requires, so the generic "
+    "download-and-build path cannot drive it.",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
+    "deepseek": "Legacy DeepSeek-V3 registry alias; graph/config coverage is shared with "
+    "deepseek_v3, whose real-checkpoint evidence owns the family claim.",
     "deepseek_v2_moe": "Alias for deepseek_v2 — covered by deepseek_v2",
+    "gguf_legacy": "Internal graph selected only after strict GGUF metadata validation; "
+    "covered by exact legacy GGUF builder and runtime tests.",
     "gpt_oss": "Internal model — no public HF checkpoint",
     "helium": "Alias for mistral — covered by mistral",
+    "minicpm_gguf": "GGUF-only MiniCPM ABI variant; native config coverage uses minicpm, "
+    "while GGUF metadata and runtime coverage exercise this exact route.",
+    "minicpm3_gguf": "GGUF-only MiniCPM3 ABI variant; native config coverage uses minicpm3, "
+    "while GGUF metadata and runtime coverage exercise this exact route.",
     "open-llama": "Alias for llama — covered by llama",
+    "pangu_embedded": "Internal embedded-model family selected from package metadata; "
+    "no standalone Hugging Face model_type/config route exists.",
+    "plm": "L1/L2 and dedicated GGUF parity cover the architecture; reproducible L4/L5 "
+    "golden data for the pinned PLM checkpoint is not yet checked in.",
+    "phimoe_gguf": "GGUF-only PhiMoE routing variant — checkpoint coverage uses phimoe",
+    "eurobert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
+    "jina_bert_v2_gguf": "GGUF-only specialized encoder — no native HF model_type route "
+    "for generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT "
+    "parity are covered by _specialized_encoders_test.py.",
+    "jina_bert_v3_gguf": "GGUF-only specialized encoder with a pinned L2 source config; "
+    "dedicated GGUF config, graph, closure, and synthetic ORT parity are covered by "
+    "_specialized_encoders_test.py, while real-weight L4/L5 remains deferred.",
+    "gguf_plamo": "GGUF-only fixed PLaMo-13B converter route whose RoPE and expanded-cache "
+    "semantics are restored by GGUF metadata postprocessing, not the native HF config "
+    "path; exact config/graph/value tests cover it and the smallest immutable GGUF exceeds "
+    "the bounded L4/L5 artifact budget.",
+    "smallthinker_gguf": "GGUF-only SmallThinker route whose routing and SWA/NoPE schedules "
+    "are restored by GGUF metadata postprocessing, not the native HF config path; dedicated "
+    "config/graph/synthetic execution tests cover it while real-weight L4/L5 is deferred.",
+    "minimax_m2_gguf": "GGUF-only MiniMax-M2 route with dedicated config, tensor closure, "
+    "full-vector Q/K norm, partial-RoPE, routing, and cache execution tests; the smallest "
+    "immutable public GGUF is 46,514,882,176 bytes, above the 16 GiB evidence budget.",
+    "mistral4_gguf": "GGUF-only Mistral4 latent-cache route with dedicated config, tensor "
+    "closure, and prefill/cached-decode execution tests; the smallest immutable public GGUF "
+    "is 32,306,941,632 bytes, above the 16 GiB evidence budget.",
+    "arctic_gguf": "GGUF-only Arctic route whose residual-MoE tensor layout is reconstructed "
+    "from GGUF metadata; dedicated exact closure, graph, and synthetic execution tests cover "
+    "it while real-weight L2/L4/L5 remains deferred.",
+    "dbrx_gguf": "GGUF-only DBRX route whose fused clamped-QKV and expert layout are restored "
+    "from GGUF metadata; dedicated exact closure, graph, and synthetic execution tests cover "
+    "it while real-weight L2/L4/L5 remains deferred.",
+    "ernie4_5_moe_gguf": "GGUF-only ERNIE MoE route whose dense/MoE schedule and shared "
+    "experts are restored from GGUF metadata; dedicated exact closure, graph, and synthetic "
+    "execution tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "grok_gguf": "GGUF-only Grok route whose scaling, sandwich norms, and dense-plus-routed "
+    "expert topology are restored from GGUF metadata; dedicated exact closure, graph, and "
+    "synthetic parity tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "grovemoe_gguf": "GGUF-only GroveMoE route whose primary and chunk expert banks are "
+    "restored from GGUF metadata; dedicated exact closure, graph, and synthetic parity tests "
+    "cover it while real-weight L2/L4/L5 remains deferred.",
+    "hunyuan_moe_gguf": "GGUF-only Hunyuan-MoE route whose post-RoPE Q/K norms and parallel "
+    "shared expert are restored from GGUF metadata; dedicated exact closure, graph, and "
+    "synthetic parity tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "nomic_bert_moe_gguf": "GGUF-only NomicBERT-MoE encoder route whose alternating MoE "
+    "schedule and fused QKV layout are restored from GGUF metadata; dedicated exact closure, "
+    "graph, and synthetic execution tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "neo_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
+    "nomic_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
     "seed_oss": "Internal model — no public HF checkpoint",
+    "semamba": "Alias for reuse — covered by reuse",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",
-    # --- VL text-decoder submodels (tested via their parent VL model) ---
+    # --- VL models / text-decoder submodels (L1 graph-build only) ---
+    "cosmos3_edge": "Cosmos3-Edge VLM (SigLIP + pixel-shuffle projector + "
+    "squared-ReLU GQA decoder) — L1 graph-build only; L4/L5 parity needs "
+    "NVIDIA's custom edge modeling code (not in transformers)",
+    "cosmos3_edge_text": "Cosmos3-Edge standalone text reasoner — L1 graph-build "
+    "only; L4/L5 parity needs NVIDIA's custom edge modeling code (not in transformers)",
     "glm4v_moe_text": "VL text decoder — tested via glm4v_moe",
     "glm4v_text": "VL text decoder — tested via glm4v",
     "qwen2_5_vl_text": "VL text decoder — tested via qwen2_5_vl",
@@ -185,6 +290,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "qwen3_vl": "VL model — requires image inputs",
     # --- Audio / speech models (require audio inputs) ---
     "data2vec-audio": "Audio model — requires audio inputs",
+    "fun_asr": "Golden YAML uses the upstream FunAudioLLM checkpoint, which lacks "
+    "config.json model_type metadata; L2 config validation uses the metadata-enabled "
+    "justinchuby mirror",
     "hubert": "Audio model — requires audio inputs",
     "musicgen": "Audio model — requires audio inputs",
     "seamless_m4t": "Audio model — requires audio inputs",
@@ -201,6 +309,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "whisper": "Speech-to-text — requires audio inputs",
     "mms": "CTC ASR model — tested via TestBuildMMSGraph",
     "fastconformer_rnnt": "NeMo .nemo RNN-T ASR — tested via tests/nemo_rnnt_integration_test.py",
+    "sortformer": "NeMo .nemo speaker diarization — tested via tests/sortformer_integration_test.py",
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",
@@ -209,8 +318,27 @@ _COVERAGE_SKIP: dict[str, str] = {
     "dbrx": "Large MoE (132B) — no small public checkpoint",
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
     "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
+    "glm_moe_dsa": "Very large MoE (~1.5T, zai-org/GLM-5.2) — no small public checkpoint",
+    "jais2": "Jais2's smallest public checkpoint is 8B; L1-L3 graph, config, "
+    "weight-alignment, and synthetic parity are covered, but real-weight L4/L5 "
+    "goldens exceed the CPU CI budget.",
+    "kclgpt": "CodeShell's public checkpoint is 7B; L1 graph, config, "
+    "weight-alignment, and synthetic weight-path coverage are present, but no "
+    "small public artifact exists for bounded L4/L5 golden generation.",
+    "lfm2_moe": "LFM2-MoE is an 8B hybrid recurrent/MoE model with no small public "
+    "checkpoint; dedicated unit and synthetic parity tests cover its graph and "
+    "weight paths.",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
-    "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
+    "orion": "Orion's public checkpoint is 14B; L1 graph/config/tensor closure is "
+    "covered, but no small public artifact exists for bounded L4/L5 validation.",
+    "maincoder": "Maincoder's pinned L2 source config and dedicated GGUF graph/value/cache "
+    "tests cover the exact route; packed import and real-weight L4/L5 remain deferred.",
+    "qwen3_5_moe": "The bounded reduced GGUF runtime fixture proves the explicit-float "
+    "hybrid state route, but the registered upstream checkpoint remains too large for "
+    "ordinary L4/L5 golden generation.",
+    "xverse": "Xverse's smallest public checkpoint is 7B; L1 graph, config, "
+    "weight-alignment, and value-based GGUF permutation coverage are present, "
+    "but real-weight L4/L5 goldens exceed the CPU CI budget.",
     # --- Models without test_model_id ---
     "aya_vision": "VL model — no test_model_id yet",
     "chameleon": "VL model — no test_model_id yet",
@@ -261,7 +389,6 @@ _COVERAGE_SKIP: dict[str, str] = {
     "doge": "CausalLM — YAML not yet created",
     "ernie4_5": "CausalLM — YAML not yet created",
     "exaone": "CausalLM — YAML not yet created",
-    "falcon_h1": "CausalLM — YAML not yet created",
     "falcon_mamba": "SSM — YAML not yet created",
     "imagegpt": "Vision model — YAML not yet created",
     "internlm2": "CausalLM — YAML not yet created",
@@ -283,7 +410,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "Gemma4AssistantForCausalLM": "Drafter alias of gemma4_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
     "gemma4_unified_assistant": "Drafter (unified variant) — covered by _gemma4_assistant_test.py + L4/L5 golden",
     "Gemma4UnifiedAssistantForCausalLM": "Drafter alias of gemma4_unified_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
-    "Qwen35MtpModel": "Drafter (inputs_embeds + target hidden_states IO; borrows target embed/lm_head) — covered by src/mobius/models/_qwen35_mtp_test.py + L4 golden (qwen35-mtp)",
+    "Qwen35MtpModel": "Drafter (inputs_embeds + post-final-norm target hidden_states IO; dedicated/shared embed, norm, and head ownership) — covered by src/mobius/models/_qwen35_mtp_test.py, src/mobius/integrations/gguf/_mtp_test.py, and L4 golden (qwen35-mtp)",
     "Eagle3LlamaForCausalLM": "Drafter (inputs_embeds + fused/recycled hidden IO; own draft-vocab lm_head) — covered by src/mobius/models/_eagle3_test.py",
     "LlamaForCausalLMEagle3": "Drafter (EAGLE-3 arch alias used by the Qwen3-8B checkpoint) — covered by src/mobius/models/_eagle3_test.py",
     "Eagle3Speculator": "Drafter (speculators-format EAGLE-3, RedHat Qwen3) — covered by src/mobius/models/_eagle3_test.py",
@@ -320,7 +447,7 @@ class TestSkipListIntegrity:
 class TestL1L3GraphBuildCoverage:
     """L1 + L3: every model needs a test config in _test_configs.py.
 
-    The config enables ``build_graph_test.py`` to exercise the model.
+    The config enables the L1 graph-construction suite to exercise the model.
     For causal-LM models, it also enables ``synthetic_parity_test.py``.
     """
 
@@ -361,7 +488,7 @@ class TestL1L3GraphBuildCoverage:
 
 
 class TestL2ConfigValidation:
-    """L2: every model needs a ``test_model_id`` in ``_TEST_MODEL_IDS``.
+    """L2: every model needs a registered ``test_model_id``.
 
     This allows ``arch_validation_test.py`` to fetch and validate its
     HuggingFace config.
@@ -370,29 +497,28 @@ class TestL2ConfigValidation:
     def test_all_models_have_test_model_id_or_skip(self):
         """Aggregate check: every registered model needs a test_model_id."""
         all_reg = _all_registered()
-        missing = [
-            mt for mt in all_reg if mt not in _TEST_MODEL_IDS and mt not in _COVERAGE_SKIP
-        ]
+        with_test_id = _all_registered_with_test_id()
+        missing = [mt for mt in all_reg if mt not in with_test_id and mt not in _COVERAGE_SKIP]
         if missing:
             pytest.fail(
                 f"{len(missing)} registered model(s) have no "
                 f"test_model_id in _registry.py and are not in "
                 f"_COVERAGE_SKIP:\n"
                 + "\n".join(f"  {mt}" for mt in missing)
-                + "\n\nFix: add test_model_id to _TEST_MODEL_IDS "
+                + "\n\nFix: set test_model_id on the model registration "
                 "in src/mobius/_registry.py."
             )
 
     @pytest.mark.parametrize("arch", _all_registered())
     def test_model_has_test_model_id(self, arch: str):
         """Per-model check for test_model_id (L2)."""
-        if arch in _TEST_MODEL_IDS:
+        if arch in _all_registered_with_test_id():
             return  # Has test_model_id — pass even if in _COVERAGE_SKIP
         if arch in _COVERAGE_SKIP:
             pytest.skip(_COVERAGE_SKIP[arch])
         pytest.fail(
-            f"Model '{arch}' has no test_model_id in "
-            f"_TEST_MODEL_IDS. Add one for L2 config validation."
+            f"Model '{arch}' has no registered test_model_id. "
+            "Set one in src/mobius/_registry.py for L2 config validation."
         )
 
 

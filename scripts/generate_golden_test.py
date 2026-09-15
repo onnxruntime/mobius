@@ -66,6 +66,29 @@ class TestExtractLogitsGolden:
         assert result["logits_summary"].dtype == np.float64
 
 
+def test_temporary_processor_max_pixels_restores_none_and_missing_attributes():
+    class ProcessorPart:
+        pass
+
+    image_processor = ProcessorPart()
+    image_processor.max_pixels = None
+    image_processor.size = ProcessorPart()
+    image_processor.size.longest_edge = None
+    video_processor = ProcessorPart()
+    processor = ProcessorPart()
+    processor.image_processor = image_processor
+    processor.video_processor = video_processor
+
+    with generate_golden._temporary_processor_max_pixels(processor, 1234):
+        assert image_processor.max_pixels == 1234
+        assert image_processor.size.longest_edge == 1234
+        assert video_processor.max_pixels == 1234
+
+    assert image_processor.max_pixels is None
+    assert image_processor.size.longest_edge is None
+    assert not hasattr(video_processor, "max_pixels")
+
+
 class TestDryRun:
     """Tests for main() with --dry-run (no HF inference needed)."""
 

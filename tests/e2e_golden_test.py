@@ -24,13 +24,20 @@ Run::
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import dataclasses
 import functools
+import hashlib
+import json
 import os
+import shutil
 import warnings
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
+import huggingface_hub.constants as hf_constants
 import numpy as np
 import pytest
 
@@ -64,6 +71,40 @@ def _load_phi3_vision_projector_weights_cached(model_id: str):
 
 # Root of test data (images, audio, etc.)
 _TESTDATA_DIR = Path(__file__).resolve().parent.parent / "testdata"
+_MISSING_ATTRIBUTE = object()
+
+
+@contextlib.contextmanager
+def _temporary_processor_max_pixels(processor: object, max_pixels: int | None):
+    """Temporarily override processor pixel limits and restore their exact state."""
+    if max_pixels is None:
+        yield
+        return
+
+    saved_attributes: list[tuple[object, str, object]] = []
+
+    def override(obj: object | None, name: str) -> None:
+        if obj is None:
+            return
+        saved_attributes.append((obj, name, getattr(obj, name, _MISSING_ATTRIBUTE)))
+        setattr(obj, name, max_pixels)
+
+    image_processor = getattr(processor, "image_processor", None)
+    video_processor = getattr(processor, "video_processor", None)
+    override(image_processor, "max_pixels")
+    image_size = getattr(image_processor, "size", None)
+    if image_size is not None and hasattr(image_size, "longest_edge"):
+        override(image_size, "longest_edge")
+    override(video_processor, "max_pixels")
+
+    try:
+        yield
+    finally:
+        for obj, name, previous in reversed(saved_attributes):
+            if previous is _MISSING_ATTRIBUTE:
+                delattr(obj, name)
+            else:
+                setattr(obj, name, previous)
 
 
 def _get_test_build_ep() -> str:
@@ -107,7 +148,11 @@ def _get_test_device_kwargs() -> dict[str, str]:
 _IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
 
 
-def _load_suppress_token_ids(model_id: str, trust_remote_code: bool = False) -> list[int]:
+def _load_suppress_token_ids(
+    model_id: str,
+    revision: str | None = None,
+    trust_remote_code: bool = False,
+) -> list[int]:
     """Return ``generation_config.suppress_tokens`` for a model (empty if none).
 
     Mirrors HuggingFace ``generate()``: tokens in ``suppress_tokens`` are forced
@@ -122,7 +167,9 @@ def _load_suppress_token_ids(model_id: str, trust_remote_code: bool = False) -> 
 
     try:
         gen_config = transformers.GenerationConfig.from_pretrained(
-            model_id, trust_remote_code=trust_remote_code
+            model_id,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
         )
     except Exception:
         return []
@@ -226,6 +273,29 @@ def test_phi3_vision_projector_weights_are_cached():
     _load_phi3_vision_projector_weights_cached.cache_clear()
 
 
+def test_temporary_processor_max_pixels_restores_none_and_missing_attributes():
+    class ProcessorPart:
+        pass
+
+    image_processor = ProcessorPart()
+    image_processor.max_pixels = None
+    image_processor.size = ProcessorPart()
+    image_processor.size.longest_edge = None
+    video_processor = ProcessorPart()
+    processor = ProcessorPart()
+    processor.image_processor = image_processor
+    processor.video_processor = video_processor
+
+    with _temporary_processor_max_pixels(processor, 1234):
+        assert image_processor.max_pixels == 1234
+        assert image_processor.size.longest_edge == 1234
+        assert video_processor.max_pixels == 1234
+
+    assert image_processor.max_pixels is None
+    assert image_processor.size.longest_edge is None
+    assert not hasattr(video_processor, "max_pixels")
+
+
 def _make_empty_kv_cache(
     session: OnnxModelSession,
     config: object,
@@ -253,7 +323,7 @@ def _make_empty_kv_cache(
             ltype = (
                 layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
             )
-            if ltype in ("linear_attention", "mamba", "mamba2"):
+            if ltype in ("conv", "linear_attention", "mamba", "mamba2"):
                 # Fixed-size recurrent state: replace symbolic dims with 1
                 static = [d if isinstance(d, int) and d > 0 else 1 for d in shape]
             else:
@@ -279,24 +349,37 @@ def _make_empty_kv_cache(
 
 
 @pytest.fixture(autouse=True)
-def _use_temp_hf_cache(tmp_path):
+def _use_temp_hf_cache(tmp_path, monkeypatch):
     """Redirect HuggingFace downloads to a per-test temp dir.
 
-    Each test gets a fresh cache that is deleted when the test finishes,
-    so only one model's weights are on disk at a time.  This prevents
-    unbounded disk growth across the full test suite.
+    Hugging Face resolves cache constants when its module is imported, so
+    changing only ``HF_HOME`` is too late for this test module. Patch the
+    runtime constants as well, including the Xet chunk cache used by large
+    checkpoints, and eagerly delete the cache after each test. This keeps
+    all-model GPU golden runs within the hosted runner's disk limit.
 
     Each pytest-xdist worker gets its own ``tmp_path``, so parallel
     workers don't collide.
     """
-    cache_dir = str(tmp_path / "hf_cache")
-    old = os.environ.get("HF_HOME")
-    os.environ["HF_HOME"] = cache_dir
-    yield
-    if old is None:
-        os.environ.pop("HF_HOME", None)
-    else:
-        os.environ["HF_HOME"] = old
+    cache_root = tmp_path / "hf_cache"
+    hub_cache = cache_root / "hub"
+    assets_cache = cache_root / "assets"
+    xet_cache = cache_root / "xet"
+
+    monkeypatch.setenv("HF_HOME", str(cache_root))
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_cache))
+    monkeypatch.setenv("HF_ASSETS_CACHE", str(assets_cache))
+    monkeypatch.setenv("HF_XET_CACHE", str(xet_cache))
+    monkeypatch.setattr(hf_constants, "HF_HOME", str(cache_root))
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(hub_cache))
+    monkeypatch.setattr(hf_constants, "HF_ASSETS_CACHE", str(assets_cache))
+    monkeypatch.setattr(hf_constants, "HF_XET_CACHE", str(xet_cache))
+
+    try:
+        yield
+    finally:
+        if cache_root.exists():
+            shutil.rmtree(cache_root)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +430,23 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
 }
 
 
+@functools.cache
+def _selected_golden_case_ids() -> set[str] | None:
+    """Return exact case IDs requested by CI, rejecting malformed selectors."""
+    raw = os.environ.get("MOBIUS_GOLDEN_CASES")
+    if raw is None:
+        return None
+    try:
+        selected = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise pytest.UsageError("MOBIUS_GOLDEN_CASES must be a JSON array") from error
+    if not isinstance(selected, list) or not all(
+        isinstance(case_id, str) and case_id for case_id in selected
+    ):
+        raise pytest.UsageError("MOBIUS_GOLDEN_CASES must be a JSON array of case IDs")
+    return set(selected)
+
+
 def _discover_cases(
     level: str,
     xfails: dict[str, str] | None = None,
@@ -358,6 +458,14 @@ def _discover_cases(
     rather than failing at run time.
     """
     cases = discover_test_cases(level=level)
+    selected = _selected_golden_case_ids()
+    if selected is not None:
+        known_case_ids = {case.case_id for case in discover_test_cases()}
+        if unknown := selected - known_case_ids:
+            raise pytest.UsageError(
+                f"Unknown MOBIUS_GOLDEN_CASES selectors: {sorted(unknown)}"
+            )
+        cases = [case for case in cases if case.case_id in selected]
     params: list[pytest.ParameterSet] = []
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
@@ -393,8 +501,74 @@ _L5_CASES = _discover_cases("L5", xfails=_L5_ONLY_XFAIL_REASONS)
 # ---------------------------------------------------------------------------
 
 
+def test_huggingface_artifact_loads_are_revision_pinned():
+    """Every Hub-backed test artifact must resolve from the case revision."""
+    tree = ast.parse(Path(__file__).read_text())
+    unpinned_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "from_pretrained"
+        and not any(keyword.arg == "revision" for keyword in node.keywords)
+    ]
+
+    assert not unpinned_lines, (
+        f"from_pretrained calls missing revision= at lines {unpinned_lines}"
+    )
+
+
 def _build_model_package(case: GoldenTestCase) -> ModelPackage:
     """Build an ONNX ModelPackage with real weights from HuggingFace."""
+    if case.gguf_source is not None:
+        from huggingface_hub import hf_hub_download
+
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        source = case.gguf_source
+        gguf_path = Path(
+            hf_hub_download(
+                repo_id=str(source["repository"]),
+                revision=str(source["revision"]),
+                filename=str(source["filename"]),
+            )
+        )
+        assert gguf_path.stat().st_size == source["size"], (
+            f"GGUF size changed for {source['repository']}:{source['filename']}"
+        )
+        digest = hashlib.sha256()
+        with gguf_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        assert digest.hexdigest() == source["lfs_sha256"], (
+            f"GGUF SHA-256 changed for {source['repository']}:{source['filename']}"
+        )
+        artifact = GGUFModel(gguf_path)
+        tensor_count = 0
+        qtypes: Counter[str] = Counter()
+        for _, _, qtype, _ in artifact.tensor_items_raw():
+            tensor_count += 1
+            qtypes[qtype.name] += 1
+        assert tensor_count == source["tensor_count"]
+        assert dict(sorted(qtypes.items())) == source["tensor_qtypes"]
+        dtype = {
+            "float32": "f32",
+            "float16": "f16",
+            "bfloat16": "bf16",
+        }[case.dtype]
+        package = build_from_gguf(
+            gguf_path,
+            dtype=dtype,
+            keep_quantized=bool(source.get("keep_quantized", True)),
+            execution_provider=str(source["execution_provider"]),
+        )
+        route = json.loads(package.gguf_import_route)
+        assert route["execution_provider"] == source["execution_provider"]
+        assert route["config_sha256"] == source["config_sha256"]
+        assert route["preserve_quantization"] == source["preserve_quantization"]
+        return package
+
     module_class = None
     task = None
     if case.architecture:
@@ -408,6 +582,7 @@ def _build_model_package(case: GoldenTestCase) -> ModelPackage:
         task = reg.task or getattr(module_class, "default_task", None)
     return build(
         case.model_id,
+        revision=case.revision,
         task=task,
         module_class=module_class,
         dtype=case.dtype,
@@ -493,13 +668,13 @@ def _run_seq2seq_prefill(
                         # Cross-attention cache: enc_seq_len=0 initially
                         dec_feeds[name] = np.zeros(
                             (1, num_kv_heads, 0, head_dim),
-                            dtype=np.float32,
+                            dtype=dec_session.get_input_dtype(name) or np.dtype(np.float32),
                         )
                     else:
                         # Self-attention cache: past_seq_len=0
                         dec_feeds[name] = np.zeros(
                             (1, num_kv_heads, 0, head_dim),
-                            dtype=np.float32,
+                            dtype=dec_session.get_input_dtype(name) or np.dtype(np.float32),
                         )
 
         outputs = dec_session.run(dec_feeds)
@@ -507,6 +682,63 @@ def _run_seq2seq_prefill(
         dec_session.close()
 
     return outputs
+
+
+def _prepare_image_to_text_inputs(
+    case: GoldenTestCase,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the checkpoint's processor to one real image and decoder prompt."""
+    import transformers
+    from PIL import Image
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
+    images = [Image.open(_TESTDATA_DIR / path).convert("RGB") for path in case.images]
+    processed = processor(
+        images=images,
+        text=case.decoder_prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )
+    pixel_values = processed["pixel_values"].float().cpu().numpy()
+    return pixel_values, processed["input_ids"].cpu().numpy().astype(np.int64)
+
+
+def _assert_gguf_golden_provenance(case: GoldenTestCase, golden_path: Path) -> None:
+    if case.gguf_source is None:
+        return
+    data = json.loads(golden_path.read_text(encoding="utf-8"))
+    assert data.get("provenance") == {
+        "reference": {"repository": case.model_id, "revision": case.revision},
+        "gguf": case.gguf_source,
+    }, f"Golden provenance does not match the pinned GGUF case: {golden_path}"
+
+
+def _run_image_to_text_prefill(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    config: object,
+) -> dict[str, np.ndarray]:
+    """Run a real image through the vision encoder and decoder prefill."""
+    pixel_values, input_ids = _prepare_image_to_text_inputs(case)
+    device_kwargs = _get_test_device_kwargs()
+    enc_session = OnnxModelSession(pkg["vision_encoder"], **device_kwargs)
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
+    try:
+        encoder_hidden = enc_session.run({"pixel_values": pixel_values})["last_hidden_state"]
+        feeds: dict[str, np.ndarray] = {
+            "input_ids": input_ids,
+            "attention_mask": np.ones_like(input_ids, dtype=np.int64),
+            "encoder_hidden_states": encoder_hidden,
+        }
+        feeds.update(_make_empty_kv_cache(dec_session, config))
+        return dec_session.run(feeds)
+    finally:
+        enc_session.close()
+        dec_session.close()
 
 
 def _prepare_prefill_feeds(
@@ -568,6 +800,7 @@ _HIDDEN_STATE_TASKS: frozenset[str] = frozenset(
         # comparator below slices to the last frame so the shape matches
         # the saved golden's per-token vector.
         "ctc-asr",
+        "feature-ctc-asr",
     }
 )
 
@@ -634,7 +867,9 @@ def _prepare_vision_feeds(
     from PIL import Image
 
     processor = transformers.AutoImageProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     image = Image.open(_TESTDATA_DIR / case.images[0])
     proc_kwargs: dict = {"images": image, "return_tensors": "np"}
@@ -657,7 +892,9 @@ def _detection_forced_size(case: GoldenTestCase) -> dict | None:
     import transformers
 
     config = transformers.AutoConfig.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     image_size = getattr(config, "image_size", None)
     if isinstance(image_size, (list, tuple)) and len(image_size) == 2:
@@ -681,11 +918,15 @@ def _prepare_audio_feeds(
     # Fall back to AutoFeatureExtractor for models without a tokenizer
     try:
         processor = transformers.AutoProcessor.from_pretrained(
-            case.model_id, trust_remote_code=case.trust_remote_code
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=case.trust_remote_code,
         )
     except (TypeError, OSError):
         processor = transformers.AutoFeatureExtractor.from_pretrained(
-            case.model_id, trust_remote_code=case.trust_remote_code
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=case.trust_remote_code,
         )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
@@ -696,6 +937,31 @@ def _prepare_audio_feeds(
         "input_values": processed["input_values"].astype(np.float32),
     }
     return feeds
+
+
+def _prepare_feature_ctc_feeds(
+    case: GoldenTestCase,
+) -> dict[str, np.ndarray]:
+    """Prepare processor-generated log-mel features for feature-input CTC."""
+    import librosa
+    import transformers
+
+    processor = transformers.AutoProcessor.from_pretrained(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
+    audio_path = _TESTDATA_DIR / case.audio[0]
+    audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
+    processed = processor(
+        audio_array,
+        sampling_rate=sample_rate,
+        return_tensors="np",
+    )
+    return {
+        "input_features": processed["input_features"].astype(np.float32),
+        "attention_mask": processed["attention_mask"].astype(bool),
+    }
 
 
 def _compute_mrope_position_ids(
@@ -834,18 +1100,74 @@ def _run_vl_vision_to_image_features(
         for name in vis_session.input_names:
             if name in processed:
                 val = processed[name]
-                vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+                array = val if isinstance(val, np.ndarray) else np.array(val)
+                target_dtype = vis_session.get_input_dtype(name)
+                vis_feeds[name] = (
+                    array.astype(target_dtype)
+                    if target_dtype is not None and array.dtype != target_dtype
+                    else array
+                )
             else:
                 # Handle HF↔ONNX name mismatches (e.g. HF "image_position_ids"
                 # vs ONNX "pixel_position_ids").
                 for hf_key, val in processed.items():
                     if hf_key.replace("image_", "pixel_") == name:
-                        vis_feeds[name] = val if isinstance(val, np.ndarray) else np.array(val)
+                        array = val if isinstance(val, np.ndarray) else np.array(val)
+                        target_dtype = vis_session.get_input_dtype(name)
+                        vis_feeds[name] = (
+                            array.astype(target_dtype)
+                            if target_dtype is not None and array.dtype != target_dtype
+                            else array
+                        )
                         break
+        for name, value in vis_feeds.items():
+            input_dtype = vis_session.get_input_dtype(name)
+            if input_dtype is not None and value.dtype != input_dtype:
+                vis_feeds[name] = value.astype(input_dtype)
         vis_out = vis_session.run(vis_feeds)
         return vis_out, vis_out[next(iter(vis_out))]
     finally:
         vis_session.close()
+
+
+def _prepare_vl_inputs(
+    case: GoldenTestCase,
+    processor: object,
+) -> dict[str, np.ndarray]:
+    """Apply an HF multimodal processor to the case's ordered image/video media."""
+    from PIL import Image
+
+    images = [Image.open(_TESTDATA_DIR / path) for path in case.images]
+    videos = [str(_TESTDATA_DIR / path) for path in case.videos]
+    prompt_text = case.prompts[0]
+    if videos:
+        content: list[dict[str, str]] = [
+            *[{"type": "image", "image": str(_TESTDATA_DIR / path)} for path in case.images],
+            *[{"type": "video", "video": str(_TESTDATA_DIR / path)} for path in case.videos],
+            {"type": "text", "text": prompt_text},
+        ]
+        prompt_text = processor.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    else:
+        prompt_text = _build_mm_prompt(processor, prompt_text, case.images, "image")
+
+    kwargs: dict[str, object] = {
+        "text": prompt_text,
+        "images": images or None,
+        "return_tensors": "pt",
+    }
+    if videos:
+        kwargs["videos"] = videos
+        kwargs["num_frames"] = case.video_num_frames
+    with _temporary_processor_max_pixels(processor, case.media_max_pixels):
+        processed_pt = processor(**kwargs)
+    return {
+        key: value.numpy() if hasattr(value, "numpy") else np.array(value)
+        for key, value in processed_pt.items()
+    }
 
 
 def _run_vision_language_prefill(
@@ -864,22 +1186,14 @@ def _run_vision_language_prefill(
     golden generation.
     """
     import transformers
-    from PIL import Image
 
-    # --- Step 0: Preprocess image with HF processor ---
+    # --- Step 0: Preprocess image/video media with the HF processor ---
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
-    image = Image.open(_TESTDATA_DIR / case.images[0])
-
-    # Build the prompt (chat template when available, else manual placeholder).
-    prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
-
-    # Use PyTorch tensors then convert — some processors don't support np
-    processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
-    processed: dict[str, np.ndarray] = {
-        k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
-    }
+    processed = _prepare_vl_inputs(case, processor)
 
     # --- Step 1: Run vision encoder (+ host-side projector where required) ---
     vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
@@ -900,7 +1214,10 @@ def _run_vision_language_prefill(
                 # Provide empty tensor for unused modalities (e.g. audio_features)
                 shape = emb_session.get_input_shape(name) or []
                 static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                emb_feeds[name] = np.zeros(
+                    static_shape,
+                    dtype=emb_session.get_input_dtype(name) or np.float32,
+                )
         emb_out = emb_session.run(emb_feeds)
     finally:
         emb_session.close()
@@ -978,10 +1295,11 @@ def _make_vl_decoder_cache_feeds(
         ltype = layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
         shape = dec_session.get_input_shape(name) or []
 
-        if ltype in ("linear_attention", "mamba", "mamba2"):
+        if ltype in ("conv", "linear_attention", "mamba", "mamba2"):
             # Fixed-size recurrent state: replace symbolic/zero dims with 1
             feeds[name] = np.zeros(
-                [d if isinstance(d, int) and d > 0 else 1 for d in shape], dtype=np.float32
+                [d if isinstance(d, int) and d > 0 else 1 for d in shape],
+                dtype=dec_session.get_input_dtype(name) or np.float32,
             )
         else:
             # Standard KV cache: seq dim starts at 0 (empty)
@@ -1000,7 +1318,9 @@ def _update_vl_cache(
     num_hidden_layers = getattr(config, "num_hidden_layers", 0)
     for i in range(num_hidden_layers):
         ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-        if ltype == "linear_attention":
+        if ltype == "conv":
+            suffixes = ("conv_state",)
+        elif ltype == "linear_attention":
             suffixes = ("conv_state", "recurrent_state")
         elif ltype in ("mamba", "mamba2"):
             suffixes = ("conv_state", "ssm_state")
@@ -1029,21 +1349,19 @@ def _run_vl_generation(
     Returns newly generated token IDs (prompt excluded).
     """
     import transformers
-    from PIL import Image
 
     # --- Step 0: prepare multimodal inputs ---
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
-    image = Image.open(_TESTDATA_DIR / case.images[0])
-
-    prompt_text = _build_mm_prompt(processor, case.prompts[0], case.images, "image")
-    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
-
-    processed_pt = processor(text=prompt_text, images=[image], return_tensors="pt")
-    processed: dict[str, np.ndarray] = {
-        k: v.numpy() if hasattr(v, "numpy") else np.array(v) for k, v in processed_pt.items()
-    }
+    suppress_ids = _load_suppress_token_ids(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
+    processed = _prepare_vl_inputs(case, processor)
 
     # --- Step 1: vision encoder (+ host-side projector where required) ---
     _vis_out, image_features = _run_vl_vision_to_image_features(pkg, case, processed)
@@ -1071,7 +1389,10 @@ def _run_vl_generation(
             if name not in emb_feeds:
                 shape = emb_session.get_input_shape(name) or []
                 static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                emb_feeds[name] = np.zeros(
+                    static_shape,
+                    dtype=emb_session.get_input_dtype(name) or np.float32,
+                )
         emb_out = emb_session.run(emb_feeds)
         inputs_embeds = emb_out[next(iter(emb_out))]  # [1, seq_len, hidden_size]
 
@@ -1158,7 +1479,10 @@ def _run_vl_generation(
                 if name not in step_emb_feeds:
                     shape = emb_session.get_input_shape(name) or []
                     static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                    step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                    step_emb_feeds[name] = np.zeros(
+                        static_shape,
+                        dtype=emb_session.get_input_dtype(name) or np.float32,
+                    )
             step_emb_out = emb_session.run(step_emb_feeds)
             step_embeds = step_emb_out[next(iter(step_emb_out))]  # [1, 1, hidden_size]
             if embeds_dtype is not None and step_embeds.dtype != embeds_dtype:
@@ -1225,7 +1549,9 @@ def _run_speech_to_text_prefill(
 
     # Load audio and extract features
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
@@ -1237,7 +1563,8 @@ def _run_speech_to_text_prefill(
         enc_feeds: dict[str, np.ndarray] = {}
         for name in enc_session.input_names:
             if name in processed:
-                enc_feeds[name] = processed[name].astype(np.float32)
+                dtype = enc_session.get_input_dtype(name) or np.float32
+                enc_feeds[name] = processed[name].astype(dtype)
         enc_outputs = enc_session.run(enc_feeds)
     finally:
         enc_session.close()
@@ -1269,8 +1596,10 @@ def _run_speech_to_text_prefill(
             if name in ("input_ids", "decoder_input_ids"):
                 dec_feeds[name] = dec_input_ids
             elif name == "encoder_attention_mask":
-                enc_seq_len = enc_hidden.shape[1]
-                dec_feeds[name] = np.ones((1, enc_seq_len), dtype=np.int64)
+                dec_feeds[name] = enc_outputs.get(
+                    "encoder_attention_mask",
+                    np.ones((1, enc_hidden.shape[1]), dtype=np.int64),
+                )
             elif name == "position_ids":
                 dec_feeds[name] = np.zeros((1, 1), dtype=np.int64)
             elif name.startswith("past_key_values."):
@@ -1283,7 +1612,7 @@ def _run_speech_to_text_prefill(
                 )
                 dec_feeds[name] = np.zeros(
                     (1, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
+                    dtype=dec_session.get_input_dtype(name) or np.dtype(np.float32),
                 )
         outputs = dec_session.run(dec_feeds)
     finally:
@@ -1377,7 +1706,9 @@ def _run_phi4mm_multimodal_prefill(
         from PIL import Image
 
         processor = transformers.AutoProcessor.from_pretrained(
-            case.model_id, trust_remote_code=True
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=True,
         )
         images = [Image.open(_TESTDATA_DIR / img_path) for img_path in case.images]
         img_inputs = processor.image_processor(images=images, return_tensors="np")
@@ -1421,7 +1752,9 @@ def _run_phi4mm_multimodal_prefill(
         import librosa
 
         processor = transformers.AutoProcessor.from_pretrained(
-            case.model_id, trust_remote_code=True
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=True,
         )
         audios = []
         for audio_path in case.audio:
@@ -1515,7 +1848,9 @@ def _run_speech_language_prefill(
 
     # Load audio and extract features
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
@@ -1525,15 +1860,29 @@ def _run_speech_language_prefill(
     # full Qwen3ASRProcessor) because the HF repo lacks auto_map.
     # Fall back to WhisperFeatureExtractor which is what Qwen3-ASR
     # actually uses under the hood.
-    fe = getattr(processor, "feature_extractor", None)
-    if fe is None or not hasattr(fe, "sampling_rate"):
-        fe = transformers.WhisperFeatureExtractor.from_pretrained(case.model_id)
-    audio_processed = fe(
-        [audio_array],
-        sampling_rate=16000,
-        return_tensors="np",
-        padding=False,
-    )
+    if case.model_type == "glmasr":
+        processed = processor.apply_transcription_request(
+            audio_array,
+            return_tensors="pt",
+        )
+        audio_processed = {
+            name: value.cpu().numpy()
+            for name, value in processed.items()
+            if name in {"input_features", "input_features_mask"}
+        }
+    else:
+        fe = getattr(processor, "feature_extractor", None)
+        if fe is None or not hasattr(fe, "sampling_rate"):
+            fe = transformers.WhisperFeatureExtractor.from_pretrained(
+                case.model_id,
+                revision=case.revision,
+            )
+        audio_processed = fe(
+            [audio_array],
+            sampling_rate=16000,
+            return_tensors="np",
+            padding=False,
+        )
 
     # Step 1: Run audio encoder
     audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
@@ -1558,7 +1907,10 @@ def _run_speech_language_prefill(
         ):
             feats = audio_feeds["input_features"]
             mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
-            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
+            audio_feeds["input_features_mask"] = np.ones(
+                (feats.shape[0], feats.shape[-1]),
+                dtype=mask_dtype,
+            )
         # Qwen3-ASR requires ``feature_attention_mask`` of shape
         # ``(batch, mel_seq)`` where ``input_features`` is
         # ``(batch, n_mels, mel_seq)``.  The feature extractor is called with
@@ -1586,11 +1938,18 @@ def _run_speech_language_prefill(
     finally:
         audio_session.close()
 
-    audio_hidden = audio_out[next(iter(audio_out))]
-    # Audio encoder output is [batch, seq, hidden]; embedding expects
-    # [num_tokens, hidden] (no batch dim).
+    audio_hidden = audio_out["audio_features"]
+    # Legacy speech encoders return padded [B, T, H] plus valid lengths;
+    # newer stages (including GLM-ASR) strip padding inside the ONNX graph.
     if audio_hidden.ndim == 3:
-        audio_hidden = audio_hidden[0]  # squeeze batch
+        lengths = audio_out.get("audio_feature_lengths")
+        if lengths is not None:
+            audio_hidden = np.concatenate(
+                [rows[: int(length)] for rows, length in zip(audio_hidden, lengths)],
+                axis=0,
+            )
+        else:
+            audio_hidden = audio_hidden[0]
 
     # Build input_ids from golden reference
     input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
@@ -1838,10 +2197,16 @@ class TestL4CheckpointVerified:
 
     @pytest.mark.parametrize("case", _L4_CASES)
     def test_prefill_argmax_matches_golden(self, case: GoldenTestCase) -> None:
+        if case.task_type == "text-to-speech":
+            pytest.skip(
+                "Continuous-token TTS uses tests/vibevoice_golden_test.py "
+                "(control logits, latent frames, and waveform semantics)."
+            )
         golden_path = golden_path_for_case(case)
         golden = load_golden_ref(golden_path)
         if golden is None:
             pytest.skip(f"Golden file missing: {golden_path}")
+        _assert_gguf_golden_provenance(case, golden_path)
 
         tolerances = load_tolerances("L4", case.dtype)
         pkg = _build_model_package(case)
@@ -1860,6 +2225,8 @@ class TestL4CheckpointVerified:
             outputs = _run_speech_language_prefill(pkg, case, golden, config)
         elif case.task_type == "image-text-to-text":
             outputs = _run_vision_language_prefill(pkg, case, config)
+        elif case.task_type == "image-to-text":
+            outputs = _run_image_to_text_prefill(pkg, case, config)
         elif case.task_type == "phi4mm-multimodal":
             outputs = _run_phi4mm_multimodal_prefill(pkg, case, golden, config)
         elif case.task_type == "gemma4-assistant":
@@ -1906,6 +2273,12 @@ class TestL4CheckpointVerified:
                 outputs = session.run(feeds)
             finally:
                 session.close()
+        elif case.task_type == "feature-ctc-asr":
+            session = _open_decoder_session(pkg)
+            try:
+                outputs = session.run(_prepare_feature_ctc_feeds(case))
+            finally:
+                session.close()
         elif len(pkg) > 1 and "embedding" in pkg:
             # Multi-model text-generation (e.g. Gemma4 VL text-only)
             outputs = _run_text_only_multimodel_prefill(pkg, golden, config)
@@ -1947,12 +2320,33 @@ _GENERATION_SUPPORTED_TASKS = frozenset(
     {
         "text-generation",
         "image-text-to-text",
+        "image-to-text",
         "seq2seq",
         "speech-to-text",
         "speech-language",
         "gemma4-assistant",
+        "ctc-asr",
+        "feature-ctc-asr",
     }
 )
+
+
+def _run_ctc_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+) -> list[int]:
+    """Run one CTC forward pass and return deterministic frame argmax IDs."""
+    session = _open_decoder_session(pkg)
+    try:
+        if case.task_type == "feature-ctc-asr":
+            feeds = _prepare_feature_ctc_feeds(case)
+        else:
+            feeds = _prepare_audio_feeds(case)
+            feeds["attention_mask"] = np.ones_like(feeds["input_values"], dtype=np.int64)
+        logits = session.run(feeds)["logits"]
+    finally:
+        session.close()
+    return np.argmax(logits[0], axis=-1).astype(np.int64).tolist()
 
 
 def _validate_greedy(case: GoldenTestCase) -> None:
@@ -2029,7 +2423,11 @@ def _run_multimodel_text_generation(
     encoder, using 1D position IDs.  Returns newly generated token IDs
     (prompt excluded).
     """
-    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
+    suppress_ids = _load_suppress_token_ids(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
     device_kwargs = _get_test_device_kwargs()
 
     dec_key = "decoder" if "decoder" in pkg else "model"
@@ -2164,6 +2562,54 @@ def _run_seq2seq_generation(
     return all_ids[0]
 
 
+def _run_image_to_text_generation(
+    pkg: ModelPackage,
+    case: GoldenTestCase,
+    config: object,
+) -> np.ndarray:
+    """Run greedy image-to-text generation through the two ONNX sessions."""
+    pixel_values, input_ids = _prepare_image_to_text_inputs(case)
+    device_kwargs = _get_test_device_kwargs()
+    enc_session = OnnxModelSession(pkg["vision_encoder"], **device_kwargs)
+    dec_session = OnnxModelSession(pkg["decoder"], **device_kwargs)
+    try:
+        encoder_hidden = enc_session.run({"pixel_values": pixel_values})["last_hidden_state"]
+        past_cache = _make_empty_kv_cache(dec_session, config)
+        generated: list[np.ndarray] = []
+        current_ids = input_ids
+        attention_mask = np.ones_like(input_ids, dtype=np.int64)
+        max_new_tokens = case.generation_params.get("max_new_tokens", 20)
+        eos_token_id = case.generation_params.get("eos_token_id")
+        for _ in range(max_new_tokens):
+            feeds: dict[str, np.ndarray] = {
+                "input_ids": current_ids,
+                "attention_mask": attention_mask,
+                "encoder_hidden_states": encoder_hidden,
+                **past_cache,
+            }
+            outputs = dec_session.run(feeds)
+            next_token = np.argmax(
+                outputs["logits"][:, -1],
+                axis=-1,
+                keepdims=True,
+            ).astype(np.int64)
+            generated.append(next_token)
+            for name in past_cache:
+                present_name = name.replace("past_key_values.", "present.")
+                past_cache[name] = outputs[present_name]
+            if eos_token_id is not None and np.all(next_token == eos_token_id):
+                break
+            current_ids = next_token
+            attention_mask = np.concatenate(
+                [attention_mask, np.ones_like(next_token, dtype=np.int64)],
+                axis=1,
+            )
+        return np.concatenate(generated, axis=1)[0]
+    finally:
+        enc_session.close()
+        dec_session.close()
+
+
 def _run_speech_to_text_generation(
     pkg: ModelPackage,
     case: GoldenTestCase,
@@ -2186,6 +2632,7 @@ def _run_speech_to_text_generation(
     # Load audio and extract features (same as L4 prefill)
     processor = transformers.AutoProcessor.from_pretrained(
         case.model_id,
+        revision=case.revision,
         trust_remote_code=case.trust_remote_code,
     )
     audio_path = _TESTDATA_DIR / case.audio[0]
@@ -2202,7 +2649,8 @@ def _run_speech_to_text_generation(
         enc_feeds: dict[str, np.ndarray] = {}
         for name in enc_session.input_names:
             if name in processed:
-                enc_feeds[name] = processed[name].astype(np.float32)
+                dtype = enc_session.get_input_dtype(name) or np.float32
+                enc_feeds[name] = processed[name].astype(dtype)
         enc_outputs = enc_session.run(enc_feeds)
     finally:
         enc_session.close()
@@ -2227,6 +2675,7 @@ def _run_speech_to_text_generation(
         generator = OnnxSpeechToTextGenerator(dec_session, config)
         all_ids = generator.generate(
             enc_hidden,
+            encoder_attention_mask=enc_outputs.get("encoder_attention_mask"),
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
             decoder_start_token_id=decoder_start_id,
@@ -2285,23 +2734,43 @@ def _run_speech_language_generation(
 
     # --- Load audio and extract features ---
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
 
-    fe = getattr(processor, "feature_extractor", None)
-    if fe is None or not hasattr(fe, "sampling_rate"):
-        fe = transformers.WhisperFeatureExtractor.from_pretrained(case.model_id)
-    audio_processed = fe(
-        [audio_array],
-        sampling_rate=16000,
-        return_tensors="np",
-        padding=False,
-    )
+    if case.model_type == "glmasr":
+        processed = processor.apply_transcription_request(
+            audio_array,
+            return_tensors="pt",
+        )
+        audio_processed = {
+            name: value.cpu().numpy()
+            for name, value in processed.items()
+            if name in {"input_features", "input_features_mask"}
+        }
+    else:
+        fe = getattr(processor, "feature_extractor", None)
+        if fe is None or not hasattr(fe, "sampling_rate"):
+            fe = transformers.WhisperFeatureExtractor.from_pretrained(
+                case.model_id,
+                revision=case.revision,
+            )
+        audio_processed = fe(
+            [audio_array],
+            sampling_rate=16000,
+            return_tensors="np",
+            padding=False,
+        )
 
     # --- Step 1: audio encoder ---
-    suppress_ids = _load_suppress_token_ids(case.model_id, case.trust_remote_code)
+    suppress_ids = _load_suppress_token_ids(
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
+    )
     audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
     try:
         audio_feeds: dict[str, np.ndarray] = {}
@@ -2321,7 +2790,10 @@ def _run_speech_language_generation(
         ):
             feats = audio_feeds["input_features"]
             mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
-            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
+            audio_feeds["input_features_mask"] = np.ones(
+                (feats.shape[0], feats.shape[-1]),
+                dtype=mask_dtype,
+            )
         # Qwen3-ASR requires ``feature_attention_mask`` of shape
         # ``(batch, mel_seq)`` where ``input_features`` is
         # ``(batch, n_mels, mel_seq)``.  The feature extractor is called with
@@ -2349,9 +2821,16 @@ def _run_speech_language_generation(
     finally:
         audio_session.close()
 
-    audio_hidden = audio_out[next(iter(audio_out))]
+    audio_hidden = audio_out["audio_features"]
     if audio_hidden.ndim == 3:
-        audio_hidden = audio_hidden[0]  # squeeze batch → [seq, hidden]
+        lengths = audio_out.get("audio_feature_lengths")
+        if lengths is not None:
+            audio_hidden = np.concatenate(
+                [rows[: int(length)] for rows, length in zip(audio_hidden, lengths)],
+                axis=0,
+            )
+        else:
+            audio_hidden = audio_hidden[0]
 
     # --- Build input_ids from golden reference ---
     input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
@@ -2444,10 +2923,20 @@ def _run_speech_language_generation(
         past_seq_len = prompt_seq_len
 
         # --- Step 4: decode loop ---
-        empty_audio = np.zeros((0, hidden_size), dtype=np.float32)
-        eos_token_id = case.generation_params.get("eos_token_id")
+        audio_dtype = (
+            emb_session.get_input_dtype(audio_feat_input)
+            if audio_feat_input is not None
+            else None
+        ) or np.float32
+        empty_audio = np.zeros((0, hidden_size), dtype=audio_dtype)
+        eos_token_id = case.generation_params.get(
+            "eos_token_id", getattr(config, "eos_token_id", None)
+        )
+        eos_token_ids = (
+            {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or ())
+        )
         for _ in range(max_new_tokens - 1):
-            if eos_token_id is not None and np.all(next_token == eos_token_id):
+            if eos_token_ids and np.all(np.isin(next_token, tuple(eos_token_ids))):
                 break
 
             # Embed single token (no new audio features during decode)
@@ -2458,7 +2947,8 @@ def _run_speech_language_generation(
                 if name not in step_emb_feeds:
                     shape = emb_session.get_input_shape(name) or []
                     static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                    step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                    input_dtype = emb_session.get_input_dtype(name) or np.float32
+                    step_emb_feeds[name] = np.zeros(static_shape, dtype=input_dtype)
             step_emb_out = emb_session.run(step_emb_feeds)
             step_embeds = step_emb_out[next(iter(step_emb_out))]
 
@@ -2534,12 +3024,14 @@ class TestL5GenerationE2E:
         golden = load_golden_ref(golden_path)
         if golden is None:
             pytest.skip(f"Golden file missing: {golden_path}")
+        _assert_gguf_golden_provenance(case, golden_path)
 
         # L5 generation golden is stored in the separate *_generation.json file.
         gen_path = generation_json_path_for_case(case)
         expected_token_ids = load_generation_golden(case)
         if expected_token_ids is None:
             pytest.skip(f"Generation golden file missing: {gen_path}")
+        _assert_gguf_golden_provenance(case, gen_path)
 
         tolerances = load_tolerances("L5", case.dtype)
         # Per-case tolerance override (e.g. VL multi-model pipeline has known
@@ -2565,6 +3057,8 @@ class TestL5GenerationE2E:
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
             )
+        elif case.task_type == "image-to-text":
+            new_tokens = _run_image_to_text_generation(pkg, case, config)
         elif case.task_type == "gemma4-assistant":
             new_tokens = _run_gemma4_assistant_generation(pkg, case)
         elif case.task_type == "seq2seq":
@@ -2579,6 +3073,8 @@ class TestL5GenerationE2E:
                 golden,
                 max_new_tokens=case.generation_params.get("max_new_tokens", 50),
             )
+        elif case.task_type in {"ctc-asr", "feature-ctc-asr"}:
+            new_tokens = _run_ctc_generation(pkg, case)
         elif len(pkg) > 1 and "embedding" in pkg:
             # Multi-model text-generation (e.g. Gemma4 any-to-any text path):
             # embedding model maps input_ids -> inputs_embeds (+ extra decoder
@@ -2598,7 +3094,42 @@ class TestL5GenerationE2E:
         expected_tokens = np.array(expected_token_ids, dtype=np.int64)
         expected_len = len(expected_tokens)
         actual_len = len(new_tokens)
+        if case.generation_params.get("exact_match", False):
+            assert actual_len == expected_len, (
+                f"L5 FAIL: exact length mismatch for {case.case_id}: "
+                f"expected {expected_len}, got {actual_len}"
+            )
+            assert np.array_equal(new_tokens, expected_tokens), (
+                f"L5 FAIL: exact token mismatch for {case.case_id}\n"
+                f"  Expected: {expected_tokens.tolist()}\n"
+                f"  Got:      {new_tokens.tolist()}"
+            )
+            with open(gen_path, encoding="utf-8") as f:
+                expected_text = json.load(f)["generated_text"]
+            import transformers
+
+            processor = transformers.AutoProcessor.from_pretrained(
+                case.model_id,
+                revision=case.revision,
+                trust_remote_code=case.trust_remote_code,
+            )
+            actual_text = processor.decode(new_tokens.tolist(), skip_special_tokens=True)
+            assert actual_text == expected_text, (
+                f"L5 FAIL: exact transcript mismatch for {case.case_id}\n"
+                f"  Expected: {expected_text!r}\n"
+                f"  Got:      {actual_text!r}"
+            )
+        if case.task_type in {"ctc-asr", "feature-ctc-asr"} and actual_len != expected_len:
+            pytest.fail(
+                f"L5 FAIL: CTC frame count changed for {case.case_id}: "
+                f"expected {expected_len}, got {actual_len}"
+            )
         if actual_len != expected_len:
+            if tolerances.min_token_match_ratio >= 1.0:
+                pytest.fail(
+                    f"L5 FAIL: exact generation length changed for {case.case_id}: "
+                    f"expected {expected_len}, got {actual_len}"
+                )
             warnings.warn(
                 f"Length mismatch for {case.case_id}: "
                 f"expected {expected_len} tokens, "

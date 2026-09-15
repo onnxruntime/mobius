@@ -7,9 +7,9 @@ Jamba interleaves Mamba SSM layers with Transformer attention layers.
 Some layers use Mixture-of-Experts (MoE) MLPs instead of dense MLPs.
 
 Layer type selection (per HuggingFace JambaConfig):
-    - Attention if ``(i - attn_layer_offset) % attn_layer_period == 0``
+    - Attention if ``i % attn_layer_period == attn_layer_offset``
     - Mamba otherwise
-    - MoE MLP if ``(i - expert_layer_offset) % expert_layer_period == 0``
+    - MoE MLP if ``i % expert_layer_period == expert_layer_offset``
     - Dense MLP otherwise
 
 State per layer:
@@ -22,8 +22,8 @@ HuggingFace reference: ``JambaForCausalLM``.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
@@ -31,23 +31,42 @@ from mobius._configs import JambaConfig
 from mobius.components import (
     MLP,
     Attention,
-    Embedding,
     Linear,
-    MambaBlock,
     MoELayer,
     RMSNorm,
-    TopKGate,
+    TiedQuantizedLMHead,
     create_attention_bias,
-    initialize_rope,
 )
 from mobius.components._ssm import JambaSelectiveScan
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
+from mobius.models.base import (
+    effective_tie_word_embeddings,
+    embedding_for_config,
+    linear_class_for_config,
+)
 
 # ---------------------------------------------------------------------------
 # Decoder layers
 # ---------------------------------------------------------------------------
+
+
+class _JambaTopKGate(nn.Module):
+    """Jamba router with float32 full-softmax and unnormalized top-k weights."""
+
+    def __init__(self, hidden_size: int, num_experts: int, top_k: int):
+        super().__init__()
+        self.weight = nn.Parameter([num_experts, hidden_size])
+        self.top_k = top_k
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        logits = op.MatMul(hidden_states, op.Transpose(self.weight, perm=[1, 0]))
+        probabilities = op.Softmax(op.Cast(logits, to=ir.DataType.FLOAT), axis=-1)
+        weights, experts = op.TopK(
+            probabilities,
+            op.Constant(value_ints=[self.top_k]),
+            axis=-1,
+            _outputs=2,
+        )
+        return op.CastLike(weights, hidden_states), experts
 
 
 class JambaMambaDecoderLayer(nn.Module):
@@ -80,14 +99,21 @@ class JambaMambaDecoderLayer(nn.Module):
 
         # MLP: MoE or dense
         if use_moe:
-            gate = TopKGate(
+            gate = _JambaTopKGate(
                 config.hidden_size,
                 config.num_local_experts,
                 config.num_experts_per_tok,
             )
-            self.feed_forward = MoELayer(config, gate=gate)
+            self.feed_forward = MoELayer(
+                config,
+                gate=gate,
+                linear_class=linear_class_for_config(config),
+            )
         else:
-            self.feed_forward = MLP(config)
+            self.feed_forward = MLP(
+                config,
+                linear_class=linear_class_for_config(config),
+            )
         self.pre_moe_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -95,8 +121,9 @@ class JambaMambaDecoderLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
+        padding_mask: ir.Value | None = None,
     ):
         """Forward pass. Returns (hidden_states, (conv_state, ssm_state)).
 
@@ -111,7 +138,7 @@ class JambaMambaDecoderLayer(nn.Module):
 
         conv_state, ssm_state = past_key_value if past_key_value is not None else (None, None)
         mamba_out, new_conv_state, new_ssm_state = self.mamba(
-            op, hidden_states, conv_state, ssm_state
+            op, hidden_states, conv_state, ssm_state, padding_mask
         )
         hidden_states = op.Add(residual, mamba_out)
 
@@ -136,19 +163,29 @@ class JambaAttentionDecoderLayer(nn.Module):
 
     def __init__(self, config: JambaConfig, *, use_moe: bool = False):
         super().__init__()
-        self.self_attn = Attention(config)
+        self.self_attn = Attention(
+            config,
+            linear_class=linear_class_for_config(config),
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # MLP: MoE or dense
         if use_moe:
-            gate = TopKGate(
+            gate = _JambaTopKGate(
                 config.hidden_size,
                 config.num_local_experts,
                 config.num_experts_per_tok,
             )
-            self.feed_forward = MoELayer(config, gate=gate)
+            self.feed_forward = MoELayer(
+                config,
+                gate=gate,
+                linear_class=linear_class_for_config(config),
+            )
         else:
-            self.feed_forward = MLP(config)
+            self.feed_forward = MLP(
+                config,
+                linear_class=linear_class_for_config(config),
+            )
         self.pre_moe_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -156,10 +193,12 @@ class JambaAttentionDecoderLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
+        padding_mask: ir.Value | None = None,
     ):
         """Forward pass. Returns (hidden_states, (key, value))."""
+        del padding_mask
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
 
@@ -196,21 +235,52 @@ class _JambaTextModel(nn.Module):
 
     def __init__(self, config: JambaConfig):
         super().__init__()
+        if config.hidden_act not in {"silu", "swish"}:
+            raise ValueError("Jamba requires SiLU expert and dense FFN activation")
+        if config.mamba_expand != 2:
+            raise ValueError("Jamba requires mamba_expand=2")
+        if not config.mamba_conv_bias or config.mamba_proj_bias:
+            raise ValueError("Jamba requires mamba_conv_bias=True and mamba_proj_bias=False")
+        if config.head_dim * config.num_attention_heads != config.hidden_size:
+            raise ValueError("Jamba attention head dimensions must reconstruct hidden_size")
+        if config.num_local_experts is not None:
+            if config.num_local_experts <= 0:
+                raise ValueError("Jamba num_experts must be positive when MoE is enabled")
+            if not 1 <= config.num_experts_per_tok <= config.num_local_experts:
+                raise ValueError("Jamba num_experts_per_tok must be in [1, num_experts]")
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
 
         layer_types = config.layer_types or []
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "Jamba layer_types must contain exactly num_hidden_layers entries"
+            )
+        if any(layer_type not in {"mamba", "full_attention"} for layer_type in layer_types):
+            raise ValueError(f"Unknown Jamba layer type in {layer_types!r}")
         self.layers = nn.ModuleList([])
-        expert_period = getattr(config, "expert_layer_period", 1)
-        expert_offset = getattr(config, "expert_layer_offset", 0)
+        if config.expert_layer_indices is None:
+            expert_period = config.expert_layer_period
+            expert_offset = config.expert_layer_offset
+            if expert_period <= 0 or not 0 <= expert_offset < expert_period:
+                raise ValueError(
+                    "Jamba expert_layer_offset must be in [0, expert_layer_period)"
+                )
+            expert_layers = {
+                i
+                for i in range(config.num_hidden_layers)
+                if i % expert_period == expert_offset
+            }
+        else:
+            expert_layers = set(config.expert_layer_indices)
+            if any(i < 0 or i >= config.num_hidden_layers for i in expert_layers):
+                raise ValueError("Jamba expert_layer_indices contains an out-of-range layer")
         for i in range(config.num_hidden_layers):
-            ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+            ltype = layer_types[i]
             use_moe = (
                 config.num_local_experts is not None
                 and config.num_local_experts > 1
-                and (i - expert_offset) % expert_period == 0
+                and i in expert_layers
             )
             if ltype == "mamba":
                 self.layers.append(JambaMambaDecoderLayer(config, use_moe=use_moe))
@@ -218,7 +288,6 @@ class _JambaTextModel(nn.Module):
                 self.layers.append(JambaAttentionDecoderLayer(config, use_moe=use_moe))
 
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = initialize_rope(config)
 
     def forward(
         self,
@@ -229,13 +298,24 @@ class _JambaTextModel(nn.Module):
         past_key_values: list | None = None,
     ):
         hidden_states = self.embed_tokens(op, input_ids)
-        position_embeddings = self.rotary_emb(op, position_ids)
+        del position_ids
+        position_embeddings = None
 
         attention_bias = create_attention_bias(
             op,
             input_ids=input_ids,
             attention_mask=attention_mask,
             dtype=self._dtype,
+        )
+        current_length = op.Shape(input_ids, start=1, end=2)
+        padding_mask = op.Unsqueeze(
+            op.Slice(
+                attention_mask,
+                op.Neg(current_length),
+                [9223372036854775807],
+                [1],
+            ),
+            [-1],
         )
 
         present_key_values = []
@@ -247,6 +327,7 @@ class _JambaTextModel(nn.Module):
                 attention_bias=attention_bias,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
+                padding_mask=padding_mask,
             )
             present_key_values.append(present_kv)
 
@@ -271,8 +352,33 @@ class JambaCausalLMModel(nn.Module):
         super().__init__()
         self.config = config
         self.model = _JambaTextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
-        if config.tie_word_embeddings:
+        quantization = getattr(config, "quantization", None)
+        quantized_embedding = quantization is not None and bool(
+            getattr(quantization, "quantize_embeddings", False)
+        )
+        quantized_head = quantization is not None and bool(
+            getattr(quantization, "quantize_lm_head", False)
+        )
+        tie = effective_tie_word_embeddings(config)
+        if tie and quantized_embedding != quantized_head:
+            raise ValueError(
+                "Jamba tied embeddings require token embedding and LM head "
+                "quantization to be enabled together"
+            )
+        if tie and quantized_embedding:
+            self.lm_head = TiedQuantizedLMHead(
+                self.model.embed_tokens,
+                config.hidden_size,
+                config.vocab_size,
+            )
+        else:
+            head_class = linear_class_for_config(config) if quantized_head else None
+            self.lm_head = (head_class or Linear)(
+                config.hidden_size,
+                config.vocab_size,
+                bias=False,
+            )
+        if tie and not quantized_embedding:
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -305,7 +411,7 @@ class JambaCausalLMModel(nn.Module):
         4. SSM params nested under mamba.ssm
         5. Attribute name mapping (mamba_mixer → mamba)
         """
-        if self.config.tie_word_embeddings:
+        if effective_tie_word_embeddings(self.config):
             if "model.embed_tokens.weight" not in state_dict:
                 state_dict["model.embed_tokens.weight"] = state_dict["lm_head.weight"]
             state_dict.pop("lm_head.weight", None)
@@ -324,8 +430,33 @@ class JambaCausalLMModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class _JambaMambaBlock(MambaBlock):
-    """MambaBlock that uses JambaSelectiveScan (with dt/B/C layernorms)."""
+class _JambaCausalConv(nn.Module):
+    """Jamba depthwise convolution with a fixed K-1 carry state."""
+
+    def __init__(self, channels: int, kernel_size: int):
+        super().__init__()
+        self.weight = nn.Parameter([channels, 1, kernel_size])
+        self.bias = nn.Parameter([channels])
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        conv_state: ir.Value,
+    ) -> tuple[ir.Value, ir.Value]:
+        return op.CausalConvWithState(
+            hidden_states,
+            self.weight,
+            self.bias,
+            conv_state,
+            activation="silu",
+            _domain="com.microsoft",
+            _outputs=2,
+        )
+
+
+class _JambaMambaBlock(nn.Module):
+    """Jamba Mamba-1 block with multi-token convolution and selective scan."""
 
     def __init__(
         self,
@@ -336,11 +467,45 @@ class _JambaMambaBlock(MambaBlock):
         conv_kernel: int = 4,
         rms_norm_eps: float = 1e-6,
     ):
-        super().__init__(d_model, d_inner, d_state, dt_rank, conv_kernel)
-        # Replace the SSM with the Jamba variant (layernormed dt/B/C)
+        super().__init__()
+        self.d_inner = d_inner
+        self.in_proj = Linear(d_model, 2 * d_inner, bias=False)
+        self.conv1d = _JambaCausalConv(d_inner, conv_kernel)
         self.ssm = JambaSelectiveScan(
-            d_inner, d_state, self.dt_rank, layer_norm_epsilon=rms_norm_eps
+            d_inner,
+            d_state,
+            dt_rank if dt_rank is not None else math.ceil(d_model / 16),
+            layer_norm_epsilon=rms_norm_eps,
         )
+        self.out_proj = Linear(d_inner, d_model, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        conv_state: ir.Value,
+        ssm_state: ir.Value,
+        padding_mask: ir.Value | None,
+    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+        x, gate = op.Split(
+            self.in_proj(op, hidden_states),
+            [self.d_inner, self.d_inner],
+            axis=-1,
+            _outputs=2,
+        )
+        if padding_mask is not None:
+            x = op.Mul(x, op.CastLike(padding_mask, x))
+        x, present_conv = self.conv1d(
+            op,
+            op.Transpose(x, perm=[0, 2, 1]),
+            conv_state,
+        )
+        x = op.Transpose(x, perm=[0, 2, 1])
+        if padding_mask is not None:
+            x = op.Mul(x, op.CastLike(padding_mask, x))
+        output, present_state = self.ssm(op, x, ssm_state, padding_mask)
+        output = op.Mul(output, op.Swish(gate))
+        return self.out_proj(op, output), present_conv, present_state
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +561,10 @@ def _rename_jamba_weight(
             return None  # handled inline
         # Fused down_proj: [num_experts, hidden, intermediate]
         # → split into per-expert down_proj
-        if key.endswith(".experts.down_proj") and value.dim() == 3:
+        if (
+            key.endswith((".experts.down_proj", ".experts.down_proj.weight"))
+            and value.dim() == 3
+        ):
             _split_fused_expert_down(key, value, out)
             return None  # handled inline
         # w1 → gate_proj, w2 → down_proj, w3 → up_proj
@@ -431,7 +599,11 @@ def _split_fused_expert_gate_up(
     intermediate = value.shape[1] // 2
 
     # Base path: e.g. "layers.0.feed_forward.experts"
-    base = new_key.replace(".gate_up_proj", "")
+    base = (
+        new_key.removesuffix(".gate_up_proj.weight")
+        if new_key.endswith(".gate_up_proj.weight")
+        else new_key.removesuffix(".gate_up_proj")
+    )
 
     for e in range(num_experts):
         expert_w = value[e]  # [2*intermediate, hidden]
@@ -455,6 +627,10 @@ def _split_fused_expert_down(
         ``layers.{i}.feed_forward.experts.{e}.down_proj.weight``
     """
     num_experts = value.shape[0]
-    base = key.replace(".down_proj", "")
+    base = (
+        key.removesuffix(".down_proj.weight")
+        if key.endswith(".down_proj.weight")
+        else key.removesuffix(".down_proj")
+    )
     for e in range(num_experts):
         out[f"{base}.{e}.down_proj.weight"] = value[e]

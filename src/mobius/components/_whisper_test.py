@@ -34,6 +34,23 @@ class TestConv1d:
         params = list(conv.parameters())
         assert len(params) == 2  # weight + bias
 
+    def test_positional_bias_and_grouped_weight_shape(self):
+        biasless = Conv1d(4, 4, 3, 1, 1, False)
+        grouped = Conv1d(4, 4, 3, groups=4)
+
+        assert biasless.bias is None
+        assert list(grouped.weight.shape) == [4, 1, 3]
+
+    def test_symmetric_padding_from_int(self):
+        conv = Conv1d(8, 8, kernel_size=3, padding=1)
+        assert conv._pads == [1, 1]
+
+    def test_asymmetric_padding_from_pair(self):
+        """A ``(left, right)`` pair makes the convolution causal."""
+        conv = Conv1d(8, 8, kernel_size=5, stride=2, padding=(4, 0))
+        assert conv._pads == [4, 0]
+        assert conv._strides == [2]
+
     def test_forward_builds_graph(self):
         conv = Conv1d(80, 512, kernel_size=3, padding=1)
         builder, op, graph = create_test_builder()

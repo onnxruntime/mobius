@@ -21,11 +21,17 @@ entries for the first ``num_hidden_layers - num_kv_shared_layers`` layers.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
-from mobius._build_context import ep_capabilities
+from mobius._build_context import ep_capabilities, prefill_prefix_pruning
 from mobius._configs import Gemma4Config
+from mobius._constants import (
+    STATIC_CACHE_KV_SEQUENCE_LENGTH,
+    STATIC_CACHE_WRITE_INDICES,
+)
 from mobius._model_package import ModelPackage
 from mobius._pipeline_contract import (
     declare_component_presence,
@@ -39,6 +45,21 @@ from mobius.tasks._base import (
 from mobius.tasks._cache_utils import (
     _register_kv_cache_outputs,
 )
+
+
+def _has_dynamic_cache_layer(config: Gemma4Config) -> bool:
+    """Whether the static-cache layout still leaves a layer on a dynamic cache.
+
+    Only full-attention layers are addressable by a fixed-capacity scatter; a
+    sliding layer keeps a growing ``past_key_values.N.*`` pair, and the last
+    ``num_kv_shared_layers`` layers borrow KV and own no cache at all.
+    """
+    layer_types = config.layer_types or (["sliding_attention"] * config.num_hidden_layers)
+    num_kv_layers = config.num_hidden_layers - (config.num_kv_shared_layers or 0)
+    return any(
+        (layer_types[i] if i < len(layer_types) else "sliding_attention") != "full_attention"
+        for i in range(num_kv_layers)
+    )
 
 
 def _register_hybrid_cache_outputs(
@@ -144,12 +165,12 @@ def _make_gemma4_static_cache_inputs(
     write_indices = nonpad_kv_seqlen = None
     if has_static:
         write_indices = builder.input(
-            "write_indices",
+            STATIC_CACHE_WRITE_INDICES,
             dtype=ir.DataType.INT64,
             shape=[batch],
         )
         nonpad_kv_seqlen = builder.input(
-            "nonpad_kv_seqlen",
+            STATIC_CACHE_KV_SEQUENCE_LENGTH,
             dtype=ir.DataType.INT64,
             shape=[batch],
         )
@@ -276,9 +297,11 @@ class Gemma4TextCausalLMTask(ModelTask):
         *,
         static_cache: bool = False,
         max_seq_len: int | None = None,
+        prune_prefill_prefix: bool = False,
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
+        self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(
         self,
@@ -351,19 +374,40 @@ class Gemma4TextCausalLMTask(ModelTask):
                 past_seq_len,
             )
 
-        logits, present_key_values = module(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            result = module(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
+        if len(result) == 3:
+            logits, present_key_values, hidden_outputs = result
+        else:
+            logits, present_key_values = result
+            hidden_outputs = None
         builder.add_output(logits, "logits")
 
         if static:
             _register_hybrid_cache_outputs(builder, present_key_values, config)
         else:
             _register_kv_cache_outputs(builder, present_key_values)
+
+        # Post-final-norm hidden state (== HF hidden_states[-1]) requested via
+        # config.output_layer_indices, named hidden_states.{idx}. A borrowed-KV
+        # speculative drafter reads this as its folded-carry seed. The model
+        # validates/normalizes the indices (exactly the last decoder layer) and
+        # returns one distinct Identity value per index, so names never collide.
+        if hidden_outputs is not None:
+            output_indices = getattr(module, "output_layer_indices", None) or []
+            if len(output_indices) != len(hidden_outputs):
+                raise ValueError(
+                    f"Gemma4 returned {len(hidden_outputs)} hidden-state tensor(s) "
+                    f"but output_layer_indices has {len(output_indices)} entr(y/ies)."
+                )
+            for idx, hs in zip(output_indices, hidden_outputs):
+                builder.add_output(hs, f"hidden_states.{idx}")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
 
@@ -411,14 +455,25 @@ class Gemma4Task(ModelTask):
         pre-allocated cache (static mode).
     """
 
+    #: decoder + vision + embedding, plus audio when ``config.audio`` is set.
+    #: ``audio_encoder`` is declared statically (it is config-gated at build time).
+    model_roles: ClassVar[dict[str, str]] = {
+        "decoder": "decoder",
+        "vision_encoder": "encoder",
+        "audio_encoder": "encoder",
+        "embedding": "embedding",
+    }
+
     def __init__(
         self,
         *,
         static_cache: bool = False,
         max_seq_len: int | None = None,
+        prune_prefill_prefix: bool = False,
     ):
         self._static_cache = static_cache
         self._max_seq_len = max_seq_len
+        self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(
         self,
@@ -488,17 +543,21 @@ class Gemma4Task(ModelTask):
             shape=[batch, seq_len, config.hidden_size],
         )
 
-        if not static:
-            past_seq_len = ir.SymbolicDim("past_sequence_len")
-            attention_mask = builder.input(
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+        # A static-cache layer masks itself from ``write_indices`` and
+        # ``nonpad_kv_seqlen`` and takes no bias, but a sliding layer keeps a
+        # dynamic cache even in static mode and still needs the mask to know
+        # where each row's real tokens are. Mint the mask exactly when such a
+        # layer survives, so a fully static decoder does not carry a port
+        # nothing reads and a hybrid one does not lose its padding information.
+        if not static or _has_dynamic_cache_layer(config):
+            attention_mask: ir.Value | None = builder.input(
                 "attention_mask",
                 dtype=ir.DataType.INT64,
                 shape=[batch, "past_seq_len + seq_len"],
             )
         else:
-            # Static cache still needs past_seq_len for sliding-window layers
-            # that use dynamic cache within the hybrid static/dynamic scheme.
-            past_seq_len = ir.SymbolicDim("past_sequence_len")
+            attention_mask = None
 
         position_ids = builder.input(
             "position_ids",
@@ -542,7 +601,6 @@ class Gemma4Task(ModelTask):
                 max_seq_len,
                 past_seq_len,
             )
-            attention_mask = None  # Static cache uses position-based attention
         else:
             past_key_values = _make_gemma4_kv_cache_inputs(
                 builder,
@@ -551,15 +609,16 @@ class Gemma4Task(ModelTask):
                 past_seq_len,
             )
 
-        logits, present_key_values = decoder(
-            op,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            per_layer_inputs=per_layer_inputs_val,
-            past_key_values=past_key_values,
-            input_ids=input_ids_val,
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            logits, present_key_values = decoder(
+                op,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                per_layer_inputs=per_layer_inputs_val,
+                past_key_values=past_key_values,
+                input_ids=input_ids_val,
+            )
 
         builder.add_output(logits, "logits")
         if static:
@@ -577,17 +636,20 @@ class Gemma4Task(ModelTask):
         """Build vision encoder: pixel_values + pixel_position_ids -> image_features.
 
         Inputs:
-        - ``pixel_values [B, N, 3*P^2]``: pre-patchified image data where
-          ``B`` is the number of images and ``N`` is the number of patches
-          (padded to ``max_soft_tokens``, typically 280).
-        - ``pixel_position_ids [B, N, 2]``: (x, y) patch coordinates.
+        - ``pixel_values [1, N, 3*P^2]``: one pre-patchified image with ``N``
+          patches (padded to ``max_soft_tokens``, typically 280).
+        - ``pixel_position_ids [1, N, 2]``: (x, y) patch coordinates.
           Unused patch slots (from images smaller than the maximum) use
           ``(-1, -1)`` as a sentinel value — no explicit mask is needed.
 
         Output:
-        - ``image_features [B*N, text_hidden_size]``: projected vision features
+        - ``image_features [N_pooled, text_hidden_size]``: projected vision features
+
+        The position-based pooler emits a variable token count determined by one
+        image's valid coordinate extent. Its scalar OneHot depth cannot represent
+        different pooled counts per batch row, so the graph contract is explicitly
+        single-image rather than advertising false dynamic-batch support.
         """
-        batch = ir.SymbolicDim("batch")
         num_patches = ir.SymbolicDim("num_patches")
         patch_size = config.vision.patch_size or 16 if config.vision else 16
         pixel_dim = 3 * patch_size * patch_size
@@ -598,12 +660,12 @@ class Gemma4Task(ModelTask):
         pixel_values = builder.input(
             "pixel_values",
             dtype=config.dtype,
-            shape=[batch, num_patches, pixel_dim],
+            shape=[1, num_patches, pixel_dim],
         )
         pixel_position_ids = builder.input(
             "pixel_position_ids",
             dtype=ir.DataType.INT64,
-            shape=[batch, num_patches, 2],
+            shape=[1, num_patches, 2],
         )
 
         image_features = vision(

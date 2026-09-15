@@ -1,0 +1,47 @@
+model_id: "EleutherAI/pythia-70m"
+model_type: "gpt_neox"
+revision: "a39f36b100fe8a5377810d56c3f4789b9c53ac42"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "mradermacher/pythia-70m-GGUF"
+  revision: "52d6f045404c9f93418df2a0144d20c9de34316b"
+  filename: "pythia-70m.Q2_K.gguf"
+  size: 38508192
+  lfs_sha256: "8e331c8c8016bed8ff1863b78fafe51e86b2364f32c2d7f3e201687e081cf7f7"
+  tensor_count: 76
+  tensor_qtypes: {F32: 50, Q2_K: 13, Q3_K: 12, Q6_K: 1}
+  execution_provider: "default"
+  config_sha256: "19607e074d570fe92a572204c482e7fde81dd3f7d6d29758fd36dc4a89ba6153"
+  preserve_quantization: false
+  tokenizer:
+    repository: "EleutherAI/pythia-70m"
+    revision: "a39f36b100fe8a5377810d56c3f4789b9c53ac42"
+    metadata_sha256: "d5c722f646ff6462ac217da5e3514d1fa8b4a7b33aedced3daa8e7f00cc74f78"
+    identity_status: "exact"
+    assets:
+      - {filename: "special_tokens_map.json", size: 99, sha256: "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad"}
+      - {filename: "tokenizer.json", size: 2113710, sha256: "c24618a1b3e6a38167beff1c72cffd126c3a66254347304b50547d12c5f25624"}
+      - {filename: "tokenizer_config.json", size: 396, sha256: "70e38394e494931c6f773ba41e19460dd4436526b852207367f04341b4066d3f"}
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "pythia-70m-q2-k-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 41000000
+  released_capabilities:
+    "0.15.2": {generic_decoder: true, state_groups: false}
+
+inputs:
+  prompts: ["The capital of France is"]
+
+level: "L4+L5"
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Portable standard-ONNX graph packaged for ORT GenAI CPU; explicit-float only."

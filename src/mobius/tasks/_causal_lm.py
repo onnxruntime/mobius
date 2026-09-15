@@ -8,7 +8,12 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
+from mobius._build_context import prefill_prefix_pruning
 from mobius._configs import ArchitectureConfig
+from mobius._constants import (
+    STATIC_CACHE_KV_SEQUENCE_LENGTH,
+    STATIC_CACHE_WRITE_INDICES,
+)
 from mobius._model_package import ModelPackage
 from mobius.components._attention import StaticCacheState
 from mobius.tasks._base import (
@@ -75,16 +80,31 @@ class CausalLMTask(ModelTask):
         max_seq_len: Maximum sequence length for static cache buffers.
             Only used when ``static_cache=True``.  Defaults to
             ``config.max_position_embeddings``.
+        prune_prefill_prefix: If ``True``, insert ``Gather(axis=1, index=-1)``
+            before the LM head so only the last token's hidden state is
+            projected to logits.  Output logits shape becomes ``[B, 1,
+            vocab]`` instead of ``[B, S, vocab]``, reducing prefill cost
+            for large-vocabulary models.  Set this when the downstream
+            runtime only needs the final token's logits (single-token
+            autoregressive generation).  Breaks workflows that require
+            per-token logits (logprob scoring, speculative decoding,
+            multi-token generation).
     """
 
     def __init__(
         self,
         *,
         static_cache: bool = False,
+        paged_cache: bool = False,
         max_seq_len: int | None = None,
+        prune_prefill_prefix: bool = False,
     ):
+        if static_cache and paged_cache:
+            raise ValueError("static_cache and paged_cache are mutually exclusive.")
         self._static_cache = static_cache
+        self._paged_cache = paged_cache
         self._max_seq_len = max_seq_len
+        self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(
         self,
@@ -116,6 +136,10 @@ class CausalLMTask(ModelTask):
 
         # --- Inputs common to both modes ---
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+
+        # --- Paged-cache mode: caller-owned LATENT PagedAttention cache. ---
+        if self._paged_cache:
+            return self._build_paged(module, config, graph, builder, op, input_ids, batch)
 
         # --- Cache setup (static vs dynamic) ---
         if static:
@@ -164,9 +188,17 @@ class CausalLMTask(ModelTask):
             ) or config.head_dim
             kv_value_head_dim = config.v_head_dim or config.head_dim
 
+            # Models whose trailing layers borrow K,V from an earlier layer
+            # (Gemma 3n's ``num_kv_shared_layers``) own fewer cache entries
+            # than they have layers; they report the count via this hook.
+            count_fn = getattr(module, "kv_cache_layer_count", None)
+            num_cache_layers = count_fn() if callable(count_fn) else config.num_hidden_layers
+            specs_fn = getattr(module, "kv_cache_specs", None)
+            cache_specs = specs_fn() if callable(specs_fn) else None
+
             past_key_values = _make_kv_cache_inputs(
                 builder,
-                config.num_hidden_layers,
+                num_cache_layers,
                 num_kv_cache_heads,
                 config.head_dim,
                 config.dtype,
@@ -174,20 +206,27 @@ class CausalLMTask(ModelTask):
                 past_seq_len,
                 key_head_dim=kv_key_head_dim,
                 value_head_dim=kv_value_head_dim,
+                cache_specs=cache_specs,
             )
 
-        result = module(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            result = module(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
         intermediate_hidden_states: list | None = None
-        if len(result) == 3:
+        final_hidden_state: ir.Value | None = None
+        if len(result) == 4:
+            logits, present_key_values, intermediate_hidden_states, final_hidden_state = result
+        elif len(result) == 3:
             logits, present_key_values, intermediate_hidden_states = result
         else:
             logits, present_key_values = result
+
+        _validate_pruned_logits(logits, self._prune_prefill_prefix, module)
 
         builder.add_output(logits, "logits")
 
@@ -211,14 +250,79 @@ class CausalLMTask(ModelTask):
                 value_head_dim=kv_value_head_dim,
                 total_seq_len="past_sequence_len + sequence_len",
                 dtype=config.dtype,
+                cache_specs=cache_specs,
             )
 
         if intermediate_hidden_states is not None:
             _register_intermediate_hidden_states(
                 builder, config.output_layer_indices, intermediate_hidden_states
             )
+        if final_hidden_state is not None:
+            builder.add_output(final_hidden_state, "mtp_seed")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
+
+    def _build_paged(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+        graph,
+        builder: GraphBuilder,
+        op,
+        input_ids: ir.Value,
+        batch: ir.SymbolicDim,
+    ) -> ModelPackage:
+        """Emit a decoder that binds caller-owned LATENT ``PagedAttention``.
+
+        The page/cache tensors (``block_table``, ``slot_mapping``, cumulative
+        lengths, past lengths, per-layer ``key_cache.N``) are graph inputs owned
+        by the native page manager; this task never allocates or manages pages.
+        """
+        from mobius.components._paged_mla import (
+            mla_paged_geometry,
+        )
+
+        # Eligibility must hold; an incompatible geometry is a typed error here
+        # (never a silent dense fallback).
+        geom = mla_paged_geometry(config)
+
+        # LATENT PagedAttention applies RoPE in-op and derives each token's
+        # absolute position from past_seqlens + cumulative_sequence_length, so
+        # the graph takes no position_ids input.
+        paged_states = _make_paged_cache_inputs(
+            builder,
+            config.num_hidden_layers,
+            geom.head_size,
+            config.dtype,
+            batch,
+        )
+
+        result = module(
+            op,
+            input_ids=input_ids,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=paged_states,
+        )
+        if len(result) == 3:
+            logits, present_key_values, _intermediate = result
+        else:
+            logits, present_key_values = result
+
+        builder.add_output(logits, "logits")
+        _register_paged_cache_outputs(builder, present_key_values)
+        return ModelPackage({"model": _make_model(graph)}, config=config)
+
+
+class SmallThinkerGGUFCausalLMTask(CausalLMTask):
+    """SmallThinker's exact dynamic concat-grow KV-cache ABI."""
+
+    def __init__(self, *, prune_prefill_prefix: bool = False):
+        super().__init__(
+            static_cache=False,
+            paged_cache=False,
+            prune_prefill_prefix=prune_prefill_prefix,
+        )
 
 
 class HybridCausalLMTask(ModelTask):
@@ -240,7 +344,15 @@ class HybridCausalLMTask(ModelTask):
     Outputs:
         - logits: FLOAT
         - present.{i}.{key|value|conv_state|recurrent_state}: FLOAT
+
+    Args:
+        prune_prefill_prefix: If ``True``, insert ``Gather(axis=1, index=-1)``
+            before the LM head so only the last token's logits are emitted.
+            See :class:`CausalLMTask` for full documentation.
     """
+
+    def __init__(self, *, prune_prefill_prefix: bool = False):
+        self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(
         self,
@@ -272,18 +384,24 @@ class HybridCausalLMTask(ModelTask):
             past_seq_len,
         )
 
-        result = module(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            result = module(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+            )
         intermediate_hidden_states: list | None = None
-        if len(result) == 3:
+        final_hidden_state: ir.Value | None = None
+        if len(result) == 4:
+            logits, present_key_values, intermediate_hidden_states, final_hidden_state = result
+        elif len(result) == 3:
             logits, present_key_values, intermediate_hidden_states = result
         else:
             logits, present_key_values = result
+
+        _validate_pruned_logits(logits, self._prune_prefill_prefix, module)
 
         builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
@@ -296,10 +414,35 @@ class HybridCausalLMTask(ModelTask):
             _register_intermediate_hidden_states(
                 builder, config.output_layer_indices, intermediate_hidden_states
             )
+        if final_hidden_state is not None:
+            builder.add_output(final_hidden_state, "mtp_seed")
 
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
+        if config.model_type in {"jamba", "nemotron_h"}:
+            model.metadata_props["mobius.runtime_support"] = (
+                "Deferred: ORT GenAI 0.15.2 discovers sparse KV and conv/recurrent slots, "
+                "but derives recurrent_state where Mobius exports ssm_state, does not "
+                "beam-reorder recurrent state, and rejects nonzero recurrent-state rewind; "
+                "tracked by https://github.com/onnxruntime/mobius/issues/605"
+            )
         return ModelPackage({"model": model}, config=config)
+
+
+def _validate_pruned_logits(
+    logits: ir.Value,
+    prune_prefill_prefix: bool,
+    module: nn.Module,
+) -> None:
+    """Fail when a custom model forward ignores the task's pruning request."""
+    if not prune_prefill_prefix:
+        return
+    shape = logits.shape
+    if shape is None or len(shape) != 3 or shape[1] != 1:
+        raise ValueError(
+            f"{type(module).__name__} does not support prune_prefill_prefix. "
+            "The model must select the final hidden state before its LM-head projection."
+        )
 
 
 def _register_intermediate_hidden_states(
@@ -377,12 +520,12 @@ def _make_static_cache_inputs(
 
     # Shared inputs across all layers
     write_indices = builder.input(
-        "write_indices",
+        STATIC_CACHE_WRITE_INDICES,
         dtype=ir.DataType.INT64,
         shape=[batch],
     )
     nonpad_kv_seqlen = builder.input(
-        "nonpad_kv_seqlen",
+        STATIC_CACHE_KV_SEQUENCE_LENGTH,
         dtype=ir.DataType.INT64,
         shape=[batch],
     )
@@ -414,6 +557,71 @@ def _register_static_cache_outputs(
     for i, (updated_key, updated_value) in enumerate(present_key_values):
         builder.add_output(updated_key, f"updated_key_cache.{i}")
         builder.add_output(updated_value, f"updated_value_cache.{i}")
+
+
+def _make_paged_cache_inputs(
+    builder: GraphBuilder,
+    num_layers: int,
+    head_size: int,
+    dtype: ir.DataType,
+    batch: ir.SymbolicDim,
+):
+    """Create caller-owned LATENT ``PagedAttention`` cache inputs.
+
+    Per-layer ``key_cache.{i}`` LATENT buffers plus the shared index inputs
+    (``block_table``, ``slot_mapping``, ``cumulative_sequence_length``,
+    ``past_seqlens``). ``cos_cache``/``sin_cache`` are supplied by the model
+    from its RoPE parameters, so the returned states leave them ``None``.
+
+    All buffers are graph inputs owned by the native page manager; this task
+    allocates none of them and never creates a second cache authority.
+    """
+    from mobius.components._paged_mla import PagedCacheState
+
+    num_blocks = ir.SymbolicDim("num_blocks")
+    block_size = ir.SymbolicDim("block_size")
+    max_blocks = ir.SymbolicDim("max_blocks_per_seq")
+    num_tokens = ir.SymbolicDim("num_tokens")
+
+    # Shared, sequence-level index inputs (int32 positional constraint S).
+    block_table = builder.input(
+        "block_table", dtype=ir.DataType.INT32, shape=[batch, max_blocks]
+    )
+    slot_mapping = builder.input("slot_mapping", dtype=ir.DataType.INT32, shape=[num_tokens])
+    cumulative_sequence_length = builder.input(
+        "cumulative_sequence_length", dtype=ir.DataType.INT32, shape=["batch + 1"]
+    )
+    past_seqlens = builder.input("past_seqlens", dtype=ir.DataType.INT32, shape=[batch])
+
+    states = []
+    for i in range(num_layers):
+        key_cache = builder.input(
+            f"key_cache.{i}",
+            dtype=dtype,
+            shape=[num_blocks, block_size, 1, head_size],
+        )
+        states.append(
+            PagedCacheState(
+                key_cache=key_cache,
+                block_table=block_table,
+                slot_mapping=slot_mapping,
+                cumulative_sequence_length=cumulative_sequence_length,
+                past_seqlens=past_seqlens,
+                cos_cache=None,
+                sin_cache=None,
+            )
+        )
+    return states
+
+
+def _register_paged_cache_outputs(
+    builder: GraphBuilder,
+    present_key_values,
+) -> None:
+    """Name the in-place LATENT cache outputs (each aliases its ``key_cache``)."""
+    for i, present in enumerate(present_key_values):
+        updated_key = present[0] if isinstance(present, (tuple, list)) else present
+        builder.add_output(updated_key, f"updated_key_cache.{i}")
 
 
 def _validate_static_cache_support(module: nn.Module) -> None:

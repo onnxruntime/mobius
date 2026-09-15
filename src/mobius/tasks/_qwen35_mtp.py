@@ -4,10 +4,9 @@
 """Graph-IO contract for the Qwen3.6 MTP self-speculative head.
 
 The MTP head is a single ``full_attention`` decoder layer with a standard
-GQA KV cache.  Like the DFlash drafter it borrows the target's shared
-``embed_tokens`` / ``lm_head``: it takes the target's ``inputs_embeds`` plus
-the target's last hidden state, and emits ``mtp_hidden`` (decoded through
-the target's lm_head by the orchestrator).
+GQA KV cache. It consumes ``input_ids`` and emits ``logits`` when the GGUF
+provides dedicated embedding/head tables; otherwise those ports are
+``inputs_embeds`` and ``mtp_hidden`` and the runtime borrows target weights.
 
 Graph inputs:
     - ``inputs_embeds``  : ``[batch, seq_len, hidden]`` (model dtype) — the
@@ -27,7 +26,8 @@ Graph outputs:
       the draft logits for ``t_{i+2}``).
     - ``present.0.key`` / ``.value`` : updated KV cache.
 
-No ``logits`` output — the head has no LM head of its own.
+Exactly one prediction output is present: ``logits`` for a dedicated head or
+``mtp_hidden`` for target-head fallback.
 """
 
 from __future__ import annotations
@@ -56,11 +56,18 @@ class Qwen35MtpTask(ModelTask):
         graph, builder = _make_graph()
         op = builder.op
 
-        inputs_embeds = builder.input(
-            "inputs_embeds",
-            dtype=config.dtype,
-            shape=[batch, seq_len, config.hidden_size],
-        )
+        input_ids = None
+        inputs_embeds = None
+        if config.use_dedicated_embeddings:
+            input_ids = builder.input(
+                "input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+            )
+        else:
+            inputs_embeds = builder.input(
+                "inputs_embeds",
+                dtype=config.dtype,
+                shape=[batch, seq_len, config.hidden_size],
+            )
         hidden_states = builder.input(
             "hidden_states",
             dtype=config.dtype,
@@ -85,16 +92,20 @@ class Qwen35MtpTask(ModelTask):
             past_seq_len,
         )
 
-        mtp_hidden, present_key_values = module(
+        prediction, present_key_values = module(
             op,
             inputs_embeds=inputs_embeds,
+            input_ids=input_ids,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
 
-        builder.add_output(mtp_hidden, "mtp_hidden")
+        builder.add_output(
+            prediction,
+            "logits" if config.use_dedicated_lm_head else "mtp_hidden",
+        )
         _register_kv_cache_outputs(
             builder,
             present_key_values,

@@ -1,0 +1,1 @@
+"""Domain-organized integration tests."""

@@ -50,8 +50,10 @@ class DFlashAttention(nn.Module):
     avoids any symbolic slicing of the rotary tables.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
         super().__init__()
+        if linear_class is None:
+            linear_class = Linear
         self.head_dim = config.head_dim
         self.num_attention_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
@@ -60,22 +62,22 @@ class DFlashAttention(nn.Module):
         self.rotary_embedding_dim = 0 if math.isclose(prf, 1.0) else int(self.head_dim * prf)
         self._rope_interleave = config.rope_interleave
 
-        self.q_proj = Linear(
+        self.q_proj = linear_class(
             config.hidden_size,
             self.num_attention_heads * self.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.k_proj = Linear(
+        self.k_proj = linear_class(
             config.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.v_proj = Linear(
+        self.v_proj = linear_class(
             config.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.o_proj = Linear(
+        self.o_proj = linear_class(
             self.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=config.attn_o_bias,
@@ -155,10 +157,10 @@ class DFlashDecoderLayer(nn.Module):
     → residual → post_attention_layernorm → SwiGLU MLP → residual.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
         super().__init__()
-        self.self_attn = DFlashAttention(config)
-        self.mlp = MLP(config)
+        self.self_attn = DFlashAttention(config, linear_class=linear_class)
+        self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

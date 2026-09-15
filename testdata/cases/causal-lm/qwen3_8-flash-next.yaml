@@ -1,0 +1,18 @@
+model_id: "Qwen/Qwen3.8-Flash-Next"
+model_type: "qwen4_exp_text"
+revision: "f5d08274bafd880402bd16f5e3e6c514136ec06c"
+task_type: "text-generation"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+ci_skip_reason: "The checkpoint includes a roughly 95 GiB PLE table and exceeds hosted CI resources."
+notes: "Pinned Qwen3.8 Flash-Next text core with Gated-DeltaNet, QSA, PLE, hyper-connections, and MoE."

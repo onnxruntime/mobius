@@ -5,7 +5,8 @@
 
 These build the mobius module + the matching diffusers module with the *same*
 random weights (no checkpoint download) and compare outputs — the pattern used
-by ``tests/integration_test.py`` for the QwenImage VAE. Guarded on diffusers.
+by ``tests/integration/architectures_test.py`` for the QwenImage VAE.
+Guarded on diffusers.
 """
 
 from __future__ import annotations
@@ -16,6 +17,21 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+
+def _run_onnx(model, *feeds):
+    import onnx_ir
+    import onnxruntime as ort
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        model_path = str(Path(temp_dir) / "model.onnx")
+        onnx_ir.save(model, model_path)
+        session = ort.InferenceSession(model_path)
+        try:
+            return [session.run(None, feed)[0] for feed in feeds]
+        finally:
+            # Windows keeps the model mapped until the session is released.
+            del session
 
 
 def _remap_transformer(state_dict: dict) -> dict:
@@ -29,14 +45,35 @@ def _remap_transformer(state_dict: dict) -> dict:
     return out
 
 
+def test_unet_without_mid_block_builds_complete_graph():
+    from mobius.integrations.diffusers._configs import UNet2DConfig
+    from mobius.models.unet import UNet2DConditionModel
+    from mobius.tasks._denoising import DenoisingTask
+
+    config = UNet2DConfig(
+        in_channels=4,
+        out_channels=4,
+        block_out_channels=(32, 64),
+        layers_per_block=1,
+        norm_num_groups=32,
+        cross_attention_dim=16,
+        attention_head_dim=8,
+        down_block_types=("CrossAttnDownBlock2D", "DownBlock2D"),
+        up_block_types=("UpBlock2D", "CrossAttnUpBlock2D"),
+        mid_block_type=None,
+    )
+    model = DenoisingTask().build(UNet2DConditionModel(config), config)["model"]
+    assert [value.name for value in model.graph.outputs] == ["noise_pred"]
+    assert not any(name.startswith("mid_block.") for name in model.graph.initializers)
+
+
 def test_cross_attention_block_matches_diffusers():
     pytest.importorskip("diffusers")
     import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers.models.transformers.transformer_2d import Transformer2DModel
 
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
     from mobius.models.unet import _CrossAttentionBlock
     from mobius.tasks._base import _make_graph, _make_model
 
@@ -64,24 +101,17 @@ def test_cross_attention_block_matches_diffusers():
     model = _make_model(graph)
     apply_weights(model, _remap_transformer(hf.state_dict()))
 
-    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        model_path = Path(temp_dir) / "model.onnx"
-        onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
-        actual = session.run(None, {"hidden": hidden.numpy(), "context": context.numpy()})[0]
+    (actual,) = _run_onnx(model, {"hidden": hidden.numpy(), "context": context.numpy()})
     assert np.abs(actual - expected).max() < 1e-4
 
 
 def test_unet_matches_diffusers():
     pytest.importorskip("diffusers")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
 
-    from mobius._diffusers_configs import UNet2DConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import UNet2DConditionModel
     from mobius.tasks._denoising import DenoisingTask
 
@@ -118,19 +148,14 @@ def test_unet_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        model_path = Path(temp_dir) / "model.onnx"
-        onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
-        actual = session.run(
-            None,
-            {
-                "sample": sample.numpy(),
-                "timestep": timestep.numpy().astype(np.int64),
-                "encoder_hidden_states": encoder_hidden_states.numpy(),
-            },
-        )[0]
+    (actual,) = _run_onnx(
+        model,
+        {
+            "sample": sample.numpy(),
+            "timestep": timestep.numpy().astype(np.float32),
+            "encoder_hidden_states": encoder_hidden_states.numpy(),
+        },
+    )
     assert np.abs(actual - expected).max() < 2e-4
 
 
@@ -143,13 +168,11 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     so cross-attention is present only where diffusers places it.
     """
     pytest.importorskip("diffusers")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
 
-    from mobius._diffusers_configs import UNet2DConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import UNet2DConditionModel
     from mobius.tasks._denoising import DenoisingTask
 
@@ -190,19 +213,14 @@ def test_unet_sd1x_mixed_block_types_matches_diffusers():
     model = DenoisingTask().build(module, config)["model"]
     apply_weights(model, module.preprocess_weights(dict(hf.state_dict())))
 
-    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        model_path = Path(temp_dir) / "model.onnx"
-        onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
-        actual = session.run(
-            None,
-            {
-                "sample": sample.numpy(),
-                "timestep": timestep.numpy().astype(np.int64),
-                "encoder_hidden_states": encoder_hidden_states.numpy(),
-            },
-        )[0]
+    (actual,) = _run_onnx(
+        model,
+        {
+            "sample": sample.numpy(),
+            "timestep": timestep.numpy().astype(np.float32),
+            "encoder_hidden_states": encoder_hidden_states.numpy(),
+        },
+    )
     assert np.abs(actual - expected).max() < 2e-4
 
 
@@ -210,16 +228,14 @@ def test_unet_lora_gate_parity():
     """Runtime LoRA parity: gate=0 == diffusers base, gate=1 == diffusers+LoRA."""
     pytest.importorskip("diffusers")
     pytest.importorskip("peft")
-    import onnx_ir
-    import onnxruntime as ort
     import torch
     from diffusers import UNet2DConditionModel as HFUNet
     from diffusers.utils import convert_state_dict_to_diffusers
     from peft import LoraConfig
     from peft.utils import get_peft_model_state_dict
 
-    from mobius._diffusers_configs import UNet2DConfig
-    from mobius._weight_loading import apply_weights
+    from mobius.integrations._weight_loading import apply_weights
+    from mobius.integrations.diffusers._configs import UNet2DConfig
     from mobius.models.unet import (
         UNet2DConditionModel,
         remap_diffusers_unet_lora,
@@ -278,18 +294,16 @@ def test_unet_lora_gate_parity():
     weights.update(remap_diffusers_unet_lora(lora_state, "test"))
     apply_weights(model, weights)
 
-    # Windows keeps the ORT model file mapped; ignore cleanup errors so the dir can be removed.
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        model_path = Path(temp_dir) / "model.onnx"
-        onnx_ir.save(model, model_path)
-        session = ort.InferenceSession(model_path)
-        feed = {
-            "sample": sample.numpy(),
-            "timestep": timestep.numpy().astype(np.int64),
-            "encoder_hidden_states": encoder_hidden_states.numpy(),
-        }
-        off = session.run(None, {**feed, "lora_gate.test": np.array(0.0, dtype=np.float32)})[0]
-        on = session.run(None, {**feed, "lora_gate.test": np.array(1.0, dtype=np.float32)})[0]
+    feed = {
+        "sample": sample.numpy(),
+        "timestep": timestep.numpy().astype(np.float32),
+        "encoder_hidden_states": encoder_hidden_states.numpy(),
+    }
+    off, on = _run_onnx(
+        model,
+        {**feed, "lora_gate.test": np.array(0.0, dtype=np.float32)},
+        {**feed, "lora_gate.test": np.array(1.0, dtype=np.float32)},
+    )
 
     # gate=0 disables the adapter (base); gate=1 applies it (diffusers+LoRA).
     assert np.abs(off - base_out).max() < 2e-4, np.abs(off - base_out).max()

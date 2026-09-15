@@ -1,0 +1,28 @@
+model_id: "vibevoice/VibeVoice-1.5B-hf"
+model_type: "vibevoice"
+revision: "edc39f80f5cae656da37baf8faa8f5502bf7081f"
+task_type: "text-to-speech"
+dtype: "float16"
+level: "L4+L5"
+
+inputs:
+  prompts:
+    - "Mobius verifies deterministic speech."
+  audio:
+    - "652-129742-0006-24khz.wav"
+
+generation:
+  max_new_tokens: 3
+  do_sample: false
+  exact_match: true
+  num_diffusion_steps: 2
+  guidance_scale: 1.3
+
+notes: >
+  Transformers-native VibeVoice 1.5B conversion pinned to the immutable revision
+  produced alongside transformers PR 40546. The voice reference is LibriSpeech
+  train-clean-100 utterance 652-129742-0006 from OpenSLR corpus 12 (CC BY 4.0),
+  deterministically resampled from 16 kHz to the model's required 24 kHz.
+  The Microsoft VibeVoice-1.5B revision
+  c00898d257e6b46004e3e2866a47534085fb685a is recorded as provenance only;
+  its pre-conversion config and weight namespaces are not Transformers-native.

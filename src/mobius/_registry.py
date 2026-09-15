@@ -24,26 +24,57 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    CodeShellConfig,
     Eagle3Config,
+    FalconH1Config,
+    Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
+    HyV3Config,
+    Jais2Config,
+    KimiK3Config,
+    KimiLinearConfig,
+    Lfm2Config,
+    Lfm2MoeConfig,
+    Lfm2VlConfig,
+    MiniMaxConfig,
     MMSConfig,
+    MoonshineConfig,
+    MoonshineStreamingConfig,
+    MuseGlimmerConfig,
+    NemotronParseConfig,
+    ParakeetCTCConfig,
+    Plamo2Config,
+    Qwen4ExpConfig,
+    SenseNovaU1Config,
+    VibeVoiceConfig,
+    VibeVoiceStreamingConfig,
     WhisperConfig,
+    XverseConfig,
 )
 from mobius.models import (
     ApertusCausalLMModel,
     ArceeCausalLMModel,
+    ArcticGGUFCausalLMModel,
+    BitNetCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
+    CodeShellCausalLMModel,
+    Cosmos3EdgeTextModel,
+    Cosmos3EdgeVLModel,
+    Cosmos3OmniReasonerModel,
+    DbrxGGUFCausalLMModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
     DeepSeekV4CausalLMModel,
     DFlashDraftModel,
     DiffLlamaCausalLMModel,
     DogeCausalLMModel,
+    DreamModel,
     Eagle3DraftModel,
     EncDecRNNTModel,
     Ernie45MoECausalLMModel,
+    Ernie45MoEGGUFCausalLMModel,
     ErnieCausalLMModel,
     ExaOne4CausalLMModel,
     Gemma2CausalLMModel,
@@ -57,21 +88,43 @@ from mobius.models import (
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
     GlmCausalLMModel,
+    GlmMoeDsaCausalLMModel,
+    GlmOcrForConditionalGeneration,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     GraniteMoECausalLMModel,
+    GrokGGUFCausalLMModel,
+    GroveMoEGGUFCausalLMModel,
+    HunyuanMoEGGUFCausalLMModel,
     HunYuanMoEV1CausalLMModel,
     HunYuanV1DenseCausalLMModel,
     HunYuanVLMoTModel,
+    HyV3CausalLMModel,
+    HyV3MtpModel,
     InternLM2CausalLMModel,
+    Jais2CausalLMModel,
+    KimiK3CausalLMModel,
+    KimiLinearCausalLMModel,
     LayerNormCausalLMModel,
+    Lfm2CausalLMModel,
+    Lfm2MoECausalLMModel,
+    Lfm2VlForConditionalGeneration,
     LLaDAModel,
+    LLaDAMoEModel,
     Llama4CausalLMModel,
+    MageVLForConditionalGeneration,
+    MaincoderCausalLMModel,
+    MiniMaxM2GGUFCausalLMModel,
+    Mistral4GGUFCausalLMModel,
     MoECausalLMModel,
+    MoonshineForConditionalGeneration,
+    MoonshineStreamingForConditionalGeneration,
     NanoChatCausalLMModel,
     NemotronCausalLMModel,
+    NemotronParseForConditionalGeneration,
     OLMo2CausalLMModel,
     OLMoCausalLMModel,
+    ParakeetForCTCModel,
     Phi3CausalLMModel,
     Phi3MoECausalLMModel,
     Phi3SmallCausalLMModel,
@@ -79,6 +132,10 @@ from mobius.models import (
     Phi4MMMultiModalModel,
     Phi4SigLIPModel,
     PhiCausalLMModel,
+    PhiMoEGGUFCausalLMModel,
+    Plamo2ForCausalLM,
+    PlamoGGUFCausalLMModel,
+    PLMCausalLMModel,
     Qwen2MoECausalLMModel,
     Qwen2VLCausalLMModel,
     Qwen3CausalLMModel,
@@ -86,6 +143,8 @@ from mobius.models import (
     Qwen3VL3ModelCausalLMModel,
     Qwen3VLCausalLMModel,
     Qwen3VLTextModel,
+    Qwen4ExpCausalLMModel,
+    Qwen4ExpForConditionalGeneration,
     Qwen25VLCausalLMModel,
     Qwen25VLTextModel,
     Qwen35CausalLMModel,
@@ -95,8 +154,16 @@ from mobius.models import (
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLTextModel,
     QwenCausalLMModel,
+    ReUseConfig,
+    RND1Model,
+    SEMambaSpeechEnhancementModel,
+    SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
+    SortformerDiarizationModel,
+    VibeVoiceForConditionalGeneration,
+    VibeVoiceStreamingForConditionalGeneration,
     WhisperForConditionalGeneration,
+    XverseCausalLMModel,
 )
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
@@ -108,10 +175,27 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
-from mobius.models.falcon import BloomCausalLMModel, FalconCausalLMModel, MPTCausalLMModel
+from mobius.models.esm import EsmConfig, EsmModel
+from mobius.models.falcon import (
+    BloomCausalLMModel,
+    FalconCausalLMModel,
+    MPTCausalLMModel,
+)
+from mobius.models.falcon_h1 import FalconH1ForCausalLM
 from mobius.models.fun_asr import FunASRForConditionalGeneration
-from mobius.models.gemma3n import Gemma3nCausalLMModel
-from mobius.models.gpt2 import GPT2CausalLMModel
+from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
+from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGUFModel
+from mobius.models.gguf_encoders import (
+    EuroBertGGUFModel,
+    JinaBertV2GGUFModel,
+    JinaBertV3GGUFModel,
+    NeoBertGGUFModel,
+    NomicBertGGUFModel,
+    NomicBertMoEGGUFModel,
+)
+from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
+from mobius.models.glm_asr import GlmAsrForConditionalGeneration
+from mobius.models.gpt2 import GPT2CausalLMModel, ScaledEmbeddingGPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
@@ -122,9 +206,15 @@ from mobius.models.layoutlmv3 import LayoutLMv3Model
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.minicpm import MiniCPM3CausalLMModel, MiniCPMCausalLMModel
+from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.mllama import MllamaCausalLMModel
 from mobius.models.modernbert import ModernBertDecoderModel, ModernBertModel
+from mobius.models.muse_glimmer import (
+    MuseGlimmerForConditionalGeneration,
+    MuseGlimmerTextCausalLMModel,
+)
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
@@ -133,10 +223,17 @@ from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
-from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
+from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.trocr import TrOCRForConditionalGeneration
+from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
+from mobius.models.vibevoice_streaming import (
+    VIBEVOICE_STREAMING_MODEL_ID,
+    VIBEVOICE_STREAMING_REVISION,
+)
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
@@ -162,6 +259,7 @@ class ModelRegistration:
             phimoe).  ``None`` means auto-derive from the model_type prefix.
         variant: Short label identifying the code-path variant (e.g. ``"mla"``,
             ``"moe"``, ``"sliding_window"``).  Used for dashboard display.
+        test_revision: Optional immutable HuggingFace revision for L2 validation.
     """
 
     module_class: type[nn.Module]
@@ -170,6 +268,7 @@ class ModelRegistration:
     test_model_id: str | None = None
     family: str | None = None
     variant: str | None = None
+    test_revision: str | None = None
 
 
 class ModelRegistry:
@@ -205,6 +304,7 @@ class ModelRegistry:
         test_model_id: str | None = None,
         family: str | None = None,
         variant: str | None = None,
+        test_revision: str | None = None,
     ) -> None:
         """Register a module class for an architecture name.
 
@@ -218,6 +318,7 @@ class ModelRegistry:
             test_model_id: HuggingFace model ID for L2 architecture validation.
             family: Dashboard family grouping override.
             variant: Short label for the code-path variant.
+            test_revision: Optional immutable HuggingFace revision for L2 validation.
         """
         self._map[architecture] = ModelRegistration(
             module_class,
@@ -226,6 +327,7 @@ class ModelRegistry:
             test_model_id,
             family,
             variant,
+            test_revision,
         )
 
     def get(self, architecture: str) -> type[nn.Module]:
@@ -368,19 +470,25 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "baichuan": ModelRegistration(CausalLMModel),
     "code_llama": ModelRegistration(CausalLMModel),
     "codegen2": ModelRegistration(CausalLMModel),
-    "command_r": ModelRegistration(CausalLMModel),
+    "command_r": ModelRegistration(CohereCausalLMModel),
+    "jais2": ModelRegistration(Jais2CausalLMModel, config_class=Jais2Config),
+    "kclgpt": ModelRegistration(CodeShellCausalLMModel, config_class=CodeShellConfig),
     "csm": ModelRegistration(CausalLMModel),
     "dots1": ModelRegistration(DeepSeekV3CausalLMModel),
+    "deepseek": ModelRegistration(DeepSeekV3CausalLMModel),
     "evolla": ModelRegistration(CausalLMModel),
     "exaone": ModelRegistration(CausalLMModel),
     "helium": ModelRegistration(CausalLMModel),
     "llama": ModelRegistration(CausalLMModel),
     "minicpm": ModelRegistration(CausalLMModel),
     "minicpm3": ModelRegistration(CausalLMModel),
+    "minicpm_gguf": ModelRegistration(MiniCPMCausalLMModel),
+    "minicpm3_gguf": ModelRegistration(MiniCPM3CausalLMModel),
     "ministral": ModelRegistration(CausalLMModel),
     "ministral3": ModelRegistration(CausalLMModel),
     "mistral": ModelRegistration(CausalLMModel),
     "open-llama": ModelRegistration(CausalLMModel),
+    "xverse": ModelRegistration(XverseCausalLMModel, config_class=XverseConfig),
     "openelm": ModelRegistration(CausalLMModel),
     "qwen2": ModelRegistration(CausalLMModel),
     "seed_oss": ModelRegistration(CausalLMModel),
@@ -392,22 +500,65 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     # --- Text Generation (architecture-specific) ---
     "apertus": ModelRegistration(ApertusCausalLMModel),
     "arcee": ModelRegistration(ArceeCausalLMModel),
+    "bitnet": ModelRegistration(BitNetCausalLMModel),
+    "talkie": ModelRegistration(TalkieForCausalLM),
+    "maincoder": ModelRegistration(
+        MaincoderCausalLMModel,
+        test_model_id="Maincode/Maincoder-1B",
+        test_revision="088ec98640bdeb105f46a9ef6a1370ed5d0d2ea5",
+    ),
+    "minimax_m2_gguf": ModelRegistration(
+        MiniMaxM2GGUFCausalLMModel,
+        family="minimax",
+        variant="gguf",
+    ),
+    "mistral4_gguf": ModelRegistration(
+        Mistral4GGUFCausalLMModel,
+        task="mistral4-gguf-text-generation",
+        family="mistral",
+        variant="gguf",
+    ),
     "bloom": ModelRegistration(BloomCausalLMModel),
+    "orion": ModelRegistration(LayerNormCausalLMModel),
     "chatglm": ModelRegistration(ChatGLMCausalLMModel),
     "codegen": ModelRegistration(CodeGenCausalLMModel),
     "cohere": ModelRegistration(CohereCausalLMModel),
     "cohere2": ModelRegistration(CohereCausalLMModel),
+    "cosmos3_edge": ModelRegistration(Cosmos3EdgeVLModel),
+    "cosmos3_edge_text": ModelRegistration(Cosmos3EdgeTextModel),
+    "cosmos3_omni": ModelRegistration(
+        Cosmos3OmniReasonerModel, task="qwen-vl", family="cosmos", variant="reasoner"
+    ),
     "diffllama": ModelRegistration(DiffLlamaCausalLMModel),
     "doge": ModelRegistration(DogeCausalLMModel),
     "ernie4_5": ModelRegistration(ErnieCausalLMModel),
     "exaone4": ModelRegistration(ExaOne4CausalLMModel),
     "falcon": ModelRegistration(FalconCausalLMModel),
-    "falcon_h1": ModelRegistration(FalconCausalLMModel),
+    "falcon_h1": ModelRegistration(
+        FalconH1ForCausalLM,
+        task="falcon-h1-text-generation",
+        config_class=FalconH1Config,
+        test_model_id="tiiuae/Falcon-H1-Tiny-90M-Base",
+        family="falcon-h1",
+    ),
+    "plamo2": ModelRegistration(
+        Plamo2ForCausalLM,
+        task="plamo2-text-generation",
+        config_class=Plamo2Config,
+        test_model_id="pfnet/plamo-2-1b",
+        family="plamo2",
+    ),
+    "plm": ModelRegistration(
+        PLMCausalLMModel,
+        test_model_id="PLM-Team/PLM-1.8B-Instruct",
+        test_revision="62d188c7d58843d7013d5b3ffe198db448787860",
+        family="plm",
+    ),
+    "pangu_embedded": ModelRegistration(CausalLMModel, family="pangu-embedded"),
     "gemma": ModelRegistration(GemmaCausalLMModel),
     "gemma2": ModelRegistration(Gemma2CausalLMModel),
-    "gemma3": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
+    "gemma3": ModelRegistration(Gemma3MultiModalModel, task="gemma3-vision-language"),
     "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
-    "gemma3n": ModelRegistration(Gemma3nCausalLMModel),
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
     "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
     "gemma4_unified_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),
@@ -447,14 +598,31 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
+    "gguf_legacy": ModelRegistration(ExactLegacyGGUFCausalLMModel),
+    "gguf_plamo": ModelRegistration(
+        PlamoGGUFCausalLMModel,
+        task="plamo-text-generation",
+    ),
     "gpt_neox_japanese": ModelRegistration(GPTNeoXJapaneseCausalLMModel),
     "gpt_oss": ModelRegistration(GPTOSSCausalLMModel),
     "gptj": ModelRegistration(GPTJCausalLMModel),
     "granite": ModelRegistration(GraniteCausalLMModel),
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
+    "hy_v3": ModelRegistration(
+        HyV3CausalLMModel,
+        config_class=HyV3Config,
+        test_model_id="tencent/Hy3",
+    ),
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
+    "lfm2": ModelRegistration(Lfm2CausalLMModel, config_class=Lfm2Config),
+    "lfm2_moe": ModelRegistration(Lfm2MoECausalLMModel, config_class=Lfm2MoeConfig),
+    "dream": ModelRegistration(DreamModel, task="masked-diffusion"),
+    "Dream": ModelRegistration(DreamModel, task="masked-diffusion"),
     "llada": ModelRegistration(LLaDAModel, task="masked-diffusion"),
+    "llada_moe": ModelRegistration(LLaDAMoEModel, task="masked-diffusion"),
+    "LLaDAMoEModel": ModelRegistration(LLaDAMoEModel, task="masked-diffusion"),
+    "rnd1": ModelRegistration(RND1Model, task="masked-diffusion"),
     "modernbert-decoder": ModelRegistration(ModernBertDecoderModel),
     "mpt": ModelRegistration(MPTCausalLMModel),
     "nanochat": ModelRegistration(NanoChatCausalLMModel),
@@ -482,6 +650,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     # architecture name and exposes the ``qwen35-mtp`` task.
     "Qwen35MtpModel": ModelRegistration(
         Qwen35MtpModel, task="qwen35-mtp", family="qwen", variant="mtp"
+    ),
+    "HyV3MtpModel": ModelRegistration(
+        HyV3MtpModel, task="hy-v3-mtp", family="hunyuan", variant="mtp"
     ),
     "Eagle3LlamaForCausalLM": ModelRegistration(
         Eagle3DraftModel,
@@ -517,28 +688,81 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         variant="speculators",
     ),
     "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
+    "smallthinker_gguf": ModelRegistration(
+        SmallThinkerGGUFCausalLMModel,
+        task="smallthinker-gguf-text-generation",
+        family="smallthinker",
+        variant="gguf",
+    ),
     "smollm3": ModelRegistration(SmolLM3CausalLMModel),
     "stablelm": ModelRegistration(LayerNormCausalLMModel),
     "starcoder2": ModelRegistration(StarCoder2CausalLMModel),
     # --- Mixture of Experts ---
     "arctic": ModelRegistration(MoECausalLMModel),
+    "arctic_gguf": ModelRegistration(ArcticGGUFCausalLMModel),
     "dbrx": ModelRegistration(MoECausalLMModel),
+    "dbrx_gguf": ModelRegistration(DbrxGGUFCausalLMModel),
     "ernie4_5_moe": ModelRegistration(Ernie45MoECausalLMModel),
+    "ernie4_5_moe_gguf": ModelRegistration(Ernie45MoEGGUFCausalLMModel),
+    "bailing_moe": ModelRegistration(Ernie45MoECausalLMModel),
     "flex_olmo": ModelRegistration(MoECausalLMModel),
     "glm4_moe": ModelRegistration(Glm4MoECausalLMModel),
     "granitemoe": ModelRegistration(GraniteMoECausalLMModel),
     "granitemoehybrid": ModelRegistration(GraniteMoeHybridCausalLMModel),
     "granitemoeshared": ModelRegistration(GraniteMoECausalLMModel),
+    "grok_gguf": ModelRegistration(GrokGGUFCausalLMModel),
+    "grovemoe_gguf": ModelRegistration(GroveMoEGGUFCausalLMModel),
+    "hunyuan_moe_gguf": ModelRegistration(HunyuanMoEGGUFCausalLMModel),
     "hunyuan_v1_moe": ModelRegistration(HunYuanMoEV1CausalLMModel),
     "jetmoe": ModelRegistration(JetMoeCausalLMModel),
-    "minimax": ModelRegistration(MiniMaxCausalLMModel),
+    "kimi_linear": ModelRegistration(
+        KimiLinearCausalLMModel,
+        task="kimi-linear-text-generation",
+        config_class=KimiLinearConfig,
+    ),
+    "kimi_k3": ModelRegistration(
+        KimiK3CausalLMModel,
+        task="kimi-k3-text-generation",
+        config_class=KimiK3Config,
+    ),
+    "minimax": ModelRegistration(MiniMaxCausalLMModel, config_class=MiniMaxConfig),
+    "MiniMaxText01": ModelRegistration(MiniMaxCausalLMModel, config_class=MiniMaxConfig),
+    "minimax_text_01": ModelRegistration(MiniMaxCausalLMModel, config_class=MiniMaxConfig),
     "mixtral": ModelRegistration(MoECausalLMModel),
     "olmoe": ModelRegistration(MoECausalLMModel),
     "phimoe": ModelRegistration(Phi3MoECausalLMModel),
+    "phimoe_gguf": ModelRegistration(PhiMoEGGUFCausalLMModel),
     "qwen2_moe": ModelRegistration(Qwen2MoECausalLMModel),
     "qwen3_5_moe": ModelRegistration(Qwen35MoECausalLMModel),
     "qwen3_moe": ModelRegistration(MoECausalLMModel),
     "qwen3_next": ModelRegistration(Qwen3NextCausalLMModel),
+    "qwen4_exp": ModelRegistration(
+        Qwen4ExpForConditionalGeneration,
+        task="qwen4-exp-vision-language",
+        config_class=Qwen4ExpConfig,
+        test_model_id="Qwen/Qwen3.8-Flash-Next",
+        family="qwen",
+        variant="multimodal+moe+gdn+qsa+ple",
+        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
+    ),
+    "qwen4_exp_text": ModelRegistration(
+        Qwen4ExpCausalLMModel,
+        task="qwen4-exp-text-generation",
+        config_class=Qwen4ExpConfig,
+        test_model_id="unsloth/Qwen3.8-Flash-Next-FP8",
+        test_revision="41cc25fe32cc20053a59c89716196897580cddf6",
+        family="qwen",
+        variant="moe+gdn+qsa+ple",
+    ),
+    "Qwen4ExpForConditionalGeneration": ModelRegistration(
+        Qwen4ExpForConditionalGeneration,
+        task="qwen4-exp-vision-language",
+        config_class=Qwen4ExpConfig,
+        test_model_id="Qwen/Qwen3.8-Flash-Next",
+        family="qwen",
+        variant="multimodal",
+        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
+    ),
     "qwen3_omni_moe": ModelRegistration(MoECausalLMModel),
     "qwen3_vl_moe": ModelRegistration(MoECausalLMModel),
     # --- DeepSeek (MLA + MoE) ---
@@ -547,6 +771,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
+    # --- GLM-5.2 (MLA + DeepSeek Sparse Attention (DSA) + MoE) ---
+    "glm_moe_dsa": ModelRegistration(GlmMoeDsaCausalLMModel, task="glm-moe-dsa"),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
     "mamba": ModelRegistration(MambaCausalLMModel),
@@ -555,6 +781,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "bamba": ModelRegistration(BambaCausalLMModel),
     "jamba": ModelRegistration(JambaCausalLMModel),
     "nemotron_h": ModelRegistration(NemotronHCausalLMModel),
+    "nemotron_parse": ModelRegistration(
+        NemotronParseForConditionalGeneration,
+        task="vision-encoder-decoder",
+        config_class=NemotronParseConfig,
+    ),
     # --- Hybrid linear-attention ---
     "longcat_flash": ModelRegistration(LongcatFlashCausalLMModel),
     # --- Multimodal ---
@@ -566,6 +797,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_vl_hybrid": ModelRegistration(LLaVAModel, task="vision-language"),
     "florence2": ModelRegistration(LLaVAModel, task="vision-language"),
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
+    "gemma3n": ModelRegistration(
+        Gemma3nMultiModalModel, task="gemma3n", config_class=Gemma3nMultiModalConfig
+    ),
     "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
     "gemma4_unified": ModelRegistration(
         Gemma4UnifiedModel, task="gemma4-unified", config_class=Gemma4Config
@@ -574,8 +808,21 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe_text": ModelRegistration(Glm4MoECausalLMModel),
     "glm4v_text": ModelRegistration(Glm4CausalLMModel),
+    "glm_ocr": ModelRegistration(
+        GlmOcrForConditionalGeneration,
+        task="glm-ocr",
+        test_model_id="zai-org/GLM-OCR",
+        test_revision="ca5d8b3e287e52589e37c28385d9655ee4372f9d",
+    ),
     "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
     "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="hunyuan-vl-mot"),
+    "neo_chat": ModelRegistration(
+        SenseNovaU1Model,
+        task="sensenova-u1",
+        config_class=SenseNovaU1Config,
+        family="sensenova",
+        variant="mot_unified",
+    ),
     "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
     "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
     "instructblip": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -583,13 +830,33 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "internvl": ModelRegistration(InternVL2Model, task="vision-language"),
     "internvl2": ModelRegistration(InternVL2Model, task="vision-language"),
     "internvl_chat": ModelRegistration(InternVL2Model, task="vision-language"),
+    "lfm2_vl": ModelRegistration(
+        Lfm2VlForConditionalGeneration,
+        task="lfm2-vl",
+        config_class=Lfm2VlConfig,
+    ),
+    "mage_vl": ModelRegistration(MageVLForConditionalGeneration, task="mage-vl"),
     "janus": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava_next": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava_next_video": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava_onevision": ModelRegistration(LLaVAModel, task="vision-language"),
     "mistral3": ModelRegistration(LLaVAModel, task="pixtral-vl"),
+    "minicpmv4_6": ModelRegistration(
+        MiniCPMV46ForConditionalGeneration,
+        task="minicpm-vl",
+    ),
     "mllama": ModelRegistration(MllamaCausalLMModel, task="mllama-vision-language"),
+    "muse_glimmer": ModelRegistration(
+        MuseGlimmerForConditionalGeneration,
+        task="muse-glimmer-vl",
+        config_class=MuseGlimmerConfig,
+        test_model_id="meta-models/Muse-Glimmer-30B",
+    ),
+    "muse_glimmer_text": ModelRegistration(
+        MuseGlimmerTextCausalLMModel,
+        config_class=MuseGlimmerConfig,
+    ),
     "molmo": ModelRegistration(LLaVAModel, task="vision-language"),
     "ovis2": ModelRegistration(LLaVAModel, task="vision-language"),
     "paligemma": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -628,6 +895,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "fun_asr": ModelRegistration(
         FunASRForConditionalGeneration, task="fun-asr-speech-language"
     ),
+    "glmasr": ModelRegistration(GlmAsrForConditionalGeneration, task="glmasr-speech-language"),
     "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
@@ -635,10 +903,46 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
     "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
     "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
+    "vibevoice": ModelRegistration(
+        VibeVoiceForConditionalGeneration,
+        task="vibevoice-tts",
+        config_class=VibeVoiceConfig,
+        test_model_id=VIBEVOICE_MODEL_ID,
+        test_revision=VIBEVOICE_REVISION,
+        family="vibevoice",
+    ),
+    "vibevoice_streaming": ModelRegistration(
+        VibeVoiceStreamingForConditionalGeneration,
+        task="vibevoice-streaming-tts",
+        config_class=VibeVoiceStreamingConfig,
+        test_model_id=VIBEVOICE_STREAMING_MODEL_ID,
+        test_revision=VIBEVOICE_STREAMING_REVISION,
+        family="vibevoice",
+        variant="realtime",
+    ),
+    "VibeVoiceStreamingForConditionalGenerationInference": ModelRegistration(
+        VibeVoiceStreamingForConditionalGeneration,
+        task="vibevoice-streaming-tts",
+        config_class=VibeVoiceStreamingConfig,
+        test_model_id=VIBEVOICE_STREAMING_MODEL_ID,
+        test_revision=VIBEVOICE_STREAMING_REVISION,
+        family="vibevoice",
+        variant="realtime",
+    ),
     "whisper": ModelRegistration(
         WhisperForConditionalGeneration,
         task="speech-to-text",
         config_class=WhisperConfig,
+    ),
+    "moonshine": ModelRegistration(
+        MoonshineForConditionalGeneration,
+        task="speech-to-text",
+        config_class=MoonshineConfig,
+    ),
+    "moonshine_streaming": ModelRegistration(
+        MoonshineStreamingForConditionalGeneration,
+        task="speech-to-text",
+        config_class=MoonshineStreamingConfig,
     ),
     # --- Encoder-only ---
     "albert": ModelRegistration(BertModel, task="feature-extraction"),
@@ -653,7 +957,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "electra": ModelRegistration(BertModel, task="feature-extraction"),
     "ernie": ModelRegistration(BertModel, task="feature-extraction"),
     "ernie_m": ModelRegistration(BertModel, task="feature-extraction"),
-    "esm": ModelRegistration(BertModel, task="feature-extraction"),
+    "esm": ModelRegistration(EsmModel, task="feature-extraction", config_class=EsmConfig),
     "flaubert": ModelRegistration(BertModel, task="feature-extraction"),
     "ibert": ModelRegistration(BertModel, task="feature-extraction"),
     "layoutlm": ModelRegistration(BertModel, task="feature-extraction"),
@@ -665,6 +969,33 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "megatron-bert": ModelRegistration(BertModel, task="feature-extraction"),
     "mobilebert": ModelRegistration(BertModel, task="feature-extraction"),
     "modernbert": ModelRegistration(ModernBertModel, task="feature-extraction"),
+    "eurobert_gguf": ModelRegistration(
+        EuroBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "jina_bert_v2_gguf": ModelRegistration(
+        JinaBertV2GGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "jina_bert_v3_gguf": ModelRegistration(
+        JinaBertV3GGUFModel,
+        task="gguf-encoder-feature-extraction",
+        test_model_id="jinaai/jina-embeddings-v3",
+        test_revision="ab036b023d30b4d1138c4c3bfa9f0c445ab455d6",
+    ),
+    "neo_bert_gguf": ModelRegistration(
+        NeoBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "nomic_bert_gguf": ModelRegistration(
+        NomicBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "nomic_bert_moe_gguf": ModelRegistration(
+        NomicBertMoEGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "gemma_embedding_gguf": ModelRegistration(
+        GemmaEmbeddingGGUFModel, task="gguf-embedding-feature-extraction"
+    ),
+    "llama_embed_gguf": ModelRegistration(
+        LlamaEmbedGGUFModel, task="gguf-embedding-feature-extraction"
+    ),
     "mpnet": ModelRegistration(BertModel, task="feature-extraction"),
     "mra": ModelRegistration(BertModel, task="feature-extraction"),
     "nezha": ModelRegistration(BertModel, task="feature-extraction"),
@@ -683,7 +1014,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "xmod": ModelRegistration(BertModel, task="feature-extraction"),
     "yoso": ModelRegistration(BertModel, task="feature-extraction"),
     # --- Absolute positional embeddings (non-RoPE) ---
-    "biogpt": ModelRegistration(GPT2CausalLMModel),
+    "biogpt": ModelRegistration(ScaledEmbeddingGPT2CausalLMModel),
     "ctrl": ModelRegistration(CTRLCausalLMModel),
     "gpt-sw3": ModelRegistration(GPT2CausalLMModel),
     "gpt2": ModelRegistration(GPT2CausalLMModel),
@@ -692,7 +1023,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "imagegpt": ModelRegistration(GPT2CausalLMModel),
     "openai-gpt": ModelRegistration(GPT2CausalLMModel),
     "opt": ModelRegistration(OPTCausalLMModel),
-    "xglm": ModelRegistration(GPT2CausalLMModel),
+    "xglm": ModelRegistration(ScaledEmbeddingGPT2CausalLMModel),
     "xlm": ModelRegistration(XLMCausalLMModel),
     # --- Encoder-decoder ---
     "bart": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
@@ -715,6 +1046,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "prophetnet": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
     "switch_transformers": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
     "t5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "t5encoder": ModelRegistration(T5EncoderModel, task="t5-text-encoding"),
     "trocr": ModelRegistration(TrOCRForConditionalGeneration, task="seq2seq"),
     "umt5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
     "xlm-prophetnet": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
@@ -771,7 +1103,23 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "wav2vec2-conformer": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "wavlm": ModelRegistration(Wav2Vec2Model, task="audio-feature-extraction"),
     "mms": ModelRegistration(Wav2Vec2ForCTCModel, task="ctc-asr", config_class=MMSConfig),
+    "parakeet_ctc": ModelRegistration(
+        ParakeetForCTCModel,
+        task="feature-ctc-asr",
+        config_class=ParakeetCTCConfig,
+    ),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
+    "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
+    "reuse": ModelRegistration(
+        SEMambaSpeechEnhancementModel,
+        task="speech-enhancement",
+        config_class=ReUseConfig,
+    ),
+    "semamba": ModelRegistration(
+        SEMambaSpeechEnhancementModel,
+        task="speech-enhancement",
+        config_class=ReUseConfig,
+    ),
 }
 
 
@@ -780,7 +1128,14 @@ def _create_default_registry() -> ModelRegistry:
     reg = ModelRegistry()
     for arch, entry in _REGISTRATIONS.items():
         reg.register(
-            arch, entry.module_class, task=entry.task, config_class=entry.config_class
+            arch,
+            entry.module_class,
+            task=entry.task,
+            config_class=entry.config_class,
+            test_model_id=entry.test_model_id,
+            family=entry.family,
+            variant=entry.variant,
+            test_revision=entry.test_revision,
         )
     # Attach test_model_id, family, and variant metadata to registrations.
     _apply_test_metadata(reg)
@@ -796,6 +1151,16 @@ def _create_default_registry() -> ModelRegistry:
 # idempotent: a text-only model_type maps to itself so ``text_only=True`` is a
 # no-op when the resolved type is already text-only.
 _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
+    "muse_glimmer": "muse_glimmer_text",
+    "muse_glimmer_text": "muse_glimmer_text",
+    "gemma3n": "gemma3n_text",
+    "gemma3n_text": "gemma3n_text",
+    # Shipped Gemma 4 multimodal checkpoints (e.g. ``google/gemma-4-E2B-it``)
+    # declare ``model_type="gemma4"`` with a nested ``text_config`` whose own
+    # ``model_type`` is ``gemma4_text``. Both resolve to the same
+    # ``Gemma4CausalLMModel`` backbone, so ``text_only=True`` is supported.
+    "gemma4": "gemma4_text",
+    "gemma4_text": "gemma4_text",
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
     # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
@@ -804,6 +1169,10 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     # so the text-only override keys off the VL type here.
     "qwen3_5_moe_vl": "qwen3_5_moe_text",
     "qwen3_5_moe_text": "qwen3_5_moe_text",
+    # Qwen3.8 Flash-Next is published as a multimodal qwen4_exp composite.
+    # text_only=True selects the same exact decoder without the vision stages.
+    "qwen4_exp": "qwen4_exp_text",
+    "qwen4_exp_text": "qwen4_exp_text",
 }
 
 
@@ -816,8 +1185,14 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llama": "meta-llama/Llama-3.2-1B",
     "mistral": "mistralai/Mistral-7B-v0.1",
     "qwen2": "Qwen/Qwen2.5-0.5B",
+    "qwen4_exp": "Qwen/Qwen3.8-Flash-Next",
+    "qwen4_exp_text": "unsloth/Qwen3.8-Flash-Next-FP8",
+    "Qwen4ExpForConditionalGeneration": "Qwen/Qwen3.8-Flash-Next",
+    "plamo2": "pfnet/plamo-2-1b",
     "cohere": "CohereForAI/c4ai-command-r7b-12-2024",
     "cohere2": "CohereForAI/c4ai-command-r7b-12-2024",
+    "cosmos3_edge": "nvidia/Cosmos3-Edge",
+    "cosmos3_edge_text": "nvidia/Cosmos3-Edge",
     "exaone": "LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct",
     "glm": "THUDM/glm-4-9b-chat-hf",
     "glm4": "THUDM/glm-4-9b-chat-hf",
@@ -832,6 +1207,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "baichuan": "baichuan-inc/Baichuan2-7B-Chat",
     "apertus": "swiss-ai/Apertus-8B-Instruct-2509",
     "arcee": "arcee-ai/AFM-4.5B-Base",
+    "bitnet": "microsoft/bitnet-b1.58-2B-4T",
+    "talkie": "PocketAiHub/talkie-1930-13b-it-GGUF",
     "diffllama": "kajuma/DiffLlama-0.3B-handcut",
     "doge": "SmallDoge/Doge-20M",
     "dots1": "rednote-hilab/dots.llm1.inst",
@@ -848,26 +1225,35 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "zamba2": "Zyphra/Zamba2-1.2B",
     "codegen2": "Salesforce/codegen2-1B",
     "command_r": "CohereForAI/c4ai-command-r-v01",
+    "jais2": "inceptionai/Jais-2-8B-Chat",
+    "kclgpt": "WisdomShell/CodeShell-7B",
     "csm": "sesame/csm-1b",
     "evolla": "westlake-repl/Evolla-10B-hf",
     "nemotron_h": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
+    "nemotron_parse": "nvidia/NVIDIA-Nemotron-Parse-2.0",
     "open-llama": "openlm-research/open_llama_3b",
+    "orion": "OrionStarAI/Orion-14B-Base",
     "persimmon": "adept/persimmon-8b-base",
     "shieldgemma2": "google/shieldgemma-2b",
     "solar_open": "upstage/solar-pro-preview-instruct",
 
     # --- CausalLM (architecture-specific) ---
     "falcon": "tiiuae/falcon-7b",
+    "falcon_h1": "tiiuae/Falcon-H1-Tiny-90M-Base",
     "bloom": "bigscience/bloom-560m",
     "gemma": "google/gemma-2b",
     "gemma2": "google/gemma-2-2b",
     "gemma3": "google/gemma-3-4b-it",
     "gemma3_text": "google/gemma-3-1b-pt",
-    "gemma3n": "google/gemma-3n-E2B-pt",
-    "gemma3n_text": "google/gemma-3n-E2B-pt",
+    "gemma_embedding_gguf": "unsloth/embeddinggemma-300m-GGUF",
+    # No text-only gemma3n checkpoint was ever published; the -it releases are
+    # multimodal, and "gemma3n_text" reaches the text path via _TEXT_ONLY_MODEL_TYPE.
+    "gemma3n": "google/gemma-3n-E4B-it",
+    "gemma3n_text": "google/gemma-3n-E2B-it",
     "gemma4_text": "google/gemma-4-E2B-it",
     "granite": "ibm-granite/granite-3.3-2b-instruct",
     "internlm2": "internlm/internlm2_5-7b-chat",
+    "llama_embed_gguf": "mradermacher/llama-embed-nemotron-8b-GGUF",
     "nemotron": "nvidia/Nemotron-Mini-4B-Instruct",
     "olmo": "allenai/OLMo-1B-hf",
     "olmo2": "allenai/OLMo-2-1124-7B",
@@ -886,9 +1272,9 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "biogpt": "microsoft/biogpt",
     "chatglm": "zai-org/chatglm2-6b",
     "codegen": "Salesforce/codegen-350M-mono",
+    "cosmos3_omni": "nvidia/Cosmos3-Nano",
     "ctrl": "Salesforce/ctrl",
     "ernie4_5": "baidu/ERNIE-4.5-0.3B-PT",
-    "falcon_h1": "tiiuae/Falcon-H1-0.5B-Base",
     "gpt-sw3": "AI-Sweden-Models/gpt-sw3-356m",
     "gpt_bigcode": "bigcode/gpt_bigcode-santacoder",
     "gpt_neo": "EleutherAI/gpt-neo-125m",
@@ -899,11 +1285,13 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "imagegpt": "openai/imagegpt-small",
     "openai-gpt": "openai-community/openai-gpt",
     "xglm": "facebook/xglm-564M",
+    "xverse": "xverse/XVERSE-7B",
     "xlm": "FacebookAI/xlm-mlm-en-2048",
 
     # --- Mixture of Experts ---
     "mixtral": "mistralai/Mixtral-8x7B-v0.1",
     "phimoe": "microsoft/Phi-tiny-MoE-instruct",
+    "phimoe_gguf": "microsoft/Phi-tiny-MoE-instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_5_moe": "Qwen/Qwen3.5-MoE-A3B-128K",
@@ -914,13 +1302,19 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "dbrx": "databricks/dbrx-instruct",
     "arctic": "Snowflake/snowflake-arctic-instruct",
     "jetmoe": "jetmoe/jetmoe-8b",
+    "kimi_linear": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
     "longcat_flash": "yujiepan/longcat-flash-tiny-random",
     "minimax": "MiniMaxAI/MiniMax-Text-01",
     "ernie4_5_moe": "baidu/ERNIE-4.5-21B-A3B-PT",
+    "bailing_moe": "baidu/ERNIE-4.5-21B-A3B-PT",
     "flex_olmo": "allenai/Flex-reddit-2x7B-1T",
     "glm4_moe": "zai-org/GLM-4.5-Air",
     "granitemoehybrid": "ibm-granite/granite-4.0-tiny-preview",
     "granitemoeshared": "ibm-research/moe-7b-1b-active-shared-experts",
+    "kimi_k3": "yujiepan/kimi-k3-tiny-random",
+    "lfm2_moe": "LiquidAI/LFM2-8B-A1B",
+    "MiniMaxText01": "MiniMaxAI/MiniMax-Text-01",
+    "minimax_text_01": "MiniMaxAI/MiniMax-Text-01",
     "qwen3_omni_moe": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     "qwen3_vl_moe": "Qwen/Qwen3-VL-30B-A3B-Instruct",
 
@@ -928,7 +1322,10 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
+    "deepseek": "deepseek-ai/DeepSeek-V3",
     "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
+    # --- GLM-5.2 (MLA + DSA + MoE) ---
+    "glm_moe_dsa": "zai-org/GLM-5.2",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -938,22 +1335,27 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Hybrid SSM+Attention ---
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
+    "lfm2": "LiquidAI/LFM2.5-230M",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
     "qwen2_vl_text": "Qwen/Qwen2-VL-2B-Instruct",
     "qwen2_5_vl": "Qwen/Qwen2.5-VL-3B-Instruct",
     "qwen2_5_vl_text": "Qwen/Qwen2.5-VL-3B-Instruct",
+    "glm_ocr": "zai-org/GLM-OCR",
     "qwen3_vl": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_vl_text": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_5": "Qwen/Qwen3.5-2B",
     "llava": "llava-hf/llava-1.5-7b-hf",
     "llava_next": "llava-hf/llava-v1.6-mistral-7b-hf",
     "mllama": "meta-llama/Llama-3.2-11B-Vision-Instruct",
+    "muse_glimmer": "meta-models/Muse-Glimmer-30B",
+    "muse_glimmer_text": "meta-models/Muse-Glimmer-30B",
     "gemma4": "google/gemma-4-E2B-it",
     "gemma4_unified": "google/gemma-4-12B",
     "gemma4_unified_text": "google/gemma-4-12B",
     "internvl2": "OpenGVLab/InternVL2-1B",
+    "mage_vl": "microsoft/Mage-VL",
     "phi4mm": "microsoft/Phi-4-multimodal-instruct",
     "phi4_multimodal": "microsoft/Phi-4-multimodal-instruct",
     "phi3_v": "microsoft/Phi-3.5-vision-instruct",
@@ -966,6 +1368,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llava_onevision": "llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
     "molmo": "allenai/MolmoE-1B-0924",
     "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
+    "minicpmv4_6": "openbmb/MiniCPM-V-4.6",
+    "lfm2_vl": "LiquidAI/LFM2.5-VL-3B",
     "aya_vision": "CohereForAI/aya-vision-8b",
     "chameleon": "facebook/chameleon-7b",
     "cohere2_vision": "CohereForAI/c4ai-command-r7b-12-2024",
@@ -975,10 +1379,11 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "fuyu": "adept/fuyu-8b",
     "glm4v": "THUDM/glm-4v-9b",
     "glm4v_moe": "THUDM/glm-4v-9b",
-    "glm4v_moe_text": "THUDM/glm-4v-9b",
+    "glm4v_moe_text": "zai-org/GLM-4.5V",
     "glm4v_text": "THUDM/glm-4v-9b",
     "got_ocr2": "stepfun-ai/GOT-OCR2_0",
     "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
+    "neo_chat": "sensenova/SenseNova-U1.5-8B-MoT",
     "instructblipvideo": "Salesforce/instructblip-flan-t5-xl",
     "internvl": "OpenGVLab/InternVL2-1B",
     "internvl_chat": "OpenGVLab/InternVL-Chat-V1-5",
@@ -997,11 +1402,15 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "vipllava": "llava-hf/vip-llava-7b-hf",
 
     # --- Speech ---
+    "moonshine": "moonshine-ai/moonshine-tiny",
+    "moonshine_streaming": "moonshine-ai/moonshine-streaming-tiny",
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
+    "glmasr": "zai-org/GLM-ASR-Nano-2512",
     "sensevoice_small": "mlx-community/SenseVoiceSmall",
     "mms": "facebook/mms-300m",
+    "parakeet_ctc": "nvidia/parakeet-ctc-1.1b",
     "speecht5": "microsoft/speecht5_asr",
     "sew": "asapp/sew-tiny-100k",
     "sew-d": "asapp/sew-d-tiny-100k",
@@ -1168,10 +1577,13 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_5": "qwen",
     "qwen3_5_moe_vl": "qwen",
     "qwen3_5_vl": "qwen",
+    "qwen4_exp": "qwen",
+    "qwen4_exp_text": "qwen",
     "qwen3_omni_moe": "qwen",
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
     "fun_asr": "qwen",
+    "glmasr": "glm",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",
@@ -1179,6 +1591,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "deepseek_v3": "deepseek",
     "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
+    "glm_moe_dsa": "glm",
     "olmo": "olmo",
     "olmo2": "olmo",
     "olmo3": "olmo",
@@ -1186,6 +1599,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "llama": "llama",
     "code_llama": "llama",
     "llama4_text": "llama",
+    "lfm2": "lfm",
+    "lfm2_vl": "lfm",
     "mllama": "llama",
     "mistral": "mistral",
     "mistral3": "mistral",
@@ -1194,7 +1609,6 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "mixtral": "mistral",
     "pixtral": "mistral",
     "falcon": "falcon",
-    "falcon_h1": "falcon",
     "falcon_mamba": "falcon",
     "mamba": "mamba",
     "mamba2": "mamba",
@@ -1250,13 +1664,15 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
     "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
+    "glm_moe_dsa": "mla+dsa-indexshare+full-attention-fallback+moe",
     "phi3small": "blocksparse",
-    "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",
     "mamba2": "ssm",
     "falcon_mamba": "ssm",
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
+    "lfm2": "hybrid-conv+attn",
+    "lfm2_vl": "siglip2-naflex+hybrid-conv+attn",
     "qwen3_next": "moe+linear-attn",
 }
 

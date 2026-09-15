@@ -11,13 +11,16 @@ from mobius._configs import ArchitectureConfig
 from mobius.components import (
     MLP,
     Attention,
-    Embedding,
     RMSNorm,
     create_attention_bias,
     create_decoder_layer,
     initialize_rope,
 )
-from mobius.models.base import CausalLMModel
+from mobius.models.base import (
+    CausalLMModel,
+    embedding_for_config,
+    linear_class_for_config,
+)
 
 
 class _WeightFreeLayerNorm(nn.Module):
@@ -46,10 +49,10 @@ class _WeightFreeLayerNorm(nn.Module):
 class _OlmoDecoderLayer(nn.Module):
     """OLMo decoder layer with weight-free LayerNorm."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, linear_class=None):
         super().__init__()
-        self.self_attn = Attention(config)
-        self.mlp = MLP(config)
+        self.self_attn = Attention(config, linear_class=linear_class)
+        self.mlp = MLP(config, linear_class=linear_class)
         self.input_layernorm = _WeightFreeLayerNorm(config.hidden_size)
         self.post_attention_layernorm = _WeightFreeLayerNorm(config.hidden_size)
 
@@ -87,11 +90,13 @@ class _OlmoTextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        linear_class = linear_class_for_config(config)
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
-            [_OlmoDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                _OlmoDecoderLayer(config, linear_class=linear_class)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
         self.norm = _WeightFreeLayerNorm(config.hidden_size)
         self.rotary_emb = initialize_rope(config)
@@ -143,7 +148,7 @@ class OLMoCausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = _OlmoTextModel(config)
+        self._replace_text_model(_OlmoTextModel(config))
 
 
 class _PostNormTextModel(nn.Module):
@@ -152,12 +157,11 @@ class _PostNormTextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        linear_class = linear_class_for_config(config)
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [
-                create_decoder_layer(config, post_norm=True)
+                create_decoder_layer(config, post_norm=True, linear_class=linear_class)
                 for _ in range(config.num_hidden_layers)
             ]
         )
@@ -207,4 +211,4 @@ class OLMo2CausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = _PostNormTextModel(config)
+        self._replace_text_model(_PostNormTextModel(config))

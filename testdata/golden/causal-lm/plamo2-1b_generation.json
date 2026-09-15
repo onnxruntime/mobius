@@ -1,0 +1,27 @@
+{
+  "model_id": "pfnet/plamo-2-1b",
+  "prompt": "Hello",
+  "generated_tokens": [
+    44,
+    2268,
+    1101,
+    1080,
+    1087,
+    8789,
+    45114,
+    2002,
+    3104,
+    1131,
+    1385,
+    1031,
+    73,
+    39,
+    109,
+    2569,
+    3648,
+    353,
+    32,
+    79135
+  ],
+  "generated_text": ", I'm new to this forum and am looking for some help.\n\nI'm trying to install a 'm trying to Raspberry Pi"
+}

@@ -77,14 +77,16 @@ jobs:
         if: inputs.device != 'cuda'
         run: pip install onnxruntime
 
-      - name: Install onnxruntime (GPU)
-        if: inputs.device == 'cuda'
-        run: pip install onnxruntime-gpu
-
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
           pip install -e '.[testing,transformers]'
+
+      - name: Install onnxruntime (GPU)
+        if: inputs.device == 'cuda'
+        run: |
+          # Install after project dependencies so the CPU ORT package cannot overwrite it.
+          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
 
       - name: Reject trust_remote_code cases
         run: |
