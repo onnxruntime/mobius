@@ -78,6 +78,10 @@ class EpCapabilities:
             DecomposeAttention.  ``True`` leaves the fused op unchanged.  Set
             ``False`` only for runtimes without an ``Attention`` kernel (QNN
             HTP), where the fused op would otherwise be forced onto CPU.
+        supports_attention_nonpad_kv_seqlen: Whether native Attention consumes
+            valid static-cache lengths. When ``False``, static-cache exports
+            require an explicit causal/valid-length bias and omit Attention's
+            nonpad input. Standalone TensorRT 11.3 ignores that native input.
         supports_rotary_embedding: ``False`` decomposes the opset-24
             ``RotaryEmbedding`` op into rotate-half primitives (Reshape/Slice/
             Mul/Sub/Add/Concat) via DecomposeRotaryEmbedding.  ``True`` leaves
@@ -162,6 +166,7 @@ class EpCapabilities:
     supports_tensor_scatter: bool = True
     supports_range: bool = True
     supports_fp8_kv_cache: bool = False
+    supports_attention_nonpad_kv_seqlen: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -371,6 +376,7 @@ def _register_builtins() -> None:
         EpCapabilities(
             name="tensorrt",
             static_cache_layout="heads_first",
+            supports_attention_nonpad_kv_seqlen=False,
             gqa_dtypes=frozenset(),
             qkv_pack_dtypes=frozenset(),
             supports_skip_layer_norm=False,

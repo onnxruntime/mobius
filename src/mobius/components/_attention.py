@@ -9,6 +9,7 @@ from typing import NamedTuple
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm
@@ -72,6 +73,7 @@ class StaticCacheState(NamedTuple):
     value_cache: ir.Value
     write_indices: ir.Value
     nonpad_kv_seqlen: ir.Value
+
     @property
     def sequence_axis(self) -> int:
         shape = self.key_cache.shape
@@ -167,7 +169,7 @@ def _apply_attention(
 
             value = op.Reshape(value, [0, 0, num_key_value_heads, -1])
             value = op.Transpose(value, perm=[0, 2, 1, 3])
-        
+
         updated_k = op.TensorScatter(
             static_cache.key_cache,
             key,
@@ -195,8 +197,8 @@ def _apply_attention(
         #     bidirectional unmasking encoded in the bias.  This routes ORT to
         #     the MEA external-cache path (Flash is precluded by any bias).
         #
-        # nonpad_kv_seqlen stays as input #6 in BOTH modes: it bounds the valid
-        # KV prefix and, on the CUDA Flash path, drives the fully-masked-row
+        # On supporting EPs, nonpad_kv_seqlen stays as input #6 in BOTH modes.
+        # It bounds the valid KV prefix and, on CUDA Flash, drives the fully-masked-row
         # zero guard (LaunchZeroFullyMaskedRows).  In bias mode the additive
         # bias already encodes the same ``slot < nonpad`` validity.  The
         # cross-repo invariant is ``nonpad == write_indices + valid_token_count``
@@ -216,6 +218,14 @@ def _apply_attention(
         else:
             mask_arg, causal = None, 1
 
+        supports_nonpad = ep_capabilities().supports_attention_nonpad_kv_seqlen
+        if not supports_nonpad and attn_mask is None:
+            raise ValueError(
+                "This execution provider requires an explicit static-cache attention bias"
+            )
+        # Unsupported EPs use the bias's slot-validity test instead of input #6.
+        nonpad_input = static_cache.nonpad_kv_seqlen if supports_nonpad else None
+
         head_attrs: dict[str, int] = {}
         if not heads_first:
             head_attrs = {
@@ -230,7 +240,7 @@ def _apply_attention(
             mask_arg,
             None,
             None,
-            static_cache.nonpad_kv_seqlen,
+            nonpad_input,
             scale=scale,
             softcap=softcap,
             is_causal=causal,
@@ -243,7 +253,6 @@ def _apply_attention(
             attn_output = op.Reshape(attn_output, [0, 0, -1])
 
         return attn_output, updated_k, updated_v
-
 
     # Dynamic cache mode: standard Attention with past KV concatenation.
     # is_causal=1 enables built-in causal masking, eliminating the need for
