@@ -351,7 +351,7 @@ class TestGemma4EmbeddingModel:
 class TestGemma4PerLayerInputLayout:
     @pytest.mark.parametrize(
         ("execution_provider", "expected_rank"),
-        [("default", 3), ("openvino", 4)],
+        [("default", 3), ("onnx-standard", 3), ("openvino", 4)],
     )
     def test_layout_matches_execution_provider(self, execution_provider, expected_rank):
         from mobius._builder import build_from_module
