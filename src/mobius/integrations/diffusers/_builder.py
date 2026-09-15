@@ -111,6 +111,7 @@ def _init_diffusers_class_map() -> None:
     if _DIFFUSERS_CLASS_MAP:
         return
 
+    from mobius._configs import Cosmos3OmniGeneratorConfig, WanVAEConfig
     from mobius.integrations.diffusers._configs import (
         CLIPTextConfig,
         CogVideoXConfig,
@@ -134,6 +135,7 @@ def _init_diffusers_class_map() -> None:
         AutoencoderKLCogVideoXModel,
         CogVideoXVAEConfig,
     )
+    from mobius.models.cosmos3_omni_generator import Cosmos3OmniGeneratorModel
     from mobius.models.dit import DiTConfig, DiTTransformer2DModel
     from mobius.models.flux_sd3 import (
         FluxConfig,
@@ -155,6 +157,7 @@ def _init_diffusers_class_map() -> None:
     from mobius.models.t5 import T5EncoderModel
     from mobius.models.unet import UNet2DConditionModel
     from mobius.models.vae import AutoencoderKLModel
+    from mobius.models.wan_vae import AutoencoderKLWanModel
 
     _DIFFUSERS_CLASS_MAP.update(
         {
@@ -201,6 +204,16 @@ def _init_diffusers_class_map() -> None:
                 CogVideoXTransformer3DModel,
                 CogVideoXConfig,
                 "video-denoising",
+            ),
+            "Cosmos3OmniTransformer": (
+                Cosmos3OmniGeneratorModel,
+                Cosmos3OmniGeneratorConfig,
+                "cosmos3-omni-generator",
+            ),
+            "AutoencoderKLWan": (
+                AutoencoderKLWanModel,
+                WanVAEConfig,
+                "wan-vae",
             ),
             "Qwen3ForCausalLM": (
                 MiniMaxMusic3LanguageModel,
@@ -486,6 +499,7 @@ def build_diffusers_pipeline(
     unet_loras: dict | None = None,
     components: set[str] | None = None,
     execution_provider: str = "default",
+    trace_optimization: bool = False,
     workflow_config: HierarchicalAudioWorkflowConfig | None = None,
 ) -> ModelPackage:
     """Build ONNX models for all supported components in a diffusers pipeline.
@@ -509,7 +523,9 @@ def build_diffusers_pipeline(
             adapter weights.
         components: Optional component-name allowlist. Non-neural pipeline metadata
             is still retained so a single-component export preserves its contract.
-        execution_provider: Target execution provider for EP-aware graph optimization.
+        execution_provider: Target execution provider for component-specific
+            optimization and lowering.
+        trace_optimization: Whether to log each component optimization stage.
         workflow_config: Optional typed, model-agnostic workflow description for
             pipelines whose ONNX GenAI execution cannot be derived from the graphs
             alone (currently hierarchical audio). When omitted, mobius supplies the
@@ -606,6 +622,7 @@ def build_diffusers_pipeline(
             config,
             task_name,
             execution_provider=execution_provider,
+            trace_optimization=trace_optimization,
         )
 
         # Flatten sub-package into the top-level package

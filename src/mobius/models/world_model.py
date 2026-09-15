@@ -1,25 +1,25 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Minimal directly declared world-model implementation."""
+"""Minimal directly declared latent-dynamics implementation."""
 
 from __future__ import annotations
 
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import WorldModelConfig
+from mobius._configs import LatentDynamicsConfig
 from mobius.components import Linear, get_activation
 
 
-class MLPWorldModel(nn.Module):
-    """Deterministic MLP reference model for the world-model task contract."""
+class MLPLatentDynamicsModel(nn.Module):
+    """Deterministic MLP reference model for the latent-dynamics contract."""
 
-    default_task = "world-model"
-    config_class = WorldModelConfig
-    category = "World Model"
+    default_task = "latent-dynamics"
+    config_class = LatentDynamicsConfig
+    category = "World Model / Dynamics"
 
-    def __init__(self, config: WorldModelConfig):
+    def __init__(self, config: LatentDynamicsConfig):
         super().__init__()
         config.validate()
         self.config = config
@@ -85,3 +85,8 @@ class MLPWorldModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Return weights unchanged; provided for parity with other Mobius models."""
         return state_dict
+
+
+# Kept for source compatibility. This model is one possible dynamics component,
+# not a complete world-model pipeline.
+MLPWorldModel = MLPLatentDynamicsModel

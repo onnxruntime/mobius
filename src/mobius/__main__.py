@@ -35,6 +35,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "fp8-kv-cache": "fp8_kv_cache",
     "prune-prefill-prefix": "prune_prefill_prefix",
     "text-only": "text_only",
+    "world-model": "world_model",
     "glm-full-attention": "glm_full_attention",
     "paged-attention": "export_paged_attention",
 }
@@ -227,6 +228,41 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "--component selects a component of a diffusers pipeline."
         )
 
+    if args.world_model:
+        incompatible = [
+            feature
+            for feature, enabled in (
+                ("static-cache", args.static_cache),
+                ("fp8-kv-cache", args.fp8_kv_cache),
+                ("prune-prefill-prefix", args.prune_prefill_prefix),
+                ("text-only", args.text_only),
+                ("glm-full-attention", args.glm_full_attention),
+                ("paged-attention", args.export_paged_attention),
+            )
+            if enabled
+        ]
+        if incompatible:
+            names = ", ".join(incompatible)
+            raise SystemExit(
+                "Error: --features world-model cannot be combined with "
+                f"decoder-specific feature(s): {names}."
+            )
+        if args.task is not None:
+            raise SystemExit(
+                "Error: --features world-model cannot be combined with --task. "
+                "A world-model builder composes multiple tasks."
+            )
+        if args.component is not None:
+            raise SystemExit(
+                "Error: --features world-model cannot be combined with --component. "
+                "A complete pipeline must be saved atomically with its manifest."
+            )
+        if args.runtime is not None:
+            raise SystemExit(
+                "Error: --features world-model emits a runtime-agnostic pipeline "
+                "manifest and cannot be combined with --runtime."
+            )
+
     load_weights = not args.no_weights
     keep_quantized = not getattr(args, "dequantize", False)
     task: str | ModelTask | None = args.task
@@ -294,6 +330,19 @@ def _cmd_build(args: argparse.Namespace) -> None:
     optimize = args.optimize
     component_filter = args.component
     execution_provider = args.execution_provider
+
+    if args.world_model:
+        from mobius._world_model_builder import build_world_model
+
+        source = args.config or args.model
+        pkg = build_world_model(
+            source,
+            dtype=dtype_override,
+            load_weights=load_weights,
+            execution_provider=execution_provider,
+        )
+        _save_package(pkg, output_dir, args, optimize, component_filter=None)
+        return
 
     # Auto-detect diffusers pipelines. Skipped when the text-only feature is set:
     # that flag only applies to transformers decoder exports, so we let the
