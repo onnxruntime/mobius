@@ -25,6 +25,7 @@ from onnx_ir import tensor_adapters
 from onnxscript import nn
 
 from mobius._build_context import build_context
+from mobius._component_manifest import ComponentManifest
 from mobius._component_quantization import configure_component_quantization
 from mobius._configs import BaseModelConfig
 from mobius._execution_providers import ep_registry
@@ -137,6 +138,7 @@ def build_from_module(
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
+    component_manifest: ComponentManifest | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -162,8 +164,12 @@ def build_from_module(
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)
     resolved_task = get_task(task)
-    component_manifest = resolved_task.component_manifest()
-    configure_component_quantization(module, config, resolved_task)
+    component_manifest = configure_component_quantization(
+        module,
+        config,
+        resolved_task,
+        manifest=component_manifest,
+    )
     _cast_module_dtype(module, dtype)
     capabilities = ep_registry.require(execution_provider)
     with build_context(capabilities, dtype):

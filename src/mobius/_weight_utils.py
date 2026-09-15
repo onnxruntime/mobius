@@ -1158,6 +1158,7 @@ def preprocess_quantized_weights(
     qmoe_target_path: str | None = None,
     qmoe_quant_methods: Collection[str] = ("gptq", "awq", "olive"),
     reject_quantized_embeddings_lm_head: bool = False,
+    defer_non_expert_sidecars: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Apply shared quantization conversion, tying, and QMoE packing.
 
@@ -1174,6 +1175,9 @@ def preprocess_quantized_weights(
             the config matches the native QMoE ABI.
         reject_quantized_embeddings_lm_head: Reject packed embedding/head
             weights because the caller's graph requires float parameters.
+        defer_non_expert_sidecars: Keep ordinary packed sidecars raw for the
+            component loader to resolve per-projection layouts. Expert packing
+            and float weight tying still run here.
 
     Returns:
         The preprocessed weight dictionary.
@@ -1266,6 +1270,16 @@ def preprocess_quantized_weights(
             f"initializers currently require float weights.{packed_key_detail}"
         )
 
+    deferred = {}
+    if defer_non_expert_sidecars:
+        deferred = {
+            key: value
+            for key, value in state_dict.items()
+            if is_packed_quant_key(key)
+            and not (qmoe_target_path is not None and ".experts." in key)
+        }
+        state_dict = {key: value for key, value in state_dict.items() if key not in deferred}
+
     if quantization is not None and quantization.quant_method == "gptq":
         state_dict = preprocess_gptq_weights(
             state_dict, bits=quantization.bits, group_size=quantization.group_size
@@ -1293,6 +1307,7 @@ def preprocess_quantized_weights(
             return_state_dict = pack_qmoe_expert_weights(
                 return_state_dict, target_moe_path=qmoe_target_path
             )
+        return_state_dict.update(deferred)
         return return_state_dict
 
     tied_quantized_table = (
@@ -1307,4 +1322,5 @@ def preprocess_quantized_weights(
             state_dict, qmoe_target_path=qmoe_target_path
         )
         state_dict = pack_qmoe_expert_weights(state_dict, target_moe_path=qmoe_target_path)
+    state_dict.update(deferred)
     return state_dict

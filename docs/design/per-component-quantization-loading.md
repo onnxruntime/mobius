@@ -186,6 +186,12 @@ Every consumer uses the same manifest:
 An unresolved component is a typed error. Consumers must not independently
 guess aliases or state-dict prefixes.
 
+Dynamic `get_hf_component_sources(model_type=..., hf_config=...)` hooks use the
+explicit model type, or `hf_config.model_type` when it is not supplied. If neither
+is available, the dynamic hook is skipped without guessing static source paths.
+Classes without a dynamic hook still publish their `HF_COMPONENT_SOURCES` for
+manually constructed configs that omit the model type.
+
 ### Mapping local module paths to HuggingFace names
 
 Quantizer metadata names runtime HuggingFace modules, while graph construction
@@ -202,6 +208,17 @@ then applies the producer's exact/regex semantics to those candidates.
 Architectures whose names cannot be aligned structurally declare explicit path
 aliases on their component descriptor; individual loaders must not invent
 their own mapping.
+
+Component-owned source roots also prefix local descendants without a shared
+anchor segment, such as T5's `encoder` and `decoder` stacks. Models can publish
+static `HF_COMPONENT_MODULE_ALIASES` or implement
+`get_hf_component_module_aliases(hf_config=...)` when aliases
+depend on configuration, such as distinct encoder and decoder layer counts.
+These config-based aliases do not require a model type and remain available
+for manually constructed T5 configs.
+An existing alias or separately declared source takes precedence over
+synthesizing a component-root name; a top-level `lm_head` must not also become
+`decoder.lm_head` for rule matching.
 
 ## 2. Component quantization manifest
 
@@ -239,8 +256,17 @@ class ComponentQuantizationPlan:
 `modules_to_not_convert` is evaluated for each candidate HuggingFace module
 name while the component is constructed. A matching module remains a normal
 `Linear`; other eligible projections use the component's packed layout.
+Literal exclusions and overrides match the complete module path or a
+dot-separated descendant, never an arbitrary substring: `model.layers.1`
+matches `model.layers.1.self_attn` but not `model.layers.10`. Patterns prefixed
+with `re:` continue to use full-match regular expressions.
 Different packed layouts inside one component require per-module overrides and
 must be represented explicitly rather than inferred from a root plan.
+
+Legacy model-wide module rules apply when the resolved manifest owns one
+component, regardless of its package key. Graph construction and normalization
+use the same manifest-based decision; passing a one-component subset of a
+multi-component package does not enable those rules.
 
 ## 3. Component-specific construction
 
@@ -264,6 +290,15 @@ linear_class = component_plan.linear_class_for(
 This keeps `per_layer_input_gate`, `per_layer_projection`, and other explicit
 float exceptions as ordinary `Linear` modules without weakening the rest of a
 quantized decoder.
+
+Graph construction and packed-weight normalization use the same effective
+module policy. Model-declared `COMPONENT_OUTPUT_HEADS` stay float unless
+`quantize_lm_head` is enabled. A module's
+`component_quantization_excluded_methods` applies to that module and all its
+descendants; selecting a quantized component must not override this invariant.
+This includes the deliberately floating-point shared-expert gates in Qwen2-MoE
+and Qwen3-Next. `quantize_embeddings` converts input token tables identified by
+their local or aliased source names, not learned positional embeddings.
 
 This replaces post-construction scanning that tries to swap `Linear` instances
 after a model has already encoded architecture-specific choices.
@@ -310,8 +345,10 @@ class WeightRecord:
 ```
 
 Grouping prevents several raw sidecar keys from being renamed, split, or
-overwritten independently. A missing scale or zero point is detected before
-any architecture transform executes.
+overwritten independently. Missing scales are rejected during grouping.
+Zero-point requirements are validated after resolving the module's effective
+symmetry, since an override may make one projection symmetric inside an
+otherwise asymmetric component.
 
 `WeightBundle` owns records for one component:
 
@@ -330,13 +367,20 @@ Format-specific layout handling lives in a registry:
 class QuantizationCodec(Protocol):
     method: str
 
-    def decode_metadata(self, value: object) -> QuantizationConfig: ...
+    def group(
+        self,
+        component: ComponentDescriptor,
+        state_dict: Mapping[str, torch.Tensor],
+        config: QuantizationConfig,
+    ) -> WeightBundle: ...
 
     def normalize(
         self,
         record: WeightRecord,
-        target: QuantizationConfig,
-    ) -> WeightRecord: ...
+        config: QuantizationConfig,
+        *,
+        kind: Literal["linear", "embedding"] = "linear",
+    ) -> dict[str, torch.Tensor]: ...
 ```
 
 Initial codecs:
@@ -354,19 +398,44 @@ The codec:
 
 Model names and model-specific parameter paths are prohibited inside codecs.
 
+The target module supplies the weight kind: linear projections use the
+three-dimensional `MatMulNBits` layout, while embedding tables use the
+two-dimensional `GatherBlockQuantized` layout. A shared `.scales` suffix alone
+does not identify a canonical group; the packed tensor, scales, and required
+zero points must all match the target parameters before normalization is
+skipped.
+The component normalizer also retains complete canonical QMoE expert groups.
+When component plans or single-component module rules are active, it rejects
+unconsumed raw sidecars even when no qweight is present or no component owns
+them; valid canonical scales must not be mistaken for orphan checkpoint data.
+
 ## 6. ModelWeightAdapter
 
-The model adapter receives one already-routed component bundle:
+The current implementation retains a raw-state compatibility adapter for
+architecture-specific name mapping, tying, and expert transformations:
 
 ```python
+@dataclasses.dataclass(frozen=True)
+class WeightAdapterContext:
+    config: BaseModelConfig
+    manifest: ComponentManifest
+
+
 class ModelWeightAdapter(Protocol):
     def adapt(
         self,
-        component: ComponentDescriptor,
-        weights: WeightBundle,
-        config: BaseModelConfig,
-    ) -> WeightBundle: ...
+        module: nn.Module,
+        state_dict: Mapping[str, torch.Tensor],
+        context: WeightAdapterContext,
+    ) -> dict[str, torch.Tensor]: ...
 ```
+
+Routing and codec grouping happen after this adapter. With component plans or
+single-component module rules, ordinary packed sidecars stay raw until the
+shared loader resolves their per-projection layouts. The shared legacy
+preprocessor can still pack QMoE expert banks and tie floating-point tables.
+A per-component `WeightBundle` adapter is a future migration target, not the
+currently implemented interface.
 
 Appropriate model-specific operations include:
 
@@ -379,9 +448,9 @@ Appropriate model-specific operations include:
 
 The adapter must not:
 
-- choose a component quantization configuration;
-- read unrelated component weights;
-- dispatch Olive/GPTQ/AWQ formats;
+- override the producer's per-projection quantization policy;
+- eagerly repack ordinary sidecars using one model-wide or component-wide layout;
+- duplicate generic Olive/GPTQ/AWQ format conversion;
 - bind graph initializers;
 - silently drop unrecognized packed tensors.
 
@@ -407,12 +476,18 @@ Required invariants:
 
 These checks happen before save or runtime metadata generation.
 
+The loading-time binding gate scans emitted `MatMulNBits` and
+`GatherBlockQuantized` nodes regardless of whether configuration came from a
+component mapping or a legacy root plan. `build(load_weights=False)` still
+returns an unbound skeleton. Independently, `ModelPackage.save()` checks all
+initializers by default.
+
 ## Ordering of normalization and model transforms
 
 Some transforms operate on logical tensors while others depend on a source
-packing layout. The pipeline therefore distinguishes:
+packing layout. The target typed pipeline distinguishes:
 
-1. **sidecar grouping** — always first;
+1. **sidecar grouping**;
 2. **semantic routing/name mapping** — typed records remain packed;
 3. **architecture transform planning** — split/fuse intent is declared;
 4. **codec normalization** — source layout becomes canonical target layout;
@@ -421,6 +496,10 @@ packing layout. The pipeline therefore distinguishes:
 
 A transform unsupported for packed storage fails explicitly. It must not
 silently dequantize and requantize.
+
+The current compatibility path performs raw semantic name mapping before
+grouping, as described above. It preserves ordinary sidecars rather than
+claiming that the full typed transform-planning pipeline is already implemented.
 
 ## Compatibility plan
 
@@ -431,6 +510,11 @@ The migration keeps current APIs operational:
 - existing `ComponentSpec`, `model_roles`, and `HF_COMPONENT_SOURCES` feed the
   manifest resolver;
 - loaders without a component manifest retain current single-model behavior.
+
+Component-aware compatibility adapters preserve raw sidecars through their
+architecture-specific renames. They must not normalize an entire component
+with one root-resolved layout before the generic loader evaluates projection
+overrides.
 
 Compatibility paths emit no behavior changes in the first two implementation
 PRs. Removal occurs only after model migrations and parity coverage.

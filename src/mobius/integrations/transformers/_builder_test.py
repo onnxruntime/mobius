@@ -669,10 +669,15 @@ def test_strip_to_text_only_drops_component_quantization() -> None:
         quant_method="olive",
     )
     config = make_config(
+        quantization=decoder,
         component_quantization={
             "decoder": decoder,
-            "vision_encoder": decoder,
-        }
+            "vision_encoder": QuantizationConfig(
+                bits=8,
+                group_size=32,
+                quant_method="olive",
+            ),
+        },
     )
 
     stripped = transformers_builder._strip_to_text_only(config, "qwen2")
