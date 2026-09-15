@@ -162,12 +162,15 @@ class TextModel(nn.Module):
         # Static cache KV axis width is a concrete int: [B, max_seq_len, kv_hidden].
         # Guard against a symbolic dim, which would otherwise raise an opaque
         # TypeError downstream. Static-cache always allocates a fixed width today.
-        max_seq_len = first.key_cache.shape[1]
+        sequence_axis = first.sequence_axis
+        cache_shape = first.key_cache.shape
+        assert cache_shape is not None
+        max_seq_len = cache_shape[sequence_axis]
         if not isinstance(max_seq_len, int):
             raise TypeError(
                 "static-cache bias requires a concrete key_cache KV dimension "
-                f"(axis 1), but got symbolic dim {max_seq_len!r}. The static "
-                "cache must be allocated with a fixed max_seq_len."
+                f"(axis {sequence_axis}), but got symbolic dim {max_seq_len!r}. "
+                "The static cache must be allocated with a fixed max_seq_len."
             )
         # S_q lives at dim 1 of both input_ids ([B, S_q]) and hidden_states
         # ([B, S_q, hidden]), so the bias works for either forward entry point.

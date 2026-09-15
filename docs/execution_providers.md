@@ -145,6 +145,11 @@ EpCapabilities(name="webgpu",  gqa_dtypes={FLOAT, FLOAT16},
 EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
                supports_skip_layer_norm=False, enable_graph_capture=True,
                provider_options={"enable_cuda_graph": "1"})
+EpCapabilities(name="tensorrt",
+               supports_attention_multi_output=False,
+               supports_past_present_share_buffer=False,
+               enable_graph_capture=True,
+               provider_options={"enable_cuda_graph": "1"})
 EpCapabilities(name="onnx-standard",
                gqa_dtypes=frozenset(), qkv_pack_dtypes=frozenset(),
                supports_fused_rope=False,  # not used by default for this EP, since it does not enable GQA fusion

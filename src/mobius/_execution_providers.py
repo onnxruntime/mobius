@@ -31,6 +31,7 @@ __all__ = [
 
 import dataclasses
 import logging
+from typing import Literal
 
 import onnx_ir as ir
 
@@ -147,6 +148,7 @@ class EpCapabilities:
     """
 
     name: str
+    static_cache_layout: Literal["flattened", "heads_first"] = "flattened"
     gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True
@@ -365,6 +367,14 @@ def _register_builtins() -> None:
             supports_matmul_nbits=False,
             enable_graph_capture=True,
             supports_past_present_share_buffer=True,
+        ),
+        EpCapabilities(
+            name="tensorrt",
+            static_cache_layout="heads_first",
+            gqa_dtypes=frozenset(),
+            qkv_pack_dtypes=frozenset(),
+            supports_skip_layer_norm=False,
+            supports_matmul_nbits=False,
         ),
         # Qualcomm Hexagon NPU via the QNN EP (onnxruntime-qnn QAIRT plugin),
         # HTP backend. The HTP runs a static-shaped, QDQ-quantized QNN context
