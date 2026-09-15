@@ -185,12 +185,28 @@ def _load_transformers_config(
 
     from mobius.integrations.transformers._config_resolver import _try_load_config_json
 
+    class _MissingStrictDataclassClassValidationError(Exception):
+        """Sentinel that cannot match errors from older Hub installations."""
+
+    try:
+        from huggingface_hub import errors as hub_errors
+    except ImportError:
+        strict_validation_error = _MissingStrictDataclassClassValidationError
+    else:
+        strict_validation_error = getattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            _MissingStrictDataclassClassValidationError,
+        )
     try:
         kwargs = {"trust_remote_code": trust_remote_code}
         if revision is not None:
             kwargs["revision"] = revision
         return transformers.AutoConfig.from_pretrained(model_id, **kwargs), False
-    except (ValueError, KeyError, OSError):
+    except (ValueError, KeyError, OSError, strict_validation_error):
+        # Legacy VibeVoice-ASR reused the TTS model type and needs an inference-
+        # native conversion. The supported HF release has model_type
+        # ``vibevoice_asr`` and never reaches this compatibility fallback.
         return _try_load_config_json(model_id, revision=revision), True
 
 
@@ -244,6 +260,23 @@ def _resolve_module_class(
 ) -> tuple[type[nn.Module], str | ModelTask | None, str]:
     """Resolve architecture aliases and structural fallback registrations."""
     architectures = getattr(parent_config, "architectures", None) or []
+    if model_type == "vibevoice":
+        supported_architectures = {
+            "VibeVoiceForConditionalGeneration",
+        }
+        unknown = set(architectures) - supported_architectures
+        if unknown or len(architectures) != 1:
+            raise ValueError(
+                "Unsupported VibeVoice architecture. Expected exactly one of "
+                f"{sorted(supported_architectures)}, got {architectures!r}."
+            )
+    if model_type == "vibevoice_asr":
+        supported_architectures = {"VibeVoiceAsrForConditionalGeneration"}
+        if set(architectures) != supported_architectures:
+            raise ValueError(
+                "Unsupported VibeVoice ASR architecture. Expected exactly "
+                f"{sorted(supported_architectures)}, got {architectures!r}."
+            )
     if allow_parent_architecture_override and architectures and architectures[0] in registry:
         architecture_key = architectures[0]
         model_type_class = registry.get(model_type) if model_type in registry else None
@@ -371,6 +404,18 @@ def build_transformers_model(
         # raw-config probe and every subsequent Hub operation to one checkpoint.
         revision = VIBEVOICE_STREAMING_REVISION
         detection_revision = VIBEVOICE_STREAMING_REVISION
+    if model_id == "microsoft/VibeVoice-ASR":
+        raise ValueError(
+            "microsoft/VibeVoice-ASR is a legacy training checkpoint; use "
+            "microsoft/VibeVoice-ASR-HF instead."
+        )
+    if model_id == "microsoft/VibeVoice-ASR-HF" and detection_revision is None:
+        from mobius.models.vibevoice_asr import VIBEVOICE_ASR_REVISION
+
+        # ASR shares VibeVoice's model_type but has a different source and
+        # processor contract. Keep config detection and weight loading pinned.
+        revision = VIBEVOICE_ASR_REVISION
+        detection_revision = VIBEVOICE_ASR_REVISION
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -599,7 +644,11 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{graph_source_name}/{name}"
-        if model_type in _QWEN4_MODEL_TYPES | {"vibevoice", "vibevoice_streaming"}:
+        if model_type in _QWEN4_MODEL_TYPES | {
+            "vibevoice",
+            "vibevoice_streaming",
+            "vibevoice_asr",
+        }:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:

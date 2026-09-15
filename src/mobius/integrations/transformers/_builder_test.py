@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import builtins
 from types import SimpleNamespace
 from unittest import mock
 
@@ -389,6 +390,68 @@ def test_qwen38_multimodal_config_keeps_parent_fields(monkeypatch) -> None:
     assert built_configs[0].image_token_id == 248056
 
 
+def test_vibevoice_architecture_dispatch_keeps_native_asr_separate() -> None:
+    """Native ASR has its own model_type and cannot fall through to VibeVoice TTS."""
+    from mobius.models import (
+        VibeVoiceASRForConditionalGeneration,
+        VibeVoiceForConditionalGeneration,
+    )
+
+    asr_parent = SimpleNamespace(
+        model_type="vibevoice_asr",
+        architectures=["VibeVoiceAsrForConditionalGeneration"],
+    )
+    primary, parent, model_type = transformers_builder._select_primary_config(asr_parent)
+    module, task, resolved = transformers_builder._resolve_module_class(
+        model_type, parent, None, None
+    )
+    assert primary is asr_parent
+    assert module is VibeVoiceASRForConditionalGeneration
+    assert task is None
+    assert resolved == "vibevoice_asr"
+
+    with pytest.raises(ValueError, match="Unsupported VibeVoice ASR architecture"):
+        transformers_builder._resolve_module_class(
+            "vibevoice_asr",
+            SimpleNamespace(
+                model_type="vibevoice_asr",
+                architectures=["VibeVoiceForConditionalGeneration"],
+            ),
+            None,
+            None,
+        )
+
+    tts_parent = SimpleNamespace(
+        model_type="vibevoice",
+        architectures=["VibeVoiceForConditionalGeneration"],
+    )
+    module, _, resolved = transformers_builder._resolve_module_class(
+        "vibevoice", tts_parent, None, None
+    )
+    assert module is VibeVoiceForConditionalGeneration
+    assert resolved == "vibevoice"
+
+
+@pytest.mark.arch_validation
+def test_vibevoice_asr_pinned_native_config_builds_through_public_builder() -> None:
+    """The official native ASR config reaches the architecture-specific five-stage task."""
+    package = transformers_builder.build_transformers_model(
+        "microsoft/VibeVoice-ASR-HF",
+        revision="f22241c2062b3b25272bf117397e03d73381037a",
+        load_weights=False,
+    )
+    assert set(package) == {
+        "acoustic_encoder",
+        "semantic_encoder",
+        "connectors",
+        "embedding",
+        "decoder",
+    }
+    assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
+        "f22241c2062b3b25272bf117397e03d73381037a"
+    }
+
+
 def test_qwen38_fp8_none_revision_uses_hugging_face_default(monkeypatch) -> None:
     calls = []
 
@@ -451,6 +514,51 @@ def test_vibevoice_none_revision_pins_first_config_probe(monkeypatch) -> None:
     ]
 
 
+def test_vibevoice_asr_none_revision_pins_first_config_probe(monkeypatch) -> None:
+    from mobius.models.vibevoice_asr import VIBEVOICE_ASR_MODEL_ID, VIBEVOICE_ASR_REVISION
+
+    calls = []
+
+    def stop_after_config(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        raise RuntimeError("stop after revision assertion")
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        stop_after_config,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after revision assertion"):
+        transformers_builder.build_transformers_model(
+            VIBEVOICE_ASR_MODEL_ID,
+            load_weights=False,
+        )
+
+    assert calls == [
+        (
+            VIBEVOICE_ASR_MODEL_ID,
+            {
+                "revision": VIBEVOICE_ASR_REVISION,
+                "trust_remote_code": False,
+            },
+        )
+    ]
+
+
+def test_legacy_vibevoice_asr_is_rejected_before_config_loading(monkeypatch) -> None:
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *_args, **_kwargs: pytest.fail("legacy checkpoint must not be fetched"),
+    )
+
+    with pytest.raises(ValueError, match="legacy training checkpoint"):
+        transformers_builder.build_transformers_model(
+            "microsoft/VibeVoice-ASR", load_weights=False
+        )
+
+
 def test_vibevoice_streaming_none_revision_pins_first_config_probe(monkeypatch) -> None:
     from mobius.models.vibevoice_streaming import (
         VIBEVOICE_STREAMING_MODEL_ID,
@@ -510,6 +618,48 @@ def test_transformers_config_forwards_only_explicit_revision(monkeypatch, revisi
     if revision is not None:
         expected_kwargs["revision"] = revision
     assert calls == [("unsloth/Qwen3.8-Flash-Next-FP8", expected_kwargs)]
+
+
+def test_transformers_config_accepts_hub_without_strict_validation_error(monkeypatch) -> None:
+    """Older supported huggingface_hub releases lack the optional error type."""
+    import transformers
+    from huggingface_hub import errors as hub_errors
+
+    config = SimpleNamespace(model_type="qwen2")
+    monkeypatch.delattr(hub_errors, "StrictDataclassClassValidationError", raising=False)
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config
+    )
+
+    assert transformers_builder._load_transformers_config(
+        "test/qwen2",
+        revision=None,
+        trust_remote_code=False,
+    ) == (config, False)
+
+
+def test_transformers_config_accepts_hub_without_errors_module(monkeypatch) -> None:
+    """Older supported huggingface_hub releases expose no ``errors`` module."""
+    import transformers
+
+    config = SimpleNamespace(model_type="qwen2")
+    import_module = builtins.__import__
+
+    def import_without_hub_errors(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "huggingface_hub" and "errors" in fromlist:
+            raise ImportError("No module named 'huggingface_hub.errors'")
+        return import_module(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_hub_errors)
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config
+    )
+
+    assert transformers_builder._load_transformers_config(
+        "test/qwen2",
+        revision=None,
+        trust_remote_code=False,
+    ) == (config, False)
 
 
 def test_strip_to_text_only_drops_component_quantization() -> None:
