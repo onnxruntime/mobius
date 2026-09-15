@@ -60,6 +60,36 @@ rewrites and fused ops:
 Other EPs are available (`cpu`, `dml`, `webgpu`, `trt-rtx`). Run
 `mobius list eps` to see all options.
 
+### Native GPT-OSS MXFP4 checkpoints
+
+Official HuggingFace GPT-OSS MXFP4 safetensors use a native checkpoint path
+that is separate from GGUF import and post-export Olive quantization. On the
+supported CUDA f16/bf16 path, Mobius preserves E2M1 values and E8M0 scales,
+bit-exactly repacks the checkpoint nibble layout, and emits ORT `QMoE`.
+Checkpoint shards remain in the HuggingFace disk cache, while bounded
+streaming prevents the complete checkpoint and transformed experts from being
+resident in host RAM at once.
+
+Native preservation is the default:
+
+```bash
+mobius build --model openai/gpt-oss-20b --ep cuda --dtype f16 output/
+```
+
+Use `--dequantize` only when a portable dense graph is required:
+
+```bash
+mobius build --model openai/gpt-oss-20b --dequantize output/
+```
+
+The dense path eagerly reconstructs expert weights and can require
+substantially more host memory. Do not describe it as quantization
+preservation.
+
+The `ORT_FP4_SM80_GEMM=0` environment override is a fallback for ORT builds
+that do not contain the optimized SM80 grouped-MoE kernel. It is not a general
+GPT-OSS export requirement; record the ORT build and GPU when using it.
+
 **Typical export matrix:** Build each dtype × EP combination:
 
 ```bash

@@ -89,6 +89,9 @@ _FILTERING_PREPROCESS_MODELS: set[str] = {
     "modernbert-decoder",
     # VibeVoice ASR translates its executable checkpoint hierarchy into split-stage names.
     "VibeVoiceForASRStreamingTraining",
+    # Realtime maps the Microsoft multi-stage checkpoint namespace, rather
+    # than accepting ONNX initializer names as an input format.
+    "vibevoice_streaming",
 }
 
 

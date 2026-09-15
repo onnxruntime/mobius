@@ -1986,6 +1986,12 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
+    if getattr(config, "model_type", None) == "vibevoice_streaming":
+        raise ValueError(
+            "VibeVoice Realtime requires host-owned text windowing, positive/negative "
+            "KV caches, DPM-Solver sampling, and prefilled voice-prompt caches; it "
+            "cannot be represented by an ONNX Runtime GenAI configuration."
+        )
     os.makedirs(directory, exist_ok=True)
     if set(pkg) in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
         pkg, "gguf_projector_type", None
@@ -2259,8 +2265,6 @@ def export_package(
             "Diffusion models (which have no config) are not supported — "
             "use ModelPackage.save() directly for those."
         )
-    os.makedirs(output_dir, exist_ok=True)
-
     # 1. Save ONNX models + weights
     logger.info("Saving ONNX models to %s", output_dir)
     pkg.save(
@@ -2355,8 +2359,6 @@ def auto_export(
             }
     """
     from mobius.integrations.transformers import build
-
-    os.makedirs(output_dir, exist_ok=True)
 
     # Build ONNX graph(s) with weights. The runtime EP (``ep``) also drives
     # EP-aware graph construction so fused ops (e.g. GroupQueryAttention on
