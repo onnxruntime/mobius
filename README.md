@@ -145,20 +145,31 @@ See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html)
 
 ## Architecture
 
-```
-HuggingFace Hub
-       │
-       ▼
- ArchitectureConfig ◄── from_transformers() / from_diffusers()
-       │
-       ▼
- Model Module ◄── Reusable Components (Attention, MLP, RMSNorm, RoPE, …)
-       │
-       ▼
- Task ◄── CausalLMTask, VisionLanguageTask, VAETask, DenoisingTask, …
-       │
-       ▼
- ONNX Model ◄── preprocess_weights() + apply_weights()
+```mermaid
+flowchart TD
+    Sources["Model sources<br/>Transformers · Diffusers · GGUF · NeMo"]
+    Config["ArchitectureConfig<br/>Normalizes source configuration"]
+    Registry["Registry<br/>Selects the model class and task"]
+    Components["Reusable components<br/>Attention · MLP · Norm · RoPE · MoE · Vision · Audio"]
+    Models["Model modules<br/>Compose components into architectures"]
+    Tasks["Tasks<br/>Define ONNX inputs, outputs, caches, and model splits"]
+    Graph["ONNX graph construction<br/>onnxscript.nn + onnx_ir"]
+    Optimize["EP-aware optimization<br/>Cleanup · Fusion · Lowering · Folding"]
+    Weights["Weight pipeline<br/>Download · Rename · Transform · Cast · Apply"]
+    Package["ModelPackage<br/>One or more deployable ONNX models"]
+    Runtime["ONNX Runtime / ONNX Runtime GenAI"]
+
+    Sources --> Config
+    Config --> Registry
+    Registry --> Models
+    Registry --> Tasks
+    Components --> Models
+    Models --> Tasks
+    Tasks --> Graph
+    Graph --> Optimize
+    Optimize --> Weights
+    Weights --> Package
+    Package --> Runtime
 ```
 
 The package is organised into four layers:
@@ -170,6 +181,37 @@ The package is organised into four layers:
 - **Registry** — Maps HuggingFace `model_type` strings to model classes
 
 See the [design document](https://onnxruntime.github.io/mobius/design.html) for details.
+
+### Repository organization
+
+```mermaid
+flowchart LR
+    Root["src/mobius/"]
+    Root --> API["Public API and build orchestration<br/>__init__.py · _builder.py · _model_package.py"]
+    Root --> Configs["_configs/<br/>Normalized architecture configuration"]
+    Root --> Components["components/<br/>Reusable ONNX building blocks"]
+    Root --> Models["models/<br/>Architecture implementations"]
+    Root --> Tasks["tasks/<br/>Graph I/O contracts"]
+    Root --> Registry["_registry.py<br/>Model and task lookup"]
+    Root --> Optimizations["_optimizations.py · rewrite_rules/ · _passes/<br/>Graph optimization"]
+    Root --> Integrations["integrations/<br/>Transformers · Diffusers · GGUF · NeMo · ORT GenAI"]
+
+    Configs --> Models
+    Components --> Models
+    Registry --> Models
+    Registry --> Tasks
+    Models --> Tasks
+    Tasks --> API
+    Integrations --> API
+    API --> Optimizations
+```
+
+Supporting directories:
+
+- `tests/` contains graph-construction, integration, parity, generation, and runtime tests.
+- `src/mobius/**/*_test.py` contains unit tests co-located with their implementation.
+- `examples/` demonstrates text, multimodal, speech, and diffusion workflows.
+- `docs/` contains user guides, design documentation, and API reference material.
 
 ## Development
 
