@@ -189,6 +189,58 @@ jobs:
           flags: synthetic-parity
           report-type: test_results
 
+  vibevoice-asr-source-parity:
+    name: VibeVoice ASR L3 Source Parity
+    runs-on: ubuntu-latest
+    needs: [detect-affected]
+    if: >-
+      always() && !cancelled() &&
+      (needs.detect-affected.result == 'failure' ||
+       needs.detect-affected.outputs.run_all == 'true' ||
+       contains(needs.detect-affected.outputs.affected, 'VibeVoiceForASRStreamingTraining'))
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Cache pip packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: pip-vibevoice-asr-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt', 'requirements/ci/vibevoice-asr.txt') }}
+          restore-keys: |
+            pip-vibevoice-asr-
+      - name: Install PyTorch CPU
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install pinned ASR reference
+        run: |
+          pip install -r requirements/ci/requirements.txt
+          pip install onnxruntime
+          pip install -e '.[testing]'
+          pip install --force-reinstall --no-deps -r requirements/ci/vibevoice-asr.txt
+      - name: Run pinned VibeVoice ASR source parity
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pytest src/mobius/models/vibevoice_asr_test.py -m integration -v --tb=short \
+            -p no:xdist --timeout=300 --junitxml=junit.xml \
+            --cov=src --cov-report=xml --cov-branch
+        timeout-minutes: 20
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: vibevoice-asr-source-parity
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: vibevoice-asr-source-parity
+          report-type: test_results
+
   golden-comparison:
     name: L4 Golden Comparison
     needs: [detect-affected]

@@ -18,11 +18,10 @@ from mobius._pipeline_contract import (
     declare_optional_input,
 )
 from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
-from mobius.tasks._cache_utils import (
-    _make_conv_cache_inputs,
-    _make_kv_cache_inputs,
-    _register_conv_cache_outputs,
-    _register_kv_cache_outputs,
+from mobius.tasks._cache_utils import _make_kv_cache_inputs, _register_kv_cache_outputs
+from mobius.tasks._streaming_convolution import (
+    make_conv_cache_inputs,
+    register_conv_cache_outputs,
 )
 
 
@@ -250,7 +249,7 @@ class VibeVoiceTask(ModelTask):
             dtype=config.dtype,
             shape=[batch, "audio_frames", config.acoustic_tokenizer.hidden_size],
         )
-        past = _make_conv_cache_inputs(
+        past = make_conv_cache_inputs(
             builder,
             module.cache_specs,
             batch,
@@ -259,7 +258,7 @@ class VibeVoiceTask(ModelTask):
         waveform, present = module(builder.op, scaled_latents, past)
         waveform.shape = ir.Shape([batch, config.acoustic_tokenizer.channels, "audio_samples"])
         builder.add_output(waveform, "waveform")
-        _register_conv_cache_outputs(builder, present)
+        register_conv_cache_outputs(builder, present)
         return _make_model(graph)
 
     def _build_semantic_encoder(
@@ -274,7 +273,7 @@ class VibeVoiceTask(ModelTask):
             dtype=config.dtype,
             shape=[batch, config.semantic_tokenizer.channels, "audio_samples"],
         )
-        past = _make_conv_cache_inputs(
+        past = make_conv_cache_inputs(
             builder,
             module.cache_specs,
             batch,
@@ -282,7 +281,7 @@ class VibeVoiceTask(ModelTask):
         )
         latents, present = module(builder.op, waveform, past)
         builder.add_output(latents, "semantic_latents")
-        _register_conv_cache_outputs(builder, present)
+        register_conv_cache_outputs(builder, present)
         return _make_model(graph)
 
     def _build_semantic_projection(

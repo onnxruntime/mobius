@@ -112,6 +112,7 @@ from mobius._configs._sub_configs import (
 )
 from mobius._configs._world_model import WorldModelConfig
 from mobius._configs.vibevoice import (
+    VibeVoiceASRConfig,
     VibeVoiceConfig,
     VibeVoiceDiffusionConfig,
     VibeVoiceStreamingConfig,
@@ -183,6 +184,7 @@ __all__ = [
     "TTSConfig",
     "VisionConfig",
     "VisionLanguageConfig",
+    "VibeVoiceASRConfig",
     "VibeVoiceConfig",
     "VibeVoiceDiffusionConfig",
     "VibeVoiceStreamingConfig",
