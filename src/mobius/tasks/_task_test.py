@@ -38,6 +38,22 @@ from mobius.tasks import (
     build_embedding_from_features,
     get_task,
 )
+from mobius.tasks._base import _make_model
+
+
+def test_make_model_uses_universal_ir12():
+    graph = ir.Graph(
+        [ir.val("input", ir.DataType.FLOAT, [1])],
+        [],
+        nodes=[],
+        name="universal_ir",
+        opset_imports={"": 24, "com.microsoft": 1},
+    )
+
+    model = _make_model(graph)
+
+    assert model.ir_version == 12
+    assert dict(model.graph.opset_imports) == {"": 24, "com.microsoft": 1}
 
 
 class TestGetTask:

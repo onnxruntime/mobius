@@ -228,7 +228,13 @@ class TestLocalSafetensorsLoading:
 
     @pytest.mark.parametrize(
         "malicious_filename",
-        ["../../../etc/passwd", "..\\..\\secret.safetensors", "/absolute/model.safetensors"],
+        [
+            "../../../etc/passwd",
+            "..\\..\\secret.safetensors",
+            "/absolute/model.safetensors",
+            "C:\\absolute\\model.safetensors",
+            "C:relative\\model.safetensors",
+        ],
     )
     def test_local_safetensors_index_rejects_unsafe_paths(self, tmp_path, malicious_filename):
         (tmp_path / "model.safetensors.index.json").write_text(

@@ -61,6 +61,46 @@ Sequential expert selection with threshold-based masking:
    - `ScatterElements` to mask out the selected expert for the next round
 3. Concatenate all selected expert indices and weights
 
+## Native quantized QMoE
+
+Do not assume every MoE checkpoint should be expanded into per-expert floating
+point tensors. When the checkpoint format matches a supported ORT `QMoE` ABI,
+preserve the quantized values and emit the fused operator directly.
+
+Two different 4-bit storage families are currently relevant:
+
+| Family | Representation | Handling |
+|---|---|---|
+| Integer affine | Integer codes, scales, and optional zero points | Shared QMoE helpers may pack fused expert-major tensors |
+| GPT-OSS MXFP4 | E2M1 values with E8M0 scales per 32-value block | GPT-OSS adapter performs bit-exact nibble repacking for FP4 QMoE |
+
+`QuantizedWeightFormat` distinguishes these families. Never route MXFP4
+through GPTQ/AWQ/Olive integer-affine helpers merely because it has four bits
+and group size 32.
+
+`MoELayer` owns common QMoE graph emission. A model whose router contract
+differs from the default can expose `qmoe_routing(op, hidden_states)` on its
+gate. Architecture-specific code remains responsible for activation clipping,
+router normalization, expert/global scales, biases, and source checkpoint
+layout.
+
+For large packed checkpoints, use an architecture-specific streaming planner
+rather than `preprocess_weights()`:
+
+```text
+checkpoint headers
+  -> validate model topology and source metadata
+  -> map sources to QMoE initializers
+  -> lazily repack one projection during serialization
+```
+
+GPT-OSS is the reference implementation:
+
+- `models/gptoss.py` defines the FP4 QMoE graph and repacking semantics;
+- `integrations/transformers/_gptoss_weights.py` validates and maps the
+  checkpoint;
+- `integrations/_weight_loading.py` supplies the generic streaming engine.
+
 ## Adding a new MoE model
 
 ### 1. Determine the gate type
