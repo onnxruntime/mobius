@@ -1340,7 +1340,7 @@ def _write_audio_processor_config(
     config: Any,
     output_dir: str,
 ) -> str | None:
-    """Write audio_processor.json for models with audio encoders.
+    """Write the native audio processor config for models with audio encoders.
 
     Returns the path if written, None otherwise.
     """
