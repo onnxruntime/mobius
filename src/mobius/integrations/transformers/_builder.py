@@ -388,7 +388,6 @@ def build_transformers_model(
         _config_from_hf,
         _default_task_for_model,
     )
-    from mobius.models.vibevoice import resolve_vibevoice_sources
 
     detection_revision = revision
     if model_id == "vibevoice/VibeVoice-1.5B-hf" and detection_revision is None:
