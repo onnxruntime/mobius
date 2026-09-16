@@ -25,6 +25,8 @@ they cannot roundtrip ONNX-aligned names by design.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 from _test_configs import (
@@ -176,8 +178,6 @@ def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
 @pytest.mark.arch_validation
 def test_vibevoice_asr_checkpoint_index_routes_every_native_tensor_once(tmp_path):
     """The pinned native ASR index routes every inference tensor without exclusions."""
-    import json
-
     from huggingface_hub import hf_hub_download
 
     from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
