@@ -240,7 +240,6 @@ from mobius.components._decoder import (
     create_decoder_layer,
 )
 from mobius.components._deepseek_mla import DeepSeekMLA as DeepSeekMLA
-from mobius.components._paged_attention import PagedAttentionState, PagedHybridContext
 from mobius.components._diffusion import (
     AdaLayerNormOutput,
     AdaLayerNormZero,
@@ -349,6 +348,7 @@ from mobius.components._ocr_projectors import (
     PaddleOCRProjector,
     YouTuVLProjector,
 )
+from mobius.components._paged_attention import PagedAttentionState, PagedHybridContext
 from mobius.components._paged_mla import (
     PagedCacheState as PagedCacheState,
 )

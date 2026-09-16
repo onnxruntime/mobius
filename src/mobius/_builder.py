@@ -171,6 +171,12 @@ def build_from_module(
     resolved_task = get_task(task)
     from mobius.tasks import PagedHybridCausalLMTask
 
+    if (
+        getattr(config, "export_paged_attention", False)
+        and getattr(config, "model_type", None) == "qwen3_5_text"
+        and not isinstance(resolved_task, PagedHybridCausalLMTask)
+    ):
+        raise ValueError("Qwen paged attention requires PagedHybridCausalLMTask")
     if isinstance(resolved_task, PagedHybridCausalLMTask):
         if execution_provider != "cuda":
             raise ValueError("PagedHybridCausalLMTask requires execution_provider='cuda'")

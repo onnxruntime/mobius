@@ -181,6 +181,59 @@ def test_direct_task_rejects_non_cuda(ep):
         )
 
 
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"dtype": ir.DataType.FLOAT}, "float16/bfloat16"),
+        ({"model_type": "llama"}, "text-only"),
+        ({"mrope_section": None}, "interleaved MRoPE"),
+        ({"mrope_interleaved": False}, "interleaved MRoPE"),
+        ({"layer_types": ["full_attention"] * 4}, "layer_types"),
+    ],
+)
+def test_direct_task_rejects_incompatible_contracts(overrides, match):
+    config = dataclasses.replace(tiny_config(), **overrides)
+    with pytest.raises(ValueError, match=match):
+        build_from_module(
+            Qwen35CausalLMModel(config),
+            config,
+            PagedHybridCausalLMTask(),
+            execution_provider="cuda",
+        )
+
+
+def test_paged_flag_cannot_be_combined_with_a_dense_task():
+    config = dataclasses.replace(tiny_config(), export_paged_attention=True)
+    with pytest.raises(ValueError, match="requires PagedHybridCausalLMTask"):
+        build_from_module(
+            Qwen35CausalLMModel(config),
+            config,
+            HybridCausalLMTask(),
+            execution_provider="cuda",
+        )
+
+
+def test_64_layer_manifest_matches_native_operator_topology():
+    config = dataclasses.replace(
+        tiny_config(),
+        num_hidden_layers=64,
+        layer_types=tiny_config().layer_types * 16,
+    )
+    package = build_from_module(
+        Qwen35CausalLMModel(config),
+        config,
+        PagedHybridCausalLMTask(),
+        execution_provider="cuda",
+    )
+    abi = inspect_paged_hybrid(package["model"])
+    assert abi.full_layers == tuple(range(3, 64, 4))
+    assert len(abi.linear_layers) == 48
+    nodes = list(package["model"].graph)
+    assert sum(node.op_type == "PagedAttention" for node in nodes) == 16
+    assert sum(node.op_type == "VarlenCausalConvWithState" for node in nodes) == 48
+    assert sum(node.op_type == "GatedDeltaNet" for node in nodes) == 48
+
+
 def test_dense_gate_parameters_still_follow_compute_dtype():
     from mobius._builder import _cast_module_dtype
 

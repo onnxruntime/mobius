@@ -461,6 +461,10 @@ class PagedHybridCausalLMTask(ModelTask):
         self._prune_prefill_prefix = prune_prefill_prefix
 
     def build(self, module: nn.Module, config: ArchitectureConfig) -> ModelPackage:
+        from mobius.models.qwen35 import Qwen35CausalLMModel
+
+        if not isinstance(module, Qwen35CausalLMModel):
+            raise TypeError("PagedHybridCausalLMTask requires Qwen35CausalLMModel")
         if config.model_type != "qwen3_5_text":
             raise ValueError(
                 "PagedHybridCausalLMTask supports only text-only model_type "
@@ -471,6 +475,8 @@ class PagedHybridCausalLMTask(ModelTask):
                 "PagedHybridCausalLMTask native CUDA ops support only float16/bfloat16; "
                 f"got {config.dtype!r}"
             )
+        if not config.mrope_section or not config.mrope_interleaved:
+            raise ValueError("PagedHybridCausalLMTask requires interleaved MRoPE sections")
         quantization = config.quantization
         if quantization is not None and quantization.quant_method != "none":
             raise ValueError("PagedHybridCausalLMTask does not support quantized checkpoints")

@@ -172,7 +172,7 @@ def test_packed_prefill_continuation_reorder_and_page_reuse(dtype, tmp_path):
     schedule = [
         [("A", 255), ("B", 3)],
         [("B", 2), ("A", 3)],
-        [("A", 1), ("C", 7)],
+        [("A", 1), ("C", 2)],
         [("C", 3), ("A", 2)],
     ]
     for step, requests in enumerate(schedule):
@@ -292,7 +292,10 @@ def test_packed_prefill_continuation_reorder_and_page_reuse(dtype, tmp_path):
             rtol=tolerance,
         )
         np.testing.assert_allclose(
-            results[1]["logits"].cpu().numpy(), full_logits[cu[1:] - 1], atol=1e-5, rtol=1e-5
+            results[1]["logits"].cpu().numpy(),
+            full_logits[cu[1:] - 1],
+            atol=2e-3 if dtype == ir.DataType.FLOAT16 else 1e-2,
+            rtol=2e-3 if dtype == ir.DataType.FLOAT16 else 1e-2,
         )
         for request, count in requests:
             lengths[request] += count

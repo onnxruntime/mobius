@@ -10,7 +10,6 @@ from typing import NamedTuple
 import onnx_ir as ir
 from onnxscript import OpBuilder
 
-
 DOMAIN = "com.microsoft"
 ORT_REVISION = "f38538cd5a4b5945a4c839565a8eebc65e1e2ef8"
 GENAI_REVISION = "d5b40851ba80ffa8e95b6b01f921dbb9008fac80"
@@ -48,7 +47,7 @@ def paged_attention(
     kv_num_heads: int,
 ) -> tuple[ir.Value, ir.Value, ir.Value]:
     """Emit the pinned 17-input SEPARATE PagedAttention ABI."""
-    return op.PagedAttention(
+    output, key_cache, value_cache = op.PagedAttention(
         query,
         key,
         value,
@@ -73,6 +72,11 @@ def paged_attention(
         _domain=DOMAIN,
         _outputs=3,
     )
+    # Generic ONNX shape inference does not know these pinned contrib schemas.
+    output.type, output.shape = query.type, query.shape
+    key_cache.type, key_cache.shape = state.key_cache.type, state.key_cache.shape
+    value_cache.type, value_cache.shape = state.value_cache.type, state.value_cache.shape
+    return output, key_cache, value_cache
 
 
 def varlen_causal_conv_with_state(
@@ -84,7 +88,7 @@ def varlen_causal_conv_with_state(
     past_conv: ir.Value,
 ) -> tuple[ir.Value, ir.Value]:
     """Emit packed depthwise convolution with fixed per-sequence carry state."""
-    return op.VarlenCausalConvWithState(
+    output, present = op.VarlenCausalConvWithState(
         packed,
         weight,
         cumulative_sequence_lengths,
@@ -94,6 +98,9 @@ def varlen_causal_conv_with_state(
         _domain=DOMAIN,
         _outputs=2,
     )
+    output.type, output.shape = packed.type, packed.shape
+    present.type, present.shape = past_conv.type, past_conv.shape
+    return output, present
 
 
 def gated_delta_net(
@@ -109,7 +116,7 @@ def gated_delta_net(
     dt_bias: ir.Value,
 ) -> tuple[ir.Value, ir.Value]:
     """Emit the native packed Qwen GatedDeltaNet recurrence."""
-    return op.GatedDeltaNet(
+    output, present = op.GatedDeltaNet(
         query,
         key,
         value,
@@ -127,3 +134,6 @@ def gated_delta_net(
         _domain=DOMAIN,
         _outputs=2,
     )
+    output.type, output.shape = value.type, value.shape
+    present.type, present.shape = past_recurrent.type, past_recurrent.shape
+    return output, present

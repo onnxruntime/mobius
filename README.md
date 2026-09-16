@@ -132,7 +132,7 @@ CUDA FP16/BF16 export for ORT GenAI's continuous-batching Engine:
 
 ```sh
 mobius build --model Qwen/Qwen3.8-27B --output qwen-paged/ \
-      --ep cuda --dtype f16 --features paged-attention
+      --ep cuda --dtype f16 --features paged-attention --runtime ort-genai
 ```
 
 This is a separate packed-token ABI, not a change to dense inference. It uses
