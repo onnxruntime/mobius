@@ -83,6 +83,8 @@ def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTas
         return CausalLMTask(prune_prefill_prefix=True)
     if task == "hybrid-text-generation":
         return HybridCausalLMTask(prune_prefill_prefix=True)
+    if task == "paged-hybrid-text-generation":
+        return PagedHybridCausalLMTask(prune_prefill_prefix=True)
     if task == "gemma4-text-generation":
         return Gemma4TextCausalLMTask(prune_prefill_prefix=True)
     if task == "gemma4":

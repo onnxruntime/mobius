@@ -20,6 +20,7 @@ from mobius._builder import (
     flags,
 )
 from mobius._model_package import ModelPackage
+from mobius.tasks import PagedHybridCausalLMTask
 
 
 def _make_value(name: str) -> ir.Value:
@@ -66,10 +67,18 @@ def test_prefill_prefix_pruning_error_lists_supported_tasks() -> None:
     with pytest.raises(
         ValueError,
         match=(
-            "text-generation, hybrid-text-generation, gemma4-text-generation, and gemma4 tasks"
+            "text-generation, hybrid-text-generation, paged-hybrid-text-generation, "
+            "gemma4-text-generation, and gemma4 tasks"
         ),
     ):
         _enable_prefill_prefix_pruning_task("feature-extraction")
+
+
+def test_prefill_prefix_pruning_supports_registered_paged_hybrid_task() -> None:
+    task = _enable_prefill_prefix_pruning_task("paged-hybrid-text-generation")
+
+    assert isinstance(task, PagedHybridCausalLMTask)
+    assert task._prune_prefill_prefix
 
 
 def test_graph_requires_opset24_tensor_scatter() -> None:

@@ -478,19 +478,20 @@ class _MRopeBase(BaseRope):
             data=ir.tensor(w_mask),
         )
 
-    def forward(
-        self, op: OpBuilder, position_ids: ir.Value, *, packed: bool = False
-    ):
+    def forward(self, op: OpBuilder, position_ids: ir.Value, *, packed: bool = False):
         """Compute MRoPE cos/sin embeddings.
 
         Args:
             op: ONNX op builder.
             position_ids: Either ``(batch, seq)`` for text-only or
                 ``(3, batch, seq)`` for multimodal (T, H, W dimensions).
-                For 2D input, the same positions are used for all 3 dims.
+                With ``packed=True``, accepts ``(3, num_tokens)`` instead.
+                For dense 2D input, the same positions are used for all 3 dims.
+            packed: Whether ``position_ids`` uses the packed serving layout.
 
         Returns:
-            Tuple of ``(cos, sin)`` each with shape ``(batch, seq, rotary_dim)``.
+            Tuple of ``(cos, sin)`` each with shape ``(batch, seq, rotary_dim)``,
+            or ``(num_tokens, rotary_dim)`` when ``packed=True``.
         """
         if packed:
             # Packed serving supplies exactly (3,N), with no batch padding.

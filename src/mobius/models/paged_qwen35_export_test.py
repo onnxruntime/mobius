@@ -50,9 +50,7 @@ def test_packed_hybrid_io_and_native_operands():
     assert inputs["position_ids"].shape == ir.Shape([3, "num_tokens"])
     assert inputs["attention_metadata"].dtype == ir.DataType.INT32
     assert inputs["past_key_values.0.key"].shape[1:] == ir.Shape([256, 2, 16])
-    assert inputs["past_key_values.1.recurrent_state"].shape[1:] == ir.Shape(
-        [4, 16, 16]
-    )
+    assert inputs["past_key_values.1.recurrent_state"].shape[1:] == ir.Shape([4, 16, 16])
     assert inputs["past_key_values.1.recurrent_state"].dtype == ir.DataType.FLOAT
 
     paged = _nodes(model, "PagedAttention")
@@ -103,8 +101,7 @@ def test_pruning_gathers_each_packed_row_end_before_lm_head():
 
 def test_production_topology_emits_16_paged_and_48_native_layers():
     schedule = [
-        "full_attention" if index % 4 == 3 else "linear_attention"
-        for index in range(64)
+        "full_attention" if index % 4 == 3 else "linear_attention" for index in range(64)
     ]
     model = _build(_config(layers=64, layer_types=schedule))
     assert len(_nodes(model, "PagedAttention")) == 16
