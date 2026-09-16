@@ -227,7 +227,14 @@ def _select_primary_config(hf_config):
             thinker = _dict_to_pretrained_config(thinker)
         if getattr(thinker, "text_config", None) is not None:
             hf_config = thinker.text_config
-    elif hasattr(hf_config, "decoder_config") and model_type == "qwen3_tts_tokenizer_12hz":
+    elif hasattr(hf_config, "decoder_config") and (
+        model_type == "qwen3_tts_tokenizer_12hz"
+        or (
+            model_type == "vibevoice"
+            and getattr(hf_config, "architectures", None)
+            == ["VibeVoiceForASRStreamingTraining"]
+        )
+    ):
         decoder = hf_config.decoder_config
         if isinstance(decoder, dict):
             decoder = type("DecoderConfig", (), {**decoder, "model_type": model_type})()
@@ -261,14 +268,21 @@ def _resolve_module_class(
     """Resolve architecture aliases and structural fallback registrations."""
     architectures = getattr(parent_config, "architectures", None) or []
     if model_type == "vibevoice":
-        supported_architectures = {
-            "VibeVoiceForConditionalGeneration",
-        }
-        unknown = set(architectures) - supported_architectures
-        if unknown or len(architectures) != 1:
+        if len(architectures) != 1:
             raise ValueError(
-                "Unsupported VibeVoice architecture. Expected exactly one of "
-                f"{sorted(supported_architectures)}, got {architectures!r}."
+                "VibeVoice checkpoints must declare exactly one recognized architecture; "
+                "Mobius will not guess between incompatible TTS and streaming ASR pipelines."
+            )
+        architecture = architectures[0]
+        if architecture == "VibeVoiceForConditionalGeneration":
+            pass
+        elif architecture == "VibeVoiceForASRStreamingTraining":
+            model_type = architecture
+        else:
+            raise ValueError(
+                f"Unsupported VibeVoice architecture {architecture!r}; supported architectures "
+                "are 'VibeVoiceForConditionalGeneration' and "
+                "'VibeVoiceForASRStreamingTraining'."
             )
     if model_type == "vibevoice_asr":
         supported_architectures = {"VibeVoiceAsrForConditionalGeneration"}
@@ -388,6 +402,7 @@ def build_transformers_model(
         _config_from_hf,
         _default_task_for_model,
     )
+    from mobius.models.vibevoice import VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS
 
     detection_revision = revision
     vibevoice_sources = None
@@ -422,6 +437,9 @@ def build_transformers_model(
         # processor contract. Keep config detection and weight loading pinned.
         revision = VIBEVOICE_ASR_REVISION
         detection_revision = VIBEVOICE_ASR_REVISION
+    if model_id in VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS and detection_revision is None:
+        revision = VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS[model_id]
+        detection_revision = revision
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -654,6 +672,7 @@ def build_transformers_model(
             "vibevoice",
             "vibevoice_streaming",
             "vibevoice_asr",
+            "VibeVoiceForASRStreamingTraining",
         }:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
         if vibevoice_sources is not None:
