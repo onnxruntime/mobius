@@ -1454,14 +1454,11 @@ def test_official_vibevoice_uses_pinned_sidecars_and_official_weights(monkeypatc
 @pytest.mark.parametrize(
     "model_id",
     [
-        "microsoft/VibeVoice-Realtime-0.5B",
-        "microsoft/VibeVoice-ASR",
         "microsoft/VibeVoice-ASR-Streaming-7B",
         "microsoft/VibeVoice-ASR-Streaming-1.5B",
         "microsoft/VibeVoice-ASR-BitNet",
-        "microsoft/VibeVoice-ASR-HF",
         "microsoft/VibeVoice-AcousticTokenizer",
-        "Microsoft/VibeVoice-ASR",
+        "Microsoft/VibeVoice-ASR-BitNet",
     ],
 )
 def test_unimplemented_official_vibevoice_collection_ids_fail_closed(model_id):

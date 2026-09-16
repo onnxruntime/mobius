@@ -390,13 +390,19 @@ def build_transformers_model(
     )
 
     detection_revision = revision
-    if model_id == "vibevoice/VibeVoice-1.5B-hf" and detection_revision is None:
-        from mobius.models.vibevoice import VIBEVOICE_REVISION
+    vibevoice_sources = None
+    config_model_id = model_id
+    if "vibevoice" in model_id.casefold():
+        from mobius.models.vibevoice import resolve_vibevoice_sources
 
-        # The native conversion is the executable source of truth. Pin the
-        # first config probe and every later processor/weight call together.
-        revision = VIBEVOICE_REVISION
-        detection_revision = VIBEVOICE_REVISION
+        vibevoice_sources = resolve_vibevoice_sources(model_id, revision)
+        if vibevoice_sources is not None:
+            # The official checkpoint has legacy metadata, so resolve executable
+            # assets from the pinned Transformers-native sidecar while retaining
+            # the requested checkpoint as the exclusive weight source.
+            revision = vibevoice_sources.weight_revision
+            config_model_id = vibevoice_sources.config_model_id
+            detection_revision = vibevoice_sources.config_revision
     if model_id == "microsoft/VibeVoice-Realtime-0.5B" and detection_revision is None:
         from mobius.models.vibevoice_streaming import VIBEVOICE_STREAMING_REVISION
 

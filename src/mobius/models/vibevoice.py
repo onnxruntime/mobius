@@ -67,14 +67,6 @@ class VibeVoiceSources:
 
 
 _UNSUPPORTED_VIBEVOICE_MODELS = {
-    "microsoft/VibeVoice-Realtime-0.5B": (
-        "VibeVoice Realtime requires its streaming backbone and scheduler, "
-        "which Mobius does not export yet."
-    ),
-    "microsoft/VibeVoice-ASR": (
-        "VibeVoice ASR requires the VibeVoice-ASR encoder-decoder task, "
-        "which Mobius does not export yet."
-    ),
     "microsoft/VibeVoice-ASR-Streaming-7B": (
         "VibeVoice ASR Streaming requires the VibeVoice-ASR streaming task, "
         "which Mobius does not export yet."
@@ -86,10 +78,6 @@ _UNSUPPORTED_VIBEVOICE_MODELS = {
     "microsoft/VibeVoice-ASR-BitNet": (
         "VibeVoice ASR BitNet requires the VibeVoice-ASR task and BitNet "
         "weight loader, which Mobius does not export yet."
-    ),
-    "microsoft/VibeVoice-ASR-HF": (
-        "VibeVoice ASR requires the VibeVoice-ASR encoder-decoder task, "
-        "which Mobius does not export yet."
     ),
     "microsoft/VibeVoice-AcousticTokenizer": (
         "VibeVoice Acoustic Tokenizer requires a standalone codec task, "

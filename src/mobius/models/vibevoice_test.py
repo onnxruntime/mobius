@@ -124,7 +124,7 @@ def test_official_vibevoice_sources_normalize_hub_id_case():
     assert sources is not None
     assert sources.model_id == "Microsoft/VibeVoice-1.5B"
     with pytest.raises(NotImplementedError, match="unsupported"):
-        resolve_vibevoice_sources("Microsoft/VibeVoice-ASR", None)
+        resolve_vibevoice_sources("Microsoft/VibeVoice-ASR-BitNet", None)
 
 
 @pytest.mark.parametrize(
