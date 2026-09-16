@@ -227,15 +227,12 @@ def _select_primary_config(hf_config):
             thinker = _dict_to_pretrained_config(thinker)
         if getattr(thinker, "text_config", None) is not None:
             hf_config = thinker.text_config
-    elif (
-        hasattr(hf_config, "decoder_config")
-        and (
-            model_type == "qwen3_tts_tokenizer_12hz"
-            or (
-                model_type == "vibevoice"
-                and getattr(hf_config, "architectures", None)
-                == ["VibeVoiceForASRStreamingTraining"]
-            )
+    elif hasattr(hf_config, "decoder_config") and (
+        model_type == "qwen3_tts_tokenizer_12hz"
+        or (
+            model_type == "vibevoice"
+            and getattr(hf_config, "architectures", None)
+            == ["VibeVoiceForASRStreamingTraining"]
         )
     ):
         decoder = hf_config.decoder_config

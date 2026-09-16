@@ -25,11 +25,12 @@ from mobius.tasks._base import (
     build_decoder_from_embeds,
     build_embedding_from_features,
 )
-from mobius.tasks._vibevoice import _make_conv_cache_inputs, _register_conv_cache_outputs
+from mobius.tasks._cache_utils import _make_kv_cache_inputs, _register_kv_cache_outputs
 from mobius.tasks._streaming_convolution import (
     make_conv_cache_inputs,
     register_conv_cache_outputs,
 )
+from mobius.tasks._vibevoice import _make_conv_cache_inputs, _register_conv_cache_outputs
 
 
 class VibeVoiceASRTask(ModelTask):
@@ -233,16 +234,23 @@ class VibeVoiceASRStreamingTask(ModelTask):
             semantic_past,
             is_final_chunk,
         )
+        speech_embeds.dtype = config.dtype
         speech_embeds.shape = ir.Shape(["valid_speech_frames", config.hidden_size])
         builder.add_output(speech_embeds, "speech_embeds")
         register_conv_cache_outputs(
             builder,
             acoustic_present,
+            module.acoustic_cache_specs,
+            batch,
+            config.dtype,
             prefix="present_acoustic_conv",
         )
         register_conv_cache_outputs(
             builder,
             semantic_present,
+            module.semantic_cache_specs,
+            batch,
+            config.dtype,
             prefix="present_semantic_conv",
         )
         declare_component_presence(graph, "audio")

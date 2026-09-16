@@ -1159,7 +1159,9 @@ class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
         self.decoder = VibeVoiceDecoderModel(config)
 
     def forward(self, op: OpBuilder, *args, **kwargs):
-        raise NotImplementedError("VibeVoiceASRStreamingTask exports each ASR stage independently")
+        raise NotImplementedError(
+            "VibeVoiceASRStreamingTask exports each ASR stage independently"
+        )
 
     @staticmethod
     def _encoder_weight_suffix(suffix: str) -> str:
@@ -1167,12 +1169,18 @@ class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
         if suffix.startswith("downsample_layers."):
             _, index_text, zero, remainder = suffix.split(".", maxsplit=3)
             if zero != "0":
-                raise ValueError(f"Unsupported VibeVoice streaming ASR downsample path: {suffix}")
+                raise ValueError(
+                    f"Unsupported VibeVoice streaming ASR downsample path: {suffix}"
+                )
             prefix = "stem" if int(index_text) == 0 else f"conv_layers.{int(index_text) - 1}"
             return f"{prefix}.{remainder}"
         if suffix.startswith("stages."):
             _, index_text, remainder = suffix.split(".", maxsplit=2)
-            prefix = "stem.stage" if int(index_text) == 0 else f"conv_layers.{int(index_text) - 1}.stage"
+            prefix = (
+                "stem.stage"
+                if int(index_text) == 0
+                else f"conv_layers.{int(index_text) - 1}.stage"
+            )
             return f"{prefix}.{remainder}".replace(".mixer.conv.conv.conv.", ".mixer.conv.")
         if suffix.startswith("head."):
             return suffix.replace("head.conv.conv.", "head.conv.")
@@ -1185,7 +1193,7 @@ class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
         routed: dict[str, torch.Tensor] = {}
         has_explicit_lm_head = "lm_head.weight" in state_dict
         for key, value in state_dict.items():
-            if key.startswith("audio_encoder.") or key.startswith("embedding.") or key.startswith("decoder."):
+            if key.startswith(("audio_encoder.", "embedding.", "decoder.")):
                 routed[key] = value
             elif key.startswith("model.acoustic_tokenizer.encoder."):
                 suffix = key.removeprefix("model.acoustic_tokenizer.encoder.")
@@ -1208,10 +1216,14 @@ class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
             elif key.startswith("model.language_model.embed_tokens."):
                 suffix = key.removeprefix("model.language_model.embed_tokens.")
                 routed[f"embedding.embed_tokens.{suffix}"] = value
-                if suffix == "weight" and self.config.tie_word_embeddings and not has_explicit_lm_head:
+                if (
+                    suffix == "weight"
+                    and self.config.tie_word_embeddings
+                    and not has_explicit_lm_head
+                ):
                     routed["decoder.lm_head.weight"] = value
-            elif key.startswith("model.language_model.layers.") or key.startswith(
-                "model.language_model.norm."
+            elif key.startswith(
+                ("model.language_model.layers.", "model.language_model.norm.")
             ):
                 routed[f"decoder.{key.removeprefix('model.language_model.')}"] = value
             elif key == "lm_head.weight":
@@ -1219,5 +1231,7 @@ class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
             elif key.startswith(self.INTENTIONALLY_UNUSED_WEIGHT_PREFIXES):
                 continue
             else:
-                raise ValueError(f"Unexpected VibeVoice streaming ASR checkpoint tensor: {key}")
+                raise ValueError(
+                    f"Unexpected VibeVoice streaming ASR checkpoint tensor: {key}"
+                )
         return routed

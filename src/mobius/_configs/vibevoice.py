@@ -407,7 +407,9 @@ def _asr_streaming_tokenizer_config(
             + "."
         )
     if not encoder_ratios or any(int(ratio) <= 0 for ratio in encoder_ratios):
-        raise ValueError("VibeVoice streaming ASR encoder_ratios must contain positive integers.")
+        raise ValueError(
+            "VibeVoice streaming ASR encoder_ratios must contain positive integers."
+        )
     return VibeVoiceTokenizerConfig(
         channels=int(getattr(source, "channels", 1)),
         hidden_size=int(getattr(source, "vae_dim", default_hidden_size)),
@@ -475,7 +477,9 @@ class VibeVoiceASRStreamingConfig(ArchitectureConfig):
                 "VibeVoice streaming ASR requires a gaussian acoustic tokenizer and "
                 "a deterministic semantic tokenizer."
             )
-        compression_ratio = int(getattr(parent, "speech_tok_compress_ratio", acoustic.hop_length))
+        compression_ratio = int(
+            getattr(parent, "speech_tok_compress_ratio", acoustic.hop_length)
+        )
         if acoustic.hop_length != compression_ratio:
             raise ValueError(
                 "VibeVoice streaming ASR acoustic tokenizer ratios must match the "

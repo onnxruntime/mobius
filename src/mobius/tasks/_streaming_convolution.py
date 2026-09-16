@@ -30,9 +30,14 @@ def make_conv_cache_inputs(
 def register_conv_cache_outputs(
     builder,
     values: list[ir.Value],
+    specs: tuple[tuple[int, int], ...],
+    batch: ir.SymbolicDim,
+    dtype: ir.DataType,
     *,
     prefix: str = "present_conv",
 ) -> None:
     """Register causal convolution state outputs under a stable component prefix."""
-    for index, value in enumerate(values):
+    for index, (value, (channels, left_pad)) in enumerate(zip(values, specs, strict=True)):
+        value.dtype = dtype
+        value.shape = ir.Shape([batch, channels, left_pad])
         builder.add_output(value, f"{prefix}.{index}")

@@ -30,12 +30,12 @@ from mobius._pipeline_contract import (
 )
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from mobius.models.vibevoice import (
     VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS,
     VIBEVOICE_ASR_STREAMING_SOURCE_REVISION,
     VibeVoiceASRStreamingForConditionalGeneration,
 )
+from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from mobius.tasks import VibeVoiceASRStreamingTask, VibeVoiceASRTask
 
 

@@ -224,7 +224,9 @@ def test_vibevoice_streaming_asr_writes_pinned_advisory_contract(
     monkeypatch.setattr(
         auto_export,
         "_write_advisory_component_contract",
-        lambda *args, **kwargs: {"inference_metadata": str(tmp_path / "inference_metadata.yaml")},
+        lambda *args, **kwargs: {
+            "inference_metadata": str(tmp_path / "inference_metadata.yaml")
+        },
     )
 
     artifacts = write_onnx_genai_config(

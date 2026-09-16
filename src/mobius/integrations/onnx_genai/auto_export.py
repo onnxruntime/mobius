@@ -1067,7 +1067,11 @@ def write_onnx_genai_config(
             _copy_runtime_assets(
                 output_dir,
                 source,
-                ("processor_config.json", "preprocessor_config.json", "generation_config.json"),
+                (
+                    "processor_config.json",
+                    "preprocessor_config.json",
+                    "generation_config.json",
+                ),
                 revision=revision,
             )
         )

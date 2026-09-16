@@ -90,8 +90,6 @@ _FILTERING_PREPROCESS_MODELS: set[str] = {
     # Realtime maps the Microsoft multi-stage checkpoint namespace, rather
     # than accepting ONNX initializer names as an input format.
     "vibevoice_streaming",
-    # Streaming ASR translates its executable checkpoint hierarchy into split-stage names.
-    "VibeVoiceForASRStreamingTraining",
 }
 
 
