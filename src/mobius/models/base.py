@@ -24,7 +24,7 @@ from mobius._build_context import (
     get_build_dtype,
     is_prefill_prefix_pruning_enabled,
 )
-from mobius._configs import ArchitectureConfig, CausalLMConfig
+from mobius._configs import ArchitectureConfig, CausalLMConfig, QuantizedWeightFormat
 from mobius._flags import flags
 from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
@@ -64,7 +64,11 @@ def effective_tie_word_embeddings(config: ArchitectureConfig) -> bool:
 def linear_class_for_config(config: ArchitectureConfig):
     """Return the configured quantized linear factory, or ``None`` for float."""
     qc = getattr(config, "quantization", None)
-    if qc is None or qc.quant_method == "none":
+    if (
+        qc is None
+        or qc.quant_method == "none"
+        or qc.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
+    ):
         return None
     zp_dtype = config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
     return make_quantized_linear_factory(

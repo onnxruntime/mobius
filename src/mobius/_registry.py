@@ -47,7 +47,9 @@ from mobius._configs import (
     Plamo2Config,
     Qwen4ExpConfig,
     SenseNovaU1Config,
+    VibeVoiceASRConfig,
     VibeVoiceConfig,
+    VibeVoiceStreamingConfig,
     WhisperConfig,
     XverseConfig,
 )
@@ -159,7 +161,9 @@ from mobius.models import (
     SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
+    VibeVoiceASRForConditionalGeneration,
     VibeVoiceForConditionalGeneration,
+    VibeVoiceStreamingForConditionalGeneration,
     WhisperForConditionalGeneration,
     XverseCausalLMModel,
 )
@@ -228,6 +232,11 @@ from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
+from mobius.models.vibevoice_asr import VIBEVOICE_ASR_MODEL_ID, VIBEVOICE_ASR_REVISION
+from mobius.models.vibevoice_streaming import (
+    VIBEVOICE_STREAMING_MODEL_ID,
+    VIBEVOICE_STREAMING_REVISION,
+)
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
@@ -904,6 +913,33 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         test_model_id=VIBEVOICE_MODEL_ID,
         test_revision=VIBEVOICE_REVISION,
         family="vibevoice",
+    ),
+    "vibevoice_streaming": ModelRegistration(
+        VibeVoiceStreamingForConditionalGeneration,
+        task="vibevoice-streaming-tts",
+        config_class=VibeVoiceStreamingConfig,
+        test_model_id=VIBEVOICE_STREAMING_MODEL_ID,
+        test_revision=VIBEVOICE_STREAMING_REVISION,
+        family="vibevoice",
+        variant="realtime",
+    ),
+    "VibeVoiceStreamingForConditionalGenerationInference": ModelRegistration(
+        VibeVoiceStreamingForConditionalGeneration,
+        task="vibevoice-streaming-tts",
+        config_class=VibeVoiceStreamingConfig,
+        test_model_id=VIBEVOICE_STREAMING_MODEL_ID,
+        test_revision=VIBEVOICE_STREAMING_REVISION,
+        family="vibevoice",
+        variant="realtime",
+    ),
+    "vibevoice_asr": ModelRegistration(
+        VibeVoiceASRForConditionalGeneration,
+        task="vibevoice-asr",
+        config_class=VibeVoiceASRConfig,
+        test_model_id=VIBEVOICE_ASR_MODEL_ID,
+        test_revision=VIBEVOICE_ASR_REVISION,
+        family="vibevoice",
+        variant="offline-asr",
     ),
     "whisper": ModelRegistration(
         WhisperForConditionalGeneration,

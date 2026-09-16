@@ -89,6 +89,9 @@ _FILTERING_PREPROCESS_MODELS: set[str] = {
     "opt",
     # ModernBert decoder: expects model.layers.* HF format with renames
     "modernbert-decoder",
+    # Realtime maps the Microsoft multi-stage checkpoint namespace, rather
+    # than accepting ONNX initializer names as an input format.
+    "vibevoice_streaming",
 }
 
 
@@ -172,35 +175,73 @@ def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
     assert parameter_names == set(routed)
 
 
-@pytest.mark.integration
-def test_official_vibevoice_weight_index_matches_native_conversion():
-    """All official index keys map one-to-one to the pinned native checkpoint."""
+@pytest.mark.arch_validation
+def test_vibevoice_asr_checkpoint_index_routes_every_native_tensor_once(tmp_path):
+    """The pinned native ASR index routes every inference tensor without exclusions."""
+    import json
+
     from huggingface_hub import hf_hub_download
 
-    from mobius.models.vibevoice import (
-        VIBEVOICE_EXECUTABLE_MODEL_ID,
-        VIBEVOICE_EXECUTABLE_REVISION,
-        VIBEVOICE_MODEL_ID,
-        VIBEVOICE_REVISION,
-        _transform_official_weight_name,
+    from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
+    from mobius.models.vibevoice_test import _make_tiny_hf_config
+
+    index_path = hf_hub_download(
+        "microsoft/VibeVoice-ASR-HF",
+        filename="model.safetensors.index.json",
+        revision="f22241c2062b3b25272bf117397e03d73381037a",
+        cache_dir=tmp_path,
     )
+    with open(index_path, encoding="utf-8") as handle:
+        checkpoint_names = set(json.load(handle)["weight_map"])
 
-    def weight_names(model_id: str, revision: str) -> set[str]:
-        path = hf_hub_download(
-            repo_id=model_id,
-            filename="model.safetensors.index.json",
-            revision=revision,
+    categories = {
+        "acoustic_encoder": {
+            name for name in checkpoint_names if name.startswith("acoustic_tokenizer_encoder.")
+        },
+        "semantic_encoder": {
+            name for name in checkpoint_names if name.startswith("semantic_tokenizer_encoder.")
+        },
+        "connectors": {
+            name for name in checkpoint_names if name.startswith("multi_modal_projector.")
+        },
+        "embedding": {
+            name
+            for name in checkpoint_names
+            if name.startswith("language_model.model.embed_tokens.")
+        },
+        "decoder": {
+            name
+            for name in checkpoint_names
+            if name.startswith(("language_model.model.layers.", "language_model.model.norm."))
+            or name == "language_model.lm_head.weight"
+        },
+    }
+    assert set().union(*categories.values()) == checkpoint_names
+    assert sum(map(len, categories.values())) == len(checkpoint_names) == 901
+    assert {name: len(values) for name, values in categories.items()} == {
+        "acoustic_encoder": 276,
+        "semantic_encoder": 276,
+        "connectors": 10,
+        "embedding": 1,
+        "decoder": 338,
+    }
+
+    # Native HF names must map directly to all five exported components.
+    from mobius._configs import VibeVoiceASRConfig
+
+    hf_config = _make_tiny_hf_config()
+    config = VibeVoiceASRConfig.from_transformers(
+        hf_config.text_config, parent_config=hf_config
+    )
+    module = VibeVoiceASRForConditionalGeneration(config)
+    routed = module.preprocess_weights({name: torch.empty(0) for name in checkpoint_names})
+    assert len(routed) == len(checkpoint_names)
+    assert all(
+        name.startswith(
+            ("acoustic_encoder.", "semantic_encoder.", "connectors.", "embedding.", "decoder.")
         )
-        with open(path, encoding="utf-8") as file:
-            return set(json.load(file)["weight_map"])
-
-    official = weight_names(VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION)
-    native = weight_names(VIBEVOICE_EXECUTABLE_MODEL_ID, VIBEVOICE_EXECUTABLE_REVISION)
-    converted = {_transform_official_weight_name(name) for name in official}
-
-    assert len(official) == 1204
-    assert len(converted) == len(official)
-    assert converted == native
+        for name in routed
+    )
 
 
 # ---------------------------------------------------------------------------

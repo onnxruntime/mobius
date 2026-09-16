@@ -93,7 +93,11 @@ from mobius._configs._base import (
     _shallow_fields,
     _shared_expert_size,
 )
-from mobius._configs._quantization import QuantizationConfig, QuantizationOverride
+from mobius._configs._quantization import (
+    QuantizationConfig,
+    QuantizationOverride,
+    QuantizedWeightFormat,
+)
 from mobius._configs._sub_configs import (
     AudioConfig,
     CodecDecoderConfig,
@@ -110,8 +114,12 @@ from mobius._configs._world_model import WorldModelConfig
 from mobius._configs.vibevoice import (
     VibeVoiceConfig,
     VibeVoiceDiffusionConfig,
+    VibeVoiceStreamingConfig,
+    VibeVoiceStreamingDiffusionConfig,
+    VibeVoiceStreamingTokenizerConfig,
     VibeVoiceTokenizerConfig,
 )
+from mobius._configs.vibevoice_asr import VibeVoiceASRConfig
 
 __all__ = [
     "DEFAULT_INT",
@@ -163,6 +171,7 @@ __all__ = [
     "ParakeetCTCConfig",
     "Plamo2Config",
     "QuantizationConfig",
+    "QuantizedWeightFormat",
     "Qwen4ExpConfig",
     "QuantizationOverride",
     "Qwen35MtpConfig",
@@ -176,7 +185,11 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "VibeVoiceConfig",
+    "VibeVoiceASRConfig",
     "VibeVoiceDiffusionConfig",
+    "VibeVoiceStreamingConfig",
+    "VibeVoiceStreamingDiffusionConfig",
+    "VibeVoiceStreamingTokenizerConfig",
     "VibeVoiceTokenizerConfig",
     "WhisperConfig",
     "XverseConfig",

@@ -142,6 +142,42 @@ def test_vibevoice_assets_and_revision_are_forwarded(monkeypatch, tmp_path):
     } <= set(artifacts)
 
 
+def test_vibevoice_asr_writes_processor_and_advisory_contract(monkeypatch, tmp_path):
+    from mobius.models.vibevoice_asr_test import _make_models
+
+    _, _, package = _make_models()
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export._write_text_runtime_assets",
+        lambda *args, **kwargs: {},
+    )
+
+    artifacts = write_onnx_genai_config(package, str(tmp_path))
+
+    processor = json.loads((tmp_path / "preprocessor_config.json").read_text())
+    compatibility = json.loads((tmp_path / "runtime_compatibility.json").read_text())
+    assert artifacts["processor_contract"] == str(tmp_path / "preprocessor_config.json")
+    assert processor["target_sample_rate"] == 24_000
+    assert (
+        processor["speech_tok_compress_ratio"] == package.config.acoustic_tokenizer.hop_length
+    )
+    assert processor["encoder_final_chunk_input"] == "is_final_chunk"
+    assert processor["prompt_protocol"]["speech_tokens"] == [
+        "<|object_ref_start|>",
+        "<|box_start|>",
+        "<|object_ref_end|>",
+    ]
+    assert "You are a helpful assistant." not in processor["prompt_protocol"]["chat_template"]
+    assert processor["acoustic_sampling"]["noise_scale_input"] == "acoustic_noise_scale"
+    assert sorted(compatibility["components"]) == [
+        "acoustic_encoder",
+        "connectors",
+        "decoder",
+        "embedding",
+        "semantic_encoder",
+    ]
+    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+
+
 def _video_diffusion_package() -> ModelPackage:
     latent = ["batch", "frames", 4, "height", "width"]
     transformer = _model(
