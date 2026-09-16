@@ -348,9 +348,7 @@ class Qwen35CausalLMModel(CausalLMModel):
             past_key_values=past_key_values,
         )
         if attention_mask.last_token_indices is not None:
-            hidden_states = op.Gather(
-                hidden_states, attention_mask.last_token_indices, axis=0
-            )
+            hidden_states = op.Gather(hidden_states, attention_mask.last_token_indices, axis=0)
         return self.lm_head(op, hidden_states), present_key_values
 
     def preprocess_weights(
