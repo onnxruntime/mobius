@@ -22,6 +22,10 @@ from mobius.components._common import (
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._mlp import MLP
+from mobius.components._paged_attention import (
+    PagedAttentionState,
+    PagedHybridContext,
+)
 from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
@@ -188,7 +192,15 @@ class Qwen35DecoderLayer(nn.Module):
             conv_state, recurrent_state = past_key_value
 
             attn_output, new_conv_state, new_recurrent_state = self.linear_attn(
-                op, hidden_states, conv_state, recurrent_state
+                op,
+                hidden_states,
+                conv_state,
+                recurrent_state,
+                cumulative_sequence_lengths=(
+                    attention_bias.cumulative_sequence_lengths
+                    if isinstance(attention_bias, PagedHybridContext)
+                    else None
+                ),
             )
             present_key_value = (new_conv_state, new_recurrent_state)
         else:
@@ -246,20 +258,28 @@ class Qwen35TextModel(nn.Module):
         inputs_embeds: ir.Value | None = None,
         deepstack_embeds: list | None = None,
     ):
-        # Embed tokens: (batch, seq_len) → (batch, seq_len, hidden_size)
+        packed = isinstance(attention_mask, PagedHybridContext)
+        # Embed tokens: dense (B,S,H), or packed (N,H).
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
         # Compute (cos, sin) for RoPE: each (batch, seq_len, rotary_dim)
-        position_embeddings = self.rotary_emb(op, position_ids)
+        if packed:
+            position_embeddings = self.rotary_emb(op, position_ids, packed=True)
+        else:
+            position_embeddings = self.rotary_emb(op, position_ids)
 
         # Causal attention mask: (batch, 1, seq_len, total_seq_len)
-        attention_bias = create_attention_bias(
-            op,
-            input_ids=hidden_states if input_ids is None else input_ids,
-            attention_mask=attention_mask,
-            dtype=self._dtype,
+        attention_bias = (
+            attention_mask
+            if packed
+            else create_attention_bias(
+                op,
+                input_ids=hidden_states if input_ids is None else input_ids,
+                attention_mask=attention_mask,
+                dtype=self._dtype,
+            )
         )
 
         present_key_values: list = []
@@ -305,6 +325,36 @@ class Qwen35CausalLMModel(CausalLMModel):
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
         self._replace_text_model(Qwen35TextModel(config))
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | PagedHybridContext | None,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+    ):
+        """Preserve the dense ABI while supporting the dedicated packed task."""
+        if not isinstance(attention_mask, PagedHybridContext):
+            return super().forward(
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values,
+            )
+        hidden_states, present_key_values = self.model(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+        if attention_mask.last_token_indices is not None:
+            hidden_states = op.Gather(
+                hidden_states, attention_mask.last_token_indices, axis=0
+            )
+        return self.lm_head(op, hidden_states), present_key_values
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

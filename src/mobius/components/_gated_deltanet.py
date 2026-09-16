@@ -34,6 +34,10 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
+from mobius.components._paged_attention import (
+    gated_delta_net,
+    varlen_causal_conv_with_state,
+)
 from mobius.components._rms_norm import PostGatedRMSNorm
 
 
@@ -64,6 +68,7 @@ class _DepthwiseConv1d(nn.Module):
         op: OpBuilder,
         input_val: ir.Value,
         conv_state: ir.Value,
+        cumulative_sequence_lengths: ir.Value | None = None,
     ):
         """Run CausalConvWithState function op.
 
@@ -82,6 +87,10 @@ class _DepthwiseConv1d(nn.Module):
             op.CastLike(op.Constant(value_float=0.0), self.weight),
             op.Constant(value_ints=[self._channels]),
         )
+        if cumulative_sequence_lengths is not None:
+            return varlen_causal_conv_with_state(
+                op, input_val, self.weight, cumulative_sequence_lengths, conv_bias, conv_state
+            )
         return op.CausalConvWithState(
             input_val,
             self.weight,
@@ -153,6 +162,10 @@ class GatedDeltaNet(nn.Module):
         # Learnable parameters for decay computation
         self.dt_bias = nn.Parameter([self.num_v_heads])
         self.A_log = nn.Parameter([self.num_v_heads])
+        if config.export_paged_attention:
+            # Preserve raw FP32 native gates without changing dense parameter dtypes.
+            self.dt_bias._keep_float32 = True
+            self.A_log._keep_float32 = True
 
         # Gated output normalization
         self.norm = PostGatedRMSNorm(self.head_v_dim, eps=config.rms_norm_eps)
@@ -166,6 +179,7 @@ class GatedDeltaNet(nn.Module):
         hidden_states: ir.Value,
         conv_state: ir.Value,
         recurrent_state: ir.Value,
+        cumulative_sequence_lengths: ir.Value | None = None,
     ):
         """Forward pass for the Gated DeltaNet layer.
 
@@ -183,6 +197,15 @@ class GatedDeltaNet(nn.Module):
             new_conv_state: (batch, conv_dim, kernel_size-1)
             new_recurrent_state: (batch, num_v_heads, k_dim, v_dim)
         """
+        if cumulative_sequence_lengths is not None:
+            return self.forward_paged(
+                op,
+                hidden_states,
+                conv_state,
+                recurrent_state,
+                cumulative_sequence_lengths,
+            )
+
         batch_dim = op.Shape(hidden_states, start=0, end=1)
 
         # === Projections ===
@@ -311,3 +334,49 @@ class GatedDeltaNet(nn.Module):
         output = self.out_proj(op, output)
 
         return output, new_conv_state, new_recurrent_state
+
+    def forward_paged(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        conv_state: ir.Value,
+        recurrent_state: ir.Value,
+        cumulative_sequence_lengths: ir.Value,
+    ):
+        """Packed native path: ``[N,H]`` activations and V-major recurrent state."""
+        mixed_qkv = self.in_proj_qkv(op, hidden_states)  # (N, 2*K + V)
+        z = self.in_proj_z(op, hidden_states)  # (N, Hv*Dv)
+        raw_b = op.Cast(self.in_proj_b(op, hidden_states), to=ir.DataType.FLOAT)
+        raw_a = op.Cast(self.in_proj_a(op, hidden_states), to=ir.DataType.FLOAT)
+
+        # Invoke the child module so nn realizes its qualified conv1d.weight.
+        conv_out, new_conv_state = self.conv1d(
+            op, mixed_qkv, conv_state, cumulative_sequence_lengths
+        )
+        query, key, value = op.Split(
+            conv_out,
+            op.Constant(value_ints=[self.key_dim, self.key_dim, self.value_dim]),
+            axis=-1,
+            _outputs=3,
+        )
+        query = op.Reshape(query, [-1, self.num_k_heads, self.head_k_dim])
+        key = op.Reshape(key, [-1, self.num_k_heads, self.head_k_dim])
+        value = op.Reshape(value, [-1, self.num_v_heads, self.head_v_dim])
+
+        output, new_recurrent_state = gated_delta_net(
+            op,
+            query,
+            key,
+            value,
+            cumulative_sequence_lengths,
+            raw_a,
+            raw_b,
+            recurrent_state,
+            self.A_log,
+            self.dt_bias,
+        )
+        output = op.Reshape(output, [-1, self.head_v_dim])
+        z = op.Reshape(z, [-1, self.head_v_dim])
+        output = self.norm(op, output, z)
+        output = op.Reshape(output, [-1, self.value_dim])
+        return self.out_proj(op, output), new_conv_state, new_recurrent_state

@@ -609,15 +609,70 @@ def build_transformers_model(
             )
         config = dataclasses.replace(config, use_dsa=False)
     if export_paged_attention:
-        from mobius.components._paged_mla import paged_attention_rejection
-
         config = dataclasses.replace(config, export_paged_attention=True)
-        reason = paged_attention_rejection(config)
-        if reason is not None:
-            raise ValueError(
-                "export_paged_attention=True (--features paged-attention) is not "
-                f"supported for model_type '{model_type}': {reason}"
-            )
+        from mobius.tasks import CausalLMTask
+
+        paged_task_placeholder = isinstance(task, CausalLMTask) and getattr(
+            task, "_paged_cache", False
+        )
+        if model_type == "qwen3_5_text":
+            from mobius.tasks import PagedHybridCausalLMTask
+
+            unsupported_options = [
+                name
+                for name, enabled in {
+                    "fp8_kv_cache": fp8_kv_cache,
+                    "kv_cache_scales": kv_cache_scales is not None,
+                    "output_layer_indices": output_layer_indices is not None,
+                    "glm_full_attention": glm_full_attention,
+                }.items()
+                if enabled
+            ]
+            if unsupported_options:
+                raise ValueError(
+                    "Qwen packed paged-attention does not support options: "
+                    + ", ".join(unsupported_options)
+                )
+            if execution_provider != "cuda":
+                raise ValueError(
+                    "Qwen packed paged-attention requires execution_provider='cuda'; "
+                    f"got {execution_provider!r}"
+                )
+            if (
+                task is not None
+                and not paged_task_placeholder
+                and not isinstance(task, PagedHybridCausalLMTask)
+            ):
+                raise ValueError(
+                    "Qwen packed paged-attention owns its task and cannot be combined "
+                    f"with task={task!r}"
+                )
+            if config.dtype not in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+                raise ValueError(
+                    "Qwen packed paged-attention requires dtype f16 or bf16; "
+                    f"got {config.dtype!r}"
+                )
+            if config.quantization is not None and config.quantization.quant_method != "none":
+                raise ValueError(
+                    "Qwen packed paged-attention does not support quantized checkpoints"
+                )
+            if not isinstance(task, PagedHybridCausalLMTask):
+                task = PagedHybridCausalLMTask()
+        else:
+            from mobius.components._paged_mla import paged_attention_rejection
+
+            reason = paged_attention_rejection(config)
+            if reason is not None:
+                raise ValueError(
+                    "export_paged_attention=True (--features paged-attention) is not "
+                    f"supported for model_type '{model_type}': {reason}"
+                )
+            if task is not None and not paged_task_placeholder:
+                raise ValueError(
+                    f"PagedAttention owns its task and cannot be combined with task={task!r}"
+                )
+            if task is None:
+                task = CausalLMTask(paged_cache=True)
     if task is None:
         task = _default_task_for_model(model_type)
 

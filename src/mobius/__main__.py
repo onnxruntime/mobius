@@ -271,6 +271,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 "Error: --features paged-attention cannot be combined with --task. "
                 "Remove --task to use --features paged-attention."
             )
+        # The Transformers builder replaces this placeholder with Qwen's
+        # dedicated packed hybrid task when the effective config requires it.
         task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision

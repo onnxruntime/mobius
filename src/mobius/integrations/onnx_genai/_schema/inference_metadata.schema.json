@@ -3656,6 +3656,44 @@
       "oneOf": [
         {
           "additionalProperties": false,
+          "description": "Packed tokens update caller-owned page buffers in place. Logical positions are mapped through the block table; neither page axis is a request batch axis. Request boundaries and committed lengths identify writes without exposing a slot_mapping input.",
+          "properties": {
+            "kind": {
+              "const": "paged_scatter",
+              "type": "string"
+            },
+            "block_size": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Graph-visible number of token slots in each page."
+            },
+            "block_table_ports": {
+              "type": "object",
+              "additionalProperties": {"type": "string"},
+              "description": "Per-component logical-to-physical page table input."
+            },
+            "past_sequence_length_ports": {
+              "type": "object",
+              "additionalProperties": {"type": "string"},
+              "description": "Per-component input carrying committed lengths before the invocation."
+            },
+            "cumulative_sequence_length_ports": {
+              "type": "object",
+              "additionalProperties": {"type": "string"},
+              "description": "Per-component exclusive prefix sums delimiting packed query rows."
+            }
+          },
+          "required": [
+            "kind",
+            "block_size",
+            "block_table_ports",
+            "past_sequence_length_ports",
+            "cumulative_sequence_length_ports"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Each step's positions extend the buffer along `sequence_axis`.\n\nThe valid region is the whole tensor, so no write cursor is graph-visible\nand the buffer's shape carries the length.",
           "properties": {
             "kind": {

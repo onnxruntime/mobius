@@ -101,6 +101,8 @@ __all__ = [
     "MobileNetV5Encoder",
     "MoELayer",
     "OffsetRMSNorm",
+    "PagedAttentionState",
+    "PagedHybridContext",
     "PatchEmbed",
     "PatchEmbedding",
     "ParakeetFastConformerEncoder",
@@ -238,6 +240,7 @@ from mobius.components._decoder import (
     create_decoder_layer,
 )
 from mobius.components._deepseek_mla import DeepSeekMLA as DeepSeekMLA
+from mobius.components._paged_attention import PagedAttentionState, PagedHybridContext
 from mobius.components._diffusion import (
     AdaLayerNormOutput,
     AdaLayerNormZero,

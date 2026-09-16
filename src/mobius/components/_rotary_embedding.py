@@ -478,7 +478,9 @@ class _MRopeBase(BaseRope):
             data=ir.tensor(w_mask),
         )
 
-    def forward(self, op: OpBuilder, position_ids: ir.Value):
+    def forward(
+        self, op: OpBuilder, position_ids: ir.Value, *, packed: bool = False
+    ):
         """Compute MRoPE cos/sin embeddings.
 
         Args:
@@ -490,6 +492,21 @@ class _MRopeBase(BaseRope):
         Returns:
             Tuple of ``(cos, sin)`` each with shape ``(batch, seq, rotary_dim)``.
         """
+        if packed:
+            # Packed serving supplies exactly (3,N), with no batch padding.
+            pos_t = op.Squeeze(op.Gather(position_ids, [0], axis=0), [0])
+            pos_h = op.Squeeze(op.Gather(position_ids, [1], axis=0), [0])
+            pos_w = op.Squeeze(op.Gather(position_ids, [2], axis=0), [0])
+            cos_t, sin_t = (
+                op.Gather(self.cos_cache, pos_t),
+                op.Gather(self.sin_cache, pos_t),
+            )
+            cos = op.Where(self.h_mask, op.Gather(self.cos_cache, pos_h), cos_t)
+            cos = op.Where(self.w_mask, op.Gather(self.cos_cache, pos_w), cos)
+            sin = op.Where(self.h_mask, op.Gather(self.sin_cache, pos_h), sin_t)
+            sin = op.Where(self.w_mask, op.Gather(self.sin_cache, pos_w), sin)
+            return self._cast_embeddings(op, cos, sin)
+
         # For 2D text-only position_ids (batch, seq), expand to (3, batch, seq)
         # by stacking the same positions for T, H, W dimensions.
         # For 3D position_ids, this is a no-op reshape.
