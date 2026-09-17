@@ -8,7 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
-from mobius._build_context import prefill_prefix_pruning, ep_capabilities
+from mobius._build_context import ep_capabilities, prefill_prefix_pruning
 from mobius._configs import ArchitectureConfig
 from mobius._constants import (
     STATIC_CACHE_KV_SEQUENCE_LENGTH,
@@ -507,7 +507,6 @@ def _make_static_cache_inputs(
 
     cache_pairs: list[tuple[ir.Value, ir.Value]] = []
     for i, (kv_heads, layer_head_dim) in enumerate(cache_specs):
-
         if layout == "heads_first":
             cache_shape = [batch, kv_heads, max_seq_len, layer_head_dim]
         else:
