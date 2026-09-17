@@ -23,6 +23,7 @@ Naming convention:
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 
 import onnx_ir as ir
 
@@ -48,6 +49,9 @@ from mobius.functions.skip_layer_normalization import (
 )
 
 _DOMAIN = "com.microsoft"
+_FUNCTION_BODY_MARKER = "mobius.function_body"
+_MATMUL_NBITS_ID = (_DOMAIN, "MatMulNBits", "")
+_MATMUL_NBITS_DEFAULT_ZERO_POINTS_ID = (_DOMAIN, "MatMulNBits", "default_zero_points")
 
 # Registry mapping (domain, name, overload) → zero-arg factory function.
 #
@@ -64,7 +68,8 @@ _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, Callable[[], ir.Function]] = {
         "MatMulBlockQuantizedFp4Weight",
         "",
     ): matmul_block_quantized_fp4_weight,
-    (_DOMAIN, "MatMulNBits", ""): matmul_nbits,
+    _MATMUL_NBITS_ID: matmul_nbits,
+    _MATMUL_NBITS_DEFAULT_ZERO_POINTS_ID: partial(matmul_nbits, has_zero_points=False),
     (_DOMAIN, "PackedMultiHeadAttention", ""): packed_multi_head_attention,
     (_DOMAIN, "SkipLayerNormalization", ""): skip_layer_normalization,
     (_DOMAIN, "SkipSimplifiedLayerNormalization", ""): skip_simplified_layer_normalization,
@@ -83,7 +88,26 @@ def get_function(op_id: ir.OperatorIdentifier) -> ir.Function | None:
     builder = _FUNCTION_BUILDERS.get(op_id)
     if builder is None:
         return None
-    return builder()
+    function = builder()
+    function.metadata_props[_FUNCTION_BODY_MARKER] = "1"
+    return function
+
+
+def _specialize_matmul_nbits_calls(model: ir.Model) -> None:
+    existing = model.functions.get(_MATMUL_NBITS_ID)
+    if existing is not None and existing.metadata_props.get(_FUNCTION_BODY_MARKER) != "1":
+        return
+
+    graphs = [model.graph, *(function.graph for function in model.functions.values())]
+    for graph in graphs:
+        for node in graph.all_nodes():
+            if (
+                node.op_identifier() != _MATMUL_NBITS_ID
+                or node.attributes.get_int("bits", 4) != 4
+            ):
+                continue
+            if len(node.inputs) < 4 or node.inputs[3] is None:
+                node.overload = _MATMUL_NBITS_DEFAULT_ZERO_POINTS_ID[2]
 
 
 def register_function_bodies(model: ir.Model) -> None:
@@ -98,7 +122,12 @@ def register_function_bodies(model: ir.Model) -> None:
     Each call creates **fresh** ``ir.Function`` objects so that concurrent
     builds in different threads (or sequential builds in the same process)
     cannot corrupt each other's function bodies.
+
+    MatMulNBits calls without zero points select an overload implementing the
+    operator's default. Native op inputs and packed weights are left unchanged,
+    and caller-provided MatMulNBits function definitions are preserved.
     """
+    _specialize_matmul_nbits_calls(model)
     for op_id in _FUNCTION_BUILDERS:
         if op_id in model.functions:
             continue
