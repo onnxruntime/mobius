@@ -170,6 +170,13 @@ is required for standalone TensorRT. Other model backbones must supply a full
 static-cache bias or export fails explicitly instead of emitting maskless
 attention on this provider.
 
+Gemma4's static-cache implementation currently requires flattened caches.
+Combining Gemma4 with `tensorrt` and `static-cache` raises an explicit error,
+including through the generic causal-LM, Gemma4 text, and multimodal tasks.
+Use a flattened-cache target for Gemma4 static-cache exports. This restriction
+does not apply to dynamic-cache graph construction and does not imply TensorRT
+runtime validation for Gemma4.
+
 Out-of-tree EPs can register at runtime via `register_ep()`:
 
 ```python

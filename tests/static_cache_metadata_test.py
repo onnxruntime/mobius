@@ -58,6 +58,65 @@ from mobius.tasks import CausalLMTask
 CAPACITY = 128
 
 
+def test_ep_capabilities_preserves_legacy_positional_arguments():
+    from mobius import EpCapabilities
+
+    legacy = {
+        "name": "custom",
+        "gqa_dtypes": frozenset({ir.DataType.FLOAT}),
+        "qkv_pack_dtypes": frozenset({ir.DataType.FLOAT16}),
+        "supports_fused_rope": True,
+        "supports_skip_layer_norm": False,
+        "supports_fused_moe": False,
+        "supports_packed_multi_head_attention": True,
+        "supports_rank4_rmsnorm": False,
+        "supports_attention": False,
+        "supports_matmul_nbits": False,
+        "supports_rotary_embedding": False,
+        "supports_tensor_scatter": False,
+        "supports_range": False,
+        "supports_fp8_kv_cache": True,
+        "default_int4_accuracy_level": 4,
+        "provider_options": {"custom_option": "1"},
+        "enable_graph_capture": True,
+        "supports_past_present_share_buffer": True,
+        "cap_kv_buffer_max_length": True,
+        "max_buffer_size": 1024,
+        "layered_per_layer_inputs": True,
+        "requires_graph_capture_rewrite": True,
+    }
+    caps = EpCapabilities(*legacy.values())
+    for name, expected in legacy.items():
+        assert getattr(caps, name) == expected
+    assert caps.static_cache_layout == "flattened"
+    assert caps.supports_attention_nonpad_kv_seqlen is True
+
+
+@pytest.mark.parametrize("task_name", ["generic", "text", "multimodal"])
+@pytest.mark.parametrize(
+    "ep_name,static_cache", [("tensorrt", True), ("tensorrt", False), ("default", True)]
+)
+def test_gemma4_static_cache_layout_support(task_name, ep_name, static_cache):
+    from gemma4_prefill_prefix_test import _make_config
+
+    from mobius.tasks._gemma4 import Gemma4Task, Gemma4TextCausalLMTask
+
+    config = _make_config(with_vision=task_name == "multimodal")
+    task_class = {
+        "generic": CausalLMTask,
+        "text": Gemma4TextCausalLMTask,
+        "multimodal": Gemma4Task,
+    }[task_name]
+    with build_context(get_ep(ep_name), dtype=config.dtype):
+        module = registry.get("gemma4" if task_name == "multimodal" else "gemma4_text")(config)
+        task = task_class(static_cache=static_cache, max_seq_len=CAPACITY)
+        if ep_name == "tensorrt" and static_cache:
+            with pytest.raises(ValueError, match="Gemma4 static cache requires the flattened"):
+                task.build(module, config)
+        else:
+            assert task.build(module, config)
+
+
 def _text_config(**overrides) -> ArchitectureConfig:
     params = {
         "num_hidden_layers": 2,

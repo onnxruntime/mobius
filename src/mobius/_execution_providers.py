@@ -155,7 +155,6 @@ class EpCapabilities:
     """
 
     name: str
-    static_cache_layout: Literal["flattened", "heads_first"] = "flattened"
     gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True
@@ -169,7 +168,6 @@ class EpCapabilities:
     supports_tensor_scatter: bool = True
     supports_range: bool = True
     supports_fp8_kv_cache: bool = False
-    supports_attention_nonpad_kv_seqlen: bool = True
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -178,6 +176,8 @@ class EpCapabilities:
     max_buffer_size: int | None = None
     layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
+    static_cache_layout: Literal["flattened", "heads_first"] = "flattened"
+    supports_attention_nonpad_kv_seqlen: bool = True
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
