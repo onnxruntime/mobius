@@ -357,8 +357,9 @@ def test_llama_global_rules_distinguish_absent_and_empty_component_plan(componen
         assert not any(node.op_type == "MatMulNBits" for node in package["model"].graph)
 
 
-def test_public_transformers_build_loads_global_olive_rules_without_component_plan(
-    monkeypatch,
+@pytest.mark.parametrize("local_cli", [False, True], ids=["builder", "local-cli"])
+def test_public_build_loads_global_olive_rules_without_component_plan(
+    monkeypatch, tmp_path, local_cli
 ):
     from transformers import LlamaConfig
 
@@ -391,24 +392,49 @@ def test_public_transformers_build_loads_global_olive_rules_without_component_pl
         f"{target}.weight_scales": scales,
         "lm_head.weight": head,
     }
-    monkeypatch.setattr(
-        transformers_builder,
-        "_load_transformers_config",
-        lambda *args, **kwargs: (hf_config, False),
-    )
-    checkpoint = _canonical_checkpoint(
-        build("test/tiny-llama-global-olive", dtype="f32", load_weights=False)
-    )
+    checkpoint_dir = tmp_path / "checkpoint"
+    model_id = str(checkpoint_dir) if local_cli else "test/tiny-llama-global-olive"
+    if local_cli:
+        hf_config.save_pretrained(checkpoint_dir)
+    else:
+        monkeypatch.setattr(
+            transformers_builder,
+            "_load_transformers_config",
+            lambda *args, **kwargs: (hf_config, False),
+        )
+    checkpoint = _canonical_checkpoint(build(model_id, dtype="f32", load_weights=False))
     del checkpoint[f"{target}.weight"]
     del checkpoint[f"{target}.scales"]
     checkpoint.update(state_dict)
-    monkeypatch.setattr(
-        transformers_builder,
-        "_download_weights",
-        lambda *args, **kwargs: dict(checkpoint),
-    )
+    if local_cli:
+        from safetensors.torch import save_file
 
-    package = build("test/tiny-llama-global-olive", dtype="f32")
+        from mobius import __main__ as cli
+
+        save_file(checkpoint, str(checkpoint_dir / "model.safetensors"))
+        captured_packages = []
+        monkeypatch.setattr(
+            cli, "_save_package", lambda package, *args: captured_packages.append(package)
+        )
+        cli.main(
+            [
+                "build",
+                "--config",
+                str(checkpoint_dir),
+                "--output",
+                str(tmp_path / "output"),
+                "--dtype",
+                "f32",
+            ]
+        )
+        (package,) = captured_packages
+    else:
+        monkeypatch.setattr(
+            transformers_builder,
+            "_download_weights",
+            lambda *args, **kwargs: dict(checkpoint),
+        )
+        package = build(model_id, dtype="f32")
 
     _assert_layout(package, "model", f"{target}.weight", 4, 16)
     _assert_bound(package, "model", f"{target}.weight", qweight.reshape(32, 2, 8))

@@ -511,6 +511,12 @@ The migration keeps current APIs operational:
   manifest resolver;
 - loaders without a component manifest retain current single-model behavior.
 
+Local Transformers `--config` builds use the same shared `build()` entry point
+as `--model`. The CLI forwards loading and quantization policy options; the
+shared builder owns component adaptation, normalization, and format-specific
+loading, including native GPT-OSS MXFP4 streaming. These steps must not be
+duplicated in a local CLI loader.
+
 Component-aware compatibility adapters preserve raw sidecars through their
 architecture-specific renames. They must not normalize an entire component
 with one root-resolved layout before the generic loader evaluates projection

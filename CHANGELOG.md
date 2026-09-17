@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Fixed
 
+- Local `--config` builds use the shared Transformers builder rather than a
+  duplicate model/weight loader, preserving per-component normalization,
+  GPT-OSS MXFP4 policies, and `--dequantize`/`--no-weights` behavior.
 - Component rewrites preserve learned positional embeddings and deliberately
   floating-point shared-expert gates. Input token-table selection respects
   source aliases rather than quantizing every embedding module.
