@@ -1037,6 +1037,7 @@ def _static_cache_model(
     scatter_axis: int | None = None,
     paired: bool = True,
     control_ports: bool = True,
+    heads_first: bool = False,
 ) -> ir.Model:
     """A minimal graph shaped like a mobius static-cache decoder export."""
     capacities = capacities or [32, 32]
@@ -1055,9 +1056,14 @@ def _static_cache_model(
                 (f"updated_key_cache.{layer}", ir.DataType.FLOAT, ["batch", capacity, 16])
             )
     model = _model("decoder", inputs, outputs)
+    if heads_first:
+        for value in (*model.graph.inputs, *model.graph.outputs):
+            if "key_cache" in value.name:
+                value.shape = ir.Shape(["batch", 2, value.shape[1], 8])
     if scatter_axis is not None:
         cache = model.graph.inputs[1]
         scattered = _value("scattered", ir.DataType.FLOAT, ["batch", capacities[0], 16])
+        scattered.shape = cache.shape
         model.graph.append(
             ir.Node(
                 "",
@@ -1109,3 +1115,32 @@ class TestStaticCachePortDiscovery:
 
     def test_accepts_a_scatter_on_the_declared_axis(self):
         assert _static_cache_ports(_static_cache_model(scatter_axis=1))["capacity"] == 32
+
+    @pytest.mark.parametrize("axis", [2, -2])
+    def test_discovers_heads_first_geometry(self, axis):
+        ports = _static_cache_ports(_static_cache_model(heads_first=True, scatter_axis=axis))
+        assert ports["capacity"] == 32
+        assert ports["sequence_axis"] == 2
+        assert ports["layout"] == "bnsh"
+
+    def test_rejects_heads_first_scatter_on_head_axis(self):
+        with pytest.raises(ValueError, match="declared capacity axis"):
+            _static_cache_ports(_static_cache_model(heads_first=True, scatter_axis=1))
+
+    def test_rejects_heads_first_symbolic_capacity(self):
+        model = _static_cache_model(heads_first=True, scatter_axis=2)
+        model.graph.inputs[1].shape = ir.Shape(["batch", 2, "capacity", 8])
+        with pytest.raises(ValueError, match="symbolic extent"):
+            _static_cache_ports(model)
+
+    def test_rejects_mixed_static_layouts(self):
+        model = _static_cache_model()
+        model.graph.inputs[1].shape = ir.Shape(["batch", 2, 32, 8])
+        with pytest.raises(ValueError, match="conflicting layouts"):
+            _static_cache_ports(model)
+
+    def test_rejects_unsupported_cache_rank(self):
+        model = _static_cache_model()
+        model.graph.inputs[1].shape = ir.Shape(["batch", 32])
+        with pytest.raises(ValueError, match="unsupported rank"):
+            _static_cache_ports(model)
