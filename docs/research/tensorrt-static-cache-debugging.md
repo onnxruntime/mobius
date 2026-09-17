@@ -444,7 +444,7 @@ adds diagnostic outputs; the corrected exporter does not require this tool.
 ### Integrated export and final validation
 
 ```powershell
-.\.venv\Scripts\mobius.exe build --model Qwen/Qwen3-0.6B --dtype bf16 --ep tensorrt --feature static-cache --max-seq-len 4096 qwen3-06B/models/tensorrt-4k-exporter-new
+.\.venv\Scripts\mobius.exe build --model Qwen/Qwen3-0.6B --dtype bf16 --ep tensorrt --features static-cache --max-seq-len 4096 qwen3-06B/models/tensorrt-4k-exporter-new
 
 & $python -X utf8 $runner --engine qwen3-06B\models\tensorrt-4k-exporter-fixed\model.engine --compare-hf --compare-steps 16 --max-new-tokens 16
 & $python -m pytest tests/static_cache_metadata_test.py -q --tb=short
