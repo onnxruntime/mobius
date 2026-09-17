@@ -187,6 +187,8 @@ class _DecoderAbi:
     outputs: dict[str, str]
     cache_slots: int
     has_recurrent_state: bool
+    state_groups: list[dict[str, Any]] | None = None
+    paged_block_size: int | None = None
 
 
 _GEMMA4_MODEL_TYPES = frozenset(
@@ -386,6 +388,10 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
 
     recurrent_indices = set(input_cache.get("conv_state", {}))
     has_recurrent_state = bool(input_cache.get("recurrent_state"))
+    from mobius.integrations._paged_hybrid import inspect_paged_hybrid
+
+    paged_hybrid = inspect_paged_hybrid(model)
+    is_paged_hybrid = paged_hybrid is not None
     if model_type == "lfm2":
         if recurrent_indices != set(output_cache.get("conv_state", {})):
             raise ValueError("LFM2 conv_state outputs must match its conv_state inputs")
@@ -424,30 +430,39 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
             output_cache["conv_state"], label="present-convolution"
         )
     elif recurrent_indices:
-        expected_input_prefix = decoder_inputs["past_key_names"].rsplit(".", 1)[0]
-        expected_output_prefix = decoder_outputs["present_key_names"].rsplit(".", 1)[0]
-        recurrent_templates = {
-            _name_template(input_cache["conv_state"], label="past-convolution"),
-            _name_template(input_cache["recurrent_state"], label="past-recurrent"),
-        }
-        present_templates = {
-            _name_template(output_cache["conv_state"], label="present-convolution"),
-            _name_template(output_cache["recurrent_state"], label="present-recurrent"),
-        }
-        # Preserve graph-derived names even when a runtime derives different
-        # names from the key-cache templates.
-        del (
-            expected_input_prefix,
-            expected_output_prefix,
-            recurrent_templates,
-            present_templates,
-        )
+        if is_paged_hybrid:
+            decoder_inputs["past_conv_names"] = _name_template(
+                input_cache["conv_state"], label="past-convolution"
+            )
+            decoder_inputs["past_recurrent_names"] = _name_template(
+                input_cache["recurrent_state"], label="past-recurrent"
+            )
+            decoder_outputs["present_conv_names"] = _name_template(
+                output_cache["conv_state"], label="present-convolution"
+            )
+            decoder_outputs["present_recurrent_names"] = _name_template(
+                output_cache["recurrent_state"], label="present-recurrent"
+            )
+        else:
+            # Preserve graph-derived names for diagnostics even when the
+            # released generic runtime has no fields for these templates.
+            _name_template(input_cache["conv_state"], label="past-convolution")
+            _name_template(input_cache["recurrent_state"], label="past-recurrent")
+            _name_template(output_cache["conv_state"], label="present-convolution")
+            _name_template(output_cache["recurrent_state"], label="present-recurrent")
     all_indices = set().union(*(set(indices) for indices in input_cache.values()))
+    state_groups = None
+    paged_block_size = None
+    if paged_hybrid is not None:
+        state_groups = paged_hybrid.state_groups()
+        paged_block_size = paged_hybrid.block_size
     return _DecoderAbi(
         inputs=decoder_inputs,
         outputs=decoder_outputs,
         cache_slots=max(all_indices) + 1,
         has_recurrent_state=has_recurrent_state,
+        state_groups=state_groups,
+        paged_block_size=paged_block_size,
     )
 
 
@@ -1543,6 +1558,10 @@ def _write_genai_config(
     # config, raise a clear error so the caller picks an EP/dtype combination
     # (e.g. fp32 on CPU) that lowers full attention to GQA.
     supports_in_place_kv_cache: bool | None = None
+    is_paged_hybrid = (
+        decoder_model is not None
+        and decoder_model.metadata_props.get("mobius.paged_hybrid") == "qwen3_5_text"
+    )
     if decoder_model is not None:
         has_gqa = any(
             node.op_type == "GroupQueryAttention" and node.domain == "com.microsoft"
@@ -1556,7 +1575,9 @@ def _write_genai_config(
             node.op_type == "Attention" and node.domain in ("", "ai.onnx")
             for node in decoder_model.graph
         )
-        if has_recurrent_state and has_standard_attention:
+        if is_paged_hybrid:
+            supports_in_place_kv_cache = True
+        elif has_recurrent_state and has_standard_attention:
             supports_in_place_kv_cache = True
         else:
             supports_in_place_kv_cache = has_gqa or has_recurrent_state
@@ -1607,6 +1628,17 @@ def _write_genai_config(
         ),
         sliding_window=sliding_window,
         has_specialized_topology=not _is_single_model_decoder_package(pkg),
+        decoder_graph_capture=False if is_paged_hybrid else None,
+        state_groups=decoder_abi.state_groups if decoder_abi is not None else None,
+        dynamic_batching=(
+            {
+                "block_size": decoder_abi.paged_block_size,
+                "max_batch_size": 100,
+                "gpu_utilization_factor": 0.6,
+            }
+            if decoder_abi is not None and decoder_abi.paged_block_size is not None
+            else None
+        ),
     )
     generator.with_special_tokens(
         **_special_token_ids_from_tokenizer_config(output_dir, config.vocab_size)

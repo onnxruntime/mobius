@@ -61,6 +61,7 @@ __all__ = [
     "GlmMoeDsaTask",
     "GlmOcrVLTask",
     "HybridCausalLMTask",
+    "PagedHybridCausalLMTask",
     "HyV3MtpTask",
     "FalconH1CausalLMTask",
     "Cosmos3EdgeVLTask",
@@ -133,6 +134,7 @@ from mobius.tasks._base import (
 from mobius.tasks._causal_lm import (
     CausalLMTask,
     HybridCausalLMTask,
+    PagedHybridCausalLMTask,
     SmallThinkerGGUFCausalLMTask,
 )
 from mobius.tasks._codec import CodecTask
@@ -266,6 +268,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "t5-text-encoding": T5TextEncoderTask,
     "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
+    "paged-hybrid-text-generation": PagedHybridCausalLMTask,
     "hy-v3-mtp": HyV3MtpTask,
     "kimi-k3-text-generation": KimiK3CausalLMTask,
     "kimi-linear-text-generation": KimiLinearCausalLMTask,

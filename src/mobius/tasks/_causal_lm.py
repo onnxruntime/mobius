@@ -16,6 +16,12 @@ from mobius._constants import (
 )
 from mobius._model_package import ModelPackage
 from mobius.components._attention import StaticCacheState
+from mobius.components._paged_attention import (
+    GENAI_REVISION,
+    ORT_REVISION,
+    PagedAttentionState,
+    PagedHybridContext,
+)
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
@@ -27,6 +33,7 @@ from mobius.tasks._cache_utils import (
     _register_hybrid_cache_outputs,
     _register_kv_cache_outputs,
     _register_linear_attention_functions,
+    linear_attention_dims,
 )
 
 
@@ -426,6 +433,204 @@ class HybridCausalLMTask(ModelTask):
                 "beam-reorder recurrent state, and rejects nonzero recurrent-state rewind; "
                 "tracked by https://github.com/onnxruntime/mobius/issues/605"
             )
+        return ModelPackage({"model": model}, config=config)
+
+
+class PagedHybridCausalLMTask(ModelTask):
+    """Packed Qwen hybrid decoder using native paged attention and DeltaNet ops.
+
+    Tokens from all request rows are concatenated into one ``[N]`` input. Full
+    attention layers update caller-owned page buffers while linear layers carry
+    fixed convolution and V-major recurrent state per request row.
+    """
+
+    def __init__(
+        self,
+        *,
+        paged_block_size: int = 256,
+        prune_prefill_prefix: bool = False,
+    ):
+        if (
+            isinstance(paged_block_size, bool)
+            or not isinstance(paged_block_size, int)
+            or paged_block_size <= 0
+            or paged_block_size % 256
+        ):
+            raise ValueError("paged_block_size must be a positive multiple of 256")
+        self._paged_block_size = paged_block_size
+        self._prune_prefill_prefix = prune_prefill_prefix
+
+    def build(self, module: nn.Module, config: ArchitectureConfig) -> ModelPackage:
+        from mobius.models.qwen35 import Qwen35CausalLMModel
+
+        if not isinstance(module, Qwen35CausalLMModel):
+            raise TypeError("PagedHybridCausalLMTask requires Qwen35CausalLMModel")
+        if config.model_type != "qwen3_5_text":
+            raise ValueError(
+                "PagedHybridCausalLMTask supports only text-only model_type "
+                f"'qwen3_5_text'; got {config.model_type!r}"
+            )
+        if config.dtype not in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+            raise ValueError(
+                "PagedHybridCausalLMTask native CUDA ops support only float16/bfloat16; "
+                f"got {config.dtype!r}"
+            )
+        if not config.mrope_section or not config.mrope_interleaved:
+            raise ValueError("PagedHybridCausalLMTask requires interleaved MRoPE sections")
+        quantization = config.quantization
+        if quantization is not None and quantization.quant_method != "none":
+            raise ValueError("PagedHybridCausalLMTask does not support quantized checkpoints")
+        if config.component_quantization is not None:
+            raise ValueError("PagedHybridCausalLMTask does not support component quantization")
+        if config.output_layer_indices or config.output_final_hidden_state:
+            raise ValueError(
+                "PagedHybridCausalLMTask does not support auxiliary hidden-state outputs"
+            )
+        layer_types = config.layer_types or []
+        if len(layer_types) != config.num_hidden_layers or set(layer_types) != {
+            "full_attention",
+            "linear_attention",
+        }:
+            raise ValueError(
+                "PagedHybridCausalLMTask requires a complete Qwen hybrid "
+                "full_attention/linear_attention layer_types schedule"
+            )
+
+        num_tokens = ir.SymbolicDim("num_tokens")
+        batch = ir.SymbolicDim("batch")
+        num_pages = ir.SymbolicDim("num_pages")
+        max_blocks = ir.SymbolicDim("max_blocks_per_sequence")
+        graph, builder = _make_graph()
+        op = builder.op
+
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[num_tokens])
+        position_ids = builder.input(
+            "position_ids", dtype=ir.DataType.INT64, shape=[3, num_tokens]
+        )
+        block_table = builder.input(
+            "block_table", dtype=ir.DataType.INT32, shape=[batch, max_blocks]
+        )
+        cumulative_sequence_lengths = builder.input(
+            "cumulative_sequence_lengths",
+            dtype=ir.DataType.INT32,
+            shape=["batch + 1"],
+        )
+        past_sequence_lengths = builder.input(
+            "past_sequence_lengths", dtype=ir.DataType.INT32, shape=[batch]
+        )
+        attention_metadata = builder.input(
+            "attention_metadata", dtype=ir.DataType.INT32, shape=[3]
+        )
+        last_token_indices = None
+        if self._prune_prefill_prefix:
+            ends = op.Slice(
+                cumulative_sequence_lengths,
+                op.Constant(value_ints=[1]),
+                op.Constant(value_ints=[2**63 - 1]),
+                op.Constant(value_ints=[0]),
+            )
+            last_token_indices = op.Sub(
+                op.Cast(ends, to=ir.DataType.INT64), op.Constant(value_int=1)
+            )
+        context = PagedHybridContext(
+            cumulative_sequence_lengths,
+            past_sequence_lengths,
+            block_table,
+            attention_metadata,
+            last_token_indices,
+        )
+
+        dims = linear_attention_dims(config) if "linear_attention" in layer_types else None
+        states = []
+        for index, layer_type in enumerate(layer_types):
+            if layer_type == "full_attention":
+                key_cache = builder.input(
+                    f"past_key_values.{index}.key",
+                    dtype=config.dtype,
+                    shape=[
+                        num_pages,
+                        self._paged_block_size,
+                        config.num_key_value_heads,
+                        config.head_dim,
+                    ],
+                )
+                value_cache = builder.input(
+                    f"past_key_values.{index}.value",
+                    dtype=config.dtype,
+                    shape=[
+                        num_pages,
+                        self._paged_block_size,
+                        config.num_key_value_heads,
+                        config.head_dim,
+                    ],
+                )
+                states.append(
+                    PagedAttentionState(
+                        key_cache,
+                        value_cache,
+                        cumulative_sequence_lengths,
+                        past_sequence_lengths,
+                        block_table,
+                        attention_metadata,
+                    )
+                )
+            else:
+                assert dims is not None
+                conv_state = builder.input(
+                    f"past_key_values.{index}.conv_state",
+                    dtype=config.dtype,
+                    shape=[batch, dims.conv_dim, dims.conv_kernel - 1],
+                )
+                # The native GDN ABI is V-major (Dv,Dk), unlike the dense
+                # LinearAttention function's K-major (Dk,Dv) state.
+                recurrent_state = builder.input(
+                    f"past_key_values.{index}.recurrent_state",
+                    dtype=ir.DataType.FLOAT,
+                    shape=[batch, dims.num_v_heads, dims.head_v_dim, dims.head_k_dim],
+                )
+                states.append((conv_state, recurrent_state))
+
+        logits, present = module(
+            op,
+            input_ids=input_ids,
+            attention_mask=None,
+            position_ids=position_ids,
+            past_key_values=states,
+            paged_context=context,
+        )
+        logits = op.Cast(logits, to=ir.DataType.FLOAT)
+        logits.shape = ir.Shape(
+            [batch if self._prune_prefill_prefix else num_tokens, config.vocab_size]
+        )
+        builder.add_output(logits, "logits")
+        for layer_type, layer_present in zip(layer_types, present):
+            if layer_type == "full_attention":
+                for cache in layer_present:
+                    cache.type = ir.TensorType(config.dtype)
+                    cache.shape = ir.Shape(
+                        [
+                            num_pages,
+                            self._paged_block_size,
+                            config.num_key_value_heads,
+                            config.head_dim,
+                        ]
+                    )
+            else:
+                assert dims is not None
+                conv, recurrent = layer_present
+                conv.type = ir.TensorType(config.dtype)
+                conv.shape = ir.Shape([batch, dims.conv_dim, dims.conv_kernel - 1])
+                recurrent.type = ir.TensorType(ir.DataType.FLOAT)
+                recurrent.shape = ir.Shape(
+                    [batch, dims.num_v_heads, dims.head_v_dim, dims.head_k_dim]
+                )
+        _register_hybrid_cache_outputs(builder, present, layer_types)
+
+        model = _make_model(graph)
+        model.metadata_props["mobius.paged_hybrid"] = "qwen3_5_text"
+        model.metadata_props["mobius.paged_block_size"] = str(self._paged_block_size)
+        model.metadata_props["mobius.ort_revision"] = ORT_REVISION
+        model.metadata_props["mobius.genai_revision"] = GENAI_REVISION
         return ModelPackage({"model": model}, config=config)
 
 

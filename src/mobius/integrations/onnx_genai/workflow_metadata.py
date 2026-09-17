@@ -7945,11 +7945,146 @@ def build_decoder_workflow_metadata(
     """Build the exact workflow-policy contract for an autoregressive decoder."""
     if len(pkg) != 1:
         raise ValueError("decoder workflow requires exactly one neural component")
+    if "mobius.paged_hybrid" in next(iter(pkg.values())).metadata_props:
+        return build_paged_hybrid_workflow_metadata(pkg)
     metadata = _build_autoregressive_workflow_metadata(
         pkg, config, sampler=sampler, source=source
     )
     _declare_batch_capacities(metadata, _DECODER_BATCH_COMPONENTS)
     return metadata
+
+
+def build_paged_hybrid_workflow_metadata(pkg: Any) -> dict[str, Any]:
+    """Describe one externally scheduled packed invocation, not a dense loop.
+
+    Engine owns admission, token packing, page allocation and request identity.
+    All scheduling tensors and current state are explicit application inputs;
+    every successor is returned. In particular, page buffers must not receive
+    the batch-row permutation used for the two fixed-state groups.
+    """
+    from mobius.integrations._paged_hybrid import inspect_paged_hybrid
+
+    if set(pkg) != {"model"}:
+        raise ValueError("Packed hybrid workflow requires one model component")
+    model = pkg["model"]
+    abi = inspect_paged_hybrid(model)
+    if abi is None:
+        raise ValueError("Packed hybrid workflow requires a verified packed hybrid ABI")
+    workflow_inputs = {
+        f"request.{value.name}": {
+            "contract": _contract(value),
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": f"request.{value.name}"},
+            "required": True,
+        }
+        for value in model.graph.inputs
+    }
+    workflow_outputs = {
+        value.name: {"contract": _contract(value), "role": "tensor", "stage": "post_adapter"}
+        for value in model.graph.outputs
+    }
+    # The external scheduler, not this single neural invocation, owns request
+    # completion. These are workflow lifecycle inputs, not extra ONNX ports.
+    for name in ("active", "done"):
+        workflow_inputs[f"request.{name}"] = {
+            "contract": {"dtype": "bool", "rank": 1, "shape": ["batch"]},
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": f"request.{name}"},
+            "required": True,
+        }
+    groups = {}
+    state = {}
+    for spec in abi.state_groups():
+        name = spec["kind"]
+        paged = name == "paged_kv"
+        suffixes = (
+            ("key", "value")
+            if paged
+            else ("conv_state" if name == "fixed_conv" else "recurrent_state",)
+        )
+        aliases = {}
+        for layer in spec["layer_ids"]:
+            for suffix in suffixes:
+                port = f"past_key_values.{layer}.{suffix}"
+                cell = f"layer_{layer}_{suffix}"
+                aliases[cell] = {
+                    "input": port,
+                    "output": f"present.{layer}.{suffix}",
+                    "layer": layer,
+                    "access": "read_write",
+                    **({"role": suffix} if paged else {}),
+                }
+                state[cell] = {
+                    "contract": workflow_inputs[f"request.{port}"]["contract"],
+                    "scope": "invocation",
+                    "initializer": f"request.{port}",
+                    "recurrence": {"kind": "invariant"},
+                    "management": "external",
+                    "release_boundary": "invocation",
+                    "service_group": name,
+                }
+        groups[name] = {
+            "kind": "full_attention" if paged else "recurrent",
+            "layout": "pkhd" if paged else ("bcw" if name == "fixed_conv" else "bhvk"),
+            "aliasing": "required" if paged else "permitted",
+            "update": (
+                {
+                    "kind": "paged_scatter",
+                    "block_size": abi.block_size,
+                    "block_table_ports": {"decoder": "block_table"},
+                    "past_sequence_length_ports": {"decoder": "past_sequence_lengths"},
+                    "cumulative_sequence_length_ports": {
+                        "decoder": "cumulative_sequence_lengths"
+                    },
+                }
+                if paged
+                else {"kind": "replace"}
+            ),
+            "capabilities": {
+                "snapshot": False,
+                "fork": False,
+                "cascade": [
+                    other["kind"] for other in abi.state_groups() if other["kind"] != name
+                ],
+            },
+            "ports": {"decoder": aliases},
+        }
+    workflow = {
+        "manifest": {"capabilities": ["workflow_ssa", "typed_emit"]},
+        "inputs": workflow_inputs,
+        "outputs": workflow_outputs,
+        "state": state,
+        "components": {"decoder": _component(model, "model.onnx")},
+        "serving": {
+            "active": "request.active",
+            "done": "request.done",
+            "state_service": {"groups": groups},
+        },
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                _invoke(
+                    "decoder",
+                    {value.name: f"request.{value.name}" for value in model.graph.inputs},
+                    {value.name: f"decoder.{value.name}" for value in model.graph.outputs},
+                ),
+                *[
+                    {
+                        "kind": "emit",
+                        "value": f"decoder.{value.name}",
+                        "output": value.name,
+                        "mode": "replace",
+                    }
+                    for value in model.graph.outputs
+                ],
+            ],
+        },
+    }
+    return {
+        "schema_version": "v1.1",
+        "required_capabilities": ["packed_hybrid", "paged_scatter"],
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
 
 
 def _build_autoregressive_workflow_metadata(
