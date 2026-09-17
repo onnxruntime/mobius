@@ -158,6 +158,15 @@ _COVERAGE_SKIP: dict[str, str] = {
     "llada_moe": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
     "non-standard bidirectional I/O has no generic golden-data path",
     "LLaDAMoEModel": "Alias for llada_moe — covered by src/mobius/models/llada_test.py",
+    "VibeVoiceStreamingForConditionalGenerationInference": (
+        "Architecture-discriminating alias for vibevoice_streaming — covered by "
+        "src/mobius/models/vibevoice_streaming_test.py."
+    ),
+    "vibevoice": (
+        "Continuous-token TTS is host-orchestrated across eight ONNX stages, and the "
+        "generic golden runner explicitly skips text-to-speech. Dedicated L4/L5 "
+        "official-checkpoint coverage is in tests/vibevoice_golden_test.py."
+    ),
     "rnd1": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
     "non-standard bidirectional I/O has no generic golden-data path",
     "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
@@ -180,6 +189,11 @@ _COVERAGE_SKIP: dict[str, str] = {
     "nvidia/RE-USE config.json is a bespoke model_cfg/stft_cfg document with no "
     "model_type field, which arch_validation_test requires, so the generic "
     "download-and-build path cannot drive it.",
+    "vibevoice_asr": "The pinned offline ASR checkpoint contains "
+    "17,348,198,410 BF16 bytes (about 8.67B parameters), exceeding the 16 GiB "
+    "real-weight evidence budget. L1 stages, raw-config L2, exact checkpoint-index "
+    "classification, and source-synthetic L3 chunk/cache/diarization protocol "
+    "coverage are checked in; L4/L5 awaits the documented CUDA workflow.",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
@@ -306,6 +320,11 @@ _COVERAGE_SKIP: dict[str, str] = {
     "mms": "CTC ASR model — tested via TestBuildMMSGraph",
     "fastconformer_rnnt": "NeMo .nemo RNN-T ASR — tested via tests/nemo_rnnt_integration_test.py",
     "sortformer": "NeMo .nemo speaker diarization — tested via tests/sortformer_integration_test.py",
+    "VibeVoiceForASRStreamingTraining": "Streaming ASR has host-owned dual-convolution "
+    "state, arbitrary-mask decoder, hotword, and speaker-attribution orchestration that "
+    "the generic L4/L5 runner cannot drive. Pinned L1-L3 graph/config/source-parity and "
+    "complete checkpoint-index routing are covered for the 1.5B and 7B checkpoints; "
+    "real-weight goldens require a dedicated GPU workflow.",
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",
@@ -443,7 +462,7 @@ class TestSkipListIntegrity:
 class TestL1L3GraphBuildCoverage:
     """L1 + L3: every model needs a test config in _test_configs.py.
 
-    The config enables ``build_graph_test.py`` to exercise the model.
+    The config enables the L1 graph-construction suite to exercise the model.
     For causal-LM models, it also enables ``synthetic_parity_test.py``.
     """
 

@@ -5,26 +5,123 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).parents[4]
+_EVIDENCE_DIR = _REPO_ROOT / "testdata" / "evidence"
 
 
 def _evidence() -> dict:
-    path = (
-        Path(__file__).parents[4]
-        / "testdata"
-        / "evidence"
-        / "gguf_draft_runtime_evidence.json"
-    )
+    path = _EVIDENCE_DIR / "gguf_draft_runtime_evidence.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _independent_trace(record: dict) -> dict:
     metadata = record["independent_direct_ort_trace"]
-    path = Path(__file__).parents[4] / "testdata" / "evidence" / metadata["filename"]
+    path = _EVIDENCE_DIR / metadata["filename"]
     payload = path.read_bytes()
     assert hashlib.sha256(payload).hexdigest() == metadata["sha256"]
     return json.loads(payload)
+
+
+def _effective_git_attributes(
+    repository: Path, paths: list[str], *, global_attributes: Path
+) -> dict[str, dict[str, str]]:
+    environment = os.environ.copy()
+    environment["GIT_ATTR_NOSYSTEM"] = "1"
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            f"core.attributesFile={global_attributes}",
+            "check-attr",
+            "-z",
+            "text",
+            "eol",
+            "--",
+            *paths,
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        env=environment,
+    )
+    fields = result.stdout.decode("utf-8").split("\0")
+    assert fields.pop() == ""
+    assert len(fields) % 3 == 0
+    attributes: dict[str, dict[str, str]] = {}
+    for path, attribute, value in zip(fields[0::3], fields[1::3], fields[2::3], strict=True):
+        attributes.setdefault(path, {})[attribute] = value
+    return attributes
+
+
+def test_evidence_json_files_are_lf_normalized_for_raw_hashes(tmp_path: Path) -> None:
+    isolated_repo = tmp_path / "repository"
+    isolated_repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=isolated_repo, check=True)
+    shutil.copyfile(_REPO_ROOT / ".gitattributes", isolated_repo / ".gitattributes")
+
+    global_attributes = tmp_path / "global-attributes"
+    global_attributes.touch()
+    evidence_json = sorted(
+        path.relative_to(_REPO_ROOT).as_posix() for path in _EVIDENCE_DIR.rglob("*.json")
+    )
+    assert any(path.startswith("testdata/evidence/causal-lm/") for path in evidence_json)
+    future_binary = "testdata/evidence/future-evidence.bin"
+    for relative_path in [*evidence_json, future_binary]:
+        path = isolated_repo / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    attributes = _effective_git_attributes(
+        isolated_repo,
+        [*evidence_json, future_binary],
+        global_attributes=global_attributes,
+    )
+
+    for relative_path in evidence_json:
+        assert attributes[relative_path] == {"text": "set", "eol": "lf"}
+    assert attributes[future_binary] == {
+        "text": "unspecified",
+        "eol": "unspecified",
+    }
+
+    expected_trace_hashes = {
+        "gguf_dflash_independent_ort_trace.json": {
+            "crlf": "e0e70e909f33ed44aa87da39bab721ebbee0c3e730e2f89dbc509c6683701e42",
+            "semantic": "ea1f1414d5bc28c2b7776fa66f2a3b4bc72eeda2b38ecaa8d1ca3f8f8bfe8fcf",
+        },
+        "gguf_eagle3_independent_ort_trace.json": {
+            "crlf": "78aa94f24d5f1b9ae020de1ffa5a70c6a30f30ff45eb5310a540cdd2b3d8fab2",
+            "semantic": "4dbd07a42b89f2067deb1eb249ce8f06ccb973cd700724592f3892deaf78a5db",
+        },
+    }
+    traces = {
+        record["independent_direct_ort_trace"]["filename"]: record[
+            "independent_direct_ort_trace"
+        ]
+        for record in _evidence()["routes"]
+    }
+    assert traces.keys() == expected_trace_hashes.keys()
+    for filename, metadata in traces.items():
+        payload = (_EVIDENCE_DIR / filename).read_bytes()
+        assert b"\n" in payload
+        assert b"\r\n" not in payload
+        assert hashlib.sha256(payload).hexdigest() == metadata["sha256"]
+        semantic_payload = json.dumps(
+            json.loads(payload), sort_keys=True, separators=(",", ":")
+        ).encode()
+        assert (
+            hashlib.sha256(semantic_payload).hexdigest()
+            == expected_trace_hashes[filename]["semantic"]
+        )
+        crlf_payload = payload.replace(b"\n", b"\r\n")
+        crlf_sha256 = hashlib.sha256(crlf_payload).hexdigest()
+        assert crlf_sha256 == expected_trace_hashes[filename]["crlf"]
+        assert crlf_sha256 != metadata["sha256"]
 
 
 def test_draft_runtime_evidence_is_bounded_immutable_and_complete() -> None:

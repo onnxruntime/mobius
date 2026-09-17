@@ -23,7 +23,12 @@ if TYPE_CHECKING:
 
 
 class Conv1d(nn.Module):
-    """1D convolution layer."""
+    """1D convolution layer.
+
+    ``padding`` is symmetric when given as an ``int``. Pass a
+    ``(left, right)`` pair for asymmetric padding — ``(kernel_size - 1, 0)``
+    makes the convolution causal, as used by streaming audio front ends.
+    """
 
     def __init__(
         self,
@@ -31,7 +36,7 @@ class Conv1d(nn.Module):
         out_channels: int,
         kernel_size: int,
         stride: int = 1,
-        padding: int = 0,
+        padding: int | tuple[int, int] = 0,
         bias: bool = True,
         groups: int = 1,
     ):
@@ -40,7 +45,11 @@ class Conv1d(nn.Module):
         self.bias = nn.Parameter([out_channels]) if bias else None
         self._kernel_shape = [kernel_size]
         self._strides = [stride]
-        self._pads = [padding, padding]
+        if isinstance(padding, int):
+            self._pads = [padding, padding]
+        else:
+            left, right = padding
+            self._pads = [int(left), int(right)]
         self._groups = groups
 
     def forward(self, op: OpBuilder, x: ir.Value):

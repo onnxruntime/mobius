@@ -2197,6 +2197,11 @@ class TestL4CheckpointVerified:
 
     @pytest.mark.parametrize("case", _L4_CASES)
     def test_prefill_argmax_matches_golden(self, case: GoldenTestCase) -> None:
+        if case.task_type == "text-to-speech":
+            pytest.skip(
+                "Continuous-token TTS uses tests/vibevoice_golden_test.py "
+                "(control logits, latent frames, and waveform semantics)."
+            )
         golden_path = golden_path_for_case(case)
         golden = load_golden_ref(golden_path)
         if golden is None:

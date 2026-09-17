@@ -11,9 +11,12 @@ import pytest
 import yaml
 
 from mobius._model_package import ModelPackage
-from mobius.integrations.onnx_genai.inference_metadata_test import (
+from mobius.integrations.onnx_genai._test_support import (
+    _graph_model,
     _model,
     _native_package,
+    _speculative_package,
+    _value,
     _VlmConfig,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
@@ -68,10 +71,6 @@ def test_speculative_emit_uses_accepted_prefix_length():
     assert workflow["state"]["cache_0"]["service_group"] == "verifier_cache"
     assert workflow["serving"]["accepted_len"] == "accepted_len"
     assert workflow["inputs"]["package.max_context"]["default"] == 4096
-
-
-def _value(name: str, dtype: ir.DataType, shape: list[int | str]) -> ir.Value:
-    return ir.Value(name=name, type=ir.TensorType(dtype), shape=ir.Shape(shape))
 
 
 def test_vlm_preprocessing_is_explicit_typed_ssa(tmp_path):
@@ -764,71 +763,6 @@ def test_language_diffusion_rejects_zero_steps():
             _masked_denoiser_package(),
             num_inference_steps=0,
         )
-
-
-def _graph_model(
-    name: str,
-    inputs: list[ir.Value],
-    outputs: list[ir.Value],
-) -> ir.Model:
-    return ir.Model(
-        ir.Graph(
-            inputs=inputs,
-            outputs=outputs,
-            nodes=[],
-            name=name,
-            opset_imports={"": 24},
-        ),
-        ir_version=11,
-    )
-
-
-def _speculative_package(
-    *,
-    adaptive: bool = False,
-    budget_dtype: ir.DataType = ir.DataType.INT64,
-) -> ModelPackage:
-    proposer_inputs = [_value("tokens", ir.DataType.INT64, ["batch", 4])]
-    if adaptive:
-        proposer_inputs.append(_value("proposal_budget", budget_dtype, ["batch"]))
-    proposer = _graph_model(
-        "proposer",
-        proposer_inputs,
-        [
-            _value("proposed_tokens", ir.DataType.INT64, ["batch", 4]),
-            _value("proposal_scores", ir.DataType.FLOAT, ["batch", 4, 32]),
-        ],
-    )
-    verifier = _graph_model(
-        "verifier",
-        [
-            _value("proposed_tokens", ir.DataType.INT64, ["batch", 4]),
-            _value(
-                "past_key_values.0.key",
-                ir.DataType.FLOAT,
-                ["batch", 2, "past_sequence", 8],
-            ),
-            _value(
-                "past_key_values.0.value",
-                ir.DataType.FLOAT,
-                ["batch", 4, "past_sequence", 4],
-            ),
-        ],
-        [
-            _value("target_scores", ir.DataType.FLOAT, ["batch", 4, 32]),
-            _value(
-                "present.0.key",
-                ir.DataType.FLOAT,
-                ["batch", 2, "past_sequence + 4", 8],
-            ),
-            _value(
-                "present.0.value",
-                ir.DataType.FLOAT,
-                ["batch", 4, "past_sequence + 4", 4],
-            ),
-        ],
-    )
-    return ModelPackage({"proposer": proposer, "verifier": verifier})
 
 
 def test_adaptive_speculative_requires_int64_budget_port():

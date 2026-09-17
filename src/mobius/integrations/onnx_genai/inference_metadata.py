@@ -48,6 +48,17 @@ from mobius._constants import (
     STATIC_CACHE_WRITE_INDICES,
 )
 from mobius._pipeline_contract import component_presence, optional_input_contract
+from mobius.integrations.onnx_genai._workflow_contract import (
+    _invoke,
+    _Port,
+    _port,
+    _publish_workflow_v1,
+    _request_aligned,
+    _shape_metadata,
+    add_policy_components_to_workflow,
+    declare_input_admission,
+    declare_request_alignment,
+)
 from mobius.upstream_patches import apply_asset_patches
 
 _LOGGER = logging.getLogger(__name__)
@@ -81,17 +92,6 @@ _TEXT_RUNTIME_ASSET_NAMES = tuple(
 
 
 @dataclasses.dataclass(frozen=True)
-class _Port:
-    """Structural description of one ONNX graph port."""
-
-    value: Any
-    name: str
-    dtype: str
-    rank: int | None
-    dims: tuple[Any, ...]
-
-
-@dataclasses.dataclass(frozen=True)
 class _ImageProgram:
     """Registry result for one declared image processor contract."""
 
@@ -101,53 +101,6 @@ class _ImageProgram:
     token_count_source: str
     summary_contents: tuple[str, ...] = ()
     vision_properties: Callable[[dict[str, Any]], dict[str, Any]] | None = None
-
-
-_DTYPE_TAGS = {
-    "FLOAT": "fp32",
-    "FLOAT16": "fp16",
-    "BFLOAT16": "bf16",
-    "FLOAT8E4M3FN": "float8_e4m3fn",
-    "FLOAT8E5M2": "float8_e5m2",
-    "INT64": "int64",
-    "INT32": "int32",
-    "INT8": "int8",
-    "UINT8": "uint8",
-    "BOOL": "bool",
-    "STRING": "string",
-}
-
-
-def _port(value: Any) -> _Port:
-    shape = getattr(value, "shape", None)
-    dims = tuple(shape) if shape is not None else ()
-    dtype = getattr(getattr(value, "dtype", None), "name", "")
-    return _Port(
-        value=value,
-        name=str(value.name),
-        dtype=_DTYPE_TAGS.get(str(dtype).upper(), str(dtype).lower() or "fp32"),
-        rank=len(dims) if shape is not None else None,
-        dims=dims,
-    )
-
-
-_BATCH_DIMENSION = "batch"
-"""Symbolic leading dimension mobius uses for per-request batching."""
-
-
-def _shape_metadata(port: _Port) -> list[int | str]:
-    """Return a YAML-safe graph shape without losing symbolic dimensions."""
-    shape: list[int | str] = []
-    for axis, dim in enumerate(port.dims):
-        if isinstance(dim, int):
-            shape.append(dim)
-            continue
-        value = getattr(dim, "value", None)
-        # Metadata dimensions cannot be null. Preserve named graph dimensions;
-        # give anonymous dynamic dimensions a stable, port-local name instead
-        # of pretending they are static or serializing an invalid null.
-        shape.append(str(value) if value is not None else f"{port.name}_dim_{axis}")
-    return shape
 
 
 def _name_image_preprocessing_program(image: dict[str, Any]) -> None:
@@ -1435,320 +1388,6 @@ def validate_executable_closure(pkg: Any, metadata: dict[str, Any]) -> None:
                 )
 
 
-#: Symbolic dimension Mobius emits for every request-aligned ONNX port.
-REQUEST_AXIS_SYMBOL = "batch"
-
-
-def request_batch_layout(shape: list[Any] | None) -> dict[str, Any] | None:
-    """Return the request-aligned batch layout implied by a port's shape."""
-    axes = [
-        axis
-        for axis, dimension in enumerate(shape or [])
-        if str(dimension) in _BATCH_DIMENSION_NAMES
-    ]
-    if len(axes) == 1:
-        return {"kind": "request_aligned", "axis": axes[0]}
-    return None
-
-
-def add_policy_components_to_workflow(
-    metadata: dict[str, Any],
-    pkg: Any,
-) -> dict[str, Any]:
-    """Reference attached ONNX policy artifacts from an existing workflow.
-
-    This helper intentionally does not synthesize a workflow or guess bindings.
-    It only adds schema-defined component declarations when a producer has
-    already emitted the exact workflow contract.
-    """
-    policy_components = getattr(pkg, "policy_components", {})
-    if not policy_components:
-        return metadata
-    workflow = metadata.get("pipeline", {}).get("workflow")
-    if not isinstance(workflow, dict):
-        return metadata
-    components = workflow.setdefault("components", {})
-
-    def semantic_contract(component: Any) -> dict[str, Any]:
-        contract = component.contract
-        contract_name, version = component.contract_id.rsplit("@", 1)
-        bindings = {
-            key: value
-            for key, value in contract.items()
-            if key
-            not in {
-                "role",
-                "mode",
-                "effect",
-                "rng",
-                "state_class",
-                "batching",
-                "inactive_rows",
-            }
-            and isinstance(value, str)
-        }
-        rng = contract.get("rng")
-        if isinstance(rng, dict):
-            bindings.update(
-                {key: value for key, value in rng.items() if isinstance(value, str)}
-            )
-        declaration: dict[str, Any] = {
-            "id": contract_name,
-            "version": version,
-            "bindings": bindings,
-        }
-        parameters = {
-            key: contract[key]
-            for key in ("mode", "batching", "inactive_rows")
-            if key in contract
-        }
-        if parameters:
-            declaration["parameters"] = parameters
-        return declaration
-
-    def tensor_contract(value: Any) -> dict[str, Any]:
-        port = _port(value)
-        dtype = {
-            "fp32": "float32",
-            "fp16": "float16",
-            "bf16": "bfloat16",
-        }.get(port.dtype, port.dtype)
-        shape = _shape_metadata(port)
-        contract: dict[str, Any] = {
-            "dtype": dtype,
-            "rank": port.rank,
-            "shape": shape,
-        }
-        layout = request_batch_layout(shape)
-        if layout is not None:
-            contract["batch_layout"] = layout
-        return contract
-
-    for name, component in policy_components.items():
-        # A policy graph is synthesized by this producer to realize the
-        # workflow's own control flow, so its port contracts are not a
-        # transcription of an external interface: they are the type annotations
-        # of the workflow's dataflow. A workflow value acquires its dtype, rank
-        # and request axis from the port that produces it, and the validator
-        # reads metadata without the artifacts, so a policy output that states
-        # no contract leaves every value derived from it untyped.
-        declaration = {
-            "implementation": {
-                "kind": "onnx",
-                "artifact": f"policies/{name}.onnx",
-            },
-            "ports": {
-                "inputs": {
-                    value.name: tensor_contract(value)
-                    for value in component.model.graph.inputs
-                },
-                "outputs": {
-                    value.name: tensor_contract(value)
-                    for value in component.model.graph.outputs
-                },
-            },
-        }
-        if component.contract:
-            declaration["contract"] = semantic_contract(component)
-            if component.contract.get("role") == "token_sampler":
-                declaration["application_overridable"] = True
-        components[name] = declaration
-    declare_request_alignment(workflow)
-    declare_input_admission(workflow)
-    return metadata
-
-
-_BATCH_DIMENSION_NAMES = frozenset({"batch", "batch_size", "batch_dim", "b"})
-
-
-def declare_request_alignment(workflow: dict[str, Any]) -> None:
-    """Stamp the request axis named by exactly one batch symbol.
-
-    The runtime compacts finished rows out of a batch by applying one row
-    permutation to every request-aligned tensor. A contract whose batch axis
-    does not say so is unpermutable, so state,
-    component ports, and outputs would silently drift apart after the first
-    eviction. Deriving the declaration from the admitted graph's own batch
-    symbol keeps alignment a property of the model interface rather than an
-    annotation every workflow builder has to remember.
-    """
-
-    def stamp(contract: Any) -> None:
-        if not isinstance(contract, dict) or "batch_layout" in contract:
-            return
-        shape = contract.get("shape") or []
-        if layout := request_batch_layout(shape):
-            contract["batch_layout"] = layout
-
-    for section in ("inputs", "outputs", "state"):
-        for declaration in (workflow.get(section) or {}).values():
-            if isinstance(declaration, dict):
-                stamp(declaration.get("contract"))
-    for component in (workflow.get("components") or {}).values():
-        ports = component.get("ports", {}) if isinstance(component, dict) else {}
-        for side in ("inputs", "outputs"):
-            for contract in (ports.get(side) or {}).values():
-                stamp(contract)
-    # A cell backed by a state-service group is stored by the runtime, not by
-    # the workflow: the group owns the buffer and the eviction policy, so the
-    # cell also needs an explicit boundary at which the runtime may free it.
-    for declaration in (workflow.get("state") or {}).values():
-        if isinstance(declaration, dict) and declaration.get("service_group"):
-            declaration.setdefault("management", "runtime")
-            declaration.setdefault("release_boundary", declaration.get("scope", "invocation"))
-
-
-def published_value_references(workflow: dict[str, Any]) -> set[str]:
-    """Every value name the published program reads, on any path.
-
-    Reachability here is deliberately path-insensitive: it answers "does this
-    workflow ever look at this value", which is what an admission decision
-    needs. Whether a particular request reaches the branch that reads it is a
-    runtime fact, and a package that guessed at it would be describing one
-    caller rather than its own contract.
-    """
-    references: set[str] = set()
-
-    def note(value: Any) -> None:
-        if isinstance(value, str):
-            references.add(value)
-        elif isinstance(value, dict):
-            for item in value.values():
-                note(item)
-        elif isinstance(value, list):
-            for item in value:
-                note(item)
-
-    def visit(step: Any) -> None:
-        if isinstance(step, list):
-            for item in step:
-                visit(item)
-            return
-        if not isinstance(step, dict):
-            return
-        kind = step.get("kind")
-        if kind == "invoke":
-            note(step.get("inputs"))
-        elif kind == "emit":
-            note(step.get("value"))
-            note(step.get("valid_length"))
-            note(step.get("when"))
-        elif kind == "branch":
-            note(step.get("predicate"))
-            note(step.get("outputs"))
-            for case in (step.get("cases") or {}).values():
-                visit(case)
-            visit(step.get("default"))
-        elif kind == "loop":
-            note(step.get("continue_when"))
-            note(step.get("max_iterations"))
-            for carry in step.get("carried") or []:
-                note(carry.get("next"))
-                note(carry.get("initial"))
-        for key in ("steps", "setup", "nodes"):
-            visit(step.get(key))
-
-    visit(workflow.get("steps") or [])
-    for declaration in (workflow.get("state") or {}).values():
-        if isinstance(declaration, dict):
-            note(declaration.get("initializer"))
-            # A bounded or growing cell reads its own extent every step, so the
-            # bound and the step size are read positions like any other. The
-            # sibling ``kind``/``axis`` keys describe the recurrence rather than
-            # naming values, so they are not references.
-            recurrence = declaration.get("recurrence") or {}
-            note(recurrence.get("max"))
-            note(recurrence.get("increment"))
-    # The serving block names the workflow values a runtime reads to drive
-    # batching -- the active/done row masks and the accepted length.
-    serving = workflow.get("serving") or {}
-    for key, value in serving.items():
-        if key != "state_service":
-            note(value)
-    # ``state_service`` is mostly port and cell names rather than values, with
-    # one exception: a group's fixed update extent is itself a workflow value.
-    for group in ((serving.get("state_service") or {}).get("groups") or {}).values():
-        if isinstance(group, dict):
-            note((group.get("update") or {}).get("capacity"))
-    return references
-
-
-def declare_input_admission(workflow: dict[str, Any]) -> None:
-    """Publish every package input's admission requirement instead of implying it.
-
-    ``required`` is what a runtime admits a request against: an input it holds
-    required and the caller did not attach is a rejected request, on every path,
-    before a single component runs. A consumer cannot see what an *absent*
-    ``required`` key was meant to say, so it has to choose a default, and the
-    choice it makes is the opposite of what omission means to a producer -- a
-    value the workflow computes for itself, defaults for itself, or explicitly
-    branches on the absence of, silently becomes a mandatory caller attachment.
-
-    So the flag is derived from the published program rather than left to a
-    reader, and stamped on every declaration:
-
-    * a declaration the package can satisfy on its own -- it carries a
-      ``default``, which is also the only thing a package-owned ``literal``
-      source is ever bound from -- is not something a caller can be required to
-      send;
-    * a declaration whose absence the program *observes*, through a
-      ``present_as`` symbol the steps actually branch on, is one the workflow
-      has been written to run without;
-    * anything else is genuinely externally required, and says so out loud.
-
-    A builder that declares both an escape and ``required: True`` has written
-    two contradictory contracts, and there is no reading of the package that
-    satisfies both, so this fails closed rather than picking one. The mirror
-    case fails closed for the same reason: an input marked optional that the
-    package has no way to proceed without is not optional, it is a request that
-    is admitted and then fails part-way through on an unbound value, which is
-    strictly worse than the rejection it replaced.
-    """
-    inputs = workflow.get("inputs") or {}
-    if not inputs:
-        return
-    references = published_value_references(workflow)
-    for name, declaration in inputs.items():
-        if not isinstance(declaration, dict):
-            continue
-        escapes = []
-        literal = (declaration.get("source") or {}).get("kind") == "literal"
-        if "default" in declaration:
-            escapes.append("a package-supplied default" if literal else "a default")
-        elif literal:
-            # A literal source is resolved from the declaration's own default
-            # and from nothing else, so one without a default names a value the
-            # package neither holds nor can ask a caller for.
-            raise ValueError(
-                f"workflow input {name!r} is sourced from a package literal but "
-                "carries no default, so nothing ever binds it"
-            )
-        present_as = declaration.get("present_as")
-        if present_as is not None:
-            if present_as not in references:
-                raise ValueError(
-                    f"workflow input {name!r} declares the presence symbol "
-                    f"{present_as!r} that no step reads, so the workflow never "
-                    "handles the input being absent"
-                )
-            escapes.append(f"the presence gate {present_as!r}")
-        if not escapes:
-            if declaration.get("required", True) is False:
-                raise ValueError(
-                    f"workflow input {name!r} is declared optional but the workflow "
-                    "carries no default and no presence gate for it, so a request "
-                    "that omits it has no defined behaviour"
-                )
-            declaration["required"] = True
-            continue
-        if declaration.get("required", False):
-            raise ValueError(
-                f"workflow input {name!r} is declared required but the workflow "
-                f"already proceeds without it through {', '.join(escapes)}"
-            )
-        declaration["required"] = False
-
-
 def add_adapter_service_to_metadata(
     metadata: dict[str, Any],
     pkg: Any,
@@ -1948,7 +1587,8 @@ def build_native_vlm_package_metadata(
     closure. It is consumed by
     :func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`,
     which publishes the workflow and the ``preprocessing`` program. Use
-    :func:`write_native_vlm_package_metadata` to emit the package contract.
+    :func:`~mobius.integrations.onnx_genai.workflow_metadata.write_native_vlm_package_metadata`
+    to emit the package contract.
 
     Processor selection is registry-driven from graph rank/dtype/shape
     signatures. No model type, architecture name, or model-name branch
@@ -2228,35 +1868,6 @@ def _copy_runtime_assets(
         for filename in names
         if os.path.isfile(os.path.join(output_dir, filename))
     }
-
-
-def write_native_vlm_package_metadata(
-    pkg: Any,
-    directory: str,
-    *,
-    config: Any,
-    source: str | None = None,
-    revision: str | None = None,
-) -> dict[str, str]:
-    """Write the published VLM package contract and its tokenizer/processor assets.
-
-    What lands in ``inference_metadata.yaml`` is the typed SSA workflow built by
-    :func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`,
-    not the structural descriptor :func:`build_native_vlm_package_metadata`
-    returns.
-    """
-    from mobius.integrations.onnx_genai.workflow_metadata import (
-        write_vlm_workflow_metadata,
-    )
-
-    # Assets first: the workflow document declares their package-relative
-    # locations under ``package.tokenizer.artifacts``, so they have to be in the
-    # package before the document that names them is written.
-    artifacts = _copy_runtime_assets(directory, source, revision=revision)
-    artifacts["inference_metadata"] = write_vlm_workflow_metadata(
-        pkg, directory, config, source=source
-    )
-    return artifacts
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2685,11 +2296,6 @@ def build_diffusion_pipeline_metadata(
         build_tensor_clamp,
         build_tensor_scale,
         build_zeros_like,
-    )
-    from mobius.integrations.onnx_genai.workflow_metadata import (
-        _invoke,
-        _publish_workflow_v1,
-        _request_aligned,
     )
 
     if num_inference_steps < 1:

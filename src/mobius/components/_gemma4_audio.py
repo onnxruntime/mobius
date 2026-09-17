@@ -147,6 +147,7 @@ class Gemma4ConvSubsampling(nn.Module):
         conv_channels: list[int] | None = None,
         hidden_size: int = 1024,
         norm_eps: float = 1e-6,
+        linear_cls: type[nn.Module] = Linear,
     ):
         super().__init__()
         if conv_channels is None:
@@ -168,7 +169,7 @@ class Gemma4ConvSubsampling(nn.Module):
         # Linear: (c1 * freq_after_2_stages) → hidden_size
         # HF Gemma4AudioSubSampleConvProjection uses nn.Linear(bias=False)
         # for this projection, so no bias initializer should be created.
-        self.input_proj_linear = Linear(c1 * freq, hidden_size, bias=False)
+        self.input_proj_linear = linear_cls(c1 * freq, hidden_size, bias=False)
 
     def _conv_norm_relu(
         self,
@@ -429,6 +430,8 @@ class Gemma4Attention(nn.Module):
         num_heads: int = 8,
         attention_context_left: int = 13,
         attention_logit_cap: float = 50.0,
+        linear_cls: type[nn.Module] = Linear,
+        clippable_linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         self._num_heads = num_heads
@@ -441,17 +444,17 @@ class Gemma4Attention(nn.Module):
         self._k_scale = math.log(1 + math.e) / math.log(2)
 
         # Q/K/V: no bias (HF nn.Linear(..., bias=False))
-        self.q_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
-        self.k_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
-        self.v_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
+        self.q_proj = clippable_linear_cls(hidden_size, hidden_size, bias=False)
+        self.k_proj = clippable_linear_cls(hidden_size, hidden_size, bias=False)
+        self.v_proj = clippable_linear_cls(hidden_size, hidden_size, bias=False)
         # post: no bias (HF has no .bias key for self_attn.post in checkpoint)
-        self.post = ClippableLinear(hidden_size, hidden_size, bias=False)
+        self.post = clippable_linear_cls(hidden_size, hidden_size, bias=False)
 
         # Learnable per-head-dim scale applied to Q after projection
         self.per_dim_scale = nn.Parameter([self._head_dim])
 
         # Relative position key projection: no bias (HF nn.Linear(..., bias=False))
-        self.relative_k_proj = Linear(hidden_size, hidden_size, bias=False)
+        self.relative_k_proj = linear_cls(hidden_size, hidden_size, bias=False)
 
         # Precomputed sinusoidal relative position embeddings [context_left, hidden_size].
         # Positions are ordered [context_left-1, ..., 1, 0] (descending relative distance).
@@ -670,21 +673,40 @@ class Gemma4AudioLayer(nn.Module):
         rms_norm_eps: float = 1e-6,
         residual_weight: float = 0.5,
         gradient_clipping: float = 1e9,
+        linear_cls: type[nn.Module] = Linear,
+        clippable_linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         self._gradient_clipping = gradient_clipping
 
         self.feed_forward1 = Gemma4FeedForward(
-            hidden_size, rms_norm_eps, residual_weight, gradient_clipping
+            hidden_size,
+            rms_norm_eps,
+            residual_weight,
+            gradient_clipping,
+            clippable_linear_cls,
         )
         self.self_attn = Gemma4Attention(
-            hidden_size, num_heads, attention_context_left, attention_logit_cap
+            hidden_size,
+            num_heads,
+            attention_context_left,
+            attention_logit_cap,
+            linear_cls,
+            clippable_linear_cls,
         )
         self.lconv1d = Gemma4LightConv1d(
-            hidden_size, conv_kernel_size, rms_norm_eps, gradient_clipping
+            hidden_size,
+            conv_kernel_size,
+            rms_norm_eps,
+            gradient_clipping,
+            clippable_linear_cls,
         )
         self.feed_forward2 = Gemma4FeedForward(
-            hidden_size, rms_norm_eps, residual_weight, gradient_clipping
+            hidden_size,
+            rms_norm_eps,
+            residual_weight,
+            gradient_clipping,
+            clippable_linear_cls,
         )
         self.norm_pre_attn = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.norm_post_attn = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -763,13 +785,19 @@ class Gemma4AudioEncoder(nn.Module):
         rms_norm_eps: float = 1e-6,
         residual_weight: float = 0.5,
         gradient_clipping: float = 1e9,
+        linear_cls: type[nn.Module] = Linear,
+        clippable_linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         if conv_channels is None:
             conv_channels = [128, 32]
 
         self.subsample_conv_projection = Gemma4ConvSubsampling(
-            input_size, conv_channels, hidden_size, rms_norm_eps
+            input_size,
+            conv_channels,
+            hidden_size,
+            rms_norm_eps,
+            linear_cls,
         )
         self.layers = nn.ModuleList(
             [
@@ -782,6 +810,8 @@ class Gemma4AudioEncoder(nn.Module):
                     rms_norm_eps,
                     residual_weight,
                     gradient_clipping,
+                    linear_cls,
+                    clippable_linear_cls,
                 )
                 for _ in range(num_layers)
             ]
@@ -793,7 +823,7 @@ class Gemma4AudioEncoder(nn.Module):
         # Keep bias=True here; the caller's pre_projection_norm must use
         # manual primitive ops (not op.RMSNormalization) to prevent this
         # fusion pattern.
-        self.output_proj = Linear(hidden_size, output_proj_dims, bias=True)
+        self.output_proj = linear_cls(hidden_size, output_proj_dims, bias=True)
 
     def forward(
         self,

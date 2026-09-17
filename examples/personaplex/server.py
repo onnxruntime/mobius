@@ -22,7 +22,7 @@ pre-built ONNX models, so it can run in a lightweight ``onnxruntime-gpu``
 environment. Build the models first with ``moshi_ort.py`` (in an environment
 that has ``mobius`` installed)::
 
-    python examples/personaplex/moshi_ort.py --device cuda --lm-dtype f16 \
+    python examples/personaplex/moshi_ort.py --device cuda \
         --frames 1 --model-dir output/personaplex/onnx
 
 Then run this server (CUDA recommended for real-time speed)::

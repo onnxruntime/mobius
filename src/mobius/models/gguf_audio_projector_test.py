@@ -591,13 +591,8 @@ def test_standalone_runtime_exports_are_advisory(
     assert "mobius.processor_abi" in onnx_metadata["components"][component]["metadata"]
 
     ort_paths = write_ort_genai_config(package, str(tmp_path / "ort-genai"))
-    ort_metadata = json.loads(
-        (tmp_path / "ort-genai" / "runtime_compatibility.json").read_text()
-    )
-    assert set(ort_paths) == {"runtime_compatibility"}
+    assert ort_paths == {}
     assert not (tmp_path / "ort-genai" / "genai_config.json").exists()
-    assert ort_metadata["runtime_validation_status"] == "unsupported-by-tested-runtime"
-    assert set(ort_metadata["graph_contract"]) == {component}
 
 
 def test_granite_feature_capture_precedes_midpoint_ctc_injection():

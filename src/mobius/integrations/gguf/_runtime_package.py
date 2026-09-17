@@ -581,7 +581,6 @@ def write_gguf_runtime_package(
                     pkg,
                     str(stage),
                     ep=runtime_execution_provider,
-                    runtime_version=runtime_version,
                 )
             )
         else:

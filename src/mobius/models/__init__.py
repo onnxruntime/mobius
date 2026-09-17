@@ -123,6 +123,7 @@ __all__ = [
     "MiniCPMCausalLMModel",
     "MiniCPMV46ForConditionalGeneration",
     "MoonshineForConditionalGeneration",
+    "MoonshineStreamingForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
     "MuseGlimmerTextCausalLMModel",
     "MimiModel",
@@ -178,7 +179,6 @@ __all__ = [
     "SenseVoiceSmallModel",
     "ReUseConfig",
     "SEMambaSpeechEnhancementModel",
-    "build_reuse",
     "SortformerConfig",
     "SortformerDiarizationModel",
     "Qwen3TTSCodePredictorModel",
@@ -210,6 +210,10 @@ __all__ = [
     "remap_diffusers_unet_lora",
     "ViTModel",
     "VideoAutoencoderModel",
+    "VibeVoiceForConditionalGeneration",
+    "VibeVoiceStreamingForConditionalGeneration",
+    "VibeVoiceASRForConditionalGeneration",
+    "VibeVoiceASRStreamingForConditionalGeneration",
     "Wav2Vec2ForCTCModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
@@ -217,9 +221,6 @@ __all__ = [
     "XLMCausalLMModel",
     "XverseCausalLMModel",
     "Zamba2CausalLMModel",
-    "mimi_default_config",
-    "moshi_depformer_config",
-    "moshi_temporal_config",
     "Plamo2ForCausalLM",
     "PLMCausalLMModel",
     "TalkieForCausalLM",
@@ -329,7 +330,7 @@ from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mage_vl import MageVLForConditionalGeneration
 from mobius.models.maincoder import MaincoderCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
-from mobius.models.mimi import MimiModel, mimi_default_config
+from mobius.models.mimi import MimiModel
 from mobius.models.minicpm import MiniCPM3CausalLMModel, MiniCPMCausalLMModel
 from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
@@ -356,11 +357,12 @@ from mobius.models.moe import (
     Qwen2MoECausalLMModel,
 )
 from mobius.models.moonshine import MoonshineForConditionalGeneration
+from mobius.models.moonshine_streaming import (
+    MoonshineStreamingForConditionalGeneration,
+)
 from mobius.models.moshi import (
     MoshiDepformerModel,
     MoshiTemporalModel,
-    moshi_depformer_config,
-    moshi_temporal_config,
 )
 from mobius.models.muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
@@ -439,7 +441,6 @@ from mobius.models.qwen_vl import (
 from mobius.models.reuse import (
     ReUseConfig,
     SEMambaSpeechEnhancementModel,
-    build_reuse,
 )
 from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
@@ -455,6 +456,12 @@ from mobius.models.unet import (
     remap_diffusers_unet_lora,
 )
 from mobius.models.vae import AutoencoderKLModel
+from mobius.models.vibevoice import (
+    VibeVoiceASRStreamingForConditionalGeneration,
+    VibeVoiceForConditionalGeneration,
+)
+from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
+from mobius.models.vibevoice_streaming import VibeVoiceStreamingForConditionalGeneration
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model

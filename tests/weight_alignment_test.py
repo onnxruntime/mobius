@@ -25,6 +25,8 @@ they cannot roundtrip ONNX-aligned names by design.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
 from _test_configs import (
@@ -87,6 +89,9 @@ _FILTERING_PREPROCESS_MODELS: set[str] = {
     "opt",
     # ModernBert decoder: expects model.layers.* HF format with renames
     "modernbert-decoder",
+    # Realtime maps the Microsoft multi-stage checkpoint namespace, rather
+    # than accepting ONNX initializer names as an input format.
+    "vibevoice_streaming",
 }
 
 
@@ -144,6 +149,137 @@ def _assert_identity_roundtrip(model_type: str, config_overrides: dict) -> None:
     assert not missing, (
         f"preprocess_weights() dropped {len(missing)} parameter(s): {sorted(missing)[:10]}"
     )
+
+
+def test_vibevoice_native_hf_weights_cover_every_stage_parameter():
+    """The converted checkpoint namespace routes without missing trained weights."""
+    modeling = pytest.importorskip("transformers.models.vibevoice.modeling_vibevoice")
+    from mobius._configs import VibeVoiceConfig
+    from mobius.models.vibevoice import VibeVoiceForConditionalGeneration
+    from mobius.models.vibevoice_test import _make_tiny_hf_config
+    from mobius.tasks import VibeVoiceTask
+
+    torch.manual_seed(11)
+    hf_config = _make_tiny_hf_config()
+    config = VibeVoiceConfig.from_transformers(
+        hf_config.text_config,
+        parent_config=hf_config,
+    )
+    module = VibeVoiceForConditionalGeneration(config)
+    package = VibeVoiceTask().build(module, config)
+    parameter_names = _collect_parameter_names(package)
+    routed = module.preprocess_weights(
+        modeling.VibeVoiceForConditionalGeneration(hf_config).state_dict()
+    )
+
+    assert parameter_names == set(routed)
+
+
+@pytest.mark.arch_validation
+def test_vibevoice_asr_checkpoint_index_routes_every_native_tensor_once(tmp_path):
+    """The pinned native ASR index routes every inference tensor without exclusions."""
+    from huggingface_hub import hf_hub_download
+
+    from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
+    from mobius.models.vibevoice_test import _make_tiny_hf_config
+
+    index_path = hf_hub_download(
+        "microsoft/VibeVoice-ASR-HF",
+        filename="model.safetensors.index.json",
+        revision="f22241c2062b3b25272bf117397e03d73381037a",
+        cache_dir=tmp_path,
+    )
+    with open(index_path, encoding="utf-8") as handle:
+        checkpoint_names = set(json.load(handle)["weight_map"])
+
+    categories = {
+        "acoustic_encoder": {
+            name for name in checkpoint_names if name.startswith("acoustic_tokenizer_encoder.")
+        },
+        "semantic_encoder": {
+            name for name in checkpoint_names if name.startswith("semantic_tokenizer_encoder.")
+        },
+        "connectors": {
+            name for name in checkpoint_names if name.startswith("multi_modal_projector.")
+        },
+        "embedding": {
+            name
+            for name in checkpoint_names
+            if name.startswith("language_model.model.embed_tokens.")
+        },
+        "decoder": {
+            name
+            for name in checkpoint_names
+            if name.startswith(("language_model.model.layers.", "language_model.model.norm."))
+            or name == "language_model.lm_head.weight"
+        },
+    }
+    assert set().union(*categories.values()) == checkpoint_names
+    assert sum(map(len, categories.values())) == len(checkpoint_names) == 901
+    assert {name: len(values) for name, values in categories.items()} == {
+        "acoustic_encoder": 276,
+        "semantic_encoder": 276,
+        "connectors": 10,
+        "embedding": 1,
+        "decoder": 338,
+    }
+
+    # Native HF names must map directly to all five exported components.
+    from mobius._configs import VibeVoiceASRConfig
+
+    hf_config = _make_tiny_hf_config()
+    config = VibeVoiceASRConfig.from_transformers(
+        hf_config.text_config, parent_config=hf_config
+    )
+    module = VibeVoiceASRForConditionalGeneration(config)
+    routed = module.preprocess_weights({name: torch.empty(0) for name in checkpoint_names})
+    assert len(routed) == len(checkpoint_names)
+    assert all(
+        name.startswith(
+            ("acoustic_encoder.", "semantic_encoder.", "connectors.", "embedding.", "decoder.")
+        )
+        for name in routed
+    )
+
+
+@pytest.mark.arch_validation
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_vibevoice_streaming_asr_pinned_weight_index_routes_every_inference_tensor_once(
+    model_id, revision
+):
+    """Audit each pinned streaming-ASR checkpoint without downloading its weights."""
+    import json
+
+    from huggingface_hub import hf_hub_download
+
+    from mobius import build
+    from mobius.models.vibevoice import VibeVoiceASRStreamingForConditionalGeneration
+
+    with open(
+        hf_hub_download(model_id, "model.safetensors.index.json", revision=revision),
+        encoding="utf-8",
+    ) as handle:
+        checkpoint_names = set(json.load(handle)["weight_map"])
+
+    package = build(model_id, revision=revision, load_weights=False)
+    module = VibeVoiceASRStreamingForConditionalGeneration(package.config)
+    routed = module.preprocess_weights({name: torch.zeros(1) for name in checkpoint_names})
+    parameter_names = _collect_parameter_names(package)
+    intentionally_unused = {
+        name
+        for name in checkpoint_names
+        if name.startswith(module.INTENTIONALLY_UNUSED_WEIGHT_PREFIXES)
+    }
+
+    assert len(checkpoint_names) == len(routed) + len(intentionally_unused)
+    assert parameter_names == set(routed)
+    assert len(intentionally_unused) == 276
 
 
 # ---------------------------------------------------------------------------

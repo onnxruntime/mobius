@@ -216,7 +216,7 @@ Fix the Phi-2 MLP weight mismatch: replace the gated MLP (gate_proj/up_proj/down
 with FCMLP (fc1/fc2) in src/mobius/models/phi.py. The HF weights use fc1/fc2.
 
 After changes, run:
-  python -m pytest tests/build_graph_test.py -k "phi" -q
+  python -m pytest tests/build_graph -k "phi" -q
 
 Commit message: "fix: use FCMLP for Phi-1/2 model (HF uses fc1/fc2 not gated MLP)"
 Push to justinchu/fix-model-parity immediately after committing.

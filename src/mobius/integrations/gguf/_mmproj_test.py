@@ -4,8 +4,8 @@
 """Tests for GGUF ``clip`` mmproj config extraction and vision-encoder build.
 
 Builds a small synthetic ``clip`` mmproj GGUF with :class:`GGUFWriter` (mirroring
-``_builder_test.py``), then exercises the mmproj config readers and the vision
-encoder build+run path end-to-end on CPU.
+the private builder test utilities), then exercises the mmproj config readers
+and the vision encoder build+run path end-to-end on CPU.
 """
 
 from __future__ import annotations

@@ -9,6 +9,7 @@ require network access. All build tests use ``--no-weights``.
 
 from __future__ import annotations
 
+import argparse
 import os
 import tempfile
 from pathlib import Path
@@ -17,6 +18,7 @@ from unittest import mock
 
 import numpy as np
 import onnx
+import onnx_ir as ir
 import pytest
 
 from mobius.__main__ import _save_package, build_parser, main
@@ -43,6 +45,17 @@ def _write_gated_gguf(path: Path, *, architecture: str, quantized: bool) -> None
 
 class TestCLIList:
     """Test the ``list`` subcommand."""
+
+    @pytest.mark.parametrize("command", ["reuse", "mimi", "moshi", "personaplex"])
+    def test_native_audio_models_are_not_subcommands(self, command):
+        parser = build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+
+        assert command not in subparsers.choices
 
     def test_list_models(self, capsys):
         main(["list", "models"])
@@ -100,7 +113,7 @@ class TestCLIBuild:
 
         assert save_package.call_args.args[2].max_workers == 8
 
-    def test_reuse_revision_is_pinned_before_diffusers_probe(self):
+    def test_standard_build_dispatches_reuse_through_public_build(self):
         from mobius.models.reuse import REUSE_REVISION
 
         with (
@@ -116,6 +129,98 @@ class TestCLIBuild:
 
         assert pipeline_probe.call_args.kwargs["revision"] == REUSE_REVISION
         assert build_model.call_args.kwargs["revision"] == REUSE_REVISION
+
+    def test_standard_build_dispatches_personaplex_through_public_build(self):
+        from mobius.integrations._moshi import _PERSONAPLEX_REVISION
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index"
+            ) as pipeline_probe,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch("mobius.__main__._save_package") as save_package,
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "nvidia/personaplex-7b-v1",
+                    tmpdir,
+                    "--no-weights",
+                    "--dtype",
+                    "f32",
+                    "--execution-provider",
+                    "cuda",
+                ]
+            )
+
+        pipeline_probe.assert_not_called()
+        assert build_model.call_args.kwargs["revision"] == _PERSONAPLEX_REVISION
+        assert build_model.call_args.kwargs["load_weights"] is False
+        assert build_model.call_args.kwargs["execution_provider"] == "cuda"
+        assert build_model.call_args.kwargs["dtype"] == ir.DataType.FLOAT
+        save_package.assert_called_once()
+
+    def test_official_vibevoice_build_keeps_the_requested_model_identity(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ) as pipeline_probe,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(["build", "--model", "microsoft/VibeVoice-1.5B", tmpdir, "--no-weights"])
+
+        assert build_model.call_args.args == ("microsoft/VibeVoice-1.5B",)
+        assert (
+            build_model.call_args.kwargs["revision"]
+            == "c00898d257e6b46004e3e2866a47534085fb685a"
+        )
+        assert build_model.call_args.kwargs["load_weights"] is False
+        assert pipeline_probe.call_args.kwargs["revision"] == (
+            "c00898d257e6b46004e3e2866a47534085fb685a"
+        )
+
+    def test_runtime_assets_use_vibevoice_processor_source(self):
+        from mobius.__main__ import _runtime_asset_source
+        from mobius._model_package import ModelPackage
+
+        model = ir.Model(ir.Graph([], [], nodes=[], name="vibevoice"), ir_version=11)
+        model.metadata_props["mobius.source_revision"] = "official-revision"
+        model.metadata_props["mobius.processor_source"] = "vibevoice/processor@native-revision"
+
+        assert _runtime_asset_source(
+            ModelPackage({"model": model}),
+            "microsoft/VibeVoice-1.5B",
+            "official-revision",
+        ) == ("vibevoice/processor", "native-revision")
+
+    def test_local_personaplex_config_bypasses_transformers(self):
+        with (
+            tempfile.TemporaryDirectory() as checkpoint,
+            tempfile.TemporaryDirectory() as output,
+            mock.patch(
+                "mobius.integrations._moshi._is_personaplex_checkpoint",
+                return_value=True,
+            ),
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index"
+            ) as diffusers_probe,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch("transformers.AutoConfig.from_pretrained") as transformers_probe,
+            mock.patch("mobius.__main__._save_package") as save_package,
+        ):
+            main(["build", "--config", checkpoint, output, "--no-weights"])
+
+        diffusers_probe.assert_not_called()
+        transformers_probe.assert_not_called()
+        assert build_model.call_args.args == (checkpoint,)
+        assert build_model.call_args.kwargs["revision"] is None
+        assert build_model.call_args.kwargs["load_weights"] is False
+        save_package.assert_called_once()
 
     @pytest.mark.parametrize("option", ["--input-sample-rate", "--bwe-sample-rate"])
     def test_reuse_rate_options_are_rejected_for_diffusers(self, option):
@@ -275,6 +380,125 @@ class TestCLIBuild:
                     str(config_dir),
                     str(tmp_path / "output"),
                     "--no-weights",
+                ]
+            )
+
+    def test_local_config_delegates_to_shared_transformers_builder(self, tmp_path):
+        from mobius._model_package import ModelPackage
+
+        hf_config = SimpleNamespace(model_type="qwen2")
+        output_dir = tmp_path / "output"
+
+        with (
+            mock.patch(
+                "mobius.integrations.transformers._builder._load_transformers_config",
+                return_value=(hf_config, False),
+            ),
+            mock.patch(
+                "mobius.__main__.build",
+                return_value=ModelPackage({}),
+            ) as build_model,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(output_dir),
+                    "--no-weights",
+                ]
+            )
+
+        build_model.assert_called_once()
+        assert build_model.call_args.args == (str(tmp_path),)
+        assert build_model.call_args.kwargs["load_weights"] is False
+        assert build_model.call_args.kwargs["keep_quantized"] is True
+
+    @pytest.mark.parametrize(
+        ("extra_args", "keep_quantized"),
+        [([], True), (["--dequantize"], False)],
+    )
+    def test_local_gptoss_quantization_policy_reaches_shared_builder(
+        self, tmp_path, extra_args, keep_quantized
+    ):
+        hf_config = SimpleNamespace(model_type="gpt_oss")
+        output = tmp_path / "output"
+
+        with (
+            mock.patch(
+                "mobius.integrations.transformers._builder._load_transformers_config",
+                return_value=(hf_config, False),
+            ),
+            mock.patch(
+                "mobius.__main__.build",
+                return_value=mock.MagicMock(),
+            ) as build_model,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(output),
+                    "--execution-provider",
+                    "cuda",
+                    "--dtype",
+                    "f16",
+                    *extra_args,
+                ]
+            )
+
+        assert build_model.call_args.kwargs["keep_quantized"] is keep_quantized
+        assert build_model.call_args.kwargs["execution_provider"] == "cuda"
+        assert build_model.call_args.kwargs["dtype"] == ir.DataType.FLOAT16
+        assert not output.exists()
+
+    def test_dequantize_help_warns_about_dense_gptoss_memory(self):
+        parser = build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        build_command = subparsers.choices["build"]
+        dequantize = next(
+            action for action in build_command._actions if action.dest == "dequantize"
+        )
+
+        assert "GPT-OSS MXFP4" in dequantize.help
+        assert "memory-intensive" in dequantize.help
+        assert "bounded native streaming" in dequantize.help
+
+    @pytest.mark.parametrize(
+        "model_type",
+        ["qwen4_exp_text", "Qwen4ExpForConditionalGeneration"],
+    )
+    def test_local_qwen4_affine_error_from_shared_builder_propagates(
+        self, tmp_path, model_type
+    ):
+        hf_config = SimpleNamespace(model_type=model_type)
+
+        with (
+            mock.patch(
+                "mobius.integrations.transformers._builder._load_transformers_config",
+                return_value=(hf_config, False),
+            ),
+            mock.patch(
+                "mobius.__main__.build",
+                side_effect=NotImplementedError(
+                    "Affine per-component Qwen4-Exp loading is blocked"
+                ),
+            ),
+            pytest.raises(NotImplementedError, match="Affine per-component Qwen4-Exp"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(tmp_path / "output"),
                 ]
             )
 
@@ -997,7 +1221,7 @@ class TestCLIBuildRuntime:
         """A VLM package emits the workflow IR, not a legacy composite pipeline."""
         pkg = mock.MagicMock()
         pkg.items.return_value = []
-        pkg.__iter__.return_value = iter(("vision_encoder", "embedding", "decoder"))
+        pkg.__iter__.side_effect = lambda: iter(("vision_encoder", "embedding", "decoder"))
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
@@ -1015,18 +1239,23 @@ class TestCLIBuildRuntime:
             mock.patch(
                 "mobius.integrations.onnx_genai.write_onnx_genai_config",
                 return_value={},
-            ) as writer,
+            ) as generic_writer,
+            mock.patch(
+                "mobius.integrations.onnx_genai.workflow_metadata."
+                "write_native_vlm_package_metadata",
+                return_value={},
+            ) as vlm_writer,
         ):
             _save_package(pkg, tmpdir, args, None, None)
 
-        writer.assert_called_once_with(
+        vlm_writer.assert_called_once_with(
             pkg,
             tmpdir,
             config=pkg.config,
             source="/models/vlm",
             revision="pinned-revision",
-            guidance_scale=None,
         )
+        generic_writer.assert_not_called()
 
     def test_runtime_onnx_genai_forwards_guidance_scale(self):
         pkg = mock.MagicMock()
@@ -1057,10 +1286,46 @@ class TestCLIBuildRuntime:
         assert writer.call_args.kwargs["guidance_scale"] == pytest.approx(6.0)
         assert writer.call_args.kwargs["revision"] == "pinned-revision"
 
+    def test_runtime_onnx_genai_uses_effective_build_revision(self):
+        model = mock.MagicMock()
+        model.metadata_props = {
+            "mobius.source_revision": "edc39f80f5cae656da37baf8faa8f5502bf7081f"
+        }
+        pkg = mock.MagicMock()
+        pkg.items.return_value = [("decoder", model)]
+        pkg.values.return_value = [model]
+        pkg.__iter__.return_value = iter(("decoder",))
+        pkg.config = object()
+        args = SimpleNamespace(
+            max_shard_size=None,
+            max_workers=8,
+            external_data="onnx",
+            execution_provider="cpu",
+            no_weights=True,
+            runtime="onnx-genai",
+            config=None,
+            model="vibevoice/VibeVoice-1.5B-hf",
+            guidance_scale=None,
+            revision=None,
+            release=False,
+        )
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config",
+                return_value={},
+            ) as writer,
+        ):
+            _save_package(pkg, tmpdir, args, None, None)
+
+        assert writer.call_args.kwargs["revision"] == (
+            "edc39f80f5cae656da37baf8faa8f5502bf7081f"
+        )
+
     def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
         pkg = mock.MagicMock()
         pkg.items.return_value = []
-        pkg.__iter__.return_value = iter(("vision_encoder", "embedding", "decoder"))
+        pkg.__iter__.side_effect = lambda: iter(("vision_encoder", "embedding", "decoder"))
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
@@ -1076,15 +1341,27 @@ class TestCLIBuildRuntime:
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
                 "mobius.integrations.onnx_genai.write_onnx_genai_config",
+                return_value={},
+            ) as generic_writer,
+            mock.patch(
+                "mobius.integrations.onnx_genai.workflow_metadata."
+                "write_native_vlm_package_metadata",
                 side_effect=ValueError(
                     "unsupported VLM signature; regenerate processor assets or register it"
                 ),
-            ) as writer,
+            ) as vlm_writer,
             pytest.raises(SystemExit, match=r"regenerate.*register"),
         ):
             _save_package(pkg, tmpdir, args, None, None)
 
-        writer.assert_called_once()
+        vlm_writer.assert_called_once_with(
+            pkg,
+            tmpdir,
+            config=pkg.config,
+            source="/models/unsupported-vlm",
+            revision=None,
+        )
+        generic_writer.assert_not_called()
 
     def test_no_runtime_does_not_call_write_ort_genai_config(self):
         """Omitting --runtime does NOT call write_ort_genai_config()."""

@@ -39,7 +39,7 @@ import yaml
 from mobius import registry
 from mobius._configs import ArchitectureConfig
 from mobius._optimizations import optimize_model
-from mobius.integrations.onnx_genai.inference_metadata import (
+from mobius.integrations.onnx_genai._workflow_contract import (
     published_value_references,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (

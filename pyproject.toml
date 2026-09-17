@@ -53,7 +53,7 @@ testing = [
     "jsonschema>=4.0",
 ]
 ort-genai = ["onnxruntime-genai", "Pillow"]
-docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton"]
+docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton", "sphinxcontrib-mermaid"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -68,7 +68,7 @@ version = { attr = "mobius.__version__" }
 
 [tool.pytest.ini_options]
 addopts = "--tb=short --color=yes"
-testpaths = ["src", "tests"]
+testpaths = ["src", "tests", "scripts"]
 python_files = ["*_test.py"]
 markers = [
     "integration: integration tests requiring model downloads and GPU/CPU inference (deselect with '-m \"not integration\"')",

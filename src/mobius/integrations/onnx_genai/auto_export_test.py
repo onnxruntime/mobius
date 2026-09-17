@@ -17,6 +17,13 @@ import yaml
 from mobius._configs import QuantizationConfig
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import write_onnx_genai_config
+from mobius.integrations.onnx_genai._test_support import (
+    _Cfg,
+    _decoder_package,
+    _model,
+    _value,
+    _vlm_package,
+)
 from mobius.integrations.onnx_genai.auto_export import (
     _ddim_alpha_schedule,
     _flow_match_euler_schedule,
@@ -24,27 +31,11 @@ from mobius.integrations.onnx_genai.auto_export import (
     _looks_like_video_diffusion,
 )
 from mobius.integrations.onnx_genai.inference_metadata import SchedulerConfig
-from mobius.integrations.onnx_genai.inference_metadata_test import (
-    _decoder_model,
-    _model,
-    _value,
-)
 from mobius.integrations.onnx_genai.workflow_metadata import (
     HierarchicalAudioWorkflowConfig,
     build_decoder_workflow_metadata,
     build_hierarchical_audio_workflow_metadata,
 )
-
-
-@dataclasses.dataclass
-class _Cfg:
-    num_attention_heads: int = 16
-    num_key_value_heads: int = 4
-    head_dim: int = 64
-    hidden_size: int = 1024
-    max_position_embeddings: int = 8192
-    sliding_window: int | None = None
-    model_type: str = "qwen"
 
 
 @dataclasses.dataclass
@@ -97,6 +88,165 @@ def _diffusion_package(*, text: bool = False):
     )
     components.update({"denoiser": denoiser, "vae_decoder": vae})
     return ModelPackage(components)
+
+
+def test_vibevoice_assets_and_revision_are_forwarded(monkeypatch, tmp_path):
+    from mobius.integrations.onnx_genai import auto_export
+    from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
+    from mobius.models.vibevoice_test import _make_tiny_models
+
+    _, _, package = _make_tiny_models()
+    calls: list[tuple[str, str | None]] = []
+
+    def text_assets(output_dir, source, *, revision=None):
+        calls.append(("text", revision))
+        return {"tokenizer": str(Path(output_dir) / "tokenizer.json")}
+
+    def runtime_assets(output_dir, source, names, *, revision=None):
+        calls.append(("runtime", revision))
+        assert names == ("processor_config.json", "generation_config.json")
+        return {"processor_config": str(Path(output_dir) / "processor_config.json")}
+
+    def audio_processor(output_dir, source, *, revision=None):
+        calls.append(("audio", revision))
+        return str(Path(output_dir) / "audio_processor.json")
+
+    monkeypatch.setattr(auto_export, "_write_text_runtime_assets", text_assets)
+    monkeypatch.setattr(auto_export, "_copy_runtime_assets", runtime_assets)
+    monkeypatch.setattr(auto_export, "_write_hf_audio_processor", audio_processor)
+    monkeypatch.setattr(
+        auto_export,
+        "_write_advisory_component_contract",
+        lambda *args, **kwargs: {
+            "inference_metadata": str(tmp_path / "inference_metadata.yaml")
+        },
+    )
+
+    artifacts = write_onnx_genai_config(
+        package,
+        str(tmp_path),
+        source=VIBEVOICE_MODEL_ID,
+        revision=VIBEVOICE_REVISION,
+    )
+
+    assert calls == [
+        ("text", VIBEVOICE_REVISION),
+        ("runtime", VIBEVOICE_REVISION),
+        ("audio", VIBEVOICE_REVISION),
+    ]
+    assert {
+        "tokenizer",
+        "processor_config",
+        "audio_processor",
+        "inference_metadata",
+    } <= set(artifacts)
+
+
+def test_vibevoice_asr_writes_processor_and_advisory_contract(monkeypatch, tmp_path):
+    from mobius.models.vibevoice_asr_test import _make_models
+
+    _, _, package = _make_models()
+    monkeypatch.setattr(
+        "mobius.integrations.onnx_genai.auto_export._write_text_runtime_assets",
+        lambda *args, **kwargs: {},
+    )
+
+    artifacts = write_onnx_genai_config(package, str(tmp_path))
+
+    processor = json.loads((tmp_path / "preprocessor_config.json").read_text())
+    compatibility = json.loads((tmp_path / "runtime_compatibility.json").read_text())
+    assert artifacts["processor_contract"] == str(tmp_path / "preprocessor_config.json")
+    assert processor["target_sample_rate"] == 24_000
+    assert (
+        processor["speech_tok_compress_ratio"] == package.config.acoustic_tokenizer.hop_length
+    )
+    assert processor["encoder_final_chunk_input"] == "is_final_chunk"
+    assert processor["prompt_protocol"]["speech_tokens"] == [
+        "<|object_ref_start|>",
+        "<|box_start|>",
+        "<|object_ref_end|>",
+    ]
+    assert "You are a helpful assistant." not in processor["prompt_protocol"]["chat_template"]
+    assert processor["acoustic_sampling"]["noise_scale_input"] == "acoustic_noise_scale"
+    assert sorted(compatibility["components"]) == [
+        "acoustic_encoder",
+        "connectors",
+        "decoder",
+        "embedding",
+        "semantic_encoder",
+    ]
+    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_vibevoice_streaming_asr_writes_pinned_advisory_contract(
+    monkeypatch, tmp_path, model_id, revision
+):
+    from mobius.integrations.onnx_genai import auto_export
+    from mobius.models.vibevoice import (
+        VibeVoiceASRStreamingForConditionalGeneration,
+    )
+    from mobius.models.vibevoice_asr_test import _streaming_config
+    from mobius.tasks import VibeVoiceASRStreamingTask
+
+    config = _streaming_config()
+    package = VibeVoiceASRStreamingTask().build(
+        VibeVoiceASRStreamingForConditionalGeneration(config), config
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    def text_assets(output_dir, source, *, revision=None):
+        calls.append(("text", revision))
+        return {"tokenizer": str(Path(output_dir) / "tokenizer.json")}
+
+    def runtime_assets(output_dir, source, names, *, revision=None):
+        calls.append(("runtime", revision))
+        assert names == (
+            "processor_config.json",
+            "preprocessor_config.json",
+            "generation_config.json",
+        )
+        return {"processor_config": str(Path(output_dir) / "processor_config.json")}
+
+    def audio_processor(output_dir, source, *, revision=None):
+        calls.append(("audio", revision))
+        return str(Path(output_dir) / "audio_processor.json")
+
+    monkeypatch.setattr(auto_export, "_write_text_runtime_assets", text_assets)
+    monkeypatch.setattr(auto_export, "_copy_runtime_assets", runtime_assets)
+    monkeypatch.setattr(auto_export, "_write_hf_audio_processor", audio_processor)
+    monkeypatch.setattr(
+        auto_export,
+        "_write_advisory_component_contract",
+        lambda *args, **kwargs: {
+            "inference_metadata": str(tmp_path / "inference_metadata.yaml")
+        },
+    )
+
+    artifacts = write_onnx_genai_config(
+        package,
+        str(tmp_path),
+        source=model_id,
+        revision=revision,
+    )
+
+    assert calls == [
+        ("text", revision),
+        ("runtime", revision),
+        ("audio", revision),
+    ]
+    assert {
+        "tokenizer",
+        "processor_config",
+        "audio_processor",
+        "inference_metadata",
+    } <= set(artifacts)
 
 
 def _video_diffusion_package() -> ModelPackage:
@@ -160,67 +310,6 @@ def _video_diffusion_package() -> ModelPackage:
 
 class _MultimodalPkg(dict):
     config = _Cfg()
-
-
-@dataclasses.dataclass
-class _VisionCfg:
-    patch_size: int = 14
-    temporal_patch_size: int = 2
-    merge_size: int = 1
-    spatial_merge_size: int = 1
-    size: dict[str, int] = dataclasses.field(
-        default_factory=lambda: {"shortest_edge": 224, "longest_edge": 224}
-    )
-
-
-@dataclasses.dataclass
-class _VlmCfg(_Cfg):
-    vision: _VisionCfg = dataclasses.field(default_factory=_VisionCfg)
-    image_token_id: int = 32000
-    eos_token_id: int = 2
-
-
-def _vlm_package(*, audio: bool = False):
-    vision = _model(
-        "vision_encoder",
-        [
-            _value("pixel_values", ir.DataType.FLOAT, ["patches", 1176]),
-            _value("grid_thw", ir.DataType.INT64, ["images", 3]),
-        ],
-        [("image_features", ir.DataType.FLOAT, ["batch", 256, 32])],
-    )
-    embedding_inputs = [
-        _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
-        _value("image_features", ir.DataType.FLOAT, ["batch", 256, 32]),
-    ]
-    components = {"vision_encoder": vision}
-    if audio:
-        components["audio_encoder"] = _model(
-            "audio_encoder",
-            [_value("input_features", ir.DataType.FLOAT, ["batch", 80, "frames"])],
-            [("audio_features", ir.DataType.FLOAT, ["batch", 64, 32])],
-        )
-        embedding_inputs.append(_value("audio_features", ir.DataType.FLOAT, ["batch", 64, 32]))
-    embedding = _model(
-        "embedding",
-        embedding_inputs,
-        [("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 32])],
-    )
-    decoder = _decoder_model(
-        [("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 32])],
-        position_shape=["batch", "sequence"],
-    )
-    components.update({"embedding": embedding, "decoder": decoder})
-    return ModelPackage(components, config=_VlmCfg())
-
-
-def _decoder_package(config=None):
-    model = _decoder_model(
-        [],
-        position_shape=["batch", "sequence"],
-        raw_token_input=True,
-    )
-    return ModelPackage({"model": model}, config=config or _Cfg())
 
 
 def test_dispatch_decoder(tmp_path):

@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### GPT-OSS MXFP4 export
+
+#### Added
+
+- GPT-OSS MXFP4 checkpoints now preserve their native block/scales storage by
+  default through bounded safetensors streaming. `--model` and local
+  `--config` builds use the same CUDA f16/bf16 contract and transactional
+  package publication.
+- `--dequantize` explicitly selects the portable dense GPT-OSS graph. Dense
+  MXFP4 reconstruction eagerly loads and converts the checkpoint and can
+  require substantial host memory; native streaming remains the default.
+
+### Per-component quantized checkpoint loading
+
+#### Added
+
+- Multi-component checkpoints may declare an authoritative
+  `component_quantization` mapping with independent affine layouts for decoder,
+  encoder, vision, audio, and embedding components. Exact and regex
+  `modules_to_not_convert` rules are evaluated for each component-local module
+  against its HuggingFace source name, so selected projections remain floating
+  point while the rest of the component binds existing packed weights.
+- Mobius validates and normalizes existing Olive, GPTQ, and AWQ sidecars per
+  component. It does not quantize floating-point checkpoint weights.
+- Gemma4, Qwen3.5/QMoE, and T5 adapters preserve their architecture-specific
+  rename, tied-weight, and expert-packing semantics while handing independently
+  routed component sidecars to the generic codec and binding validator.
+- OpenVINO Gemma4 exports keep the layer and projection dimensions separate in
+  `per_layer_inputs` between the embedding and decoder components. Other
+  execution providers retain the existing flattened layout.
+
+#### Fixed
+
+- Local `--config` builds use the shared Transformers builder rather than a
+  duplicate model/weight loader, preserving per-component normalization,
+  GPT-OSS MXFP4 policies, and `--dequantize`/`--no-weights` behavior.
+- Component rewrites preserve learned positional embeddings and deliberately
+  floating-point shared-expert gates. Input token-table selection respects
+  source aliases rather than quantizing every embedding module.
+- Ordinary decoder sidecars, including Qwen3.5 text, MoE, and VL weights, remain
+  raw until per-projection overrides are resolved. QMoE expert packing and
+  float table tying remain in the shared compatibility preprocessor.
+- Graph construction and normalization agree on legacy module rules for any
+  single-component manifest, not only packages using the `model` key.
+- The binding gate also covers model-wide affine configurations. Orphan packed
+  sidecars are rejected without rejecting complete canonical affine or QMoE groups.
+- Dynamic component source resolvers use the available HuggingFace model type
+  instead of receiving an empty identifier. Configs without a model type retain
+  static component metadata and config-based aliases, including T5 layer mappings.
+- Split tied tables already materialized by a model adapter load into their
+  quantized embedding and LM-head targets instead of being rejected solely
+  because the checkpoint declares tied weights.
+- Literal quantization exclusions and overrides respect module-path boundaries
+  rather than accidentally matching similarly named layers or unrelated paths.
+- The compatibility weight normalizer requires an explicit task and reports a
+  clear error if it is missing.
+- Raw GPTQ/AWQ scales are no longer mistaken for already-normalized parameters.
+  Canonical detection requires a complete group with the target layout, and
+  zero-point requirements follow each projection's effective symmetry.
+- Independently quantized embedding tables retain the two-dimensional
+  `GatherBlockQuantized` layout instead of being packed as linear projections.
+- Graph construction and loading honor model-declared float exclusions and
+  output heads, including Qwen3.5-MoE and Whisper. Legacy global module rules
+  no longer fail when the component mapping is absent.
+- Gemma4 preserves raw component sidecars until per-projection normalization,
+  and T5 maps local projections back to their HuggingFace names, so component
+  and projection overrides select the same layout for graph and weights.
+- Sparse per-layer configuration dictionaries preserve the default attention
+  head dimension and KV-head count instead of replacing them with overrides
+  declared for only a subset of layers.
+
 ### Packed fused MoE experts (Olive/GPTQ/AWQ) survive HF weight renaming
 
 #### Fixed

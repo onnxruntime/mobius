@@ -528,7 +528,7 @@ def test_seed_oss_output_presence_controls_effective_tie() -> None:
 
 
 def test_seed_oss_packed_tied_head_has_one_canonical_owner(tmp_path) -> None:
-    from mobius.integrations.gguf._builder_test import _write_quantized_gguf
+    from mobius.integrations.gguf._builder_test_utils import _write_quantized_gguf
 
     path = tmp_path / "seed-oss-tied-q4.gguf"
     _write_quantized_gguf(

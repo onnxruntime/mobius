@@ -61,7 +61,7 @@ def build_from_nemo(
     from mobius._registry import registry
     from mobius.integrations.nemo._config_mapping import nemo_to_config
     from mobius.integrations.nemo._reader import NeMoArchive
-    from mobius.integrations.transformers import _default_task_for_model
+    from mobius.integrations.transformers._config_resolver import _default_task_for_model
 
     archive = NeMoArchive(nemo_path, revision=revision)
     logger.info("Loaded NeMo archive: %s (target=%s)", archive.path, archive.target)

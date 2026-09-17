@@ -3379,16 +3379,16 @@
       "src/mobius/integrations/gguf/_repacker_test.py::TestRepackQ10::test_round_trip_dequantize"
     ],
     "embedding-and-output-aliases": [
-      "src/mobius/integrations/gguf/_builder_test.py::test_tied_quantized_embedding_is_shared_with_output_head",
-      "src/mobius/integrations/gguf/_builder_test.py::test_quantized_untied_output_head_is_preserved"
+      "src/mobius/integrations/gguf/_builder_core_test.py::test_tied_quantized_embedding_is_shared_with_output_head",
+      "src/mobius/integrations/gguf/_builder_architectures_test.py::test_quantized_untied_output_head_is_preserved"
     ],
     "expert-stacking-and-3d-experts": [
-      "src/mobius/integrations/gguf/_builder_test.py::test_fused_experts_are_split_without_tensor_loss",
+      "src/mobius/integrations/gguf/_builder_contracts_test.py::test_fused_experts_are_split_without_tensor_loss",
       "src/mobius/integrations/gguf/_block_quantized_moe_builder_test.py::test_e2e_uniform_native_moe_fuses_through_builder",
       "src/mobius/integrations/_block_quant_test.py::test_stack_is_byte_exact_and_recoverable"
     ],
     "qkv-split-and-row-permutation": [
-      "src/mobius/integrations/gguf/_builder_test.py::test_phimoe_fused_qkv_is_split_without_loss",
+      "src/mobius/integrations/gguf/_builder_core_test.py::test_phimoe_fused_qkv_is_split_without_loss",
       "src/mobius/integrations/gguf/_minicpm_test.py::test_quantized_minicpm_loader_permutes_packed_rows_scales_and_zero_points",
       "src/mobius/integrations/gguf/_kimi_k3_test.py::test_fused_kv_b_float_values_and_quantized_import"
     ],

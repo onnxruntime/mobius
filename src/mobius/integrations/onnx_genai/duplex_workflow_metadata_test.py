@@ -20,7 +20,7 @@ import pytest
 import yaml
 
 from mobius._model_package import ModelPackage
-from mobius.integrations.onnx_genai.inference_metadata_test import (
+from mobius.integrations.onnx_genai._test_support import (
     _model,
     _onnx_genai_schema_path,
     _value,

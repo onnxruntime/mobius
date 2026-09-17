@@ -34,7 +34,7 @@ from mobius.integrations.diffusers._configs import (
     MiniMaxMusic3WorkflowConfig,
 )
 from mobius.integrations.onnx_genai import write_onnx_genai_config
-from mobius.integrations.onnx_genai.auto_export_test import (
+from mobius.integrations.onnx_genai._test_support import (
     _Cfg,
     _VlmCfg,
 )

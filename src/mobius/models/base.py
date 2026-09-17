@@ -24,7 +24,7 @@ from mobius._build_context import (
     get_build_dtype,
     is_prefill_prefix_pruning_enabled,
 )
-from mobius._configs import ArchitectureConfig, CausalLMConfig
+from mobius._configs import ArchitectureConfig, CausalLMConfig, QuantizedWeightFormat
 from mobius._flags import flags
 from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
@@ -64,7 +64,11 @@ def effective_tie_word_embeddings(config: ArchitectureConfig) -> bool:
 def linear_class_for_config(config: ArchitectureConfig):
     """Return the configured quantized linear factory, or ``None`` for float."""
     qc = getattr(config, "quantization", None)
-    if qc is None or qc.quant_method == "none":
+    if (
+        qc is None
+        or qc.quant_method == "none"
+        or qc.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
+    ):
         return None
     zp_dtype = config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
     return make_quantized_linear_factory(
@@ -502,12 +506,16 @@ class CausalLMModel(nn.Module):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Preprocess the state_dict to match the model's expected keys."""
-        qc = getattr(self.config, "quantization", None)
+        qc = self.config.quantization_for("model")
         return preprocess_quantized_weights(
             state_dict,
             qc,
             tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=None,
+            defer_non_expert_sidecars=(
+                self.config.component_quantization is not None
+                or (qc is not None and qc.has_module_plan)
+            ),
         )
 
 

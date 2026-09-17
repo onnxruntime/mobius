@@ -18,10 +18,10 @@ from mobius.integrations.onnx_genai import (
     write_onnx_genai_config,
     write_speech_enhancement_workflow_metadata,
 )
-from mobius.integrations.onnx_genai.auto_export import _looks_like_speech_enhancement
-from mobius.integrations.onnx_genai.inference_metadata_test import (
+from mobius.integrations.onnx_genai._test_support import (
     _onnx_genai_schema_path,
 )
+from mobius.integrations.onnx_genai.auto_export import _looks_like_speech_enhancement
 from mobius.models.reuse import ReUseConfig, SEMambaSpeechEnhancementModel
 
 _TINY = {

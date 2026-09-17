@@ -55,6 +55,7 @@ __all__ = [
     "Granite4WindowQFormerProjector",
     "GatedShortConv",
     "ClippableLinear",
+    "ClippableQuantizedLinear",
     "CogVLMClipSidecar",
     "GroupNorm",
     "GQAContext",
@@ -115,6 +116,7 @@ __all__ = [
     "RMSNormBias",
     "RmsNorm2d",
     "ScaleFreeRMSNorm",
+    "ScaledQuantizedEmbedding",
     "SelectiveScan",
     "SequenceMambaBlock",
     "SequenceSelectiveScan",
@@ -159,6 +161,7 @@ __all__ = [
     "get_activation",
     "initialize_rope",
     "make_quantized_linear_factory",
+    "make_clippable_quantized_linear_factory",
     "siglip2_naflex_attention_mask",
 ]
 
@@ -380,10 +383,13 @@ from mobius.components._qformer import (
 )
 from mobius.components._quantized_linear import (
     BlockQuantizedLinear,
+    ClippableQuantizedLinear,
     NVFP4QuantizedLinear,
     QuantizedEmbedding,
     QuantizedLinear,
+    ScaledQuantizedEmbedding,
     TiedQuantizedLMHead,
+    make_clippable_quantized_linear_factory,
     make_quantized_linear_factory,
 )
 from mobius.components._qwen3_asr_audio import (

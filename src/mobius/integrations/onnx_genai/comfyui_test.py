@@ -10,6 +10,9 @@ import json
 import pytest
 import yaml
 
+from mobius.integrations.onnx_genai._test_support import (
+    _onnx_genai_schema_path,
+)
 from mobius.integrations.onnx_genai.comfyui import (
     ComfyUIWorkflow,
     parse_comfyui_workflow,
@@ -18,9 +21,6 @@ from mobius.integrations.onnx_genai.comfyui import (
 )
 from mobius.integrations.onnx_genai.convert import convert_comfyui_workflow
 from mobius.integrations.onnx_genai.inference_metadata import SchedulerConfig
-from mobius.integrations.onnx_genai.inference_metadata_test import (
-    _onnx_genai_schema_path,
-)
 
 # ComfyUI's canonical "default" text-to-image API-format workflow (trimmed).
 _DEFAULT_TXT2IMG = {

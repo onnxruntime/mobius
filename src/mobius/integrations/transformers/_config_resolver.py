@@ -16,13 +16,17 @@ __all__ = [
     "_try_load_config_json",
 ]
 
+import dataclasses
 import logging
+from collections.abc import Mapping
 
 from mobius._configs import (
     ArchitectureConfig,
     BaseModelConfig,
+    QuantizationConfig,
     _as_attribute_config,
 )
+from mobius._configs._base import _extract_component_quantization
 from mobius._registry import registry
 
 logger = logging.getLogger(__name__)
@@ -66,8 +70,46 @@ def _config_from_hf(hf_config, parent_config=None, module_class=None) -> BaseMod
 
     # Call from_transformers — pass parent_config for ArchitectureConfig tree
     if issubclass(config_cls, ArchitectureConfig):
-        return config_cls.from_transformers(hf_config, parent_config=parent_config)
-    return config_cls.from_transformers(hf_config)
+        resolved = config_cls.from_transformers(hf_config, parent_config=parent_config)
+    else:
+        resolved = config_cls.from_transformers(hf_config)
+
+    if resolved.component_quantization is None:
+        source = parent_config or hf_config
+        raw_quantization = (
+            source.get("quantization_config")
+            if isinstance(source, Mapping)
+            else getattr(source, "quantization_config", None)
+        )
+        decoder_quantization = resolved.quantization
+        if (
+            decoder_quantization is None
+            and getattr(resolved, "block_quant_scheme", None) is None
+        ):
+            decoder_quantization = QuantizationConfig.from_value(
+                raw_quantization,
+                expert_dtype=(
+                    source.get("expert_dtype")
+                    if isinstance(source, Mapping)
+                    else getattr(source, "expert_dtype", None)
+                ),
+            )
+        component_quantization = _extract_component_quantization(
+            hf_config,
+            parent_config,
+            decoder_quantization,
+        )
+        if component_quantization is not None:
+            resolved = dataclasses.replace(
+                resolved,
+                component_quantization=component_quantization,
+                quantization=component_quantization.get(
+                    "decoder",
+                    component_quantization.get("model"),
+                ),
+            )
+
+    return resolved
 
 
 def _default_task_for_model(model_type: str) -> str:
@@ -169,15 +211,22 @@ def _dict_to_pretrained_config(d: dict):
     works correctly.
     """
     import transformers
-    from huggingface_hub import errors as hub_errors
 
     # Introduced in newer huggingface_hub releases. Older supported versions
     # can still construct these configs and should not fail on the import.
-    strict_validation_error = getattr(
-        hub_errors,
-        "StrictDataclassClassValidationError",
-        TypeError,
-    )
+    class _MissingStrictDataclassClassValidationError(Exception):
+        """Sentinel that cannot match errors from older Hub installations."""
+
+    try:
+        from huggingface_hub import errors as hub_errors
+    except ImportError:
+        strict_validation_error = _MissingStrictDataclassClassValidationError
+    else:
+        strict_validation_error = getattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            _MissingStrictDataclassClassValidationError,
+        )
 
     # Composite configs (e.g. configs with text_config/thinker_config) may
     # duplicate rope_scaling at the top level.  PretrainedConfig's rope

@@ -680,6 +680,39 @@ def _generate_image_to_text(case: TestCase, json_path: Path, device: str) -> Non
         )
 
 
+@contextlib.contextmanager
+def non_mutating_encoder_context(model: object):
+    """Stop a seq2seq decoder from mutating ``encoder_hidden_states`` in place.
+
+    Some speech decoders add an absolute position table to the encoder output
+    with ``+=`` (Moonshine Streaming does). Under cached cross-attention the
+    mutated tensor is never read again, so generation is unaffected — but a
+    golden reference must not *depend* on that. Cloning the argument on entry
+    makes the reference provably free of encoder-context accumulation, so the
+    committed golden describes "encoder context is added exactly once", which
+    is the semantics the exported ONNX decoder implements.
+
+    A no-op for models that expose no ``model.decoder`` or never mutate.
+    """
+    decoder = getattr(getattr(model, "model", None), "decoder", None)
+    forward = getattr(decoder, "forward", None)
+    if forward is None:
+        yield
+        return
+
+    def guarded(*args, **kwargs):
+        states = kwargs.get("encoder_hidden_states")
+        if states is not None and hasattr(states, "clone"):
+            kwargs["encoder_hidden_states"] = states.clone()
+        return forward(*args, **kwargs)
+
+    decoder.forward = guarded
+    try:
+        yield
+    finally:
+        decoder.forward = forward
+
+
 def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for an encoder-decoder speech recognition model."""
     import librosa
@@ -690,12 +723,15 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
 
     model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
         case.model_id,
+        revision=case.revision,
         device_map=device,
         trust_remote_code=case.trust_remote_code,
     )
     model.eval()
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
 
     # Load and preprocess audio
@@ -712,7 +748,7 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     decoder_input_ids = torch.tensor(
         [[decoder_start_id]], dtype=torch.long, device=model_device
     )
-    with torch.no_grad():
+    with torch.no_grad(), non_mutating_encoder_context(model):
         outputs = model(
             **processed,
             decoder_input_ids=decoder_input_ids,
@@ -724,7 +760,7 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     # L5: greedy generation
     generated_ids = None
     if "L5" in case.level:
-        with torch.no_grad():
+        with torch.no_grad(), non_mutating_encoder_context(model):
             gen = model.generate(
                 **processed,
                 max_new_tokens=case.generation_params.get("max_new_tokens", 50),
@@ -1976,7 +2012,7 @@ def main() -> int:
         label = f"{case.yaml_path.parent.name}/{case.case_id}"
 
         if case.skip_reason:
-            print(f"  SKIP: {label} — {case.skip_reason}")
+            print(f"  SKIP: {label} - {case.skip_reason}")
             skipped += 1
             continue
 
@@ -1986,7 +2022,7 @@ def main() -> int:
             continue
 
         if args.dry_run:
-            print(f"  DRY-RUN: {label} → {json_path}")
+            print(f"  DRY-RUN: {label} -> {json_path}")
             skipped += 1
             continue
 

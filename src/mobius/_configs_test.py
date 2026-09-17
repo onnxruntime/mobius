@@ -18,6 +18,7 @@ from mobius._configs import (
     GlmAsrConfig,
     MuseGlimmerConfig,
     QuantizationConfig,
+    QuantizedWeightFormat,
     VisionConfig,
     _extract_audio_config,
     _extract_mrope_fields,
@@ -919,6 +920,29 @@ class TestQuantizationConfig:
         assert qc.quant_method == "none"
         assert qc.sym is True
 
+    def test_new_weight_format_preserves_existing_positional_arguments(self):
+        qc = QuantizationConfig(8, 64, "olive", False, True, True, False, True, True)
+
+        assert qc.float_zero_point is True
+        assert qc.quantize_embeddings is True
+        assert qc.quantize_lm_head is False
+        assert qc.quantize_vision is True
+        assert qc.tie_word_embeddings is True
+        assert qc.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
+
+    def test_serialized_weight_format_is_normalized_to_enum(self):
+        qc = QuantizationConfig(
+            quant_method="manual",
+            weight_format="mxfp4",  # type: ignore[arg-type]
+        )
+
+        assert qc.weight_format is QuantizedWeightFormat.MXFP4
+
+    def test_quant_method_alone_does_not_infer_native_storage(self):
+        qc = QuantizationConfig(quant_method="mxfp4")
+
+        assert qc.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
+
     def test_from_transformers_gptq_dict(self):
         """Parse a GPTQ quantization_config dict."""
         hf = type(
@@ -1057,6 +1081,108 @@ class TestQuantizationConfig:
         assert qc.quantize_embeddings is True
         assert qc.quantize_lm_head is True
         assert qc.quantize_vision is True
+
+    def test_component_plan_matches_exact_and_regex_module_rules(self):
+        qc = QuantizationConfig.from_value(
+            {
+                "quant_method": "olive",
+                "bits": 4,
+                "group_size": 32,
+                "modules_to_not_convert": [
+                    r"re:.*\.per_layer_input_gate",
+                ],
+                "overrides": {
+                    "model.layers.0.q_proj": {
+                        "bits": 8,
+                        "group_size": 64,
+                    }
+                },
+            }
+        )
+
+        assert qc is not None
+        assert qc.for_module(("model.language_model.layers.0.per_layer_input_gate",)) is None
+        overridden = qc.for_module(("model.layers.0.q_proj",))
+        assert overridden is not None
+        assert (overridden.bits, overridden.group_size) == (8, 64)
+
+    def test_invalid_component_regex_fails_during_config_parse(self):
+        with pytest.raises(ValueError, match="Invalid quantization regex"):
+            QuantizationConfig.from_value(
+                {
+                    "quant_method": "olive",
+                    "modules_to_not_convert": ["re:("],
+                }
+            )
+
+    @pytest.mark.parametrize("rule", ["exclusion", "override"])
+    @pytest.mark.parametrize(
+        ("module_name", "matches"),
+        [
+            ("model.layers.1", True),
+            ("model.layers.1.self_attn.q_proj", True),
+            ("model.layers.10.self_attn.q_proj", False),
+            ("model.layers.1_extra", False),
+            ("other.model.layers.1.self_attn.q_proj", False),
+        ],
+    )
+    def test_literal_module_rules_respect_path_boundaries(self, rule, module_name, matches):
+        policy = (
+            {"modules_to_not_convert": ["model.layers.1"]}
+            if rule == "exclusion"
+            else {"overrides": {"model.layers.1": {"bits": 8, "group_size": 64}}}
+        )
+        qc = QuantizationConfig.from_value(
+            {"quant_method": "olive", "bits": 4, "group_size": 32, **policy}
+        )
+        assert qc is not None
+
+        resolved = qc.for_module((module_name,))
+
+        if rule == "exclusion" and matches:
+            assert resolved is None
+        else:
+            assert resolved is not None
+            expected = (8, 64) if matches else (4, 32)
+            assert (resolved.bits, resolved.group_size) == expected
+
+    def test_architecture_config_parses_explicit_component_quantization(self):
+        text = SimpleNamespace(
+            model_type="llama",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            hidden_act="silu",
+            max_position_embeddings=128,
+        )
+        parent = SimpleNamespace(
+            model_type="composite",
+            component_quantization={
+                "decoder": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "modules_to_not_convert": [
+                        r"re:.*\.per_layer_projection",
+                    ],
+                },
+                "vision": {
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 64,
+                },
+            },
+        )
+
+        config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+
+        assert config.component_quantization is not None
+        assert config.quantization_for("decoder").bits == 4
+        assert config.quantization_for("vision_encoder").bits == 8
+        assert config.quantization_for("decoder").modules_to_not_convert
 
     def test_quantize_component_flags_default_false(self):
         qc = QuantizationConfig()
@@ -1253,6 +1379,42 @@ class TestGemma4Config:
         assert config.global_head_dim == 512
         assert config.num_key_value_heads == 8
         assert config.num_global_key_value_heads == 2
+
+    def test_sparse_per_layer_head_dim_preserves_default(self):
+        from mobius._configs import Gemma4Config
+
+        config = type(
+            "FakeConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "num_hidden_layers": 5,
+                "vocab_size": 262144,
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "hidden_act": "silu",
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10_000.0,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "per_layer_config": {"04": {"head_dim": 512}},
+            },
+        )()
+
+        result = Gemma4Config.from_transformers(config)
+
+        assert result.head_dim == 256
+        assert result.global_head_dim == 512
 
     def test_unsupported_third_heterogeneous_layer_type_fails(self):
         from mobius._configs import Gemma4Config

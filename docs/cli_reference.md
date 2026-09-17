@@ -162,9 +162,7 @@ tokenizer files to the output directory:
   directory.
 
 For a graph-representable, single-model decoder-only text graph, Mobius emits the
-architecture-neutral `model.type: "decoder"` contract. Validation currently targets
-onnxruntime-genai 0.15.2, but the tested runtime version and registry are evidence,
-not export admission checks.
+architecture-neutral `model.type: "decoder"` contract.
 The graph determines the exact semantic input names, output names, cache templates,
 and global cache indices, so dense, MoE, tied-weight, quantized, and unknown
 architecture names do not need a runtime registry entry.
@@ -186,21 +184,6 @@ which selects `Gpt_Model`, `LFM2_Model`, `WhisperModel`, `MarianModel`,
 its [dedicated runtime model](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/models/qwen_vl_model.cpp).
 The Phi-3 LongRoPE threshold dispatch is in the released
 [`Generator`](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/generators.cpp).
-
-Mobius preserves graph-derived recurrent and heterogeneous state names even when the
-tested runtime cannot orchestrate them. The generated compatibility sidecar records
-the complete component input/output contract and marks such packages
-`unsupported-by-tested-runtime`; the state-manifest work is tracked by
-[#605](https://github.com/onnxruntime/mobius/issues/605).
-
-Each export also writes `runtime_compatibility.json` with
-`runtime_validation_status`, warnings, the requested and tested versions, and the
-graph-derived component contract. `validated` means the exact requested runtime was
-exercised; `unvalidated` means no matching evidence exists; and
-`unsupported-by-tested-runtime` records a known downstream limitation without
-blocking export. GGUF runtime evidence remains an independent exact-artifact matrix.
-Source identity and tokenizer semantic mismatches still fail because they would make
-the package metadata incorrect.
 
 #### Example
 
@@ -394,8 +377,8 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--ep EP` | Target execution provider for EP-aware optimization. |
-| `--runtime RUNTIME` | Request `onnx-genai` or `ort-genai` metadata. Emission is rejected unless the architecture has structured runtime evidence and the GGUF embeds an exact validated tokenizer; neither format bypasses the architecture verdict. |
-| `--runtime-version VERSION` | Exact selected runtime version. Once runtime support exists, this must equal the version in the matching evidence record; compatible-version ranges are not inferred. |
+| `--runtime RUNTIME` | Request `onnx-genai` or `ort-genai` metadata. Exact architecture, tokenizer, runtime, and final-package evidence marks the output validated. Downstream runtime, version, registry, or executor gaps preserve the model with an explicit unvalidated report; intrinsic graph, tensor, source-identity, and storage failures still fail closed. |
+| `--runtime-version VERSION` | Selected runtime version. An exact evidence match marks the package validated; other versions are exported with runtime status unvalidated rather than inferred compatible. |
 | `--mmproj PATH` | Exact companion `clip` GGUF. Pairing validates source identity, target architecture, modality, tensor closure, and dimensions before graph construction. |
 | `--target-config PATH` | Exact target config directory for `dflash`/`eagle3`; requires the adjacent complete `tokenizer.json` and emits a target-binding draft manifest. |
 | `--target-gguf PATH` | Exact target GGUF for a `dflash`/`eagle3` pair; emits target/draft graphs, cache namespaces, required shared-weight bridges, and `runtime_unvalidated` manifest/status metadata. |
@@ -438,13 +421,16 @@ embeddings dequantize because these graphs do not yet implement
 `GatherBlockQuantized`. BERT and ModernBERT GQA metadata are rejected; BERT
 quantized fused QKV is also rejected, while float fused QKV is split losslessly.
 
-Sharded GGUF inputs are rejected because a single shard has an incomplete
-tensor table. MTP-free `nemotron_h_moe` backbones are supported with exact
-hybrid scheduling and routed/shared/latent expert semantics; quantized sources
-require `--dequantize`. Files with the released combined attention+MoE MTP
-sidecar fail before graph construction, and ORT GenAI packaging remains
-deferred. See
-[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-h-moe-support-boundary).
+Complete local and Hub GGUF split sets are assembled as one logical model after
+validating shard counts, filenames, declared identity metadata, tensor ownership,
+and bounds. Missing, duplicate, or structurally inconsistent shards are rejected
+before graph construction. Manifest-backed Hub sets also verify revision-pinned
+sizes and SHA-256 hashes. MTP-free `nemotron_h_moe` backbones are supported with
+exact hybrid scheduling and routed/shared/latent expert semantics; quantized
+sources require `--dequantize`. Files with the released combined attention+MoE
+MTP sidecar fail before graph construction, and ORT GenAI packaging remains
+deferred. See the
+[GGUF capability and evidence catalog](gguf-capability-catalog.md).
 
 Runtime packaging materializes a tokenizer only when its source can be represented
 faithfully; opaque processors remain explicit validation warnings and do not block

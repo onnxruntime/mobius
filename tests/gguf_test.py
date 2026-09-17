@@ -892,7 +892,6 @@ class TestCLIBuildGGUF:
         assert "Runtime validation: UNVALIDATED" in stdout
         assert "requested runtime: ort-genai (unvalidated)" in stdout
         assert (output / "genai_config.json").is_file()
-        assert (output / "runtime_compatibility.json").is_file()
         assert not (output / "tokenizer.json").exists()
 
     @pytest.mark.parametrize(

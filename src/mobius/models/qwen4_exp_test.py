@@ -531,13 +531,12 @@ def test_multimodal_embedding_preserves_global_image_order():
     np.testing.assert_array_equal(actual[0, 0], weight[input_ids[0, 0]].numpy())
 
 
-def test_state_manifest_preserves_layers_and_runtime_workflows_fail_closed(tmp_path):
+def test_state_manifest_preserves_layers_and_workflows_fail_closed(tmp_path):
     from mobius._model_package import ModelPackage
     from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
     from mobius.integrations.onnx_genai.workflow_metadata import (
         build_vlm_workflow_metadata,
     )
-    from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
     config = _vl_config()
     package = Qwen4ExpVisionLanguageTask().build(
@@ -575,14 +574,6 @@ def test_state_manifest_preserves_layers_and_runtime_workflows_fail_closed(tmp_p
             "update": {"key": "append", "value": "append", "index_key": "replace"},
         },
     ]
-    ort_output = tmp_path / "ort"
-    ort_artifacts = write_ort_genai_config(package, str(ort_output))
-    ort_compatibility = json.loads(
-        Path(ort_artifacts["runtime_compatibility"]).read_text(encoding="utf-8")
-    )
-    assert ort_compatibility["runtime_validation_status"] == ("unsupported-by-tested-runtime")
-    assert "past_position_ids" in ort_compatibility["graph_contract"]["decoder"]["inputs"]
-
     with pytest.raises(ValueError, match="cannot bind Qwen4-Exp"):
         build_vlm_workflow_metadata(package, config)
     onnx_genai_output = tmp_path / "onnx-genai"
@@ -631,25 +622,6 @@ def test_state_manifest_preserves_layers_and_runtime_workflows_fail_closed(tmp_p
         )["runtime_validation_status"]
         == "unsupported-by-tested-runtime"
     )
-
-
-def test_ort_genai_text_export_writes_advisory_runtime_metadata(tmp_path):
-    from mobius.integrations.ort_genai.auto_export import export_package
-
-    config = _config()
-    package = build_from_module(
-        Qwen4ExpCausalLMModel(config),
-        config,
-        task="qwen4-exp-text-generation",
-    )
-    output_dir = tmp_path / "output"
-    with mock.patch.object(package, "save") as save:
-        result = export_package(package, str(output_dir))
-    save.assert_called_once()
-    compatibility = json.loads(
-        Path(result["runtime_compatibility"]).read_text(encoding="utf-8")
-    )
-    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
 
 
 def test_processor_config_matches_qwen4exp_graph_contract(tmp_path):

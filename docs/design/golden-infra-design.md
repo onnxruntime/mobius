@@ -1245,11 +1245,12 @@ jobs:
 | Generation params | Always greedy | Deterministic. Sampling is non-reproducible across platforms. |
 | Filename convention | Model ID → slug | Predictable, grep-friendly, no spaces or special chars |
 
-## Appendix B: Migration Path from Existing `integration_test.py`
+## Appendix B: Migration Path from Live Integration Tests
 
-The existing `integration_test.py` runs HF inference live. The golden file infrastructure replaces this for daily CI:
+The focused `tests/integration/` suites run HF inference live. The golden
+file infrastructure replaces this for daily CI:
 
-| Before (integration_test.py) | After (e2e_golden_test.py) |
+| Before (live integration suites) | After (e2e_golden_test.py) |
 |------|------|
 | Downloads HF model on every run | Uses pre-computed .npz golden data |
 | Requires GPU for large models | CPU-only (ONNX inference) |
@@ -1257,7 +1258,9 @@ The existing `integration_test.py` runs HF inference live. The golden file infra
 | Tests parametrized in Python code | Tests parametrized from YAML files |
 | Adding coverage = code change | Adding coverage = YAML + npz file |
 
-**`integration_test.py` is NOT deleted.** It remains as the "source of truth" for generating golden data and as a development-time tool. The golden tests are its pre-computed counterpart.
+The focused live integration suites remain the source of truth for generating
+golden data and as development-time tools. The golden tests are their
+pre-computed counterpart.
 
 ## Appendix C: File Size Estimates
 

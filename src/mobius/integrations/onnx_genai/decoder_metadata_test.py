@@ -12,14 +12,14 @@ import pytest
 import yaml
 
 from mobius._configs import QuantizationConfig
+from mobius.integrations.onnx_genai._test_support import (
+    _onnx_genai_schema_path,
+)
 from mobius.integrations.onnx_genai.decoder_metadata import (
     build_decoder_metadata,
     decoder_metadata_from_config,
     moe_metadata_from_config,
     write_decoder_metadata,
-)
-from mobius.integrations.onnx_genai.inference_metadata_test import (
-    _onnx_genai_schema_path,
 )
 
 

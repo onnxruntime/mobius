@@ -11,9 +11,8 @@ end with ``onnxruntime``::
     user audio --> Mimi encoder --> [Moshi temporal + depformer] --> Mimi
                                      decoder --> Moshi (assistant) audio
 
-The four models (all built from the native Kyutai ``safetensors`` checkpoints
-via :func:`mobius.integrations.moshi.build_mimi` /
-:func:`~mobius.integrations.moshi.build_moshi_lm`):
+The four models are built together from the native Kyutai checkpoint through
+the standard :func:`mobius.build` API:
 
 * **Mimi encoder** ``waveform (B,1,T) -> codes (B,8,Tf)``
 * **Moshi temporal** ``frame (B,17,S) -> hidden + text_logits + KV``
@@ -46,18 +45,16 @@ Usage::
     # Reuse already-exported ONNX models (skip the build step)
     python examples/personaplex/moshi_ort.py --model-dir out/personaplex/onnx
 
-    # Simulated real-time stream (reports RTF / per-frame budget). Build the
-    # models with an fp16 LM on CUDA first for real-time speed:
-    python examples/personaplex/moshi_ort.py --device cuda --lm-dtype f16 \
+    # Simulated stream (reports RTF / per-frame budget):
+    python examples/personaplex/moshi_ort.py --device cuda \
         --stream --audio user.wav --save-to out/personaplex
 
     # Live full-duplex mic -> speaker (needs sounddevice + audio hardware)
     python examples/personaplex/moshi_ort.py --skip-build --device cuda --mic
 
-Real-time note: each 12.5 Hz frame must finish within 80 ms. On an fp16 LM +
-CUDA the Moshi LM is ~27 ms/frame (~3x headroom); CPU fp32 (~1.8 s/frame) is
-far too slow for ``--stream``/``--mic``. The Mimi codec stays fp32 (its fp16
-export currently hits a Conv dtype mismatch).
+Real-time note: each 12.5 Hz frame must finish within 80 ms. The unified
+package currently supports fp32 only because the Mimi codec has no validated
+fp16/bf16 graph and runtime path.
 """
 
 from __future__ import annotations
@@ -227,8 +224,8 @@ class MoshiORT:
         def _load(name: str):
             return ort.InferenceSession(_model_path(model_dir, name), providers=providers)
 
-        self.enc = _load("mimi_encoder")
-        self.dec = _load("mimi_decoder")
+        self.enc = _load("encoder")
+        self.dec = _load("decoder")
         self.temporal = _load("temporal")
         self.depformer = _load("depformer")
 
@@ -556,32 +553,15 @@ class MoshiORT:
         return out[1 : 1 + MIMI_CB]
 
 
-def _build_models(model_dir: str, device: str, lm_dtype: str = "f32"):
-    """Export the four ONNX models from the native checkpoints (once).
-
-    The Mimi codec is always built in float32 (its fp16 export currently hits a
-    Conv dtype mismatch); the Moshi LM honours ``lm_dtype`` (use ``"f16"`` on
-    CUDA for real-time streaming).
-    """
-    from mobius.integrations.moshi import build_mimi, build_moshi_lm
+def _build_models(model_dir: str, device: str):
+    """Export the four fp32 ONNX models from the native checkpoint."""
+    from mobius import build
 
     os.makedirs(model_dir, exist_ok=True)
     ep = "cuda" if device == "cuda" else "default"
-    print(f"[build] Mimi codec (f32) from {_MODEL_ID} ...")
-    mimi = build_mimi(_MODEL_ID, execution_provider=ep)
-    mimi.save(os.path.join(model_dir, "mimi"))
-    # Mimi saves encoder/ and decoder/ subdirs; flatten the names we load.
-    for role in ("encoder", "decoder"):
-        src = os.path.join(model_dir, "mimi", role)
-        dst = os.path.join(model_dir, f"mimi_{role}")
-        if os.path.isdir(src) and not os.path.isdir(dst):
-            os.rename(src, dst)
-
-    print(f"[build] Moshi LM ({lm_dtype}, temporal + depformer) from {_MODEL_ID} ...")
-    dtype = None if lm_dtype == "f32" else lm_dtype
-    lm = build_moshi_lm(_MODEL_ID, dtype=dtype, execution_provider=ep)
-    lm["temporal"].save(os.path.join(model_dir, "temporal"))
-    lm["depformer"].save(os.path.join(model_dir, "depformer"))
+    print(f"[build] PersonaPlex package (f32) from {_MODEL_ID} ...")
+    package = build(_MODEL_ID, execution_provider=ep)
+    package.save(model_dir)
     print(f"[build] saved ONNX models under {model_dir}")
 
 
@@ -765,12 +745,6 @@ def main() -> None:
     parser.add_argument("--audio", default=None, help="24kHz mono user-stream wav")
     parser.add_argument("--frames", type=int, default=25, help="frames if no --audio")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-    parser.add_argument(
-        "--lm-dtype",
-        choices=["f32", "f16"],
-        default="f32",
-        help="Moshi LM dtype (use f16 on cuda for real-time)",
-    )
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument(
         "--seed",
@@ -807,7 +781,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.skip_build and not os.path.isdir(os.path.join(args.model_dir, "temporal")):
-        _build_models(args.model_dir, args.device, args.lm_dtype)
+        _build_models(args.model_dir, args.device)
 
     moshi = MoshiORT(
         args.model_dir,

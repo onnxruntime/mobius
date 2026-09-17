@@ -303,7 +303,7 @@ The agent should look for structural similarities with existing models:
 
 ### 4.1. Unit tests (mandatory)
 
-Add a tiny config entry to `tests/build_graph_test.py`:
+Add a tiny config entry to the appropriate list in `tests/_test_configs.py`:
 
 ```python
 ("new_model_type", {"hidden_act": "silu"}),
@@ -314,7 +314,9 @@ config (64 hidden dimensions, 2 layers, no weights).
 
 ### 4.2. Integration tests (mandatory for new architectures)
 
-Add the smallest available checkpoint to `tests/integration_test.py`:
+Add the smallest available checkpoint to the appropriate focused integration
+suite. Generic causal LMs use `TEXT_MODELS` in
+`tests/integration/_support.py`:
 
 ```python
 pytest.param("org/model-name", False, id="model-name"),

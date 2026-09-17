@@ -33,6 +33,24 @@ from mobius.models.base import CausalLMModel
 from mobius.tasks import CausalLMTask, ModelTask
 
 
+def test_transformers_package_exposes_only_public_builders():
+    import mobius.integrations.transformers as transformers_integration
+
+    assert transformers_integration.__all__ == ["build", "build_transformers_model"]
+    assert transformers_integration.build is build
+    assert transformers_integration.build_transformers_model is build
+
+    for helper in (
+        "_config_from_hf",
+        "_default_task_for_model",
+        "_dict_to_pretrained_config",
+        "_try_load_config_json",
+    ):
+        assert helper not in vars(transformers_integration)
+        with pytest.raises(AttributeError):
+            getattr(transformers_integration, helper)
+
+
 class TestBuildFromModule:
     def test_default_task(self):
         config = make_config()

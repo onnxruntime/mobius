@@ -109,6 +109,39 @@ def tmp_repo(tmp_path, monkeypatch, gd):
 
 
 # ---------------------------------------------------------------------------
+# Scanner tests: integration discovery covers legacy and domain-package tests.
+# ---------------------------------------------------------------------------
+def test_scan_integration_tests_includes_domain_package(gd, tmp_repo):
+    tests_dir = tmp_repo / "tests"
+    integration_dir = tests_dir / "integration"
+    integration_dir.mkdir(parents=True)
+    (tests_dir / "legacy_integration_test.py").write_text(
+        'MODEL_TYPE = "legacy_model"\n', encoding="utf-8"
+    )
+    (integration_dir / "text_test.py").write_text(
+        'MODEL_TYPE = "packaged_model"\n', encoding="utf-8"
+    )
+    (integration_dir / "_support.py").write_text(
+        'MODEL_TYPE = "support_only"\n', encoding="utf-8"
+    )
+    models = {
+        model_type: _build_model(
+            gd,
+            model_type=model_type,
+            family=model_type,
+            test_model_id=f"fake/{model_type}",
+        )
+        for model_type in ("legacy_model", "packaged_model", "support_only")
+    }
+
+    gd._scan_integration_tests(models)
+
+    assert models["legacy_model"].has_integration_test
+    assert models["packaged_model"].has_integration_test
+    assert not models["support_only"].has_integration_test
+
+
+# ---------------------------------------------------------------------------
 # Scanner tests: golden JSON discovery must honor YAML skip_reason.
 # ---------------------------------------------------------------------------
 # ``_scan_l4_golden_files`` and ``_scan_l5_generation_golden`` find golden

@@ -53,7 +53,7 @@ GPU (f16, greedy, matching HuggingFace ``model.generate``):
   dinner, turnips and carrots and bruised potatoes ..."
 
 Numerical correctness of the image / audio pipeline is also verified by the
-integration tests (``tests/integration_test.py::
+integration tests (``tests/integration/gemma4_test.py::
 test_gemma4_unified_12b_multimodal_prefill``, vision cosine 1.0 vs HuggingFace).
 
 Optional ``--quantize Q4_K_M`` INT4-quantizes the decoder with Olive (~23GB ->
