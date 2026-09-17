@@ -68,14 +68,6 @@ class VibeVoiceSources:
 
 
 _UNSUPPORTED_VIBEVOICE_MODELS = {
-    "microsoft/VibeVoice-ASR-Streaming-7B": (
-        "VibeVoice ASR Streaming requires the VibeVoice-ASR streaming task, "
-        "which Mobius does not export yet."
-    ),
-    "microsoft/VibeVoice-ASR-Streaming-1.5B": (
-        "VibeVoice ASR Streaming requires the VibeVoice-ASR streaming task, "
-        "which Mobius does not export yet."
-    ),
     "microsoft/VibeVoice-ASR-BitNet": (
         "VibeVoice ASR BitNet requires the VibeVoice-ASR task and BitNet "
         "weight loader, which Mobius does not export yet."
