@@ -402,7 +402,6 @@ def build_transformers_model(
         _config_from_hf,
         _default_task_for_model,
     )
-    from mobius.models.vibevoice import VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS
 
     detection_revision = revision
     vibevoice_sources = None
@@ -437,9 +436,6 @@ def build_transformers_model(
         # processor contract. Keep config detection and weight loading pinned.
         revision = VIBEVOICE_ASR_REVISION
         detection_revision = VIBEVOICE_ASR_REVISION
-    if model_id in VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS and detection_revision is None:
-        revision = VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS[model_id]
-        detection_revision = revision
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -758,7 +754,10 @@ def build_transformers_model(
                 )
             state_dict = _download_weights(model_id, revision=revision)
             if hasattr(model_module, "preprocess_weights"):
-                if vibevoice_sources is not None:
+                if (
+                    vibevoice_sources is not None
+                    and vibevoice_sources.weight_layout is not None
+                ):
                     state_dict = model_module.preprocess_weights(
                         state_dict,
                         checkpoint_layout=vibevoice_sources.weight_layout,

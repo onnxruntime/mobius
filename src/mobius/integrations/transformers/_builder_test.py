@@ -1477,10 +1477,87 @@ def test_official_vibevoice_uses_pinned_sidecars_and_official_weights(monkeypatc
 
 
 @pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_streaming_asr_uses_pinned_sources_and_native_weight_preprocessing(
+    monkeypatch, model_id, revision
+) -> None:
+    """The shared resolver must preserve streaming ASR's preprocessing signature."""
+    parent = SimpleNamespace(model_type="vibevoice", architectures=[])
+    package = ModelPackage(
+        {
+            "audio_encoder": ir.Model(
+                ir.Graph([], [], nodes=[], name="audio_encoder"), ir_version=11
+            )
+        }
+    )
+    calls = []
+
+    class StreamingAsrModule(_DummyModule):
+        def preprocess_weights(self, state_dict):
+            calls.append(("preprocess", state_dict))
+            return state_dict
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: calls.append(("config", args, kwargs)) or (parent, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (value, value, "VibeVoiceForASRStreamingTraining"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            StreamingAsrModule,
+            "vibevoice-asr-streaming",
+            "VibeVoiceForASRStreamingTraining",
+        ),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: make_config(model_type="vibevoice"),
+    )
+    monkeypatch.setattr(
+        transformers_builder, "build_from_module", lambda *args, **kwargs: package
+    )
+    state_dict = {"weight": torch.ones(())}
+    monkeypatch.setattr(
+        transformers_builder,
+        "_download_weights",
+        lambda *args, **kwargs: calls.append(("weights", args, kwargs)) or state_dict,
+    )
+
+    result = transformers_builder.build_transformers_model(model_id)
+
+    assert result is package
+    assert calls == [
+        (
+            "config",
+            (model_id,),
+            {"revision": revision, "trust_remote_code": False},
+        ),
+        ("weights", (model_id,), {"revision": revision}),
+        ("preprocess", state_dict),
+    ]
+    assert package["audio_encoder"].metadata_props == {
+        "mobius.source_revision": revision,
+        "mobius.executable_source": f"{model_id}@{revision}",
+        "mobius.processor_source": f"{model_id}@{revision}",
+    }
+
+
+@pytest.mark.parametrize(
     "model_id",
     [
-        "microsoft/VibeVoice-ASR-Streaming-7B",
-        "microsoft/VibeVoice-ASR-Streaming-1.5B",
         "microsoft/VibeVoice-ASR-BitNet",
         "microsoft/VibeVoice-AcousticTokenizer",
         "Microsoft/VibeVoice-ASR-BitNet",

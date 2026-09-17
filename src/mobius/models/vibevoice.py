@@ -46,16 +46,24 @@ VIBEVOICE_REVISION = "c00898d257e6b46004e3e2866a47534085fb685a"
 VIBEVOICE_EXECUTABLE_MODEL_ID = "vibevoice/VibeVoice-1.5B-hf"
 VIBEVOICE_EXECUTABLE_REVISION = "edc39f80f5cae656da37baf8faa8f5502bf7081f"
 VIBEVOICE_MICROSOFT_PROVENANCE_REVISION = VIBEVOICE_REVISION
+VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS = {
+    "microsoft/VibeVoice-ASR-Streaming-1.5B": "4262d23d8a539a6530cf64fbd0b1751ef9a30853",
+    "microsoft/VibeVoice-ASR-Streaming-7B": "60d858b518b4e19d404af3737f848fc185b30177",
+}
+VIBEVOICE_ASR_STREAMING_MODEL_ID = "microsoft/VibeVoice-ASR-Streaming-1.5B"
+VIBEVOICE_ASR_STREAMING_REVISION = VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS[
+    VIBEVOICE_ASR_STREAMING_MODEL_ID
+]
+VIBEVOICE_ASR_STREAMING_SOURCE_REVISION = "505653d3873b065a488aea551c6ee3dc51d3062f"
 
 
 @dataclasses.dataclass(frozen=True)
 class VibeVoiceSources:
-    """Immutable provenance for one VibeVoice TTS build.
+    """Immutable provenance for one supported VibeVoice checkpoint.
 
-    ``model_id`` and ``weight_revision`` are always the user's checkpoint. The
-    official 1.5B release predates Transformers-native VibeVoice metadata, so
-    its executable config and processor are resolved from the pinned conversion
-    mirror while its official weights remain the only downloaded weights.
+    ``model_id`` and ``weight_revision`` are always the user's checkpoint.
+    ``weight_layout`` is set only when the module accepts an explicit checkpoint
+    layout during weight preprocessing.
     """
 
     model_id: str
@@ -64,18 +72,10 @@ class VibeVoiceSources:
     config_revision: str
     processor_model_id: str
     processor_revision: str
-    weight_layout: str
+    weight_layout: str | None
 
 
 _UNSUPPORTED_VIBEVOICE_MODELS = {
-    "microsoft/VibeVoice-ASR-Streaming-7B": (
-        "VibeVoice ASR Streaming requires the VibeVoice-ASR streaming task, "
-        "which Mobius does not export yet."
-    ),
-    "microsoft/VibeVoice-ASR-Streaming-1.5B": (
-        "VibeVoice ASR Streaming requires the VibeVoice-ASR streaming task, "
-        "which Mobius does not export yet."
-    ),
     "microsoft/VibeVoice-ASR-BitNet": (
         "VibeVoice ASR BitNet requires the VibeVoice-ASR task and BitNet "
         "weight loader, which Mobius does not export yet."
@@ -103,6 +103,25 @@ def resolve_vibevoice_sources(model_id: str, revision: str | None) -> VibeVoiceS
     if canonical_model_id in unsupported:
         raise NotImplementedError(
             f"{model_id} is unsupported: {unsupported[canonical_model_id]}"
+        )
+    streaming_revisions = {
+        known_model_id.casefold(): pinned_revision
+        for known_model_id, pinned_revision in VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS.items()
+    }
+    if canonical_model_id in streaming_revisions:
+        pinned_revision = streaming_revisions[canonical_model_id]
+        if revision not in {None, pinned_revision}:
+            raise ValueError(
+                f"{model_id} is only verified at revision {pinned_revision}; got {revision}."
+            )
+        return VibeVoiceSources(
+            model_id=model_id,
+            weight_revision=pinned_revision,
+            config_model_id=model_id,
+            config_revision=pinned_revision,
+            processor_model_id=model_id,
+            processor_revision=pinned_revision,
+            weight_layout=None,
         )
     if canonical_model_id == VIBEVOICE_MODEL_ID.casefold():
         if revision not in {None, VIBEVOICE_REVISION}:
@@ -1231,17 +1250,6 @@ class VibeVoiceForConditionalGeneration(nn.Module):
             elif key == "lm_head.weight":
                 routed["decoder.lm_head.weight"] = value
         return routed
-
-
-VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS = {
-    "microsoft/VibeVoice-ASR-Streaming-1.5B": "4262d23d8a539a6530cf64fbd0b1751ef9a30853",
-    "microsoft/VibeVoice-ASR-Streaming-7B": "60d858b518b4e19d404af3737f848fc185b30177",
-}
-VIBEVOICE_ASR_STREAMING_MODEL_ID = "microsoft/VibeVoice-ASR-Streaming-1.5B"
-VIBEVOICE_ASR_STREAMING_REVISION = VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS[
-    VIBEVOICE_ASR_STREAMING_MODEL_ID
-]
-VIBEVOICE_ASR_STREAMING_SOURCE_REVISION = "505653d3873b065a488aea551c6ee3dc51d3062f"
 
 
 class VibeVoiceASRStreamingAudioEncoder(nn.Module):
