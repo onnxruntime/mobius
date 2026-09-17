@@ -15,7 +15,7 @@ import onnxruntime as ort
 import pytest
 import torch
 
-from mobius import build, build_from_module
+from mobius import ModelPackage, build, build_from_module
 from mobius._component_quantization import normalize_component_quantized_weights
 from mobius._configs import (
     ArchitectureConfig,
@@ -638,7 +638,7 @@ def test_public_local_llama_build_qualifies_olive_int2_layout(tmp_path, mixed_pr
     package = build(str(checkpoint_dir), dtype="f32")
     export_dir = tmp_path / "exported"
     package.save(str(export_dir), progress_bar=False, max_workers=1)
-    graph = ir.load(export_dir / "model.onnx").graph
+    graph = ModelPackage.load(str(export_dir))["model"].graph
     matmul_nbits_nodes = [
         node
         for node in graph
