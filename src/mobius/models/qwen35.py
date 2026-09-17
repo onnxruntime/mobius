@@ -22,7 +22,7 @@ from mobius.components._common import (
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._mlp import MLP
-from mobius.components._paged_attention import PagedHybridContext
+from mobius.components._paged_attention import PagedAttentionState, PagedHybridContext
 from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
@@ -176,9 +176,10 @@ class Qwen35DecoderLayer(nn.Module):
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
+        attention_bias: ir.Value | None,
         position_embeddings: tuple[ir.Value, ir.Value],
-        past_key_value: tuple[ir.Value, ir.Value] | None,
+        past_key_value: tuple[ir.Value, ir.Value] | PagedAttentionState | None,
+        paged_context: PagedHybridContext | None = None,
     ):
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
@@ -186,6 +187,8 @@ class Qwen35DecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             # DeltaNet states are passed through past_key_value as
             # (conv_state, recurrent_state), same tuple pattern as KV cache
+            if isinstance(past_key_value, PagedAttentionState) or past_key_value is None:
+                raise TypeError("Linear attention requires conv/recurrent state")
             conv_state, recurrent_state = past_key_value
 
             attn_output, new_conv_state, new_recurrent_state = self.linear_attn(
@@ -194,19 +197,29 @@ class Qwen35DecoderLayer(nn.Module):
                 conv_state,
                 recurrent_state,
                 cumulative_sequence_lengths=(
-                    attention_bias.cumulative_sequence_lengths
-                    if isinstance(attention_bias, PagedHybridContext)
+                    paged_context.cumulative_sequence_lengths
+                    if paged_context is not None
                     else None
                 ),
             )
             present_key_value = (new_conv_state, new_recurrent_state)
         else:
+            paged_state = None
+            dense_state = past_key_value
+            if paged_context is not None:
+                if not isinstance(past_key_value, PagedAttentionState):
+                    raise TypeError("Packed full attention requires PagedAttentionState")
+                paged_state = past_key_value
+                dense_state = None
+            elif isinstance(past_key_value, PagedAttentionState):
+                raise TypeError("PagedAttentionState requires paged_context")
             attn_output, present_key_value = self.self_attn(
                 op,
                 hidden_states=hidden_states,
                 attention_bias=attention_bias,
                 position_embeddings=position_embeddings,
-                past_key_value=past_key_value,
+                past_key_value=dense_state,
+                paged_state=paged_state,
             )
 
         hidden_states = op.Add(residual, attn_output)
@@ -249,13 +262,16 @@ class Qwen35TextModel(nn.Module):
         self,
         op: OpBuilder,
         input_ids: ir.Value | None,
-        attention_mask: ir.Value,
+        attention_mask: ir.Value | None,
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
         deepstack_embeds: list | None = None,
+        paged_context: PagedHybridContext | None = None,
     ):
-        packed = isinstance(attention_mask, PagedHybridContext)
+        packed = paged_context is not None
+        if packed and attention_mask is not None:
+            raise ValueError("paged_context cannot be combined with attention_mask")
         # Embed tokens: dense (B,S,H), or packed (N,H).
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -269,7 +285,7 @@ class Qwen35TextModel(nn.Module):
 
         # Causal attention mask: (batch, 1, seq_len, total_seq_len)
         attention_bias = (
-            attention_mask
+            None
             if packed
             else create_attention_bias(
                 op,
@@ -290,6 +306,7 @@ class Qwen35TextModel(nn.Module):
                 attention_bias=attention_bias,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
+                paged_context=paged_context,
             )
             present_key_values.append(present_kv)
             # DeepStack injection (see TextModel.forward for the rationale).
@@ -327,12 +344,14 @@ class Qwen35CausalLMModel(CausalLMModel):
         self,
         op: OpBuilder,
         input_ids: ir.Value,
-        attention_mask: ir.Value | PagedHybridContext | None,
+        attention_mask: ir.Value | None,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        *,
+        paged_context: PagedHybridContext | None = None,
     ):
         """Preserve the dense ABI while supporting the dedicated packed task."""
-        if not isinstance(attention_mask, PagedHybridContext):
+        if paged_context is None:
             return super().forward(
                 op,
                 input_ids,
@@ -346,9 +365,10 @@ class Qwen35CausalLMModel(CausalLMModel):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            paged_context=paged_context,
         )
-        if attention_mask.last_token_indices is not None:
-            hidden_states = op.Gather(hidden_states, attention_mask.last_token_indices, axis=0)
+        if paged_context.last_token_indices is not None:
+            hidden_states = op.Gather(hidden_states, paged_context.last_token_indices, axis=0)
         return self.lm_head(op, hidden_states), present_key_values
 
     def preprocess_weights(

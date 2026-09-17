@@ -61,6 +61,11 @@ def package():
 
 
 def test_exact_state_disciplines_and_application_scheduling(package):
+    abi = inspect_paged_hybrid(package["model"])
+    assert abi is not None
+    assert abi.full_layers == (3,)
+    assert abi.linear_layers == (0, 1, 2)
+
     metadata = build_decoder_workflow_metadata(package, package.config)
     schema = json.loads(
         (Path(__file__).with_name("_schema") / "inference_metadata.schema.json").read_text()
@@ -167,6 +172,300 @@ def test_incomplete_hybrid_cannot_claim_engine_compatibility(package, mutation):
 def test_unmarked_block_table_is_not_hybrid_compatibility(package):
     del package["model"].metadata_props["mobius.paged_hybrid"]
     assert inspect_paged_hybrid(package["model"]) is None
+
+
+def test_verifier_accepts_normal_saved_export(package, tmp_path):
+    package.save(str(tmp_path), check_weights=False, progress_bar=False)
+
+    assert inspect_paged_hybrid(ir.load(tmp_path / "model.onnx")) is not None
+
+
+def test_verifier_accepts_unrelated_symbolic_request_dimensions(package):
+    graph = package["model"].graph
+    request_inputs = {
+        value.name: value
+        for value in graph.inputs
+        if value.name
+        in {"block_table", "past_sequence_lengths", "cumulative_sequence_lengths"}
+        or value.name.endswith((".conv_state", ".recurrent_state"))
+    }
+    request_inputs["block_table"].shape = ir.Shape(["blocks_batch", "max_blocks"])
+    request_inputs["past_sequence_lengths"].shape = ir.Shape(["lengths_batch"])
+    request_inputs["cumulative_sequence_lengths"].shape = ir.Shape(["boundaries"])
+    for name, state in request_inputs.items():
+        if not name.endswith((".conv_state", ".recurrent_state")):
+            continue
+        state.shape = ir.Shape([f"{name}.batch", *state.shape[1:]])
+        layer, kind = name.split(".")[1:3]
+        present = next(
+            value for value in graph.outputs if value.name == f"present.{layer}.{kind}"
+        )
+        present.shape = ir.Shape([f"present.{name}.batch", *state.shape[1:]])
+
+    key = next(value for value in graph.inputs if value.name == "past_key_values.3.key")
+    value = next(value for value in graph.inputs if value.name == "past_key_values.3.value")
+    key.shape = ir.Shape(["key_pages", 256, "key_heads", "key_dim"])
+    value.shape = ir.Shape(["value_pages", 256, "value_heads", "value_dim"])
+    next(value for value in graph.outputs if value.name == "present.3.key").shape = ir.Shape(
+        ["present_key_pages", 256, "present_key_heads", "present_key_dim"]
+    )
+    next(value for value in graph.outputs if value.name == "present.3.value").shape = ir.Shape(
+        ["present_value_pages", 256, "present_value_heads", "present_value_dim"]
+    )
+
+    paged = next(node for node in graph if node.op_type == "PagedAttention")
+    for index, name in enumerate(("query", "key", "value")):
+        operand = paged.inputs[index]
+        operand.shape = ir.Shape([f"{name}_tokens", operand.shape[1]])
+    paged.outputs[0].shape = ir.Shape(["output_tokens", paged.outputs[0].shape[1]])
+
+    assert inspect_paged_hybrid(package["model"]) is not None
+
+
+@pytest.mark.parametrize(
+    ("operand_index", "mutation"),
+    [
+        (0, "dtype"),
+        (1, "dtype"),
+        (2, "dtype"),
+        (0, "rank"),
+        (1, "rank"),
+        (2, "rank"),
+        (0, "width"),
+        (1, "width"),
+        (2, "width"),
+    ],
+)
+def test_verifier_rejects_invalid_paged_attention_qkv(package, operand_index, mutation):
+    node = next(node for node in package["model"].graph if node.op_type == "PagedAttention")
+    operand = node.inputs[operand_index]
+    assert operand is not None and operand.shape is not None
+    if mutation == "dtype":
+        operand.type = ir.TensorType(ir.DataType.FLOAT)
+    elif mutation == "rank":
+        operand.shape = ir.Shape([1, *operand.shape])
+    else:
+        operand.shape = ir.Shape([operand.shape[0], 7])
+
+    with pytest.raises(ValueError, match="PagedAttention"):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize("mutation", ["dtype", "rank", "width", "disconnected"])
+def test_verifier_rejects_invalid_paged_attention_data_output(package, mutation):
+    node = next(node for node in package["model"].graph if node.op_type == "PagedAttention")
+    output = node.outputs[0]
+    assert output.shape is not None
+    if mutation == "dtype":
+        output.type = ir.TensorType(ir.DataType.FLOAT)
+    elif mutation == "rank":
+        output.shape = ir.Shape([1, *output.shape])
+    elif mutation == "width":
+        output.shape = ir.Shape([output.shape[0], 7])
+    else:
+        replacement = ir.Value(type=output.type, shape=output.shape)
+        output.replace_all_uses_with(replacement)
+
+    with pytest.raises(ValueError, match="PagedAttention data output"):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize("mutation", ["disconnected_key", "swapped_key_value"])
+def test_verifier_rejects_paged_attention_output_misbinding(package, mutation):
+    graph = package["model"].graph
+    key = next(value for value in graph.outputs if value.name == "present.3.key")
+    value = next(value for value in graph.outputs if value.name == "present.3.value")
+    if mutation == "swapped_key_value":
+        key.name, value.name = value.name, key.name
+    else:
+        key.name = "orphaned.present.3.key"
+        graph.outputs.remove(key)
+        graph.outputs.append(
+            ir.Value(
+                name="present.3.key",
+                type=key.type,
+                shape=key.shape,
+            )
+        )
+
+    with pytest.raises(ValueError, match="PagedAttention"):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize(
+    ("state_name", "native_op"),
+    [
+        ("present.0.conv_state", "VarlenCausalConvWithState"),
+        ("present.0.recurrent_state", "GatedDeltaNet"),
+    ],
+)
+def test_verifier_rejects_disconnected_linear_state_output(package, state_name, native_op):
+    graph = package["model"].graph
+    state = next(value for value in graph.outputs if value.name == state_name)
+    state.name = f"orphaned.{state_name}"
+    graph.outputs.remove(state)
+    graph.outputs.append(ir.Value(name=state_name, type=state.type, shape=state.shape))
+
+    with pytest.raises(ValueError, match=native_op):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize(
+    ("op_type", "attribute", "replacement"),
+    [
+        (
+            "VarlenCausalConvWithState",
+            "activation",
+            ir.AttrString("activation", "relu"),
+        ),
+        ("GatedDeltaNet", "gate_activation", ir.AttrString("gate_activation", "silu")),
+        ("GatedDeltaNet", "scale", ir.AttrFloat32("scale", 1.0)),
+    ],
+)
+def test_verifier_rejects_malformed_native_attributes(
+    package, op_type, attribute, replacement
+):
+    node = next(node for node in package["model"].graph if node.op_type == op_type)
+    node.attributes[attribute] = replacement
+
+    with pytest.raises(ValueError, match=op_type):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize(
+    ("op_type", "attribute", "replacement"),
+    [
+        ("PagedAttention", "scale", ir.AttrFloat32("scale", 0.5)),
+        ("PagedAttention", "is_causal", ir.AttrInt64("is_causal", 0)),
+        (
+            "PagedAttention",
+            "local_window_size",
+            ir.AttrInt64("local_window_size", 128),
+        ),
+        ("PagedAttention", "softcap", ir.AttrFloat32("softcap", 30.0)),
+        ("VarlenCausalConvWithState", "dilation", ir.AttrInt64("dilation", 2)),
+        (
+            "VarlenCausalConvWithState",
+            "state_update_capacity",
+            ir.AttrInt64("state_update_capacity", 1),
+        ),
+        ("GatedDeltaNet", "state_update_capacity", ir.AttrInt64("state_update_capacity", 1)),
+    ],
+)
+def test_verifier_rejects_non_phase1_native_options(package, op_type, attribute, replacement):
+    node = next(node for node in package["model"].graph if node.op_type == op_type)
+    node.attributes[attribute] = replacement
+
+    with pytest.raises(ValueError, match=op_type):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize(("mutation", "size"), [("input", 10), ("output", 3)])
+def test_verifier_rejects_extended_gated_delta_contract(package, mutation, size):
+    node = next(node for node in package["model"].graph if node.op_type == "GatedDeltaNet")
+    if mutation == "input":
+        node.resize_inputs(size)
+    else:
+        node.resize_outputs(size)
+
+    with pytest.raises(ValueError, match="GatedDeltaNet"):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize("operand_index", [4, 5, 7, 8])
+def test_verifier_rejects_non_float_gated_delta_operands(package, operand_index):
+    node = next(node for node in package["model"].graph if node.op_type == "GatedDeltaNet")
+    operand = node.inputs[operand_index]
+    assert operand is not None
+    operand.type = ir.TensorType(ir.DataType.FLOAT16)
+
+    with pytest.raises(ValueError, match="GatedDeltaNet"):
+        inspect_paged_hybrid(package["model"])
+
+
+def test_verifier_requires_matching_gated_delta_qkv_dtypes(package):
+    node = next(node for node in package["model"].graph if node.op_type == "GatedDeltaNet")
+    key = node.inputs[1]
+    assert key is not None
+    key.type = ir.TensorType(ir.DataType.BFLOAT16)
+
+    with pytest.raises(ValueError, match="GatedDeltaNet QKV layout"):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize("operand_index", [2, 4, 5])
+def test_verifier_requires_matching_gated_delta_token_extents(package, operand_index):
+    node = next(node for node in package["model"].graph if node.op_type == "GatedDeltaNet")
+    for index in (0, 1, 2, 4, 5):
+        value = node.inputs[index]
+        assert value is not None and value.shape is not None
+        value.shape = ir.Shape([8, *value.shape[1:]])
+    node.outputs[0].shape = ir.Shape([8, *node.outputs[0].shape[1:]])
+    operand = node.inputs[operand_index]
+    assert operand is not None and operand.shape is not None
+    operand.shape = ir.Shape([7, *operand.shape[1:]])
+
+    with pytest.raises(ValueError, match="GatedDeltaNet"):
+        inspect_paged_hybrid(package["model"])
+
+
+def test_verifier_requires_depthwise_varlen_conv_weight(package):
+    node = next(
+        node for node in package["model"].graph if node.op_type == "VarlenCausalConvWithState"
+    )
+    weight = node.inputs[1]
+    assert weight is not None and weight.shape is not None
+    weight.shape = ir.Shape([weight.shape[0], 2, weight.shape[2]])
+
+    with pytest.raises(ValueError, match="VarlenCausalConvWithState"):
+        inspect_paged_hybrid(package["model"])
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "past_sequence_lengths",
+        "conv_state",
+        "recurrent_state",
+        "cumulative_sequence_lengths",
+    ],
+)
+def test_verifier_rejects_concrete_request_dimension_mismatch(package, target):
+    graph = package["model"].graph
+    inputs = {value.name: value for value in graph.inputs}
+    inputs["block_table"].shape = ir.Shape([2, inputs["block_table"].shape[1]])
+    inputs["past_sequence_lengths"].shape = ir.Shape([2])
+    inputs["cumulative_sequence_lengths"].shape = ir.Shape([3])
+    for layer in range(3):
+        for kind in ("conv_state", "recurrent_state"):
+            state = inputs[f"past_key_values.{layer}.{kind}"]
+            state.shape = ir.Shape([2, *state.shape[1:]])
+            present = next(
+                value for value in graph.outputs if value.name == f"present.{layer}.{kind}"
+            )
+            present.shape = state.shape
+
+    if target in {"past_sequence_lengths", "cumulative_sequence_lengths"}:
+        inputs[target].shape = ir.Shape([4])
+    else:
+        state = inputs[f"past_key_values.0.{target}"]
+        state.shape = ir.Shape([4, *state.shape[1:]])
+        present = next(value for value in graph.outputs if value.name == f"present.0.{target}")
+        present.shape = state.shape
+
+    with pytest.raises(ValueError, match=r"request-aligned|batch \+ 1"):
+        inspect_paged_hybrid(package["model"])
+
+
+def test_verifier_rejects_cross_layer_recurrent_state_binding(package):
+    nodes = [node for node in package["model"].graph if node.op_type == "GatedDeltaNet"]
+    assert len(nodes) >= 2
+    first_state, second_state = nodes[0].inputs[6], nodes[1].inputs[6]
+    nodes[0].replace_input_with(6, second_state)
+    nodes[1].replace_input_with(6, first_state)
+
+    with pytest.raises(ValueError, match=r"state output|cross-bound"):
+        inspect_paged_hybrid(package["model"])
 
 
 @pytest.mark.parametrize("ep", ["default", "cpu", "dml"])

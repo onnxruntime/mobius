@@ -593,9 +593,10 @@ class PagedHybridCausalLMTask(ModelTask):
         logits, present = module(
             op,
             input_ids=input_ids,
-            attention_mask=context,
+            attention_mask=None,
             position_ids=position_ids,
             past_key_values=states,
+            paged_context=context,
         )
         logits = op.Cast(logits, to=ir.DataType.FLOAT)
         logits.shape = ir.Shape(

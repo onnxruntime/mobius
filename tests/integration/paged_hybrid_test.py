@@ -19,8 +19,8 @@ import pytest
 import torch
 
 from mobius import build_from_module
+from mobius._testing import make_config
 from mobius.components._paged_attention import GENAI_REVISION, ORT_REVISION
-from mobius.integrations.onnx_genai.paged_hybrid_metadata_test import tiny_config
 from mobius.integrations.ort_genai.auto_export import _write_genai_config
 from mobius.models.qwen35 import Qwen35CausalLMModel
 from mobius.tasks import HybridCausalLMTask, PagedHybridCausalLMTask
@@ -39,8 +39,32 @@ def cuda_runtime():
         pytest.skip(f"Set MOBIUS_ORT_REVISION={ORT_REVISION} for the pinned CUDA build")
 
 
+def _tiny_config(dtype=ir.DataType.FLOAT16):
+    return make_config(
+        model_type="qwen3_5_text",
+        dtype=dtype,
+        hidden_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=64,
+        intermediate_size=192,
+        vocab_size=128,
+        max_position_embeddings=2048,
+        num_hidden_layers=4,
+        layer_types=["linear_attention"] * 3 + ["full_attention"],
+        partial_rotary_factor=0.5,
+        mrope_section=[8, 4, 4],
+        mrope_interleaved=True,
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=64,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+    )
+
+
 def _package(dtype, *, packed=True, prune=False):
-    config = tiny_config(dtype)
+    config = _tiny_config(dtype)
     module = Qwen35CausalLMModel(config)
     rng = np.random.default_rng(731)
     for name, parameter in module.named_parameters():

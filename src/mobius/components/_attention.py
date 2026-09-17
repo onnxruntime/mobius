@@ -593,9 +593,18 @@ class Qwen35Attention(nn.Module):
         position_embeddings: tuple,
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
+        paged_state: PagedAttentionState | None = None,
     ):
+        if paged_state is not None:
+            if past_key_value is not None or static_cache is not None:
+                raise ValueError(
+                    "Paged attention state cannot be combined with dense cache state"
+                )
+            return self.forward_paged(op, hidden_states, position_embeddings, paged_state)
         if isinstance(past_key_value, PagedAttentionState):
-            return self.forward_paged(op, hidden_states, position_embeddings, past_key_value)
+            raise TypeError(
+                "PagedAttentionState must be passed through paged_state, not past_key_value"
+            )
         # Q projection (doubled) → split into Q and gate per head
         q_gate = self.q_proj(op, hidden_states)
         # Reshape to per-head view so split separates Q/gate within each head

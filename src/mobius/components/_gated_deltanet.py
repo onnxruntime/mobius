@@ -348,6 +348,11 @@ class GatedDeltaNet(nn.Module):
         z = self.in_proj_z(op, hidden_states)  # (N, Hv*Dv)
         raw_b = op.Cast(self.in_proj_b(op, hidden_states), to=ir.DataType.FLOAT)
         raw_a = op.Cast(self.in_proj_a(op, hidden_states), to=ir.DataType.FLOAT)
+        # The generic builder does not infer Cast output types until the
+        # production optimization pipeline runs. Keep the native ABI explicit
+        # even for directly-built graphs.
+        raw_b.type = ir.TensorType(ir.DataType.FLOAT)
+        raw_a.type = ir.TensorType(ir.DataType.FLOAT)
 
         # Invoke the child module so nn realizes its qualified conv1d.weight.
         conv_out, new_conv_state = self.conv1d(

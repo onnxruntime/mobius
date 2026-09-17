@@ -15,6 +15,7 @@ from mobius._testing import (
     make_config,
 )
 from mobius.components._attention import Attention, FusedQKVAttention, Qwen35Attention
+from mobius.components._paged_attention import PagedAttentionState
 
 
 class TestAttention:
@@ -214,6 +215,22 @@ class TestQwen35Attention:
         # Should have Attention op + Sigmoid (for gate) + Mul (output gating)
         assert count_op_type(graph, "Attention") >= 1
         assert count_op_type(graph, "Sigmoid") >= 1
+
+    def test_legacy_paged_state_fails_fast(self):
+        config = make_config(partial_rotary_factor=0.5)
+        attn = Qwen35Attention(config)
+        builder, op, _ = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        paged_state = PagedAttentionState(*([None] * 6))
+
+        with pytest.raises(TypeError, match="paged_state"):
+            attn(
+                op,
+                hidden,
+                attention_bias=None,
+                position_embeddings=(),
+                past_key_value=paged_state,
+            )
 
 
 class TestGQAContextDispatch:

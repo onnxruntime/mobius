@@ -5,11 +5,17 @@
 
 from __future__ import annotations
 
+import inspect
+
 import onnx_ir as ir
 import pytest
 
 from mobius._testing import make_config
-from mobius.models.qwen35 import Qwen35CausalLMModel
+from mobius.models.qwen35 import (
+    Qwen35CausalLMModel,
+    Qwen35DecoderLayer,
+    Qwen35TextModel,
+)
 from mobius.tasks import PagedHybridCausalLMTask
 
 
@@ -74,6 +80,18 @@ def test_packed_hybrid_io_and_native_operands():
     assert model.metadata_props["mobius.paged_block_size"] == "256"
     assert "mobius.ort_revision" in model.metadata_props
     assert "mobius.genai_revision" in model.metadata_props
+
+
+def test_packed_context_has_an_explicit_component_api():
+    causal_parameters = inspect.signature(Qwen35CausalLMModel.forward).parameters
+    text_parameters = inspect.signature(Qwen35TextModel.forward).parameters
+    layer_parameters = inspect.signature(Qwen35DecoderLayer.forward).parameters
+
+    assert causal_parameters["paged_context"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "paged_context" in text_parameters
+    assert "paged_context" in layer_parameters
+    assert "PagedHybridContext" not in str(causal_parameters["attention_mask"].annotation)
+    assert "PagedHybridContext" not in str(layer_parameters["attention_bias"].annotation)
 
 
 def test_fp32_native_decay_parameters_and_qualified_weight_names():
