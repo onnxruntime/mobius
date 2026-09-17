@@ -212,6 +212,8 @@ __all__ = [
     "VideoAutoencoderModel",
     "VibeVoiceForConditionalGeneration",
     "VibeVoiceStreamingForConditionalGeneration",
+    "VibeVoiceASRForConditionalGeneration",
+    "VibeVoiceASRStreamingForConditionalGeneration",
     "Wav2Vec2ForCTCModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
@@ -454,7 +456,11 @@ from mobius.models.unet import (
     remap_diffusers_unet_lora,
 )
 from mobius.models.vae import AutoencoderKLModel
-from mobius.models.vibevoice import VibeVoiceForConditionalGeneration
+from mobius.models.vibevoice import (
+    VibeVoiceASRStreamingForConditionalGeneration,
+    VibeVoiceForConditionalGeneration,
+)
+from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from mobius.models.vibevoice_streaming import VibeVoiceStreamingForConditionalGeneration
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel

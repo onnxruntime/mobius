@@ -68,6 +68,14 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
         "diffusion_head",
         "audio_decoder",
     },
+    "vibevoice-asr": {
+        "acoustic_encoder",
+        "semantic_encoder",
+        "connectors",
+        "embedding",
+        "decoder",
+    },
+    "vibevoice-asr-streaming": {"audio_encoder", "embedding", "decoder"},
 }
 
 

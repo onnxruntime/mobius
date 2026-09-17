@@ -211,15 +211,22 @@ def _dict_to_pretrained_config(d: dict):
     works correctly.
     """
     import transformers
-    from huggingface_hub import errors as hub_errors
 
     # Introduced in newer huggingface_hub releases. Older supported versions
     # can still construct these configs and should not fail on the import.
-    strict_validation_error = getattr(
-        hub_errors,
-        "StrictDataclassClassValidationError",
-        TypeError,
-    )
+    class _MissingStrictDataclassClassValidationError(Exception):
+        """Sentinel that cannot match errors from older Hub installations."""
+
+    try:
+        from huggingface_hub import errors as hub_errors
+    except ImportError:
+        strict_validation_error = _MissingStrictDataclassClassValidationError
+    else:
+        strict_validation_error = getattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            _MissingStrictDataclassClassValidationError,
+        )
 
     # Composite configs (e.g. configs with text_config/thinker_config) may
     # duplicate rope_scaling at the top level.  PretrainedConfig's rope
