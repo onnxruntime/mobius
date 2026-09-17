@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 import torch
 
@@ -56,6 +58,42 @@ def _bytes(*shape: int, offset: int = 0) -> torch.Tensor:
 
 def _floats(*shape: int) -> torch.Tensor:
     return torch.linspace(0.125, 1.125, math.prod(shape)).reshape(shape)
+
+
+def _olive_pack_low_bit(codes: np.ndarray, bits: int) -> np.ndarray:
+    """Pack an Olive [N, K] integer-code matrix, lowest code in the low bits."""
+    codes = np.asarray(codes, dtype=np.uint8)
+    values_per_byte = 8 // bits
+    assert codes.ndim == 2
+    assert codes.shape[1] % values_per_byte == 0
+    assert np.all(codes < 2**bits)
+    grouped = codes.reshape(codes.shape[0], -1, values_per_byte)
+    packed = np.zeros(grouped.shape[:2], dtype=np.uint8)
+    for index in range(values_per_byte):
+        packed |= grouped[..., index] << (index * bits)
+    return packed
+
+
+def _decode_symmetric_olive_weight(
+    qweight: np.ndarray,
+    scales: np.ndarray,
+    *,
+    bits: int,
+    group_size: int,
+    k: int,
+) -> np.ndarray:
+    """Independently decode Olive's symmetric affine sidecars to [N, K]."""
+    values_per_byte = 8 // bits
+    mask = 2**bits - 1
+    codes = np.stack(
+        [(qweight >> shift) & mask for shift in range(0, 8, bits)],
+        axis=-1,
+    ).reshape(qweight.shape[0], -1)
+    assert codes.shape[1] == qweight.shape[1] * values_per_byte
+    codes = codes[:, :k]
+    zero_point = 2 ** (bits - 1)
+    expanded_scales = np.repeat(scales.astype(np.float32), group_size, axis=1)[:, :k]
+    return (codes.astype(np.float32) - zero_point) * expanded_scales
 
 
 def _build(module):
@@ -109,6 +147,57 @@ def _assert_layout(package, component: str, name: str, bits: int, group_size: in
         node.attributes["bits"].as_int(),
         node.attributes["block_size"].as_int(),
     ) == (bits, group_size)
+
+
+def _run_bound_projection_on_cpu(
+    node: ir.Node,
+    x: np.ndarray,
+    model_path: Path,
+) -> np.ndarray:
+    """Run an emitted MatMulNBits projection without involving model-level math."""
+
+    def _constant(name: str, value: np.ndarray) -> ir.Value:
+        result = ir.Value(name=name)
+        result.const_value = ir.tensor(value)
+        result.shape = ir.Shape(value.shape)
+        result.dtype = result.const_value.dtype
+        return result
+
+    assert set(node.attributes) == {"K", "N", "bits", "block_size"}
+    assert node.inputs[1] is not None and node.inputs[1].const_value is not None
+    assert node.inputs[2] is not None and node.inputs[2].const_value is not None
+    attributes = {name: attribute.as_int() for name, attribute in node.attributes.items()}
+    input_value = ir.Value(
+        name="X",
+        shape=ir.Shape(x.shape),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    packed_value = _constant("packed_weight", node.inputs[1].const_value.numpy())
+    scales_value = _constant("scales", node.inputs[2].const_value.numpy())
+    output_value = ir.Value(
+        name="Y",
+        shape=ir.Shape([x.shape[0], attributes["N"]]),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    runtime_node = ir.Node(
+        "com.microsoft",
+        "MatMulNBits",
+        inputs=[input_value, packed_value, scales_value],
+        outputs=[output_value],
+        attributes=ir.convenience.convert_attributes(attributes),
+    )
+    graph = ir.Graph(
+        inputs=[input_value],
+        outputs=[output_value],
+        nodes=[runtime_node],
+        initializers=[packed_value, scales_value],
+        opset_imports={"": 22, "com.microsoft": 1},
+        name="olive_projection",
+    )
+    ir.save(ir.Model(graph, ir_version=10), model_path)
+    session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    assert session.get_providers() == ["CPUExecutionProvider"]
+    return session.run(None, {"X": x})[0]
 
 
 def _t5_config(encoder, decoder) -> ArchitectureConfig:
@@ -447,6 +536,219 @@ def test_public_build_loads_global_olive_rules_without_component_plan(
         and np.array_equal(value.const_value.numpy(), head.numpy().T)
         for value in package["model"].graph.initializers.values()
     )
+
+
+@pytest.mark.parametrize(
+    ("bits", "codes", "expected"),
+    [
+        (2, [0, 1, 2, 3], 0xE4),
+        (4, [1, 2], 0x21),
+        (8, [0xA5], 0xA5),
+    ],
+)
+def test_olive_low_bit_packing_oracle(bits, codes, expected):
+    packed = _olive_pack_low_bit(np.array([codes], dtype=np.uint8), bits=bits)
+    np.testing.assert_array_equal(packed, np.array([[expected]], dtype=np.uint8))
+
+
+@pytest.mark.parametrize("mixed_precision", [False, True], ids=["uniform-int2", "mixed"])
+def test_public_local_llama_build_qualifies_olive_int2_layout(tmp_path, mixed_precision):
+    from safetensors.torch import save_file
+    from transformers import LlamaConfig
+
+    group_size = 16
+    overrides = (
+        {
+            "model.layers.0.mlp.down_proj": {"bits": 4},
+            "model.layers.0.mlp.gate_proj": {"bits": 8},
+        }
+        if mixed_precision
+        else {}
+    )
+    hf_config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=False,
+        quantization_config={
+            "quant_method": "olive",
+            "bits": 2,
+            "group_size": group_size,
+            "symmetric": True,
+            "overrides": overrides,
+        },
+    )
+    checkpoint_dir = tmp_path / ("mixed-checkpoint" if mixed_precision else "int2-checkpoint")
+    hf_config.save_pretrained(checkpoint_dir)
+
+    projection_shapes = {
+        "model.layers.0.self_attn.q_proj": (32, 32),
+        "model.layers.0.self_attn.k_proj": (16, 32),
+        "model.layers.0.self_attn.v_proj": (16, 32),
+        "model.layers.0.self_attn.o_proj": (32, 32),
+        "model.layers.0.mlp.gate_proj": (64, 32),
+        "model.layers.0.mlp.up_proj": (64, 32),
+        "model.layers.0.mlp.down_proj": (32, 64),
+    }
+    expected_bits = dict.fromkeys(projection_shapes, 2)
+    if mixed_precision:
+        expected_bits["model.layers.0.mlp.down_proj"] = 4
+        expected_bits["model.layers.0.mlp.gate_proj"] = 8
+
+    unbound_package = build(str(checkpoint_dir), dtype="f32", load_weights=False)
+    checkpoint = _canonical_checkpoint(unbound_package)
+    embedding = _floats(32, 32)
+    lm_head = _floats(32, 32).flip(0).contiguous()
+    checkpoint["model.embed_tokens.weight"] = embedding
+    checkpoint["lm_head.weight"] = lm_head
+    olive_sidecars: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for projection_index, (name, (n, k)) in enumerate(projection_shapes.items()):
+        bits = expected_bits[name]
+        code_indices = np.arange(n * k, dtype=np.uint32).reshape(n, k)
+        # Vary every bit and projection so byte, stride, and binding mistakes
+        # cannot hide behind repeated packed values.
+        codes = (code_indices * 3 + code_indices // max(8 // bits, 2) + projection_index) % (
+            2**bits
+        )
+        qweight = _olive_pack_low_bit(codes.astype(np.uint8), bits)
+        scales = (
+            np.arange(n * (k // group_size), dtype=np.float32).reshape(n, k // group_size) + 1
+        ) / (32 + projection_index)
+
+        # Producer-side oracle: Olive writes one flat packed row per output
+        # channel and does not emit qzeros for symmetric checkpoints.
+        assert qweight.shape == (n, k * bits // 8)
+        assert scales.shape == (n, k // group_size)
+        assert np.unique(qweight).size > 1
+        assert np.unique(scales).size > 1
+        del checkpoint[f"{name}.weight"]
+        del checkpoint[f"{name}.scales"]
+        checkpoint[f"{name}.weight_qweight"] = torch.from_numpy(qweight)
+        checkpoint[f"{name}.weight_scales"] = torch.from_numpy(scales)
+        olive_sidecars[name] = (qweight, scales)
+    assert not any("qzero" in name for name in checkpoint)
+    save_file(checkpoint, str(checkpoint_dir / "model.safetensors"))
+
+    # This is the public local-checkpoint path: config discovery, safetensors
+    # loading, source-name adaptation, layout normalization, binding, and export.
+    package = build(str(checkpoint_dir), dtype="f32")
+    export_dir = tmp_path / "exported"
+    package.save(str(export_dir), progress_bar=False, max_workers=1)
+    graph = ir.load(export_dir / "model.onnx").graph
+    matmul_nbits_nodes = [
+        node
+        for node in graph
+        if node.domain == "com.microsoft" and node.op_type == "MatMulNBits"
+    ]
+    assert len(matmul_nbits_nodes) == len(projection_shapes)
+    quantized_nodes = {
+        node.inputs[1].name.removesuffix(".weight"): node for node in matmul_nbits_nodes
+    }
+    assert set(quantized_nodes) == set(projection_shapes)
+
+    for name, (n, k) in projection_shapes.items():
+        bits = expected_bits[name]
+        node = quantized_nodes[name]
+        attributes = {
+            attribute_name: attribute.as_int()
+            for attribute_name, attribute in node.attributes.items()
+        }
+        assert set(attributes) == {"K", "N", "bits", "block_size"}
+        assert attributes["bits"] == bits
+        assert attributes["block_size"] == group_size
+        assert attributes["K"] == k
+        assert attributes["N"] == n
+        assert len(node.inputs) == 3
+        assert node.inputs[0] is not None and node.inputs[0].const_value is None
+        assert node.inputs[1] is not None and node.inputs[1].name == f"{name}.weight"
+        assert node.inputs[2] is not None and node.inputs[2].name == f"{name}.scales"
+        assert list(node.outputs[0].uses())
+
+        source_qweight, source_scales = olive_sidecars[name]
+        bound_qweight = node.inputs[1]
+        bound_scales = node.inputs[2]
+        assert tuple(bound_qweight.shape) == (
+            n,
+            k // group_size,
+            group_size * bits // 8,
+        )
+        assert tuple(bound_scales.shape) == (n, k // group_size)
+        assert bound_qweight.dtype == ir.DataType.UINT8
+        assert bound_scales.dtype == ir.DataType.FLOAT
+        assert bound_qweight.const_value.numpy().nbytes == n * k * bits // 8
+        np.testing.assert_array_equal(
+            bound_qweight.const_value.numpy(),
+            source_qweight.reshape(tuple(bound_qweight.shape)),
+            strict=True,
+        )
+        np.testing.assert_array_equal(
+            bound_scales.const_value.numpy(),
+            source_scales,
+            strict=True,
+        )
+        assert f"{name}.zero_points" not in graph.initializers
+
+    # Float embedding and output head are intentionally outside the projection
+    # schedule. The head transpose may be folded and consequently renamed.
+    np.testing.assert_array_equal(
+        graph.initializers["model.embed_tokens.weight"].const_value.numpy(),
+        embedding.numpy(),
+        strict=True,
+    )
+    output_heads = [
+        value
+        for value in graph.initializers.values()
+        if (
+            value.const_value is not None
+            and value.dtype == ir.DataType.FLOAT
+            and tuple(value.shape) == (32, 32)
+            and np.array_equal(value.const_value.numpy(), lm_head.numpy().T)
+        )
+    ]
+    assert len(output_heads) == 1
+    assert list(output_heads[0].uses())
+    assert all(value.const_value is not None for value in graph.initializers.values()), (
+        "the exported model contains an incompletely bound graph"
+    )
+
+    if mixed_precision:
+        # Cover the default INT2 projection and both INT4/INT8 overrides.
+        runtime_projections = (
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.mlp.down_proj",
+            "model.layers.0.mlp.gate_proj",
+        )
+        for name in runtime_projections:
+            bits = expected_bits[name]
+            _, k = projection_shapes[name]
+            source_qweight, source_scales = olive_sidecars[name]
+            x = np.linspace(-0.75, 0.875, 3 * k, dtype=np.float32).reshape(3, k)
+            actual = _run_bound_projection_on_cpu(
+                quantized_nodes[name],
+                x,
+                tmp_path / f"projection-int{bits}.onnx",
+            )
+            decoded_weight = _decode_symmetric_olive_weight(
+                source_qweight,
+                source_scales,
+                bits=bits,
+                group_size=group_size,
+                k=k,
+            )
+            expected = x @ decoded_weight.T
+            accumulation_bound = (
+                2 * k * np.finfo(np.float32).eps * (np.abs(x) @ np.abs(decoded_weight).T)
+            )
+            allowed_error = np.maximum(accumulation_bound, 1e-6)
+            absolute_error = np.abs(actual - expected)
+            assert np.all(absolute_error <= allowed_error), (
+                f"maximum normalized accumulation error: "
+                f"{np.max(absolute_error / allowed_error)}"
+            )
 
 
 def test_whisper_declared_output_head_stays_float_and_binds_tied_embedding():
