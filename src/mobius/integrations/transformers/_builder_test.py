@@ -11,6 +11,7 @@ from unittest import mock
 
 import onnx_ir as ir
 import pytest
+import torch
 from onnxscript import nn
 
 from mobius._configs import (
@@ -483,7 +484,11 @@ def test_qwen38_fp8_none_revision_uses_hugging_face_default(monkeypatch) -> None
 
 
 def test_vibevoice_none_revision_pins_first_config_probe(monkeypatch) -> None:
-    from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
+    from mobius.models.vibevoice import (
+        VIBEVOICE_EXECUTABLE_MODEL_ID,
+        VIBEVOICE_EXECUTABLE_REVISION,
+        VIBEVOICE_MODEL_ID,
+    )
 
     calls = []
 
@@ -505,9 +510,9 @@ def test_vibevoice_none_revision_pins_first_config_probe(monkeypatch) -> None:
 
     assert calls == [
         (
-            VIBEVOICE_MODEL_ID,
+            VIBEVOICE_EXECUTABLE_MODEL_ID,
             {
-                "revision": VIBEVOICE_REVISION,
+                "revision": VIBEVOICE_EXECUTABLE_REVISION,
                 "trust_remote_code": False,
             },
         )
@@ -544,6 +549,31 @@ def test_vibevoice_asr_none_revision_pins_first_config_probe(monkeypatch) -> Non
             },
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_vibevoice_streaming_asr_none_revision_pins_first_config_probe(
+    monkeypatch, model_id, revision
+) -> None:
+    """Both official streaming-ASR variants must pin their initial config probe."""
+    calls = []
+
+    def stop_after_config(called_model_id, **kwargs):
+        calls.append((called_model_id, kwargs))
+        raise RuntimeError("stop after revision assertion")
+
+    monkeypatch.setattr(transformers_builder, "_load_transformers_config", stop_after_config)
+
+    with pytest.raises(RuntimeError, match="stop after revision assertion"):
+        transformers_builder.build_transformers_model(model_id, load_weights=False)
+
+    assert calls == [(model_id, {"revision": revision, "trust_remote_code": False})]
 
 
 def test_legacy_vibevoice_asr_is_rejected_before_config_loading(monkeypatch) -> None:
@@ -669,10 +699,15 @@ def test_strip_to_text_only_drops_component_quantization() -> None:
         quant_method="olive",
     )
     config = make_config(
+        quantization=decoder,
         component_quantization={
             "decoder": decoder,
-            "vision_encoder": decoder,
-        }
+            "vision_encoder": QuantizationConfig(
+                bits=8,
+                group_size=32,
+                quant_method="olive",
+            ),
+        },
     )
 
     stripped = transformers_builder._strip_to_text_only(config, "qwen2")
@@ -1371,6 +1406,171 @@ def test_build_threads_revision_to_diffusers_fallback(monkeypatch) -> None:
             },
         )
     ]
+
+
+def test_official_vibevoice_uses_pinned_sidecars_and_official_weights(monkeypatch) -> None:
+    """The official legacy config must never replace the requested checkpoint."""
+    from mobius.models.vibevoice import (
+        VIBEVOICE_EXECUTABLE_MODEL_ID,
+        VIBEVOICE_EXECUTABLE_REVISION,
+        VIBEVOICE_MODEL_ID,
+        VIBEVOICE_REVISION,
+    )
+
+    parent = SimpleNamespace(model_type="vibevoice", architectures=[])
+    package = ModelPackage(
+        {
+            "audio_encoder": ir.Model(
+                ir.Graph([], [], nodes=[], name="audio_encoder"), ir_version=11
+            )
+        }
+    )
+    calls = []
+
+    class OfficialVibeVoiceModule(_DummyModule):
+        def preprocess_weights(self, state_dict, *, checkpoint_layout):
+            calls.append(("preprocess", state_dict, checkpoint_layout))
+            return state_dict
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: calls.append(("config", args, kwargs)) or (parent, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (value, value, "vibevoice"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (OfficialVibeVoiceModule, "vibevoice-tts", "vibevoice"),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: make_config(model_type="vibevoice"),
+    )
+    monkeypatch.setattr(
+        transformers_builder, "build_from_module", lambda *args, **kwargs: package
+    )
+    state_dict = {"weight": torch.ones(())}
+    monkeypatch.setattr(
+        transformers_builder,
+        "_download_weights",
+        lambda *args, **kwargs: calls.append(("weights", args, kwargs)) or state_dict,
+    )
+
+    result = transformers_builder.build_transformers_model(VIBEVOICE_MODEL_ID)
+
+    assert result is package
+    assert calls == [
+        (
+            "config",
+            (VIBEVOICE_EXECUTABLE_MODEL_ID,),
+            {"revision": VIBEVOICE_EXECUTABLE_REVISION, "trust_remote_code": False},
+        ),
+        ("weights", (VIBEVOICE_MODEL_ID,), {"revision": VIBEVOICE_REVISION}),
+        ("preprocess", state_dict, "official"),
+    ]
+    assert package["audio_encoder"].metadata_props == {
+        "mobius.source_revision": VIBEVOICE_REVISION,
+        "mobius.executable_source": f"{VIBEVOICE_EXECUTABLE_MODEL_ID}@{VIBEVOICE_EXECUTABLE_REVISION}",
+        "mobius.processor_source": f"{VIBEVOICE_EXECUTABLE_MODEL_ID}@{VIBEVOICE_EXECUTABLE_REVISION}",
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    (
+        ("microsoft/VibeVoice-ASR-Streaming-1.5B", "4262d23d8a539a6530cf64fbd0b1751ef9a30853"),
+        ("microsoft/VibeVoice-ASR-Streaming-7B", "60d858b518b4e19d404af3737f848fc185b30177"),
+    ),
+)
+def test_streaming_asr_uses_pinned_sources_and_native_weight_preprocessing(
+    monkeypatch, model_id, revision
+) -> None:
+    """The shared resolver must preserve streaming ASR's preprocessing signature."""
+    parent = SimpleNamespace(model_type="vibevoice", architectures=[])
+    package = ModelPackage(
+        {
+            "audio_encoder": ir.Model(
+                ir.Graph([], [], nodes=[], name="audio_encoder"), ir_version=11
+            )
+        }
+    )
+    calls = []
+
+    class StreamingAsrModule(_DummyModule):
+        def preprocess_weights(self, state_dict):
+            calls.append(("preprocess", state_dict))
+            return state_dict
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: calls.append(("config", args, kwargs)) or (parent, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (value, value, "VibeVoiceForASRStreamingTraining"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            StreamingAsrModule,
+            "vibevoice-asr-streaming",
+            "VibeVoiceForASRStreamingTraining",
+        ),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: make_config(model_type="vibevoice"),
+    )
+    monkeypatch.setattr(
+        transformers_builder, "build_from_module", lambda *args, **kwargs: package
+    )
+    state_dict = {"weight": torch.ones(())}
+    monkeypatch.setattr(
+        transformers_builder,
+        "_download_weights",
+        lambda *args, **kwargs: calls.append(("weights", args, kwargs)) or state_dict,
+    )
+
+    result = transformers_builder.build_transformers_model(model_id)
+
+    assert result is package
+    assert calls == [
+        (
+            "config",
+            (model_id,),
+            {"revision": revision, "trust_remote_code": False},
+        ),
+        ("weights", (model_id,), {"revision": revision}),
+        ("preprocess", state_dict),
+    ]
+    assert package["audio_encoder"].metadata_props == {
+        "mobius.source_revision": revision,
+        "mobius.executable_source": f"{model_id}@{revision}",
+        "mobius.processor_source": f"{model_id}@{revision}",
+    }
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "microsoft/VibeVoice-ASR-BitNet",
+        "microsoft/VibeVoice-AcousticTokenizer",
+        "Microsoft/VibeVoice-ASR-BitNet",
+    ],
+)
+def test_unimplemented_official_vibevoice_collection_ids_fail_closed(model_id):
+    with pytest.raises(NotImplementedError, match="unsupported"):
+        transformers_builder.build_transformers_model(model_id, load_weights=False)
 
 
 def test_glm_full_attention_rejects_diffusers_dispatch(monkeypatch) -> None:

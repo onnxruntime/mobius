@@ -61,7 +61,7 @@ def _quantized_linear_class(config: ArchitectureConfig) -> type | None:
     )
 
 
-def _preprocess_moe_weights(model: nn.Module, state_dict) -> dict:
+def _preprocess_moe_weights(model: CausalLMModel, state_dict) -> dict:
     """Shared MoE weight preprocessing that routes routed experts through QMoE.
 
     Applies the standard quantization conversion (GPTQ/AWQ/Olive) and, when the
@@ -74,7 +74,7 @@ def _preprocess_moe_weights(model: nn.Module, state_dict) -> dict:
     Callers pass a state dict whose HF expert layout has already been
     normalised (see :func:`_rename_moe_expert_weights`).
     """
-    quantization = getattr(model.config, "quantization", None)
+    quantization = model.config.quantization_for("model")
     # The GGUF importer already emits the graph's exact per-expert packed
     # parameter names. Do not route those tensors through the HF GPTQ/AWQ
     # preprocessor, whose fallback guard correctly rejects packed expert
@@ -93,6 +93,10 @@ def _preprocess_moe_weights(model: nn.Module, state_dict) -> dict:
         tie_embeddings=model.config.tie_word_embeddings,
         qmoe_target_path=".mlp",
         qmoe_quant_methods=("gptq", "awq", "olive"),
+        defer_non_expert_sidecars=(
+            model.config.component_quantization is not None
+            or (quantization is not None and quantization.has_module_plan)
+        ),
     )
 
 
@@ -991,6 +995,9 @@ class Qwen2MoEDecoderLayer(MoEDecoderLayer):
             gate=self.mlp.gate,
             linear_class=_quantized_linear_class(config),
             shared_expert_gate_class=Linear,
+        )
+        self.mlp.shared_expert_gate.component_quantization_excluded_methods = frozenset(
+            {"olive", "gptq", "awq"}
         )
 
 

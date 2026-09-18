@@ -74,7 +74,7 @@ class ComponentDescriptor:
             return self.source_paths
 
         local_parts = local_module_path.split(".")
-        candidates = [local_module_path]
+        candidates: list[str] = []
         for local_prefix, source_prefix in self.source_path_aliases:
             if local_module_path == local_prefix:
                 candidates.append(source_prefix)
@@ -89,9 +89,16 @@ class ComponentDescriptor:
             ]
             if anchor_indices:
                 for index in anchor_indices:
-                    suffix = local_parts[index + 1 :]
-                    candidates.append(".".join((*source_parts, *suffix)))
-        return tuple(dict.fromkeys(candidates))
+                    suffix_parts = local_parts[index + 1 :]
+                    candidates.append(".".join((*source_parts, *suffix_parts)))
+        if not candidates:
+            component_roots = {self.name, self.module_attribute_path.rsplit(".", 1)[-1]}
+            for source_path in self.source_paths:
+                if source_path.rsplit(".", 1)[-1] in component_roots:
+                    # Use the component root only if no alias or separate
+                    # source (such as a top-level output head) already owns it.
+                    candidates.append(f"{source_path}.{local_module_path}")
+        return tuple(dict.fromkeys((local_module_path, *candidates)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,12 +139,15 @@ class ComponentManifest(Mapping[str, ComponentDescriptor]):
 
 def get_hf_component_sources(
     module_class: type,
-    model_type: str,
+    model_type: str | None,
     hf_config: object,
 ) -> dict[str, tuple[str, ...]]:
-    """Read runtime HuggingFace component paths from a registered model class."""
+    """Read component paths, invoking dynamic hooks only with a known model type."""
     resolver = getattr(module_class, "get_hf_component_sources", None)
     if resolver is not None:
+        model_type = model_type or getattr(hf_config, "model_type", None)
+        if not model_type:
+            return {}
         resolved = resolver(model_type=model_type, hf_config=hf_config)
     else:
         resolved = getattr(module_class, "HF_COMPONENT_SOURCES", {})
@@ -158,13 +168,18 @@ def resolve_component_manifest(
 
     component_sources: dict[str, tuple[str, ...]] = {}
     component_aliases: dict[str, tuple[tuple[str, str], ...]] = {}
-    if module_class is not None and model_type is not None and hf_config is not None:
+    if module_class is not None and hf_config is not None:
         component_sources = get_hf_component_sources(
             module_class,
             model_type,
             hf_config,
         )
-        raw_aliases = getattr(module_class, "HF_COMPONENT_MODULE_ALIASES", {})
+        alias_resolver = getattr(module_class, "get_hf_component_module_aliases", None)
+        raw_aliases = (
+            alias_resolver(hf_config=hf_config)
+            if alias_resolver is not None
+            else getattr(module_class, "HF_COMPONENT_MODULE_ALIASES", {})
+        )
         component_aliases = {
             name: tuple(aliases.items()) for name, aliases in raw_aliases.items()
         }

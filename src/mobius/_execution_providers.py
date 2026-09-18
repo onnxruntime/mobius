@@ -135,6 +135,9 @@ class EpCapabilities:
             large weight tensors (e.g. fused per-layer embedding tables) must
             be split into chunks that each fit within this bound.  WebGPU's
             W3C spec default ``maxBufferSize`` is 268,435,456 bytes (256 MiB).
+        layered_per_layer_inputs: Keep per-layer inputs as
+            ``[batch, sequence, layers, projection]`` instead of flattening the
+            final two dimensions.
         requires_graph_capture_rewrite: Whether this EP requires rewrite rules
             to make models compatible with graph capture (e.g. replacing
             ``Shape`` / ``ConstantOfShape`` with static alternatives for
@@ -166,6 +169,7 @@ class EpCapabilities:
     supports_past_present_share_buffer: bool = False
     cap_kv_buffer_max_length: bool = False
     max_buffer_size: int | None = None
+    layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
 
     def __post_init__(self) -> None:
@@ -297,6 +301,7 @@ def _register_builtins() -> None:
             qkv_pack_dtypes=frozenset(),  # no QKV packing
             supports_skip_layer_norm=False,
             provider_options={"device_type": "NPU"},
+            layered_per_layer_inputs=True,
         ),
         EpCapabilities(
             name="cpu",

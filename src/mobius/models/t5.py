@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import ClassVar
 
@@ -537,11 +538,56 @@ class T5ForConditionalGeneration(nn.Module):
         "decoder": ("decoder", "lm_head"),
     }
 
+    @staticmethod
+    def get_hf_component_module_aliases(*, hf_config: object) -> dict[str, dict[str, str]]:
+        num_layers = getattr(hf_config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = getattr(hf_config, "num_layers", 0)
+        if not isinstance(num_layers, int):
+            raise TypeError("T5 component aliases require an integer encoder layer count")
+        num_decoder_layers: int = getattr(hf_config, "num_decoder_layers", None) or num_layers
+        aliases = {}
+        for component, layer_count, renames in (
+            ("encoder", num_layers, _T5_ENCODER_RENAMES),
+            (
+                "decoder",
+                num_decoder_layers,
+                _T5_DECODER_RENAMES,
+            ),
+        ):
+            aliases[component] = {
+                f"block.{index}.{local.removesuffix('.')}": (
+                    f"{component}.block.{index}.{source.removesuffix('.')}"
+                )
+                for index in range(layer_count)
+                for source, local in (_T5_COMMON_RENAMES | renames).items()
+            }
+        return aliases
+
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
-        self.encoder = T5Encoder(config)
-        self.decoder = T5Decoder(config)
+        encoder_config = config
+        decoder_config = config
+        if config.component_quantization is not None:
+            encoder_config = dataclasses.replace(
+                config,
+                quantization=config.quantization_for_source_paths(
+                    "encoder",
+                    self.HF_COMPONENT_SOURCES["encoder"],
+                ),
+                component_quantization=None,
+            )
+            decoder_config = dataclasses.replace(
+                config,
+                quantization=config.quantization_for_source_paths(
+                    "decoder",
+                    self.HF_COMPONENT_SOURCES["decoder"],
+                ),
+                component_quantization=None,
+            )
+        self.encoder = T5Encoder(encoder_config)
+        self.decoder = T5Decoder(decoder_config)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

@@ -162,6 +162,11 @@ _COVERAGE_SKIP: dict[str, str] = {
         "Architecture-discriminating alias for vibevoice_streaming — covered by "
         "src/mobius/models/vibevoice_streaming_test.py."
     ),
+    "vibevoice": (
+        "Continuous-token TTS is host-orchestrated across eight ONNX stages, and the "
+        "generic golden runner explicitly skips text-to-speech. Dedicated L4/L5 "
+        "official-checkpoint coverage is in tests/vibevoice_golden_test.py."
+    ),
     "rnd1": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
     "non-standard bidirectional I/O has no generic golden-data path",
     "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
@@ -315,6 +320,11 @@ _COVERAGE_SKIP: dict[str, str] = {
     "mms": "CTC ASR model — tested via TestBuildMMSGraph",
     "fastconformer_rnnt": "NeMo .nemo RNN-T ASR — tested via tests/nemo_rnnt_integration_test.py",
     "sortformer": "NeMo .nemo speaker diarization — tested via tests/sortformer_integration_test.py",
+    "VibeVoiceForASRStreamingTraining": "Streaming ASR has host-owned dual-convolution "
+    "state, arbitrary-mask decoder, hotword, and speaker-attribution orchestration that "
+    "the generic L4/L5 runner cannot drive. Pinned L1-L3 graph/config/source-parity and "
+    "complete checkpoint-index routing are covered for the 1.5B and 7B checkpoints; "
+    "real-weight goldens require a dedicated GPU workflow.",
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",
