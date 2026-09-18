@@ -478,9 +478,7 @@ class Qwen25OmniTalkerForConditionalGeneration(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         embedding_size = config.embedding_size or config.hidden_size
-        self.thinker_to_talker_proj = Linear(
-            embedding_size, config.hidden_size, bias=True
-        )
+        self.thinker_to_talker_proj = Linear(embedding_size, config.hidden_size, bias=True)
         self.model = Qwen25OmniTalkerModel(config)
         self.codec_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
