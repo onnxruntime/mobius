@@ -71,6 +71,39 @@ class EpCapabilities:
             (query/key norm over the head dimension) to rank-3 and back via
             HtpRank4RMSNorm.  ``True`` leaves it unchanged.  Set ``False``
             only for the QNN HTP, which miscomputes rank-4 RMSNormalization.
+        supports_attention: ``False`` decomposes the fused opset-24
+            ``Attention`` op into scaled-dot-product primitives
+            (Reshape/Transpose/MatMul/Softmax/Add, plus Expand for GQA) via
+            DecomposeAttention.  ``True`` leaves the fused op unchanged.  Set
+            ``False`` only for runtimes without an ``Attention`` kernel (QNN
+            HTP), where the fused op would otherwise be forced onto CPU.
+        supports_rotary_embedding: ``False`` decomposes the opset-24
+            ``RotaryEmbedding`` op into rotate-half primitives (Reshape/Slice/
+            Mul/Sub/Add/Concat) via DecomposeRotaryEmbedding.  ``True`` leaves
+            the fused op unchanged.  Set ``False`` only for runtimes without a
+            ``RotaryEmbedding`` kernel (QNN HTP), where it is forced onto CPU.
+        supports_tensor_scatter: ``False`` rewrites the static-cache
+            ``TensorScatter`` in-place KV write into ``ScatterND`` (batch=1) via
+            TensorScatterToScatterND.  ``True`` leaves ``TensorScatter``
+            unchanged.  Set ``False`` only for runtimes without a
+            ``TensorScatter`` kernel (QNN HTP), where it is forced onto CPU.
+        supports_range: ``False`` replaces the ONNX ``Range`` op in
+            :func:`~mobius.components.create_static_cache_attention_bias` with a
+            precomputed ``Constant(arange)`` + ``Slice``.  ``True`` (the
+            default) leaves ``Range`` unchanged.  Set ``False`` only when
+            static cache is used on runtimes that lack a ``Range`` kernel (QNN
+            HTP), where the ``Range`` node would otherwise be forced onto CPU.
+        supports_fp8_kv_cache: ``True`` allows :class:`~mobius._passes.
+            Fp8KvCachePass` to retype the ``GroupQueryAttention`` KV cache to
+            ``FLOAT8E4M3FN``.  Only CUDA (SM89+ Ada/Hopper/Blackwell) ships the
+            FP8 GQA kernel, so this defaults to ``False`` for every other EP —
+            ``--features fp8-kv-cache`` is ignored (with a warning) on EPs that
+            cannot run an FP8 KV cache, preventing invalid/unloadable models.
+        supports_matmul_nbits: ``False`` converts ``com.microsoft::MatMulNBits``
+            (blockwise-INT4 weight) into a standard ``DequantizeLinear`` +
+            ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
+            contrib op unchanged.  Set ``False`` only for runtimes that lack a
+            ``MatMulNBits`` kernel but can consume QDQ weights (QNN HTP).
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -102,6 +135,9 @@ class EpCapabilities:
             large weight tensors (e.g. fused per-layer embedding tables) must
             be split into chunks that each fit within this bound.  WebGPU's
             W3C spec default ``maxBufferSize`` is 268,435,456 bytes (256 MiB).
+        layered_per_layer_inputs: Keep per-layer inputs as
+            ``[batch, sequence, layers, projection]`` instead of flattening the
+            final two dimensions.
         requires_graph_capture_rewrite: Whether this EP requires rewrite rules
             to make models compatible with graph capture (e.g. replacing
             ``Shape`` / ``ConstantOfShape`` with static alternatives for
@@ -121,12 +157,19 @@ class EpCapabilities:
     supports_fused_moe: bool = True
     supports_packed_multi_head_attention: bool = False
     supports_rank4_rmsnorm: bool = True
+    supports_attention: bool = True
+    supports_matmul_nbits: bool = True
+    supports_rotary_embedding: bool = True
+    supports_tensor_scatter: bool = True
+    supports_range: bool = True
+    supports_fp8_kv_cache: bool = False
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
     supports_past_present_share_buffer: bool = False
     cap_kv_buffer_max_length: bool = False
     max_buffer_size: int | None = None
+    layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
 
     def __post_init__(self) -> None:
@@ -258,6 +301,7 @@ def _register_builtins() -> None:
             qkv_pack_dtypes=frozenset(),  # no QKV packing
             supports_skip_layer_norm=False,
             provider_options={"device_type": "NPU"},
+            layered_per_layer_inputs=True,
         ),
         EpCapabilities(
             name="cpu",
@@ -276,7 +320,11 @@ def _register_builtins() -> None:
             provider_options={
                 "enable_skip_layer_norm_strict_mode": "1",
             },
+            enable_graph_capture=True,
             supports_past_present_share_buffer=True,
+            # Only CUDA ships the FP8 (E4M3) GroupQueryAttention KV-cache kernel
+            # (SM89+ Ada/Hopper/Blackwell).
+            supports_fp8_kv_cache=True,
         ),
         EpCapabilities(
             name="dml",
@@ -301,6 +349,17 @@ def _register_builtins() -> None:
             max_buffer_size=268_435_456,  # 256 MiB
             requires_graph_capture_rewrite=True,
         ),
+        # MLX plugin EP for Apple silicon. Its GroupQueryAttention kernel accepts
+        # separate Q/K/V in f32, f16, and bf16 and supports in-place shared KV.
+        # Keep QKV unpacked because the plugin's GQA claim expects nine inputs.
+        EpCapabilities(
+            name="mlx",
+            gqa_dtypes=frozenset(
+                {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
+            ),
+            qkv_pack_dtypes=frozenset(),
+            supports_past_present_share_buffer=True,
+        ),
         EpCapabilities(
             name="trt-rtx",
             gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
@@ -308,6 +367,7 @@ def _register_builtins() -> None:
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
             ),
             supports_skip_layer_norm=False,
+            supports_matmul_nbits=False,
             enable_graph_capture=True,
             supports_past_present_share_buffer=True,
         ),
@@ -333,6 +393,11 @@ def _register_builtins() -> None:
             },
             supports_past_present_share_buffer=False,  # standard-Attention KV concat
             supports_rank4_rmsnorm=False,  # HTP miscomputes rank-4 RMSNorm (q/k norm)
+            supports_attention=False,  # no HTP Attention kernel — decompose to SDPA
+            supports_matmul_nbits=False,  # no HTP MatMulNBits kernel — convert to QDQ
+            supports_rotary_embedding=False,  # no HTP RotaryEmbedding — rotate-half
+            supports_tensor_scatter=False,  # no HTP TensorScatter — ScatterND (batch=1)
+            supports_range=False,  # no HTP Range — Constant(arange)+Slice in static bias
         ),
         # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
         # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via

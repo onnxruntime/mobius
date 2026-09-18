@@ -14,6 +14,8 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-trust_remote_code: true
-notes: "Phi-3.5 with LongRoPE positional embeddings."
-skip_reason: "DynamicCache.from_legacy_cache removed in transformers 5.x."
+trust_remote_code: false
+notes: "Phi-3.5 with LongRoPE positional embeddings. trust_remote_code is
+  false so the transformers-native phi3 implementation is used; the
+  checkpoint's bundled modeling_phi3.py relies on cache APIs removed in
+  transformers 5.x."

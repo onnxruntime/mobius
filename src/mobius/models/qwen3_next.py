@@ -83,6 +83,9 @@ class Qwen3NextMoEBlock(nn.Module):
         )
         self.shared_expert = MLP(shared_config)
         self.shared_expert_gate = Linear(config.hidden_size, 1, bias=False)
+        self.shared_expert_gate.component_quantization_excluded_methods = frozenset(
+            {"olive", "gptq", "awq"}
+        )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Route tokens to experts via softmax top-k gating

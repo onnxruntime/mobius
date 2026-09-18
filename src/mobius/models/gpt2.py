@@ -15,6 +15,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
     FCMLP,
     Embedding,
@@ -45,6 +46,7 @@ class GPT2CausalLMModel(CausalLMModel):
 
     default_task = "text-generation"
     category = "causal-lm"
+    physically_tie_word_embeddings = True
 
     def __init__(self, config: ArchitectureConfig):
         nn.Module.__init__(self)
@@ -54,6 +56,8 @@ class GPT2CausalLMModel(CausalLMModel):
         post_norm = getattr(config, "post_norm", False)
         self.transformer = _GPT2TextModel(config, post_norm=post_norm)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings and self.physically_tie_word_embeddings:
+            self.lm_head.weight = self.transformer.wte.weight
 
     def forward(
         self,
@@ -146,6 +150,7 @@ class GPT2CausalLMModel(CausalLMModel):
             if name == "biogpt.embed_tokens.weight":
                 embed_scale = float(tensor.shape[1]) ** 0.5
                 new["transformer.wte.weight"] = tensor * embed_scale
+                new.setdefault("lm_head.weight", tensor)
                 continue
             # BioGPT position embedding — first 2 rows are padding slots
             if name == "biogpt.embed_positions.weight":
@@ -162,6 +167,7 @@ class GPT2CausalLMModel(CausalLMModel):
             if name == "model.embed_tokens.weight":
                 embed_scale = float(tensor.shape[1]) ** 0.5
                 new["transformer.wte.weight"] = tensor * embed_scale
+                new.setdefault("lm_head.weight", tensor)
                 continue
             if name.startswith("model.layer_norm."):
                 new["transformer.ln_f." + name[len("model.layer_norm.") :]] = tensor
@@ -297,9 +303,30 @@ class GPT2CausalLMModel(CausalLMModel):
                 new["transformer.wpe.weight"] = emb[offset:]
 
         # ── 8. Tied word embeddings ──────────────────────────────────────────
-        if "lm_head.weight" not in new and "transformer.wte.weight" in new:
-            new["lm_head.weight"] = new["transformer.wte.weight"]
-        return super().preprocess_weights(new)
+        new = preprocess_quantized_weights(
+            new,
+            getattr(self.config, "quantization", None),
+            tie_embeddings=(
+                self.config.tie_word_embeddings and self.physically_tie_word_embeddings
+            ),
+            embed_key="transformer.wte.weight",
+        )
+        if self.config.tie_word_embeddings and self.physically_tie_word_embeddings:
+            # The graph has one shared Parameter owned by transformer.wte.
+            new.pop("lm_head.weight", None)
+        return new
+
+
+class ScaledEmbeddingGPT2CausalLMModel(GPT2CausalLMModel):
+    """GPT-2-family model whose input embedding activation is scaled.
+
+    BioGPT and XGLM multiply token embeddings by ``sqrt(hidden_size)`` but use
+    the unscaled tied table for their output projection. Their ONNX graphs
+    therefore need two physical parameters even when the logical HF config
+    says that word embeddings are tied.
+    """
+
+    physically_tie_word_embeddings = False
 
 
 class _GPT2TextModel(nn.Module):

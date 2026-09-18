@@ -13,7 +13,7 @@ head. The classifier output is interpreted as alignment probabilities.
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] torchaudio
+    pip install mobius-onnx[transformers] torchaudio
 
 Usage::
 

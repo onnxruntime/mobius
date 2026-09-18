@@ -13,13 +13,8 @@ import torch
 
 from mobius._builder import (
     _cast_module_dtype,
-    build,
     build_from_module,
     resolve_dtype,
-)
-from mobius._config_resolver import (
-    _config_from_hf,
-    _default_task_for_model,
 )
 from mobius._model_package import ModelPackage
 from mobius._registry import (
@@ -28,9 +23,32 @@ from mobius._registry import (
     registry,
 )
 from mobius._testing import make_config
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.transformers import build
+from mobius.integrations.transformers._config_resolver import (
+    _config_from_hf,
+    _default_task_for_model,
+)
 from mobius.models.base import CausalLMModel
 from mobius.tasks import CausalLMTask, ModelTask
+
+
+def test_transformers_package_exposes_only_public_builders():
+    import mobius.integrations.transformers as transformers_integration
+
+    assert transformers_integration.__all__ == ["build", "build_transformers_model"]
+    assert transformers_integration.build is build
+    assert transformers_integration.build_transformers_model is build
+
+    for helper in (
+        "_config_from_hf",
+        "_default_task_for_model",
+        "_dict_to_pretrained_config",
+        "_try_load_config_json",
+    ):
+        assert helper not in vars(transformers_integration)
+        with pytest.raises(AttributeError):
+            getattr(transformers_integration, helper)
 
 
 class TestBuildFromModule:
@@ -176,6 +194,14 @@ class TestResolveDtype:
     def test_unknown_dtype_raises(self):
         with pytest.raises(ValueError, match="Unknown dtype"):
             resolve_dtype("int8")
+
+    def test_mlx_supports_bf16_gqa_shared_kv(self):
+        from mobius._execution_providers import ep_registry
+
+        caps = ep_registry.require("mlx")
+        assert ir.DataType.BFLOAT16 in caps.gqa_dtypes
+        assert caps.qkv_pack_dtypes == frozenset()
+        assert caps.supports_past_present_share_buffer
 
 
 class TestCastModuleDtype:

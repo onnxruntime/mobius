@@ -13,8 +13,8 @@ from typing import ClassVar
 
 import onnx_ir as ir
 
-from mobius._diffusers_configs import UNet2DConfig
 from mobius._model_package import ModelPackage
+from mobius.integrations.diffusers._configs import UNet2DConfig
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 
 
@@ -36,20 +36,42 @@ class DenoisingTask(ModelTask):
             dtype=ir.DataType.FLOAT,
             shape=["batch", config.in_channels, "height", "width"],
         )
-        timestep = builder.input("timestep", dtype=ir.DataType.INT64, shape=["batch"])
+        timestep = builder.input("timestep", dtype=ir.DataType.FLOAT, shape=["batch"])
         encoder_hidden_states = builder.input(
             "encoder_hidden_states",
             dtype=ir.DataType.FLOAT,
             shape=["batch", "sequence_length", config.cross_attention_dim],
         )
 
+        # Runtime LoRA gates: one scalar `lora_gate.{name}` input per baked
+        # adapter (1.0 = active, 0.0 = inactive, or a blend strength), so a loaded
+        # model can switch/blend LoRAs at run time with no rebuild. Only modules
+        # that declare adapters (`_lora_adapter_names`) receive the gates.
+        lora_gates = {}
+        for name in getattr(module, "_lora_adapter_names", []):
+            lora_gates[name] = builder.input(
+                f"lora_gate.{name}", dtype=ir.DataType.FLOAT, shape=[]
+            )
+
+        extra_kwargs = {"lora_gates": lora_gates} if lora_gates else {}
         noise_pred = module(
             op,
             sample=sample,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
+            **extra_kwargs,
         )
 
+        # The denoiser is spatially shape preserving, so republish the latent's named
+        # dimensions on the estimate instead of leaving the anonymous symbols shape
+        # inference produces, which no consumer can relate back to the inputs. A
+        # denoiser that learns the variance emits twice the latent channels.
+        out_channels = getattr(config, "out_channels", None)
+        if out_channels is None:
+            out_channels = config.in_channels * (
+                2 if getattr(config, "learn_sigma", False) else 1
+            )
+        noise_pred.shape = ir.Shape(["batch", out_channels, "height", "width"])
         builder.add_output(noise_pred, "noise_pred")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)

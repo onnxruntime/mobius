@@ -35,7 +35,7 @@ jobs:
     runs-on: ${{ inputs.device == 'cuda' && fromJSON(format('["self-hosted", "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10", "JobId=golden-regen-{0}-{1}-{2}"]', github.run_id, github.run_number, github.run_attempt)) || 'ubuntu-latest' }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
           # NOTE: For production use, replace with a GitHub App or bot
@@ -45,12 +45,12 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Cache pip packages
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
           key: pip-golden-${{ hashFiles('pyproject.toml', 'requirements/ci/requirements.txt') }}
@@ -58,7 +58,7 @@ jobs:
             pip-golden-
 
       - name: Cache HuggingFace models
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: hf-golden-${{ hashFiles('testdata/cases/**/*.yaml') }}
@@ -77,14 +77,16 @@ jobs:
         if: inputs.device != 'cuda'
         run: pip install onnxruntime
 
-      - name: Install onnxruntime (GPU)
-        if: inputs.device == 'cuda'
-        run: pip install onnxruntime-gpu
-
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
           pip install -e '.[testing,transformers]'
+
+      - name: Install onnxruntime (GPU)
+        if: inputs.device == 'cuda'
+        run: |
+          # Install after project dependencies so the CPU ORT package cannot overwrite it.
+          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
 
       - name: Reject trust_remote_code cases
         run: |

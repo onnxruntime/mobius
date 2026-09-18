@@ -1,0 +1,16 @@
+{
+  "llamacpp_commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+  "artifact_sha256": "0b63b6b68f0c1f0e667ad070808dfee7a03db06fc41c3fe23c9d794841c6f801",
+  "seed": 648,
+  "random_count": 128,
+  "random_alphabet_sha256": "38e72f5140f7aee4f1720f8f2900ef43058fa06c16b4bca90d01aadd82e6ac4c",
+  "modes": [
+    ["no-add", "no-parse-special"],
+    ["no-add", "parse-special"],
+    ["add-special", "parse-special"]
+  ],
+  "fixed_count": 20,
+  "chat_template_sha256": "63cac63c16341fc9de398dd30d2c0ba5ebb79fa202857f05a903528d86721e2a",
+  "case_count": 444,
+  "ordered_results_sha256": "ca7875445f21a03eb9a480c6aa96251bf4a8951a6e284dc480ef32eaedb796f5"
+}

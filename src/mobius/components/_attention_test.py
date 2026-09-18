@@ -14,7 +14,7 @@ from mobius._testing import (
     create_test_input,
     make_config,
 )
-from mobius.components._attention import Attention, Qwen35Attention
+from mobius.components._attention import Attention, FusedQKVAttention, Qwen35Attention
 
 
 class TestAttention:
@@ -147,6 +147,33 @@ class TestAttention:
         params = list(attn.parameters())
         # 4 weights + 4 biases = 8
         assert len(params) == 8
+
+
+class TestFusedQKVAttention:
+    def test_clamps_fused_projection_before_split(self):
+        config = make_config(
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+        )
+        attention = FusedQKVAttention(config, clamp=8.0)
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 2, 8])
+
+        query, key, value = attention._project_qkv(op, hidden)
+        builder._adapt_outputs([query, key, value], "")
+
+        split = query.producer()
+        assert split is key.producer() is value.producer()
+        assert split.op_type == "Split"
+        assert split.inputs[0].producer().op_type == "Clip"
+        assert split.inputs[0].producer().inputs[0].producer().op_type == "MatMul"
+        assert {name for name, _ in attention.named_parameters()} == {
+            "qkv_proj.weight",
+            "o_proj.weight",
+        }
+        assert graph.num_nodes() > 0
 
 
 class TestQwen35Attention:
@@ -350,6 +377,34 @@ class TestGQAContextDispatch:
         assert ops.get("GroupQueryAttention", 0) == config.num_hidden_layers
         # Standard ONNX Attention should not appear
         assert ops.get("Attention", 0) == 0
+
+    def test_build_with_webgpu_ep_emits_gqa_directly(self):
+        """WebGPU float16 builds keep attention and KV updates in GQA."""
+        from mobius._builder import build_from_module
+        from mobius._registry import registry
+        from mobius.rewrite_rules._testing_utils import count_ops
+
+        config = make_config(
+            dtype=ir.DataType.FLOAT16,
+            max_position_embeddings=128,
+            rope_type="default",
+            rope_theta=10000.0,
+        )
+        pkg = build_from_module(
+            registry.get("llama")(config),
+            config,
+            execution_provider="webgpu",
+        )
+        model = pkg["model"]
+        ops = count_ops(model)
+
+        assert ops.get("GroupQueryAttention", 0) == config.num_hidden_layers
+        assert ops.get("Attention", 0) == 0
+        assert all(
+            node.domain == "com.microsoft"
+            for node in model.graph
+            if node.op_type == "GroupQueryAttention"
+        )
 
     def test_build_with_default_ep_uses_standard_attention(self):
         """build_from_module with default EP keeps standard ONNX Attention (no GQA)."""

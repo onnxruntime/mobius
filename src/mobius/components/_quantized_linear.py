@@ -1,10 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Quantized linear and embedding layers (com.microsoft domain).
+"""Quantized linear and embedding layers.
 
 ``QuantizedLinear`` uses ``MatMulNBits``; ``QuantizedEmbedding`` uses
-``GatherBlockQuantized``.
+``GatherBlockQuantized``. ``BlockQuantizedLinear`` preserves runtime-supported
+native GGUF IQ/MXFP4 blocks for onnx-genai's CPU execution provider.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
+
 # MatMulNBits packs weights into uint8 blobs.  The packed shape depends
 # on bits and block_size:
 #   packed_weights: [N, n_blocks, blob_size]  (uint8)
@@ -24,6 +27,55 @@ from onnxscript import OpBuilder, nn
 #   zero_points:    [N, ceil(n_blocks*bits/8)] (uint8, optional, bit-packed)
 
 _MICROSOFT_DOMAIN = "com.microsoft"
+
+# Domain for BlockQuantizedMatMul, the onnx-genai (nxrt) runtime's custom op for
+# GGUF IQ/MXFP4 block formats. These formats have no standard-op expression the
+# runtime can execute: MXFP4 is E2M1 float4 with E8M0 block scales, and the IQ
+# families use non-linear codebooks / super-block layouts. Neither is
+# representable by affine ``com.microsoft.MatMulNBits`` (int4/uint4 affine block
+# quant) nor by a runtime-supported ``DequantizeLinear`` (the nxrt CPU kernel
+# only dequantizes Int8/Uint8/Int32, not FLOAT4E2M1 or codebooks). This is the
+# only remaining custom op, and it deliberately lives in the runtime's ``pkg``
+# namespace rather than the legacy custom-op namespace — matching the domain the
+# runtime actually registers the kernel under.
+_NXRT_DOMAIN = "pkg.nxrt"
+_MICROSOFT_NVFP4_OP = "MatMulBlockQuantizedFp4Weight"
+
+_NATIVE_BLOCK_FORMATS = {
+    "mxfp4": (32, 17),
+    "iq4_nl": (32, 18),
+    "iq4_xs": (256, 136),
+    "iq3_s": (256, 110),
+    "iq3_xxs": (256, 98),
+    "iq2_xxs": (256, 66),
+    "iq2_xs": (256, 74),
+    "iq2_s": (256, 82),
+    "iq1_s": (256, 50),
+    "iq1_m": (256, 56),
+}
+
+
+def _accuracy_level_attrs(bits: int) -> dict[str, int]:
+    """Return the ``accuracy_level`` attribute for ``MatMulNBits``, if any.
+
+    Only emitted for 4-bit weights: ``accuracy_level`` is sourced from
+    ``EpCapabilities.default_int4_accuracy_level`` and its int8-accumulation
+    semantics are defined for INT4 ``MatMulNBits``. For 2-bit / 8-bit weights the
+    attribute is omitted so those paths keep ORT's default behavior.
+
+    ORT's MLAS CPU ``MatMulNBits`` kernel selects its compute path from the
+    ``accuracy_level`` attribute: unset/0 keeps the highest-precision fp32
+    dequant + fp32 GEMM path, while ``4`` dynamically quantizes activations to
+    int8 and uses int8 dot-products (SDOT/NEON on ARM, AVX-VNNI on x86) — the
+    same class of kernel llama.cpp uses, and typically 2-4x faster on CPU with
+    no observable quality loss for Q4 weights. The value is sourced from the
+    active EP's :attr:`EpCapabilities.default_int4_accuracy_level` (4 for CPU /
+    WebGPU). When it is 0 the attribute is omitted so ORT keeps its default.
+    """
+    if bits != 4:
+        return {}
+    level = ep_capabilities().default_int4_accuracy_level
+    return {"accuracy_level": level} if level else {}
 
 
 class QuantizedLinear(nn.Module):
@@ -126,10 +178,196 @@ class QuantizedLinear(nn.Module):
             N=self._n,
             bits=self._bits,
             block_size=self._block_size,
+            **_accuracy_level_attrs(self._bits),
             _domain=_MICROSOFT_DOMAIN,
         )
         if self.bias is not None:
             result = op.Add(result, self.bias)
+        return result
+
+
+class NVFP4QuantizedLinear(nn.Module):
+    """Linear projection backed by Microsoft's storage-faithful NVFP4 op.
+
+    The native W4A16 ABI stores two E2M1 values per weight byte, one raw E4M3
+    block-scale byte per 16 weights, and one FP32 global scale. Dynamic W4A4
+    activation quantization is not part of this four-input graph contract.
+
+    Bias is deliberately emitted as a separate ``Add`` so the registered
+    four-input ONNX Function can inline the exact no-bias ABI used by the
+    pinned reference artifact.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        block_size: int = 16,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if block_size != 16:
+            raise ValueError(
+                f"MatMulBlockQuantizedFp4Weight requires block_size=16; got {block_size}."
+            )
+        if in_features % block_size:
+            raise ValueError(
+                "MatMulBlockQuantizedFp4Weight requires K divisible by 16; "
+                f"got K={in_features}."
+            )
+        self._k = in_features
+        self._n = out_features
+        self._block_size = block_size
+        self.weight = nn.Parameter(
+            [out_features, in_features // 2],
+            dtype=ir.DataType.UINT8,
+        )
+        self.weight_scale = nn.Parameter(
+            [out_features, in_features // block_size],
+            dtype=ir.DataType.UINT8,
+        )
+        self.weight_scale_2 = nn.Parameter([1], dtype=ir.DataType.FLOAT)
+        self.bias = nn.Parameter([out_features], dtype=ir.DataType.FLOAT16) if bias else None
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        """Compute ``x @ dequant(weight).T`` through the native W4A16 ABI."""
+        if x.dtype != ir.DataType.FLOAT16:
+            raise ValueError(
+                f"MatMulBlockQuantizedFp4Weight requires FLOAT16 activations; got {x.dtype}."
+            )
+        op.builder.graph.opset_imports[_MICROSOFT_DOMAIN] = 1
+        result = getattr(op, _MICROSOFT_NVFP4_OP)(
+            x,
+            self.weight,
+            self.weight_scale,
+            self.weight_scale_2,
+            block_size=self._block_size,
+            _domain=_MICROSOFT_DOMAIN,
+        )
+        result.dtype = x.dtype
+        if x.shape is not None:
+            result.shape = ir.Shape([*x.shape[:-1], self._n])
+        if self.bias is not None:
+            result = op.Add(result, self.bias)
+        return result
+
+
+class ClippableQuantizedLinear(QuantizedLinear):
+    """Weight-quantized linear with learned input/output activation bounds."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = False,
+        zero_point_dtype: ir.DataType = ir.DataType.UINT8,
+        bias: bool = False,
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            bits,
+            block_size,
+            has_zero_point,
+            zero_point_dtype,
+            bias,
+        )
+        self.input_min = nn.Parameter([])
+        self.input_max = nn.Parameter([])
+        self.output_min = nn.Parameter([])
+        self.output_max = nn.Parameter([])
+
+    @staticmethod
+    def _clip(
+        op: OpBuilder,
+        x: ir.Value,
+        minimum: ir.Value,
+        maximum: ir.Value,
+    ) -> ir.Value:
+        # Clip bounds are learned in float32 even when the component computes
+        # in fp16/bf16. Upcast for schema/provider compatibility, then restore
+        # the activation dtype before the next projection.
+        x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
+        minimum_f32 = op.Cast(minimum, to=ir.DataType.FLOAT)
+        maximum_f32 = op.Cast(maximum, to=ir.DataType.FLOAT)
+        return op.CastLike(op.Clip(x_f32, minimum_f32, maximum_f32), x)
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        x = self._clip(op, x, self.input_min, self.input_max)
+        result = super().forward(op, x)
+        return self._clip(op, result, self.output_min, self.output_max)
+
+
+class BlockQuantizedLinear(nn.Module):
+    """Linear layer backed by native GGUF block quantization.
+
+    The packed weight retains llama.cpp's serialized block layout, including
+    the per-block E8M0/fp16 scale. No dequantization or affine repacking occurs.
+
+    Emits ``pkg.nxrt.BlockQuantizedMatMul`` — the onnx-genai runtime's custom op.
+    This is the only remaining custom op because these formats (MXFP4 E2M1 float4;
+    IQ non-linear codebooks) cannot be expressed with standard ONNX ops the
+    runtime can execute (see ``_NXRT_DOMAIN``). It intentionally avoids the
+    legacy custom-op namespace and uses the runtime's registered
+    ``pkg.nxrt`` domain instead.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        format: str,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if format not in _NATIVE_BLOCK_FORMATS:
+            raise ValueError(
+                f"format must be one of {sorted(_NATIVE_BLOCK_FORMATS)}, got {format!r}"
+            )
+
+        self._k = in_features
+        self._n = out_features
+        self._format = format
+        block_elements, block_bytes = _NATIVE_BLOCK_FORMATS[format]
+        self.weight = nn.Parameter(
+            [out_features, math.ceil(in_features / block_elements), block_bytes],
+            dtype=ir.DataType.UINT8,
+        )
+        self.bias = nn.Parameter([out_features]) if bias else None
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        op.builder.graph.opset_imports[_NXRT_DOMAIN] = 1
+        output_dtype = x.dtype
+        activation = x if x.dtype == ir.DataType.FLOAT else op.Cast(x, to=ir.DataType.FLOAT)
+        inputs: list[ir.Value | None] = [activation, self.weight]
+        if self.bias is not None:
+            bias = (
+                self.bias
+                if self.bias.dtype == ir.DataType.FLOAT
+                else op.Cast(self.bias, to=ir.DataType.FLOAT)
+            )
+            inputs.append(bias)
+
+        result = op.BlockQuantizedMatMul(
+            *inputs,
+            K=self._k,
+            N=self._n,
+            format=self._format,
+            block_layout_version=1,
+            _domain=_NXRT_DOMAIN,
+        )
+        result.dtype = ir.DataType.FLOAT
+        if x.shape is not None:
+            result.shape = ir.Shape([*x.shape[:-1], self._n])
+        if output_dtype not in (None, ir.DataType.FLOAT):
+            result = op.Cast(result, to=output_dtype)
+            result.dtype = output_dtype
+            if x.shape is not None:
+                result.shape = ir.Shape([*x.shape[:-1], self._n])
         return result
 
 
@@ -186,6 +424,7 @@ class QuantizedEmbedding(nn.Module):
 
         self._bits = bits
         self._block_size = block_size
+        self._embedding_dim = embedding_dim
         self.padding_idx = padding_idx
 
         n_blocks = embedding_dim // block_size
@@ -219,7 +458,7 @@ class QuantizedEmbedding(nn.Module):
         if self.zero_points is not None:
             inputs.append(self.zero_points)
 
-        return op.GatherBlockQuantized(
+        result = op.GatherBlockQuantized(
             *inputs,
             bits=self._bits,
             block_size=self._block_size,
@@ -227,6 +466,43 @@ class QuantizedEmbedding(nn.Module):
             quantize_axis=1,
             _domain=_MICROSOFT_DOMAIN,
         )
+        result.dtype = self.scales.dtype
+        if input_ids.shape is not None:
+            result.shape = ir.Shape([*input_ids.shape, self._embedding_dim])
+        return result
+
+
+class ScaledQuantizedEmbedding(QuantizedEmbedding):
+    """Block-quantized token lookup followed by a fixed activation scale."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int | None = None,
+        embed_scale: float = 1.0,
+        *,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = True,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            bits=bits,
+            block_size=block_size,
+            has_zero_point=has_zero_point,
+            padding_idx=padding_idx,
+        )
+        self.embed_scale = embed_scale
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
+        embeddings = super().forward(op, input_ids)
+        assert self.scales.dtype is not None
+        scale = op.Constant(
+            value=ir.tensor(np.asarray(self.embed_scale, dtype=self.scales.dtype.numpy()))
+        )
+        return op.Mul(embeddings, scale)
 
 
 class TiedQuantizedLMHead(nn.Module):
@@ -304,6 +580,7 @@ class TiedQuantizedLMHead(nn.Module):
             N=self._n,
             bits=self._bits,
             block_size=self._block_size,
+            **_accuracy_level_attrs(self._bits),
             _domain=_MICROSOFT_DOMAIN,
         )
 
@@ -350,4 +627,34 @@ def make_quantized_linear_factory(
 
     _Factory.__name__ = "QuantizedLinear"
     _Factory.__qualname__ = "QuantizedLinear"
+    return _Factory
+
+
+def make_clippable_quantized_linear_factory(
+    bits: int = 4,
+    block_size: int = 32,
+    has_zero_point: bool = False,
+    zero_point_dtype: ir.DataType = ir.DataType.UINT8,
+) -> type[ClippableQuantizedLinear]:
+    """Create a Linear-compatible clipped MatMulNBits factory."""
+
+    class _Factory(ClippableQuantizedLinear):
+        def __init__(
+            self,
+            in_features: int,
+            out_features: int,
+            bias: bool = True,
+        ):
+            super().__init__(
+                in_features=in_features,
+                out_features=out_features,
+                bias=bias,
+                bits=bits,
+                block_size=block_size,
+                has_zero_point=has_zero_point,
+                zero_point_dtype=zero_point_dtype,
+            )
+
+    _Factory.__name__ = "ClippableQuantizedLinear"
+    _Factory.__qualname__ = "ClippableQuantizedLinear"
     return _Factory

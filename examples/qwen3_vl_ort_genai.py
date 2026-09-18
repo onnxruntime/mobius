@@ -10,8 +10,8 @@ using raw ONNX Runtime sessions with HuggingFace preprocessing.
 
 Requirements::
 
-    pip install mobius-ai[ort-genai] onnxruntime-gpu  # for CUDA
-    pip install mobius-ai[ort-genai] onnxruntime       # for CPU only
+    pip install mobius-onnx[ort-genai] onnxruntime-gpu  # for CUDA
+    pip install mobius-onnx[ort-genai] onnxruntime       # for CPU only
 
 Supported dtype/EP combinations::
 

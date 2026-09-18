@@ -21,13 +21,14 @@ HuggingFace weight names:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import (
+    is_packed_quant_key,
     vlm_decoder_weights,
     vlm_embedding_weights,
     vlm_vision_weights,
@@ -38,7 +39,7 @@ from mobius.components import (
     MLPMultiModalProjector,
     VisionModel,
 )
-from mobius.models.base import TextModel
+from mobius.models.base import TextModel, effective_tie_word_embeddings
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -194,6 +195,47 @@ class LLaVAModel(nn.Module):
     default_task: str = "vision-language"
     category: str = "Multimodal"
 
+    # Runtime HF ``named_modules()`` sub-trees for the LLaVA/PaliGemma/Mistral3
+    # layout. Decoder paths exclude token embeddings, which are a separate graph.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "model.language_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_tower", "model.multi_modal_projector"),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
+    _IDEFICS_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.text_model.layers",
+            "model.text_model.norm",
+            "model.text_model.rotary_emb",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.vision_model", "model.connector"),
+        "embedding": ("model.text_model.embed_tokens",),
+    }
+
+    @classmethod
+    def get_hf_component_sources(
+        cls,
+        *,
+        model_type: str,
+        hf_config: object,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return static runtime paths for verified HF layouts served by this class."""
+        del hf_config
+        if model_type in {"llava", "llava_next", "llava_onevision", "paligemma", "mistral3"}:
+            return cls.HF_COMPONENT_SOURCES
+        if model_type in {"idefics2", "idefics3", "smolvlm"}:
+            return cls._IDEFICS_COMPONENT_SOURCES
+        # This generic mobius class is registered for additional HF families
+        # whose runtime trees differ. Empty paths prevent tools from slicing
+        # against a guessed checkpoint-style prefix.
+        return {}
+
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
@@ -218,13 +260,23 @@ class LLaVAModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        tie_word_embeddings = effective_tie_word_embeddings(self.config)
         # Mistral-3 / Pixtral models prefix decoder weights with
         # ``language_model.`` — strip it so the decoder/embedding
         # sub-models can find their weights.
         if self._is_pixtral:
-            return _preprocess_pixtral_weights(state_dict, self.config.tie_word_embeddings)
+            return _preprocess_pixtral_weights(
+                state_dict,
+                tie_word_embeddings,
+                component_quantization=self.config.component_quantization is not None,
+            )
+        if self.config.component_quantization is not None:
+            return _preprocess_llava_component_weights(
+                state_dict,
+                tie_word_embeddings=tie_word_embeddings,
+            )
         # Default LLaVA: only handle weight tying
-        if self.config.tie_word_embeddings:
+        if tie_word_embeddings:
             embed_key = "language_model.model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
@@ -235,6 +287,8 @@ class LLaVAModel(nn.Module):
 def _preprocess_pixtral_weights(
     state_dict: dict[str, torch.Tensor],
     tie_word_embeddings: bool,
+    *,
+    component_quantization: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Remap HF Mistral-3/Pixtral weight names to ONNX sub-model names.
 
@@ -243,6 +297,22 @@ def _preprocess_pixtral_weights(
     the ``model.`` prefix, adds ``vision_encoder.`` for vision/projector
     weights, and strips ``language_model.`` for decoder/embedding.
     """
+    if (
+        component_quantization
+        and tie_word_embeddings
+        and any(
+            (
+                key.removeprefix("model.").startswith("language_model.model.embed_tokens.")
+                and is_packed_quant_key(key)
+            )
+            for key in state_dict
+        )
+    ):
+        raise NotImplementedError(
+            "Packed tied Pixtral embeddings require an explicit LM-head copy; "
+            "the generic component loader cannot synthesize it safely."
+        )
+
     renamed: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
         # Strip outer model. prefix (Mistral3ForConditionalGeneration.model)
@@ -252,9 +322,10 @@ def _preprocess_pixtral_weights(
             renamed[f"vision_encoder.{k}"] = value
         elif k.startswith("language_model.model.embed_tokens."):
             suffix = k[len("language_model.model.") :]
-            renamed[f"decoder.model.{suffix}"] = value
+            if not component_quantization or not is_packed_quant_key(k):
+                renamed[f"decoder.model.{suffix}"] = value
             renamed[f"embedding.{suffix}"] = value
-            if tie_word_embeddings:
+            if tie_word_embeddings and suffix == "embed_tokens.weight":
                 renamed["decoder.lm_head.weight"] = value
         elif k.startswith("language_model.lm_head."):
             suffix = k[len("language_model.") :]
@@ -264,4 +335,77 @@ def _preprocess_pixtral_weights(
             renamed[f"decoder.{suffix}"] = value
         elif k == "lm_head.weight" or k.startswith("lm_head."):
             renamed[f"decoder.{k}"] = value
+    return renamed
+
+
+def _preprocess_llava_component_weights(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    tie_word_embeddings: bool,
+) -> dict[str, torch.Tensor]:
+    """Route LLaVA and Idefics checkpoint names to package components."""
+
+    def _is_token_embedding(key: str) -> bool:
+        stripped = key.removeprefix("model.")
+        return stripped.startswith(
+            (
+                "language_model.model.embed_tokens.",
+                "text_model.embed_tokens.",
+            )
+        )
+
+    if tie_word_embeddings and any(
+        _is_token_embedding(key) and is_packed_quant_key(key) for key in state_dict
+    ):
+        raise NotImplementedError(
+            "Packed tied LLaVA embeddings require an explicit LM-head copy; "
+            "the generic component loader cannot synthesize it safely."
+        )
+
+    renamed: dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        stripped = key[len("model.") :] if key.startswith("model.") else key
+        if stripped.startswith("language_model.model.embed_tokens."):
+            suffix = stripped[len("language_model.model.") :]
+            if not is_packed_quant_key(stripped):
+                renamed[f"decoder.model.{suffix}"] = value
+            renamed[f"embedding.{suffix}"] = value
+        elif stripped.startswith("text_model.embed_tokens."):
+            suffix = stripped[len("text_model.") :]
+            if not is_packed_quant_key(stripped):
+                renamed[f"decoder.model.{suffix}"] = value
+            renamed[f"embedding.{suffix}"] = value
+        elif stripped.startswith("language_model."):
+            suffix = stripped[len("language_model.") :]
+            renamed[f"decoder.{suffix}"] = value
+        elif stripped.startswith("text_model."):
+            suffix = stripped[len("text_model.") :]
+            renamed[f"decoder.model.{suffix}"] = value
+        elif stripped.startswith(("vision_tower.", "multi_modal_projector.")):
+            target = f"vision_encoder.{stripped}"
+            target = target.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+                ".mlp.fc2.", ".mlp.down_proj."
+            )
+            renamed[target] = value
+        elif stripped.startswith("vision_model."):
+            target = f"vision_encoder.vision_tower.{stripped}"
+            target = target.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+                ".mlp.fc2.", ".mlp.down_proj."
+            )
+            renamed[target] = value
+        elif stripped.startswith("connector."):
+            suffix = stripped[len("connector.") :]
+            renamed[f"vision_encoder.multi_modal_projector.{suffix}"] = value
+        elif stripped.startswith("lm_head."):
+            renamed[f"decoder.{stripped}"] = value
+        else:
+            renamed[key] = value
+
+    embedding = renamed.get("embedding.embed_tokens.weight")
+    if (
+        tie_word_embeddings
+        and "decoder.lm_head.weight" not in renamed
+        and embedding is not None
+    ):
+        renamed["decoder.lm_head.weight"] = embedding
     return renamed

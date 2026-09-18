@@ -14,8 +14,8 @@ from typing import ClassVar
 
 import onnx_ir as ir
 
-from mobius._diffusers_configs import CogVideoXConfig
 from mobius._model_package import ModelPackage
+from mobius.integrations.diffusers._configs import CogVideoXConfig
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 
 
@@ -49,6 +49,13 @@ class VideoDenoisingTask(ModelTask):
             sample=sample,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states,
+        )
+        # Unpatchify recomputes the spatial extents from Shape ops, which mints
+        # fresh symbolic dimensions. The prediction is elementwise with the
+        # latent, so the declared contract has to say so: a solver that carries
+        # the latent across steps needs both to unify.
+        noise_pred.shape = ir.Shape(
+            ["batch", "num_frames", config.out_channels, "height", "width"]
         )
 
         builder.add_output(noise_pred, "noise_pred")

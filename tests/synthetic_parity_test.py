@@ -36,14 +36,226 @@ from _test_configs import (
     _base_config,
 )
 
-from mobius._config_resolver import _default_task_for_model
 from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
 from mobius._testing.parity import ParityResult, compare_synthetic
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)
+
+
+def test_qwen2_5_omni_thinker_synthetic_parity():
+    """Exercise all four Thinker components with native HF weights, offline."""
+    from _test_configs import SPEECH_CONFIGS
+    from transformers import (
+        Qwen2_5OmniThinkerConfig,
+        Qwen2_5OmniThinkerForConditionalGeneration,
+    )
+    from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+        chunk_and_pad_features,
+        get_pool_indices,
+    )
+
+    from mobius._builder import build_from_module
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    overrides = next(o for mt, o, _ in SPEECH_CONFIGS if mt == "qwen2_5_omni")
+    config = _base_config(**overrides)
+    audio, vision = config.audio, config.vision
+    hf_config = Qwen2_5OmniThinkerConfig(
+        audio_config={
+            name: getattr(audio, name)
+            for name in (
+                "d_model",
+                "encoder_layers",
+                "encoder_attention_heads",
+                "encoder_ffn_dim",
+                "num_mel_bins",
+                "max_source_positions",
+                "n_window",
+                "output_dim",
+            )
+        },
+        vision_config={
+            "depth": vision.num_hidden_layers,
+            "num_heads": vision.num_attention_heads,
+            **{
+                name: getattr(vision, name)
+                for name in (
+                    "hidden_size",
+                    "intermediate_size",
+                    "patch_size",
+                    "temporal_patch_size",
+                    "in_channels",
+                    "out_hidden_size",
+                    "spatial_merge_size",
+                    "fullatt_block_indexes",
+                    "window_size",
+                )
+            },
+        },
+        text_config={
+            **{
+                name: getattr(config, name)
+                for name in (
+                    "vocab_size",
+                    "hidden_size",
+                    "intermediate_size",
+                    "num_hidden_layers",
+                    "num_attention_heads",
+                    "num_key_value_heads",
+                    "max_position_embeddings",
+                    "rms_norm_eps",
+                    "hidden_act",
+                )
+            },
+            "rope_parameters": {
+                "rope_type": "default",
+                "rope_theta": config.rope_theta,
+                "mrope_section": config.mrope_section,
+            },
+        },
+        audio_token_id=audio.audio_token_id,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+    )
+    torch.manual_seed(42)
+    reference = Qwen2_5OmniThinkerForConditionalGeneration._from_config(
+        hf_config, attn_implementation="eager"
+    ).eval()
+    module = registry.get("qwen2_5_omni")(config)
+    package = build_from_module(module, config, task="qwen25-omni")
+    weights = module.preprocess_weights(reference.state_dict())
+    for model in package.values():
+        missing = {
+            name
+            for name, value in model.graph.initializers.items()
+            if value.const_value is None and name not in weights
+        }
+        assert not missing, f"Unmapped HF parameters: {missing}"
+    package.apply_weights(weights)
+
+    # Unequal, odd-length audio clips include a tail chunk and independent clips.
+    session = OnnxModelSession(package["audio_encoder"])
+    try:
+        for lengths in ([7], [35, 13]):
+            feature_lens = torch.tensor(lengths)
+            features = torch.randn(audio.num_mel_bins, sum(lengths))
+            padded, chunk_lengths = chunk_and_pad_features(
+                features, feature_lens, audio.n_window
+            )
+            actual = session.run(
+                {
+                    "input_features": padded.numpy(),
+                    "chunk_lengths": chunk_lengths.numpy(),
+                    "pool_indices": get_pool_indices(feature_lens).numpy(),
+                }
+            )["audio_features"]
+            with torch.no_grad():
+                expected = reference.audio_tower(
+                    features, feature_lens=feature_lens
+                ).last_hidden_state.numpy()
+            np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-4)
+    finally:
+        session.close()
+
+    # A non-square image and multi-frame video exercise window/full attention.
+    grid = torch.tensor([[1, 4, 10], [2, 4, 4]])
+    pixels = torch.randn(
+        int(grid.prod(-1).sum()),
+        vision.in_channels * vision.temporal_patch_size * vision.patch_size**2,
+    )
+    with torch.no_grad():
+        expected = reference.visual(pixels, grid_thw=grid).pooler_output.numpy()
+    session = OnnxModelSession(package["vision_encoder"])
+    try:
+        actual = session.run({"pixel_values": pixels.numpy(), "image_grid_thw": grid.numpy()})[
+            "image_features"
+        ]
+        np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-4)
+    finally:
+        session.close()
+
+    # Features must advance across batch rows, with separate image/video streams.
+    ids = torch.tensor([[5, 100, 101, 102], [101, 102, 100, 6]])
+    session = OnnxModelSession(package["embedding"])
+    try:
+        media = {
+            name: torch.randn(2, config.hidden_size) for name in ("audio", "image", "video")
+        }
+        feeds = {
+            "input_ids": ids.numpy(),
+            **{f"{name}_features": value.numpy() for name, value in media.items()},
+        }
+        actual_embeds = session.run(feeds)["inputs_embeds"]
+        with torch.no_grad():
+            expected_embeds = reference.model.embed_tokens(ids)
+            for name, token_id in (("audio", 100), ("image", 101), ("video", 102)):
+                expected_embeds[ids == token_id] = media[name]
+        np.testing.assert_allclose(actual_embeds, expected_embeds.numpy(), atol=0, rtol=0)
+        text_ids = np.array([[7], [8]], dtype=np.int64)
+        text_embeds = session.run(
+            {
+                "input_ids": text_ids,
+                **{
+                    f"{name}_features": np.empty((0, config.hidden_size), np.float32)
+                    for name in media
+                },
+            }
+        )["inputs_embeds"]
+        with torch.no_grad():
+            expected_text = reference.model.embed_tokens(torch.from_numpy(text_ids)).numpy()
+        np.testing.assert_allclose(text_embeds, expected_text, atol=0, rtol=0)
+    finally:
+        session.close()
+
+    # Compare full prefill logits and a cached decode with three distinct MRoPE axes.
+    session = OnnxModelSession(package["decoder"])
+    cache = None
+    feeds = {}
+    for layer in range(config.num_hidden_layers):
+        for kind in ("key", "value"):
+            feeds[f"past_key_values.{layer}.{kind}"] = np.zeros(
+                (2, config.num_key_value_heads, 0, config.head_dim), np.float32
+            )
+    try:
+        for embeds, offset in ((actual_embeds, 0), (text_embeds, 4)):
+            length = embeds.shape[1]
+            positions = np.broadcast_to(
+                np.arange(offset, offset + length), (3, 2, length)
+            ).copy()
+            positions[1] += 1
+            positions[2] += 2
+            mask = np.ones((2, offset + length), np.int64)
+            feeds.update(inputs_embeds=embeds, attention_mask=mask, position_ids=positions)
+            outputs = session.run(feeds)
+            with torch.no_grad():
+                result = reference.model(
+                    inputs_embeds=torch.from_numpy(embeds),
+                    attention_mask=torch.from_numpy(mask),
+                    position_ids=torch.from_numpy(positions),
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                expected = reference.lm_head(result.last_hidden_state).numpy()
+            np.testing.assert_allclose(outputs["logits"], expected, atol=1e-5, rtol=1e-4)
+            cache = result.past_key_values
+            for layer in range(config.num_hidden_layers):
+                for kind in ("key", "value"):
+                    feeds[f"past_key_values.{layer}.{kind}"] = outputs[
+                        f"present.{layer}.{kind}"
+                    ]
+    finally:
+        session.close()
+
+
+def test_vibevoice_synthetic_pipeline_parity():
+    """Run the dedicated eight-stage continuous-token parity harness."""
+    from mobius.models.vibevoice_test import run_vibevoice_synthetic_stage_parity
+
+    run_vibevoice_synthetic_stage_parity()
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +296,17 @@ _SKIP_REASONS: dict[str, str] = {
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
+    # GLM-5.2's default (config.use_dsa=True) DSA/IndexShare path emits
+    # pkg.nxrt::IndexShare -- a custom onnx-genai-runtime domain with no
+    # stock-ORT registration, so this generic OnnxModelSession-based harness
+    # can never execute it (unlike com.microsoft::QMoE, a real ORT contrib
+    # op). DSA numeric correctness is covered instead by the dedicated
+    # GlmMoeDsaIndexer-vs-transformers parity test in glm_moe_dsa_test.py and
+    # by onnx-genai's native-CPU/CUDA e2e regression
+    # (glm_tiny_qmoe_native_cuda_e2e.rs); the config.use_dsa=False
+    # (--glm-full-attention) dense-MLA fallback has no custom ops and would
+    # be exercised by this harness if the tiny config defaulted to it.
+    "glm_moe_dsa": "DSA/IndexShare emits pkg.nxrt::IndexShare, unsupported by stock ORT",
 }
 
 # Per-model atol overrides for L3 synthetic parity.
@@ -104,10 +327,17 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Bloom: LayerNorm accumulation differs after eps alignment → ~0.019 max diff.
     # Argmax correct, cosine=0.9998 — model is functionally correct.
     "bloom": 0.02,
+    # Jais2 combines LayerNorm with squared-ReLU; ORT/PyTorch accumulation differs
+    # by ~0.0025 while retaining the same argmax and cosine >= 0.99999.
+    "jais2": 0.003,
     # Jamba MoE+Mamba: FP accumulation differences from sequential vs batched expert
     # dispatch, plus Mamba1 SSM single-token decode FP path differences.
     # Argmax correct, cosine=0.998 — model is functionally correct.
     "jamba": 0.04,
+    # Bamba's hybrid Mamba2 + attention path differs slightly in FP accumulation
+    # order from HuggingFace. Both deterministic seeds keep the same argmax and
+    # cosine >= 0.999996 with max absolute error below 0.0017.
+    "bamba": 0.002,
     # ModernBERT decoder has a 3-component LM head (dense→norm→decoder) whose
     # FP accumulation differs from PyTorch → ~0.043 max diff.
     # Argmax correct, cosine=0.996 — model is functionally correct.
@@ -150,15 +380,28 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3n: AltUp magnitude normalization (target_mag/new_mag ratio) amplifies
     # FP differences between ORT and PyTorch, especially with random weight init.
     # Argmax correct (near-tie), cosine≥0.995, top10_jaccard=1.0 — functionally correct.
-    "gemma3n_text": 0.1,  # ~0.094 max diff worst-case (AltUp magnitude ratio)
-    "gemma3n": 0.1,  # same architecture
+    # Only the text entry appears here: the "gemma3n" key builds the multimodal
+    # model, which this causal-LM suite does not cover.
+    "gemma3n_text": 0.05,  # ~0.026 max diff worst-case (AltUp magnitude ratio)
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
-    # DeepSeek-V3: sigmoid-gated MoE with fused expert weights. Sequential vs batched
-    # expert dispatch produces FP accumulation differences → ~0.034 max diff.
-    # Near-tie argmax, cosine=0.996 — functionally correct.
-    "deepseek_v3": 0.04,
+    # DeepSeek-V3: previously carried a 0.04 override attributed to "MoE
+    # dispatch FP accumulation", but that was masking a real bug: the
+    # DeepSeek-V2/V3 MLA softmax scale was missing the YaRN
+    # mscale_all_dim^2 correction HF applies (see
+    # ``mobius.components._rotary_embedding.yarn_apply_mscale``). Fixed in
+    # ``_deepseek_mla.py``. Post-fix, remaining diff is genuine FP-order
+    # noise from parallel MoE dispatch: ~3.5e-5 measured via a standalone
+    # interpreter, ~1.2e-3 measured under this pytest process (both
+    # reproducible in their own harness — the residual gap is ORT
+    # intra-op thread-schedule dependent, not seed-dependent). 0.0025
+    # keeps ~2x headroom over the higher measurement while staying 16x
+    # tighter than the old 0.04.
+    "deepseek_v3": 0.0025,
+    # HYV3 uses fused expert banks in Transformers and sequential experts in ONNX.
+    # With identical weights this changes only float32 accumulation order (~0.0014).
+    "hy_v3": 0.002,
     # dots1: same DeepSeek V3 architecture (sigmoid routing + shared experts).
     # MoE dispatch accumulation differences → similar tolerance needed.
     "dots1": 0.04,
@@ -203,11 +446,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # DeepSeek MLA: deepseek_v2_0 uses group_limited_greedy routing which hits a
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
-    # Additional divergences (newly registered models)
-    # NemotronH Mamba2 layers diverge (cos=0.65): LinearAttention gated-SSM
-    # recurrence on CPU produces different results than HF's naive Mamba2.
-    # Attention-only layers match perfectly (cos=0.9999).
-    "nemotron_h": "Mamba2 SSM recurrence diverges on CPU (LinearAttention vs HF naive)",
 }
 
 # Fields that are properties in HF configs and cannot be set directly,
@@ -237,15 +475,21 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         "exaone",  # real HF type is exaone4
         "phi3small",  # real HF type is phi3
         "mistral3",  # our implementation maps to mistral; real mistral3 is different
+        "grok_gguf",
+        "grovemoe_gguf",
+        "hunyuan_moe_gguf",
+        "minimax_m2_gguf",
+        "mistral4_gguf",
         # gemma4_unified_text: mobius-internal alias for the gemma-4-12B text
         # backbone (reuses Gemma4CausalLMModel). No matching HF model_type is
         # registered with AutoModelForCausalLM, so a reference model cannot be
         # constructed here.  Text parity is covered by the real-weight
         # integration test (test_gemma4_unified_12b_text_prefill).
         "gemma4_unified_text",
-        # falcon_h1: our ONNX uses FalconCausalLMModel (ALiBi attention), not the
-        # real HF FalconH1 (Mamba2+SSM hybrid).  Comparing against HF would be apples-to-oranges.
-        "falcon_h1",
+        # The composite and architecture alias share qwen4_exp_text's graph.
+        # Run parity once through the canonical standalone text model type.
+        "qwen4_exp",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 
@@ -260,18 +504,13 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "gemma": {"head_dim": TINY_HEAD_DIM},
     # Gemma3/Gemma3n: head_dim is an explicit param in HF (default 256); pass tiny value.
     "gemma3_text": {"head_dim": TINY_HEAD_DIM, "query_pre_attn_scalar": TINY_HEAD_DIM},
-    # num_kv_shared_layers default is 15; with TINY_LAYERS=2 this makes all layers
-    # "shared", causing prev_layers[:-13]=[] and a ValueError on index lookup. Set to 0.
+    # num_kv_shared_layers is threaded through from the tiny config (HF defaults
+    # to 15, which with TINY_LAYERS=2 would make every layer "shared" and leave
+    # no source layer to borrow K,V from), so it is set explicitly per entry in
+    # _test_configs.py rather than pinned to 0 here.
     "gemma3n_text": {
         "query_pre_attn_scalar": TINY_HEAD_DIM,
         "head_dim": TINY_HEAD_DIM,
-        "num_kv_shared_layers": 0,
-        "hidden_activation": "gelu_pytorch_tanh",
-    },
-    "gemma3n": {
-        "query_pre_attn_scalar": TINY_HEAD_DIM,
-        "head_dim": TINY_HEAD_DIM,
-        "num_kv_shared_layers": 0,
         "hidden_activation": "gelu_pytorch_tanh",
     },
     "gemma3": {"query_pre_attn_scalar": TINY_HEAD_DIM, "head_dim": TINY_HEAD_DIM},
@@ -399,6 +638,7 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     },
     # HunYuanMoEV1 requires head_dim (defaults to None, causing pow(None, float) error).
     "hunyuan_v1_moe": {"head_dim": TINY_HEAD_DIM},
+    "hy_v3": {"head_dim": TINY_HEAD_DIM},
     # Llama4Text requires head_dim to match our tiny num_heads x head_dim = hidden_size.
     # Disable MoE (we use dense CausalLMModel) and Llama4-specific attention features
     # (QK-norm and temperature tuning) not implemented in CausalLMModel.
@@ -453,8 +693,6 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # Gemma3Config wraps Gemma3TextConfig; tiny kwargs go to the outer config
     # but the actual model is built from text_config which retains HF defaults.
     "gemma3": "gemma3_text",
-    # Gemma3nConfig is the multimodal wrapper; text-only parity uses Gemma3nTextConfig.
-    "gemma3n": "gemma3n_text",
     # Qwen3.5-MoE outer config wraps text_config; use the text-only model type
     # so tiny kwargs (num_experts, moe_intermediate_size, etc.) apply directly.
     "qwen3_5_moe": "qwen3_5_moe_text",
@@ -463,6 +701,68 @@ _HF_MODEL_TYPE_OVERRIDES: dict[str, str] = {
     # VL text sub-models: use the base text model type for CausalLM parity testing.
     "qwen3_vl_moe": "qwen3_moe",
     "qwen3_omni_moe": "qwen3_moe",
+}
+
+
+def _adapt_muse_glimmer_text_config(hf_kwargs: dict) -> None:
+    """Translate the shared tiny config fields to Muse Glimmer's HF schema."""
+    hf_kwargs["head_dim"] = TINY_HEAD_DIM
+    hf_kwargs.setdefault("hidden_activation", hf_kwargs.get("hidden_act", "silu"))
+    hf_kwargs.pop("hidden_act", None)
+    hf_kwargs["attention_bias"] = False
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": hf_kwargs.pop("rope_theta", 10_000.0),
+    }
+    hf_kwargs.pop("rope_type", None)
+    hf_kwargs.pop("attn_qk_norm", None)
+    hf_kwargs.pop("no_rope_layers", None)
+
+
+def _adapt_qwen4_exp_text_config(hf_kwargs: dict) -> None:
+    """Translate flat Mobius RoPE/expert fields to the strict HF config."""
+    hf_kwargs["head_dim"] = hf_kwargs["hidden_size"] // hf_kwargs["num_attention_heads"]
+    hf_kwargs["num_experts"] = hf_kwargs.pop("num_local_experts")
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": 10_000.0,
+        "partial_rotary_factor": hf_kwargs.pop("partial_rotary_factor", 1.0),
+    }
+
+
+def _adapt_hy_v3_config(hf_kwargs: dict) -> None:
+    """Translate Mobius' explicit routing fields to native Transformers HYV3."""
+    num_experts = hf_kwargs.pop("num_local_experts")
+    expert_width = hf_kwargs["moe_intermediate_size"]
+    shared_width = hf_kwargs.pop("shared_expert_intermediate_size")
+    dense_prefix = hf_kwargs.pop("first_k_dense_replace")
+    num_layers = hf_kwargs["num_hidden_layers"]
+    hf_kwargs["num_experts"] = num_experts
+    hf_kwargs["num_shared_experts"] = shared_width // expert_width
+    hf_kwargs["mlp_layer_types"] = ["dense"] * dense_prefix + ["sparse"] * (
+        num_layers - dense_prefix
+    )
+    hf_kwargs["router_scaling_factor"] = hf_kwargs.pop("routed_scaling_factor")
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": hf_kwargs.pop("rope_type", "default"),
+        "rope_theta": hf_kwargs.pop("rope_theta", 10_000.0),
+    }
+    for field in (
+        "disable_qmoe",
+        "norm_topk_prob",
+        "routing_weight_normalization_epsilon",
+        "routing_weight_normalization_floor",
+        "scoring_func",
+        "topk_method",
+        "use_expert_bias",
+    ):
+        hf_kwargs.pop(field, None)
+
+
+_HF_CONFIG_ADAPTERS = {
+    "hy_v3": _adapt_hy_v3_config,
+    "muse_glimmer_text": _adapt_muse_glimmer_text_config,
+    "qwen4_exp_text": _adapt_qwen4_exp_text_config,
 }
 
 
@@ -494,13 +794,18 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     for key, value in config_overrides.items():
         if key == "_config_cls":
             continue
-        if key in _HF_READONLY_FIELDS:
+        if key in _HF_READONLY_FIELDS and not (
+            model_type == "falcon_h1" and key == "mlp_bias"
+        ):
             continue
         hf_kwargs[key] = value
 
     # Apply model-specific HF extras
     if model_type in _HF_EXTRA_CONFIG:
         hf_kwargs.update(_HF_EXTRA_CONFIG[model_type])
+
+    if adapter := _HF_CONFIG_ADAPTERS.get(hf_model_type):
+        adapter(hf_kwargs)
 
     # Convert layer_types to attn_layer_indices for hybrid Mamba models
     # Bamba uses attn_layer_indices (computed property layers_block_type)
@@ -509,6 +814,17 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         hf_kwargs["attn_layer_indices"] = [
             i for i, lt in enumerate(layer_types) if lt in ("full_attention", "attention")
         ]
+
+    if hf_model_type in {"lfm2", "lfm2_moe"}:
+        hf_kwargs["conv_L_cache"] = hf_kwargs.pop("short_conv_kernel", 3)
+        hf_kwargs["conv_bias"] = hf_kwargs.pop("short_conv_bias", False)
+        hf_kwargs["norm_eps"] = hf_kwargs.pop("rms_norm_eps")
+        hf_kwargs["rope_parameters"] = {
+            "rope_type": "default",
+            "rope_theta": 10_000.0,
+        }
+        if hf_model_type == "lfm2_moe":
+            hf_kwargs["num_experts"] = hf_kwargs.pop("num_local_experts")
 
     # Jamba uses attn_layer_offset/attn_layer_period
     if hf_model_type in ("jamba",) and "layer_types" in hf_kwargs:
@@ -540,23 +856,24 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             for lt in hf_kwargs["layer_types"]
         ]
 
-    # GraniteMoeHybrid uses layers_block_type (HF field) with layer-type values.
-    # Convert our internal "mamba2"/"full_attention" names to the current HF values
-    # ("linear_attention"/"full_attention"); the legacy "mamba"/"attention" names
-    # are no longer accepted by HF's layer-type validator.
+    # GraniteMoeHybrid's current constructor consumes layer_types and selects
+    # the recurrent path only for the literal "mamba" layer type.
     if hf_model_type in ("granitemoehybrid",) and "layer_types" in hf_kwargs:
-        layer_types = hf_kwargs.pop("layer_types")
-        hf_kwargs["layers_block_type"] = [
-            "full_attention" if lt in ("full_attention", "attention") else "linear_attention"
-            for lt in layer_types
+        hf_kwargs["layer_types"] = [
+            "attention" if lt in ("full_attention", "attention") else "mamba"
+            for lt in hf_kwargs["layer_types"]
         ]
 
-    # NemotronH uses layers_block_type with HF values {"mamba", "attention", "moe"}.
-    # Convert our internal layer_types names (mamba2, full_attention, mlp) to HF names.
+    # NemotronH uses its public layer-type vocabulary rather than Mobius names.
     # Also translate mobius Mamba field names to HF NemotronHConfig field names.
     if hf_model_type in ("nemotron_h",) and "layer_types" in hf_kwargs:
         layer_types = hf_kwargs.pop("layer_types")
-        _nemotron_type_map = {"mamba2": "mamba", "full_attention": "attention", "mlp": "moe"}
+        _nemotron_type_map = {
+            "mamba2": "mamba",
+            "full_attention": "attention",
+            "mlp": "mlp",
+            "moe": "moe",
+        }
         hf_kwargs["layers_block_type"] = [_nemotron_type_map.get(lt, lt) for lt in layer_types]
         # Mobius NemotronHConfig → HF NemotronHConfig field name mapping
         _nemotron_field_map = {
@@ -566,10 +883,17 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "mamba_n_groups": "n_groups",
             "mamba_d_conv": "conv_kernel",
             "mamba_expand": "expand",
+            "rms_norm_eps": "layer_norm_epsilon",
         }
         for old_name, new_name in _nemotron_field_map.items():
             if old_name in hf_kwargs:
                 hf_kwargs[new_name] = hf_kwargs.pop(old_name)
+        if "hidden_act" in hf_kwargs:
+            hf_kwargs["mlp_hidden_act"] = hf_kwargs.pop("hidden_act")
+        if "shared_expert_intermediate_size" in hf_kwargs:
+            hf_kwargs["moe_shared_expert_intermediate_size"] = hf_kwargs.pop(
+                "shared_expert_intermediate_size"
+            )
         # HF NemotronH has an explicit head_dim (default 128) that is not
         # derived from hidden_size / num_attention_heads. Set it to match.
         if "head_dim" not in hf_kwargs:
@@ -635,6 +959,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "num_experts_per_tok": "moe_topk",
             "moe_intermediate_size": "expert_ffn_hidden_size",
         },
+        "nemotron_h": {"num_local_experts": "n_routed_experts"},
     }
     if hf_model_type in expert_field_aliases:
         for src_field, dst_field in expert_field_aliases[hf_model_type].items():
@@ -648,6 +973,8 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         "attn_qk_norm",
         "attn_qk_norm_full",
         "post_feedforward_norm",
+        "short_conv_kernel",
+        "short_conv_bias",
         # dual_ln is a mobius-only flag for Falcon/Bloom parallel attention;
         # HF controls this behavior via new_decoder_architecture=True.
         "dual_ln",
@@ -663,13 +990,44 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     return hf_config
 
 
+def _create_softcapped_backbone_causal_lm(hf_config):
+    """Wrap an HF backbone with the checkpoint's scaled, softcapped LM head."""
+    from transformers import AutoModel
+
+    class _SoftcappedBackboneCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = AutoModel.from_config(hf_config)
+            self.lm_head = torch.nn.Linear(
+                hf_config.hidden_size,
+                hf_config.vocab_size,
+                bias=False,
+            )
+
+        def forward(self, **kwargs):
+            hidden_states = self.model(**kwargs).last_hidden_state
+            logits = self.lm_head(hidden_states) * hf_config.output_multiplier
+            cap = hf_config.final_logit_softcapping
+            if cap:
+                logits = cap * torch.tanh(logits / cap)
+            return type("CausalLMOutput", (), {"logits": logits})()
+
+    return _SoftcappedBackboneCausalLM()
+
+
+_HF_MODEL_FACTORIES = {
+    "muse_glimmer_text": _create_softcapped_backbone_causal_lm,
+}
+
+
 def _create_hf_model(model_type: str, hf_config, seed: int):
     """Create a HuggingFace model from config with deterministic init."""
     from transformers import AutoModelForCausalLM
 
     torch.manual_seed(seed)
     try:
-        hf_model = AutoModelForCausalLM.from_config(hf_config)
+        factory = _HF_MODEL_FACTORIES.get(model_type, AutoModelForCausalLM.from_config)
+        hf_model = factory(hf_config)
     except Exception as e:
         pytest.skip(f"Cannot create HF model for {model_type}: {type(e).__name__}: {e}")
 
@@ -705,6 +1063,312 @@ def _fill_random_weights(model: ir.Model, rng: np.random.Generator) -> None:
         else:
             data = rng.standard_normal(shape).astype(np.float32) * 0.02
         init.const_value = ir.Tensor(data)
+
+
+def _nemotron_parse_torch_attention(
+    hidden_states: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+    prefix: str,
+    *,
+    num_heads: int,
+    key_value_states: torch.Tensor | None = None,
+    causal: bool = False,
+) -> torch.Tensor:
+    """Evaluate one Nemotron Parse attention block with exported weights."""
+    source = hidden_states if key_value_states is None else key_value_states
+    query = torch.nn.functional.linear(
+        hidden_states,
+        weights[f"{prefix}.q_proj.weight"],
+        weights[f"{prefix}.q_proj.bias"],
+    )
+    key = torch.nn.functional.linear(
+        source,
+        weights[f"{prefix}.k_proj.weight"],
+        weights[f"{prefix}.k_proj.bias"],
+    )
+    value = torch.nn.functional.linear(
+        source,
+        weights[f"{prefix}.v_proj.weight"],
+        weights[f"{prefix}.v_proj.bias"],
+    )
+    batch, query_len, hidden_size = query.shape
+    key_len = key.shape[1]
+    head_dim = hidden_size // num_heads
+    query = query.reshape(batch, query_len, num_heads, head_dim).transpose(1, 2)
+    key = key.reshape(batch, key_len, num_heads, head_dim).transpose(1, 2)
+    value = value.reshape(batch, key_len, num_heads, head_dim).transpose(1, 2)
+    scores = query @ key.transpose(-1, -2) * head_dim**-0.5
+    if causal:
+        mask = torch.ones(query_len, key_len, dtype=torch.bool).tril()
+        scores = scores.masked_fill(~mask, float("-inf"))
+    output = torch.softmax(scores, dim=-1) @ value
+    output = output.transpose(1, 2).reshape(batch, query_len, hidden_size)
+    return torch.nn.functional.linear(
+        output,
+        weights[f"{prefix}.out_proj.weight"],
+        weights[f"{prefix}.out_proj.bias"],
+    )
+
+
+def _nemotron_parse_torch_vision(
+    pixel_values: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Evaluate the tiny one-layer C-RADIO encoder and compression neck."""
+    prefix = "vision_encoder.model_encoder.radio_model.model"
+    patch_weight = weights[f"{prefix}.patch_generator.embedder.weight"].reshape(32, 3, 16, 16)
+    hidden = torch.nn.functional.conv2d(pixel_values, patch_weight, stride=16)
+    hidden = hidden.flatten(2).transpose(1, 2)
+    pos = weights[f"{prefix}.patch_generator.pos_embed"].reshape(1, 4, 4, 32)
+    hidden = hidden + pos[:, :2].reshape(1, 8, 32)
+    cls = weights[f"{prefix}.patch_generator.cls_token.token"].unsqueeze(0)
+    hidden = torch.cat((cls, hidden), dim=1)
+
+    block = f"{prefix}.blocks.0"
+    norm = torch.nn.functional.layer_norm(
+        hidden,
+        (32,),
+        weights[f"{block}.norm1.weight"],
+        weights[f"{block}.norm1.bias"],
+        1e-6,
+    )
+    qkv = torch.nn.functional.linear(
+        norm,
+        weights[f"{block}.attn.qkv.weight"],
+        weights[f"{block}.attn.qkv.bias"],
+    )
+    query, key, value = qkv.chunk(3, dim=-1)
+    batch, sequence, _ = query.shape
+    query = query.reshape(batch, sequence, 4, 8).transpose(1, 2)
+    key = key.reshape(batch, sequence, 4, 8).transpose(1, 2)
+    value = value.reshape(batch, sequence, 4, 8).transpose(1, 2)
+    attn = torch.softmax(query @ key.transpose(-1, -2) * 8**-0.5, dim=-1) @ value
+    attn = attn.transpose(1, 2).reshape(batch, sequence, 32)
+    attn = torch.nn.functional.linear(
+        attn,
+        weights[f"{block}.attn.proj.weight"],
+        weights[f"{block}.attn.proj.bias"],
+    )
+    hidden = hidden + attn
+    norm = torch.nn.functional.layer_norm(
+        hidden,
+        (32,),
+        weights[f"{block}.norm2.weight"],
+        weights[f"{block}.norm2.bias"],
+        1e-6,
+    )
+    mlp = torch.nn.functional.gelu(
+        torch.nn.functional.linear(
+            norm,
+            weights[f"{block}.mlp.fc1.weight"],
+            weights[f"{block}.mlp.fc1.bias"],
+        )
+    )
+    hidden = hidden + torch.nn.functional.linear(
+        mlp,
+        weights[f"{block}.mlp.fc2.weight"],
+        weights[f"{block}.mlp.fc2.bias"],
+    )
+
+    summary = hidden[:, [0, 1, 2]].reshape(batch, -1)
+    features = hidden[:, 8:]
+    features = torch.nn.functional.linear(
+        features,
+        weights["vision_encoder.conv1.weight"],
+        weights["vision_encoder.conv1.bias"],
+    )
+    features = torch.nn.functional.layer_norm(
+        features,
+        (64,),
+        weights["vision_encoder.layer_norm1.weight"],
+        weights["vision_encoder.layer_norm1.bias"],
+        1e-6,
+    )
+    features = features.reshape(batch, 2, 4, 64).permute(0, 3, 1, 2)
+    features = torch.nn.functional.conv2d(
+        features,
+        weights["vision_encoder.conv2.weight"],
+        stride=(1, 4),
+    )
+    features = features.permute(0, 2, 3, 1).reshape(batch, 2, 64)
+    features = torch.nn.functional.layer_norm(
+        features,
+        (64,),
+        weights["vision_encoder.layer_norm2.weight"],
+        weights["vision_encoder.layer_norm2.bias"],
+        1e-6,
+    )
+    summary = torch.nn.functional.linear(
+        summary,
+        weights["vision_encoder.sum_proj.weight"],
+        weights["vision_encoder.sum_proj.bias"],
+    )
+    summary = torch.nn.functional.layer_norm(
+        summary,
+        (64,),
+        weights["vision_encoder.layer_norm3.weight"],
+        weights["vision_encoder.layer_norm3.bias"],
+        1e-6,
+    )
+    return torch.cat((features, summary[:, None]), dim=1)
+
+
+def _nemotron_parse_torch_decoder(
+    input_ids: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    weights: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Evaluate the tiny one-layer pre-norm mBART decoder."""
+    hidden = torch.nn.functional.embedding(input_ids, weights["decoder.embed_tokens.weight"])
+    hidden = hidden * 8.0
+    hidden = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights["decoder.layernorm_embedding.weight"],
+        weights["decoder.layernorm_embedding.bias"],
+    )
+    layer = "decoder.layers.0"
+    residual = hidden
+    norm = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights[f"{layer}.self_attn_layer_norm.weight"],
+        weights[f"{layer}.self_attn_layer_norm.bias"],
+    )
+    hidden = residual + _nemotron_parse_torch_attention(
+        norm,
+        weights,
+        f"{layer}.self_attn",
+        num_heads=4,
+        causal=True,
+    )
+    residual = hidden
+    norm = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights[f"{layer}.encoder_attn_layer_norm.weight"],
+        weights[f"{layer}.encoder_attn_layer_norm.bias"],
+    )
+    hidden = residual + _nemotron_parse_torch_attention(
+        norm,
+        weights,
+        f"{layer}.encoder_attn",
+        num_heads=4,
+        key_value_states=encoder_hidden_states,
+    )
+    residual = hidden
+    hidden = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights[f"{layer}.final_layer_norm.weight"],
+        weights[f"{layer}.final_layer_norm.bias"],
+    )
+    hidden = torch.nn.functional.gelu(
+        torch.nn.functional.linear(
+            hidden,
+            weights[f"{layer}.fc1.weight"],
+            weights[f"{layer}.fc1.bias"],
+        )
+    )
+    hidden = residual + torch.nn.functional.linear(
+        hidden,
+        weights[f"{layer}.fc2.weight"],
+        weights[f"{layer}.fc2.bias"],
+    )
+    hidden = torch.nn.functional.layer_norm(
+        hidden,
+        (64,),
+        weights["decoder.layer_norm.weight"],
+        weights["decoder.layer_norm.bias"],
+    )
+    return hidden @ weights["decoder.embed_tokens.weight"].T
+
+
+def test_nemotron_parse_synthetic_parity():
+    """L3 parity for the full tiny vision encoder and cross-attentive decoder."""
+    from _test_configs import VL_CONFIGS
+
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    overrides = next(
+        overrides for model_type, overrides, _ in VL_CONFIGS if model_type == "nemotron_parse"
+    )
+    config = _base_config(**overrides)
+    _, pkg = _build_onnx_model("nemotron_parse", config)
+    decoder_layer_norms = [
+        node for node in pkg["decoder"].graph if node.op_type == "LayerNormalization"
+    ]
+    assert len(decoder_layer_norms) == 3 * config.num_decoder_layers + 2
+    assert all(
+        node.attributes["epsilon"].value == pytest.approx(1e-5) for node in decoder_layer_norms
+    )
+    rng = np.random.default_rng(42)
+    for model in pkg.values():
+        _fill_random_weights(model, rng)
+
+    weights: dict[str, torch.Tensor] = {}
+    for model in pkg.values():
+        for name, initializer in model.graph.initializers.items():
+            if initializer.const_value is not None and not name.startswith("const_"):
+                weights[name] = torch.from_numpy(initializer.const_value.numpy())
+
+    pixel_values = rng.standard_normal((1, 3, 32, 64)).astype(np.float32)
+    input_ids = np.array([[2, 7, 11]], dtype=np.int64)
+    torch_encoder = _nemotron_parse_torch_vision(torch.from_numpy(pixel_values), weights)
+    torch_logits = _nemotron_parse_torch_decoder(
+        torch.from_numpy(input_ids),
+        torch_encoder,
+        weights,
+    )
+
+    vision_session = OnnxModelSession(pkg["vision_encoder"])
+    decoder_session = OnnxModelSession(pkg["decoder"])
+    try:
+        onnx_encoder = vision_session.run({"pixel_values": pixel_values})["last_hidden_state"]
+        empty_cache = {
+            name: np.zeros((1, 4, 0, 16), dtype=np.float32)
+            for name in decoder_session.input_names
+            if name.startswith("past_key_values.")
+        }
+        onnx_logits = decoder_session.run(
+            {
+                "input_ids": input_ids,
+                "attention_mask": np.ones_like(input_ids, dtype=np.int64),
+                "encoder_hidden_states": onnx_encoder,
+                **empty_cache,
+            }
+        )["logits"]
+
+        unpadded_ids = np.array([[2, 7]], dtype=np.int64)
+        unpadded_logits = decoder_session.run(
+            {
+                "input_ids": unpadded_ids,
+                "attention_mask": np.ones_like(unpadded_ids, dtype=np.int64),
+                "encoder_hidden_states": onnx_encoder,
+                **empty_cache,
+            }
+        )["logits"]
+        padded_ids = np.array([[1, 1, 2, 7]], dtype=np.int64)
+        padded_logits = decoder_session.run(
+            {
+                "input_ids": padded_ids,
+                "attention_mask": np.array([[0, 0, 1, 1]], dtype=np.int64),
+                "encoder_hidden_states": onnx_encoder,
+                **empty_cache,
+            }
+        )["logits"]
+    finally:
+        vision_session.close()
+        decoder_session.close()
+
+    np.testing.assert_allclose(onnx_encoder, torch_encoder.numpy(), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(onnx_logits, torch_logits.numpy(), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(
+        unpadded_logits[:, -1],
+        padded_logits[:, -1],
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -781,6 +1445,23 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
     # 3. Create HF model
     hf_config = _create_hf_config(model_type, config_overrides)
     hf_model = _create_hf_model(model_type, hf_config, seed)
+    if model_type == "nemotron_h":
+        # Force correction bias to determine the selected experts. This catches
+        # implementations that incorrectly use biased scores as final weights.
+        for layer in hf_model.model.layers:
+            if getattr(layer, "block_type", None) != "moe":
+                continue
+            bias = layer.mixer.gate.e_score_correction_bias
+            with torch.no_grad():
+                bias.copy_(
+                    torch.linspace(
+                        4.0,
+                        1.0,
+                        bias.numel(),
+                        dtype=bias.dtype,
+                        device=bias.device,
+                    )
+                )
 
     # 4. Transfer HF weights to ONNX
     try:
@@ -788,6 +1469,8 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         for onnx_model in pkg.values():
             apply_weights(onnx_model, preprocessed)
     except Exception as e:
+        if model_type == "qwen4_exp_text":
+            raise
         pytest.skip(f"Weight transfer failed for {model_type}: {type(e).__name__}: {e}")
 
     # Fill any remaining unset initializers (ONNX constants, etc.)
@@ -795,12 +1478,8 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         _fill_random_weights(onnx_model, rng)
 
     # 5. Prepare inputs
-    # Mamba1 (layer_type="mamba") only supports single-token decode (seq_len=1)
-    # because SelectiveScan uses a sequential recurrence that squeezes the seq
-    # dimension.  Mamba2 and attention layers handle arbitrary seq_len.
-    layer_types = getattr(config, "layer_types", None) or []
-    has_mamba1 = "mamba" in layer_types
-    prefill_seq_len = 1 if has_mamba1 else 3
+    # Exercise multi-token prefill for both recurrent and attention architectures.
+    prefill_seq_len = 3
     input_ids = rng.integers(1, config.vocab_size, size=(1, prefill_seq_len)).astype(np.int64)
     attention_mask = np.ones_like(input_ids)
     position_ids = np.arange(input_ids.shape[1], dtype=np.int64)[np.newaxis, :]
@@ -830,6 +1509,11 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "position_ids": position_ids,
+        **(
+            {"past_position_ids": np.zeros((1, 0), dtype=np.int64)}
+            if model_type == "qwen4_exp_text"
+            else {}
+        ),
     }
     # Add zero-valued past KV cache feeds with correct shapes:
     # batch=1, past_sequence_len=0, other dims from model spec
@@ -849,12 +1533,14 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
                 shape.append(1)
             else:
                 shape.append(0)
-        feeds[name] = np.zeros(shape, dtype=np.float32)
+        feeds[name] = np.zeros(shape, dtype=inp.dtype.numpy())
 
     try:
         onnx_out = session.run(feeds)
     except Exception as e:
         session.close()
+        if model_type == "qwen4_exp_text":
+            raise
         pytest.skip(f"ONNX inference failed for {model_type}: {type(e).__name__}: {e}")
     onnx_logits = onnx_out["logits"]
     session.close()

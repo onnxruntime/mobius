@@ -30,15 +30,83 @@ Usage::
 
 from __future__ import annotations
 
-__all__ = ["process_tensors", "_reverse_permute"]
+__all__ = [
+    "PACKED_SAFE_PROCESSORS",
+    "process_tensors",
+    "_reverse_permute",
+    "needs_llama_qk_permute",
+    "LLAMA_QK_PERMUTE_MODEL_TYPES",
+]
 
 import logging
 from typing import Any
 
-import numpy as np
 import torch
 
+from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
+
 logger = logging.getLogger(__name__)
+
+#: mobius ``model_type`` values that no GGUF architecture maps to, but which
+#: still store Q/K with the llama.cpp interleaved-rope permutation, so a caller
+#: passing one directly must get the right answer.
+#:
+#: ``mistral`` is Llama-architecture; llama.cpp writes Mistral checkpoints with
+#: ``general.architecture = "llama"``, so no spec produces this model_type.
+_EXTRA_QK_PERMUTE_MODEL_TYPES = frozenset({"mistral"})
+
+# Model types whose GGUF Q/K weights are stored with llama.cpp's
+# interleaved-rope permutation and therefore require reverse-permutation
+# on import. These are the architectures whose llama.cpp converter calls
+# ``permute()`` on ``attn_q``/``attn_k`` (GGML "normal" rope).
+#
+# Qwen2/Qwen3, Gemma, GPT-2, Mamba, etc. use non-interleaved (NEOX-style)
+# rope and store Q/K in plain HF row order — applying the permute to them
+# scrambles the attention heads and produces garbage output. They must
+# NOT be reverse-permuted.
+#
+# Derived from the architecture registry so that declaring a new architecture
+# cannot leave this set behind.
+LLAMA_QK_PERMUTE_MODEL_TYPES = (
+    frozenset(
+        spec.model_type
+        for spec in iter_arch_specs()
+        if spec.llama_qk_permute and spec.model_type is not None
+    )
+    | _EXTRA_QK_PERMUTE_MODEL_TYPES
+)
+
+
+def needs_llama_qk_permute(model_type: str | None) -> bool:
+    """Return True if this model type needs llama.cpp Q/K reverse-permute."""
+    return model_type in LLAMA_QK_PERMUTE_MODEL_TYPES
+
+
+def _resolve_processor(config: Any) -> Any:
+    """Return the weight processor for *config*, or ``None``.
+
+    Dispatch prefers the GGUF architecture recorded on the config, because that
+    is the identity the registry is keyed on. Falling back to ``model_type`` is
+    what silently broke Gemma 3: its processor was registered under ``gemma3``
+    while GGUF ``gemma3`` resolves to model_type ``gemma3_text``, so the Gemma
+    norm un-offset never ran and every norm was left with llama.cpp's baked-in
+    ``+1`` on top of the ``OffsetRMSNorm`` the graph applies at runtime.
+
+    The ``model_type`` path is retained for callers that build a config without
+    going through :func:`gguf_to_config`.
+    """
+    gguf_arch = getattr(config, "_gguf_arch", None)
+    if gguf_arch is not None:
+        spec = try_get_arch_spec(gguf_arch)
+        if spec is not None:
+            name = spec.tensor_processor
+            return None if name is None else _PROCESSOR_IMPLS[name]
+
+    model_type = getattr(config, "model_type", None)
+    if model_type is None:
+        return None
+    name = _LEGACY_MODEL_TYPE_PROCESSORS.get(model_type)
+    return None if name is None else _PROCESSOR_IMPLS[name]
 
 
 def process_tensors(
@@ -47,9 +115,9 @@ def process_tensors(
 ) -> dict[str, torch.Tensor]:
     """Apply architecture-specific tensor transformations.
 
-    Dispatches to an architecture-specific processor based on
-    ``config.model_type``. If no processor is registered for the
-    model type, the state dict is returned unchanged.
+    Dispatches on the GGUF architecture recorded on *config*, falling back to
+    ``config.model_type``. If no processor applies, the state dict is returned
+    unchanged.
 
     Args:
         state_dict: HuggingFace-named state dict from GGUF import.
@@ -60,11 +128,7 @@ def process_tensors(
     Returns:
         The transformed state dict (modified in-place).
     """
-    model_type = getattr(config, "model_type", None)
-    if model_type is None:
-        return state_dict
-
-    processor = _PROCESSORS.get(model_type)
+    processor = _resolve_processor(config)
     if processor is None:
         return state_dict
 
@@ -80,7 +144,7 @@ def _process_llama(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Reverse-permute Q/K weights for Llama/Mistral.
+    """Reverse-permute Q/K weights and biases for Llama/Mistral.
 
     Reference: ``LlamaTensorProcessor`` in HF's
     ``modeling_gguf_pytorch_utils.py``.
@@ -95,13 +159,76 @@ def _process_llama(
             "num_attention_heads or num_key_value_heads not in config"
         )
         return state_dict
+    # Some pinned loaders accept a fused QKV tensor as an alternative to the
+    # split projections. Split it before applying the same inverse Q/K RoPE
+    # permutation used by the separate layout.
+    fused_qkv = [(name, tensor) for name, tensor in state_dict.items() if ".qkv_proj." in name]
+    if fused_qkv:
+        head_dim = int(config.head_dim)
+        q_width = int(num_heads) * head_dim
+        kv_width = int(num_kv_heads) * head_dim
+    for name, tensor in fused_qkv:
+        if tensor.shape[0] != q_width + 2 * kv_width:
+            raise ValueError(
+                f"Invalid fused QKV width for {name}: expected "
+                f"{q_width + 2 * kv_width}, got {tensor.shape[0]}"
+            )
+        query, key, value = tensor.split([q_width, kv_width, kv_width], dim=0)
+        prefix, suffix = name.rsplit(".qkv_proj.", 1)
+        state_dict[f"{prefix}.q_proj.{suffix}"] = query
+        state_dict[f"{prefix}.k_proj.{suffix}"] = key
+        state_dict[f"{prefix}.v_proj.{suffix}"] = value
+        del state_dict[name]
+
+    gguf_arch = getattr(config, "_gguf_arch", None)
+    spec = try_get_arch_spec(gguf_arch) if gguf_arch is not None else None
+    if not (
+        spec.llama_qk_permute
+        if spec is not None
+        else needs_llama_qk_permute(getattr(config, "model_type", None))
+    ):
+        return state_dict
 
     for name, tensor in state_dict.items():
-        if ".q_proj." in name and name.endswith(".weight"):
+        if ".q_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_heads)
-        elif ".k_proj." in name and name.endswith(".weight"):
+        elif ".k_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_kv_heads)
 
+    return state_dict
+
+
+def _process_bitnet(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Undo Q/K permutation and fold optional llama.cpp projection scales.
+
+    The pinned loader passes each optional scalar ``*.scale`` tensor to
+    ``build_lora_mm`` after dequantizing the stored weight. Mobius's float
+    ``Linear`` has no sidecar input, so multiplying the dequantized matrix by
+    that scalar preserves the same values exactly.
+    """
+    state_dict = _process_llama(state_dict, config)
+    scale_names = [name for name in state_dict if name.endswith(".scale")]
+    for scale_name in scale_names:
+        weight_name = scale_name.removesuffix(".scale") + ".weight"
+        if weight_name not in state_dict:
+            raise ValueError(f"BitNet scale tensor {scale_name!r} has no paired weight")
+        scale = state_dict[scale_name]
+        if scale.numel() != 1 or not torch.isfinite(scale).all():
+            raise ValueError(
+                f"BitNet scale tensor {scale_name!r} must be one finite scalar, "
+                f"got shape {tuple(scale.shape)}"
+            )
+        weight = state_dict[weight_name]
+        if weight.dim() != 2:
+            raise ValueError(
+                f"BitNet scaled projection {weight_name!r} must be rank 2, "
+                f"got shape {tuple(weight.shape)}"
+            )
+        state_dict[weight_name] = weight * scale.reshape(())
+        del state_dict[scale_name]
     return state_dict
 
 
@@ -111,10 +238,20 @@ def _reverse_permute(
 ) -> torch.Tensor:
     """Reverse the Q/K weight permutation applied by llama.cpp.
 
-    llama.cpp interleaves head dimensions as:
-        ``(n_head, dim, 2, ...) -> swapaxes(2,1) -> reshape``
+    llama.cpp's forward permute (``convert_hf_to_gguf.py``) is::
 
-    We reverse this to get standard HF layout.
+        weights.reshape(n_head, 2, dim, ...).swapaxes(1, 2).reshape(orig)
+
+    where ``dim = out_features // n_head // 2``. The exact inverse — and
+    the transform HF's ``modeling_gguf_pytorch_utils._reverse_permute_weights``
+    applies when loading GGUF — reshapes with ``dim`` and ``2`` swapped::
+
+        weights.reshape(n_head, dim, 2, ...).swapaxes(1, 2).reshape(orig)
+
+    Using the forward reshape order here (``(n_head, 2, dim)``) only
+    coincidentally inverts the permute when ``dim == 2`` (head_dim == 4);
+    for real head dims (e.g. 64) it scrambles the Q/K rows, corrupting
+    rope and producing garbage output.
 
     Args:
         weights: The Q or K projection weight tensor.
@@ -122,38 +259,111 @@ def _reverse_permute(
             for Q weights, ``num_key_value_heads`` for K weights.
     """
     dim = weights.shape[0] // n_head // 2
-    w = weights.reshape(n_head, 2, dim, *weights.shape[1:])
+    w = weights.reshape(n_head, dim, 2, *weights.shape[1:])
     return w.swapaxes(1, 2).reshape(weights.shape)
 
 
-def _process_gemma(
-    state_dict: dict[str, torch.Tensor],
-    config: Any,
+def _process_bloom(
+    state_dict: dict[str, torch.Tensor], config: Any
 ) -> dict[str, torch.Tensor]:
-    """Restore Gemma2/3 norm weights.
-
-    GGUF stores ``w_gguf = w_hf - 1`` for all norm weights.
-    Reference: ``Gemma2TensorProcessor`` in HF's
-    ``modeling_gguf_pytorch_utils.py``.
-    """
-    for name in list(state_dict):
-        if "norm" in name and name.endswith(".weight"):
-            state_dict[name] = state_dict[name] + 1
+    """Restore Bloom's head-interleaved HF QKV layout from canonical GGUF order."""
+    heads = int(config.num_attention_heads)
+    hidden = int(config.hidden_size)
+    for name, tensor in list(state_dict.items()):
+        if ".query_key_value." not in name:
+            continue
+        tail = tensor.shape[1:]
+        q, k, v = tensor.reshape(3, hidden, *tail)
+        state_dict[name] = torch.stack(
+            (
+                q.reshape(heads, -1, *tail),
+                k.reshape(heads, -1, *tail),
+                v.reshape(heads, -1, *tail),
+            ),
+            dim=1,
+        ).reshape(tensor.shape)
     return state_dict
 
 
-def _process_nemotron(
+def _process_xverse(
+    state_dict: dict[str, torch.Tensor], config: Any
+) -> dict[str, torch.Tensor]:
+    """Invert the pinned Xverse converter's architecture-specific Q/K transforms."""
+    q_heads = int(config.num_attention_heads)
+    kv_heads = int(config.num_key_value_heads)
+    for name, tensor in list(state_dict.items()):
+        if name.endswith(".q_proj.weight"):
+            heads = q_heads
+        elif name.endswith(".k_proj.weight"):
+            heads = q_heads // kv_heads if q_heads != kv_heads else q_heads
+        else:
+            continue
+        state_dict[name] = _reverse_permute(tensor, heads)
+    return state_dict
+
+
+def _process_unoffset_norm(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Restore Nemotron norm weights (same offset as Gemma).
+    """Undo the ``+1`` llama.cpp bakes into centered norm weights.
 
-    Reference: ``NemotronTensorProcessor`` in HF's
-    ``modeling_gguf_pytorch_utils.py``.
+    Several architectures scale by ``(1 + w)`` rather than by ``w``: Gemma's
+    ``Gemma*RMSNorm`` and Nemotron's ``NemotronLayerNorm1P`` both store ``w_hf``
+    in the HuggingFace checkpoint and add one at runtime. llama.cpp has no
+    offset norm, so its converters fold the constant in and write
+    ``w_gguf = w_hf + 1`` — see ``conversion/nemotron.py`` at the pinned commit
+    ("Adding +1 to LayerNorm's weights here to implement layernorm1p w/o
+    changing anything on the GGML engine side") and the Gemma equivalents.
+
+    The mobius graphs normalize with :class:`OffsetRMSNorm` /
+    :class:`OffsetLayerNorm`, which re-apply the ``1 +`` themselves, so the
+    initializer they consume must be the raw ``w_hf``. Subtract one to undo the
+    fold; otherwise the offset lands twice and every norm — hence the whole
+    model — is corrupted.
+
+    This matches HF's ``Gemma2TensorProcessor`` **and** ``NemotronTensorProcessor``
+    in ``modeling_gguf_pytorch_utils.py``, both of which subtract one. mobius
+    previously had a separate Nemotron processor that added one instead, leaving
+    Nemotron GGUF imports scaling by ``w_hf + 3`` instead of ``w_hf + 1``.
     """
     for name in list(state_dict):
         if "norm" in name and name.endswith(".weight"):
-            state_dict[name] = state_dict[name] + 1
+            state_dict[name] = state_dict[name] - 1
+    return state_dict
+
+
+def _process_muse_glimmer(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore Muse Glimmer's centered per-block norm weights.
+
+    Muse Glimmer's four per-block norms are *centered*: the HF checkpoint stores
+    ``w`` and the model multiplies by ``w + 1``. llama.cpp folds the ``+ 1`` in
+    at conversion time so its generic RMSNorm can use the tensor directly, so a
+    GGUF file holds ``w_gguf = w_hf + 1`` and importing it needs the offset
+    removed. This is the opposite direction from Gemma/Nemotron, which store
+    ``w_hf - 1``.
+
+    The final ``model.norm`` is a plain RMSNorm in this architecture and is
+    stored uncentered, so it must be left alone -- verified against the
+    published checkpoint, where ``model.norm.weight`` is centered on 0 while the
+    per-block norms are centered on 1.
+
+    Muse Glimmer's llama.cpp converter also stores Q/K with the interleaved-rope
+    permutation, on every layer including the NoPE (full-attention) ones, so the
+    llama reverse-permute has to run as well.
+    """
+    state_dict = _process_llama(state_dict, config)
+    for name in list(state_dict):
+        if not name.endswith(".weight"):
+            continue
+        if ".layers." not in name:
+            continue
+        if "layernorm" not in name:
+            continue
+        state_dict[name] = state_dict[name] - 1
     return state_dict
 
 
@@ -184,30 +394,413 @@ def _process_mamba(
 
     - ``conv1d.weight``: unsqueeze dim 1 (GGUF is 2D, HF is 3D)
     - ``A_log``: GGUF stores ``-exp(A_log)``; restore with ``log(-x)``
+    - Mamba2 ``A_log``/``D``: squeeze llama.cpp's trailing singleton axis
 
     Reference: ``MambaTensorProcessor`` in HF's
     ``modeling_gguf_pytorch_utils.py``.
     """
+    layer_types = getattr(config, "layer_types", None) or ()
+    is_mamba2 = config.model_type in {"mamba2", "falcon_h1"} or "mamba2" in layer_types
     for name, tensor in list(state_dict.items()):
         if "conv1d" in name and name.endswith(".weight"):
             if tensor.dim() == 2:
                 state_dict[name] = tensor.unsqueeze(1)
-        elif "A_log" in name:
-            state_dict[name] = torch.from_numpy(np.log(-tensor.numpy()))
+        elif name.endswith(".A_log"):
+            if not torch.all(tensor < 0):
+                raise ValueError(
+                    f"Malformed GGUF Mamba decay tensor {name!r}: "
+                    "ssm_a must contain only negative -exp(A_log) values"
+                )
+            tensor = torch.log(-tensor)
+            if is_mamba2 and tensor.dim() == 2 and tensor.shape[-1] == 1:
+                tensor = tensor.squeeze(-1)
+            state_dict[name] = tensor
+        elif is_mamba2 and name.endswith(".D") and tensor.dim() == 2 and tensor.shape[-1] == 1:
+            state_dict[name] = tensor.squeeze(-1)
+        elif is_mamba2 and name.endswith(".norm.weight") and tensor.dim() == 2:
+            state_dict[name] = tensor.flatten()
     return state_dict
 
 
-# Map model_type → processor function.
-# Architectures not listed here need no tensor transforms.
-_PROCESSORS: dict[str, Any] = {
+def _process_nemotron_h(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Invert both inherited GraniteHybrid attention and Mamba2 transforms."""
+    state_dict = _process_llama(state_dict, config)
+    return _process_mamba(state_dict, config)
+
+
+def _process_plamo2(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Apply PLaMo2's exact GGUF-to-graph value and shape transforms."""
+    state_dict = _process_mamba(state_dict, config)
+    # llama.cpp has already folded the official additive norm constants.
+    # Preserve those serialized float values exactly through model preprocessing.
+    config._plamo2_norms_are_folded = True
+    for name in tuple(state_dict):
+        if name.endswith(".dt_proj.bias"):
+            state_dict[name.removesuffix(".dt_proj.bias") + ".dt_bias"] = state_dict.pop(name)
+    return state_dict
+
+
+def _process_kimi_linear(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Invert the pinned Kimi Linear converter's recurrent tensor transforms."""
+    del config
+    for name in tuple(state_dict):
+        tensor = state_dict[name]
+        if name.endswith((".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight")):
+            if tensor.dim() != 4 or tensor.shape[0] != 1 or tensor.shape[2] != 1:
+                raise ValueError(
+                    f"Kimi Linear convolution tensor {name!r} must have shape "
+                    f"[1, channels, 1, kernel], got {tuple(tensor.shape)}"
+                )
+            state_dict[name] = tensor.reshape(tensor.shape[1], tensor.shape[3])
+        elif name.endswith(".A_log"):
+            if not torch.all(torch.isfinite(tensor)) or not torch.all(tensor < 0):
+                raise ValueError(
+                    f"Kimi Linear decay tensor {name!r} must contain finite negative values"
+                )
+            state_dict[name] = torch.log(-tensor)
+        elif name.endswith(".k_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi Linear K-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.transpose(1, 2).reshape(
+                tensor.shape[0] * tensor.shape[2], tensor.shape[1]
+            )
+        elif name.endswith(".v_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi Linear V-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.reshape(
+                tensor.shape[0] * tensor.shape[1], tensor.shape[2]
+            )
+    return state_dict
+
+
+def _process_split_mla_kv(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    fuse_for_expanded_graph: bool,
+) -> dict[str, torch.Tensor]:
+    """Restore split MLA K/V-B matrices to flat Linear row order."""
+    k_suffix = ".k_b_proj.weight"
+    v_suffix = ".v_b_proj.weight"
+    k_by_prefix = {
+        name[: -len(k_suffix)]: tensor
+        for name, tensor in state_dict.items()
+        if name.endswith(k_suffix)
+    }
+    v_by_prefix = {
+        name[: -len(v_suffix)]: tensor
+        for name, tensor in state_dict.items()
+        if name.endswith(v_suffix)
+    }
+    if set(k_by_prefix) != set(v_by_prefix):
+        missing_k = sorted(set(v_by_prefix) - set(k_by_prefix))
+        missing_v = sorted(set(k_by_prefix) - set(v_by_prefix))
+        raise ValueError(
+            "GLM-5.2 split K/V-B projections must be paired per layer: "
+            f"missing_k={missing_k}, missing_v={missing_v}"
+        )
+
+    for prefix in sorted(k_by_prefix):
+        key = k_by_prefix[prefix]
+        value = v_by_prefix[prefix]
+        if key.dim() != 3 or value.dim() != 3:
+            raise ValueError(
+                "GLM-5.2 split K/V-B tensors must both be rank 3, got "
+                f"{prefix + k_suffix!r} rank {key.dim()} and "
+                f"{prefix + v_suffix!r} rank {value.dim()}"
+            )
+        key = key.transpose(1, 2)
+        if not fuse_for_expanded_graph:
+            state_dict[prefix + k_suffix] = key.reshape(
+                key.shape[0] * key.shape[1], key.shape[2]
+            )
+            state_dict[prefix + v_suffix] = value.reshape(
+                value.shape[0] * value.shape[1], value.shape[2]
+            )
+            continue
+
+        if key.shape[0] != value.shape[0] or key.shape[2] != value.shape[2]:
+            raise ValueError(
+                f"GLM-5.2 split K/V-B tensors for {prefix!r} have incompatible shapes "
+                f"{tuple(key.shape)} and {tuple(value.shape)}"
+            )
+        del state_dict[prefix + k_suffix]
+        del state_dict[prefix + v_suffix]
+        state_dict[prefix + ".kv_b_proj.weight"] = torch.cat((key, value), dim=1).reshape(
+            -1, key.shape[2]
+        )
+    return state_dict
+
+
+def _process_glm_dsa(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore GLM-DSA split MLA weights for sparse or dense graph selection."""
+    return _process_split_mla_kv(
+        state_dict,
+        fuse_for_expanded_graph=not getattr(config, "use_dsa", True),
+    )
+
+
+def _process_mistral4(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore Mistral4 K/V-B matrices while retaining its split latent graph."""
+    del config
+    return _process_split_mla_kv(state_dict, fuse_for_expanded_graph=False)
+
+
+def _process_kimi_k3(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Invert Kimi-K3 recurrent and compressed-MLA converter transforms."""
+    del config
+    for name in tuple(state_dict):
+        tensor = state_dict[name]
+        if name.endswith((".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight")):
+            if tensor.dim() == 4 and tensor.shape[0] == 1 and tensor.shape[2] == 1:
+                state_dict[name] = tensor.reshape(tensor.shape[1], tensor.shape[3])
+            elif tensor.dim() == 3 and tensor.shape[0] == 1:
+                state_dict[name] = tensor.reshape(tensor.shape[1], tensor.shape[2])
+            else:
+                raise ValueError(
+                    f"Kimi-K3 convolution tensor {name!r} must use the pinned "
+                    f"[1, channels, 1, kernel] or [1, channels, kernel] layout, "
+                    f"got {tuple(tensor.shape)}"
+                )
+        elif name.endswith(".A_log"):
+            if not torch.all(torch.isfinite(tensor)) or not torch.all(tensor < 0):
+                raise ValueError(
+                    f"Kimi-K3 decay tensor {name!r} must contain finite negative values"
+                )
+            state_dict[name] = torch.log(-tensor)
+        elif name.endswith(".k_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi-K3 K-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.transpose(1, 2).reshape(
+                tensor.shape[0] * tensor.shape[2], tensor.shape[1]
+            )
+        elif name.endswith(".v_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi-K3 V-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.reshape(
+                tensor.shape[0] * tensor.shape[1], tensor.shape[2]
+            )
+        elif name.endswith(
+            (".attn_res_score.weight", ".ffn_res_score.weight", ".output_res_score.weight")
+        ):
+            if tensor.dim() != 1:
+                raise ValueError(
+                    f"Kimi-K3 residual score tensor {name!r} must be rank 1, "
+                    f"got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.unsqueeze(0)
+    return state_dict
+
+
+def _process_granitehybrid(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Invert Granite transforms and reconstruct fused shared/expert gate-up weights."""
+    state_dict = _process_llama(state_dict, config)
+    state_dict = _process_mamba(state_dict, config)
+
+    def fuse_pairs(
+        module_suffix: str,
+        tensor_suffix: str,
+        *,
+        rank: int,
+        dim: int,
+        label: str,
+    ) -> None:
+        gate_suffix = f"{module_suffix}gate_proj.{tensor_suffix}"
+        up_suffix = f"{module_suffix}up_proj.{tensor_suffix}"
+        prefixes = {
+            name.removesuffix(suffix)
+            for name in state_dict
+            for suffix in (gate_suffix, up_suffix)
+            if name.endswith(suffix)
+        }
+        for prefix in prefixes:
+            gate_name = f"{prefix}{gate_suffix}"
+            up_name = f"{prefix}{up_suffix}"
+            present = [name for name in (gate_name, up_name) if name in state_dict]
+            if len(present) != 2:
+                missing = up_name if gate_name in state_dict else gate_name
+                raise ValueError(f"GraniteHybrid {label} is missing paired tensor {missing!r}")
+            gate = state_dict[gate_name]
+            up = state_dict[up_name]
+            if gate.dim() != rank or up.dim() != rank or gate.shape != up.shape:
+                raise ValueError(
+                    f"GraniteHybrid {label} gate/up tensors must both have the same "
+                    f"rank-{rank} shape, got {gate_name}={tuple(gate.shape)} and "
+                    f"{up_name}={tuple(up.shape)}"
+                )
+            state_dict[f"{prefix}{module_suffix}input_linear.{tensor_suffix}"] = torch.cat(
+                (state_dict.pop(gate_name), state_dict.pop(up_name)), dim=dim
+            )
+
+    # HF splits every fused input projection into gate then up along its output
+    # dimension. Reconstruct exactly that order for dense/shared weights and biases.
+    fuse_pairs(".shared_mlp.", "weight", rank=2, dim=0, label="shared FFN weights")
+    fuse_pairs(".shared_mlp.", "bias", rank=1, dim=0, label="shared FFN biases")
+    # Routed experts add a leading expert axis: [E, F, H] -> [E, 2F, H].
+    fuse_pairs(
+        ".block_sparse_moe.",
+        "weight",
+        rank=3,
+        dim=1,
+        label="routed expert weights",
+    )
+    return state_dict
+
+
+def _plamo_unshuffle_q(tensor: torch.Tensor, config: Any) -> torch.Tensor:
+    """Invert the converter's ``[repeat, kv, head] -> [kv, repeat, head]`` Q shuffle."""
+    heads = int(config.num_attention_heads)
+    kv_heads = int(config.num_key_value_heads)
+    head_dim = int(config.head_dim)
+    hidden = int(config.hidden_size)
+    if heads % kv_heads:
+        raise ValueError("PLaMo Q shuffle requires query heads divisible by KV heads")
+    if tensor.dim() != 2 or tuple(tensor.shape) != (heads * head_dim, hidden):
+        raise ValueError(
+            "PLaMo Q projection must have shape "
+            f"{(heads * head_dim, hidden)}, got {tuple(tensor.shape)}"
+        )
+    repeat = heads // kv_heads
+    return (
+        tensor.reshape(kv_heads, repeat, head_dim, hidden)
+        .permute(1, 0, 2, 3)
+        .reshape(heads * head_dim, hidden)
+        .contiguous()
+    )
+
+
+def _plamo_unshuffle_output(tensor: torch.Tensor, config: Any) -> torch.Tensor:
+    """Invert the converter's output-input-head shuffle."""
+    heads = int(config.num_attention_heads)
+    kv_heads = int(config.num_key_value_heads)
+    head_dim = int(config.head_dim)
+    hidden = int(config.hidden_size)
+    if heads % kv_heads:
+        raise ValueError("PLaMo output shuffle requires query heads divisible by KV heads")
+    if tensor.dim() != 2 or tuple(tensor.shape) != (hidden, heads * head_dim):
+        raise ValueError(
+            "PLaMo output projection must have shape "
+            f"{(hidden, heads * head_dim)}, got {tuple(tensor.shape)}"
+        )
+    repeat = heads // kv_heads
+    return (
+        tensor.reshape(hidden, kv_heads, repeat, head_dim)
+        .permute(0, 2, 1, 3)
+        .reshape(hidden, heads * head_dim)
+        .contiguous()
+    )
+
+
+def _process_plamo(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore source PLaMo Q/output layouts after llama.cpp conversion."""
+    q_suffix = ".self_attn.q_proj.weight"
+    output_suffix = ".self_attn.o_proj.weight"
+    for name in tuple(state_dict):
+        if name.endswith(q_suffix):
+            state_dict[name] = _plamo_unshuffle_q(state_dict[name], config)
+        elif name.endswith(output_suffix):
+            state_dict[name] = _plamo_unshuffle_output(state_dict[name], config)
+    return state_dict
+
+
+# Named weight processors. The architecture registry refers to these by name,
+# which is why the table is keyed on the processor's own identity rather than on
+# a model_type. Every name here must be referenced by at least one architecture
+# spec, and every name a spec references must exist here; ``_arch_registry_test``
+# checks both directions, so an orphaned processor or a typo in a spec fails the
+# suite instead of silently doing nothing.
+#
+# NOTE: Qwen2/Qwen3 deliberately have no processor. Unlike Llama/Mistral,
+# llama.cpp does not permute Qwen Q/K weights (Qwen uses NEOX-style rope), so
+# reverse-permuting them corrupts the attention heads. See
+# ``LLAMA_QK_PERMUTE_MODEL_TYPES``.
+_PROCESSOR_IMPLS: dict[str, Any] = {
+    "bitnet": _process_bitnet,
     "llama": _process_llama,
-    "mistral": _process_llama,
-    "qwen2": _process_llama,
-    "qwen3": _process_llama,
-    "gemma": _process_gemma,
-    "gemma2": _process_gemma,
-    "gemma3": _process_gemma,
-    "nemotron": _process_nemotron,
+    "unoffset_norm": _process_unoffset_norm,
+    "muse_glimmer": _process_muse_glimmer,
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
+    "nemotron_h": _process_nemotron_h,
+    "plamo": _process_plamo,
+    "plamo2": _process_plamo2,
+    "granitehybrid": _process_granitehybrid,
+    "glm_dsa": _process_glm_dsa,
+    "mistral4": _process_mistral4,
+    "kimi_linear": _process_kimi_linear,
+    "kimi_k3": _process_kimi_k3,
+    "bloom": _process_bloom,
+    "xverse": _process_xverse,
+}
+
+# Processors in this set either touch only tensors that stay floating-point or
+# have an equivalent packed-domain transform in ``_builder._load_gguf_weights``.
+# Any architecture using another processor must reject ``keep_quantized=True``:
+# skipping a projection transform changes represented values even if the packed
+# bytes, scales, and zero-points individually remain well-formed.
+PACKED_SAFE_PROCESSORS = frozenset(
+    {
+        "kimi_k3",
+        "kimi_linear",
+        "llama",
+        "mamba",
+        "muse_glimmer",
+        "plamo2",
+        "unoffset_norm",
+    }
+)
+
+#: mobius ``model_type`` values that no GGUF architecture maps to, but that a
+#: caller may pass directly in a hand-built config.
+#:
+#: ``mistral`` is Llama-architecture (llama.cpp writes it as ``llama``).
+#: ``gemma3`` is the *multimodal* Gemma 3 model type; ``models/gemma3.py``
+#: normalizes with ``OffsetRMSNorm``, so it needs the Gemma un-offset. GGUF
+#: ``gemma3`` resolves to ``gemma3_text`` and is handled through its spec.
+_EXTRA_MODEL_TYPE_PROCESSORS: dict[str, str] = {
+    "mistral": "llama",
+    "gemma3": "unoffset_norm",
+}
+
+#: Fallback ``model_type`` → processor-name map for configs that did not come
+#: from :func:`~mobius.integrations.gguf._config_mapping.gguf_to_config` and so
+#: carry no ``_gguf_arch``. Derived from the registry, then extended.
+_LEGACY_MODEL_TYPE_PROCESSORS: dict[str, str] = {
+    **{
+        spec.model_type: spec.tensor_processor
+        for spec in iter_arch_specs()
+        if spec.model_type is not None and spec.tensor_processor is not None
+    },
+    **_EXTRA_MODEL_TYPE_PROCESSORS,
 }

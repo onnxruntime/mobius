@@ -21,6 +21,10 @@ class TestMakeProviderOptions:
         result = make_provider_options("cuda")
         assert len(result) == 1
         assert "cuda" in result[0]
+        assert result[0]["cuda"]["enable_cuda_graph"] == "1"
+
+    def test_cuda_model_override_disables_graph_capture(self):
+        result = make_provider_options("cuda", enable_graph_capture=False)
         assert result[0]["cuda"]["enable_cuda_graph"] == "0"
 
     def test_cuda_graph_capture_from_capability_flag(self):
@@ -86,6 +90,7 @@ class TestMakeProviderOptions:
         caps = ep_registry.get("openvino")
         assert caps is not None
         assert caps.supports_skip_layer_norm is False
+        assert caps.layered_per_layer_inputs is True
 
 
 class TestMakeSlidingWindowConfig:

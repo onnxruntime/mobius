@@ -14,8 +14,8 @@ from typing import ClassVar
 
 import onnx_ir as ir
 
-from mobius._diffusers_configs import VAEConfig
 from mobius._model_package import ModelPackage
+from mobius.integrations.diffusers._configs import VAEConfig
 from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 
 
@@ -76,6 +76,12 @@ class VAETask(ModelTask):
             hidden_states = module.post_quant_conv(op, hidden_states)
         hidden_states = module.decoder(op, latent_sample=hidden_states)
 
+        # The decoder upsamples by a fixed factor, but the factor is a property of the
+        # configured block stack rather than of the graph, so publish named image dims
+        # instead of anonymous inferred symbols.
+        hidden_states.shape = ir.Shape(
+            ["batch", config.out_channels, "image_height", "image_width"]
+        )
         builder.add_output(hidden_states, "sample")
 
         return _make_model(graph)

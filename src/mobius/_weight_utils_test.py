@@ -8,22 +8,64 @@ from __future__ import annotations
 import pytest
 import torch
 
+from mobius._configs import QuantizationConfig
 from mobius._weight_utils import (
+    is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
     preprocess_olive_weights,
+    preprocess_quantized_weights,
     rename_weight_keys,
     split_codegen_qkv,
     split_fused_qkv,
     split_gate_up_proj,
     split_interleaved_qkv,
+    stack_per_expert_moe_weights,
     strip_prefix,
     tie_word_embeddings,
     vlm_decoder_weights,
     vlm_embedding_weights,
     vlm_vision_weights,
 )
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("float_head", NotImplementedError, "requires quantize_lm_head=True"),
+        ("different_layout", ValueError, "must use the same quantization layout"),
+        ("missing_scales", ValueError, "missing Olive sidecars"),
+    ],
+)
+def test_split_tied_table_rejects_unsupported_materialization(case, error, message):
+    embedding = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_embeddings=True
+    )
+    head = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_lm_head=True
+    )
+    state_dict = {
+        "embedding.embed_tokens.weight_qweight": torch.zeros(32, 8, dtype=torch.uint8),
+        "embedding.embed_tokens.weight_scales": torch.ones(32, 1),
+    }
+    if case == "float_head":
+        head.quantize_lm_head = False
+    elif case == "different_layout":
+        head.bits = 8
+    else:
+        del state_dict["embedding.embed_tokens.weight_scales"]
+
+    with pytest.raises(error, match=message):
+        materialize_split_tied_olive_lm_head(
+            state_dict,
+            embed_key="embedding.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+            embedding_quantization=embedding,
+            head_quantization=head,
+        )
+    assert "decoder.lm_head.weight_qweight" not in state_dict
 
 
 class TestSplitFusedQKV:
@@ -510,6 +552,42 @@ class TestPreprocessGptqWeights:
         result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
         assert result["q_proj.scales"].shape == (self.N, self.N_GROUPS)
 
+    def test_expert_major_tensors_preserve_expert_axis(self):
+        num_experts = 64
+        sd = {
+            "experts.qweight": torch.randint(
+                0,
+                255,
+                (num_experts, self.K_PACKED, self.N),
+                dtype=torch.int32,
+            ),
+            "experts.qzeros": torch.randint(
+                0,
+                255,
+                (num_experts, max(1, self.N_GROUPS_PACKED), self.N),
+                dtype=torch.int32,
+            ),
+            "experts.scales": torch.randn(num_experts, self.N_GROUPS, self.N),
+        }
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+        assert result["experts.weight"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS,
+            self.BLOB_SIZE,
+        )
+        assert result["experts.zero_points"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS * self.BITS // 8,
+        )
+        assert result["experts.scales"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS,
+        )
+
     def test_non_gptq_keys_pass_through(self):
         t = torch.randn(4, 8)
         sd = {"model.embed_tokens.weight": t, "lm_head.weight": t.clone()}
@@ -538,21 +616,43 @@ class TestPreprocessOliveWeights:
 
     def test_qweight_renamed_and_reshaped_to_matmulnbits_weight(self):
         sd = {
-            "q_proj.qweight": torch.randint(0, 255, (self.N, self.PACKED_K), dtype=torch.uint8)
+            "q_proj.weight_qweight": torch.randint(
+                0, 255, (self.N, self.PACKED_K), dtype=torch.uint8
+            )
         }
 
         result = preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
 
         assert "q_proj.weight" in result
-        assert "q_proj.qweight" not in result
+        assert "q_proj.weight_qweight" not in result
         assert result["q_proj.weight"].shape == (self.N, self.N_BLOCKS, self.BLOB_SIZE)
         assert result["q_proj.weight"].dtype == torch.uint8
+
+    def test_fused_moe_qweight_renamed_and_reshaped(self):
+        """Fused MoE expert params (no nested ``.weight``) get ``.weight`` appended."""
+        num_experts = 4
+        sd = {
+            "mlp.experts.gate_up_proj_qweight": torch.randint(
+                0, 255, (num_experts, self.N, self.PACKED_K), dtype=torch.uint8
+            )
+        }
+
+        result = preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+        assert "mlp.experts.gate_up_proj.weight" in result
+        assert "mlp.experts.gate_up_proj_qweight" not in result
+        assert result["mlp.experts.gate_up_proj.weight"].shape == (
+            num_experts,
+            self.N,
+            self.N_BLOCKS,
+            self.BLOB_SIZE,
+        )
 
     def test_scales_orientation_is_preserved(self):
         scales = torch.randn(self.N, self.N_BLOCKS)
 
         result = preprocess_olive_weights(
-            {"q_proj.scales": scales}, bits=self.BITS, group_size=self.GROUP_SIZE
+            {"q_proj.weight_scales": scales}, bits=self.BITS, group_size=self.GROUP_SIZE
         )
 
         assert result["q_proj.scales"] is scales
@@ -561,11 +661,11 @@ class TestPreprocessOliveWeights:
         qzeros = torch.randint(0, 255, (self.N, self.N_BLOCKS // 2), dtype=torch.uint8)
 
         result = preprocess_olive_weights(
-            {"q_proj.qzeros": qzeros}, bits=self.BITS, group_size=self.GROUP_SIZE
+            {"q_proj.weight_qzeros": qzeros}, bits=self.BITS, group_size=self.GROUP_SIZE
         )
 
         assert "q_proj.zero_points" in result
-        assert "q_proj.qzeros" not in result
+        assert "q_proj.weight_qzeros" not in result
         assert torch.equal(result["q_proj.zero_points"], qzeros)
 
     def test_non_quantized_keys_pass_through(self):
@@ -579,7 +679,9 @@ class TestPreprocessOliveWeights:
 
     def test_non_uint8_qweight_raises(self):
         sd = {
-            "q_proj.qweight": torch.randint(0, 255, (self.N, self.PACKED_K), dtype=torch.int32)
+            "q_proj.weight_qweight": torch.randint(
+                0, 255, (self.N, self.PACKED_K), dtype=torch.int32
+            )
         }
 
         with pytest.raises(ValueError, match="Olive qweight must be uint8"):
@@ -587,7 +689,7 @@ class TestPreprocessOliveWeights:
 
     def test_non_uint8_qzeros_raises(self):
         sd = {
-            "q_proj.qzeros": torch.randint(
+            "q_proj.weight_qzeros": torch.randint(
                 0, 255, (self.N, self.N_BLOCKS // 2), dtype=torch.int32
             )
         }
@@ -599,10 +701,10 @@ class TestPreprocessOliveWeights:
     V = 64  # vocab size for embedding tests
 
     def test_embed_qweight_kept_2d(self):
-        """embed_tokens.qweight targets GatherBlockQuantized: keep 2-D uint8."""
+        """embed_tokens.weight_qweight targets GatherBlockQuantized: keep 2-D uint8."""
         qweight = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
         result = preprocess_olive_weights(
-            {"model.embed_tokens.qweight": qweight},
+            {"model.embed_tokens.weight_qweight": qweight},
             bits=self.BITS,
             group_size=self.GROUP_SIZE,
             quantize_embeddings=True,
@@ -614,31 +716,54 @@ class TestPreprocessOliveWeights:
     def test_embed_qzeros_renamed_to_zero_points(self):
         qzeros = torch.randint(0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.uint8)
         result = preprocess_olive_weights(
-            {"model.embed_tokens.qzeros": qzeros},
+            {"model.embed_tokens.weight_qzeros": qzeros},
             bits=self.BITS,
             group_size=self.GROUP_SIZE,
             quantize_embeddings=True,
         )
         assert "model.embed_tokens.zero_points" in result
-        assert "model.embed_tokens.qzeros" not in result
+        assert "model.embed_tokens.weight_qzeros" not in result
 
     def test_embed_non_uint8_qweight_raises(self):
         sd = {
-            "model.embed_tokens.qweight": torch.randint(
+            "model.embed_tokens.weight_qweight": torch.randint(
                 0, 255, (self.V, self.PACKED_K), dtype=torch.int32
             )
         }
         with pytest.raises(ValueError, match="Olive embedding qweight must be uint8"):
-            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=True
+            )
 
     def test_embed_non_uint8_qzeros_raises(self):
         sd = {
-            "model.embed_tokens.qzeros": torch.randint(
+            "model.embed_tokens.weight_qzeros": torch.randint(
                 0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.int32
             )
         }
         with pytest.raises(ValueError, match="Olive embedding qzeros must be uint8"):
-            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=True
+            )
+
+    def test_embed_qweight_with_quantize_embeddings_false_raises(self):
+        """quantize_embeddings=False must not silently accept a packed embedding key.
+
+        Regression test: previously this branch matched on key suffix alone
+        and ignored ``quantize_embeddings`` entirely, so a caller/config
+        mismatch (a packed embedding key present while the caller declares
+        the embedding float) would either sneak through unnoticed or, worse,
+        get incorrectly reshaped/renamed via the generic Linear branch.
+        """
+        sd = {
+            "model.embed_tokens.weight_qweight": torch.randint(
+                0, 255, (self.V, self.PACKED_K), dtype=torch.uint8
+            )
+        }
+        with pytest.raises(ValueError, match="quantize_embeddings=False"):
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=False
+            )
 
     # --- Tied LM head synthesis ---
 
@@ -652,9 +777,9 @@ class TestPreprocessOliveWeights:
         qzeros = torch.randint(0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.uint8)
         result = preprocess_olive_weights(
             {
-                "model.embed_tokens.qweight": qweight,
-                "model.embed_tokens.scales": scales,
-                "model.embed_tokens.qzeros": qzeros,
+                "model.embed_tokens.weight_qweight": qweight,
+                "model.embed_tokens.weight_scales": scales,
+                "model.embed_tokens.weight_qzeros": qzeros,
             },
             bits=self.BITS,
             group_size=self.GROUP_SIZE,
@@ -677,14 +802,27 @@ class TestPreprocessOliveWeights:
         )
         assert result["lm_head.weight"] is embed
 
+    def test_float_tie_fallback_uses_custom_keys(self):
+        embed = torch.randn(self.V, self.K)
+        result = preprocess_olive_weights(
+            {"decoder.model.embed_tokens.weight": embed},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            tie_word_embeddings=True,
+            embed_key="decoder.model.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+        )
+        assert result["decoder.lm_head.weight"] is embed
+        assert "lm_head.weight" not in result
+
     def test_untied_quantized_lm_head_not_overwritten(self):
-        """A present lm_head.qweight must not be replaced by embed synthesis."""
+        """A present lm_head.weight_qweight must not be replaced by embed synthesis."""
         lm_head = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
         embed = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
         result = preprocess_olive_weights(
             {
-                "lm_head.qweight": lm_head,
-                "model.embed_tokens.qweight": embed,
+                "lm_head.weight_qweight": lm_head,
+                "model.embed_tokens.weight_qweight": embed,
             },
             bits=self.BITS,
             group_size=self.GROUP_SIZE,
@@ -839,6 +977,197 @@ class TestPreprocessAwqWeights:
         sd = {"q_proj.qzeros": torch.zeros(1, self.N, dtype=torch.int32)}
         with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
             preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+
+class TestPreprocessQuantizedWeights:
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
+    def test_defers_ordinary_sidecars_without_changing_float_tying(self, quant_method):
+        quantization = QuantizationConfig(
+            bits=4, group_size=16, quant_method=quant_method, sym=False
+        )
+        if quant_method == "olive":
+            weight_key, scales_key = "layer.weight_qweight", "layer.weight_scales"
+            zeros_key = "layer.weight_qzeros"
+            packed = torch.arange(256).reshape(16, 16).to(torch.uint8)
+            scales = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+            zeros = torch.ones(16, 1, dtype=torch.uint8)
+        else:
+            weight_key, scales_key = "layer.qweight", "layer.scales"
+            zeros_key = "layer.qzeros"
+            shape = (4, 16) if quant_method == "gptq" else (32, 2)
+            packed = torch.arange(64, dtype=torch.int32).reshape(shape)
+            scales = torch.arange(32, dtype=torch.float32).reshape(2, 16)
+            zeros = torch.arange(4, dtype=torch.int32).reshape(2, 2)
+        embedding = torch.ones(8, 32)
+        state_dict = {
+            weight_key: packed,
+            scales_key: scales,
+            zeros_key: zeros,
+            "model.embed_tokens.weight": embedding,
+        }
+
+        result = preprocess_quantized_weights(
+            state_dict, quantization, tie_embeddings=True, defer_non_expert_sidecars=True
+        )
+
+        assert result[weight_key] is packed
+        assert result[scales_key] is scales
+        assert result[zeros_key] is zeros
+        assert result["lm_head.weight"] is embedding
+        assert "layer.weight" not in result
+        assert "lm_head.weight" not in state_dict
+
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
+    def test_dispatches_quantization_method(self, quant_method):
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method=quant_method)
+        if quant_method == "olive":
+            state_dict = {"layer.weight_qweight": torch.zeros(8, 16, dtype=torch.uint8)}
+        else:
+            state_dict = {"layer.qweight": torch.zeros(4, 8, dtype=torch.int32)}
+
+        result = preprocess_quantized_weights(state_dict, quantization)
+
+        assert result["layer.weight"].shape == (8, 2, 8)
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ["_qweight", "_scales", "_qzeros", ".qweight", ".scales", ".qzeros"],
+    )
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_rejects_packed_experts_for_unsupported_qmoe_abi(self, suffix, defer):
+        quantization = QuantizationConfig(bits=8, group_size=16, quant_method="olive")
+        state_dict = {
+            f"decoder.model.layers.0.mlp.experts.gate_up_proj{suffix}": torch.zeros(1)
+        }
+
+        with pytest.raises(ValueError, match="QMoE ABI"):
+            preprocess_quantized_weights(
+                state_dict,
+                quantization,
+                qmoe_target_path=".mlp",
+                defer_non_expert_sidecars=defer,
+            )
+
+    def test_rejects_unsupported_qmoe_quantization_method(self):
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method="gptq")
+        with pytest.raises(NotImplementedError, match="only supports QMoE export"):
+            preprocess_quantized_weights(
+                {},
+                quantization,
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive",),
+            )
+
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_per_expert_gptq_moe_produces_populated_fused_qmoe(self, defer):
+        """Per-expert GPTQ experts stack+pack into non-empty fused QMoE params.
+
+        This is the end-to-end guard for the per-expert -> fused-QMoE path:
+        a symmetric GPTQ MoE checkpoint whose routed experts are stored as
+        separate modules must yield populated ``fc1/fc2_experts_weights`` with a
+        leading expert axis, and leave no per-expert expert tensors behind.
+        """
+        quantization = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=True)
+        num_experts = 3
+        hidden, inter = 256, 128
+        prefix = "model.layers.0.mlp.experts"
+        state_dict: dict[str, torch.Tensor] = {}
+        for e in range(num_experts):
+            # gate/up: in=hidden(256), out=inter(128); down: in=inter(128), out=hidden(256)
+            for proj, k, n in (
+                ("gate_proj", hidden, inter),
+                ("up_proj", hidden, inter),
+                ("down_proj", inter, hidden),
+            ):
+                k_packed = k * 4 // 32
+                n_groups = k // 32
+                state_dict[f"{prefix}.{e}.{proj}.qweight"] = torch.randint(
+                    0, 255, (k_packed, n), dtype=torch.int32
+                )
+                state_dict[f"{prefix}.{e}.{proj}.scales"] = torch.randn(n_groups, n)
+
+        result = preprocess_quantized_weights(
+            state_dict,
+            quantization,
+            qmoe_target_path=".mlp",
+            defer_non_expert_sidecars=defer,
+        )
+
+        fc1 = result["model.layers.0.mlp.fc1_experts_weights"]
+        fc2 = result["model.layers.0.mlp.fc2_experts_weights"]
+        assert fc1.shape[0] == num_experts
+        assert fc2.shape[0] == num_experts
+        assert fc1.shape[1] == 2 * inter  # gate rows then up rows
+        assert fc2.shape[1] == hidden
+        assert fc1.numel() > 0 and fc2.numel() > 0
+        # No per-expert expert tensors survive the fusion.
+        assert not any(".experts." in k and ".gate_proj" in k for k in result)
+        assert not any(".experts." in k and ".down_proj" in k for k in result)
+
+    @pytest.mark.parametrize("flag", ["quantize_embeddings", "quantize_lm_head"])
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_rejects_quantized_embedding_or_lm_head(self, flag, defer):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            **{flag: True},
+        )
+        with pytest.raises(NotImplementedError, match="Quantized embeddings and LM heads"):
+            preprocess_quantized_weights(
+                {},
+                quantization,
+                reject_quantized_embeddings_lm_head=True,
+                defer_non_expert_sidecars=defer,
+            )
+
+    @pytest.mark.parametrize(
+        ("float_key", "suffix"),
+        [
+            (float_key, suffix)
+            for float_key in (
+                "decoder.model.embed_tokens.weight",
+                "decoder.lm_head.weight",
+            )
+            for suffix in (
+                "_qweight",
+                "_scales",
+                "_qzeros",
+                ".qweight",
+                ".scales",
+                ".qzeros",
+            )
+        ],
+    )
+    def test_rejects_packed_embedding_or_head_key_without_config_flags(
+        self, float_key, suffix
+    ):
+        owner = float_key.removesuffix(".weight")
+        packed_key = float_key + suffix if suffix.startswith("_") else owner + suffix
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method="gptq")
+
+        with pytest.raises(NotImplementedError, match="Packed checkpoint key") as error:
+            preprocess_quantized_weights(
+                {packed_key: torch.zeros(1)},
+                quantization,
+                reject_quantized_embeddings_lm_head=True,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
+
+        assert packed_key in str(error.value)
+
+    def test_ties_custom_float_keys(self):
+        embedding = torch.randn(8, 16)
+        result = preprocess_quantized_weights(
+            {"decoder.model.embed_tokens.weight": embedding},
+            None,
+            tie_embeddings=True,
+            embed_key="decoder.model.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+        )
+
+        assert result["decoder.lm_head.weight"] is embedding
 
 
 class TestMergeLoraWeights:
@@ -1049,3 +1378,142 @@ class TestSplitCodegenQKV:
         """mp_num that doesn't divide hidden raises ValueError."""
         with pytest.raises(ValueError, match="divisible"):
             split_codegen_qkv(torch.zeros(96, 32), num_heads=4, head_dim=8, mp_num=3)
+
+
+class TestStackPerExpertMoEWeights:
+    """Per-expert GPTQ/AWQ MoE tensors -> fused expert-major QMoE layout.
+
+    Runs on the MatMulNBits-reshaped layout produced by preprocess_gptq_weights:
+    ``.weight`` [N, n_blocks, blob], ``.scales`` [N, n_blocks].
+    """
+
+    NUM_EXPERTS = 4
+    HIDDEN = 8
+    INTER = 6
+    N_BLOCKS = 2
+    BLOB = 2  # bits=4 -> block_size/2
+
+    def _per_expert_state_dict(self):
+        prefix = "model.layers.0.mlp.experts"
+        sd = {}
+        # Deterministic distinct values so a permutation/gate-up swap is visible.
+        for e in range(self.NUM_EXPERTS):
+            for proj, out in (
+                ("gate_proj", self.INTER),
+                ("up_proj", self.INTER),
+                ("down_proj", self.HIDDEN),
+            ):
+                base = (e + 1) * 1000 + {"gate_proj": 0, "up_proj": 100, "down_proj": 200}[
+                    proj
+                ]
+                w = (
+                    (base + torch.arange(out * self.N_BLOCKS * self.BLOB))
+                    .reshape(out, self.N_BLOCKS, self.BLOB)
+                    .to(torch.uint8)
+                )
+                s = (
+                    (base + torch.arange(out * self.N_BLOCKS))
+                    .reshape(out, self.N_BLOCKS)
+                    .float()
+                )
+                sd[f"{prefix}.{e}.{proj}.weight"] = w
+                sd[f"{prefix}.{e}.{proj}.scales"] = s
+                sd[f"{prefix}.{e}.{proj}.bias"] = torch.zeros(out)
+        return sd, prefix
+
+    def test_stacks_into_fused_expert_major(self):
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+
+        gu_w = result[f"{prefix}.gate_up_proj.weight"]
+        gu_s = result[f"{prefix}.gate_up_proj.scales"]
+        dn_w = result[f"{prefix}.down_proj.weight"]
+
+        assert gu_w.shape == (self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS, self.BLOB)
+        assert gu_s.shape == (self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS)
+        assert dn_w.shape == (self.NUM_EXPERTS, self.HIDDEN, self.N_BLOCKS, self.BLOB)
+
+        # Per-expert biases/g_idx are dropped; no per-expert keys survive.
+        assert not any(".experts.0." in k for k in result)
+
+    def test_gate_first_then_up_ordering(self):
+        """fc1 rows must be [gate(0:inter); up(inter:2*inter)] per expert."""
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        gu_w = result[f"{prefix}.gate_up_proj.weight"]
+        for e in range(self.NUM_EXPERTS):
+            torch.testing.assert_close(
+                gu_w[e, : self.INTER], sd[f"{prefix}.{e}.gate_proj.weight"]
+            )
+            torch.testing.assert_close(
+                gu_w[e, self.INTER :], sd[f"{prefix}.{e}.up_proj.weight"]
+            )
+
+    def test_expert_axis_order_preserved(self):
+        """Stacking must preserve expert index order (catches permutation)."""
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        dn_w = result[f"{prefix}.down_proj.weight"]
+        for e in range(self.NUM_EXPERTS):
+            torch.testing.assert_close(dn_w[e], sd[f"{prefix}.{e}.down_proj.weight"])
+
+    def test_already_fused_is_noop(self):
+        """Olive-style fused expert-major tensors pass through unchanged."""
+        sd = {
+            "model.layers.0.mlp.experts.gate_up_proj.weight": torch.zeros(
+                self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS, self.BLOB
+            ),
+            "model.layers.0.mlp.experts.down_proj.weight": torch.zeros(
+                self.NUM_EXPERTS, self.HIDDEN, self.N_BLOCKS, self.BLOB
+            ),
+        }
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        assert result is sd
+
+    def test_non_expert_keys_pass_through(self):
+        sd, _prefix = self._per_expert_state_dict()
+        sd["model.embed_tokens.weight"] = torch.randn(4, 8)
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        assert torch.equal(
+            result["model.embed_tokens.weight"], sd["model.embed_tokens.weight"]
+        )
+
+
+class TestIsPackedQuantKey:
+    """Shared predicate for packed-quantization sidecar keys."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # Olive underscore convention (suffix on the parameter name).
+            "model.layers.0.mlp.experts.gate_up_proj_qweight",
+            "model.layers.0.mlp.experts.gate_up_proj_scales",
+            "model.layers.0.mlp.experts.down_proj_qzeros",
+            "model.layers.0.self_attn.q_proj.weight_qweight",
+            # GPTQ/AWQ dotted convention (sibling buffers of the module).
+            "model.layers.0.mlp.experts.0.gate_proj.qweight",
+            "model.layers.0.mlp.experts.0.gate_proj.scales",
+            "model.layers.0.mlp.experts.0.gate_proj.qzeros",
+        ],
+    )
+    def test_packed_keys_detected(self, key):
+        assert is_packed_quant_key(key)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # Float weights, including the fused MoE tensors that *are* split.
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.down_proj",
+            "model.layers.0.mlp.gate.weight",
+            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.block_sparse_moe.input_linear.weight",
+            # Already-unpacked names produced downstream by the preprocessors.
+            "model.layers.0.mlp.fc1_experts_weights",
+            "model.layers.0.self_attn.q_proj.zero_points",
+            # Suffix must be terminal, not merely present.
+            "model.layers.0.mlp.experts.gate_up_proj_qweight.extra",
+        ],
+    )
+    def test_unpacked_keys_rejected(self, key):
+        assert not is_packed_quant_key(key)

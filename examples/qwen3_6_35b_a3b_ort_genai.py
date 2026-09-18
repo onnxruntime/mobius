@@ -22,7 +22,7 @@ sessions with onnxruntime-genai providing only the tokenizer.
 
 Requirements::
 
-    pip install mobius-ai[ort-genai]
+    pip install mobius-onnx[ort-genai]
     # For INT4 quantization (Olive from source recommended):
     pip install -e /path/to/Olive cupy-cuda12x
 

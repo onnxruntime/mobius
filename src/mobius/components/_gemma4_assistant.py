@@ -205,10 +205,20 @@ class Gemma4AssistantAttention(nn.Module):
         if self.sliding_window and attention_mask is not None:
             from mobius._build_context import get_build_dtype
 
+            # The shared KV holds ``kv_len`` real positions, but ``attention_mask``
+            # is the target's full buffer-width mask (kv_len + 1 for the slot of
+            # the token being predicted — GQA consumes that extra slot via
+            # ``total_seq_len`` while the generic path passes only the shared KV
+            # as K). Slice the mask to ``kv_len`` so the additive bias width
+            # matches the Attention op's total_sequence_length (= K's seq dim);
+            # otherwise ORT rejects the model with an inconsistent
+            # total_sequence_length error.
+            kv_len = op.Shape(shared_key, start=2, end=3)  # [1] = shared KV seq len
+            mask_kv = op.Slice(attention_mask, [0], kv_len, [1], [1])  # [B, kv_len]
             attn_bias = create_attention_bias(
                 op,
                 input_ids=q,
-                attention_mask=attention_mask,
+                attention_mask=mask_kv,
                 sliding_window=self.sliding_window,
                 dtype=get_build_dtype(),
             )

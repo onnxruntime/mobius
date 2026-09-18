@@ -1,0 +1,20 @@
+model_id: "meta-models/Muse-Glimmer-30B"
+model_type: "muse_glimmer"
+revision: "97c77dff50b2797bcc558fa2d909761dbc575c59"
+task_type: "image-text-to-text"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+ci_skip_reason: "Muse Glimmer is a 30B dense model requiring about 60 GB of checkpoint storage and a large-memory GPU."
+notes: "Muse Glimmer 30B. Dynamic vision encoder + embedding mixer + gated text decoder."

@@ -8,8 +8,14 @@ import threading
 import onnx_ir as ir
 import pytest
 
-from mobius._build_context import build_context, ep_capabilities, get_build_dtype
-from mobius._execution_providers import EpCapabilities
+from mobius._build_context import (
+    build_context,
+    ep_capabilities,
+    get_build_dtype,
+    is_prefill_prefix_pruning_enabled,
+    prefill_prefix_pruning,
+)
+from mobius._execution_providers import EpCapabilities, ep_registry
 
 _CUDA_CAPABILITIES = EpCapabilities(
     name="cuda",
@@ -31,11 +37,19 @@ class TestBuildContextDefaults:
         """No context active → returns FLOAT."""
         assert get_build_dtype() == ir.DataType.FLOAT
 
+    def test_prefill_prefix_pruning_is_disabled(self):
+        assert not is_prefill_prefix_pruning_enabled()
+
     def test_default_capabilities_has_no_fusions(self):
         """Default EP has no GQA dtypes (portable ONNX)."""
         capabilities = ep_capabilities()
         assert len(capabilities.gqa_dtypes) == 0
         assert len(capabilities.qkv_pack_dtypes) == 0
+
+    def test_webgpu_capabilities_enable_fp16_gqa(self):
+        capabilities = ep_registry.require("webgpu")
+        assert ir.DataType.FLOAT16 in capabilities.gqa_dtypes
+        assert capabilities.supports_past_present_share_buffer
 
 
 class TestBuildContextScoping:
@@ -59,6 +73,11 @@ class TestBuildContextScoping:
             raise RuntimeError("deliberate")
         assert ep_capabilities().name == "default"
         assert get_build_dtype() == ir.DataType.FLOAT
+
+    def test_prefill_prefix_pruning_restored_after_context(self):
+        with prefill_prefix_pruning(True):
+            assert is_prefill_prefix_pruning_enabled()
+        assert not is_prefill_prefix_pruning_enabled()
 
 
 class TestBuildContextNesting:

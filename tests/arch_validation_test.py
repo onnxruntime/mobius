@@ -26,16 +26,18 @@ They require network access to download config.json from HuggingFace.
 
 from __future__ import annotations
 
+import builtins
 import logging
 
+import onnx_ir as ir
 import pytest
 
-from mobius._config_resolver import (
+from mobius._registry import registry
+from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _default_task_for_model,
     _try_load_config_json,
 )
-from mobius._registry import registry
 from mobius.tasks import get_task
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,8 @@ _GRAPH_ONLY_XFAILS: dict[str, str] = {
     "florence2": "Florence2 DaViT vision encoder is multi-stage (not standard ViT)",
     "got_ocr2": "VisionConfig missing without trust_remote_code",
     "janus": "VisionConfig.hidden_size missing without trust_remote_code",
+    "kimi_k3": "Selective MXFP4 compressed-tensors experts are unsupported by the "
+    "generic quantized-linear loader",
     "molmo": "VisionConfig missing without trust_remote_code",
     "ovis2": "VisionConfig missing without trust_remote_code",
 }
@@ -94,7 +98,7 @@ _PARSE_PARAMS = _build_arch_params({})
 _GRAPH_PARAMS = _build_arch_params(_GRAPH_ONLY_XFAILS)
 
 
-def _load_hf_config(model_id: str):
+def _load_hf_config(model_id: str, revision: str | None = None):
     """Load HF config using AutoConfig first, fallback to raw config.json.
 
     AutoConfig handles model-specific field mappings (e.g. GPT-2's
@@ -103,20 +107,81 @@ def _load_hf_config(model_id: str):
     """
     import transformers
 
+    class _MissingStrictDataclassClassValidationError(Exception):
+        """Sentinel that cannot match errors from older Hub installations."""
+
     try:
-        return transformers.AutoConfig.from_pretrained(model_id, trust_remote_code=False)
-    except (ValueError, OSError):
-        return _try_load_config_json(model_id)
+        from huggingface_hub import errors as hub_errors
+    except ImportError:
+        strict_validation_error = _MissingStrictDataclassClassValidationError
+    else:
+        strict_validation_error = getattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            _MissingStrictDataclassClassValidationError,
+        )
+
+    try:
+        return transformers.AutoConfig.from_pretrained(
+            model_id,
+            revision=revision,
+            trust_remote_code=False,
+        )
+    except (ValueError, OSError, strict_validation_error):
+        return _try_load_config_json(model_id, revision=revision)
 
 
-def _resolve_hf_config(hf_config):
+def test_load_hf_config_accepts_hub_without_errors_module(monkeypatch):
+    """Architecture validation supports older compatible Hub releases."""
+    import transformers
+
+    config = object()
+    import_module = builtins.__import__
+
+    def import_without_hub_errors(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "huggingface_hub" and "errors" in fromlist:
+            raise ImportError("No module named 'huggingface_hub.errors'")
+        return import_module(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_hub_errors)
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: config
+    )
+
+    assert _load_hf_config("test/qwen2") is config
+
+
+def _resolve_hf_config(hf_config, registration=None):
     """Resolve nested config wrappers (thinker, talker, text, llm, decoder).
 
     Mirrors the resolution logic in ``build()`` — some models
     wrap the actual config inside a parent config.
+
+    The generic ``decoder`` unwrap is skipped for a model whose registry entry
+    names its own ``config_class``: such a class consumes the *composite* config
+    and reads the sub-configs itself (Nemotron Parse reads both
+    ``config.decoder`` and ``config.encoder``). Unwrapping first hands it a
+    sub-config, which loses the parent's ``model_type``, so resolution falls back
+    to plain ``ArchitectureConfig``.
+
+    Only that branch. Production ``_select_primary_config`` has no generic
+    ``decoder`` unwrap at all — this harness added one — whereas the
+    ``talker``/``thinker``/``text``/``llm`` branches do mirror production and are
+    still needed by models that also declare a ``config_class`` (lfm2_vl,
+    muse_glimmer).
     """
     parent_config = hf_config
-    if hasattr(hf_config, "talker_config"):
+    owns_composite = (
+        registration is not None and getattr(registration, "config_class", None) is not None
+    )
+    architectures = getattr(hf_config, "architectures", None) or []
+    if (
+        getattr(hf_config, "model_type", None) == "vibevoice"
+        and architectures == ["VibeVoiceForASRStreamingTraining"]
+        and hasattr(hf_config, "decoder_config")
+    ):
+        hf_config = hf_config.decoder_config
+    elif hasattr(hf_config, "talker_config"):
         talker = hf_config.talker_config
         # Qwen3-Omni talker nests the real model config under text_config
         if hasattr(talker, "text_config"):
@@ -134,27 +199,30 @@ def _resolve_hf_config(hf_config):
     elif hasattr(hf_config, "llm_config"):
         # InternVL2 wraps the LLM config under llm_config
         hf_config = hf_config.llm_config
-    elif hasattr(hf_config, "decoder"):
+    elif hasattr(hf_config, "decoder") and not owns_composite:
         # VisionEncoderDecoder (TrOCR) wraps decoder config
         hf_config = hf_config.decoder
     return hf_config, parent_config
 
 
-def _build_graph(model_type: str, model_id: str):
-    """Download config, build ONNX graph, return ModelPackage.
+def _build_graph(model_type: str, model_id: str, *, revision: str | None = None):
+    """Download config, build ONNX graph, return ``(ModelPackage, task)``.
 
-    Uses get_task().build() directly (same pattern as build_graph_test.py)
+    Uses get_task().build() directly (same pattern as the L1 graph tests)
     to bypass ArchitectureConfig.validate() which rejects non-LM configs
     (e.g. vision models with vocab_size=0).
     """
-    hf_config = _load_hf_config(model_id)
+    registration = registry.get_registration(model_type)
+    hf_config = _load_hf_config(
+        model_id,
+        revision=registration.test_revision if revision is None else revision,
+    )
     if hf_config is None:
         pytest.skip(
             f"Cannot download config for {model_id} (gated/private model or network error)"
         )
 
-    hf_config, parent_config = _resolve_hf_config(hf_config)
-    registration = registry.get_registration(model_type)
+    hf_config, parent_config = _resolve_hf_config(hf_config, registration)
     config = _config_from_hf(
         hf_config,
         parent_config=parent_config,
@@ -164,7 +232,7 @@ def _build_graph(model_type: str, model_id: str):
     module = registration.module_class(config)
     task_name = registration.task or _default_task_for_model(model_type)
     task = get_task(task_name)
-    return task.build(module, config)
+    return task.build(module, config), task
 
 
 @pytest.mark.arch_validation
@@ -179,7 +247,8 @@ class TestArchValidation:
     @pytest.mark.parametrize("model_type,model_id", _PARSE_PARAMS)
     def test_config_downloads_and_parses(self, model_type: str, model_id: str):
         """Verify config.json can be downloaded and parsed."""
-        hf_config = _load_hf_config(model_id)
+        revision = registry.get_registration(model_type).test_revision
+        hf_config = _load_hf_config(model_id, revision=revision)
         if hf_config is None:
             pytest.skip(
                 f"Cannot download config for {model_id} (gated/private model or network error)"
@@ -195,7 +264,7 @@ class TestArchValidation:
         shape mismatches, missing fields, or initialization errors, this
         test will catch them.
         """
-        pkg = _build_graph(model_type, model_id)
+        pkg, task = _build_graph(model_type, model_id)
 
         # Validate: every component has a non-empty graph
         assert len(pkg) > 0, "ModelPackage is empty"
@@ -205,6 +274,16 @@ class TestArchValidation:
             assert len(nodes) > 0, f"{component_name} has no nodes"
             assert len(model.graph.inputs) > 0, f"{component_name} has no inputs"
             assert len(model.graph.outputs) > 0, f"{component_name} has no outputs"
+
+        # Every component the task builds must declare a role. An undeclared
+        # component falls back to the "decoder" role in build_from_module and
+        # would be handed fusion passes meant for attention stacks, and
+        # inspect_components would not report it at all.
+        undeclared = sorted(set(pkg) - set(task.model_roles or {}))
+        assert not undeclared, (
+            f"{model_type}: components {undeclared} are built but missing from "
+            f"{type(task).__name__}.model_roles"
+        )
 
         del pkg
 
@@ -216,10 +295,16 @@ class TestArchValidation:
         inputs/outputs are defined. Note: output type info may not be
         available for all outputs when building without shape inference.
         """
-        pkg = _build_graph(model_type, model_id)
+        pkg, task = _build_graph(model_type, model_id)
+        roles = task.model_roles or {}
 
         for component_name, model in pkg.items():
-            # Model should have initializers (parameters)
+            # Model should have initializers (parameters). "glue" components are
+            # parameter-free loop wiring — they read every tensor they use from
+            # a graph input, so they hold only hoisted constants (if anything)
+            # and the parameter check does not apply.
+            if roles.get(component_name) == "glue":
+                continue
             initializers = list(model.graph.initializers)
             assert len(initializers) > 0, (
                 f"{component_name} has no initializers — graph may be missing parameters"
@@ -234,6 +319,60 @@ class TestArchValidation:
                 assert output.name, f"{component_name} has an unnamed output"
 
         del pkg
+
+    @pytest.mark.parametrize(
+        ("model_id", "revision", "hidden_size", "q_heads", "kv_heads", "tied_embeddings"),
+        (
+            (
+                "microsoft/VibeVoice-ASR-Streaming-1.5B",
+                "4262d23d8a539a6530cf64fbd0b1751ef9a30853",
+                1536,
+                12,
+                2,
+                True,
+            ),
+            (
+                "microsoft/VibeVoice-ASR-Streaming-7B",
+                "60d858b518b4e19d404af3737f848fc185b30177",
+                3584,
+                28,
+                4,
+                False,
+            ),
+        ),
+    )
+    def test_vibevoice_asr_pinned_variants_build(
+        self,
+        model_id: str,
+        revision: str,
+        hidden_size: int,
+        q_heads: int,
+        kv_heads: int,
+        tied_embeddings: bool,
+    ):
+        """Build both official streaming-ASR variants from their pinned configs."""
+        pkg, task = _build_graph(
+            "VibeVoiceForASRStreamingTraining",
+            model_id,
+            revision=revision,
+        )
+
+        config = pkg.config
+        assert config.hidden_size == hidden_size
+        assert config.num_attention_heads == q_heads
+        assert config.num_key_value_heads == kv_heads
+        assert config.tie_word_embeddings is tied_embeddings
+        assert config.dtype == ir.DataType.FLOAT
+        assert config.acoustic_tokenizer.hidden_size == 64
+        assert config.semantic_tokenizer.hidden_size == 128
+        assert config.compression_ratio == 3200
+        assert config.sampling_rate == 24_000
+        assert set(pkg) == {"audio_encoder", "embedding", "decoder"}
+        assert task.model_roles == {
+            "audio_encoder": "encoder",
+            "embedding": "embedding",
+            "decoder": "decoder",
+        }
 
 
 class TestRegistryConsistency:

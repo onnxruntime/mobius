@@ -1,0 +1,31 @@
+{
+  "model_id": "nvidia/NVIDIA-Nemotron-Parse-2.0",
+  "prompt": "</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>",
+  "generated_tokens": [
+    50251,
+    51312,
+    25,
+    7671,
+    6134,
+    3718,
+    41839,
+    31347,
+    1778,
+    5152,
+    50630,
+    51346,
+    52316,
+    221,
+    221,
+    50251,
+    51361,
+    68,
+    390,
+    26070,
+    36360,
+    243,
+    40,
+    2
+  ],
+  "generated_text": "<x_0.2344><y_0.2164># MOBIUS OCR VALIDATION<x_0.6045><y_0.243><class_Title>\n\n<x_0.2344><y_0.2547>Nemotron Parse 2</s>"
+}

@@ -85,7 +85,7 @@ def main():
     except ImportError:
         print(
             "Error: mobius is not installed.\n"
-            "Install with: pip install mobius-ai[transformers]",
+            "Install with: pip install mobius-onnx[transformers]",
             file=sys.stderr,
         )
         sys.exit(1)

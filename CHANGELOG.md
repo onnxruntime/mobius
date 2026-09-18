@@ -7,20 +7,392 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Text-only export for multimodal Gemma 4 (`--text-only`)
+### GPT-OSS MXFP4 export
 
 #### Added
 
-- `build(text_only=True)` and the `mobius build --text-only` CLI flag export the
+- GPT-OSS MXFP4 checkpoints now preserve their native block/scales storage by
+  default through bounded safetensors streaming. `--model` and local
+  `--config` builds use the same CUDA f16/bf16 contract and transactional
+  package publication.
+- `--dequantize` explicitly selects the portable dense GPT-OSS graph. Dense
+  MXFP4 reconstruction eagerly loads and converts the checkpoint and can
+  require substantial host memory; native streaming remains the default.
+
+### Per-component quantized checkpoint loading
+
+#### Added
+
+- Multi-component checkpoints may declare an authoritative
+  `component_quantization` mapping with independent affine layouts for decoder,
+  encoder, vision, audio, and embedding components. Exact and regex
+  `modules_to_not_convert` rules are evaluated for each component-local module
+  against its HuggingFace source name, so selected projections remain floating
+  point while the rest of the component binds existing packed weights.
+- Mobius validates and normalizes existing Olive, GPTQ, and AWQ sidecars per
+  component. It does not quantize floating-point checkpoint weights.
+- Gemma4, Qwen3.5/QMoE, and T5 adapters preserve their architecture-specific
+  rename, tied-weight, and expert-packing semantics while handing independently
+  routed component sidecars to the generic codec and binding validator.
+- OpenVINO Gemma4 exports keep the layer and projection dimensions separate in
+  `per_layer_inputs` between the embedding and decoder components. Other
+  execution providers retain the existing flattened layout.
+
+#### Fixed
+
+- Local `--config` builds use the shared Transformers builder rather than a
+  duplicate model/weight loader, preserving per-component normalization,
+  GPT-OSS MXFP4 policies, and `--dequantize`/`--no-weights` behavior.
+- Component rewrites preserve learned positional embeddings and deliberately
+  floating-point shared-expert gates. Input token-table selection respects
+  source aliases rather than quantizing every embedding module.
+- Ordinary decoder sidecars, including Qwen3.5 text, MoE, and VL weights, remain
+  raw until per-projection overrides are resolved. QMoE expert packing and
+  float table tying remain in the shared compatibility preprocessor.
+- Graph construction and normalization agree on legacy module rules for any
+  single-component manifest, not only packages using the `model` key.
+- The binding gate also covers model-wide affine configurations. Orphan packed
+  sidecars are rejected without rejecting complete canonical affine or QMoE groups.
+- Dynamic component source resolvers use the available HuggingFace model type
+  instead of receiving an empty identifier. Configs without a model type retain
+  static component metadata and config-based aliases, including T5 layer mappings.
+- Split tied tables already materialized by a model adapter load into their
+  quantized embedding and LM-head targets instead of being rejected solely
+  because the checkpoint declares tied weights.
+- Literal quantization exclusions and overrides respect module-path boundaries
+  rather than accidentally matching similarly named layers or unrelated paths.
+- The compatibility weight normalizer requires an explicit task and reports a
+  clear error if it is missing.
+- Raw GPTQ/AWQ scales are no longer mistaken for already-normalized parameters.
+  Canonical detection requires a complete group with the target layout, and
+  zero-point requirements follow each projection's effective symmetry.
+- Independently quantized embedding tables retain the two-dimensional
+  `GatherBlockQuantized` layout instead of being packed as linear projections.
+- Graph construction and loading honor model-declared float exclusions and
+  output heads, including Qwen3.5-MoE and Whisper. Legacy global module rules
+  no longer fail when the component mapping is absent.
+- Gemma4 preserves raw component sidecars until per-projection normalization,
+  and T5 maps local projections back to their HuggingFace names, so component
+  and projection overrides select the same layout for graph and weights.
+- Sparse per-layer configuration dictionaries preserve the default attention
+  head dimension and KV-head count instead of replacing them with overrides
+  declared for only a subset of layers.
+
+### Packed fused MoE experts (Olive/GPTQ/AWQ) survive HF weight renaming
+
+#### Fixed
+
+- MoE exports whose routed experts go through the fused `com.microsoft::QMoE`
+  packer (`qwen3_moe`, Mixtral, OLMoE, Qwen2-MoE, Ernie4.5-MoE, GLM4-MoE) no
+  longer fail on **packed quantized** fused expert tensors.
+  `_rename_moe_expert_weights` matched packed sidecars by substring
+  (`.experts.gate_up_proj` also matches `experts.gate_up_proj_qweight`) and
+  split them as if they were float weights, writing the `qweight`, `scales` and
+  `qzeros` of one projection to the *same* per-expert `.weight` key — so only
+  the last one survived, and the restacked tensor no longer matched the QMoE
+  parameter, aborting the export at weight binding:
+
+  ```
+  ValueError: Weight shape mismatch for 'model.layers.0.mlp.fc1_experts_weights':
+  model expects [4, 64, 32], got [4, 256]
+  ```
+
+  Packed tensors now pass through untouched and reach
+  `pack_qmoe_expert_weights` in the expert-major layout it expects (Qwen3-MoE
+  Olive int4: `[128, 1536, 1024]` uint8 weights + `[128, 1536, 16]` bf16
+  scales). Unquantized fused experts still un-fuse into the dense per-expert
+  fallback.
+
+#### Added
+
+- `mobius._weight_utils.is_packed_quant_key` plus the shared
+  `OLIVE_PACKED_QUANT_SUFFIXES` / `DOTTED_PACKED_QUANT_SUFFIXES` /
+  `PACKED_QUANT_SUFFIXES` constants: one predicate for
+  `_qweight`/`_scales`/`_qzeros` (Olive) and `.qweight`/`.scales`/`.qzeros`
+  (GPTQ/AWQ) sidecar keys, reused by `preprocess_quantized_weights`.
+
+---
+
+### Qwen3-MoE packages load in ONNX Runtime GenAI
+
+#### Fixed
+
+- Exported `qwen3_moe` packages no longer fail to load with
+  `RuntimeError: Unsupported model_type in config.json: qwen3_moe`.
+  `_ORT_GENAI_MODEL_TYPE` had no `qwen3_moe` entry, so `--config` mode wrote
+  the HuggingFace type straight into `genai_config.json` and ORT GenAI
+  rejected it (its LLM type registry has no `qwen3_moe`). Qwen3-MoE now
+  resolves to the accepted `qwen3` type: both `qwen2` and `qwen3` dispatch to
+  ORT GenAI's `DecoderOnly_Model`, but its tokenizer tag fallback
+  (`tokenizer_tag_utils.cpp`) only supplies the Qwen3 reasoning-token IDs
+  (`bor` 151667 / `eor` 151668) for `qwen3` — under `qwen2` they are absent and
+  `tokenizer.bor_token_id` / `eor_token_id` throws. The pre-existing dense
+  `qwen3 -> qwen2` alias is unchanged.
+
+---
+
+### Fixed
+
+- An exported graph is no longer transcribed into its own workflow component.
+  A component backed by a shipped `.onnx` file now declares only `ports.roles`;
+  the artifact answers every question about which ports exist and what shape
+  they have, and the runtime resolves them against the live session. The
+  removed block was a second statement of the same ABI with nothing keeping the
+  two in agreement — the same defect as `model.io`, one level down. Package
+  validation and runtime conformance both stay at 11/11 against the pinned ONNX
+  GenAI branch, and the contract tests now resolve every role, invocation
+  binding and state pair against the graph itself rather than against the
+  metadata's agreement with a copy of itself, which is a strictly stronger
+  check.
+
+  Policy graphs keep their contracts, and that boundary was measured rather
+  than assumed: a workflow value inherits its dtype, rank and request axis from
+  the port that produced it, so dropping them left row-wise emits untyped and
+  made 4 of the 11 packages invalid. Those contracts type the workflow's own
+  dataflow; they do not describe an external interface.
+
+- Deep decoders are now covered where the cache layer annotation actually
+  matters. Every metadata package built in the test suite had two layers, and
+  below ten a cell label sorts identically whether ordered lexicographically,
+  numerically or by insertion — so a `layer` derived from a cell's position
+  rather than parsed from its port name would have passed every assertion while
+  transposing caches on any real model. `canonical_workflow_contract_test` now
+  builds twelve-layer dynamic, static-cache and hybrid decoders and pins that
+  the declared layer restates the port name, that ordering by it recovers the
+  buffer lists, and that a hybrid's alternating groups own layers their cells'
+  positions never equal. A producer that dropped the parse leaves the 101
+  pre-existing assertions green and fails seven of these.
+
+- Every component a task builds now declares an optimization role. Qwen3-TTS's
+  four loop-wiring graphs (`code_predictor_prefill`,
+  `code_predictor_step_embedder`, `code_predictor_indices`, `talker_text_step`)
+  were absent from `TTSTask.model_roles`, so `build_from_module` fell back to
+  the `"decoder"` role and offered them the GQA / QKV-packing passes meant for
+  attention stacks, and `inspect_components` under-reported the package by four
+  components. They now declare a `"glue"` role: a parameter-free graph that
+  reads every tensor it uses from a graph input. `arch_validation_test` fails
+  any task that builds a component it does not declare, and a network-free unit
+  test pins the same invariant for Qwen3-TTS.
+
+### One canonical serialized representation
+
+#### Changed
+
+- **`pipeline.workflow` is now the only place a package describes its graph
+  ABI.** No export emits `model.io`, including a bare single-file decoder: that
+  case is a one-component workflow, not a different kind of document. `model`
+  keeps package-wide geometry and capabilities and nothing else. Two writable
+  statements of one fact are a defect whatever they contain — nothing forces
+  them to agree, and a reader of either never learns the other exists — so a
+  runtime that wants an optimized single-graph path derives it by lowering the
+  workflow instead. Verified end to end: the ONNX GenAI runtime executes the
+  fixed-capacity decode path from the workflow alone, with no `model.io` in the
+  package.
+
+#### Added
+
+- An ONNX component that ships an artifact declares no port contracts. The
+  `.onnx` file travels inside the package and is authoritative for which ports
+  exist and what each one's dtype, rank and shape is, so transcribing that into
+  YAML would be a second writable statement of one fact — the very thing this
+  section removes — sitting one level below `model.io` rather than beside it.
+  The runtime resolves ports against the live session, which catches a name the
+  graph does not expose instead of agreeing with a stale echo of it. A
+  producer-synthesized policy graph is the exception and states its contracts,
+  because a workflow value takes its dtype, rank and request axis from the port
+  that produced it: those contracts are the dataflow's type annotations, not a
+  description of an external interface.
+- Every ONNX component declares `ports.roles`: what it *does* with a value bound
+  to a port. An invocation records which SSA value reaches a port, not whether
+  that port is tokens, a mask or logits. Mobius mints these port names in its own
+  task builders, so it states the mapping (`input_ids`→`token_ids`,
+  `inputs_embeds`, `attention_mask`, `position_ids`, `logits`,
+  `last_hidden_state`→`hidden_states`, `encoder_hidden_states`,
+  `audio_features`) rather than inferring it. A port outside that vocabulary
+  carries no role.
+- State port aliases declare `role` (`key`/`value`) and `layer`. A layer's key
+  and value buffers are the same dtype and shape, and a cell's label sorts
+  lexicographically so `cache_10` precedes `cache_2` — pairing per-layer buffers
+  positionally would silently transpose two layers' caches. Both fields are
+  emitted together or not at all, so a recurrent or convolution cache is never
+  given a fabricated index.
+- `IndexedScatter.kv_length_ports` names the port carrying the graph-visible
+  valid length, beside the existing `write_indices_ports`. The two control
+  vectors are both rank-1 integers and are therefore indistinguishable by shape;
+  with both named, the whole fixed-capacity ABI is recoverable from the workflow.
+- `tests/canonical_workflow_contract_test.py` pins the invariant. It asks one
+  set of shape-agnostic questions of dynamic, static-cache, FP8, heterogeneous
+  and composite packages — and of all 11 checked-in fixtures — so a future
+  feature cannot grow its own top-level block while every feature-specific test
+  keeps passing.
+
+### Fixed-capacity (static) KV cache and FP8 KV cache metadata
+
+#### Added
+
+- `--features static-cache` now produces onnx-genai metadata instead of being
+  refused. The producer publishes the write cursor (`write_indices`), the valid
+  length (`nonpad_kv_seqlen`), the fixed-capacity buffer contracts, the
+  per-layer input/output pairs, and an `indexed_scatter` state-service update
+  discipline naming the cursor, the capacity and the per-component port that
+  carries it. The buffers are declared as `recurrence: {kind: invariant}` loop
+  cells and the capacity as a `package.cache_capacity` literal workflow input.
+  Nothing dispatches on model name; the ports are read from the graph.
+- Heterogeneous caches keep their own disciplines. Gemma 4's sliding layers stay
+  on a growing rank-4 BNSH cache while its full-attention layers use rank-3
+  fixed-capacity buffers, and only the layers that own a buffer bind ports in a
+  state group — its KV-shared suffix owns none.
+- A `static_cache` package joined the checked-in onnx-genai conformance
+  fixtures, so the engine exercises the fixed-capacity carry and the write
+  cursor rather than only the growing-tensor path.
+
+#### Fixed
+
+- Gemma 4's shared-KV fallback pinned a 4-D BNSH shape onto *any* borrowed KV
+  tensor whose rank was not 4. A static-cache source hands over a fully known
+  rank-3 `[batch, capacity, kv_hidden]` buffer, so this overwrote a correct
+  shape with a wrong one — corrupting the declared shape of
+  `updated_key_cache.N` and defeating the rank-3 static-source test further
+  down, which would then have transposed a rank-3 tensor as BNSH. The fallback
+  now only supplies a shape when there is none.
+- Gemma 4's vision-language decoder dropped `attention_mask` whenever the export
+  was static, but a Gemma 4 decoder is only *partly* static: its sliding layers
+  keep a dynamic cache and build their bias from that mask. The hybrid decoder
+  therefore lost all padding information. Both builders now apply one rule — a
+  mask exists exactly when some layer still has a dynamic cache — so a fully
+  static decoder carries no unused port and a hybrid one keeps its mask.
+- `--features fp8-kv-cache` no longer silently produces a float16 cache. The
+  gate only tested whether GQA fusion was *expected*; the pass now reports how
+  many caches it converted and the build fails when the answer is zero, naming
+  the reason: FP8 KV storage needs an attention operator with `k_scale`/
+  `v_scale` inputs, which a `TensorScatter` + `ai.onnx` `Attention` static-cache
+  graph does not have.
+
+
+### Qwen3.5/3.6-MoE mixed float/quantized decoder (Olive checkpoints)
+
+#### Fixed
+
+- **Olive-quantized** Qwen3.5/3.6-**MoE** exports (text and VL) no longer
+  quantize the modules that Olive's quantization walk skips:
+  - `linear_attn` (GatedDeltaNet) projections now use plain `Linear`.
+  - `shared_expert_gate` (the `[1, hidden]` sigmoid gate of `Qwen35MoEBlock`)
+    now uses plain `Linear`.
+
+  Olive's `ModelWrapper` excludes `linear_attn` for the `qwen3_5_moe` /
+  `qwen3_5_moe_text` model types (`MAMBA` table) and every
+  `shared_expert_gate` (`SHARED_EXPERT_GATE` table) from quantization since
+  microsoft/Olive#2630, so those checkpoints never contain the packed
+  `MatMulNBits` initializers the previous graph expected (e.g.
+  `linear_attn.in_proj_qkv.weight` as `[48, 2, 8]` uint8 + scales). Ordinary
+  self-attention, the shared-expert MLP, the dense MLP and the fused
+  `com.microsoft::QMoE` experts remain quantized; router `gate` behavior is
+  unchanged.
+
+  Scope is deliberately narrow:
+  - **Dense** Qwen3.5/3.6 (`Qwen35CausalLMModel` and its VL split) is *not* in
+    Olive's `MAMBA` table, so its `linear_attn` stays quantized.
+  - Other checkpoint formats retain their previous graph construction; this
+    change only aligns Mobius with Olive's module selection.
+
+- Qwen3.6 VL exports now emit the packed Qwen image-processing pipeline when
+  the composite build exposes its unwrapped `qwen3_5_moe_text` config. This
+  adds the required `PatchImage` transform so `pixel_values` matches the
+  vision encoder's rank-2 packed-patch input.
+
+#### Added
+
+- `Qwen2MoELayer(..., shared_expert_gate_class=...)` to override the linear
+  factory for `shared_expert_gate` only (`None` falls back to `linear_class`,
+  so existing callers are unaffected).
+
+---
+
+### NVIDIA Cosmos 3 Edge vision-language model (`cosmos3_edge`)
+
+#### Added
+
+- Support for the **full `cosmos3_edge` vision-language model**
+  (`nvidia/Cosmos3-Edge`, `Cosmos3EdgeForConditionalGeneration`) as a 3-model
+  onnxruntime-genai split (`decoder` + `vision_encoder` + `embedding`):
+  - **decoder**: grouped-query-attention text reasoner with a **non-gated
+    squared-ReLU FFN** (`hidden_act="relu2"`, `up_proj → relu2 → down_proj`)
+    and 3D multimodal RoPE (`mrope_section=[24, 20, 20]`); takes
+    `inputs_embeds`.
+  - **vision_encoder**: SigLIP vision tower + a new
+    `Cosmos3EdgeMultiModalProjector` (pre-shuffle `LayerNorm` → 2×2
+    pixel-shuffle → `linear_fc1` → GELU → `linear_fc2`).
+  - **embedding**: token embedding + image-feature fusion at
+    `image_token_id=19`.
+  `preprocess_weights` routes the single HF checkpoint to the three
+  sub-models: `model.visual.*` / `model.projector.*` → vision (with SigLIP
+  `mlp.fc1/fc2` → `up_proj/down_proj`), `embed_tokens` → embedding, the
+  top-level text tower (`layers.*` / `norm` / `lm_head`) → decoder (renaming
+  `self_attn.to_{q,k,v,out}` → `{q,k,v,o}_proj`), and drops the
+  generator-tower `k_norm_und_for_gen` key-norm. Built via a new
+  `Cosmos3EdgeVLTask` (`cosmos3-edge-vl`). The decoder-only text reasoner
+  remains available as `cosmos3_edge_text`.
+- **L1 graph-build tested only.** NVIDIA does not publish modeling code for
+  `cosmos3_edge` (not in `transformers`, no remote-code module), so the exact
+  pixel-shuffle ordering and numerical parity are unverifiable; L4/L5 parity
+  is deferred. The `cosmos3_omni` variants (`Cosmos3-Nano`/`-Super`) are
+  two-tower diffusion world models tracked separately.
+
+### Cargo-style `--features` build option
+
+#### Added
+
+- `mobius build --features <a,b,...>` collects the build-mode toggles under a
+  single Rust/cargo-style option. Accepts a comma-separated list and may be
+  repeated (`--features fp8-kv-cache,static-cache` or `--features fp8-kv-cache
+  --features static-cache`). Available features: `static-cache`, `fp8-kv-cache`,
+  `prune-prefill-prefix`, `text-only`. Unknown feature names are rejected with an error
+  listing the valid set.
+
+#### Changed
+
+- The boolean flags `--static-cache`, `--fp8-kv-cache`, and `--text-only` have
+  been **removed** in favor of the equivalent `--features` value. Companion
+  value args (`--max-seq-len`, `--kv-cache-scale-file`) are unchanged.
+
+### Prefill token-prefix pruning (`--features prune-prefill-prefix`)
+
+#### Added
+
+- `build(prune_prefill_prefix=True)` and
+  `mobius build --features prune-prefill-prefix` discard prefill token positions
+  before the final token after required KV states have been produced. Generic
+  causal models prune immediately before the LM head; Gemma 4 also prunes its
+  KV-sharing layer suffix and per-layer inputs.
+
+### FP8 (E4M3) KV-cache export (`--features fp8-kv-cache`)
+
+#### Added
+
+- `build(fp8_kv_cache=True)` and `mobius build --features fp8-kv-cache` retype the
+  fused `GroupQueryAttention` KV cache to `FLOAT8E4M3FN` (per-tensor E4M3) after
+  GQA fusion, adding `k_scale`/`v_scale` initializers and the
+  `k_quant_type`/`v_quant_type="PER_TENSOR"`, `kv_cache_bit_width=8` attributes.
+  Halves KV-cache memory at long context on ORT runtimes with the FP8 KV kernel
+  (SM89+). `--kv-cache-scale-file` supplies calibrated per-layer scales
+  (onnxruntime-genai format); without it all layers use a unit scale of 1.0.
+  Only graph-input or empty-placeholder caches are retyped — a non-empty
+  initializer cache is skipped with a warning.
+
+### Text-only export for multimodal Gemma 4 (`--features text-only`)
+
+#### Added
+
+- `build(text_only=True)` and `mobius build --features text-only` export the
   **text backbone** of a unified multimodal checkpoint as a standalone
   decoder-only LLM. For `gemma4_unified` (`google/gemma-4-12B`) this remaps the
   model type to its text sibling (`gemma4_unified_text`) and strips the
   vision/audio config so the decoder fuses to `GroupQueryAttention` on
   GQA-capable execution providers (CUDA/DML) instead of the float-bias
   `Attention` path forced by the multimodal bidirectional vision-block overlay.
-  `--text-only` is rejected with `--config` / `--component` and now also bypasses
-  diffusers autodetect so `build()` validation runs (a diffusers/unsupported repo
-  raises instead of silently exporting a pipeline).
+  The `text-only` feature is rejected with `--config` / `--component` and now
+  also bypasses diffusers autodetect so `build()` validation runs (a
+  diffusers/unsupported repo raises instead of silently exporting a pipeline).
 
 #### Changed
 
@@ -193,7 +565,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intentionally skipped tensors (tokenizer, rope_freqs) from
   genuinely unmapped ones.
 - `gguf` optional dependency group in `pyproject.toml`
-  (`pip install mobius-ai[gguf]`).
+  (`pip install mobius-onnx[gguf]`).
 - 28 unit tests for GGUF reader, config mapping, tensor mapping,
   tensor processors, and CLI using synthetic GGUF files.
 
@@ -457,7 +829,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logging in `_config_resolver.py`, `_diffusers_builder.py`, and
   `__main__.py`.
 - Added dependency lower bounds: `onnxscript>=0.6.0`, `onnx_ir>=0.1.0`,
-  `numpy>=1.24.0`, `torch>=2.1.0`.
+  `numpy>=1.24.0`, `torch>=2.10.0`.
 - Lazy-import heavy dependencies (`torch`, `transformers`,
   `safetensors.torch`) in CLI for faster `list`/`info` subcommands.
 - Mllama cross-attention K/V now cached after first computation in

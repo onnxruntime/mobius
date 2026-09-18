@@ -277,6 +277,7 @@ class _Mamba2ResidualBlock(nn.Module):
         n_groups: int,
         conv_kernel: int,
         layer_norm_epsilon: float,
+        chunk_size: int = 256,
         use_conv_bias: bool = True,
     ):
         super().__init__()
@@ -289,6 +290,7 @@ class _Mamba2ResidualBlock(nn.Module):
             d_state=d_state,
             n_groups=n_groups,
             conv_kernel=conv_kernel,
+            chunk_size=chunk_size,
             conv_bias=use_conv_bias,
         )
 
@@ -308,7 +310,7 @@ class _Mamba2ResidualBlock(nn.Module):
         Returns:
             output: (batch, 1, d_model)
             new_conv_state: (batch, conv_dim, conv_kernel - 1)
-            new_ssm_state: (batch, num_heads, d_head, d_state)
+            new_ssm_state: (batch, num_heads, d_state, d_head)
         """
         residual = hidden_states
         normed = self.norm(op, hidden_states)
@@ -348,6 +350,7 @@ class Mamba2Backbone(nn.Module):
                     n_groups=config.n_groups,
                     conv_kernel=config.conv_kernel,
                     layer_norm_epsilon=config.layer_norm_epsilon,
+                    chunk_size=config.chunk_size,
                     use_conv_bias=config.use_conv_bias,
                 )
                 for _ in range(config.num_hidden_layers)

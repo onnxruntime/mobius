@@ -1,0 +1,20 @@
+{
+  "upstream": {
+    "repo": "meta-models/Muse-Glimmer-30B",
+    "revision": "a4e59da52a7bc87ae7251dd5545c0dd437c44b68"
+  },
+  "summary": "Render a bare tool name as an exact recipient instead of a namespace pattern.",
+  "operations": [
+    {
+      "kind": "diff",
+      "target": "chat_template.jinja",
+      "patch": "chat_template.jinja.patch",
+      "upstream_sha256": "cfc67e5f349f37690dfd31ed1f18bc4442a9dd32fe39a648f993cb4eb3cae678"
+    },
+    {
+      "kind": "sync_chat_template",
+      "target": "tokenizer_config.json",
+      "source": "chat_template.jinja"
+    }
+  ]
+}

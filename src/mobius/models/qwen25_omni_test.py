@@ -7,8 +7,10 @@ from types import SimpleNamespace
 
 import torch
 
+from mobius import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius.models.qwen25_omni import Qwen25OmniThinkerForConditionalGeneration
+from mobius.tasks import Qwen25OmniTask
 
 
 def _hf_config():
@@ -137,4 +139,48 @@ def test_qwen25_omni_preprocess_weights_routes_thinker_components():
         "talker.model.embed_tokens.weight",
         "talker.model.layers.0.self_attn.q_proj.weight",
         "talker.codec_head.weight",
+    }
+
+
+def test_qwen25_omni_package_builds_talker_models():
+    text, parent = _hf_config()
+    config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+    module = Qwen25OmniThinkerForConditionalGeneration(config)
+    package = build_from_module(module, config, task=Qwen25OmniTask())
+
+    assert set(package) == {
+        "audio_encoder",
+        "vision_encoder",
+        "embedding",
+        "decoder",
+        "talker_embedding",
+        "talker",
+    }
+    assert {value.name for value in package["talker_embedding"].graph.inputs} == {"input_ids"}
+    assert {value.name for value in package["talker"].graph.inputs} >= {
+        "inputs_embeds",
+        "attention_mask",
+        "position_ids",
+        "past_key_values.0.key",
+        "past_key_values.0.value",
+    }
+    assert {value.name for value in package["talker"].graph.outputs} >= {
+        "logits",
+        "present.0.key",
+        "present.0.value",
+    }
+
+
+def test_qwen25_omni_package_omits_talker_models_when_disabled():
+    text, parent = _hf_config()
+    config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+    config.talker = None
+    module = Qwen25OmniThinkerForConditionalGeneration(config)
+    package = build_from_module(module, config, task=Qwen25OmniTask())
+
+    assert set(package) == {
+        "audio_encoder",
+        "vision_encoder",
+        "embedding",
+        "decoder",
     }

@@ -1,0 +1,65 @@
+name: Publish
+
+# Publishes the `mobius-onnx` distribution to PyPI via Trusted Publishing
+# (OIDC — no API token). The PyPI trusted publisher is configured for this
+# repository with workflow `publish.yml` and environment `pypi`; both must
+# match exactly for the upload to be authorized.
+#
+# Triggers:
+#   * pushing a version tag (``v*``) — the normal release path, and
+#   * manual ``workflow_dispatch`` — publishes the version currently declared
+#     in ``mobius.__version__``.
+#
+# The built version comes from ``mobius.__version__`` (setuptools dynamic
+# version), so tag the commit whose ``__version__`` matches the tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install build dependencies
+        run: pip install build twine
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Verify distribution metadata
+        run: twine check dist/*
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+  publish:
+    name: Publish to PyPI
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
