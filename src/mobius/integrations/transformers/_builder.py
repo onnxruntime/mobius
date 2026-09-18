@@ -221,7 +221,8 @@ def _select_primary_config(hf_config):
     parent_config = hf_config
     model_type = hf_config.model_type
 
-    if hasattr(hf_config, "talker_config"):
+    # Omni exports Thinker; its sibling Talker has a separate decoder config.
+    if hasattr(hf_config, "talker_config") and model_type != "qwen2_5_omni":
         hf_config = hf_config.talker_config
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
