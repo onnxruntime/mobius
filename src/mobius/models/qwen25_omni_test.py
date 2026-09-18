@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mobius import build_from_module
@@ -103,6 +104,44 @@ def test_qwen25_omni_extracts_nested_thinker_config():
     assert config.talker.hidden_size == 32
     assert config.talker.vocab_size == 8448
     assert config.talker.attn_qkv_bias
+
+
+@pytest.mark.parametrize("raw_json", [False, True])
+def test_qwen25_omni_full_checkpoint_builds_thinker_and_talker(monkeypatch, raw_json):
+    from transformers import Qwen2_5OmniConfig
+
+    from mobius.integrations.transformers import _builder
+    from mobius.integrations.transformers._config_resolver import _dict_to_pretrained_config
+
+    _, parent = _hf_config()
+    hf_config = Qwen2_5OmniConfig(
+        thinker_config={
+            name: vars(value) if isinstance(value, SimpleNamespace) else value
+            for name, value in vars(parent.thinker_config).items()
+        }
+    )
+    if raw_json:
+        hf_config = _dict_to_pretrained_config(hf_config.to_dict())
+    assert hf_config.talker_config is not None
+    monkeypatch.setattr(
+        _builder, "_load_transformers_config", lambda *args, **kwargs: (hf_config, raw_json)
+    )
+
+    package = _builder.build_transformers_model("test/qwen25-omni", load_weights=False)
+
+    assert set(package) == {
+        "audio_encoder",
+        "vision_encoder",
+        "embedding",
+        "decoder",
+        "talker_embedding",
+        "talker",
+    }
+    assert package.config.vocab_size == 256
+    assert package.config.hidden_size == 64
+    assert package.config.audio.audio_token_id == 100
+    assert package.config.image_token_id == 101
+    assert package.config.video_token_id == 102
 
 
 def test_qwen25_omni_preprocess_weights_routes_thinker_components():

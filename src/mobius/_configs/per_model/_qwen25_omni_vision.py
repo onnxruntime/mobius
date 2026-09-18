@@ -33,7 +33,11 @@ def _qwen25_omni_vision(config, parent_config, model_type: str, fields: dict):
         temporal_patch_size=getattr(vision, "temporal_patch_size", 2),
         fullatt_block_indexes=getattr(vision, "fullatt_block_indexes", None),
         window_size=getattr(vision, "window_size", 112),
-        image_token_id=getattr(thinker, "image_token_id", None),
+        image_token_id=getattr(
+            thinker, "image_token_id", getattr(thinker, "image_token_index", None)
+        ),
     )
-    fields["video_token_id"] = getattr(thinker, "video_token_id", None)
+    fields["video_token_id"] = getattr(
+        thinker, "video_token_id", getattr(thinker, "video_token_index", None)
+    )
     return None
