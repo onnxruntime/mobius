@@ -338,11 +338,11 @@ def _extract_mrope_fields(config) -> dict:
     )
     if mrope_interleaved:
         result["mrope_interleaved"] = True
-        section = rope_scaling.get("mrope_section", None) or rope_parameters.get(
-            "mrope_section", None
-        )
-        if section is not None:
-            result["mrope_section"] = section
+    section = rope_scaling.get("mrope_section", None) or rope_parameters.get(
+        "mrope_section", None
+    )
+    if section is not None:
+        result["mrope_section"] = section
     return result
 
 
@@ -481,6 +481,7 @@ class BaseModelConfig:
 
     vocab_size: int = DEFAULT_INT
     hidden_size: int = DEFAULT_INT
+    embedding_size: int | None = None
     intermediate_size: int = DEFAULT_INT
     num_hidden_layers: int = DEFAULT_INT
     num_attention_heads: int = DEFAULT_INT
@@ -774,6 +775,9 @@ class ArchitectureConfig(BaseModelConfig):
     mrope_section: list[int] | None = None
     mrope_interleaved: bool = False
 
+    # Qwen2.5-Omni uses independent Thinker and Talker decoder dimensions.
+    talker: ArchitectureConfig | None = None
+
     # Standalone vision config
     image_size: int = 224
     patch_size: int = 16
@@ -1016,6 +1020,7 @@ class ArchitectureConfig(BaseModelConfig):
                 or 0
             ),
             hidden_size=_as_int(hidden_size),
+            embedding_size=getattr(config, "embedding_size", None),
             intermediate_size=_as_int(
                 getattr(config, "intermediate_size", None)
                 or getattr(config, "mlp_hidden_size", None)
@@ -1090,6 +1095,7 @@ class ArchitectureConfig(BaseModelConfig):
                                         "qwen2",
                                         "qwen2_5_vl_text",
                                         "qwen2_5_omni_text",
+                                        "qwen2_5_omni_talker",
                                         "qwen2_moe",
                                         "qwen2_vl_text",
                                     ),
@@ -1501,6 +1507,13 @@ class ArchitectureConfig(BaseModelConfig):
                 compress=getattr(ec, "compress", 2),
                 upsampling_ratios=list(getattr(ec, "upsampling_ratios", [8, 6, 5, 4])),
             )
+
+        if model_type == "qwen2_5_omni_text" and parent_config is not None:
+            talker_config = getattr(parent_config, "talker_config", None)
+            if talker_config is not None:
+                if isinstance(talker_config, dict):
+                    talker_config = type("TalkerConfig", (), talker_config)()
+                options["talker"] = ArchitectureConfig.from_transformers(talker_config)
 
         # Model dtype
         resolved = _resolve_dtype(config)
