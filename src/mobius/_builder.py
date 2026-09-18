@@ -476,7 +476,11 @@ def build(
     model_type = hf_config.model_type
 
     parent_config = hf_config
-    if hasattr(hf_config, "talker_config"):
+    if model_type == "qwen2_5_omni" and hasattr(hf_config, "thinker_config"):
+        thinker = hf_config.thinker_config
+        if hasattr(thinker, "text_config"):
+            hf_config = thinker.text_config
+    elif hasattr(hf_config, "talker_config"):
         hf_config = hf_config.talker_config
     elif hasattr(hf_config, "thinker_config"):
         thinker = hf_config.thinker_config
@@ -567,7 +571,15 @@ def build(
 
     if dtype is not None:
         dtype = resolve_dtype(dtype)
-        config = dataclasses.replace(config, dtype=dtype)
+        talker_config = getattr(config, "talker", None)
+        if talker_config is not None:
+            config = dataclasses.replace(
+                config,
+                dtype=dtype,
+                talker=dataclasses.replace(talker_config, dtype=dtype),
+            )
+        else:
+            config = dataclasses.replace(config, dtype=dtype)
 
     if output_layer_indices is not None:
         # Opt-in: emit additional `hidden_states.{k}` ONNX outputs for each

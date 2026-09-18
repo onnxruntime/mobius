@@ -316,6 +316,7 @@ class BaseModelConfig:
 
     vocab_size: int = DEFAULT_INT
     hidden_size: int = DEFAULT_INT
+    embedding_size: int | None = None
     intermediate_size: int = DEFAULT_INT
     num_hidden_layers: int = DEFAULT_INT
     num_attention_heads: int = DEFAULT_INT
@@ -435,6 +436,9 @@ class ArchitectureConfig(BaseModelConfig):
     # MRoPE config (for multimodal position encoding)
     mrope_section: list[int] | None = None
     mrope_interleaved: bool = False
+
+    # Qwen2.5-Omni uses independent Thinker and Talker decoder dimensions.
+    talker: ArchitectureConfig | None = None
 
     # Standalone vision config
     image_size: int = 224
@@ -589,6 +593,7 @@ class ArchitectureConfig(BaseModelConfig):
             num_hidden_layers=_as_int(num_hidden_layers),
             vocab_size=getattr(config, "vocab_size", None) or 0,
             hidden_size=_as_int(hidden_size),
+            embedding_size=getattr(config, "embedding_size", None),
             intermediate_size=(
                 getattr(config, "intermediate_size", None)
                 or getattr(config, "n_inner", None)
@@ -651,6 +656,7 @@ class ArchitectureConfig(BaseModelConfig):
                                         "qwen2",
                                         "qwen2_5_vl_text",
                                         "qwen2_5_omni_text",
+                                        "qwen2_5_omni_talker",
                                         "qwen2_moe",
                                         "qwen2_vl_text",
                                     ),
@@ -981,6 +987,13 @@ class ArchitectureConfig(BaseModelConfig):
                 num_quantizers=getattr(ec, "num_quantizers", 32),
                 num_semantic_quantizers=getattr(ec, "num_semantic_quantizers", 1),
             )
+
+        if model_type == "qwen2_5_omni_text" and parent_config is not None:
+            talker_config = getattr(parent_config, "talker_config", None)
+            if talker_config is not None:
+                if isinstance(talker_config, dict):
+                    talker_config = type("TalkerConfig", (), talker_config)()
+                options["talker"] = ArchitectureConfig.from_transformers(talker_config)
 
         # Model dtype
         resolved = _resolve_dtype(config)

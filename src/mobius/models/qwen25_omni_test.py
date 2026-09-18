@@ -59,7 +59,28 @@ def _hf_config():
         image_token_id=101,
         video_token_id=102,
     )
-    return text, SimpleNamespace(thinker_config=thinker, tie_word_embeddings=False)
+    talker = SimpleNamespace(
+        model_type="qwen2_5_omni_talker",
+        vocab_size=8448,
+        embedding_size=64,
+        hidden_size=32,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        max_position_embeddings=128,
+        rope_scaling={"rope_type": "default", "mrope_section": [2, 1, 1]},
+        rope_theta=1_000_000.0,
+    )
+    return text, SimpleNamespace(
+        model_type="qwen2_5_omni",
+        thinker_config=thinker,
+        talker_config=talker,
+        tie_word_embeddings=False,
+    )
 
 
 def test_qwen25_omni_extracts_nested_thinker_config():
@@ -74,6 +95,12 @@ def test_qwen25_omni_extracts_nested_thinker_config():
     assert config.vision.hidden_size == 64
     assert config.image_token_id == 101
     assert config.video_token_id == 102
+    assert config.hidden_size == 64
+    assert config.talker is not None
+    assert config.talker.embedding_size == 64
+    assert config.talker.hidden_size == 32
+    assert config.talker.vocab_size == 8448
+    assert config.talker.attn_qkv_bias
 
 
 def test_qwen25_omni_preprocess_weights_routes_thinker_components():
@@ -91,7 +118,10 @@ def test_qwen25_omni_preprocess_weights_routes_thinker_components():
             "thinker.model.embed_tokens.weight": weight,
             "thinker.model.layers.0.self_attn.q_proj.bias": weight,
             "thinker.lm_head.weight": weight,
-            "talker.model.layers.0.weight": weight,
+            "talker.thinker_to_talker_proj.weight": weight,
+            "talker.model.embed_tokens.weight": weight,
+            "talker.model.layers.0.self_attn.q_proj.weight": weight,
+            "talker.codec_head.weight": weight,
             "token2wav.dit.weight": weight,
         }
     )
@@ -103,4 +133,8 @@ def test_qwen25_omni_preprocess_weights_routes_thinker_components():
         "embedding.embed_tokens.weight",
         "decoder.layers.0.self_attn.q_proj.bias",
         "decoder.lm_head.weight",
+        "talker.thinker_to_talker_proj.weight",
+        "talker.model.embed_tokens.weight",
+        "talker.model.layers.0.self_attn.q_proj.weight",
+        "talker.codec_head.weight",
     }

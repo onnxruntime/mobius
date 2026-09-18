@@ -2863,9 +2863,22 @@ class TestBuildGraphQwen3ASR:
 
 
 class TestBuildGraphQwen25Omni:
-    """Verify the Qwen2.5-Omni Thinker four-model split."""
+    """Verify the Qwen2.5-Omni Thinker and Talker model split."""
 
     def _omni_config(self):
+        talker_config = _base_config(
+            model_type="qwen2_5_omni_talker",
+            vocab_size=128,
+            embedding_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            attn_qkv_bias=True,
+            hidden_act="silu",
+            mrope_section=[2, 1, 1],
+        )
         return _base_config(
             model_type="qwen2_5_omni_text",
             attn_qkv_bias=True,
@@ -2899,9 +2912,10 @@ class TestBuildGraphQwen25Omni:
             ),
             image_token_id=101,
             video_token_id=102,
+            talker=talker_config,
         )
 
-    def test_package_builds_four_models(self):
+    def test_package_builds_talker_models(self):
         from mobius.models import Qwen25OmniThinkerForConditionalGeneration
         from mobius.tasks import Qwen25OmniTask
 
@@ -2914,6 +2928,8 @@ class TestBuildGraphQwen25Omni:
             "vision_encoder",
             "embedding",
             "decoder",
+            "talker_embedding",
+            "talker",
         }
         assert {value.name for value in package["audio_encoder"].graph.inputs} == {
             "input_features",
@@ -2925,6 +2941,37 @@ class TestBuildGraphQwen25Omni:
             "audio_features",
             "image_features",
             "video_features",
+        }
+        assert {value.name for value in package["talker_embedding"].graph.inputs} == {
+            "input_ids"
+        }
+        assert {value.name for value in package["talker"].graph.inputs} >= {
+            "inputs_embeds",
+            "attention_mask",
+            "position_ids",
+            "past_key_values.0.key",
+            "past_key_values.0.value",
+        }
+        assert {value.name for value in package["talker"].graph.outputs} >= {
+            "logits",
+            "present.0.key",
+            "present.0.value",
+        }
+
+    def test_package_omits_talker_models_when_disabled(self):
+        from mobius.models import Qwen25OmniThinkerForConditionalGeneration
+        from mobius.tasks import Qwen25OmniTask
+
+        config = self._omni_config()
+        config.talker = None
+        module = Qwen25OmniThinkerForConditionalGeneration(config)
+        package = build_from_module(module, config, task=Qwen25OmniTask())
+
+        assert set(package) == {
+            "audio_encoder",
+            "vision_encoder",
+            "embedding",
+            "decoder",
         }
 
 
