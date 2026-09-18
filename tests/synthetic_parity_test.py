@@ -63,6 +63,7 @@ def test_qwen2_5_omni_thinker_synthetic_parity():
 
     overrides = next(o for mt, o, _ in SPEECH_CONFIGS if mt == "qwen2_5_omni")
     config = _base_config(**overrides)
+    config.talker = None
     audio, vision = config.audio, config.vision
     hf_config = Qwen2_5OmniThinkerConfig(
         audio_config={
