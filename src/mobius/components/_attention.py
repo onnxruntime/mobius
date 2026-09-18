@@ -9,6 +9,7 @@ from typing import NamedTuple
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm
@@ -72,6 +73,18 @@ class StaticCacheState(NamedTuple):
     value_cache: ir.Value
     write_indices: ir.Value
     nonpad_kv_seqlen: ir.Value
+
+    @property
+    def sequence_axis(self) -> int:
+        shape = self.key_cache.shape
+        if shape is None:
+            raise ValueError("Key cache shape is not defined")
+        if len(shape) == 3:
+            return 1
+        elif len(shape) == 4:
+            return 2
+        else:
+            raise ValueError(f"Static cache must have rank 3 or 4, got rank {len(shape)}.")
 
 
 def _apply_attention(
@@ -143,17 +156,31 @@ def _apply_attention(
         # for all t in range(seq_len).  This handles both prefill
         # (write_indices=0, seq_len=N) and decode (write_indices=N,
         # seq_len=1) with the same graph.
+
+        sequence_axis = static_cache.sequence_axis
+        heads_first = sequence_axis == 2
+
+        if heads_first:
+            query = op.Reshape(query, [0, 0, num_attention_heads, -1])
+            query = op.Transpose(query, perm=[0, 2, 1, 3])
+
+            key = op.Reshape(key, [0, 0, num_key_value_heads, -1])
+            key = op.Transpose(key, perm=[0, 2, 1, 3])
+
+            value = op.Reshape(value, [0, 0, num_key_value_heads, -1])
+            value = op.Transpose(value, perm=[0, 2, 1, 3])
+
         updated_k = op.TensorScatter(
             static_cache.key_cache,
             key,
             static_cache.write_indices,
-            axis=1,
+            axis=sequence_axis,
         )  # [B, max_seq, kv_hidden]
         updated_v = op.TensorScatter(
             static_cache.value_cache,
             value,
             static_cache.write_indices,
-            axis=1,
+            axis=sequence_axis,
         )  # [B, max_seq, kv_hidden]
 
         # External-cache masking.  Two modes, selected by whether the caller
@@ -170,8 +197,8 @@ def _apply_attention(
         #     bidirectional unmasking encoded in the bias.  This routes ORT to
         #     the MEA external-cache path (Flash is precluded by any bias).
         #
-        # nonpad_kv_seqlen stays as input #6 in BOTH modes: it bounds the valid
-        # KV prefix and, on the CUDA Flash path, drives the fully-masked-row
+        # On supporting EPs, nonpad_kv_seqlen stays as input #6 in BOTH modes.
+        # It bounds the valid KV prefix and, on CUDA Flash, drives the fully-masked-row
         # zero guard (LaunchZeroFullyMaskedRows).  In bias mode the additive
         # bias already encodes the same ``slot < nonpad`` validity.  The
         # cross-repo invariant is ``nonpad == write_indices + valid_token_count``
@@ -190,21 +217,41 @@ def _apply_attention(
             mask_arg, causal = attn_mask, 0
         else:
             mask_arg, causal = None, 1
-        attn_output, _, _ = op.Attention(
+
+        supports_nonpad = ep_capabilities().supports_attention_nonpad_kv_seqlen
+        if not supports_nonpad and attn_mask is None:
+            raise ValueError(
+                "This execution provider requires an explicit static-cache attention bias"
+            )
+        # Unsupported EPs use the bias's slot-validity test instead of input #6.
+        nonpad_input = static_cache.nonpad_kv_seqlen if supports_nonpad else None
+
+        head_attrs: dict[str, int] = {}
+        if not heads_first:
+            head_attrs = {
+                "q_num_heads": num_attention_heads,
+                "kv_num_heads": num_key_value_heads,
+            }
+
+        attn_output = op.Attention(
             query,
             updated_k,
             updated_v,
             mask_arg,
-            None,  # no past_key (full cache is already provided)
-            None,  # no past_value
-            static_cache.nonpad_kv_seqlen,
-            q_num_heads=num_attention_heads,
-            kv_num_heads=num_key_value_heads,
+            None,
+            None,
+            nonpad_input,
             scale=scale,
             softcap=softcap,
             is_causal=causal,
-            _outputs=3,
+            _outputs=1,
+            **head_attrs,
         )
+
+        if heads_first:
+            attn_output = op.Transpose(attn_output, perm=[0, 2, 1, 3])
+            attn_output = op.Reshape(attn_output, [0, 0, -1])
+
         return attn_output, updated_k, updated_v
 
     # Dynamic cache mode: standard Attention with past KV concatenation.

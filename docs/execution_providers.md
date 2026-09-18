@@ -145,6 +145,11 @@ EpCapabilities(name="webgpu",  gqa_dtypes={FLOAT, FLOAT16},
 EpCapabilities(name="trt-rtx", gqa_dtypes={FLOAT16, BFLOAT16},
                supports_skip_layer_norm=False, enable_graph_capture=True,
                provider_options={"enable_cuda_graph": "1"})
+EpCapabilities(name="tensorrt",
+               static_cache_layout="heads_first",
+               supports_attention_nonpad_kv_seqlen=False,
+               gqa_dtypes=frozenset(), qkv_pack_dtypes=frozenset(),
+               supports_skip_layer_norm=False, supports_matmul_nbits=False)
 EpCapabilities(name="onnx-standard",
                gqa_dtypes=frozenset(), qkv_pack_dtypes=frozenset(),
                supports_fused_rope=False,  # not used by default for this EP, since it does not enable GQA fusion
@@ -152,6 +157,25 @@ EpCapabilities(name="onnx-standard",
                supports_fused_matmul=False,
                supports_packed_multi_head_attention=False)
 ```
+
+Standalone `tensorrt` is separate from ORT's `trt-rtx` provider. Static-cache
+exports use `[B, kv_heads, capacity, head_dim]` caches and an explicit additive
+attention bias, with `is_causal=0`. Query cache slots are
+`write_indices + arange(query_length)`; allowed keys must also be below
+`nonpad_kv_seqlen`. The length remains a graph input used by the bias, but is
+omitted from native Attention input #6: the tested TensorRT 11.3 path ignores
+that input and otherwise applies incorrect top-left causality during decode.
+Default/ORT masking behavior is unchanged. No extra `static-cache-bias` flag
+is required for standalone TensorRT. Other model backbones must supply a full
+static-cache bias or export fails explicitly instead of emitting maskless
+attention on this provider.
+
+Gemma4's static-cache implementation currently requires flattened caches.
+Combining Gemma4 with `tensorrt` and `static-cache` raises an explicit error,
+including through the generic causal-LM, Gemma4 text, and multimodal tasks.
+Use a flattened-cache target for Gemma4 static-cache exports. This restriction
+does not apply to dynamic-cache graph construction and does not imply TensorRT
+runtime validation for Gemma4.
 
 Out-of-tree EPs can register at runtime via `register_ep()`:
 
