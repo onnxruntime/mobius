@@ -3,13 +3,16 @@
 
 from __future__ import annotations
 
+import dataclasses
+
+import onnx_ir as ir
 import pytest
 from onnxscript.rewriter import rewrite
 from onnxscript.rewriter._rewrite_rule import RewriteRuleSet
 
 from mobius import build
 from mobius._builder import build_from_module
-from mobius._configs import ArchitectureConfig, Gemma2Config
+from mobius._configs import ArchitectureConfig, Gemma2Config, QuantizationConfig
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.rewrite_rules import group_query_attention_rules, pack_qkv_for_gqa_rules
@@ -34,6 +37,70 @@ _LLAMA_CONFIG = ArchitectureConfig(
     rope_type="default",
     rope_theta=10000.0,
     pad_token_id=0,
+)
+
+# Tiny DeepSeek MLA config for structural K/V head-dimension coverage.
+_DEEPSEEK_MLA_CONFIG = ArchitectureConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_attention_heads=2,
+    num_key_value_heads=2,
+    head_dim=16,
+    num_hidden_layers=1,
+    vocab_size=64,
+    max_position_embeddings=32,
+    hidden_act="silu",
+    rms_norm_eps=1e-6,
+    rope_type="default",
+    rope_theta=10000.0,
+    dtype=ir.DataType.FLOAT16,
+    q_lora_rank=16,
+    kv_lora_rank=16,
+    qk_nope_head_dim=8,
+    qk_rope_head_dim=8,
+    v_head_dim=8,
+)
+
+# Synthetic DeepSeek-V2-Lite-shaped config for the int4 QMoE regression guard.
+# Mirrors the real architecture (MLA attention + first_k_dense_replace, softmax
+# routing, shared experts) at tiny dimensions so the test runs fully offline with
+# no HuggingFace download. hidden_size and moe_intermediate_size are multiples of
+# the quantization group_size (128) because QMoE requires divisibility, while the
+# small MLA/dense dimensions are fine for MatMulNBits (which ceil-pads the K axis).
+# Layer 0 is a dense MLP; layers 1..2 are routed MoE layers -> 2 QMoE, 3 Attention.
+_DEEPSEEK_V2_LITE_INT4_CONFIG = ArchitectureConfig(
+    hidden_size=128,
+    intermediate_size=256,
+    num_attention_heads=2,
+    num_key_value_heads=2,
+    head_dim=16,
+    num_hidden_layers=3,
+    vocab_size=128,
+    max_position_embeddings=32,
+    hidden_act="silu",
+    rms_norm_eps=1e-6,
+    rope_type="default",
+    rope_theta=10000.0,
+    dtype=ir.DataType.FLOAT16,
+    q_lora_rank=16,
+    kv_lora_rank=16,
+    qk_nope_head_dim=8,
+    qk_rope_head_dim=8,
+    v_head_dim=8,
+    num_local_experts=4,
+    num_experts_per_tok=2,
+    moe_intermediate_size=128,
+    n_shared_experts=1,
+    first_k_dense_replace=1,
+    scoring_func="softmax",
+    norm_topk_prob=False,
+    routed_scaling_factor=1.0,
+    quantization=QuantizationConfig(
+        bits=4,
+        group_size=128,
+        quant_method="gptq",
+        sym=True,
+    ),
 )
 
 # Tiny qwen3 config: has QK norm, weights NOT packable
@@ -208,6 +275,88 @@ class TestGroupQueryAttentionRules:
         vision_counts = count_ops(vision)
         assert vision_counts.get("Attention", 0) == vision_attn_before
         assert vision_counts.get("GroupQueryAttention", 0) == 0
+
+    @pytest.mark.parametrize(
+        ("v_head_dim", "expected_attention", "expected_gqa"),
+        [(8, 1, 0), (16, 0, 1)],
+    )
+    def test_mla_gqa_fusion_requires_equal_kv_head_dimensions(
+        self, v_head_dim, expected_attention, expected_gqa
+    ):
+        """GQA fusion declines unequal MLA K/V dimensions and accepts equal ones."""
+        config = dataclasses.replace(_DEEPSEEK_MLA_CONFIG, v_head_dim=v_head_dim)
+        model = build_from_module(registry.get("deepseek_v3")(config), config)["model"]
+        attention = next(node for node in model.graph if node.op_type == "Attention")
+        assert attention.inputs[4] is not None
+        assert attention.inputs[4].shape[-1] == 16
+        assert attention.inputs[5] is not None
+        assert attention.inputs[5].shape[-1] == v_head_dim
+
+        rewrite(model, pattern_rewrite_rules=group_query_attention_rules())
+        counts = count_ops(model)
+        assert counts.get("Attention", 0) == expected_attention
+        assert counts.get("GroupQueryAttention", 0) == expected_gqa
+
+    def test_deepseek_v2_lite_int4_uses_one_qmoe_per_moe_layer(self):
+        """The int4 graph keeps shared experts dense and routed experts fused.
+
+        Self-contained regression guard: builds a tiny DeepSeek-V2-Lite-shaped
+        model from an inline config (no HuggingFace download) so it runs in the
+        offline main CI. Layer 0 is a dense MLP and layers 1..2 are routed MoE
+        layers, so exactly one com.microsoft::QMoE is emitted per routed MoE
+        layer while the shared experts remain dense MatMulNBits.
+        """
+        config = _DEEPSEEK_V2_LITE_INT4_CONFIG
+        num_layers = config.num_hidden_layers
+        num_moe_layers = num_layers - config.first_k_dense_replace
+        with pytest.warns(UserWarning, match="GQA fusion expected"):
+            model = build_from_module(
+                registry.get("deepseek_v3")(config),
+                config,
+                execution_provider="cuda",
+            )["model"]
+        counts = count_ops(model)
+
+        assert counts.get("QMoE", 0) == num_moe_layers
+        assert counts.get("GroupQueryAttention", 0) == 0
+        assert counts.get("Attention", 0) == num_layers
+        for node in (node for node in model.graph if node.op_type == "QMoE"):
+            # router_probs (index 1) and router_weights (index 14) share
+            # QMoE's "T" type constraint with hidden_states, so they are
+            # cast back to the model dtype (FLOAT16 here) after being
+            # computed in FLOAT32 for routing-score numerical stability.
+            assert node.inputs[1] is not None
+            assert node.inputs[1].dtype == ir.DataType.FLOAT16
+            # fc1_scales/fc2_scales (indices 3, 6) must match the
+            # hidden_states/activation dtype (FLOAT16 here): QMoE's kernel
+            # registration requires T2 (scales) to exactly equal T
+            # (activation), so scales are no longer pinned to FLOAT32.
+            assert node.inputs[3] is not None
+            assert node.inputs[3].dtype == ir.DataType.FLOAT16
+            assert node.inputs[6] is not None
+            assert node.inputs[6].dtype == ir.DataType.FLOAT16
+            assert node.inputs[14] is not None
+            assert node.inputs[14].dtype == ir.DataType.FLOAT16
+
+        input_names = [
+            value.name
+            for node in model.graph
+            for value in node.inputs
+            if value is not None and value.name is not None
+        ]
+        assert not any(".moe.experts." in name for name in input_names)
+        for layer_idx in range(config.first_k_dense_replace, num_layers):
+            prefix = f"model.layers.{layer_idx}.mlp.shared_experts."
+            shared_matmuls = [
+                node
+                for node in model.graph
+                if node.op_type == "MatMulNBits"
+                and any(
+                    value is not None and value.name is not None and prefix in value.name
+                    for value in node.inputs
+                )
+            ]
+            assert len(shared_matmuls) == 3
 
     def test_fallback_attention_to_gqa_no_rope(self):
         """AttentionToGQA fallback fires when applied in isolation (do_rotary=0).
@@ -560,6 +709,50 @@ class TestGroupQueryAttentionRules:
                 "Transpose input should be Concat of W_q, W_k, W_v"
             )
 
+    @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+    def test_packed_weight_intermediates_declare_weight_dtype(self, dtype):
+        """Concat/Transpose intermediates carry the projection weight dtype.
+
+        The replacement builder leaves new values untyped. Without an explicit
+        stamp, folding ``Transpose(Concat(W_q, W_k, W_v))`` into an initializer
+        has no declared type to inherit and can widen fp16 weights to fp32.
+        """
+        config = dataclasses.replace(_LLAMA_CONFIG, dtype=dtype)
+        m = build_from_module(registry.get("llama")(config), config)["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == config.num_hidden_layers
+
+        for gqa in gqa_nodes:
+            transpose = gqa.inputs[0].producer().inputs[1].producer()
+            assert transpose.op_type == "Transpose"
+            concat = transpose.inputs[0].producer()
+            assert concat.op_type == "Concat"
+            assert concat.outputs[0].dtype == dtype
+            assert transpose.outputs[0].dtype == dtype
+
+    @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+    def test_packed_bias_intermediate_declares_bias_dtype(self, dtype):
+        """The packed-bias Concat intermediate carries the bias dtype."""
+        config = dataclasses.replace(_QWEN2_BIAS_CONFIG, dtype=dtype)
+        m = build_from_module(registry.get("qwen2")(config), config)["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+        rewrite(m, pattern_rewrite_rules=pack_qkv_for_gqa_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == config.num_hidden_layers
+
+        for gqa in gqa_nodes:
+            add = gqa.inputs[0].producer()
+            assert add.op_type == "Add"
+            bias_concat = add.inputs[1].producer()
+            assert bias_concat.op_type == "Concat"
+            assert bias_concat.outputs[0].dtype == dtype
+
     def test_packed_qkv_with_bias_runs_with_ort(self):
         """Biased packed-QKV GQA model runs correctly with ORT."""
         model = registry.get("qwen2")(_QWEN2_BIAS_CONFIG)
@@ -657,3 +850,184 @@ class TestGroupQueryAttentionRules:
         for node in gqa_nodes:
             sc = node.attributes.get("softcap")
             assert sc is None, f"Unexpected softcap attribute on GQA node for Llama: {sc}"
+
+    def test_partial_rotary_embedding_dim_propagated(self):
+        """Partial-RoPE models must forward rotary_embedding_dim to the GQA.
+
+        Qwen3.5/3.8 rotate only the first ``head_dim * partial_rotary_factor``
+        head elements (e.g. 64 of 256). If the fusion drops the dimension the
+        fused GQA defaults to the full head_dim and reads past the partial
+        cos/sin cache, corrupting every full-attention layer's output.
+        """
+        cfg = dataclasses.replace(_QWEN3_CONFIG, partial_rotary_factor=0.5)
+        model = registry.get("qwen3")(cfg)
+        pkg = build_from_module(model, cfg)
+        m = pkg["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) > 0, "Expected GQA nodes after fusion"
+
+        expected = int(cfg.head_dim * 0.5)
+        for node in gqa_nodes:
+            val = node.attributes.get("rotary_embedding_dim")
+            assert val is not None, (
+                "rotary_embedding_dim missing on GQA node — partial RoPE would "
+                "silently rotate the full head_dim and corrupt attention"
+            )
+            assert val.value == expected, (
+                f"Expected rotary_embedding_dim={expected}, got {val.value}"
+            )
+
+    def test_full_rotary_omits_rotary_embedding_dim(self):
+        """Full-RoPE models (Qwen3 default) must not carry rotary_embedding_dim.
+
+        Omitting it lets the GQA kernel default to the full head_dim, which is
+        correct; a spurious attribute could mislead consumers.
+        """
+        model = registry.get("qwen3")(_QWEN3_CONFIG)
+        pkg = build_from_module(model, _QWEN3_CONFIG)
+        m = pkg["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) > 0
+
+        for node in gqa_nodes:
+            val = node.attributes.get("rotary_embedding_dim")
+            assert val is None, f"Unexpected rotary_embedding_dim on full-RoPE GQA node: {val}"
+
+
+class TestSlidingWindowSurvivesFusion:
+    """A window baked into the attention bias must reach ``local_window_size``.
+
+    ``GroupQueryAttention`` ignores the attention bias and rebuilds its mask
+    from ``seqlens_k``/``total_seq_len``, so fusing a windowed ``Attention``
+    without carrying the window over silently turns local attention into global
+    attention. The model still produces fluent text, which is what makes the
+    regression so expensive to find.
+    """
+
+    @staticmethod
+    def _muse_glimmer_config(layer_types: list[str]) -> ArchitectureConfig:
+        from mobius._configs import MuseGlimmerConfig
+
+        return MuseGlimmerConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=len(layer_types),
+            vocab_size=256,
+            max_position_embeddings=128,
+            hidden_act="silu",
+            layer_types=layer_types,
+            layer_rope_theta=[
+                0.0 if kind == "full_attention" else 500_000.0 for kind in layer_types
+            ],
+            sliding_window=8,
+            pad_token_id=0,
+            rope_type="default",
+            rope_theta=500_000.0,
+            rms_norm_eps=1e-5,
+            dtype=ir.DataType.BFLOAT16,
+        )
+
+    def test_per_layer_window_reaches_the_gqa_nodes(self):
+        from mobius.models.muse_glimmer import MuseGlimmerTextCausalLMModel
+
+        layer_types = ["sliding_attention", "sliding_attention", "full_attention"]
+        config = self._muse_glimmer_config(layer_types)
+        m = build_from_module(MuseGlimmerTextCausalLMModel(config), config)["model"]
+
+        rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
+
+        gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == len(layer_types)
+        windows = [
+            (
+                n.attributes.get("local_window_size").value
+                if n.attributes.get("local_window_size") is not None
+                else None
+            )
+            for n in gqa_nodes
+        ]
+        # Sliding layers carry the window; the full-attention layer must not.
+        assert windows == [8, 8, None], windows
+
+
+class TestAttentionBiasInspection:
+    """Unit coverage for the bias walk that recovers the window."""
+
+    @staticmethod
+    def _value(name: str) -> ir.Value:
+        return ir.Value(name=name)
+
+    @staticmethod
+    def _const(value: int) -> ir.Value:
+        import numpy as np
+
+        return ir.Value(name=f"const_{value}", const_value=ir.tensor(np.array(value)))
+
+    @classmethod
+    def _op(cls, op_type: str, *inputs: ir.Value) -> ir.Value:
+        node = ir.Node("", op_type, inputs=list(inputs), num_outputs=1)
+        return node.outputs[0]
+
+    def test_sliding_term_is_recovered(self):
+        from mobius.rewrite_rules._group_query_attention import (
+            local_window_from_attention_bias,
+        )
+
+        q_index, kv_index = self._value("q_index"), self._value("kv_index")
+        causal = self._op("GreaterOrEqual", q_index, kv_index)
+        distance = self._op("Sub", q_index, kv_index)
+        within = self._op("Less", distance, self._const(64))
+        bias = self._op("Where", self._op("And", causal, within))
+
+        shape = local_window_from_attention_bias(bias)
+        assert shape.recognized
+        assert shape.window == 64
+
+    def test_padding_comparison_is_not_mistaken_for_a_window(self):
+        from mobius.rewrite_rules._group_query_attention import (
+            local_window_from_attention_bias,
+        )
+
+        # `slot < nonpad_kv_seqlen` is a padding test against a dynamic length,
+        # not a window: no constant bound, and no distance subtraction.
+        slot, seqlen = self._value("slot"), self._value("nonpad_kv_seqlen")
+        bias = self._op("Where", self._op("Less", slot, seqlen))
+
+        shape = local_window_from_attention_bias(bias)
+        assert shape.recognized
+        assert shape.window is None
+
+    def test_plain_causal_bias_has_no_window(self):
+        from mobius.rewrite_rules._group_query_attention import (
+            local_window_from_attention_bias,
+        )
+
+        q_index, kv_index = self._value("q_index"), self._value("kv_index")
+        bias = self._op("Where", self._op("GreaterOrEqual", q_index, kv_index))
+
+        shape = local_window_from_attention_bias(bias)
+        assert shape.recognized
+        assert shape.window is None
+
+    def test_bidirectional_overlay_blocks_fusion(self):
+        from mobius.rewrite_rules._group_query_attention import (
+            local_window_from_attention_bias,
+        )
+
+        q_index, kv_index = self._value("q_index"), self._value("kv_index")
+        causal = self._op("GreaterOrEqual", q_index, kv_index)
+        same_block = self._op("Equal", q_index, kv_index)
+        bias = self._op("Where", self._op("Or", causal, same_block))
+
+        # GQA cannot express an overlay that unmasks non-causal positions, so
+        # the caller must leave the Attention node alone.
+        assert not local_window_from_attention_bias(bias).recognized

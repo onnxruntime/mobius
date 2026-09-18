@@ -1,0 +1,65 @@
+model_id: microsoft/VibeVoice-Realtime-0.5B
+model_type: vibevoice_streaming
+architecture: VibeVoiceStreamingForConditionalGenerationInference
+revision: 6bce5f06044837fe6d2c5d7a71a84f0416bd57e4
+task_type: text-to-speech
+dtype: bfloat16
+level: L4+L5
+inputs:
+  prompts:
+  - Mobius validates streaming speech.
+generation:
+  max_new_tokens: 6
+  do_sample: false
+  num_diffusion_steps: 2
+  guidance_scale: 1.3
+skip_reason: 'Realtime generation is host-orchestrated and requires Microsoft''s prefilled voice-cache
+  artifacts, four independent CFG cache families, and DPM-Solver scheduling. The generic GoldenTestCase
+  runner cannot represent that protocol; L3 source parity covers the initial and continuation steps
+  of every exported stage, so this case makes no unsupported L4/L5 golden claim.
+
+  '
+notes: 'Official English Realtime TTS checkpoint pinned to its immutable revision. Mobius exports
+  six executable stages with explicit lower/upper Qwen2 KV and acoustic-decoder convolution states.
+  It does not accept arbitrary waveform prompts, and it does not claim ONNX Runtime GenAI orchestration
+  support.
+
+  '
+real_weight_validation:
+  status: partial
+  checkpoint: >
+    microsoft/VibeVoice-Realtime-0.5B@6bce5f06044837fe6d2c5d7a71a84f0416bd57e4
+    model.safetensors (2,035,332,888 bytes)
+  hardware: >
+    Apple M1 Max with 32 GB unified memory; ONNX Runtime 1.29.0 with eight CPU
+    intra-op threads and the MLX EP plugin; no CUDA provider.
+  upstream: >
+    Microsoft VibeVoice source 79e516a3e20b599f137c9da03410a2a0b473b63b and its
+    en-Carter_man.pt prefilled cache. The source full-generation wrapper is
+    incompatible with this environment's newer Transformers GenerationMixin and
+    DynamicCache APIs.
+  export: >
+    Mobius weighted six-stage float16 and float32 packages at the immutable
+    checkpoint revision. A native BF16 package also serialized successfully, but
+    stock ORT 1.29 CPU lacks kernels for its BF16 MatMul, Expand, and decoder
+    operations. CoreML loaded the float16 decoder but profiled zero CoreML nodes
+    and 757 CPU nodes.
+  component_parity:
+    all_six_stages: >
+      L3 source-backed initial and continuation parity is covered by
+      src/mobius/models/vibevoice_streaming_test.py.
+    lm_backbone: >
+      Weighted CPU run consumed the 108-token Carter cache and emitted finite
+      [1, 5, 896] hidden states with 113-token present KV.
+    tts_backbone: >
+      Weighted CPU run consumed the 316-token Carter cache and emitted finite
+      [1, 5, 896] hidden states, EOS logit -5.1796875, and 321-token present KV.
+  end_to_end:
+    single-streaming-acoustic-step: >
+      One five-token text window, Carter positive/negative cache conditions, two
+      source DPM-Solver steps, and the causal decoder emitted a finite
+      3,200-sample / 0.133333 s WAV artifact. CPU took 1.915602 s (RTF 14.3670);
+      MLX took 0.733651 s (RTF 5.5024), profiled 72 MLX and 42 CPU nodes, and
+      differed from CPU by at most 9.536743e-7. Float32 CPU completed the same
+      step in 5.248908 s (RTF 39.3668). This is not a complete six-latent window
+      or an L5 golden comparison.

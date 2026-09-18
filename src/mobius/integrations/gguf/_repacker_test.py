@@ -3,13 +3,22 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
+import onnx_ir as ir
+import onnxruntime as ort
 import pytest
+from gguf import quants
 
 from mobius.integrations.gguf._repacker import (
     RepackedTensor,
     _unpack_q4_k_scales,
     can_repack,
+    native_block_spec,
+    preserve_native_blocks,
+    repack_dequantized_tensor,
     repack_gguf_tensor,
 )
 
@@ -19,6 +28,127 @@ _Q8_0 = 8
 _Q4_K = 12
 _Q1_0 = 41
 _BLOCK_SIZE = 32
+
+
+def _const(name: str, value: np.ndarray) -> ir.Value:
+    result = ir.Value(name=name)
+    tensor = ir.tensor(value)
+    result.const_value = tensor
+    result.dtype = tensor.dtype
+    result.shape = ir.Shape(value.shape)
+    return result
+
+
+def _run_repacked_matmul_round_trip(
+    repacked: RepackedTensor,
+    activation: np.ndarray,
+    *,
+    k_in: int,
+    tmp_path,
+) -> np.ndarray:
+    a = ir.Value(
+        name="A",
+        shape=ir.Shape(activation.shape),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    weight = _const("B", repacked.weight)
+    scales = _const("scales", repacked.scales.astype(np.float32))
+    assert repacked.zero_points is not None
+    zero_points = _const("zero_points", repacked.zero_points)
+    output = ir.Value(name="Y")
+    node = ir.Node(
+        "com.microsoft",
+        "MatMulNBits",
+        inputs=[a, weight, scales, zero_points],
+        outputs=[output],
+        attributes=ir.convenience.convert_attributes(
+            {
+                "K": k_in,
+                "N": repacked.weight.shape[0],
+                "bits": repacked.bits,
+                "block_size": repacked.block_size,
+            }
+        ),
+    )
+    graph = ir.Graph(
+        inputs=[a],
+        outputs=[output],
+        nodes=[node],
+        initializers=[weight, scales, zero_points],
+        opset_imports={"": 24, "com.microsoft": 1},
+        name="gguf_exact_affine_abi",
+    )
+    first = tmp_path / "first.onnx"
+    second = tmp_path / "round-trip.onnx"
+    ir.save(ir.Model(graph, ir_version=10), first)
+    ir.save(ir.load(first), second)
+    options = ort.SessionOptions()
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "ort-profile")
+    session = ort.InferenceSession(
+        second,
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
+    )
+    result = session.run(None, {"A": activation})[0]
+    profile_path = options.profile_file_prefix
+    profile_file = session.end_profiling()
+    assert profile_file.startswith(profile_path)
+    events = json.loads(Path(profile_file).read_text(encoding="utf-8"))
+    kernels = [
+        event
+        for event in events
+        if event.get("cat") == "Node" and event.get("args", {}).get("op_name") == "MatMulNBits"
+    ]
+    assert kernels
+    assert {event["args"].get("provider") for event in kernels} == {"CPUExecutionProvider"}
+    Path(profile_file).unlink()
+    return result
+
+
+@pytest.mark.parametrize(
+    ("qtype_name", "qtype_value", "format_name", "block_elements", "block_bytes"),
+    [
+        ("MXFP4", 39, "mxfp4", 32, 17),
+        ("IQ4_NL", 20, "iq4_nl", 32, 18),
+        ("IQ4_XS", 23, "iq4_xs", 256, 136),
+        ("IQ3_S", 21, "iq3_s", 256, 110),
+        ("IQ3_XXS", 18, "iq3_xxs", 256, 98),
+        ("IQ2_XXS", 16, "iq2_xxs", 256, 66),
+        ("IQ2_XS", 17, "iq2_xs", 256, 74),
+        ("IQ2_S", 22, "iq2_s", 256, 82),
+        ("IQ1_S", 19, "iq1_s", 256, 50),
+        ("IQ1_M", 29, "iq1_m", 256, 56),
+    ],
+)
+def test_native_block_specs_match_gguf_and_preserve_bytes(
+    qtype_name: str,
+    qtype_value: int,
+    format_name: str,
+    block_elements: int,
+    block_bytes: int,
+):
+    from gguf import GGMLQuantizationType
+
+    qtype = getattr(GGMLQuantizationType, qtype_name)
+    assert qtype.value == qtype_value
+    spec = native_block_spec(qtype.value)
+    assert spec is not None
+    assert (spec.format, spec.elements, spec.bytes) == (
+        format_name,
+        block_elements,
+        block_bytes,
+    )
+
+    raw = np.arange(2 * block_bytes, dtype=np.uint8)
+    packed = preserve_native_blocks(raw, qtype.value, (2, block_elements))
+    assert packed.shape == (2, 1, block_bytes)
+    np.testing.assert_array_equal(packed.reshape(-1), raw)
+
+
+def test_native_block_size_mismatch_is_rejected():
+    with pytest.raises(ValueError, match="Native iq1_m data size mismatch"):
+        preserve_native_blocks(np.zeros(55, dtype=np.uint8), 29, (1, 256))
 
 
 def _make_q1_0_block(scale: float, bits: list[int]) -> np.ndarray:
@@ -386,6 +516,94 @@ class TestEdgeCases:
         assert result.zero_points[0, 1] == 0x88
 
 
+class TestExactAffineRuntimeAbi:
+    """Exact routes survive ONNX package round-trip and execute through ORT."""
+
+    def test_q4_0_codes_scales_zero_points_and_row_tails(self, tmp_path) -> None:
+        n_out, k_in = 3, 70
+        n_blocks = 3
+        source_rows = []
+        packed_blocks = []
+        for row in range(n_out):
+            row_values = []
+            for block_index in range(n_blocks):
+                scale = np.float16(0.125 * (1 + row + block_index))
+                codes = ((np.arange(32) + row + 3 * block_index) % 16).tolist()
+                block = _make_q4_0_block(float(scale), codes)
+                packed_blocks.append(block)
+                row_values.append(
+                    quants.dequantize(
+                        block.reshape(1, -1),
+                        quants.GGMLQuantizationType.Q4_0,
+                    ).ravel()
+                )
+            source_rows.append(np.concatenate(row_values)[:k_in])
+        source = np.stack(source_rows).astype(np.float32)
+        repacked = repack_gguf_tensor(
+            np.concatenate(packed_blocks), _Q4_0, shape=(n_out, k_in)
+        )
+        activation = np.linspace(-1.0, 1.0, 2 * k_in, dtype=np.float32).reshape(2, k_in)
+
+        actual = _run_repacked_matmul_round_trip(
+            repacked, activation, k_in=k_in, tmp_path=tmp_path
+        )
+        np.testing.assert_allclose(actual, activation @ source.T, rtol=1e-5, atol=1e-5)
+
+    def test_q8_0_signed_codes_scales_zero_points_and_row_tails(self, tmp_path) -> None:
+        n_out, k_in = 2, 47
+        source_rows = []
+        packed_blocks = []
+        for row in range(n_out):
+            row_values = []
+            for block_index in range(2):
+                scale = np.float16(0.03125 * (1 + row + block_index))
+                codes = (
+                    (np.arange(32, dtype=np.int16) * (row + 3) + 11 * block_index) % 256 - 128
+                ).astype(np.int8)
+                block = _make_q8_0_block(float(scale), codes.tolist())
+                packed_blocks.append(block)
+                row_values.append(
+                    quants.dequantize(
+                        block.reshape(1, -1),
+                        quants.GGMLQuantizationType.Q8_0,
+                    ).ravel()
+                )
+            source_rows.append(np.concatenate(row_values)[:k_in])
+        source = np.stack(source_rows).astype(np.float32)
+        repacked = repack_gguf_tensor(
+            np.concatenate(packed_blocks), _Q8_0, shape=(n_out, k_in)
+        )
+        activation = np.linspace(0.25, 1.25, 3 * k_in, dtype=np.float32).reshape(3, k_in)
+
+        actual = _run_repacked_matmul_round_trip(
+            repacked, activation, k_in=k_in, tmp_path=tmp_path
+        )
+        np.testing.assert_allclose(actual, activation @ source.T, rtol=1e-5, atol=1e-5)
+
+    def test_q1_0_binary_codes_and_row_tails(self, tmp_path) -> None:
+        n_out, k_in = 2, 129
+        source_rows = []
+        packed_blocks = []
+        for row in range(n_out):
+            row_values = []
+            for block_index in range(2):
+                scale = np.float16(0.25 * (1 + row + block_index))
+                bits = ((np.arange(128) + row + block_index) % 3 == 0).astype(np.uint8)
+                packed_blocks.append(_make_q1_0_block(float(scale), bits.tolist()))
+                row_values.append(np.where(bits == 1, scale, -scale).astype(np.float32))
+            source_rows.append(np.concatenate(row_values)[:k_in])
+        source = np.stack(source_rows)
+        repacked = repack_gguf_tensor(
+            np.concatenate(packed_blocks), _Q1_0, shape=(n_out, k_in)
+        )
+        activation = np.linspace(-0.5, 0.5, k_in, dtype=np.float32)[None, :]
+
+        actual = _run_repacked_matmul_round_trip(
+            repacked, activation, k_in=k_in, tmp_path=tmp_path
+        )
+        np.testing.assert_allclose(actual, activation @ source.T, rtol=1e-5, atol=1e-5)
+
+
 # ---- Q4_K helpers ----
 
 
@@ -439,6 +657,25 @@ def _make_q4_k_block(
     return np.concatenate([d_bytes, dmin_bytes, scales_bytes, qs_bytes])
 
 
+def _dequantize_repacked_q4(result: RepackedTensor, k_in: int) -> np.ndarray:
+    """Dequantize a 4-bit RepackedTensor with MatMulNBits semantics."""
+    n_out, n_blocks, _ = result.weight.shape
+    packed = result.weight
+    quants = np.empty((n_out, n_blocks, 32), dtype=np.float32)
+    quants[:, :, 0::2] = packed & 0x0F
+    quants[:, :, 1::2] = (packed >> 4) & 0x0F
+
+    if result.zero_points is None:
+        zero_points = np.full((n_out, n_blocks), 8.0, dtype=np.float32)
+    else:
+        zero_points = np.empty((n_out, n_blocks), dtype=np.float32)
+        zero_points[:, 0::2] = result.zero_points & 0x0F
+        zero_points[:, 1::2] = (result.zero_points >> 4)[:, : n_blocks // 2]
+
+    values = (quants - zero_points[:, :, None]) * result.scales[:, :, None]
+    return values.reshape(n_out, -1)[:, :k_in]
+
+
 class TestUnpackQ4KScales:
     def test_simple_values(self):
         """Pack known 6-bit values and verify round-trip."""
@@ -482,6 +719,31 @@ class TestUnpackQ4KScales:
 
 
 class TestRepackQ4K:
+    def test_asymmetric_block_matches_explicit_llama_dequantization(self):
+        """Exercise scale high bits, min subtraction, and paired nibble ordering."""
+        block = _make_q4_k_block(
+            d=1.0,
+            dmin=1.0,
+            sub_scales=[1, 2, 3, 4, 17, 18, 19, 20],
+            sub_mins=[5, 6, 7, 8, 33, 34, 35, 36],
+            nibbles=[
+                value
+                for pair in ((0, 1), (2, 3), (4, 5), (6, 7))
+                for value in pair
+                for _ in range(32)
+            ],
+        )
+
+        actual = quants.dequantize(
+            block.reshape(1, -1), quants.GGMLQuantizationType.Q4_K
+        ).ravel()
+        expected = np.repeat(
+            np.array([-5.0, -4.0, -1.0, 4.0, 35.0, 56.0, 79.0, 104.0]),
+            32,
+        )
+
+        np.testing.assert_array_equal(actual, expected)
+
     def test_single_super_block_shapes(self):
         """Single Q4_K super-block -> 8 MatMulNBits sub-blocks."""
         sc = [10] * 8
@@ -500,59 +762,36 @@ class TestRepackQ4K:
         assert result.scales.shape == (1, 8)
         assert result.zero_points.shape == (1, 4)  # 8 zps / 2
 
-    def test_effective_scales(self):
-        """Verify effective scale = d * sub_scale."""
+    def test_requantized_values_stay_within_half_scale(self):
+        """Affine requantization bounds each value by half a block scale."""
         sc = [10, 20, 30, 40, 1, 2, 3, 4]
         mn = [0] * 8  # zero mins -> zp=0, no offset
-        nibs = [0] * 256
+        nibs = list(range(16)) * 16
         d_val = 0.5
         block = _make_q4_k_block(d=d_val, dmin=0.0, sub_scales=sc, sub_mins=mn, nibbles=nibs)
-        raw = block.reshape(-1)
+        gguf_deq = quants.dequantize(
+            block.reshape(1, -1), quants.GGMLQuantizationType.Q4_K
+        ).reshape(1, 256)
+        result = repack_gguf_tensor(block, _Q4_K, shape=(1, 256))
+        ort_deq = _dequantize_repacked_q4(result, 256)
 
-        result = repack_gguf_tensor(raw, _Q4_K, shape=(1, 256))
+        error = np.abs(ort_deq - gguf_deq).reshape(1, 8, 32)
+        assert np.all(error.max(axis=-1) <= result.scales * 0.51 + 1e-6)
 
-        for i, s in enumerate(sc):
-            expected = np.float16(d_val * s)
-            np.testing.assert_almost_equal(result.scales[0, i], expected, decimal=2)
-
-    def test_zero_point_computation(self):
-        """Verify zp = round(dmin * sub_min / eff_scale), clamped."""
-        d_val = 1.0
-        dmin_val = 1.0
-        # Use sub_scale=1 so eff_scale=1.0, making zp = sub_min (direct)
-        sc = [1] * 8
-        # sub_min values in valid 6-bit range [0, 63]
-        # zp = round(dmin * mn[i] / (d * sc[i])) = mn[i], clamped to [0,15]
-        mn = [3, 5, 10, 0, 1, 63, 1, 2]
-        expected_zp = [3, 5, 10, 0, 1, 15, 1, 2]  # 63 clamped to 15
-        nibs = [0] * 256
+    def test_constant_negative_blocks_use_valid_zero_points(self):
+        """A large Q4_K offset is requantized instead of clamping its source zp."""
         block = _make_q4_k_block(
-            d=d_val, dmin=dmin_val, sub_scales=sc, sub_mins=mn, nibbles=nibs
+            d=1.0,
+            dmin=1.0,
+            sub_scales=[0] * 8,
+            sub_mins=[50] * 8,
+            nibbles=[8] * 256,
         )
-        raw = block.reshape(-1)
+        result = repack_gguf_tensor(block, _Q4_K, shape=(1, 256))
+        ort_deq = _dequantize_repacked_q4(result, 256)
 
-        result = repack_gguf_tensor(raw, _Q4_K, shape=(1, 256))
-
-        # Unpack 4-bit zero points from packed bytes
-        zp_packed = result.zero_points[0]  # (4,) bytes
-        zps = []
-        for byte_val in zp_packed:
-            zps.append(int(byte_val) & 0x0F)
-            zps.append((int(byte_val) >> 4) & 0x0F)
-        assert zps == expected_zp
-
-    def test_zero_effective_scale_gives_zero_zp(self):
-        """When d=0 or sub_scale=0, zp should be 0 (no division by 0)."""
-        sc = [0] * 8
-        mn = [50] * 8
-        nibs = [8] * 256
-        block = _make_q4_k_block(d=1.0, dmin=1.0, sub_scales=sc, sub_mins=mn, nibbles=nibs)
-        raw = block.reshape(-1)
-
-        result = repack_gguf_tensor(raw, _Q4_K, shape=(1, 256))
-
-        # All zps should be 0
-        assert np.all(result.zero_points == 0)
+        assert np.all(result.zero_points == 0xFF)
+        np.testing.assert_allclose(ort_deq, -50.0, atol=float(result.scales.max()) * 0.51)
 
     def test_round_trip_dequantize(self):
         """Compare repacked MatMulNBits dequant against gguf native."""
@@ -583,29 +822,38 @@ class TestRepackQ4K:
         raw = block.reshape(-1)
         result = repack_gguf_tensor(raw, _Q4_K, shape=(1, 256))
 
-        # Manually dequantize from MatMulNBits format
-        ort_deq = np.empty(256, dtype=np.float32)
-        zp_packed = result.zero_points[0]
-        for sb in range(8):
-            packed = result.weight[0, sb]  # (16,) uint8
-            low = (packed & 0x0F).astype(np.float32)
-            high = ((packed >> 4) & 0x0F).astype(np.float32)
-            elements = np.empty(32, dtype=np.float32)
-            elements[0::2] = low
-            elements[1::2] = high
-            s = result.scales[0, sb].astype(np.float32)
-            byte_idx = sb // 2
-            if sb % 2 == 0:
-                zp = float(zp_packed[byte_idx] & 0x0F)
-            else:
-                zp = float((zp_packed[byte_idx] >> 4) & 0x0F)
-            ort_deq[sb * 32 : (sb + 1) * 32] = (elements - zp) * s
+        ort_deq = _dequantize_repacked_q4(result, 256).ravel()
+        max_abs_diff = float(np.max(np.abs(ort_deq - gguf_deq)))
+        tolerance = float(result.scales.max()) * 0.51 + 1e-6
+        assert max_abs_diff > 0
+        assert max_abs_diff <= tolerance
 
-        # Lossy: allow tolerance proportional to effective scale
-        # Typical max error ≈ 0.5 * max(eff_scale)
-        max_eff_scale = float(d_val) * max(sc)
-        atol = max_eff_scale * 0.6
-        np.testing.assert_allclose(ort_deq, gguf_deq, atol=atol)
+    def test_super_blocks_may_cross_logical_rows(self):
+        """Flattened Q4_K blocks are reshaped only after reference dequant."""
+        rng = np.random.RandomState(7)
+        source_blocks = []
+        for i in range(3):
+            source_blocks.append(
+                _make_q4_k_block(
+                    d=0.01 * (i + 1),
+                    dmin=0.004 * (i + 1),
+                    sub_scales=[10 + i] * 8,
+                    sub_mins=[3 + i] * 8,
+                    nibbles=rng.randint(0, 16, size=256).tolist(),
+                )
+            )
+        raw = np.concatenate(source_blocks)
+        shape = (8, 96)  # 768 values: rows split across three 256-value blocks
+
+        gguf_deq = quants.dequantize(
+            raw.reshape(3, -1), quants.GGMLQuantizationType.Q4_K
+        ).reshape(shape)
+        result = repack_gguf_tensor(raw, _Q4_K, shape=shape)
+        ort_deq = _dequantize_repacked_q4(result, shape[1])
+
+        assert result.weight.shape == (8, 3, 16)
+        max_abs_diff = float(np.max(np.abs(ort_deq - gguf_deq)))
+        assert max_abs_diff <= float(result.scales.max()) * 0.51 + 1e-6
 
     def test_multiple_rows_and_super_blocks(self):
         """N=2 rows, K=512 -> 2 super-blocks per row."""
@@ -645,6 +893,93 @@ class TestRepackQ4K:
     def test_q4_k_in_can_repack(self):
         """Q4_K (type 12) is recognized as repackable."""
         assert can_repack(12) is True
+
+
+class TestRepackQ6K:
+    """Q6_K (type 14) -> MatMulNBits 4-bit repacking."""
+
+    def test_in_can_repack(self):
+        """Q6_K (type 14) is recognized as repackable."""
+        assert can_repack(14) is True
+
+    def test_dequantization_matches_gguf_reference_exactly(self):
+        """Our unpack must equal ggml's ``dequantize_row_q6_K``, bit for bit.
+
+        Q6_K interleaves each 256-element super-block across two halves, four
+        emission groups, and a 16-entry scale table. Every plausible-looking
+        wrong permutation still produces finite numbers of the right magnitude,
+        so only an exact comparison against the reference implementation can
+        distinguish a correct unpack from a subtly transposed one -- and the
+        lossy requantization that follows would mask the difference, which is
+        why this compares the dequantized floats directly.
+        """
+        gguf_quants = pytest.importorskip("gguf.quants")
+        from gguf.constants import GGMLQuantizationType
+
+        from mobius.integrations.gguf._repacker import _dequantize_q6_k
+
+        rng = np.random.default_rng(0)
+        n_super = 8
+        blocks = rng.integers(0, 256, size=(n_super, 210), dtype=np.uint8)
+        # Keep `d` finite and non-denormal so the comparison is about layout.
+        blocks[:, 208:210] = np.frombuffer(
+            np.float16([1.5] * n_super).tobytes(), dtype=np.uint8
+        ).reshape(n_super, 2)
+
+        expected = (
+            gguf_quants.dequantize(blocks.reshape(-1).copy(), GGMLQuantizationType.Q6_K)
+            .astype(np.float32)
+            .ravel()
+        )
+        got = _dequantize_q6_k(blocks)
+
+        np.testing.assert_array_equal(got, expected)
+
+    def test_repack_stays_within_half_a_block_scale(self):
+        """The 4-bit requantization is lossy, but bounded by its own scale."""
+        from mobius.integrations.gguf._repacker import _dequantize_q6_k, _repack_q6_k
+
+        rng = np.random.default_rng(1)
+        n_out, k_in = 4, 256
+        n_super = n_out * k_in // 256
+        blocks = rng.integers(0, 256, size=(n_super, 210), dtype=np.uint8)
+        blocks[:, 208:210] = np.frombuffer(
+            np.float16([1.5] * n_super).tobytes(), dtype=np.uint8
+        ).reshape(n_super, 2)
+
+        reference = _dequantize_q6_k(blocks)[: n_out * k_in].reshape(n_out, k_in)
+        result = _repack_q6_k(blocks, n_out, k_in)
+        got = _dequantize_repacked_q4(result, k_in)
+
+        assert result.weight.shape[0] == n_out
+        max_scale = float(result.scales.max())
+        error = np.abs(got - reference)
+        assert np.any(error > 0)
+        assert np.max(error) <= max_scale * 0.51 + 1e-6
+
+    def test_super_block_byte_and_element_counts(self):
+        """Q6_K is 210 bytes per 256 elements; a wrong size mis-slices silently."""
+        from mobius.integrations.gguf._repacker import (
+            _BLOCK_BYTES,
+            _GGUF_BLOCK_ELEMENTS,
+            _GGUF_Q6_K,
+        )
+
+        assert _BLOCK_BYTES[_GGUF_Q6_K] == 210
+        assert _GGUF_BLOCK_ELEMENTS[_GGUF_Q6_K] == 256
+
+
+class TestRepackDequantizedTensor:
+    def test_asymmetric_q4_round_trip_bound(self):
+        rng = np.random.default_rng(0)
+        values = rng.normal(size=(3, 70)).astype(np.float32)
+        result = repack_dequantized_tensor(values)
+        dequantized = _dequantize_repacked_q4(result, values.shape[1])
+
+        max_abs_diff = float(np.max(np.abs(dequantized - values)))
+        assert max_abs_diff <= float(result.scales.max()) * 0.51 + 1e-6
+        assert result.weight.shape == (3, 3, 16)
+        assert result.zero_points.shape == (3, 2)
 
 
 # ---- Q1_0 tests ----

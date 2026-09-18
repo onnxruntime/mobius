@@ -34,7 +34,7 @@ segment as it is ready.  Press Ctrl-C to stop.
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] torchaudio
+    pip install mobius-onnx[transformers] torchaudio
     pip install sounddevice   # for --mic, --live, or audio playback
 
 Usage::

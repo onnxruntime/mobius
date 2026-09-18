@@ -9,6 +9,11 @@ to avoid requiring model downloads.
 
 from __future__ import annotations
 
+import errno
+import os
+import struct
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import numpy as np
@@ -17,10 +22,63 @@ import pytest
 from mobius.integrations.gguf._config_mapping import (
     GGUF_ARCH_TO_MODEL_TYPE,
     _extract_config_fields,
+    _infer_attn_o_bias,
+    _infer_attn_qkv_bias,
+    _infer_mlp_bias,
     _infer_tie_embeddings,
     gguf_to_config,
 )
+from mobius.integrations.gguf._header import _gguf_architecture_from_header
 from mobius.integrations.gguf._reader import GGUFModel
+from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if os.name == "nt" and (
+            getattr(error, "winerror", None) in {1, 50, 1314}
+            or error.errno in {errno.EPERM, errno.EACCES, errno.ENOSYS}
+        ):
+            pytest.skip(f"Windows runner cannot create test symlinks: {error}")
+        raise
+
+
+def _raw_gguf_string(value: bytes) -> bytes:
+    return struct.pack("<Q", len(value)) + value
+
+
+def _raw_gguf_header(*entries: bytes) -> bytes:
+    return b"GGUF" + struct.pack("<IQQ", 3, 0, len(entries)) + b"".join(entries)
+
+
+def _raw_gguf_architecture_entry() -> bytes:
+    return (
+        _raw_gguf_string(b"general.architecture")
+        + struct.pack("<I", 8)
+        + _raw_gguf_string(b"llama")
+    )
+
+
+def test_unsupported_header_reports_both_endian_versions() -> None:
+    data = b"GGUF" + struct.pack("<I", 4) + bytes(16)
+    with pytest.raises(
+        ValueError,
+        match=r"little-endian=4, big-endian=67108864",
+    ):
+        _gguf_architecture_from_header(data, source="unsupported.gguf")
+
+
+def _raw_gguf_array_entry(
+    *,
+    count: int,
+    element_type: int,
+    payload: bytes = b"",
+) -> bytes:
+    return (
+        _raw_gguf_string(b"test.array") + struct.pack("<IIQ", 9, element_type, count) + payload
+    )
 
 
 def _write_test_gguf(
@@ -369,6 +427,124 @@ class TestGGUFModelReader:
         with pytest.raises(FileNotFoundError, match="not found"):
             GGUFModel(tmp_path / "nonexistent.gguf")
 
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are unavailable")
+    def test_rejects_fifo_without_waiting_for_a_writer(self, tmp_path: Path):
+        path = tmp_path / "source.gguf"
+        os.mkfifo(path)
+
+        with pytest.raises(FileNotFoundError, match="not found"):
+            GGUFModel(path)
+
+    def test_reader_uses_pinned_source_during_opening_time_symlink_aba(
+        self,
+        llama_gguf: Path,
+        gemma4_gguf: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import gguf
+
+        original_reader = gguf.GGUFReader
+        logical = tmp_path / "source.gguf"
+        _symlink_or_skip(logical, llama_gguf)
+
+        def replace_path_before_reader_opens(source):
+            logical.unlink()
+            _symlink_or_skip(logical, gemma4_gguf)
+            logical.unlink()
+            _symlink_or_skip(logical, llama_gguf)
+            return original_reader(source)
+
+        monkeypatch.setattr(gguf, "GGUFReader", replace_path_before_reader_opens)
+
+        model = GGUFModel(logical)
+        assert model.architecture == "llama"
+        assert model.source_matches_path()
+
+    def test_reader_fails_closed_when_symlink_is_retargeted_during_open(
+        self,
+        llama_gguf: Path,
+        gemma4_gguf: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import gguf
+
+        path = tmp_path / "source.gguf"
+        _symlink_or_skip(path, llama_gguf)
+        original_reader = gguf.GGUFReader
+
+        def retarget_symlink_before_reader_opens(source):
+            path.unlink()
+            _symlink_or_skip(path, gemma4_gguf)
+            return original_reader(source)
+
+        monkeypatch.setattr(gguf, "GGUFReader", retarget_symlink_before_reader_opens)
+
+        with pytest.raises(
+            ValueError, match="source path changed while the reader was opening"
+        ):
+            GGUFModel(path)
+
+    def test_artifact_hash_waits_for_exclusive_pinned_descriptor_access(
+        self, llama_gguf: Path
+    ):
+        model = GGUFModel(llama_gguf)
+        descriptor_held = threading.Event()
+        release_descriptor = threading.Event()
+        hash_started = threading.Event()
+
+        def hold_descriptor():
+            with model.open_source_descriptor():
+                descriptor_held.set()
+                release_descriptor.wait()
+
+        def hash_artifact():
+            hash_started.set()
+            return gguf_artifact_identity(
+                llama_gguf,
+                model,
+                architecture=model.architecture,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            holder = executor.submit(hold_descriptor)
+            assert descriptor_held.wait(timeout=1)
+            hasher = executor.submit(hash_artifact)
+            assert hash_started.wait(timeout=1)
+            try:
+                with pytest.raises(TimeoutError):
+                    hasher.result(timeout=0.05)
+            finally:
+                release_descriptor.set()
+            holder.result(timeout=1)
+            identity = hasher.result(timeout=1)
+
+        assert identity.sha256 == model.source_sha256()
+
+    def test_rejects_huge_metadata_array_before_constructing_upstream_reader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import gguf
+
+        path = tmp_path / "huge-array.gguf"
+        path.write_bytes(
+            _raw_gguf_header(
+                _raw_gguf_array_entry(count=2**63, element_type=0),
+                _raw_gguf_architecture_entry(),
+            )
+        )
+
+        def fail_if_constructed(path: str):
+            pytest.fail(f"GGUFReader unexpectedly opened {path}")
+
+        monkeypatch.setattr(gguf, "GGUFReader", fail_if_constructed)
+        with pytest.raises(
+            ValueError,
+            match=r"truncated GGUF metadata array.*9223372036854775808 elements",
+        ):
+            GGUFModel(path)
+
     def test_repr(self, llama_gguf: Path):
         model = GGUFModel(llama_gguf)
         r = repr(model)
@@ -405,6 +581,7 @@ class TestConfigMapping:
         assert GGUF_ARCH_TO_MODEL_TYPE["llama"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["mistral"] == "llama"
         assert GGUF_ARCH_TO_MODEL_TYPE["qwen2"] == "qwen2"
+        assert GGUF_ARCH_TO_MODEL_TYPE["qwen35"] == "qwen3_5_text"
         assert GGUF_ARCH_TO_MODEL_TYPE["phi3"] == "phi3"
 
     def test_tie_embeddings_detected(self, tied_gguf: Path):
@@ -416,6 +593,48 @@ class TestConfigMapping:
         model = GGUFModel(llama_gguf)
         config = gguf_to_config(model)
         assert config.tie_word_embeddings is False
+
+    def test_infer_projection_biases_from_tensor_names(self):
+        """Q/K/V, output, and MLP biases are inferred from tensor names.
+
+        Regression for the invalid Q4 bug: Qwen2 carries Q/K/V biases in
+        GGUF (``blk.N.attn_{q,k,v}.bias``). If ``attn_qkv_bias`` is not
+        inferred, the graph builder omits the bias Add and the model emits
+        garbage. Attention-output and MLP biases are absent for Qwen2.
+        """
+
+        class _FakeModel:
+            def __init__(self, names):
+                self.tensor_names = names
+
+        qwen_like = _FakeModel(
+            [
+                "blk.0.attn_q.weight",
+                "blk.0.attn_q.bias",
+                "blk.0.attn_k.bias",
+                "blk.0.attn_v.bias",
+                "blk.0.ffn_down.weight",
+            ]
+        )
+        assert _infer_attn_qkv_bias(qwen_like) is True
+        assert _infer_attn_o_bias(qwen_like) is False
+        assert _infer_mlp_bias(qwen_like) is False
+
+        no_bias = _FakeModel(["blk.0.attn_q.weight", "blk.0.ffn_down.weight"])
+        assert _infer_attn_qkv_bias(no_bias) is False
+        assert _infer_attn_o_bias(no_bias) is False
+        assert _infer_mlp_bias(no_bias) is False
+
+        full_bias = _FakeModel(
+            [
+                "blk.0.attn_qkv.bias",
+                "blk.0.attn_output.bias",
+                "blk.0.ffn_up.bias",
+            ]
+        )
+        assert _infer_attn_qkv_bias(full_bias) is True
+        assert _infer_attn_o_bias(full_bias) is True
+        assert _infer_mlp_bias(full_bias) is True
 
     def test_custom_rope_theta(self, tmp_path: Path):
         path = tmp_path / "rope.gguf"

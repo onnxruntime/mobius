@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "maximum_session_bytes": 17179869184,
+    "bound_target_draft_source_and_tokenizer_bytes": 13293887389,
+    "exact_target_and_draft_gguf_bytes": 10152041152,
+    "execution_provider": "CPUExecutionProvider",
+    "onnxruntime_version": "1.29.0",
+    "higher_level_runtime": "onnxruntime-genai",
+    "higher_level_runtime_version": "0.15.2",
+    "higher_level_runtime_status": "runtime_unvalidated",
+    "production_revision_policy": "No revision default or gate was added to production builds."
+  },
+  "oracle": {
+    "repository": "ggml-org/llama.cpp",
+    "revision": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+    "version": "0.2.0-dev build 10600",
+    "compiler": "AppleClang 21.0.0.21000101",
+    "platform": "Darwin arm64",
+    "speculative_binary_sha256": "49c7b7f38adf921ad867c2b5b8513512dbc3870732aa282499ee39d41d737d56",
+    "target_only_binary_sha256": "24febf68c67f369acd8f86f3e2ec45aebca2d1fa34b0014e37586af5f0c4f412",
+    "prompt_sha256": "80f4858863f6f34dcc55b11be951545f025d0cb1a8d6bd8868958b788f00d6f5",
+    "tokenizer_tokens_sha256": "40d4ea40d5a19d60f50b7acfd7c66026cfca9c0186b7b52a69e757fca65af538",
+    "tokenizer_merges_sha256": "24fa2ae2a398e50784a1fff678482094af4f63e6783d35686726abacda8dc371",
+    "tokenizer_types_sha256": "536de815c96740a876dbaaa0b181fc54b71e958de2063d4d1a7f425f8692cc16"
+  },
+  "direct_ort": {
+    "runtime_version": "1.29.0",
+    "execution_provider": "CPUExecutionProvider",
+    "native_runtime_sha256": "7a1e931b35d068bbafa058323710d468a271f4026bcea3756b8f90e995877961",
+    "python_binding_sha256": "48c9a0805d97aea31f4230a3c878279eff86548749477ac7a8a8ee73289e0305",
+    "coordinator": "mobius.integrations.gguf.DraftPairRunner",
+    "sampling": "greedy argmax",
+    "batch_size": 1,
+    "beam_reorder_supported": false
+  },
+  "independent_direct_ort": {
+    "coordinator": "tests.gguf_draft_oracle.IndependentDraftOracle",
+    "production_runner_imported": false,
+    "transition_helpers_imported": false,
+    "draft_mapping_source": "raw immutable draft GGUF metadata",
+    "sampling": "greedy argmax",
+    "cache_replay_disposition": "Batched verification and accepted-prefix replay can produce different quantized target cache values; every cache tensor state is hashed, maximum absolute differences are recorded, and replay argmax tokens must match exactly.",
+    "mutations": [
+      "draft_mapping",
+      "proposal_order",
+      "cache_copy",
+      "rollback"
+    ]
+  },
+  "routes": [
+    {
+      "architecture": "dflash",
+      "result": "passed-direct-ort",
+      "target": {
+        "repository": "Qwen/Qwen3-4B-GGUF",
+        "revision": "bc640142c66e1fdd12af0bd68f40445458f3869b",
+        "filename": "Qwen3-4B-Q4_K_M.gguf",
+        "size": 2497280256,
+        "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+        "tensor_count": 398,
+        "tensor_qtypes": {
+          "F32": 145,
+          "Q4_K": 216,
+          "Q6_K": 37
+        }
+      },
+      "draft": {
+        "repository": "AtomicChat/Qwen3-4B-DFlash-GGUF",
+        "revision": "b53c7de66f442c556248089966755447c41edc97",
+        "filename": "Qwen3-4B-DFlash.Q8_0.gguf",
+        "size": 577047008,
+        "sha256": "2913a8a5619b30233c0745ccd58de8fbe144b831b54770eb04d4a371221ca273",
+        "tensor_count": 58,
+        "tensor_qtypes": {
+          "F32": 22,
+          "Q8_0": 36
+        }
+      },
+      "draft_source": {
+        "repository": "z-lab/Qwen3-4B-DFlash-b16",
+        "revision": "b74e3a329c4d963783143b1e970d95b002be72bd",
+        "config_size": 1097,
+        "config_sha256": "2de97cdf48f429628074d229d024753f1ea02b575732983d6ed2bc882bbd63c8",
+        "weights_filename": "model.safetensors",
+        "weights_size": 1074860568,
+        "weights_sha256": "a21d0ffe5970c84e9a0710ccb12087d1a4bcbedf979e623476c92c9d005a9cd4"
+      },
+      "target_config": {
+        "repository": "Qwen/Qwen3-4B",
+        "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+        "config_size": 726,
+        "config_sha256": "8ba006f74fecfaaeb392872a60f4a480e7ec9860153d2e1b769ec81f9a147f8a",
+        "tokenizer_size": 11422654,
+        "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "tokenizer_config_size": 9732,
+        "tokenizer_config_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+      },
+      "source_fidelity": {
+        "method": "Pinned llama.cpp converted the immutable HF source to F16; every same-named tensor was fully dequantized and compared with the Q8_0 candidate.",
+        "tensor_count": 58,
+        "element_count": 537427200,
+        "tensor_names_sha256": "6dbb2bd6d04386c92c9522e9553a0b148127afa1a187172fa3291ee31dd64de9",
+        "cosine": 0.9998792383279358,
+        "relative_l2": 0.005406377932967539,
+        "max_abs": 0.01934814453125,
+        "target_storage": "Mobius reports lossy Q4_K/Q6_K to INT4 affine block-32 repacking; target-only and speculative runs use the identical repacked target graph."
+      },
+      "mobius_packages": {
+        "target_files": [
+          "embedding/model.onnx",
+          "embedding/model.onnx.data",
+          "lm_head/model.onnx",
+          "lm_head/model.onnx.data",
+          "model/model.onnx",
+          "model/model.onnx.data",
+          "quantization_report.json"
+        ],
+        "target_sha256": "217a8870220a7042f5d340807c230c27b55a20a47d702836329499db3d437418",
+        "draft_files": [
+          "model.onnx",
+          "model.onnx.data",
+          "quantization_report.json"
+        ],
+        "draft_sha256": "25f29b6bf6a564ea3c8507bd02eafe72cfc8fe59893819ee1aa2836dd243bfa9"
+      },
+      "direct_ort_result": {
+        "generated_token_count": 32,
+        "generated_tokens_sha256": "78c55f7b34e9a14f4c02850a631ed9f85e0a155f25901b5d99db36f1755b7a35",
+        "target_only_equal": true,
+        "draft_width": 15,
+        "rounds": 5,
+        "proposed_tokens": 75,
+        "accepted_tokens": 18,
+        "multi_token_rounds": 3,
+        "rollback_events": 5,
+        "target_cache_threaded": true,
+        "draft_cache_threaded": true,
+        "baseline_seconds": 26.956369041930884,
+        "speculative_seconds": 18.034498166991398,
+        "timing_disposition": "Functional CPU evidence only; the observed 1.49x run is not a benchmark claim."
+      },
+      "independent_direct_ort_trace": {
+        "filename": "gguf_dflash_independent_ort_trace.json",
+        "sha256": "1062e5ed665aeafbcf0d0fb250f9b48c520091ebc4b2ad6b19dbd341518c481f",
+        "mutation_discriminators": {
+          "draft_mapping": "semantic.draft_mapping",
+          "proposal_order": "semantic.proposal_order",
+          "cache_copy": "semantic.draft_cache_replay",
+          "rollback": "semantic.target_replay_tokens"
+        }
+      },
+      "upstream_result": {
+        "generated_token_count": 66,
+        "generated_tokens_sha256": "a17075971e7ec05a00f0558abb6a58a313f780b14fc77429dbac9c7971e8b3b2",
+        "target_only_equal": true,
+        "proposed_tokens": 114,
+        "accepted_tokens": 49,
+        "multi_token_rounds": 13,
+        "zero_accept_rounds": 2,
+        "rejection_rounds": 16
+      },
+      "runtime_warning": "onnxruntime-genai 0.15.2 is unvalidated for this package, but does not gate graph export or direct ONNX Runtime execution."
+    },
+    {
+      "architecture": "eagle3",
+      "result": "passed-direct-ort",
+      "target": {
+        "repository": "Qwen/Qwen3-8B-GGUF",
+        "revision": "7c41481f57cb95916b40956ab2f0b139b296d974",
+        "filename": "Qwen3-8B-Q4_K_M.gguf",
+        "size": 5027783488,
+        "sha256": "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+        "tensor_count": 399,
+        "tensor_qtypes": {
+          "F32": 145,
+          "Q4_K": 217,
+          "Q6_K": 37
+        }
+      },
+      "draft": {
+        "repository": "williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF",
+        "revision": "44480ff4ea6330788818f7f5fc9a69b326dc4c06",
+        "filename": "Qwen3-8B-speculator.eagle3-F16.gguf",
+        "size": 2049930400,
+        "sha256": "d6cf1f3cf29e9cd72c02fb11f989f5192f2b24e142741fdc2de8cd590140f2f2",
+        "tensor_count": 15,
+        "tensor_qtypes": {
+          "F16": 10,
+          "F32": 4,
+          "I64": 1
+        }
+      },
+      "draft_source": {
+        "repository": "RedHatAI/Qwen3-8B-speculator.eagle3",
+        "revision": "08610ffa01dd9f16731fe8f627b85905b6aa51c4",
+        "config_size": 1378,
+        "config_sha256": "84870e0313ac492b78fd0d96de0f1e2958c230a32ca47d0295158f9d3c21981a",
+        "weights_filename": "model.safetensors",
+        "weights_size": 2044116968,
+        "weights_sha256": "ca1fa9bba3eaa6a42848d6f7aede55ec0cc3a72e23381ee58afb8d594917a69a"
+      },
+      "target_config": {
+        "repository": "Qwen/Qwen3-8B",
+        "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+        "config_size": 728,
+        "config_sha256": "f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+        "tokenizer_size": 11422654,
+        "tokenizer_sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+        "tokenizer_config_size": 9732,
+        "tokenizer_config_sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101"
+      },
+      "source_fidelity": {
+        "method": "Pinned llama.cpp independently converted the immutable HF source; all 15 GGUF tensor names, qtypes, shapes, and raw values matched exactly.",
+        "tensor_count": 15,
+        "element_count": 1021885696,
+        "tensor_names_sha256": "91d398e4b8122167a228a9e216406d999dcf01ff7b2f63148e58101556600cb1",
+        "framed_tensor_payload_sha256": "25efb6197aac25d6ae2678c7385b57fa81bcee61587349e0c29b59d182d025a7",
+        "all_types_shapes_values_equal": true,
+        "target_storage": "Mobius reports lossy Q4_K/Q6_K to INT4 affine block-32 repacking; target-only and speculative runs use the identical repacked target graph."
+      },
+      "mobius_packages": {
+        "target_files": [
+          "model.onnx",
+          "model.onnx.data",
+          "quantization_report.json"
+        ],
+        "target_sha256": "f4fdf49f5bc7fd34d6b87e5617589747b7dc9b2d1ac870c219095b9f0afb68d8",
+        "draft_files": [
+          "model.onnx",
+          "model.onnx.data",
+          "quantization_report.json"
+        ],
+        "draft_sha256": "bc75c475debeef5258de42e8039717472b1c8832a8d7278b8b957c007a9648b4"
+      },
+      "direct_ort_result": {
+        "generated_token_count": 32,
+        "generated_tokens_sha256": "03979bff0e9b6a144306f76e727c1c23b63a2a2349e3a1672b74b8be0c339608",
+        "target_only_equal": true,
+        "draft_width": 4,
+        "rounds": 11,
+        "proposed_tokens": 43,
+        "accepted_tokens": 20,
+        "multi_token_rounds": 7,
+        "rollback_events": 10,
+        "target_cache_threaded": true,
+        "draft_cache_threaded": true,
+        "baseline_seconds": 5.135919083841145,
+        "speculative_seconds": 2.7995243340265006,
+        "timing_disposition": "Functional CPU evidence only; the observed 1.83x run is not a benchmark claim."
+      },
+      "independent_direct_ort_trace": {
+        "filename": "gguf_eagle3_independent_ort_trace.json",
+        "sha256": "9d6c6fdb630bc0a040eacc2a2357a2991609ea0d904ff16574a9b55f7d010d55",
+        "mutation_discriminators": {
+          "draft_mapping": "semantic.draft_mapping",
+          "proposal_order": "semantic.proposal_order",
+          "cache_copy": "semantic.draft_cache_replay",
+          "rollback": "semantic.target_replay_tokens"
+        }
+      },
+      "upstream_result": {
+        "generated_token_count": 67,
+        "generated_tokens_sha256": "6fc18d14c240fbed04ab06136d0fb65c1d16f5f36e17f3abb179bbaac9cca181",
+        "target_only_equal": true,
+        "proposed_tokens": 85,
+        "accepted_tokens": 45,
+        "multi_token_rounds": 13,
+        "zero_accept_rounds": 2,
+        "rejection_rounds": 17
+      },
+      "runtime_warning": "onnxruntime-genai 0.15.2 is unvalidated for this package, but does not gate graph export or direct ONNX Runtime execution."
+    }
+  ]
+}

@@ -3,10 +3,10 @@ name: quality-checklist
 description: >
   Use this skill when verifying that a new model is truly done and ready to
   merge. Provides a Definition-of-Done checklist covering all five test
-  confidence levels (L1 graph build through L5 Foundry Local smoke-test),
-  ORT GenAI runtime validation, Olive quantization compatibility, multi-dtype
-  (f32/f16/bf16) and multi-EP (CPU/CUDA/DML) correctness, documentation
-  requirements, and code review criteria.
+  confidence levels (L1 graph build through L5 generation), faithful runtime
+  metadata, optional downstream runtime probes, Olive quantization
+  compatibility, multi-dtype (f32/f16/bf16) and multi-EP (CPU/CUDA/DML)
+  correctness, documentation requirements, and code review criteria.
 ---
 
 # Skill: Quality Checklist
@@ -14,8 +14,8 @@ description: >
 ## When to use
 
 Use this checklist before marking a new model addition as **done**.
-Every item must be checked — or explicitly waived with a written reason —
-before the PR is merged.
+Every required item must be checked — or explicitly waived with a written
+reason — before the PR is merged.
 
 ---
 
@@ -32,15 +32,16 @@ before the PR is merged.
       the model is not a standard text-generation model
 - [ ] `preprocess_weights()` correctly maps every HuggingFace state-dict key
       to the ONNX initializer name (verified by the weight-alignment test)
-- [ ] All new components use `from mobius.components import ...` (public API),
-      not private submodule paths
+- [ ] Models/tasks import components from the public API; component submodules
+      import sibling primitives directly to avoid package-init cycles
 - [ ] No explicit protobuf operations anywhere in new code
       (`onnx.helper`, `onnx.TensorProto`, etc. are forbidden)
 - [ ] Tensor shapes are annotated in comments after non-trivial operations
 - [ ] Automated code review (Copilot/PR review) has been run and all
       findings are resolved or explicitly dismissed with a reason
-- [ ] `lintrunner -a` is clean — zero lint errors before merging
-      (`lintrunner f --output oneline --all-files` to auto-fix, then re-run to confirm)
+- [ ] Run the CI formatter first (`lintrunner f --output oneline --all-files`),
+      then `lintrunner -a`; confirm the pinned tools actually ran (an
+      uninitialized/no-op lintrunner is not evidence)
 
 ### 2. L1 — Graph builds
 
@@ -48,7 +49,7 @@ before the PR is merged.
       for VLM / audio models)
 - [ ] `is_representative=True` if the model has unique behaviour (custom
       class, special attention, MoE, hybrid layers, etc.)
-- [ ] `python -m pytest tests/build_graph_test.py -k "<model_type>"` passes
+- [ ] `python -m pytest tests/build_graph -k "<model_type>"` passes
 - [ ] Weight-alignment test passes:
       `python -m pytest tests/weight_alignment_test.py -k "<model_type>"`
 
@@ -56,6 +57,8 @@ before the PR is merged.
 
 - [ ] YAML test case created at `testdata/cases/<category>/<model>.yaml`
 - [ ] `test_model_id` field set to a real HuggingFace model ID
+- [ ] Revision/trust flags are pinned and forwarded through config, processor,
+      weights, golden generation, and CLI build
 - [ ] Schema validates: `python -m pytest tests/yaml_schema_test.py`
 
 ### 4. L3 — Synthetic parity
@@ -64,8 +67,9 @@ before the PR is merged.
       `_test_configs.py`; added automatically for text-generation models)
 - [ ] `python -m pytest tests/synthetic_parity_test.py -k "<model>"` passes
       with `atol=1e-3` / `rtol=1e-3` (or `1e-2` for multimodal)
-- [ ] Real-weight parity also checked via `tests/integration_test.py` (add
-      model to `_TEXT_MODELS` or equivalent if a small checkpoint is available)
+- [ ] Real-weight parity also checked via a focused integration suite (add
+      generic causal LMs to `TEXT_MODELS` in `tests/integration/_support.py`
+      if a small checkpoint is available)
 
 ### 5. L4 — Golden match
 
@@ -87,6 +91,8 @@ before the PR is merged.
 - [ ] Generation golden file committed to
       `testdata/golden/<cat>/<model>_generation.json`
 - [ ] `python -m pytest tests/e2e_golden_test.py -m generation -k "<model>"` passes
+- [ ] Sequence length is asserted before exact token/frame comparison (no
+      prefix-only `zip` comparison)
 
 > **Speech-language models:** The golden generation script supports the
 > `speech-language` task type for models that process audio inputs (e.g.,
@@ -104,10 +110,13 @@ before the PR is merged.
 
 ### 7. Multi-dtype correctness
 
-- [ ] fp32 tests pass (target: exact token match in greedy generation)
-- [ ] fp16 tests pass (target: logit parity `atol=1e-2`; token match for
-      first N tokens)
-- [ ] bf16 tests pass (target: logit parity `atol=1e-2`)
+- [ ] Every claimed dtype runs real, nonzero input and checks semantic output,
+      not merely export/session creation
+- [ ] fp32 passes full-logit parity and deterministic semantic output
+- [ ] fp16/bf16 pass full-logit parity (`atol=1e-2`) plus
+      architecture-appropriate tokens, frame IDs, transcript, or image output
+- [ ] A dtype that executes inaccurately is rejected explicitly and is not the
+      default; never silently downgrade
 
 Use the example `--compare-hf --dtype f16/bf16` flag if a comparison script
 exists:
@@ -140,42 +149,64 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
       opt-in via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`)
 - [ ] Dead graph inputs removed after EP-aware optimization
       (`RemoveDeadGraphInputsPass` in Stage 4 of `optimize_model()`)
-- [ ] For models with dual head_dim (e.g. Gemma4: 256 for sliding,
-      512 for full attention), verify whether ORT GenAI requires
-      `search.past_present_share_buffer=false` because GenAI allocates
-      uniform KV cache shapes; if so, explicitly override the generated
-      `genai_config.json` before runtime validation rather than assuming
-      the default generated setting is correct
-- [ ] Encoder inputs (vision/audio) are declared with `dtype=config.dtype`
-      at sub-model entry (no stale float32-only cast guidance)
+- [ ] Vision/audio graph inputs match the real processor (normally float32);
+      reduced-precision encoders cast once at graph entry
+- [ ] Representative graph evidence covers raw/post-Mobius/post-weight and
+      ORT EP-optimized op histograms; verify critical fusions, unexpected
+      Transpose nodes, and activation-vs-scalar metadata Memcpy nodes
+- [ ] Final fusion claims use loaded weights/constants; no-weight graphs cannot
+      prove initializer folding
 
-### 9. ORT GenAI runtime
+### 9. ORT GenAI metadata and downstream runtime
 
-- [ ] Model can be loaded with `ort_genai.Model(output_dir)` without error
-- [ ] Greedy text generation produces non-empty, coherent output
-- [ ] ORT GenAI test added to `tests/ort_genai_test.py`
-      (or confirmed covered by an existing parametrized test)
+- [ ] Generated metadata faithfully reflects graph filenames, semantic I/O,
+      representable cache templates, and global cache-slot indices
+- [ ] Intrinsic schema/config errors are tested without inferring downstream
+      runtime capability
+
+Downstream evidence:
+
+- [ ] The network-free generic decoder test passes with the pinned latest stable
+      `onnxruntime-genai==0.15.2`.
+- [ ] Every runtime-supported real route has an `ort_genai` YAML marker with an
+      immutable evidence ID, exact tokenizer provenance, bounded download size,
+      CPU provider claim, and explicit released-version capabilities.
+- [ ] Real generation asserts the full generated length before token equality
+      and runs with an isolated Hub/Xet cache that is deleted after the test.
+- [ ] If ORT GenAI validation is run for a model with dual head dimensions,
+      determine whether that runtime requires
+      `search.past_present_share_buffer=false` for its uniform KV-cache
+      allocation, and override the generated config only for that probe.
+- [ ] Add an ORT GenAI integration test when useful, but do not require one for
+      export acceptance.
+
+Omitting these downstream probes requires no waiver or TODO.
+
+
+Waiver needed if any of the steps are not possible.
 
 Run the ORT GenAI integration test:
 
 ```bash
-python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
+python -m pytest tests/ort_genai_e2e_test.py -m ort_genai_fast -v
+python -m pytest tests/gguf_small_model_runtime_integration_test.py \
+  -m ort_genai_real -v
 ```
 
-### 10. Foundry Local smoke test
+### 10. Foundry Local package check
 
-- [ ] Model exported package can be loaded and run in Foundry Local
-- [ ] At minimum, verify that the `genai_config.json` and all ONNX files
-      are present and the model responds to a short prompt
-
-> If Foundry Local is not available in the current environment, document the
-> skip with a `# TODO: verify with Foundry Local` comment in the PR.
+- [ ] `genai_config.json` and all ONNX files are present and internally
+      consistent
+- [ ] If Foundry Local is available, record its version and load/generation
+      result as optional downstream evidence; limitations do not block export
 
 ### 11. Olive quantization compatibility
 
 - [ ] Model can be loaded from the exported ONNX package by Olive
 - [ ] INT4 / INT8 quantization runs to completion without errors
 - [ ] Quantized model produces non-degenerate output (coherent text)
+- [ ] Quantization uses only required execution providers if unrelated provider
+      registration fails, and evidence includes size, load, and inference
 - [ ] If quantization changes the graph structure (e.g. MatMulNBits), verify
       the `genai_config.json` still loads correctly in ORT GenAI
 
@@ -199,18 +230,32 @@ novel weight layouts (e.g. fused QKV, non-standard expert routing).
       a comment in the source file or the skill notes explains it
 - [ ] README model table updated if this is a significant new addition
 
+### 13. Publication and CI triage
+
+- [ ] Run specialist review after L1-L3, before expensive L4/L5, and again
+      after optimization or rebase changes
+- [ ] Rebase linearly onto `origin/main`; resolve shared registries/helpers
+      semantically, run shared-surface tests, and push with `--force-with-lease`
+- [ ] After rebase, rerun metadata generation and intrinsic config validation.
+      If downstream runtime evidence is included, rerun that exact probe too.
+- [ ] Confirm the remote PR head SHA, mergeability, replacement lint, and
+      architecture checks after the final push
+- [ ] Triage red CI at check/job/test granularity against the exact base SHA;
+      record test names and metrics, and never change unrelated models
+- [ ] For expensive GPU goldens, link targeted L4 and L5 jobs; aggregate
+      timeout or runner failure is not model evidence
+
 ---
 
 ## Waiver policy
 
-Any item that cannot be completed must be waived explicitly in the PR
+Any required item that cannot be completed must be waived explicitly in the PR
 description:
 
 ```
 **Waivers:**
 - L5 golden: Model is 70B — generating golden data exceeds CI resources.
   skip_reason added to YAML.
-- Foundry Local: Not available in this environment. Tracked in issue #NNN.
 ```
 
 Unchecked items without a waiver are grounds to request changes before merge.
@@ -225,7 +270,7 @@ lintrunner f --output oneline --all-files
 lintrunner -a
 
 # L1 – graph build
-python -m pytest tests/build_graph_test.py -k "<model_type>"
+python -m pytest tests/build_graph -k "<model_type>"
 
 # L1 – weight alignment
 python -m pytest tests/weight_alignment_test.py -k "<model_type>"
@@ -237,7 +282,7 @@ python -m pytest tests/yaml_schema_test.py
 python -m pytest tests/synthetic_parity_test.py -k "<model>" -sv
 
 # L3 – real-weight integration (if small checkpoint available)
-python -m pytest tests/integration_test.py -m integration -k "<model>" -sv
+python -m pytest tests/integration -m integration -k "<model>" -sv
 
 # L4 – generate golden
 python scripts/generate_golden.py --level L4 --filter '<model>*'

@@ -1,8 +1,11 @@
 # Model Catalog
 
-**mobius** supports 273 registered model types across 10 categories.
-This catalog lists every supported architecture with its module class, task type,
-and example HuggingFace model IDs.
+This user-facing catalog groups registered HuggingFace model types by task and lists
+their module classes and example model IDs. Diffusers pipeline components are described
+separately because they are not entries in the model registry. Neither list implies GGUF
+import or runtime support; see the generated
+[GGUF capability and evidence catalog](gguf-capability-catalog.md) for those
+capability-specific verdicts and statistics.
 
 > **Auto-fallback**: Models not explicitly registered but architecturally
 > compatible with Llama (standard CausalLM transformers) are automatically
@@ -79,7 +82,7 @@ Models that route tokens to a subset of expert MLPs.
 | `deepseek_v2` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V2-Lite` |
 | `deepseek_v3` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V3` |
 | `phimoe` | `Phi3MoECausalLMModel` | `microsoft/Phi-3.5-MoE-instruct` |
-| `gptoss` | `GPTOSSCausalLMModel` | — |
+| `gpt_oss` | `GPTOSSCausalLMModel` | `openai/gpt-oss-20b` (native MXFP4/QMoE on CUDA) |
 
 Also registered with `MoECausalLMModel`: `arctic`, `dbrx`,
 `ernie4_5_moe`, `flex_olmo`, `glm4_moe`, `granitemoe`,
@@ -182,8 +185,11 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | Model Type | Module Class | Task | Example HuggingFace Model |
 |---|---|---|---|
 | `whisper` | `WhisperForConditionalGeneration` | `speech-to-text` | `openai/whisper-tiny` |
+| `moonshine` | `MoonshineForConditionalGeneration` | `speech-to-text` | `UsefulSensors/moonshine-tiny` |
+| `moonshine_streaming` | `MoonshineStreamingForConditionalGeneration` | `speech-to-text` | `moonshine-ai/moonshine-streaming-tiny` |
 | `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 | `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
+| `VibeVoiceForASRStreamingTraining` | `VibeVoiceASRStreamingForConditionalGeneration` | `vibevoice-asr-streaming` | `microsoft/VibeVoice-ASR-Streaming-1.5B`, `microsoft/VibeVoice-ASR-Streaming-7B` |
 
 ### Text-to-Speech
 
@@ -191,6 +197,8 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 |---|---|---|---|
 | `qwen3_tts` | `Qwen3TTSForConditionalGeneration` | `tts` | — |
 | `qwen3_tts_tokenizer_12hz` | `Qwen3TTSTokenizerV2Model` | `codec` | — |
+| `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `vibevoice/VibeVoice-1.5B-hf` |
+| `vibevoice_asr` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr` | `microsoft/VibeVoice-ASR-HF` |
 
 ### Audio Feature Extraction
 
@@ -243,8 +251,12 @@ Supported component classes include:
 - `ControlNetModel` — ControlNet conditioning
 - `CogVideoXTransformer3DModel` — CogVideoX
 - `VideoAutoencoderModel` — Video VAE
-- `QwenImageTransformer2DModel` — Qwen image generation
-- `AutoencoderKLQwenImageModel` — Qwen image VAE
+- `QwenImageTransformer2DModel` — Qwen image generation and packed-token
+  Qwen-Image-Edit-2509 denoising with source-image conditioning, masks, and 3D RoPE
+- `AutoencoderKLQwenImageModel` — Qwen image VAE, including edit-pipeline latent
+  normalization
+- `Qwen2_5_VLForConditionalGeneration` — image-aware prompt encoder used by
+  Qwen-Image-Edit-2509
 
 ```python
 from mobius import build
@@ -263,21 +275,14 @@ All decoder-only LLMs and MoE models support quantized weight loading:
 | **AWQ** | HuggingFace (e.g. `-AWQ` suffix models) | `build("TheBloke/Llama-2-7B-AWQ")` |
 | **GGUF** | Local `.gguf` files | `build_from_gguf("model.gguf")` |
 
-GGUF support (Phase 1) dequantizes weights to float before building the
-ONNX graph. Phase 2 (`--keep-quantized`) preserves quantization using
-MatMulNBits ops.
+GGUF import uses quantized target storage by default where the selected graph
+supports it. Source blocks may be byte-preserved, losslessly repacked, or
+lossily dequantized/requantized to a target such as INT4 affine block-32.
+Lossy conversion emits one aggregate warning, and every saved package records
+source fidelity, storage, and compute semantics in `quantization_report.json`.
+Use `--dequantize` for an explicitly reported float model.
 
-## Summary
-
-| Category | Count | Primary Classes |
-|---|---|---|
-| Decoder-only LLMs | ~100 | `CausalLMModel`, `GPT2CausalLMModel` |
-| Mixture of Experts | ~25 | `MoECausalLMModel`, `DeepSeekV3CausalLMModel` |
-| SSM / Hybrid | 5 | `MambaCausalLMModel`, `JambaCausalLMModel` |
-| Vision-Language | ~40 | `LLaVAModel`, `Qwen25VLCausalLMModel` |
-| Encoder-only | ~40 | `BertModel`, `DistilBertModel` |
-| Encoder-decoder | ~20 | `BartForConditionalGeneration`, `T5ForConditionalGeneration` |
-| Speech & Audio | ~20 | `WhisperForConditionalGeneration`, `Wav2Vec2Model` |
-| Vision | ~25 | `ViTModel`, `CLIPVisionModel` |
-| Diffusion | ~10 | `UNet2DConditionModel`, `FluxTransformer2DModel` |
-| **Total** | **~273** | |
+Encoder GGUF imports for `bert` and `modern-bert` select
+`feature-extraction` and expose token-level `last_hidden_state` only. Pooling,
+classifier/reranker heads, generative task overrides, and cache options are
+rejected unless their exact output contracts are implemented.

@@ -9,8 +9,268 @@ import math
 
 import numpy as np
 import pytest
+import torch
 
 from mobius.models.t5 import _rename_t5_weight
+
+
+def test_standard_t5_graph_contract_is_stable():
+    """Ordinary T5 keeps the pre-GGUF deterministic graph size and cache shape."""
+    from mobius._configs import ArchitectureConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+    from mobius.tasks import Seq2SeqTask
+
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        num_decoder_layers=2,
+        vocab_size=256,
+        max_position_embeddings=64,
+        hidden_act="gelu",
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        pad_token_id=0,
+    )
+    package = Seq2SeqTask().build(T5ForConditionalGeneration(config), config)
+    decoder = package["decoder"]
+
+    decoder_inputs = {value.name: value for value in decoder.graph.inputs}
+    assert "encoder_attention_mask" not in decoder_inputs
+    assert str(decoder_inputs["past_key_values.0.cross.key"].shape) == (
+        "[batch,4,encoder_sequence_len,16]"
+    )
+
+
+def test_t5_encoder_and_decoder_use_independent_quantization():
+    from mobius._builder import build_from_module
+    from mobius._configs import ArchitectureConfig, QuantizationConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+
+    decoder = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+        quantize_embeddings=True,
+        modules_to_not_convert=("lm_head",),
+    )
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=1,
+        num_decoder_layers=1,
+        vocab_size=256,
+        max_position_embeddings=64,
+        hidden_act="gelu",
+        rms_norm_eps=1e-6,
+        pad_token_id=0,
+        quantization=decoder,
+        component_quantization={
+            "encoder": QuantizationConfig(
+                bits=8,
+                group_size=32,
+                quant_method="olive",
+                sym=True,
+                quantize_embeddings=True,
+            ),
+            "decoder": decoder,
+        },
+    )
+
+    package = build_from_module(
+        T5ForConditionalGeneration(config),
+        config,
+        task="seq2seq",
+    )
+
+    def layouts(component: str) -> set[tuple[int, int]]:
+        return {
+            (
+                node.attributes["bits"].as_int(),
+                node.attributes["block_size"].as_int(),
+            )
+            for node in package[component].graph
+            if node.op_type == "MatMulNBits"
+        }
+
+    assert layouts("encoder") == {(8, 32)}
+    assert layouts("decoder") == {(4, 16)}
+
+    def embedding_layout(component: str) -> tuple[int, int]:
+        node = next(
+            node for node in package[component].graph if node.op_type == "GatherBlockQuantized"
+        )
+        return (
+            node.attributes["bits"].as_int(),
+            node.attributes["block_size"].as_int(),
+        )
+
+    assert embedding_layout("encoder") == (8, 32)
+    assert embedding_layout("decoder") == (4, 16)
+
+
+def test_t5_component_preprocess_preserves_packed_shared_and_head_sidecars():
+    from mobius._configs import ArchitectureConfig, QuantizationConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+        quantize_embeddings=True,
+        quantize_lm_head=True,
+    )
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=1,
+        num_decoder_layers=1,
+        vocab_size=256,
+        hidden_act="gelu",
+        quantization=quantization,
+        component_quantization={
+            "encoder": quantization,
+            "decoder": quantization,
+        },
+    )
+    qweight = torch.zeros(256, 32, dtype=torch.uint8)
+    scales = torch.ones(256, 4)
+
+    result = T5ForConditionalGeneration(config).preprocess_weights(
+        {
+            "shared.weight_qweight": qweight,
+            "shared.weight_scales": scales,
+            "lm_head.weight_qweight": qweight,
+            "lm_head.weight_scales": scales,
+        }
+    )
+
+    assert result["encoder.embed_tokens.weight_qweight"] is qweight
+    assert result["encoder.embed_tokens.weight_scales"] is scales
+    assert result["decoder.embed_tokens.weight_qweight"] is qweight
+    assert result["decoder.embed_tokens.weight_scales"] is scales
+    assert result["decoder.lm_head.weight_qweight"] is qweight
+    assert result["decoder.lm_head.weight_scales"] is scales
+    assert not any(name.startswith("shared.") for name in result)
+
+
+def test_t5_materializes_missing_packed_tied_head_for_split_decoder():
+    from mobius._configs import ArchitectureConfig, QuantizationConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+        quantize_embeddings=True,
+        quantize_lm_head=True,
+        tie_word_embeddings=True,
+    )
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=1,
+        num_decoder_layers=1,
+        vocab_size=256,
+        hidden_act="gelu",
+        tie_word_embeddings=True,
+        quantization=quantization,
+        component_quantization={
+            "encoder": quantization,
+            "decoder": quantization,
+        },
+    )
+    qweight = torch.zeros(256, 32, dtype=torch.uint8)
+    scales = torch.ones(256, 4)
+
+    result = T5ForConditionalGeneration(config).preprocess_weights(
+        {
+            "shared.weight_qweight": qweight,
+            "shared.weight_scales": scales,
+        }
+    )
+
+    assert result["decoder.lm_head.weight_qweight"] is qweight
+    assert result["decoder.lm_head.weight_scales"] is scales
+
+
+def test_t5_rejects_shared_packed_embedding_with_different_component_layouts():
+    from mobius._configs import ArchitectureConfig, QuantizationConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+
+    encoder = QuantizationConfig(
+        bits=8,
+        group_size=32,
+        quant_method="olive",
+        quantize_embeddings=True,
+    )
+    decoder = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        quantize_embeddings=True,
+    )
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=1,
+        num_decoder_layers=1,
+        vocab_size=256,
+        hidden_act="gelu",
+        component_quantization={
+            "encoder": encoder,
+            "decoder": decoder,
+        },
+    )
+
+    with pytest.raises(ValueError, match="same embedding quantization layout"):
+        T5ForConditionalGeneration(config).preprocess_weights(
+            {
+                "shared.weight_qweight": torch.zeros(256, 32, dtype=torch.uint8),
+                "shared.weight_scales": torch.ones(256, 4),
+            }
+        )
+
+
+def test_t5_encoder_is_public_and_consumes_attention_mask():
+    from mobius._configs import ArchitectureConfig
+    from mobius.models import T5EncoderModel
+    from mobius.tasks import T5TextEncoderTask
+
+    config = ArchitectureConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        hidden_act="relu",
+        relative_attention_num_buckets=8,
+        relative_attention_max_distance=16,
+    )
+    graph = T5TextEncoderTask().build(T5EncoderModel(config), config)["model"].graph
+    attention_mask = next(value for value in graph.inputs if value.name == "attention_mask")
+    assert list(attention_mask.uses())
+    assert any(node.op_type == "Unsqueeze" for node in graph)
 
 
 class TestRelativePositionBucket:
@@ -94,20 +354,90 @@ class TestRelativePositionBucket:
 class TestT5WeightRename:
     """Test weight name mapping from HuggingFace to ONNX."""
 
-    def test_relative_attention_bias_lifted_to_encoder(self):
-        """Block 0's relative_attention_bias maps to encoder level."""
+    def test_relative_attention_bias_keeps_encoder_layer_index(self):
+        """Relative bias remains attached to its source encoder layer."""
         hf = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-        assert _rename_t5_weight(hf) == "encoder.relative_attention_bias.weight"
+        assert _rename_t5_weight(hf) == "encoder.block.0.relative_attention_bias.weight"
 
-    def test_relative_attention_bias_lifted_to_decoder(self):
-        """Block 0's relative_attention_bias maps to decoder level."""
+    def test_relative_attention_bias_keeps_decoder_layer_index(self):
+        """Relative bias remains attached to its source decoder layer."""
         hf = "decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-        assert _rename_t5_weight(hf) == "decoder.relative_attention_bias.weight"
+        assert _rename_t5_weight(hf) == "decoder.block.0.relative_attention_bias.weight"
 
     def test_self_attention_projections(self):
         """Self-attention projections rename correctly."""
         hf = "encoder.block.2.layer.0.SelfAttention.q.weight"
         assert _rename_t5_weight(hf) == "encoder.block.2.self_attn.q_proj.weight"
+
+    def test_preprocess_preserves_values_and_ties_shared_weights(self):
+        from mobius._configs import ArchitectureConfig
+        from mobius.models.t5 import T5ForConditionalGeneration
+
+        config = ArchitectureConfig(
+            vocab_size=8,
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_decoder_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+            hidden_act="relu",
+            tie_word_embeddings=True,
+        )
+        model = T5ForConditionalGeneration(config)
+        shared = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        projection = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        relative_bias = torch.arange(64, dtype=torch.float32).reshape(32, 2)
+        transformed = model.preprocess_weights(
+            {
+                "shared.weight": shared,
+                "encoder.block.0.layer.0.SelfAttention.q.weight": projection,
+                "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight": (
+                    relative_bias
+                ),
+            }
+        )
+
+        assert transformed["encoder.block.0.self_attn.q_proj.weight"] is projection
+        assert transformed["encoder.block.0.relative_attention_bias.weight"] is relative_bias
+        assert transformed["encoder.embed_tokens.weight"] is shared
+        assert transformed["decoder.embed_tokens.weight"] is shared
+        assert transformed["decoder.lm_head.weight"] is shared
+
+    @pytest.mark.parametrize("bias_layers", [[0], [0, 1]])
+    def test_relative_bias_initializer_ownership_matches_source_layers(
+        self, bias_layers: list[int]
+    ):
+        from mobius import build_from_module
+        from mobius._configs import ArchitectureConfig
+        from mobius.models.t5 import T5ForConditionalGeneration
+
+        config = ArchitectureConfig(
+            vocab_size=8,
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=2,
+            num_decoder_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+            hidden_act="relu",
+            encoder_relative_attention_bias_layers=bias_layers,
+            decoder_relative_attention_bias_layers=bias_layers,
+        )
+        package = build_from_module(T5ForConditionalGeneration(config), config, task="seq2seq")
+
+        encoder_names = set(package["encoder"].graph.initializers)
+        decoder_names = set(package["decoder"].graph.initializers)
+        assert "encoder.block.0.relative_attention_bias.weight" in encoder_names
+        assert "decoder.block.0.relative_attention_bias.weight" in decoder_names
+        assert ("encoder.block.1.relative_attention_bias.weight" in encoder_names) == (
+            1 in bias_layers
+        )
+        assert ("decoder.block.1.relative_attention_bias.weight" in decoder_names) == (
+            1 in bias_layers
+        )
 
     def test_cross_attention_projections(self):
         """Cross-attention projections rename correctly."""

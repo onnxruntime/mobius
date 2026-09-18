@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from mobius._testing import (
@@ -103,6 +105,66 @@ class TestDeepSeekMLAInit:
 
     def test_custom_scale(self):
         config = _mla_config()
+        mla = DeepSeekMLA(config, scale=0.25)
+        assert mla.scaling == pytest.approx(0.25)
+
+    def test_yarn_mscale_softmax_scale_correction(self):
+        """YaRN-active configs apply an extra mscale^2 softmax-scale factor.
+
+        Regression test for the missing DeepSeek-V2/V3 YaRN attention
+        softmax-scale correction (HF's ``yarn_apply_mscale``): the RoPE
+        cos/sin ``attention_factor`` only rescales the rope portion of Q/K,
+        not the full attention logit, so a separate ``mscale_all_dim``-based
+        correction must also be applied to ``self.scaling``. Values mirror
+        the real ``deepseek-ai/DeepSeek-V2-Lite`` config.
+        """
+        config = _mla_config(
+            rope_type="yarn",
+            rope_scaling={
+                "factor": 40,
+                "mscale": 0.707,
+                "mscale_all_dim": 0.707,
+                "original_max_position_embeddings": 4096,
+            },
+        )
+        mla = DeepSeekMLA(config)
+        qk_head_dim = 12 + 4  # 16
+        mscale = 0.1 * 0.707 * math.log(40) + 1.0
+        expected = qk_head_dim**-0.5 * mscale * mscale
+        assert mla.scaling == pytest.approx(expected)
+        # Sanity: the correction is non-trivial (not silently a no-op).
+        assert mla.scaling != pytest.approx(qk_head_dim**-0.5)
+
+    def test_yarn_mscale_correction_skipped_when_rope_type_default(self):
+        """No mscale correction is applied outside of YaRN.
+
+        Matches HF's ``rope_parameters.get("rope_type", "default") !=
+        "default"`` guard.
+        """
+        config = _mla_config(
+            rope_type="default",
+            rope_scaling={"factor": 40, "mscale_all_dim": 0.707},
+        )
+        mla = DeepSeekMLA(config)
+        qk_head_dim = 12 + 4  # 16
+        assert mla.scaling == pytest.approx(qk_head_dim**-0.5)
+
+    def test_yarn_mscale_correction_skipped_when_mscale_all_dim_zero(self):
+        """No correction when ``mscale_all_dim`` is unset/zero, matching HF."""
+        config = _mla_config(
+            rope_type="yarn",
+            rope_scaling={"factor": 40, "mscale_all_dim": 0.0},
+        )
+        mla = DeepSeekMLA(config)
+        qk_head_dim = 12 + 4  # 16
+        assert mla.scaling == pytest.approx(qk_head_dim**-0.5)
+
+    def test_custom_scale_overrides_yarn_correction(self):
+        """An explicit ``scale=`` always wins over the YaRN correction."""
+        config = _mla_config(
+            rope_type="yarn",
+            rope_scaling={"factor": 40, "mscale_all_dim": 0.707},
+        )
         mla = DeepSeekMLA(config, scale=0.25)
         assert mla.scaling == pytest.approx(0.25)
 

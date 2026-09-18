@@ -313,6 +313,35 @@ class LongRope(BaseRope):
         return self._cast_embeddings(op, cos, sin)
 
 
+def yarn_apply_mscale(
+    rope_type: str | None, rope_scaling: dict | None, scaling: float
+) -> float:
+    """Apply the DeepSeek-V2/V3 YaRN attention-softmax scale correction.
+
+    This mirrors HuggingFace's ``yarn_apply_mscale`` in
+    ``modeling_deepseek_v2.py``: DeepSeek's MLA attention modules multiply
+    the softmax scale (``qk_head_dim**-0.5``) by ``mscale(factor,
+    mscale_all_dim) ** 2`` whenever YaRN is active. This is *independent*
+    of — and in addition to — the ``attention_factor`` that :class:`YarnRope`
+    applies to the RoPE cos/sin cache: that factor only rescales the
+    rotated (rope) portion of Q/K, while this correction rescales the whole
+    attention logit (rope + nope portions alike). Omitting it reproduces
+    exactly at position 0 (single-key softmax is scale-invariant) but
+    diverges sharply at position >= 1 for any real YaRN-scaled checkpoint
+    where ``mscale_all_dim`` is non-zero (e.g. DeepSeek-V2-Lite, DeepSeek-V3).
+    """
+    if rope_type == "default" or not rope_scaling:
+        return scaling
+    mscale_all_dim = rope_scaling.get("mscale_all_dim") or 0.0
+    if not mscale_all_dim:
+        return scaling
+    factor = rope_scaling.get("factor") or 1.0
+    if factor <= 1:
+        return scaling
+    mscale = 0.1 * mscale_all_dim * math.log(factor) + 1.0
+    return scaling * mscale * mscale
+
+
 class YarnRope(BaseRope):
     """YaRN (Yet another RoPE extensioN) rotary embeddings.
 

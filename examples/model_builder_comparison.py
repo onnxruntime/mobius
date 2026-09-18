@@ -1200,7 +1200,7 @@ def _expected_counts(model_id: str) -> dict[str, int] | None:
 
 def _mobius_version() -> str:
     try:
-        return importlib.metadata.version("mobius-ai")
+        return importlib.metadata.version("mobius-onnx")
     except importlib.metadata.PackageNotFoundError:
         pass
     try:

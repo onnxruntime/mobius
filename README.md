@@ -1,9 +1,11 @@
 # mobius
 
+[![PyPI](https://img.shields.io/pypi/v/mobius-onnx)](https://pypi.org/project/mobius-onnx/)
 [![CI](https://github.com/onnxruntime/mobius/actions/workflows/main.yml/badge.svg)](https://github.com/onnxruntime/mobius/actions/workflows/main.yml)
 [![L4: Golden Checkpoint Parity (GPU)](https://github.com/onnxruntime/mobius/actions/workflows/gpu_l4_golden_parity.yml/badge.svg)](https://github.com/onnxruntime/mobius/actions/workflows/gpu_l4_golden_parity.yml)
 [![L5: End-to-End Generation (GPU)](https://github.com/onnxruntime/mobius/actions/workflows/gpu_l5_generation_e2e.yml/badge.svg)](https://github.com/onnxruntime/mobius/actions/workflows/gpu_l5_generation_e2e.yml)
 [![Nightly L2 Architecture Validation](https://github.com/onnxruntime/mobius/actions/workflows/nightly_l2.yml/badge.svg)](https://github.com/onnxruntime/mobius/actions/workflows/nightly_l2.yml)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 ONNX model definitions for GenAI using the `onnxscript.nn` API.
 
@@ -27,14 +29,18 @@ multi-component export for pipelines.
 |---|---|
 | **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3/3.5/3.6, Phi-3/3.5, Gemma 1/2/3/4, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
 | **Mixture of Experts** | PhiMoE, GPTOSS, Mixtral, OLMoE, DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Qwen3-Next, GLM-4-MoE, Arctic, DBRX, Jamba |
-| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
+| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), Nemotron Parse, LLaVA, InternVL2, Mage-VL (image + streaming video), MiniCPM-V 4.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
 | **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa, DistilBERT, ELECTRA, XLNet |
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
-| **Speech-to-Text** | Whisper, FastConformer-RNNT, FunASR, Qwen3-ASR, SenseVoice |
+| **Speech-to-Text** | Whisper, Moonshine, Moonshine Streaming, FastConformer-RNNT, FunASR, GLM-ASR, Qwen3-ASR, SenseVoice |
 | **Audio** | Wav2Vec2, HuBERT, WavLM, SpeechT5 |
 | **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
-| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage, HunyuanDiT, CogVideoX |
+| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage / Qwen-Image-Edit-2509, HunyuanDiT, CogVideoX |
 | **Adapters** | T2I-Adapter, IP-Adapter |
+
+Mage-VL supports direct three-model ONNX export. ORT GenAI export is currently
+rejected because the runtime cannot supply its required `patch_positions` input
+or Mage-VL's 1D decoder positions.
 
 Supports **290+ Transformers model types** and **10 Diffusers component types**
 across **40+ task types** and **100+ reusable components**.
@@ -98,16 +104,34 @@ See the [EP quickstart](docs/ep_quickstart.md) and
 ### CLI
 
 ```sh
-mobius build --model Qwen/Qwen2.5-0.5B output_dir/
+mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/
 
 # Build for CUDA with f16
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --ep cuda --dtype f16
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ --ep cuda --dtype f16
 
 # Build a diffusers pipeline (all components)
-mobius build --model Qwen/Qwen-Image-2512 output_dir/
+mobius build --model Qwen/Qwen-Image-2512 --output output_dir/
 
 # Build encoder-decoder model (produces encoder/model.onnx + decoder/model.onnx)
-mobius build --model openai/whisper-tiny output_dir/
+mobius build --model openai/whisper-tiny --output output_dir/
+```
+
+Build-mode toggles use the cargo-style `--features` option. Available features
+are `static-cache`, `fp8-kv-cache`, `prune-prefill-prefix`, and `text-only`. Pass them
+as a comma-separated list or repeat the option:
+
+```sh
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ \
+      --features static-cache,prune-prefill-prefix --max-seq-len 2048
+```
+
+Use `--release` with either `build` or `build-gguf` to potentially reduce saved model size
+by stripping build-time debug and provenance metadata. Functional metadata with keys prefixed by
+`mobius.` is preserved:
+
+```sh
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ --release
+mobius build-gguf model.gguf --output output_dir/ --release
 ```
 
 See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html) for all subcommands and flags.
@@ -151,10 +175,10 @@ See the [design document](https://onnxruntime.github.io/mobius/design.html) for 
 
 ```bash
 # Unit tests (fast, no network needed)
-pytest tests/build_graph_test.py -v
+pytest tests/build_graph -v
 
 # Integration tests (downloads models)
-pytest tests/integration_test.py -m integration -v
+pytest tests/integration -m integration -v
 
 # All unit tests (components, configs, tasks, models)
 pytest src tests -m "not integration" -v
@@ -164,6 +188,9 @@ lintrunner f --all-files
 ```
 
 ### Adding a new model
+
+To [request a new model](https://github.com/onnxruntime/mobius/issues/new?template=model-request.yml),
+or ask an AI coding agent to implement a new model, use the resources below:
 
 See the [AI-assisted model support strategy](https://onnxruntime.github.io/mobius/ai-model-support-strategy.html)
 and the developer skills in `.agents/skills/`:

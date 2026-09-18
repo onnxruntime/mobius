@@ -1,0 +1,31 @@
+{
+  "model_id": "microsoft/Mage-VL",
+  "prompt": "Describe the image and then summarize the main action in the video.",
+  "generated_tokens": [
+    785,
+    2168,
+    61891,
+    264,
+    1874,
+    315,
+    3040,
+    2953,
+    11259,
+    2163,
+    264,
+    1965,
+    304,
+    264,
+    23889,
+    11,
+    1817,
+    9963,
+    264,
+    13753,
+    42395,
+    448,
+    279,
+    18096
+  ],
+  "generated_text": "The image depicts a group of four men standing around a table in a stadium, each holding a yellow microphone with the BBC"
+}

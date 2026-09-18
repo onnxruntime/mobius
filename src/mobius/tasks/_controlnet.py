@@ -36,7 +36,7 @@ class ControlNetTask(ModelTask):
             dtype=ir.DataType.FLOAT,
             shape=["batch", config.in_channels, "height", "width"],
         )
-        timestep = builder.input("timestep", dtype=ir.DataType.INT64, shape=["batch"])
+        timestep = builder.input("timestep", dtype=ir.DataType.FLOAT, shape=["batch"])
         encoder_hidden_states = builder.input(
             "encoder_hidden_states",
             dtype=ir.DataType.FLOAT,

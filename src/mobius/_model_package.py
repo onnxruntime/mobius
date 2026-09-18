@@ -20,19 +20,526 @@ from __future__ import annotations
 
 __all__ = ["ModelPackage"]
 
+import inspect
+import json
 import logging
+import math
 import os
+import shutil
+import tempfile
+import threading
 from collections import UserDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from itertools import chain
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import onnx_ir as ir
+import rfc8785
 import torch
 import tqdm
 
+from mobius._export_report import ComponentExportReport
 from mobius._optimizations import fold_initializers_after_weights
-from mobius._weight_loading import _assign_weight
+from mobius.adapters import (
+    AdapterArtifact,
+    AdapterServiceOptions,
+    AdapterTargetManifest,
+)
+from mobius.generation import PolicyComponent
+from mobius.integrations._weight_loading import _assign_weight
+
+if TYPE_CHECKING:
+    from mobius.integrations.gguf._quantization_report import GGUFQuantizationReport
 
 logger = logging.getLogger(__name__)
+
+_PACKAGE_MANIFEST = ".mobius-package.json"
+_PACKAGE_MANIFEST_FORMAT = "mobius.model-package.v1"
+_MTP_SIDECAR_BASENAME = ".mobius-mtp"
+_QUANTIZATION_REPORT = "quantization_report.json"
+_EXPORT_REPORT = "export_report.json"
+_WEIGHT_LOADING_REPORT = "weight-loading-report.json"
+_DEFAULT_STREAMING_DENSE_SHARD_BYTES = 1 << 30
+_MAX_STREAMING_DENSE_SHARD_BYTES = 5_000_000_000
+_SAFETENSORS_SAVE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _ComponentSaveLayout:
+    """An immutable component selection and its corresponding directory layout."""
+
+    components: tuple[tuple[str, ir.Model], ...]
+    filter_applied: bool
+
+    @property
+    def uses_subdirectories(self) -> bool:
+        return len(self.components) > 1
+
+
+def _select_component_save_layout(
+    package: ModelPackage,
+    components: Callable[[str], bool] | None,
+) -> _ComponentSaveLayout:
+    """Evaluate a component predicate once and freeze its selected models."""
+    selected: list[tuple[str, ir.Model]] = []
+    for name, model in package.data.items():
+        if components is None or components(name):
+            selected.append((name, model))
+    return _ComponentSaveLayout(tuple(selected), filter_applied=components is not None)
+
+
+def _component_output_directory(
+    directory: str | Path,
+    component_name: str,
+    *,
+    uses_subdirectories: bool,
+) -> Path:
+    """Return the directory where a selected component's files are written."""
+    root = Path(directory)
+    return root / component_name if uses_subdirectories else root
+
+
+def _read_mtp_sidecar_name(directory: str) -> str | None:
+    manifest_path = os.path.join(directory, _PACKAGE_MANIFEST)
+    if not os.path.lexists(manifest_path):
+        return None
+    if os.path.islink(manifest_path):
+        raise ValueError("ModelPackage manifest must not be a symlink.")
+    if not os.path.isfile(manifest_path):
+        raise ValueError(f"ModelPackage manifest is not a file: {manifest_path}.")
+    with open(manifest_path) as file:
+        manifest = json.load(file)
+    sidecar_name = manifest.get("mtp_head") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("format") != _PACKAGE_MANIFEST_FORMAT
+        or not isinstance(sidecar_name, str)
+        or not sidecar_name
+        or sidecar_name in {".", ".."}
+        or os.path.basename(sidecar_name) != sidecar_name
+    ):
+        raise ValueError(f"Invalid ModelPackage manifest: {manifest_path}.")
+    return sidecar_name
+
+
+def _write_mtp_manifest(directory: str, sidecar_name: str) -> None:
+    payload = json.dumps(
+        {"format": _PACKAGE_MANIFEST_FORMAT, "mtp_head": sidecar_name},
+        indent=2,
+        sort_keys=True,
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.path.join(directory, _PACKAGE_MANIFEST), flags, 0o666)
+    with os.fdopen(descriptor, "w") as file:
+        file.write(payload)
+        file.write("\n")
+
+
+def _mtp_sidecar_name(package: ModelPackage) -> str:
+    """Choose a sidecar directory that cannot hide a model component."""
+    component_keys = {name.casefold() for name in package}
+    name = _MTP_SIDECAR_BASENAME
+    suffix = 0
+    while name.casefold() in component_keys:
+        suffix += 1
+        name = f"{_MTP_SIDECAR_BASENAME}-{suffix}"
+    return name
+
+
+def _validate_mtp_chain(package: ModelPackage) -> None:
+    """Reject malformed or cyclic MTP package chains before saving any files."""
+    seen: set[int] = set()
+    current = package
+    while True:
+        identity = id(current)
+        if identity in seen:
+            raise ValueError("ModelPackage mtp_head attachments must not contain a cycle.")
+        seen.add(identity)
+        component_keys: set[str] = set()
+        for name in current:
+            if (
+                not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+                or os.path.isabs(name)
+            ):
+                raise ValueError(
+                    f"ModelPackage component name {name!r} must be a non-empty path segment."
+                )
+            collision_key = name.casefold()
+            if collision_key in component_keys:
+                raise ValueError(
+                    "ModelPackage component names must be distinct when compared "
+                    f"case-insensitively; {name!r} collides with another component."
+                )
+            component_keys.add(collision_key)
+            if collision_key in {
+                _PACKAGE_MANIFEST.casefold(),
+                _EXPORT_REPORT.casefold(),
+                _QUANTIZATION_REPORT.casefold(),
+                _WEIGHT_LOADING_REPORT.casefold(),
+            }:
+                raise ValueError(
+                    f"ModelPackage component name {name!r} is reserved for package metadata."
+                )
+        sidecar = current.mtp_head
+        if sidecar is None:
+            return
+        if not isinstance(sidecar, ModelPackage):
+            raise TypeError("ModelPackage mtp_head must be another ModelPackage or None.")
+        current = sidecar
+
+
+def _validate_streaming_safetensors_destination(
+    package: ModelPackage,
+    directory: str,
+    *,
+    external_data: str,
+    component_layout: _ComponentSaveLayout,
+) -> None:
+    """Defensively reject known aliases to files read by a streaming package.
+
+    Streaming saves publish a fresh staged directory without replacement; that
+    transaction, rather than this pathname inventory, protects the complete
+    artifact set. These direct checks retain clearer diagnostics for known
+    source-directory, hard-link, and symlink collisions. They are not a claim
+    of complete TOCTOU protection for ordinary non-streaming saves.
+    """
+    output_directories: set[Path] = set()
+    output_files: set[Path] = set()
+    source_directories: set[Path] = set()
+    source_files: set[Path] = set()
+    current_package = package
+    current_directory = Path(directory)
+    current_layout = component_layout
+    while True:
+        component_directories = {
+            _component_output_directory(
+                current_directory,
+                name,
+                uses_subdirectories=current_layout.uses_subdirectories,
+            )
+            for name, _ in current_layout.components
+        }
+        output_directories.update(path.resolve() for path in component_directories)
+        for output_directory in component_directories:
+            output_files.add(output_directory / "model.onnx")
+            if external_data == "onnx":
+                output_files.add(output_directory / "model.onnx.data")
+            else:
+                output_files.update(
+                    {
+                        output_directory / "model.safetensors",
+                        output_directory / "model.safetensors.index.json",
+                    }
+                )
+            if output_directory.is_dir():
+                for existing in output_directory.iterdir():
+                    name = existing.name
+                    if external_data == "onnx" and (
+                        name == "model.onnx.data"
+                        or (name.startswith("model.onnx-") and name.endswith(".data"))
+                    ):
+                        output_files.add(existing)
+                    elif external_data == "safetensors" and (
+                        name == "model.safetensors"
+                        or name == "model.safetensors.index.json"
+                        or (name.startswith("model-") and name.endswith(".safetensors"))
+                    ):
+                        output_files.add(existing)
+
+        # These package control files are written, replaced, or removed by
+        # save() at the package root rather than a component directory.
+        output_files.update(
+            current_directory / name
+            for name in (
+                _PACKAGE_MANIFEST,
+                _QUANTIZATION_REPORT,
+                _EXPORT_REPORT,
+                _WEIGHT_LOADING_REPORT,
+            )
+        )
+
+        source_directories.update(
+            Path(path).resolve()
+            for path in getattr(current_package, "_native_streaming_source_directories", ())
+        )
+        source_files.update(
+            Path(path).resolve()
+            for path in getattr(current_package, "_native_streaming_source_files", ())
+        )
+        if current_package.mtp_head is None:
+            break
+        current_directory /= _mtp_sidecar_name(current_package)
+        current_package = current_package.mtp_head
+        # MTP sidecars are always saved in full by the recursive save call.
+        current_layout = _select_component_save_layout(current_package, None)
+
+    if external_data == "safetensors":
+        collisions = output_directories & source_directories
+        if collisions:
+            collision = min(collisions, key=str)
+            raise ValueError(
+                "A native streaming package cannot save safetensors external data "
+                f"into source checkpoint directory {str(collision)!r}: output shards "
+                "could overwrite weights that are still read lazily. Choose a separate "
+                "output directory."
+            )
+
+    for output_file in sorted(output_files, key=str):
+        if not os.path.lexists(output_file):
+            continue
+        for source_file in source_files:
+            try:
+                aliases_source = os.path.samefile(output_file, source_file)
+            except FileNotFoundError:
+                aliases_source = False
+            if aliases_source:
+                raise ValueError(
+                    "A native streaming package cannot overwrite output file "
+                    f"{str(output_file)!r} because it aliases lazy source file "
+                    f"{str(source_file)!r} through the same path, a hard link, or "
+                    "a symlink. Remove the alias or choose a separate output path."
+                )
+
+
+def _validate_output_directory(
+    directory: str, *, kind: str, inspect_contents: bool = True
+) -> None:
+    if not os.path.lexists(directory):
+        return
+    if os.path.islink(directory) or not os.path.isdir(directory):
+        raise ValueError(f"ModelPackage {kind} output must be a real directory.")
+    if inspect_contents:
+        for root, directories, files in os.walk(directory):
+            if any(os.path.islink(os.path.join(root, entry)) for entry in directories + files):
+                raise ValueError(f"ModelPackage {kind} output must not contain symlinks.")
+
+
+def _validate_mtp_save_paths(
+    package: ModelPackage,
+    directory: str,
+    component_layout: _ComponentSaveLayout,
+    *,
+    external_data: str = "onnx",
+    include_policy_components: bool = True,
+    include_adapter_artifacts: bool = True,
+) -> None:
+    """Reject unsafe output paths throughout the package chain before any writes."""
+    _validate_output_directory(directory, kind="package", inspect_contents=False)
+    if package.export_report is not None and component_layout.filter_applied:
+        raise ValueError(
+            "Component-filtered saves cannot preserve an attached export report; "
+            "save the complete package or detach and replace the report."
+        )
+    report_path = os.path.join(directory, _QUANTIZATION_REPORT)
+    if os.path.lexists(report_path) and (
+        os.path.islink(report_path) or not os.path.isfile(report_path)
+    ):
+        raise ValueError("ModelPackage quantization report output must be a real file.")
+    if (
+        package.gguf_quantization_report is None
+        and package.gguf_reuse_plan is None
+        and os.path.isfile(report_path)
+    ):
+        raise ValueError(
+            "ModelPackage output contains a stale quantization_report.json, but the "
+            "package being saved has no GGUF quantization report. Remove or clean the "
+            "output directory before saving."
+        )
+    export_report_path = os.path.join(directory, _EXPORT_REPORT)
+    if os.path.lexists(export_report_path) and (
+        os.path.islink(export_report_path) or not os.path.isfile(export_report_path)
+    ):
+        raise ValueError("ModelPackage component export report output must be a real file.")
+    if (
+        package.export_report is None
+        and package.gguf_reuse_plan is None
+        and os.path.isfile(export_report_path)
+    ):
+        raise ValueError(
+            "ModelPackage output contains a stale export_report.json, but the package "
+            "being saved has no component export report. Remove or clean the output "
+            "directory before saving."
+        )
+    if (
+        package.export_report is not None
+        and package.gguf_reuse_plan is None
+        and (
+            package.export_report.status == "partial"
+            or package.export_report.runtime_validation_status == "unvalidated"
+        )
+        and os.path.isdir(directory)
+        and os.listdir(directory)
+    ):
+        raise FileExistsError(
+            "Partial or runtime-unvalidated component exports require an empty output "
+            "directory so omitted or unverified components cannot survive from a "
+            "previous package."
+        )
+    weight_report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+    if os.path.lexists(weight_report_path) and (
+        os.path.islink(weight_report_path) or not os.path.isfile(weight_report_path)
+    ):
+        raise ValueError("ModelPackage weight-loading report output must be a real file.")
+    previous_sidecar_name = _read_mtp_sidecar_name(directory)
+    selected = [name for name, _ in component_layout.components]
+    if len(selected) > 1:
+        reserved = {"policies", "adapters"}.intersection(name.casefold() for name in selected)
+        if reserved:
+            name = sorted(reserved)[0]
+            raise ValueError(
+                f"ModelPackage component name {name!r} is reserved for package artifacts."
+            )
+    if len(selected) > 1:
+        for name in selected:
+            _validate_output_directory(
+                os.path.join(directory, name),
+                kind=f"component {name!r}",
+            )
+    else:
+        for entry in os.listdir(directory) if os.path.isdir(directory) else ():
+            if (
+                entry == "model.onnx"
+                or (
+                    entry.startswith("model")
+                    and (
+                        entry.endswith(".data")
+                        or (external_data == "safetensors" and ".safetensors" in entry)
+                    )
+                )
+            ) and os.path.islink(os.path.join(directory, entry)):
+                raise ValueError("ModelPackage model output must not be a symlink.")
+    if include_policy_components and package.policy_components:
+        _validate_output_directory(
+            os.path.join(directory, "policies"),
+            kind="policy artifact",
+        )
+    if include_adapter_artifacts and package.adapter_artifacts:
+        _validate_output_directory(
+            os.path.join(directory, "adapters"),
+            kind="adapter artifact",
+        )
+    active_artifact_names = {
+        name
+        for name, active in (
+            ("policies", include_policy_components and bool(package.policy_components)),
+            ("adapters", include_adapter_artifacts and bool(package.adapter_artifacts)),
+        )
+        if active
+    }
+    if (
+        previous_sidecar_name is not None
+        and previous_sidecar_name.casefold() in active_artifact_names
+    ):
+        raise ValueError(
+            "ModelPackage manifest MTP sidecar collides with an active artifact namespace."
+        )
+    if package.mtp_head is None:
+        return
+    sidecar_directory = os.path.join(directory, _mtp_sidecar_name(package))
+    _validate_output_directory(sidecar_directory, kind="MTP sidecar")
+    _validate_mtp_save_paths(
+        package.mtp_head,
+        sidecar_directory,
+        _select_component_save_layout(package.mtp_head, None),
+        external_data=external_data,
+        include_policy_components=include_policy_components,
+        include_adapter_artifacts=include_adapter_artifacts,
+    )
+
+
+def _adapter_dtype_name(dtype: ir.DataType) -> str:
+    names = {
+        ir.DataType.FLOAT16: "float16",
+        ir.DataType.FLOAT: "float32",
+        ir.DataType.BFLOAT16: "bfloat16",
+    }
+    try:
+        return names[dtype]
+    except KeyError as error:
+        raise ValueError(
+            f"adapter dtype {dtype.name} must be a floating-point adapter dtype"
+        ) from error
+
+
+def _adapter_source_file(artifact: AdapterArtifact) -> str:
+    if artifact.source.path is None:
+        raise ValueError(
+            f"adapter {artifact.name!r} cannot preserve an in-memory source format"
+        )
+    if artifact.source.format == "onnx_adapter":
+        return artifact.source.path
+    raise ValueError(
+        f"adapter {artifact.name!r} source format {artifact.source.format!r} "
+        "cannot be preserved"
+    )
+
+
+def _save_safetensors(model: ir.Model, path: str, **kwargs: Any) -> None:
+    """Save safetensors with the spelling required by its zero-copy writer."""
+    contains_e8m0 = False
+    for graph in chain((model.graph,), model.graph.subgraphs()):
+        # onnx-ir externalizes graph values and initializers; tensor-valued
+        # attributes remain embedded and intentionally are not part of this scan.
+        values = chain(
+            graph.inputs,
+            graph.outputs,
+            graph.initializers.values(),
+            chain.from_iterable(chain(node.inputs, node.outputs) for node in graph),
+        )
+        if any(
+            value is not None
+            and (
+                value.dtype == ir.DataType.FLOAT8E8M0
+                or (
+                    value.const_value is not None
+                    and value.const_value.dtype == ir.DataType.FLOAT8E8M0
+                )
+            )
+            for value in values
+        ):
+            contains_e8m0 = True
+            break
+    if not contains_e8m0:
+        ir.save_safetensors(model, path, **kwargs)
+        return
+
+    import safetensors
+    from onnx_ir import _safetensors as onnx_ir_safetensors
+
+    # Every Mobius E8M0 save takes this lock before inspecting onnx-ir's map.
+    # This temporary private-global mutation is removable once our minimum
+    # onnx-ir maps E8M0 to safetensors 0.8's "float8_e8m0fnu" spelling (or
+    # safetensors accepts the old alias). Unrelated direct onnx-ir callers
+    # cannot participate in this lock.
+    with _SAFETENSORS_SAVE_LOCK:
+        dtype_mapping = getattr(onnx_ir_safetensors, "_IR_DTYPE_TO_SAFETENSORS_DTYPE", None)
+        old_e8m0_name = (
+            dtype_mapping.get(ir.DataType.FLOAT8E8M0) if dtype_mapping is not None else None
+        )
+        needs_e8m0_compatibility = (
+            # This is onnx-ir's writer feature probe: TensorSpec arrived with
+            # safetensors 0.8, alongside the E8M0 spelling transition.
+            hasattr(safetensors, "TensorSpec")
+            and dtype_mapping is not None
+            and old_e8m0_name == "float8_e8m0"
+        )
+        if not needs_e8m0_compatibility:
+            ir.save_safetensors(model, path, **kwargs)
+            return
+
+        assert dtype_mapping is not None
+        dtype_mapping[ir.DataType.FLOAT8E8M0] = "float8_e8m0fnu"
+        try:
+            ir.save_safetensors(model, path, **kwargs)
+        finally:
+            dtype_mapping[ir.DataType.FLOAT8E8M0] = old_e8m0_name
 
 
 class ModelPackage(UserDict[str, ir.Model]):
@@ -41,19 +548,104 @@ class ModelPackage(UserDict[str, ir.Model]):
     Attributes:
         config: The architecture configuration used to build the models,
             or ``None`` if not available (e.g. after :meth:`load`).
+        gguf_quantization_report: Optional persisted report describing GGUF
+            source-storage preservation and conversion behavior.
+        export_report: Optional persisted component-level report describing
+            independently supported/exported and deferred/omitted package parts.
+        quantization_report: Optional transient, loader-specific metadata describing
+            quantization handling. The concrete report type and schema belong to the
+            integration that produced it (for example, ``CompressedTensorsLoadReport``);
+            they are not a stable shared ``ModelPackage`` API and are not persisted by
+            :meth:`save`.
+        mtp_head: Optional nested MTP sidecar package. :meth:`save` records its
+            collision-free directory in an explicit package manifest, and
+            :meth:`load` restores it automatically.
+        draft_manifest: Optional target/draft orchestration and identity contract.
+        draft_pair_quantization_reports: Per-component GGUF fidelity reports for a
+            target-coupled draft package.
     """
 
     def __init__(
         self,
         models: dict[str, ir.Model] | None = None,
         config: object | None = None,
+        policy_components: dict[str, PolicyComponent] | None = None,
+        adapter_artifacts: dict[str, AdapterArtifact] | None = None,
+        adapter_target_manifest: AdapterTargetManifest | None = None,
+        adapter_service_options: AdapterServiceOptions | None = None,
     ) -> None:
         super().__init__(models or {})
         self.config = config
+        self.gguf_quantization_report: GGUFQuantizationReport | None = None
+        self.gguf_architecture = ""
+        self.gguf_artifact_identity: Any = None
+        self.gguf_execution_provider = ""
+        self.gguf_import_route = ""
+        self.gguf_source_filename = ""
+        self.gguf_source_identity: object | None = None
+        self.gguf_source_path = ""
+        self.gguf_tokenizer_verdict: Any = None
+        self.export_report: ComponentExportReport | None = None
+        self.quantization_report: object | None = None
+        self.weight_loading_report: dict[str, object] | None = None
+        # Canonical source shard parent directories used only to protect lazy
+        # native streaming serialization. They are intentionally never persisted.
+        self._native_streaming_source_directories: frozenset[Path] = frozenset()
+        self._native_streaming_source_files: frozenset[Path] = frozenset()
+        # Optional persistence policy attached by the GGUF importer.
+        self.gguf_reuse_plan: Any = None
+        self.draft_manifest: Any = None
+        self.mtp_head: ModelPackage | None = None
+        self.draft_manifest: dict[str, Any] | None = None
+        self.draft_config: object | None = None
+        self.draft_pair_quantization_reports: dict[str, GGUFQuantizationReport | None] = {}
+        self.gguf_architecture: str | None = None
+        self.gguf_execution_provider: str | None = None
+        self.gguf_source_path: str | None = None
+        self.gguf_target_source_path: str | None = None
+        self.policy_components = dict(policy_components or {})
+        self.adapter_target_manifest = adapter_target_manifest
+        self.adapter_service_options = adapter_service_options or AdapterServiceOptions()
+        if adapter_target_manifest is not None:
+            adapter_target_manifest.validate(self.data)
+        self.adapter_artifacts: dict[str, AdapterArtifact] = {}
+        for name, artifact in (adapter_artifacts or {}).items():
+            if name != artifact.name:
+                raise ValueError(
+                    f"adapter catalog key {name!r} does not match artifact name "
+                    f"{artifact.name!r}"
+                )
+            self.add_adapter_artifact(artifact)
+
+    def register_lazy_source_artifacts(
+        self,
+        *,
+        files: Iterable[str | os.PathLike[str]] = (),
+        directories: Iterable[str | os.PathLike[str]] = (),
+    ) -> None:
+        """Register local artifacts that lazy tensors may read during save."""
+
+        def resolved(paths: Iterable[str | os.PathLike[str]]) -> set[Path]:
+            return {Path(path).expanduser().resolve() for path in paths}
+
+        self._native_streaming_source_files = frozenset(
+            set(self._native_streaming_source_files) | resolved(files)
+        )
+        self._native_streaming_source_directories = frozenset(
+            set(self._native_streaming_source_directories) | resolved(directories)
+        )
 
     def __repr__(self) -> str:
         names = ", ".join(repr(k) for k in self.data)
         return f"ModelPackage({{{names}}})"
+
+    def __setitem__(self, name: str, model: ir.Model) -> None:
+        """Store a component whose ONNX graph is available for downstream tooling."""
+        if not isinstance(model, ir.Model) or model.graph is None:
+            raise TypeError(
+                f"ModelPackage component {name!r} must be an ir.Model with a graph"
+            )
+        super().__setitem__(name, model)
 
     # -- Persistence -------------------------------------------------------
 
@@ -63,22 +655,31 @@ class ModelPackage(UserDict[str, ir.Model]):
         *,
         external_data: str = "onnx",
         max_shard_size_bytes: int | None = None,
+        max_workers: int = 8,
         components: Callable[[str], bool] | None = None,
         progress_bar: bool = True,
         check_weights: bool = True,
+        include_policy_components: bool = True,
+        include_adapter_artifacts: bool = True,
+        _atomic_export_report: bool = True,
+        _component_layout: _ComponentSaveLayout | None = None,
     ) -> None:
         """Save all component models to a directory.
 
         When the package contains a single model, it is saved directly as
         ``model.onnx`` in *directory*.  When multiple models are present,
-        each is saved in its own subfolder as ``{name}/model.onnx``.
+        each is saved in its own subfolder as ``{name}/model.onnx``. An attached
+        :attr:`mtp_head` package is saved under a collision-free directory named
+        by ``.mobius-package.json``.
 
         .. note::
             This method writes ONNX files only.  If you need a directory that
             ``onnxruntime-genai`` can load (i.e. with ``genai_config.json`` and
             tokenizer files), use
-            :func:`mobius.integrations.ort_genai.export_package` instead — it
-            wraps :meth:`save` with the ORT-GenAI config-generation step.
+            :func:`mobius.integrations.ort_genai.export_package` instead. For
+            onnx-genai, call
+            :func:`mobius.integrations.onnx_genai.write_onnx_genai_config`
+            after saving, or use ``mobius build --runtime onnx-genai``.
 
         Args:
             directory: Path to the output directory (created if needed).
@@ -93,8 +694,14 @@ class ModelPackage(UserDict[str, ir.Model]):
                     errors on some CUDA/cuBLAS versions when loading weights
                     via memory-mapped I/O.  Use ``"onnx"`` (the default) for
                     models targeting CUDA execution.
-            max_shard_size_bytes: Maximum shard size in bytes for safetensors
-                format.  Only used when *external_data* is ``"safetensors"``.
+            max_shard_size_bytes: Maximum external-data shard size in bytes.
+                Used by both ONNX and safetensors external-data formats. A
+                single tensor larger than this value is written in its own
+                oversized shard.
+            max_workers: Number of threads used to write ONNX external data.
+                Defaults to 8. Set to 1 to save serially. Older ``onnx_ir``
+                versions that do not support concurrent saves fall back to
+                serial behavior.
             components: Optional predicate ``(name) -> bool`` that selects
                 which components to save.  When ``None`` (default), all
                 components are saved.  Examples::
@@ -109,45 +716,590 @@ class ModelPackage(UserDict[str, ir.Model]):
             check_weights: Whether to verify that all initializers have
                 weight data before saving.  Defaults to ``True``.
                 Set to ``False`` when saving skeleton models without weights.
+            include_policy_components: Save attached generation-policy ONNX
+                components under ``policies/``. Defaults to ``True``.
+            include_adapter_artifacts: Save attached parameter-adapter bundles
+                under ``adapters/``. Defaults to ``True``.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
-                ``"safetensors"``, or if *check_weights* is ``True`` and
-                any initializer is missing its ``const_value``.
+                ``"safetensors"``, if *max_workers* is not positive, or if
+                *check_weights* is ``True`` and any initializer is missing its
+                ``const_value``.
         """
+        # Freeze the caller-controlled predicate before validation so every
+        # validation and write observes exactly the same root save layout.
+        component_layout = _component_layout or _select_component_save_layout(self, components)
         if external_data not in {"onnx", "safetensors"}:
             raise ValueError(
                 f"Unknown external_data format {external_data!r}. "
                 "Expected 'onnx' or 'safetensors'."
             )
-        os.makedirs(directory, exist_ok=True)
-        callback = _make_progress_callback() if progress_bar else None
+        _validate_mtp_chain(self)
+        _validate_streaming_safetensors_destination(
+            self,
+            directory,
+            external_data=external_data,
+            component_layout=component_layout,
+        )
+        _validate_mtp_save_paths(
+            self,
+            directory,
+            component_layout,
+            external_data=external_data,
+            include_policy_components=include_policy_components,
+            include_adapter_artifacts=include_adapter_artifacts,
+        )
+        if max_workers <= 0:
+            raise ValueError(f"max_workers must be positive, got {max_workers}.")
+        reuse_plan = getattr(self, "gguf_reuse_plan", None)
+        streaming_external_data = False
+        current_package = self
+        while True:
+            report = current_package.weight_loading_report
+            if report is not None and report.get("streaming_external_data") is True:
+                streaming_external_data = True
+                break
+            if current_package.mtp_head is None:
+                break
+            current_package = current_package.mtp_head
+        if (
+            streaming_external_data or (self.export_report is not None and reuse_plan is None)
+        ) and _atomic_export_report:
+            destination = os.path.abspath(directory)
+            if os.path.lexists(destination):
+                raise FileExistsError(
+                    "Transactional package destination already exists; refusing replacement."
+                )
+            parent = os.path.dirname(destination)
+            os.makedirs(parent, exist_ok=True)
+            stage = tempfile.mkdtemp(
+                prefix=f".{os.path.basename(destination)}.",
+                suffix=".tmp",
+                dir=parent,
+            )
+            try:
+                self.save(
+                    stage,
+                    external_data=external_data,
+                    max_shard_size_bytes=max_shard_size_bytes,
+                    max_workers=max_workers,
+                    progress_bar=progress_bar,
+                    check_weights=check_weights,
+                    include_policy_components=include_policy_components,
+                    include_adapter_artifacts=include_adapter_artifacts,
+                    _atomic_export_report=False,
+                    _component_layout=component_layout,
+                )
+                if self.draft_manifest is not None:
+                    from mobius.integrations.gguf._draft import write_draft_manifest
 
-        selected = {
-            name: model
-            for name, model in self.data.items()
-            if components is None or components(name)
-        }
-        use_subfolders = len(selected) > 1
+                    write_draft_manifest(self.draft_manifest, stage)
+                from mobius.integrations.gguf._runtime_package import (
+                    _publish_directory_no_replace,
+                )
+
+                _publish_directory_no_replace(Path(stage), Path(destination))
+            finally:
+                if os.path.isdir(stage):
+                    shutil.rmtree(stage)
+            return
+        if reuse_plan is not None:
+            if external_data != "onnx":
+                raise ValueError(
+                    "GGUF weight reuse requires external_data='onnx'; safetensors "
+                    "cannot preserve arbitrary GGUF byte ranges."
+                )
+            if max_shard_size_bytes is not None:
+                raise ValueError(
+                    "GGUF weight reuse writes one converted-weight sidecar and does "
+                    "not support max_shard_size_bytes."
+                )
+        previous_sidecar_name = _read_mtp_sidecar_name(directory)
+        os.makedirs(directory, exist_ok=True)
+        quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
+        if self.gguf_quantization_report is not None and reuse_plan is None:
+            self.gguf_quantization_report.write_json(quantization_report_path)
+        export_report_path = os.path.join(directory, _EXPORT_REPORT)
+        selected = dict(component_layout.components)
+        report = self.weight_loading_report
+        dense_stream = (
+            report is not None
+            and report.get("output_weight_format") == "dense"
+            and report.get("native_fp8") is False
+        )
+        preserved_stream = report is not None and report.get("streaming_external_data") is True
+        if dense_stream or preserved_stream:
+            assert report is not None
+            # onnx-ir may materialize external-data shards concurrently. Keep
+            # this fallback serial so the documented bound remains one output
+            # shard plus one reconstructed tensor instead of max_workers shards.
+            max_workers = 1
+            if max_shard_size_bytes is None:
+                max_shard_size_bytes = _DEFAULT_STREAMING_DENSE_SHARD_BYTES
+            if max_shard_size_bytes > _MAX_STREAMING_DENSE_SHARD_BYTES:
+                raise ValueError(
+                    "Streaming dense fallback packages require "
+                    f"max_shard_size_bytes <= {_MAX_STREAMING_DENSE_SHARD_BYTES}; "
+                    f"got {max_shard_size_bytes}. The serializer buffers one output "
+                    "shard before flushing it."
+                )
+            largest_tensor_bytes = 0
+            for model in selected.values():
+                for initializer in model.graph.initializers.values():
+                    if initializer.shape is None or initializer.dtype is None:
+                        continue
+                    num_elements = math.prod(int(dim) for dim in initializer.shape)
+                    tensor_bytes = (num_elements * initializer.dtype.bitwidth + 7) // 8
+                    largest_tensor_bytes = max(largest_tensor_bytes, tensor_bytes)
+            self.weight_loading_report = {
+                **report,
+                "external_data_shard_limit_bytes": max_shard_size_bytes,
+                "largest_dense_tensor_bytes": largest_tensor_bytes,
+                "largest_reconstruction_working_set_bytes": max(
+                    int(
+                        report.get(
+                            "largest_reconstruction_working_set_bytes",
+                            0,
+                        )
+                    ),
+                    int(report.get("largest_source_cast_overlap_bytes", 0)),
+                    largest_tensor_bytes,
+                ),
+                "serializer_max_workers": max_workers,
+                "serialization_memory_bound": (
+                    "one output shard plus the largest source/reconstruction "
+                    "working set and serializer overhead; "
+                    "external-data serialization is forced to one worker"
+                ),
+            }
+        use_subfolders = component_layout.uses_subdirectories
+        if reuse_plan is not None and (len(selected) != 1 or use_subfolders):
+            raise ValueError("GGUF weight reuse currently supports one flat ONNX model only.")
 
         for name, model in selected.items():
+            callback = _make_progress_callback() if progress_bar else None
             if check_weights:
                 _check_weights(name, model)
-            if use_subfolders:
-                model_dir = os.path.join(directory, name)
-                os.makedirs(model_dir, exist_ok=True)
-            else:
-                model_dir = directory
-            path = os.path.join(model_dir, "model.onnx")
-            if external_data == "safetensors":
-                ir.save_safetensors(
-                    model,
-                    path,
-                    max_shard_size_bytes=max_shard_size_bytes,
-                    callback=callback,
+            model_dir = os.fspath(
+                _component_output_directory(
+                    directory,
+                    name,
+                    uses_subdirectories=component_layout.uses_subdirectories,
                 )
-            else:
-                ir.save(model, path, external_data="model.onnx.data", callback=callback)
+            )
+            if use_subfolders:
+                os.makedirs(model_dir, exist_ok=True)
+            path = os.path.join(model_dir, "model.onnx")
+            with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
+                if reuse_plan is not None:
+                    from mobius.integrations.gguf._reuse import save_reuse_package
+
+                    package_metadata: dict[str, bytes] = {}
+                    if self.gguf_quantization_report is not None:
+                        package_metadata[_QUANTIZATION_REPORT] = (
+                            json.dumps(
+                                self.gguf_quantization_report.to_dict(),
+                                indent=2,
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        ).encode()
+                    if self.export_report is not None:
+                        package_metadata[_EXPORT_REPORT] = self.export_report.to_bytes()
+                    if self.draft_manifest is not None:
+                        package_metadata["draft_manifest.json"] = (
+                            json.dumps(self.draft_manifest, indent=2, sort_keys=True) + "\n"
+                        ).encode()
+                    save_reuse_package(
+                        saved_model,
+                        path,
+                        reuse_plan,
+                        callback=callback,
+                        package_metadata=package_metadata,
+                    )
+                elif external_data == "safetensors":
+                    _save_safetensors(
+                        saved_model,
+                        path,
+                        max_shard_size_bytes=max_shard_size_bytes,
+                        callback=callback,
+                    )
+                else:
+                    save_kwargs: dict[str, Any] = {
+                        "external_data": "model.onnx.data",
+                        "max_shard_size_bytes": max_shard_size_bytes,
+                        "callback": callback,
+                    }
+                    if "max_workers" in inspect.signature(ir.save).parameters:
+                        save_kwargs["max_workers"] = max_workers
+                    ir.save(saved_model, path, **save_kwargs)
+
+        if reuse_plan is None:
+            # Re-saving a loaded reuse package through the ordinary saver copies
+            # all weights into ONNX external data, so any old reuse manifest in
+            # the destination would become a false provenance claim.
+            stale_reuse_manifest = os.path.join(directory, "gguf-reuse.json")
+            if os.path.isfile(stale_reuse_manifest):
+                os.remove(stale_reuse_manifest)
+        report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+        if self.weight_loading_report is not None:
+            if os.path.islink(report_path):
+                raise ValueError("Weight-loading report must not be a symlink.")
+            with open(report_path, "w", encoding="utf-8") as file:
+                json.dump(self.weight_loading_report, file, indent=2, sort_keys=True)
+                file.write("\n")
+        elif os.path.isfile(report_path):
+            os.remove(report_path)
+        if include_policy_components:
+            self.save_policy_components(directory, check_weights=check_weights)
+        if include_adapter_artifacts:
+            self.save_adapter_artifacts(directory)
+        if self.mtp_head is not None:
+            sidecar_name = _mtp_sidecar_name(self)
+            sidecar_directory = os.path.join(directory, sidecar_name)
+            if os.path.isdir(sidecar_directory):
+                shutil.rmtree(sidecar_directory)
+            self.mtp_head.save(
+                sidecar_directory,
+                external_data=external_data,
+                max_shard_size_bytes=max_shard_size_bytes,
+                max_workers=max_workers,
+                progress_bar=progress_bar,
+                check_weights=check_weights,
+                include_policy_components=include_policy_components,
+                include_adapter_artifacts=include_adapter_artifacts,
+                _atomic_export_report=False,
+            )
+            _write_mtp_manifest(directory, sidecar_name)
+        else:
+            sidecar_name = None
+            manifest_path = os.path.join(directory, _PACKAGE_MANIFEST)
+            if os.path.isfile(manifest_path):
+                os.remove(manifest_path)
+        if previous_sidecar_name is not None and previous_sidecar_name != sidecar_name:
+            previous_sidecar = os.path.join(directory, previous_sidecar_name)
+            current_directories = (
+                [os.path.join(directory, name) for name in selected] if use_subfolders else []
+            )
+            if sidecar_name is not None:
+                current_directories.append(os.path.join(directory, sidecar_name))
+            if include_policy_components and self.policy_components:
+                current_directories.append(os.path.join(directory, "policies"))
+            if include_adapter_artifacts and self.adapter_artifacts:
+                current_directories.append(os.path.join(directory, "adapters"))
+            aliases_current_output = any(
+                os.path.exists(current)
+                and os.path.exists(previous_sidecar)
+                and os.path.samefile(previous_sidecar, current)
+                for current in current_directories
+            )
+            if (
+                not aliases_current_output
+                and os.path.isdir(previous_sidecar)
+                and not os.path.islink(previous_sidecar)
+            ):
+                shutil.rmtree(previous_sidecar)
+        if self.export_report is not None and reuse_plan is None:
+            if os.path.islink(export_report_path):
+                raise ValueError("Component export report must not be a symlink.")
+            self.export_report.write_json(export_report_path)
+
+    def add_policy_component(self, name: str, component: PolicyComponent) -> None:
+        """Attach a reusable generation-policy graph to this package."""
+        if not name or "/" in name or "\\" in name:
+            raise ValueError("Policy component name must be a non-empty path segment")
+        self.policy_components[name] = component
+
+    def add_adapter_artifact(
+        self, artifact: AdapterArtifact, *, validate_base: bool = True
+    ) -> None:
+        """Attach a model-agnostic adapter artifact to this package.
+
+        Persistence and ONNX GenAI metadata emission intentionally remain separate
+        until the runtime artifact/schema contract is finalized.
+        """
+        if artifact.name in self.adapter_artifacts:
+            raise ValueError(f"adapter artifact {artifact.name!r} is already attached")
+        if validate_base:
+            artifact.validate_base(
+                self.data,
+                fingerprint_targets=(
+                    self.adapter_target_manifest.targets
+                    if self.adapter_target_manifest is not None
+                    else None
+                ),
+            )
+        if self.adapter_target_manifest is not None:
+            if artifact.base_fingerprint != self.adapter_target_manifest.base_fingerprint:
+                raise ValueError(
+                    f"adapter {artifact.name!r} base fingerprint does not match "
+                    "the authoritative target manifest"
+                )
+            missing = artifact.target_bindings - self.adapter_target_manifest.bindings
+            if missing:
+                raise ValueError(
+                    f"adapter artifact {artifact.name!r} contains targets outside "
+                    f"the authoritative manifest: {sorted(map(str, missing))}"
+                )
+        self.adapter_artifacts[artifact.name] = artifact
+
+    def save_adapter_artifacts(self, directory: str) -> dict[str, dict[str, object]]:
+        """Save exact adapter bundles and return ONNX GenAI catalog entries."""
+        if not self.adapter_artifacts:
+            return {}
+        if self.adapter_target_manifest is None:
+            raise ValueError(
+                "adapter artifacts require an authoritative adapter target manifest"
+            )
+        self.adapter_target_manifest.validate(self.data)
+        adapter_dir = os.path.join(directory, "adapters")
+        os.makedirs(adapter_dir, exist_ok=True)
+        descriptors = {
+            descriptor.target: descriptor
+            for descriptor in self.adapter_target_manifest.targets
+        }
+        manifest_targets = {
+            target["id"]: target
+            for target in self.adapter_target_manifest_metadata()["targets"]
+        }
+        catalog: dict[str, dict[str, object]] = {}
+        identities: set[tuple[str, str]] = set()
+        for artifact_index, (alias, artifact) in enumerate(
+            sorted(self.adapter_artifacts.items())
+        ):
+            identity_version = (artifact.stable_identity, artifact.version)
+            if identity_version in identities:
+                raise ValueError(
+                    f"adapter identity/version {identity_version[0]}@"
+                    f"{identity_version[1]} must be unique"
+                )
+            identities.add(identity_version)
+            ordered_weights = sorted(
+                artifact.weights,
+                key=lambda item: (
+                    item.target.component,
+                    item.target.parameter,
+                    item.target_id or "",
+                ),
+            )
+            dtypes = {weight.dtype for weight in artifact.weights}
+            if len(dtypes) != 1:
+                raise ValueError(
+                    f"adapter {alias!r} has heterogeneous target dtypes, "
+                    "which the ONNX GenAI artifact contract cannot represent"
+                )
+            rank = ordered_weights[0].rank
+            alpha = ordered_weights[0].alpha
+            dtype = _adapter_dtype_name(dtypes.pop())
+            bindings: list[dict[str, object]] = []
+            portable_targets: dict[str, dict[str, list[float]]] = {}
+            for weight in ordered_weights:
+                descriptor = descriptors[weight.target]
+                target_id = weight.target_id or descriptor.semantic_name
+                if target_id not in manifest_targets:
+                    raise ValueError(
+                        f"adapter {alias!r} references target ID {target_id!r} "
+                        "outside the authoritative manifest"
+                    )
+                target_policy = manifest_targets[target_id]
+                if target_policy.get("rank", weight.rank) != weight.rank:
+                    raise ValueError(
+                        f"adapter {alias!r} target {target_id!r} rank {weight.rank} "
+                        f"violates manifest policy {target_policy['rank']}"
+                    )
+                if target_policy.get("alpha", weight.alpha) != weight.alpha:
+                    raise ValueError(
+                        f"adapter {alias!r} target {target_id!r} alpha {weight.alpha} "
+                        f"violates manifest policy {target_policy['alpha']}"
+                    )
+                slice_policy = target_policy.get("output_slice")
+                if isinstance(slice_policy, dict):
+                    if slice_policy.get("rank", weight.rank) != weight.rank:
+                        raise ValueError(
+                            f"adapter {alias!r} target {target_id!r} rank {weight.rank} "
+                            f"violates output-slice policy {slice_policy['rank']}"
+                        )
+                    if slice_policy.get("alpha", weight.alpha) != weight.alpha:
+                        raise ValueError(
+                            f"adapter {alias!r} target {target_id!r} alpha {weight.alpha} "
+                            f"violates output-slice policy {slice_policy['alpha']}"
+                        )
+                weight_key = weight.weight_key or descriptor.semantic_name
+                binding: dict[str, object] = {
+                    "target": target_id,
+                    "weight_key": weight_key,
+                }
+                if weight.rank != rank:
+                    binding["rank"] = weight.rank
+                if weight.alpha != alpha:
+                    binding["alpha"] = weight.alpha
+                bindings.append(binding)
+                portable_targets[weight_key] = {
+                    "a": weight.a.numpy().reshape(-1).astype("float32").tolist(),
+                    "b": weight.b.numpy().reshape(-1).astype("float32").tolist(),
+                }
+
+            artifact_dir = os.path.join(directory, "adapters", alias)
+            os.makedirs(artifact_dir, exist_ok=True)
+            weight_artifacts: list[dict[str, object]] = []
+            if self.adapter_service_options.portable_fallback:
+                relative_location = f"adapters/{alias}/adapter.json"
+                destination = os.path.join(directory, relative_location)
+                payload = rfc8785.dumps({"targets": portable_targets})
+                with open(destination, "wb") as handle:
+                    handle.write(payload)
+                weight_artifacts.append(
+                    {
+                        "location": relative_location,
+                        "loader_capability": "onnx-genai.adapters.json@1",
+                        "scale_encoding": "alpha_over_rank",
+                        "format": "json",
+                    }
+                )
+            if (
+                self.adapter_service_options.preserve_source_format
+                and artifact.source.format != "in_memory"
+            ):
+                if artifact.source.format == "onnx_adapter":
+                    source_path = _adapter_source_file(artifact)
+                    relative_location = f"adapters/{alias}/adapter.onnx_adapter"
+                    destination = os.path.join(directory, relative_location)
+                    shutil.copyfile(source_path, destination)
+                    weight_artifacts.append(
+                        {
+                            "location": relative_location,
+                            "loader_capability": "onnxruntime.lora-adapter@1",
+                            "scale_encoding": "baked",
+                            "format": "ort_genai",
+                        }
+                    )
+                elif artifact.source.format == "peft_safetensors":
+                    if artifact.source.path is None:
+                        raise ValueError(f"adapter {alias!r} PEFT source path is absent")
+                    source_dir = artifact.source.path
+                    source_weights = os.path.join(source_dir, "adapter_model.safetensors")
+                    source_config = os.path.join(source_dir, "adapter_config.json")
+                    relative_location = f"adapters/{alias}/adapter_model.safetensors"
+                    relative_config = f"adapters/{alias}/adapter_config.json"
+                    destination = os.path.join(directory, relative_location)
+                    config_destination = os.path.join(directory, relative_config)
+                    shutil.copyfile(source_weights, destination)
+                    shutil.copyfile(source_config, config_destination)
+                    weight_artifacts.append(
+                        {
+                            "location": relative_location,
+                            "loader_capability": "onnx-genai.adapters.hf-peft@1",
+                            "config_location": relative_config,
+                            "scale_encoding": "alpha_over_rank",
+                            "format": "hf_peft",
+                        }
+                    )
+                else:
+                    raise ValueError(
+                        f"adapter {alias!r} source format {artifact.source.format!r} "
+                        "cannot be preserved"
+                    )
+            if not weight_artifacts:
+                raise ValueError(
+                    f"adapter {alias!r} must emit a portable or preserved source artifact"
+                )
+            provenance = {"producer": artifact.source.producer}
+            if artifact.source.base_model:
+                provenance["source"] = artifact.source.base_model
+            if artifact.source.revision:
+                provenance["revision"] = artifact.source.revision
+            catalog[alias] = {
+                "index": artifact_index,
+                "identity": artifact.stable_identity,
+                "version": artifact.version,
+                "rank": rank,
+                "alpha": alpha,
+                "dtype": dtype,
+                "provenance": provenance,
+                "weights": weight_artifacts,
+                "bindings": bindings,
+            }
+        return catalog
+
+    def adapter_target_manifest_metadata(self) -> dict[str, object]:
+        """Serialize the authoritative generic LoRA target manifest."""
+        if self.adapter_target_manifest is None:
+            raise ValueError("adapter target manifest is not attached")
+        targets: list[dict[str, object]] = []
+        for descriptor in sorted(
+            self.adapter_target_manifest.targets,
+            key=lambda item: item.semantic_name,
+        ):
+            initializer = self.data[descriptor.target.component].graph.initializers[
+                descriptor.target.parameter
+            ]
+            activation_dtype = _adapter_dtype_name(
+                descriptor.activation_dtype or initializer.dtype
+            )
+            base: dict[str, object] = {
+                "id": descriptor.semantic_name,
+                "component": descriptor.target.component,
+                "initializer": descriptor.target.parameter,
+                "node_name": descriptor.node_name,
+                "output_name": descriptor.output_name,
+                "activation_dtype": activation_dtype,
+                "input_features": descriptor.input_size,
+                "output_features": descriptor.output_size,
+            }
+            if descriptor.layer_index is not None:
+                base["layer_index"] = descriptor.layer_index
+            if descriptor.rank is not None:
+                base["rank"] = descriptor.rank
+            if descriptor.alpha is not None:
+                base["alpha"] = descriptor.alpha
+            if descriptor.graph_input_a is not None:
+                graph_inputs = {
+                    "a": descriptor.graph_input_a,
+                    "b": descriptor.graph_input_b,
+                }
+                if descriptor.graph_input_scale is not None:
+                    graph_inputs["scale"] = descriptor.graph_input_scale
+                base["graph_inputs"] = graph_inputs
+            targets.append(base)
+            for target_slice in descriptor.slices:
+                sliced = dict(base)
+                sliced["id"] = f"{descriptor.semantic_name}.{target_slice.role}"
+                output_slice: dict[str, object] = {
+                    "role": target_slice.role,
+                    "offset": target_slice.offset,
+                    "width": target_slice.width,
+                }
+                if target_slice.rank is not None:
+                    output_slice["rank"] = target_slice.rank
+                if target_slice.alpha is not None:
+                    output_slice["alpha"] = target_slice.alpha
+                sliced["output_slice"] = output_slice
+                targets.append(sliced)
+        return {"targets": targets}
+
+    def save_policy_components(
+        self,
+        directory: str,
+        *,
+        check_weights: bool = True,
+    ) -> dict[str, str]:
+        """Save attached policy graphs and return package-relative artifact paths."""
+        if not self.policy_components:
+            return {}
+        policy_dir = os.path.join(directory, "policies")
+        os.makedirs(policy_dir, exist_ok=True)
+        artifacts: dict[str, str] = {}
+        for name, component in self.policy_components.items():
+            if check_weights:
+                _check_weights(name, component.model)
+            relative_path = f"policies/{name}.onnx"
+            # Policy components are separate ONNX artifacts with public ABI
+            # dimension names such as ``batch``. Namespacing those dimensions
+            # makes an otherwise exact semantic contract ineligible for runtime fusion.
+            ir.save(component.model, os.path.join(directory, relative_path))
+            artifacts[name] = relative_path
+        return artifacts
 
     @classmethod
     def load(cls, directory: str) -> ModelPackage:
@@ -160,27 +1312,100 @@ class ModelPackage(UserDict[str, ir.Model]):
         - **Subfolder**: each subdirectory contains ``model.onnx`` → multi-
           component package keyed by subfolder name.
 
+        An MTP sidecar named by ``.mobius-package.json`` is restored as
+        :attr:`mtp_head`. Unmarked subdirectories, including ``mtp/``, remain
+        ordinary model components.
+
         Args:
             directory: Path to the directory containing models.
 
         Returns:
             A new ``ModelPackage`` with one entry per model found.
         """
+        return cls._load(directory, frozenset())
+
+    @classmethod
+    def _load(cls, directory: str, ancestors: frozenset[str]) -> ModelPackage:
+        resolved_directory = os.path.realpath(directory)
+        if resolved_directory in ancestors:
+            raise ValueError("ModelPackage MTP sidecar manifests must not contain a cycle.")
+        ancestors = ancestors | {resolved_directory}
+        sidecar_name = _read_mtp_sidecar_name(directory)
+        mtp_dir: str | None = None
+        if sidecar_name is not None:
+            mtp_dir = os.path.join(directory, sidecar_name)
+            if not os.path.isdir(mtp_dir):
+                raise ValueError(
+                    f"ModelPackage manifest references missing MTP sidecar {sidecar_name!r}."
+                )
+            if os.path.islink(mtp_dir):
+                raise ValueError("ModelPackage MTP sidecar directory must not be a symlink.")
+            resolved_sidecar = os.path.realpath(mtp_dir)
+            if os.path.dirname(resolved_sidecar) != resolved_directory:
+                raise ValueError("ModelPackage MTP sidecar must remain inside its package.")
+
         models: dict[str, ir.Model] = {}
-        # Check for subfolder layout first
         for entry in sorted(os.listdir(directory)):
             subdir = os.path.join(directory, entry)
+            if (
+                mtp_dir is not None
+                and os.path.isdir(subdir)
+                and os.path.samefile(subdir, mtp_dir)
+            ):
+                continue
             model_path = os.path.join(subdir, "model.onnx")
             if os.path.isdir(subdir) and os.path.isfile(model_path):
                 models[entry] = ir.load(model_path)
-        if models:
-            return cls(models)
-        # Fall back to flat layout
-        for filename in sorted(os.listdir(directory)):
-            if filename.endswith(".onnx"):
-                name = filename.removesuffix(".onnx")
-                models[name] = ir.load(os.path.join(directory, filename))
-        return cls(models)
+        if not models:
+            for filename in sorted(os.listdir(directory)):
+                if filename.endswith(".onnx"):
+                    name = filename.removesuffix(".onnx")
+                    models[name] = ir.load(os.path.join(directory, filename))
+        package = cls(models)
+        quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
+        if os.path.lexists(quantization_report_path):
+            if os.path.islink(quantization_report_path) or not os.path.isfile(
+                quantization_report_path
+            ):
+                raise ValueError("ModelPackage quantization report must be a real file.")
+            from mobius.integrations.gguf._quantization_report import GGUFQuantizationReport
+
+            package.gguf_quantization_report = GGUFQuantizationReport.read_json(
+                quantization_report_path
+            )
+        export_report_path = os.path.join(directory, _EXPORT_REPORT)
+        if os.path.lexists(export_report_path):
+            if os.path.islink(export_report_path) or not os.path.isfile(export_report_path):
+                raise ValueError("ModelPackage component export report must be a real file.")
+            package.export_report = ComponentExportReport.read_json(export_report_path)
+        report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+        if os.path.lexists(report_path):
+            if os.path.islink(report_path) or not os.path.isfile(report_path):
+                raise ValueError("Weight-loading report must be a regular file.")
+            with open(report_path, encoding="utf-8") as file:
+                report = json.load(file)
+            if (
+                not isinstance(report, dict)
+                or report.get("format") != "mobius.weight-loading-report.v1"
+            ):
+                raise ValueError("Invalid weight-loading report.")
+            package.weight_loading_report = report
+        package._load_policy_components(directory)
+        if mtp_dir is not None:
+            package.mtp_head = cls._load(mtp_dir, ancestors)
+        return package
+
+    def _load_policy_components(self, directory: str) -> None:
+        policy_dir = os.path.join(directory, "policies")
+        if not os.path.isdir(policy_dir):
+            return
+        for filename in sorted(os.listdir(policy_dir)):
+            if not filename.endswith(".onnx"):
+                continue
+            model = ir.load(os.path.join(policy_dir, filename))
+            self.policy_components[filename.removesuffix(".onnx")] = (
+                PolicyComponent.from_model(model)
+            )
 
     # -- Weight application ------------------------------------------------
 
@@ -188,6 +1413,8 @@ class ModelPackage(UserDict[str, ir.Model]):
         self,
         state_dict: dict[str, torch.Tensor],
         prefix_map: dict[str, str] | None = None,
+        *,
+        fold_constants: bool = True,
     ) -> None:
         """Apply weights from a state dict across component models.
 
@@ -249,6 +1476,9 @@ class ModelPackage(UserDict[str, ir.Model]):
 
         _log_weight_mapping(state_dict, applied)
 
+        if not fold_constants:
+            return
+
         # Fold constants now that weights have been loaded.
         # PackQKV emits Concat(w_q, w_k, w_v) in the graph; those nodes can only
         # be constant-folded once the weight tensors carry their const_value.
@@ -256,20 +1486,100 @@ class ModelPackage(UserDict[str, ir.Model]):
             fold_initializers_after_weights(model)
 
 
+@contextmanager
+def _namespaced_symbolic_dimensions(
+    model: ir.Model,
+    namespace: str,
+) -> Iterator[ir.Model]:
+    """Namespace interface symbols and discard non-contractual intermediate aliases."""
+    interface_values = {id(value) for value in (*model.graph.inputs, *model.graph.outputs)}
+    values: dict[int, ir.Value] = {}
+    graphs: list[ir.GraphProtocol] = []
+    nodes = ir.traversal.RecursiveGraphIterator(model.graph, enter_graph=graphs.append)
+    for node in nodes:
+        for value in (*node.inputs, *node.outputs):
+            if value is not None:
+                values[id(value)] = value
+    for graph in graphs:
+        for value in (*graph.inputs, *graph.outputs, *graph.initializers.values()):
+            values[id(value)] = value
+
+    originals: list[tuple[ir.Value, ir.Shape]] = []
+    symbols: dict[str, str] = {}
+    try:
+        for value in values.values():
+            if value.shape is None:
+                continue
+            dimensions: list[int | str | ir.SymbolicDim] = []
+            changed = False
+            for dimension in value.shape:
+                if isinstance(dimension, int):
+                    dimensions.append(dimension)
+                    continue
+                if dimension.value is None:
+                    dimensions.append(dimension)
+                    continue
+                if id(value) not in interface_values:
+                    dimensions.append(ir.SymbolicDim(None))
+                    changed = True
+                    continue
+                text = str(dimension)
+                dimensions.append(symbols.setdefault(text, f"{namespace}.{text}"))
+                changed = True
+            if changed:
+                originals.append((value, value.shape))
+                denotations = [
+                    value.shape.get_denotation(index) for index in range(len(value.shape))
+                ]
+                value.shape = ir.Shape(dimensions, denotations)
+        yield model
+    finally:
+        for value, shape in originals:
+            value.shape = shape
+
+
 def _make_progress_callback():
-    """Create a tqdm progress-bar callback for ``ir.save``."""
-    pbar = tqdm.tqdm()
-    total_set = False
+    """Create a thread-safe tqdm progress-bar callback for ``ir.save``.
+
+    Newer ``onnx_ir`` versions may invoke callbacks concurrently and out of
+    index order. Count invocations instead of tracking ``metadata.index`` and
+    derive each bar's position from its shard filename so rendering order is
+    deterministic. Serialize all progress-bar mutations. This remains compatible
+    with ``onnx_ir`` 1.0, where callbacks are invoked serially.
+    """
+    lock = threading.Lock()
+    bars: dict[str, tqdm.tqdm] = {}
 
     def callback(tensor: ir.TensorProtocol, metadata: ir.external_data.CallbackInfo) -> None:
-        nonlocal total_set
-        if not total_set:
-            pbar.total = metadata.total
-            total_set = True
-        pbar.update()
-        pbar.set_description(
-            f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
-        )
+        with lock:
+            shard_total = getattr(metadata, "shard_total", None)
+            key = metadata.filename if shard_total is not None else "__all__"
+            pbar = bars.get(key)
+            if pbar is None:
+                description = (
+                    f"Saving {metadata.filename}"
+                    if shard_total is not None
+                    else "Saving external data"
+                )
+                position = 0
+                if shard_total is not None:
+                    shard_prefix, separator, _ = metadata.filename.rpartition("-of-")
+                    shard_number = shard_prefix.rpartition("-")[2]
+                    if separator and shard_number.isdigit():
+                        position = int(shard_number) - 1
+                pbar = tqdm.tqdm(
+                    total=shard_total if shard_total is not None else metadata.total,
+                    desc=description,
+                    position=position,
+                    leave=True,
+                )
+                bars[key] = pbar
+            pbar.update()
+            pbar.set_postfix_str(
+                f"{tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})"
+            )
+            if pbar.n >= pbar.total:
+                pbar.close()
 
     return callback
 

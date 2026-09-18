@@ -21,6 +21,8 @@ HuggingFace class: FunASRForConditionalGeneration
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import numpy as np
 import onnx_ir as ir
 import torch
@@ -502,6 +504,13 @@ class FunASRForConditionalGeneration(nn.Module):
     default_task: str = "fun-asr-speech-language"
     category: str = "Speech-to-Text"
     config_class: type = ArchitectureConfig
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "audio_encoder": ("audio_encoder", "audio_adaptor"),
+        "embedding": ("llm.model.embed_tokens",),
+        "decoder": ("llm.model.layers", "llm.model.norm", "llm.lm_head"),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

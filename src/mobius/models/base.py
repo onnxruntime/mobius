@@ -19,15 +19,14 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities, get_build_dtype
-from mobius._configs import ArchitectureConfig, CausalLMConfig
-from mobius._flags import flags
-from mobius._weight_utils import (
-    preprocess_awq_weights,
-    preprocess_gptq_weights,
-    preprocess_olive_weights,
-    tie_word_embeddings,
+from mobius._build_context import (
+    ep_capabilities,
+    get_build_dtype,
+    is_prefill_prefix_pruning_enabled,
 )
+from mobius._configs import ArchitectureConfig, CausalLMConfig, QuantizedWeightFormat
+from mobius._flags import flags
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
     DecoderLayer,
     Embedding,
@@ -48,6 +47,53 @@ from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 logger = logging.getLogger(__name__)
 
 
+def effective_tie_word_embeddings(config: ArchitectureConfig) -> bool:
+    """Return the effective embedding/head tie declared by model or quantizer metadata.
+
+    Olive may clear the top-level flag after quantizing a tied table, while
+    preserving the tie in ``quantization.tie_word_embeddings``. A top-level
+    false value therefore does not override an explicit quantization-level tie.
+    """
+    quantization = getattr(config, "quantization", None)
+    return bool(
+        getattr(config, "tie_word_embeddings", False)
+        or (quantization is not None and getattr(quantization, "tie_word_embeddings", False))
+    )
+
+
+def linear_class_for_config(config: ArchitectureConfig):
+    """Return the configured quantized linear factory, or ``None`` for float."""
+    qc = getattr(config, "quantization", None)
+    if (
+        qc is None
+        or qc.quant_method == "none"
+        or qc.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
+    ):
+        return None
+    zp_dtype = config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=qc.bits,
+        block_size=qc.group_size,
+        has_zero_point=not qc.sym,
+        zero_point_dtype=zp_dtype,
+    )
+
+
+def embedding_for_config(config: ArchitectureConfig):
+    """Create the float or block-quantized token embedding declared by config."""
+    qc = getattr(config, "quantization", None)
+    if qc is not None and getattr(qc, "quantize_embeddings", False):
+        return QuantizedEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            bits=qc.bits,
+            block_size=qc.group_size,
+            has_zero_point=not qc.sym,
+            padding_idx=config.pad_token_id,
+        )
+    return Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+
+
 class TextModel(nn.Module):
     """Base text model with embedding, decoder layers, and final norm."""
 
@@ -66,33 +112,8 @@ class TextModel(nn.Module):
 
         # If the config has quantization, swap Linear for QuantizedLinear
         # in all decoder layer projections (Attention Q/K/V/O + MLP).
-        linear_class = None
-        qc = getattr(config, "quantization", None)
-        if qc is not None and qc.quant_method != "none":
-            zp_dtype = (
-                config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
-            )
-            linear_class = make_quantized_linear_factory(
-                bits=qc.bits,
-                block_size=qc.group_size,
-                has_zero_point=not qc.sym,
-                zero_point_dtype=zp_dtype,
-            )
-
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
-        if qc is not None and getattr(qc, "quantize_embeddings", False):
-            # Olive RTN (embeds: true) quantizes the embedding table; look it
-            # up with GatherBlockQuantized instead of a plain Gather.
-            self.embed_tokens = QuantizedEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                bits=qc.bits,
-                block_size=qc.group_size,
-                has_zero_point=not qc.sym,
-                padding_idx=config.pad_token_id,
-            )
+        linear_class = linear_class_for_config(config)
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [
                 DecoderLayer(config, linear_class=linear_class, mlp_class=mlp_class)
@@ -173,6 +194,7 @@ class TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        deepstack_embeds: list | None = None,
     ):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -305,6 +327,24 @@ class TextModel(nn.Module):
                 past_key_value=past_kv,
             )
             present_key_values.append(present_kv)
+
+            # DeepStack (Qwen3-VL family): add pre-scattered intermediate
+            # vision features to the hidden states of the first ``D`` decoder
+            # layers, where ``D = len(deepstack_embeds)``.  Each entry is a
+            # full-length ``[batch, seq, hidden]`` tensor that is zero at
+            # non-image positions, so a plain Add reproduces HuggingFace's
+            # "inject at visual token positions" semantics.  ``deepstack_embeds``
+            # is ``None`` for every non-DeepStack model, making this inert.
+            #
+            # Injected BEFORE the intermediate-hidden-state capture below so
+            # ``output_layer_indices`` observes the post-injection tensor that
+            # the model actually propagates to the next layer.  This matches
+            # HuggingFace ``output_hidden_states`` semantics, where
+            # ``hidden_states[k + 1]`` is layer ``k``'s output with the DeepStack
+            # contribution already added.
+            if deepstack_embeds is not None and layer_idx < len(deepstack_embeds):
+                hidden_states = op.Add(hidden_states, deepstack_embeds[layer_idx])
+
             if layer_idx in capture_set:
                 captured_by_index[layer_idx] = hidden_states
 
@@ -376,9 +416,13 @@ class CausalLMModel(nn.Module):
         embed_quantized = qc is not None and getattr(qc, "quantize_embeddings", False)
         # Olive RTN may quantize+tie the head while clearing the model's
         # top-level tie flag; recover it from the quantization config.
-        tie = config.tie_word_embeddings or (
-            qc is not None and getattr(qc, "tie_word_embeddings", False)
-        )
+        tie = effective_tie_word_embeddings(config)
+        if tie and quantize_lm_head != embed_quantized:
+            raise ValueError(
+                "Tied embeddings and LM heads must use compatible storage: "
+                "quantize_embeddings and quantize_lm_head must either both be true "
+                "or both be false."
+            )
 
         if quantize_lm_head and embed_quantized and tie:
             # Tied quantized head: share the embedding's packed table and quant
@@ -405,8 +449,24 @@ class CausalLMModel(nn.Module):
             # graph. Only valid when both are unquantized float tables;
             # quantized embed/head use different packed layouts and are tied
             # by sharing Parameters in TiedQuantizedLMHead above.
-            if config.tie_word_embeddings and not embed_quantized:
+            if tie and not embed_quantized:
                 self.lm_head.weight = self.model.embed_tokens.weight
+
+    def _replace_text_model(self, model: nn.Module) -> None:
+        """Replace the text model while preserving tied embedding/head parameters."""
+        self.model = model
+        if isinstance(self.lm_head, TiedQuantizedLMHead):
+            self.lm_head = TiedQuantizedLMHead(
+                self.model.embed_tokens,
+                self.config.hidden_size,
+                self.config.vocab_size,
+            )
+        elif (
+            effective_tie_word_embeddings(self.config)
+            and isinstance(self.lm_head, Linear)
+            and isinstance(self.model.embed_tokens, Embedding)
+        ):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -423,50 +483,44 @@ class CausalLMModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        emit_final_hidden = self.config.output_final_hidden_state
         if len(result) == 3:
             hidden_states, present_key_values, intermediate_hidden_states = result
+            hidden_states = _retain_last_sequence_token(op, hidden_states)
             logits = self.lm_head(op, hidden_states)
+            if emit_final_hidden:
+                return logits, present_key_values, intermediate_hidden_states, hidden_states
             return logits, present_key_values, intermediate_hidden_states
         hidden_states, present_key_values = result
+        hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
+        if emit_final_hidden:
+            return logits, present_key_values, None, hidden_states
         return logits, present_key_values
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Preprocess the state_dict to match the model's expected keys."""
-        qc = getattr(self.config, "quantization", None)
-        if qc is not None and qc.quant_method == "gptq":
-            state_dict = preprocess_gptq_weights(
-                state_dict, bits=qc.bits, group_size=qc.group_size
-            )
-        elif qc is not None and qc.quant_method == "awq":
-            state_dict = preprocess_awq_weights(
-                state_dict, bits=qc.bits, group_size=qc.group_size
-            )
-        elif qc is not None and qc.quant_method == "olive":
-            # Olive-packed weights: also handles quantized embed/lm_head and
-            # the float tied-head fallback, so return directly.
-            tie = self.config.tie_word_embeddings or getattr(qc, "tie_word_embeddings", False)
-            return preprocess_olive_weights(
-                state_dict,
-                bits=qc.bits,
-                group_size=qc.group_size,
-                quantize_embeddings=getattr(qc, "quantize_embeddings", False),
-                quantize_lm_head=getattr(qc, "quantize_lm_head", False),
-                tie_word_embeddings=tie,
-            )
-        if self.config.tie_word_embeddings:
-            # Ensure both embed_tokens.weight and lm_head.weight are present so
-            # apply_weights can assign each to its initializer.  For graph-level
-            # tied models (standard CausalLMModel) both ir.Values are the same
-            # object, so apply_weights' id()-dedup redirects lm_head uses to the
-            # embed_tokens canonical and drops the duplicate initializer.  For
-            # subclasses that override self.model after super().__init__ (e.g.
-            # Cohere, GPT-2 family), the ir.Values differ but the dedup still
-            # unifies them at load time via replace_all_uses_with.
-            tie_word_embeddings(state_dict)
-        return state_dict
+        qc = self.config.quantization_for("model")
+        return preprocess_quantized_weights(
+            state_dict,
+            qc,
+            tie_embeddings=effective_tie_word_embeddings(self.config),
+            qmoe_target_path=None,
+            defer_non_expert_sidecars=(
+                self.config.component_quantization is not None
+                or (qc is not None and qc.has_module_plan)
+            ),
+        )
+
+
+def _retain_last_sequence_token(op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+    """Retain only the final sequence position when prefill-prefix pruning is active."""
+    if not is_prefill_prefix_pruning_enabled():
+        return hidden_states
+    last_hidden = op.Gather(hidden_states, op.Constant(value_int=-1), axis=1)
+    return op.Unsqueeze(last_hidden, op.Constant(value_ints=[1]))
 
 
 class LayerNormTextModel(TextModel):
@@ -518,7 +572,7 @@ class LayerNormCausalLMModel(CausalLMModel):
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
         # Replace TextModel with the LayerNorm-based variant.
-        self.model = LayerNormTextModel(config)
+        self._replace_text_model(LayerNormTextModel(config))
 
 
 class FusedGateUpCausalLMModel(CausalLMModel):

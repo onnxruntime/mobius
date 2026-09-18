@@ -97,10 +97,21 @@ Key decoder fields: `filename`, `hidden_size`, `head_size`,
 ### LLM (decoder-only → `DecoderOnly_Model`)
 
 ```
-chatglm, decoder, ernie4_5, gemma, gemma2, gemma3_text, gpt2,
-gptoss, granite, internlm2, llama, mistral, nemotron, olmo,
-phi, phimoe, phi3, phi3small, qwen2, qwen3, smollm3
+decoder
 ```
+
+Mobius emits `model.type = "decoder"` for every graph-representable,
+single-model decoder-only package, regardless of the HuggingFace architecture
+name. The optimized graph and config mappings define the runtime contract.
+
+Specialized decoder-only exceptions are explicit:
+
+- `gpt2`: selects `Gpt_Model`; Mobius rejects its separate key/value cache ABI
+  because the runtime requires combined rank-5 cache tensors.
+- `lfm2`: selects `LFM2_Model` and its convolution-cache implementation.
+- `phi3`, `phi3small`, `phimoe`: used only for LongRoPE configs whose runtime
+  must recompute caches after crossing the short-context threshold. Non-LongRoPE
+  exports use `decoder`.
 
 ### VLM (vision-language → `MultiModalLanguageModel`)
 
@@ -141,7 +152,7 @@ phi3small_pipeline, qwen2_5_vl_pipeline
 ```json
 {
   "model": {
-    "type": "llama",
+    "type": "decoder",
     "vocab_size": 32000,
     "context_length": 4096,
     "eos_token_id": 2,
@@ -244,6 +255,15 @@ decoder_inputs = {name: name for name in decoder_input_names}
 This means the genai config automatically adapts when `RemoveDeadGraphInputsPass`
 removes unused inputs (e.g. `position_ids` absorbed by GQA fusion).
 
+Hybrid cache metadata must preserve global layer indices across KV, convolution,
+and recurrent states. Derive slot count from the maximum
+`past_key_values.<index>.*` input index plus one; counting only `.key` inputs
+silently drops non-KV or sparsely indexed layers.
+
+CUDA Graph capture belongs on stable-shape autoregressive decoder sessions,
+not one-shot variable-shape vision/embedding stages. Keep an explicit decoder
+opt-out and validate capture together with shared KV buffers on the real model.
+
 > For the full generation flow, input routing, QwenImageProcessor output
 > tensors, and the multimodal processor factory, see
 > [`references/multimodal-pipeline.md`](references/multimodal-pipeline.md).
@@ -272,6 +292,15 @@ The vision ONNX model expects packed-attention inputs that the ORT GenAI
 processor doesn't provide. Either:
 1. Compute them externally and inject via NamedTensors, or
 2. Modify the vision model to compute them from `image_grid_thw` internally
+
+### Config metadata and downstream runtime acceptance
+
+Mobius owns metadata correctness, not ORT GenAI capability decisions. Emit the
+most accurate package from graph metadata: filenames, semantic graph inputs and
+outputs, every cache template the current config schema can represent, and the
+global cache-slot count. Preserve intrinsic schema/config validation, but do
+not gate or reject export based on the current GenAI model registry, runtime
+version, topology support, or cache executor capability.
 
 ### "input_ids size exceeds max length"
 

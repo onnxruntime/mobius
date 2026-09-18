@@ -41,7 +41,7 @@ pkg.save("output/llama/")
 CLI equivalent (see [CLI Reference](cli_reference.md) for all `--ep` options):
 
 ```bash
-mobius build --model meta-llama/Llama-3.2-1B output/ \
+mobius build --model meta-llama/Llama-3.2-1B --output output/ \
   --ep cuda --dtype f16
 ```
 
@@ -102,7 +102,8 @@ caps = get_ep("cuda")
 print(caps.gqa_dtypes)          # frozenset({FLOAT16, BFLOAT16})
 print(caps.qkv_pack_dtypes)     # frozenset({FLOAT, FLOAT16, BFLOAT16})
 print(caps.supports_fused_rope) # True
-print(caps.provider_options)    # {'enable_cuda_graph': '0', ...}
+print(caps.enable_graph_capture) # True
+print(caps.provider_options)     # {'enable_skip_layer_norm_strict_mode': '1'}
 ```
 
 ---

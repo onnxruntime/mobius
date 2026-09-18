@@ -1,0 +1,407 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Unit tests for the GGUF ``clip`` mmproj → HF tensor-name mapping."""
+
+from __future__ import annotations
+
+import pytest
+
+from mobius.integrations.gguf._mmproj_mapping import (
+    is_mmproj_stat_tensor,
+    map_generic_projector_to_onnx,
+    map_generic_vision_to_onnx,
+    map_mmproj_audio_to_hf,
+    map_mmproj_gemma3_vision_to_hf,
+    map_mmproj_glm4v_vision_to_onnx,
+    map_mmproj_glma_audio_to_onnx,
+    map_mmproj_qwen2_audio_to_onnx,
+    map_mmproj_qwen3_audio_to_onnx,
+    map_mmproj_qwen3_speaker_to_onnx,
+    map_mmproj_qwen3_vision_to_onnx,
+    map_mmproj_vision_to_hf,
+)
+
+
+class TestGenericProjectorMapping:
+    @pytest.mark.parametrize(
+        ("gguf_name", "expected"),
+        [
+            ("v.class_embd", "vision_tower.embeddings.class_embedding"),
+            (
+                "v.blk.2.ffn_down.weight",
+                "vision_tower.encoder.2.mlp.up_proj.weight",
+            ),
+            (
+                "v.blk.4.attn_out.bias",
+                "vision_tower.encoder.4.self_attn.out_proj.bias",
+            ),
+            ("v.post_ln.weight", "vision_tower.post_layernorm.weight"),
+        ],
+    )
+    def test_vision_names(self, gguf_name: str, expected: str):
+        assert map_generic_vision_to_onnx(gguf_name) == expected
+
+    @pytest.mark.parametrize(
+        ("projector_type", "gguf_name", "expected"),
+        [
+            ("mlp", "mm.0.weight", "projector.linear_0.weight"),
+            (
+                "ldp",
+                "mm.model.mb_block.2.block.1.fc2.bias",
+                "projector.block_2.se_fc2.bias",
+            ),
+            ("ldpv2", "mm.model.peg.0.weight", "projector.peg_0.weight"),
+            (
+                "adapter",
+                "adapter.linear.gate.weight",
+                "projector.gate.weight",
+            ),
+            (
+                "resampler",
+                "resampler.attn.out.weight",
+                "projector.attn_out.weight",
+            ),
+            ("resampler", "resampler.pos_embed", "projector.pos_embed"),
+        ],
+    )
+    def test_projector_names(
+        self,
+        projector_type: str,
+        gguf_name: str,
+        expected: str,
+    ):
+        assert map_generic_projector_to_onnx(gguf_name, projector_type) == expected
+
+    def test_unknown_projector_fails_closed(self):
+        with pytest.raises(ValueError, match="Unknown generic"):
+            map_generic_projector_to_onnx("mm.weight", "future-projector")
+
+
+class TestStatTensorDetection:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "v.blk.0.attn_q.weight.input_max",
+            "v.blk.0.attn_q.weight.input_min",
+            "v.blk.0.attn_q.weight.output_max",
+            "v.blk.0.attn_q.weight.output_min",
+            "a.blk.3.ffn_up.weight.output_min",
+        ],
+    )
+    def test_stat_tensors_detected(self, name: str):
+        assert is_mmproj_stat_tensor(name) is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "v.blk.0.attn_q.weight",
+            "v.patch_embd.weight",
+            "mm.input_projection.weight",
+            "a.conv1d.0.weight",
+        ],
+    )
+    def test_real_weights_not_flagged(self, name: str):
+        assert is_mmproj_stat_tensor(name) is False
+
+
+class TestVisionMapping:
+    @pytest.mark.parametrize(
+        ("gguf_name", "expected"),
+        [
+            (
+                "v.blk.0.attn_q.weight",
+                "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            ),
+            (
+                "v.blk.7.attn_k.weight",
+                "vision_tower.encoder.layers.7.self_attn.k_proj.weight",
+            ),
+            (
+                "v.blk.2.attn_v.weight",
+                "vision_tower.encoder.layers.2.self_attn.v_proj.weight",
+            ),
+            (
+                "v.blk.2.attn_out.weight",
+                "vision_tower.encoder.layers.2.self_attn.o_proj.weight",
+            ),
+            (
+                "v.blk.1.attn_q_norm.weight",
+                "vision_tower.encoder.layers.1.self_attn.q_norm.weight",
+            ),
+            (
+                "v.blk.1.attn_k_norm.weight",
+                "vision_tower.encoder.layers.1.self_attn.k_norm.weight",
+            ),
+            (
+                "v.blk.0.ln1.weight",
+                "vision_tower.encoder.layers.0.input_layernorm.weight",
+            ),
+            (
+                "v.blk.0.ln2.weight",
+                "vision_tower.encoder.layers.0.pre_feedforward_layernorm.weight",
+            ),
+            (
+                "v.blk.0.attn_post_norm.weight",
+                "vision_tower.encoder.layers.0.post_attention_layernorm.weight",
+            ),
+            (
+                "v.blk.0.ffn_post_norm.weight",
+                "vision_tower.encoder.layers.0.post_feedforward_layernorm.weight",
+            ),
+            (
+                "v.blk.4.ffn_gate.weight",
+                "vision_tower.encoder.layers.4.mlp.gate_proj.weight",
+            ),
+            (
+                "v.blk.4.ffn_up.weight",
+                "vision_tower.encoder.layers.4.mlp.up_proj.weight",
+            ),
+            (
+                "v.blk.4.ffn_down.weight",
+                "vision_tower.encoder.layers.4.mlp.down_proj.weight",
+            ),
+            (
+                "v.patch_embd.weight",
+                "vision_tower.patch_embedder.input_proj.weight",
+            ),
+            (
+                "v.position_embd.weight",
+                "vision_tower.patch_embedder.position_embedding_table",
+            ),
+            (
+                "mm.input_projection.weight",
+                "embed_vision.embedding_projection.weight",
+            ),
+        ],
+    )
+    def test_vision_names(self, gguf_name: str, expected: str):
+        assert map_mmproj_vision_to_hf(gguf_name) == expected
+
+    def test_clipping_bounds_are_mapped(self):
+        assert (
+            map_mmproj_vision_to_hf("v.blk.0.attn_q.input_max")
+            == "vision_tower.encoder.layers.0.self_attn.q_proj.input_max"
+        )
+
+    def test_unknown_stem_skipped(self):
+        assert map_mmproj_vision_to_hf("v.blk.0.mystery.weight") is None
+
+    def test_audio_tensor_not_mapped_by_vision(self):
+        assert map_mmproj_vision_to_hf("a.blk.0.attn_q.weight") is None
+
+
+class TestGemma3VisionMapping:
+    @pytest.mark.parametrize(
+        ("gguf_name", "expected"),
+        [
+            (
+                "v.patch_embd.weight",
+                "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            ),
+            (
+                "v.blk.2.attn_out.bias",
+                "vision_tower.vision_model.encoder.layers.2.self_attn.out_proj.bias",
+            ),
+            (
+                "v.blk.4.ffn_up.weight",
+                "vision_tower.vision_model.encoder.layers.4.mlp.fc2.weight",
+            ),
+            (
+                "mm.soft_emb_norm.weight",
+                "multi_modal_projector.mm_soft_emb_norm.weight",
+            ),
+            (
+                "mm.input_projection.weight",
+                "multi_modal_projector.mm_input_projection_weight",
+            ),
+        ],
+    )
+    def test_names_match_gemma3_preprocessor(self, gguf_name: str, expected: str):
+        assert map_mmproj_gemma3_vision_to_hf(gguf_name) == expected
+
+    def test_unknown_tensor_is_not_silently_mapped(self):
+        assert map_mmproj_gemma3_vision_to_hf("v.pre_ln.weight") is None
+
+
+class TestAudioMapping:
+    @pytest.mark.parametrize(
+        ("gguf_name", "expected"),
+        [
+            (
+                "a.blk.0.attn_q.weight",
+                "audio_tower.layers.0.self_attn.q_proj.weight",
+            ),
+            (
+                "a.blk.0.per_dim_scale.weight",
+                "audio_tower.layers.0.self_attn.per_dim_scale",
+            ),
+            (
+                "a.blk.0.conv_dw.weight",
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight",
+            ),
+            (
+                "a.conv1d.0.weight",
+                "audio_tower.subsample_conv_projection.conv0.weight",
+            ),
+            (
+                "a.input_projection.weight",
+                "audio_tower.subsample_conv_projection.input_proj_linear.weight",
+            ),
+            (
+                "mm.a.input_projection.weight",
+                "embed_audio.embedding_projection.weight",
+            ),
+            (
+                "a.pre_encode.out.weight",
+                "audio_tower.output_proj.weight",
+            ),
+        ],
+    )
+    def test_audio_names(self, gguf_name: str, expected: str):
+        assert map_mmproj_audio_to_hf(gguf_name) == expected
+
+    def test_clipping_bounds_are_mapped(self):
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.attn_q.output_min")
+            == "audio_tower.layers.0.self_attn.q_proj.output_min"
+        )
+
+    def test_historical_conv_norm_names_are_swapped_back(self):
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.conv_norm.weight")
+            == "audio_tower.layers.0.lconv1d.pre_layer_norm.weight"
+        )
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.norm_conv.weight")
+            == "audio_tower.layers.0.lconv1d.conv_norm.weight"
+        )
+
+
+class TestMuseGlimmerVisionMapping:
+    """Muse Glimmer ``clip`` mmproj → HF vision names.
+
+    Verified against ``unsloth/Muse-Glimmer-30B-GGUF``'s
+    ``mmproj-Muse-Glimmer-30B-BF16.gguf``: all 809 tensors map, and the mapped
+    names are exactly the 809 parameters of the published vision encoder graph.
+    """
+
+    def test_block_tensors_land_on_the_vision_tower_layers(self) -> None:
+        from mobius.integrations.gguf._mmproj_mapping import (
+            map_mmproj_muse_glimmer_vision_to_hf as convert,
+        )
+
+        assert (
+            convert("v.blk.7.attn_q.weight")
+            == "model.vision_tower.layers.7.attn.q_proj.weight"
+        )
+        assert convert("v.blk.7.attn_q.bias") == "model.vision_tower.layers.7.attn.q_proj.bias"
+        assert (
+            convert("v.blk.7.attn_out.weight")
+            == "model.vision_tower.layers.7.attn.proj.weight"
+        )
+        assert convert("v.blk.7.ln1.weight") == "model.vision_tower.layers.7.norm1.weight"
+        assert convert("v.blk.7.ln2.bias") == "model.vision_tower.layers.7.norm2.bias"
+        assert convert("v.blk.7.ffn_up.weight") == "model.vision_tower.layers.7.mlp.fc1.weight"
+        assert convert("v.blk.7.ffn_down.bias") == "model.vision_tower.layers.7.mlp.fc2.bias"
+
+    def test_stem_tensors_and_the_three_projector_matrices(self) -> None:
+        from mobius.integrations.gguf._mmproj_mapping import (
+            map_mmproj_muse_glimmer_vision_to_hf as convert,
+        )
+
+        assert (
+            convert("v.patch_embd.weight")
+            == "model.vision_tower.patch_embedder.patch_embedding.weight"
+        )
+        assert (
+            convert("v.position_embd.weight")
+            == "model.vision_tower.patch_embedder.position_embedding_table.weight"
+        )
+        assert convert("v.pre_ln.bias") == "model.vision_tower.ln_pre.bias"
+        assert convert("v.post_ln.weight") == "model.vision_tower.ln_post.weight"
+        # mm.0/mm.1 are the pixel-shuffle adapter, mm.2 the text projection.
+        assert convert("mm.0.weight") == "model.vision_adapter.fc1.weight"
+        assert convert("mm.1.weight") == "model.vision_adapter.fc2.weight"
+        assert convert("mm.2.weight") == "model.vision_projection.weight"
+
+    def test_stats_and_unknown_tensors_are_skipped(self) -> None:
+        from mobius.integrations.gguf._mmproj_mapping import (
+            map_mmproj_muse_glimmer_vision_to_hf as convert,
+        )
+
+        assert convert("v.blk.0.attn_q.input_max") is None
+        # Muse Glimmer's tower has no SwiGLU gate and no QK norms; a file
+        # carrying them is not this architecture.
+        assert convert("v.blk.0.ffn_gate.weight") is None
+        assert convert("v.blk.0.attn_q_norm.weight") is None
+        assert convert("a.blk.0.attn_q.weight") is None
+
+
+class TestQwenGlmProjectorMapping:
+    def test_qwen3vl_deepstack_layer_maps_to_dense_merger_index(self) -> None:
+        assert (
+            map_mmproj_qwen3_vision_to_onnx(
+                "v.deepstack.11.fc2.weight",
+                deepstack_layers=(5, 11, 17),
+            )
+            == "visual.deepstack_merger_list.1.linear_fc2.weight"
+        )
+        assert (
+            map_mmproj_qwen3_vision_to_onnx(
+                "v.deepstack.7.fc2.weight",
+                deepstack_layers=(5, 11, 17),
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                "v.blk.2.attn_qkv.weight",
+                "visual.blocks.2.attn.qkv.weight",
+            ),
+            ("v.post_ln.bias", "visual.merger.norm.bias"),
+            ("mm.2.weight", "visual.merger.linear_fc2.weight"),
+        ],
+    )
+    def test_qwen3vl_names(self, source: str, expected: str) -> None:
+        assert (
+            map_mmproj_qwen3_vision_to_onnx(
+                source,
+                deepstack_layers=(5, 11, 17),
+            )
+            == expected
+        )
+
+    def test_glm4v_qk_norm_variant(self) -> None:
+        assert (
+            map_mmproj_glm4v_vision_to_onnx("v.blk.3.attn_q_norm.weight")
+            == "visual.blocks.3.attn.q_norm.weight"
+        )
+        assert (
+            map_mmproj_glm4v_vision_to_onnx("mm.patch_merger.weight")
+            == "visual.downsample.weight"
+        )
+
+    def test_qwen2_and_qwen3_audio_names_remain_distinct(self) -> None:
+        assert map_mmproj_qwen2_audio_to_onnx("mm.a.fc.weight") == "projection.weight"
+        assert (
+            map_mmproj_qwen3_audio_to_onnx("a.blk.4.attn_k.bias")
+            == "audio_tower.layers.4.self_attn.k_proj.bias"
+        )
+        assert (
+            map_mmproj_qwen3_audio_to_onnx("mm.a.mlp.2.weight") == "audio_tower.proj2.weight"
+        )
+
+    def test_glma_boundary_rows_and_stack_projector(self) -> None:
+        assert map_mmproj_glma_audio_to_onnx("v.boi") == "boi"
+        assert map_mmproj_glma_audio_to_onnx("mm.a.mlp.1.weight") == "linear_1.weight"
+
+    def test_qwen3tts_speaker_res2_branch(self) -> None:
+        assert (
+            map_mmproj_qwen3_speaker_to_onnx("a.blk.2.res2.6.weight")
+            == "encoder.blocks.2.res2net_block.blocks.6.conv.weight"
+        )
+        assert map_mmproj_qwen3_speaker_to_onnx("a.gen.code.proj_in.weight") is None

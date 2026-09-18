@@ -28,7 +28,7 @@ from mobius import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._testing.comparison import assert_logits_close
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import _download_weights
+from mobius.integrations._weight_loading import _download_weights
 from mobius.models.phi import Phi4MMMultiModalModel
 from mobius.tasks import Phi4MMMultiModalTask
 

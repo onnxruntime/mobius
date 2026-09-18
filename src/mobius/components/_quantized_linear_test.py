@@ -7,14 +7,22 @@ from __future__ import annotations
 
 import math
 
+import onnx_ir as ir
 import pytest
 
+from mobius._build_context import build_context
+from mobius._execution_providers import ep_registry
 from mobius._testing import (
     count_op_type,
     create_test_builder,
     create_test_input,
 )
-from mobius.components._quantized_linear import QuantizedLinear
+from mobius.components._quantized_linear import (
+    BlockQuantizedLinear,
+    ClippableQuantizedLinear,
+    NVFP4QuantizedLinear,
+    QuantizedLinear,
+)
 
 # Test dimensions
 IN_FEATURES = 64
@@ -125,7 +133,60 @@ class TestQuantizedLinearForward:
                 assert attrs["N"] == OUT_FEATURES
                 assert attrs["bits"] == 4
                 assert attrs["block_size"] == 32
+                # No active build context -> default EP (accuracy_level 0),
+                # so the attribute is omitted and ORT keeps its default path.
+                assert "accuracy_level" not in attrs
                 break
+        else:
+            pytest.fail("MatMulNBits node not found")
+
+    def test_no_accuracy_level_without_context(self):
+        """Default EP omits accuracy_level (ORT default / highest precision)."""
+        ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES, bits=4, block_size=32)
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+        result = ql(op, x)
+        b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert "accuracy_level" not in attrs
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
+
+    def test_cpu_ep_emits_accuracy_level_4(self):
+        """CPU EP context stamps accuracy_level=4 (int8 MLAS path)."""
+        with build_context(ep_registry.require("cpu")):
+            ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES, bits=4, block_size=32)
+            b, op, graph = create_test_builder()
+            x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+            result = ql(op, x)
+            b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["accuracy_level"] == 4
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
+
+    def test_cpu_ep_omits_accuracy_level_for_non_int4(self):
+        """accuracy_level is INT4-specific: 8-bit weights keep ORT's default."""
+        with build_context(ep_registry.require("cpu")):
+            ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES, bits=8, block_size=32)
+            b, op, graph = create_test_builder()
+            x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+            result = ql(op, x)
+            b._adapt_outputs([result], "")
+        for node in graph:
+            if node.op_type == "MatMulNBits":
+                attrs = {a.name: a.value for a in node.attributes.values()}
+                assert attrs["bits"] == 8
+                assert "accuracy_level" not in attrs
+                break
+        else:
+            pytest.fail("MatMulNBits node not found")
 
     def test_3_inputs_without_zero_points(self):
         ql = QuantizedLinear(IN_FEATURES, OUT_FEATURES)
@@ -205,6 +266,144 @@ class TestQuantizedLinearForward:
         assert "bias" in names
 
 
+class TestNVFP4QuantizedLinear:
+    def test_exact_parameter_abi(self):
+        linear = NVFP4QuantizedLinear(IN_FEATURES, OUT_FEATURES)
+
+        assert linear.weight.shape == [OUT_FEATURES, IN_FEATURES // 2]
+        assert linear.weight.dtype.name == "UINT8"
+        assert linear.weight_scale.shape == [OUT_FEATURES, IN_FEATURES // 16]
+        assert linear.weight_scale.dtype.name == "UINT8"
+        assert linear.weight_scale_2.shape == [1]
+        assert linear.weight_scale_2.dtype.name == "FLOAT"
+
+    @pytest.mark.parametrize(("in_features", "block_size"), [(63, 16), (64, 32)])
+    def test_rejects_unsupported_layout(self, in_features, block_size):
+        with pytest.raises(ValueError, match="requires"):
+            NVFP4QuantizedLinear(
+                in_features,
+                OUT_FEATURES,
+                block_size=block_size,
+            )
+
+    def test_emits_exact_native_node_and_separate_bias(self):
+        linear = NVFP4QuantizedLinear(
+            IN_FEATURES,
+            OUT_FEATURES,
+            bias=True,
+        )
+        builder, op, graph = create_test_builder()
+        x = create_test_input(
+            builder,
+            "x",
+            [2, 3, IN_FEATURES],
+            dtype=ir.DataType.FLOAT16,
+        )
+
+        result = linear(op, x)
+        builder._adapt_outputs([result], "")
+
+        native = next(
+            node for node in graph if node.op_type == "MatMulBlockQuantizedFp4Weight"
+        )
+        assert native.domain == "com.microsoft"
+        assert len(native.inputs) == 4
+        assert native.attributes["block_size"].value == 16
+        assert native.outputs[0].shape == [2, 3, OUT_FEATURES]
+        assert count_op_type(graph, "Add") == 1
+        assert graph.opset_imports["com.microsoft"] == 1
+
+    def test_rejects_non_fp16_activation_abi(self):
+        linear = NVFP4QuantizedLinear(IN_FEATURES, OUT_FEATURES)
+        builder, op, _graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, IN_FEATURES])
+
+        with pytest.raises(ValueError, match="requires FLOAT16 activations"):
+            linear(op, x)
+
+
+class TestBlockQuantizedLinear:
+    @pytest.mark.parametrize(
+        ("format_name", "block_elements", "block_bytes"),
+        [
+            ("mxfp4", 32, 17),
+            ("iq4_nl", 32, 18),
+            ("iq4_xs", 256, 136),
+            ("iq3_s", 256, 110),
+            ("iq3_xxs", 256, 98),
+            ("iq2_xxs", 256, 66),
+            ("iq2_xs", 256, 74),
+            ("iq2_s", 256, 82),
+            ("iq1_s", 256, 50),
+            ("iq1_m", 256, 56),
+        ],
+    )
+    def test_emits_native_block_contract(
+        self,
+        format_name: str,
+        block_elements: int,
+        block_bytes: int,
+    ):
+        linear = BlockQuantizedLinear(
+            IN_FEATURES,
+            OUT_FEATURES,
+            format=format_name,
+            bias=True,
+        )
+        expected_blocks = (IN_FEATURES + block_elements - 1) // block_elements
+        assert linear.weight.shape == [OUT_FEATURES, expected_blocks, block_bytes]
+
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+        result = linear(op, x)
+        b._adapt_outputs([result], "")
+
+        node = next(node for node in graph if node.op_type == "BlockQuantizedMatMul")
+        assert node.domain == "pkg.nxrt"
+        assert graph.opset_imports["pkg.nxrt"] == 1
+        assert len(node.inputs) == 3
+        attrs = {attribute.name: attribute.value for attribute in node.attributes.values()}
+        assert attrs == {
+            "K": IN_FEATURES,
+            "N": OUT_FEATURES,
+            "format": format_name,
+            "block_layout_version": 1,
+        }
+
+    def test_rejects_runtime_unsupported_iq_format(self):
+        with pytest.raises(ValueError, match="format must be one of"):
+            BlockQuantizedLinear(IN_FEATURES, OUT_FEATURES, format="q4_k")
+
+
+class TestClippableQuantizedLinear:
+    def test_keeps_clipping_parameters(self):
+        linear = ClippableQuantizedLinear(IN_FEATURES, OUT_FEATURES)
+        names = {name for name, _ in linear.named_parameters()}
+        assert {
+            "weight",
+            "scales",
+            "input_min",
+            "input_max",
+            "output_min",
+            "output_max",
+        } <= names
+
+    def test_graph_clips_around_matmulnbits(self):
+        linear = ClippableQuantizedLinear(
+            IN_FEATURES,
+            OUT_FEATURES,
+            bits=8,
+            block_size=32,
+        )
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+        result = linear(op, x)
+        b._adapt_outputs([result], "")
+
+        assert count_op_type(graph, "MatMulNBits") == 1
+        assert count_op_type(graph, "Clip") == 2
+
+
 class TestMakeQuantizedLinearFactory:
     """Tests for the make_quantized_linear_factory closure."""
 
@@ -239,6 +438,22 @@ class TestMakeQuantizedLinearFactory:
         assert instance._k == 32
         assert instance._n == 64
         assert instance.bias is None
+
+    def test_clippable_factory_uses_requested_layout(self):
+        from mobius.components._quantized_linear import (
+            make_clippable_quantized_linear_factory,
+        )
+
+        factory = make_clippable_quantized_linear_factory(
+            bits=8,
+            block_size=32,
+            has_zero_point=True,
+        )
+        linear = factory(IN_FEATURES, OUT_FEATURES, bias=False)
+
+        assert isinstance(linear, ClippableQuantizedLinear)
+        assert linear.weight.shape == [OUT_FEATURES, 2, 32]
+        assert linear.zero_points is not None
 
 
 class TestQuantizedEmbeddingInit:
@@ -299,6 +514,8 @@ class TestQuantizedEmbeddingForward:
         result = qe(op, ids)
         b._adapt_outputs([result], "")
         assert count_op_type(graph, "GatherBlockQuantized") == 1
+        assert result.dtype == ir.DataType.FLOAT
+        assert result.shape == ir.Shape([1, 4, self.DIM])
 
     def test_node_domain_and_attributes(self):
         import onnx_ir as ir

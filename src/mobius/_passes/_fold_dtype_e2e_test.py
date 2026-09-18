@@ -62,7 +62,7 @@ from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._optimizations import fold_initializers_after_weights
 from mobius._registry import registry
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 
 
 def _make_fp16_llama_config() -> ArchitectureConfig:

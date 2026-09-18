@@ -13,7 +13,7 @@ Supports real-time microphone input and audio file input.
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] sounddevice
+    pip install mobius-onnx[transformers] sounddevice
 
 Usage::
 

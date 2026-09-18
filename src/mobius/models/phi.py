@@ -11,6 +11,8 @@ MuP (maximal update parameterization) scaling.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
@@ -200,6 +202,18 @@ class PhiCausalLMModel(CausalLMModel):
                 (".mlp.fc2.", ".mlp.down_proj."),
             ],
         )
+        for key in list(new_state_dict):
+            if ".self_attn.qkv_proj." not in key:
+                continue
+            q, k, v = split_fused_qkv(
+                new_state_dict.pop(key),
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            )
+            new_state_dict[key.replace("qkv_proj", "q_proj")] = q
+            new_state_dict[key.replace("qkv_proj", "k_proj")] = k
+            new_state_dict[key.replace("qkv_proj", "v_proj")] = v
         return super().preprocess_weights(new_state_dict)
 
 
@@ -1277,6 +1291,15 @@ class Phi4MMMultiModalModel(nn.Module):
 
     default_task: str = "phi4mm-multimodal"
     category: str = "Multimodal"
+
+    # Runtime HF ``named_modules()`` sub-trees per ONNX component. The speech
+    # component's ModelPackage key is ``audio_encoder``.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "vision_encoder": ("model.embed_tokens_extend.image_embed",),
+        "audio_encoder": ("model.embed_tokens_extend.audio_embed",),
+        "embedding": ("model.embed_tokens",),
+        "decoder": ("model.layers", "model.norm", "lm_head"),
+    }
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

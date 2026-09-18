@@ -27,7 +27,7 @@ HuggingFace weight names:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
@@ -83,6 +83,8 @@ class _InternVisionEmbeddings(nn.Module):
         patch_size: int,
         hidden_size: int,
         num_channels: int = 3,
+        *,
+        class_token_at_end: bool = False,
     ):
         super().__init__()
         self.num_patches = (image_size // patch_size) ** 2
@@ -97,6 +99,7 @@ class _InternVisionEmbeddings(nn.Module):
         )
         # Position embedding includes CLS position — bare parameter
         self.position_embedding = nn.Parameter([1, self.num_patches + 1, hidden_size])
+        self._class_token_at_end = class_token_at_end
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # pixel_values: [batch, channels, height, width]
@@ -117,8 +120,12 @@ class _InternVisionEmbeddings(nn.Module):
             self.class_embedding,
             op.Concat(batch_size, op.Constant(value_ints=[1]), hidden_dim, axis=0),
         )
-        # [batch, num_patches + 1, hidden_size]
-        embeddings = op.Concat(cls_token, patch_embeds, axis=1)
+        # HF prepends CLS; llama.cpp's serialized InternVL route appends it.
+        embeddings = (
+            op.Concat(patch_embeds, cls_token, axis=1)
+            if self._class_token_at_end
+            else op.Concat(cls_token, patch_embeds, axis=1)
+        )
 
         # Add position embeddings
         embeddings = op.Add(embeddings, self.position_embedding)
@@ -263,7 +270,12 @@ class _InternVisionModel(nn.Module):
     HF reference: ``InternVisionModel`` in ``modeling_intern_vit.py``.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        *,
+        class_token_at_end: bool = False,
+    ):
         super().__init__()
         vc = config.vision
         assert vc is not None, "VisionConfig is required"
@@ -271,6 +283,7 @@ class _InternVisionModel(nn.Module):
             image_size=vc.image_size,
             patch_size=vc.patch_size,
             hidden_size=vc.hidden_size,
+            class_token_at_end=class_token_at_end,
         )
         self.encoder = _InternVisionEncoder(
             num_layers=vc.num_hidden_layers,
@@ -546,6 +559,51 @@ class InternVL2Model(nn.Module):
 
     default_task: str = "vision-language"
     category: str = "Multimodal"
+
+    # Runtime ``InternVLChatModel.named_modules()`` sub-trees per ONNX component.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "language_model.model.layers",
+            "language_model.model.norm",
+            "language_model.model.rotary_emb",
+            "language_model.lm_head",
+        ),
+        "vision_encoder": ("vision_model", "mlp1"),
+        "embedding": ("language_model.model.embed_tokens",),
+    }
+    _INTERNLM2_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "language_model.model.layers",
+            "language_model.model.norm",
+            "language_model.output",
+        ),
+        "vision_encoder": ("vision_model", "mlp1"),
+        "embedding": ("language_model.model.tok_embeddings",),
+    }
+
+    @classmethod
+    def get_hf_component_sources(
+        cls,
+        *,
+        model_type: str,
+        hf_config: object,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return paths for the verified OpenGVLab remote-code runtime."""
+        llm_config = getattr(hf_config, "llm_config", None)
+        llm_model_type = getattr(llm_config, "model_type", None)
+        if llm_model_type == "internlm2":
+            return cls._INTERNLM2_COMPONENT_SOURCES
+        if llm_model_type in {"llama", "qwen2"}:
+            return cls.HF_COMPONENT_SOURCES
+        if llm_model_type is not None:
+            return {}
+        architectures = getattr(hf_config, "architectures", None) or ()
+        if (
+            model_type in {"internvl", "internvl2", "internvl_chat"}
+            or "InternVLChatModel" in architectures
+        ):
+            return cls.HF_COMPONENT_SOURCES
+        return {}
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()

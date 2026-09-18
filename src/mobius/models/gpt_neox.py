@@ -212,6 +212,7 @@ class GPTNeoXCausalLMModel(CausalLMModel):
 
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
+            key = key.replace("lm_head.", "embed_out.")
             key = key.replace(".attention.dense.", ".attention.o_proj.")
             # GPT-NeoX-Japanese stores the output projection bias as a separate
             # parameter (not as part of the Linear layer)

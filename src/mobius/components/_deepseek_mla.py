@@ -20,6 +20,7 @@ from mobius.components._common import Linear
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import (
     apply_rotary_pos_emb,
+    yarn_apply_mscale,
 )
 
 if TYPE_CHECKING:
@@ -43,8 +44,12 @@ class DeepSeekMLA(nn.Module):
         self,
         config: ArchitectureConfig,
         scale: float | None = None,
+        linear_class: type | None = None,
+        split_kv_b: bool = False,
     ):
         super().__init__()
+        if linear_class is None:
+            linear_class = Linear
         self.num_heads = config.num_attention_heads
         self.q_lora_rank = config.q_lora_rank
         self.kv_lora_rank = config.kv_lora_rank
@@ -55,16 +60,16 @@ class DeepSeekMLA(nn.Module):
 
         # Q path: LoRA compression → norm → decompression
         if self.q_lora_rank is not None and self.q_lora_rank > 0:
-            self.q_a_proj = Linear(config.hidden_size, self.q_lora_rank, bias=False)
+            self.q_a_proj = linear_class(config.hidden_size, self.q_lora_rank, bias=False)
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = Linear(
+            self.q_b_proj = linear_class(
                 self.q_lora_rank,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
             )
         else:
             # No LoRA — direct projection
-            self.q_proj = Linear(
+            self.q_proj = linear_class(
                 config.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
@@ -72,31 +77,50 @@ class DeepSeekMLA(nn.Module):
 
         # KV path: joint projection for latent KV + RoPE key
         # Output: (kv_lora_rank) for latent KV + (qk_rope_head_dim) for k_rope
-        self.kv_a_proj_with_mqa = Linear(
+        self.kv_a_proj_with_mqa = linear_class(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=False,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        # Decompresses latent KV into per-head k_nope + v
-        self.kv_b_proj = Linear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-        )
+        self._split_kv_b = split_kv_b
+        if split_kv_b:
+            self.k_b_proj = linear_class(
+                self.kv_lora_rank,
+                self.num_heads * self.qk_nope_head_dim,
+                bias=False,
+            )
+            self.v_b_proj = linear_class(
+                self.kv_lora_rank,
+                self.num_heads * self.v_head_dim,
+                bias=False,
+            )
+        else:
+            # Decompresses latent KV into per-head k_nope + v
+            self.kv_b_proj = linear_class(
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=False,
+            )
 
-        self.o_proj = Linear(
+        self.o_proj = linear_class(
             self.num_heads * self.v_head_dim,
             config.hidden_size,
             bias=False,
         )
 
-        # Attention scale: 1/sqrt(qk_head_dim).
-        # YaRN mscale is handled by the cos/sin cache (attention_factor
-        # is applied to cos/sin in YarnRope), so no additional scaling
-        # is needed here. The cos/sin scaling produces attention_factor^2
-        # effect on the attention logits automatically.
-        self.scaling = scale if scale is not None else self.qk_head_dim**-0.5
+        # Attention scale: 1/sqrt(qk_head_dim), with an additional YaRN
+        # mscale^2 softmax-scale correction when YaRN is active (see
+        # ``yarn_apply_mscale``). This is separate from the RoPE cos/sin
+        # ``attention_factor`` applied inside YarnRope, which only rescales
+        # the rope portion of Q/K, not the full attention logit.
+        self.scaling = (
+            scale
+            if scale is not None
+            else yarn_apply_mscale(
+                config.rope_type, config.rope_scaling, self.qk_head_dim**-0.5
+            )
+        )
 
         # Whether RoPE uses interleaved layout (DeepSeek-V3 uses this)
         self._rope_interleave = config.rope_interleave
@@ -144,18 +168,28 @@ class DeepSeekMLA(nn.Module):
 
         # Decompress latent KV → per-head k_nope + v
         k_pass = self.kv_a_layernorm(op, k_pass)
-        kv_decompressed = self.kv_b_proj(op, k_pass)
-        # (B, S, num_heads * (nope + v_dim)) → (B, S, num_heads, nope + v_dim)
-        kv_decompressed = op.Reshape(
-            kv_decompressed,
-            [0, 0, self.num_heads, self.qk_nope_head_dim + self.v_head_dim],
-        )
-        k_nope, value_states = op.Split(
-            kv_decompressed,
-            [self.qk_nope_head_dim, self.v_head_dim],
-            axis=-1,
-            _outputs=2,
-        )
+        if self._split_kv_b:
+            k_nope = op.Reshape(
+                self.k_b_proj(op, k_pass),
+                [0, 0, self.num_heads, self.qk_nope_head_dim],
+            )
+            value_states = op.Reshape(
+                self.v_b_proj(op, k_pass),
+                [0, 0, self.num_heads, self.v_head_dim],
+            )
+        else:
+            kv_decompressed = self.kv_b_proj(op, k_pass)
+            # (B, S, num_heads * (nope + v_dim)) → (B, S, num_heads, nope + v_dim)
+            kv_decompressed = op.Reshape(
+                kv_decompressed,
+                [0, 0, self.num_heads, self.qk_nope_head_dim + self.v_head_dim],
+            )
+            k_nope, value_states = op.Split(
+                kv_decompressed,
+                [self.qk_nope_head_dim, self.v_head_dim],
+                axis=-1,
+                _outputs=2,
+            )
         # k_nope: (B, S, H, nope_dim) → (B, S, H*nope_dim)... not needed yet
         # value_states: (B, S, H, v_dim) → (B, S, H*v_dim) for Attention op
         value_states = op.Reshape(value_states, [0, 0, -1])
