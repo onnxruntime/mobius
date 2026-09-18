@@ -16,7 +16,6 @@ from mobius.tasks._base import (
     ComponentSpec,
     _make_graph,
     _make_model,
-    build_decoder_from_embeds,
 )
 from mobius.tasks._cache_utils import (
     _make_kv_cache_inputs,
@@ -52,7 +51,7 @@ class Qwen25OmniTask(QwenVLTask):
             "audio_encoder": self._build_audio(module.audio_encoder, config),
             "vision_encoder": self._build_vision(module.vision_encoder, config),
             "embedding": self._build_embedding(module.embedding, config),
-            "decoder": build_decoder_from_embeds(module.decoder, config, mrope=True),
+            "decoder": self._build_decoder(module.decoder, config),
         }
         if module.talker is not None and config.talker is not None:
             models["talker_embedding"] = self._build_talker_embedding(
@@ -60,6 +59,61 @@ class Qwen25OmniTask(QwenVLTask):
             )
             models["talker"] = self._build_talker(module.talker, config.talker)
         return ModelPackage(models, config=config)
+
+    def _build_decoder(
+        self,
+        decoder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build Thinker logits, normalized hidden states, and KV cache."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+        graph, builder = _make_graph(name="decoder")
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
+        )
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_sequence_len + sequence_len"],
+        )
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[3, batch, seq_len],
+        )
+        past_key_values = _make_kv_cache_inputs(
+            builder,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+        logits, hidden_states, present_key_values = decoder(
+            builder.op,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+        builder.add_output(logits, "logits")
+        builder.add_output(hidden_states, "hidden_states")
+        _register_kv_cache_outputs(
+            builder,
+            present_key_values,
+            batch=batch,
+            num_kv_heads=config.num_key_value_heads,
+            key_head_dim=config.head_dim,
+            value_head_dim=config.head_dim,
+            total_seq_len="past_sequence_len + sequence_len",
+            dtype=config.dtype,
+        )
+        return _make_model(graph)
 
     def _build_talker_embedding(
         self,
@@ -99,7 +153,7 @@ class Qwen25OmniTask(QwenVLTask):
         attention_mask = builder.input(
             "attention_mask",
             dtype=ir.DataType.INT64,
-            shape=[batch, "past_seq_len + seq_len"],
+            shape=[batch, "past_sequence_len + sequence_len"],
         )
         position_ids = builder.input(
             "position_ids",
@@ -123,7 +177,16 @@ class Qwen25OmniTask(QwenVLTask):
             past_key_values=past_key_values,
         )
         builder.add_output(logits, "logits")
-        _register_kv_cache_outputs(builder, present_key_values)
+        _register_kv_cache_outputs(
+            builder,
+            present_key_values,
+            batch=batch,
+            num_kv_heads=config.num_key_value_heads,
+            key_head_dim=config.head_dim,
+            value_head_dim=config.head_dim,
+            total_seq_len="past_sequence_len + sequence_len",
+            dtype=config.dtype,
+        )
         return _make_model(graph)
 
     def _build_audio(self, audio_encoder: nn.Module, config: ArchitectureConfig) -> ir.Model:

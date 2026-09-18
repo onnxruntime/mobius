@@ -104,6 +104,7 @@ def test_qwen25_omni_extracts_nested_thinker_config():
     assert config.talker.hidden_size == 32
     assert config.talker.vocab_size == 8448
     assert config.talker.attn_qkv_bias
+    assert config.talker.mrope_section == [2, 1, 1]
 
 
 @pytest.mark.parametrize("raw_json", [False, True])
@@ -175,7 +176,7 @@ def test_qwen25_omni_preprocess_weights_routes_thinker_components():
         "decoder.layers.0.self_attn.q_proj.bias",
         "decoder.lm_head.weight",
         "talker.thinker_to_talker_proj.weight",
-        "talker.model.embed_tokens.weight",
+        "embed_tokens.weight",
         "talker.model.layers.0.self_attn.q_proj.weight",
         "talker.codec_head.weight",
     }
@@ -196,6 +197,19 @@ def test_qwen25_omni_package_builds_talker_models():
         "talker",
     }
     assert {value.name for value in package["talker_embedding"].graph.inputs} == {"input_ids"}
+    assert set(package["talker_embedding"].graph.initializers) == {"embed_tokens.weight"}
+    decoder_outputs = {value.name: value for value in package["decoder"].graph.outputs}
+    assert set(decoder_outputs) >= {
+        "logits",
+        "hidden_states",
+        "present.0.key",
+        "present.0.value",
+    }
+    assert [str(dim) for dim in decoder_outputs["hidden_states"].shape] == [
+        "batch",
+        "sequence_len",
+        "64",
+    ]
     assert {value.name for value in package["talker"].graph.inputs} >= {
         "inputs_embeds",
         "attention_mask",
@@ -208,6 +222,14 @@ def test_qwen25_omni_package_builds_talker_models():
         "present.0.key",
         "present.0.value",
     }
+    talker_outputs = {value.name: value for value in package["talker"].graph.outputs}
+    for name in ("present.0.key", "present.0.value"):
+        assert [str(dim) for dim in talker_outputs[name].shape] == [
+            "batch",
+            "2",
+            "past_sequence_len + sequence_len",
+            "8",
+        ]
 
 
 def test_qwen25_omni_package_omits_talker_models_when_disabled():

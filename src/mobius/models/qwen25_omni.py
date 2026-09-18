@@ -419,7 +419,7 @@ class Qwen25OmniDecoderModel(nn.Module):
 
         hidden_states = self.norm(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
-        return logits, present_key_values
+        return logits, hidden_states, present_key_values
 
 
 class Qwen25OmniTalkerModel(nn.Module):
@@ -564,6 +564,11 @@ class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
         """
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
+            if key == "talker.model.embed_tokens.weight":
+                # The embedding component traces this nested module directly,
+                # so its initializer has no outer Talker scopes.
+                cleaned["embed_tokens.weight"] = value
+                continue
             if key.startswith("talker."):
                 if self.talker is not None:
                     cleaned[key] = value

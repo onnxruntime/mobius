@@ -338,11 +338,11 @@ def _extract_mrope_fields(config) -> dict:
     )
     if mrope_interleaved:
         result["mrope_interleaved"] = True
-        section = rope_scaling.get("mrope_section", None) or rope_parameters.get(
-            "mrope_section", None
-        )
-        if section is not None:
-            result["mrope_section"] = section
+    section = rope_scaling.get("mrope_section", None) or rope_parameters.get(
+        "mrope_section", None
+    )
+    if section is not None:
+        result["mrope_section"] = section
     return result
 
 
