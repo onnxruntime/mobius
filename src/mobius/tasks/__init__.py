@@ -35,6 +35,7 @@ __all__ = [
     "DraftTargetCausalLMTask",
     "Eagle3DraftTask",
     "Qwen35MtpTask",
+    "Qwen25OmniTask",
     "Qwen4ExpCausalLMTask",
     "Qwen4ExpVisionLanguageTask",
     "DenoisingTask",
@@ -194,6 +195,7 @@ from mobius.tasks._qwen4_exp import (
     Qwen4ExpCausalLMTask,
     Qwen4ExpVisionLanguageTask,
 )
+from mobius.tasks._qwen25_omni import Qwen25OmniTask
 from mobius.tasks._qwen35_mtp import Qwen35MtpTask
 from mobius.tasks._qwen_image import QwenImageDenoisingTask
 from mobius.tasks._qwen_image_text_encoder import QwenImageTextEncoderTask
@@ -275,6 +277,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "dflash-draft": DFlashDraftTask,
     "eagle3-draft": Eagle3DraftTask,
     "qwen35-mtp": Qwen35MtpTask,
+    "qwen25-omni": Qwen25OmniTask,
     "qwen4-exp-text-generation": Qwen4ExpCausalLMTask,
     "qwen4-exp-vision-language": Qwen4ExpVisionLanguageTask,
     "vae": VAETask,

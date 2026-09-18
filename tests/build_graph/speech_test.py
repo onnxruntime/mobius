@@ -43,7 +43,64 @@ from mobius.tasks import (
 )
 
 _SPEECH_MODEL_PARAMS = _make_params(SPEECH_CONFIGS)
+
+
+class TestBuildGraphQwen25Omni:
+    """Verify the Qwen2.5-Omni Thinker four-model split."""
+
+    def _omni_config(self):
+        overrides = next(
+            overrides
+            for model_type, overrides, _ in SPEECH_CONFIGS
+            if model_type == "qwen2_5_omni"
+        )
+        return _base_config(**overrides)
+
+    @pytest.mark.parametrize(
+        "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+    )
+    def test_package_builds_four_models(self, dtype):
+        from mobius.models import Qwen25OmniThinkerForConditionalGeneration
+        from mobius.tasks import Qwen25OmniTask
+
+        config = self._omni_config()
+        config.dtype = dtype
+        module = Qwen25OmniThinkerForConditionalGeneration(config)
+        package = build_from_module(module, config, task=Qwen25OmniTask())
+
+        assert set(package) == {
+            "audio_encoder",
+            "vision_encoder",
+            "embedding",
+            "decoder",
+        }
+        assert {value.name for value in package["audio_encoder"].graph.inputs} == {
+            "input_features",
+            "chunk_lengths",
+            "pool_indices",
+        }
+        assert package["audio_encoder"].graph.inputs[0].dtype == dtype
+        assert {value.name for value in package["embedding"].graph.inputs} == {
+            "input_ids",
+            "audio_features",
+            "image_features",
+            "video_features",
+        }
+
+    @pytest.mark.parametrize("missing", ["audio", "vision"])
+    def test_missing_encoder_rejected(self, missing):
+        from mobius.models import Qwen25OmniThinkerForConditionalGeneration
+        from mobius.tasks import Qwen25OmniTask
+
+        config = self._omni_config()
+        setattr(config, missing, None)
+        module = Qwen25OmniThinkerForConditionalGeneration(config)
+        with pytest.raises(ValueError, match=f"non-None {missing}_encoder"):
+            Qwen25OmniTask().build(module, config)
+
+
 _SPEECH_TASK_KEYS: dict[str, set[str]] = {
+    "qwen25-omni": {"audio_encoder", "vision_encoder", "embedding", "decoder"},
     "speech-to-text": {"encoder", "decoder"},
     "speech-language": {"audio_encoder", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},
