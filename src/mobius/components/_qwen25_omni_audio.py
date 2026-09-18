@@ -12,8 +12,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/qw
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import nn
-from onnxscript._internal import builder
+from onnxscript import OpBuilder, nn
 
 from mobius._build_context import get_build_dtype
 from mobius.components._common import LayerNorm, Linear
@@ -37,23 +36,24 @@ class Qwen25OmniAudioAttention(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
     ):
         """Bidirectional self-attention.
 
         Args:
-            hidden_states: (batch, seq_len, d_model)
+            hidden_states: (total_tokens, d_model)
+            cu_seqlens: Cumulative lengths of the independent audio chunks.
 
         Returns:
-            output: (batch, seq_len, d_model)
+            output: (total_tokens, d_model)
         """
         seq_len = op.Shape(hidden_states, start=0, end=1)
-        packed_shape = op.Concat(seq_len, [self._num_heads, self._head_dim], axis=0)
-        q = op.Reshape(self.q_proj(op, hidden_states), packed_shape)
-        k = op.Reshape(self.k_proj(op, hidden_states), packed_shape)
-        v = op.Reshape(self.v_proj(op, hidden_states), packed_shape)
+        # Rank-3 Attention splits the projected hidden dimension into heads.
+        q = op.Unsqueeze(self.q_proj(op, hidden_states), [0])
+        k = op.Unsqueeze(self.k_proj(op, hidden_states), [0])
+        v = op.Unsqueeze(self.v_proj(op, hidden_states), [0])
 
         # Build the block-diagonal mask represented by HF's cu_seqlens.
         positions = op.Range(0, op.Squeeze(seq_len, [0]), 1)
@@ -82,9 +82,6 @@ class Qwen25OmniAudioAttention(nn.Module):
         )
         attention_bias = op.Unsqueeze(attention_bias, [0, 1])
 
-        q = op.Unsqueeze(op.Transpose(q, perm=[1, 0, 2]), [0])
-        k = op.Unsqueeze(op.Transpose(k, perm=[1, 0, 2]), [0])
-        v = op.Unsqueeze(op.Transpose(v, perm=[1, 0, 2]), [0])
         attn_output = op.Attention(
             q,
             k,
@@ -94,8 +91,7 @@ class Qwen25OmniAudioAttention(nn.Module):
             kv_num_heads=self._num_heads,
             scale=float(self._head_dim**-0.5),
         )
-        attn_output = op.Transpose(op.Squeeze(attn_output, [0]), perm=[1, 0, 2])
-        attn_output = op.Reshape(attn_output, op.Concat(seq_len, [-1], axis=0))
+        attn_output = op.Squeeze(attn_output, [0])
         return self.out_proj(op, attn_output)
 
 
@@ -125,17 +121,18 @@ class Qwen25OmniAudioEncoderLayer(nn.Module):
 
     def forward(
         self,
-        op: builder.OpBuilder,
+        op: OpBuilder,
         hidden_states: ir.Value,
         cu_seqlens: ir.Value,
     ):
         """Pre-norm encoder layer with bidirectional attention.
 
         Args:
-            hidden_states: (batch, seq_len, d_model)
+            hidden_states: (total_tokens, d_model)
+            cu_seqlens: Cumulative lengths of the independent audio chunks.
 
         Returns:
-            hidden_states: (batch, seq_len, d_model)
+            hidden_states: (total_tokens, d_model)
         """
         # Self-attention with pre-norm and residual
         residual = hidden_states

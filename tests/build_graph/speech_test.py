@@ -35,7 +35,6 @@ from mobius._configs import (
     CodePredictorConfig,
     SpeakerEncoderConfig,
     TTSConfig,
-    VisionConfig,
 )
 from mobius._registry import registry
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
@@ -50,46 +49,22 @@ class TestBuildGraphQwen25Omni:
     """Verify the Qwen2.5-Omni Thinker four-model split."""
 
     def _omni_config(self):
-        return _base_config(
-            model_type="qwen2_5_omni_text",
-            attn_qkv_bias=True,
-            hidden_act="silu",
-            mrope_section=[4, 2, 2],
-            audio=AudioConfig(
-                d_model=64,
-                encoder_layers=2,
-                encoder_attention_heads=4,
-                encoder_ffn_dim=128,
-                num_mel_bins=32,
-                max_source_positions=128,
-                output_dim=64,
-                audio_token_id=100,
-                n_window=8,
-            ),
-            vision=VisionConfig(
-                hidden_size=64,
-                intermediate_size=128,
-                num_hidden_layers=2,
-                num_attention_heads=4,
-                patch_size=14,
-                temporal_patch_size=2,
-                in_channels=3,
-                out_hidden_size=64,
-                spatial_merge_size=2,
-                fullatt_block_indexes=[0],
-                window_size=112,
-                image_token_id=101,
-                video_token_id=102,
-            ),
-            image_token_id=101,
-            video_token_id=102,
+        overrides = next(
+            overrides
+            for model_type, overrides, _ in SPEECH_CONFIGS
+            if model_type == "qwen2_5_omni"
         )
+        return _base_config(**overrides)
 
-    def test_package_builds_four_models(self):
+    @pytest.mark.parametrize(
+        "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+    )
+    def test_package_builds_four_models(self, dtype):
         from mobius.models import Qwen25OmniThinkerForConditionalGeneration
         from mobius.tasks import Qwen25OmniTask
 
         config = self._omni_config()
+        config.dtype = dtype
         module = Qwen25OmniThinkerForConditionalGeneration(config)
         package = build_from_module(module, config, task=Qwen25OmniTask())
 
@@ -104,6 +79,7 @@ class TestBuildGraphQwen25Omni:
             "chunk_lengths",
             "pool_indices",
         }
+        assert package["audio_encoder"].graph.inputs[0].dtype == dtype
         assert {value.name for value in package["embedding"].graph.inputs} == {
             "input_ids",
             "audio_features",
@@ -111,8 +87,20 @@ class TestBuildGraphQwen25Omni:
             "video_features",
         }
 
+    @pytest.mark.parametrize("missing", ["audio", "vision"])
+    def test_missing_encoder_rejected(self, missing):
+        from mobius.models import Qwen25OmniThinkerForConditionalGeneration
+        from mobius.tasks import Qwen25OmniTask
+
+        config = self._omni_config()
+        setattr(config, missing, None)
+        module = Qwen25OmniThinkerForConditionalGeneration(config)
+        with pytest.raises(ValueError, match=f"non-None {missing}_encoder"):
+            Qwen25OmniTask().build(module, config)
+
 
 _SPEECH_TASK_KEYS: dict[str, set[str]] = {
+    "qwen25-omni": {"audio_encoder", "vision_encoder", "embedding", "decoder"},
     "speech-to-text": {"encoder", "decoder"},
     "speech-language": {"audio_encoder", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},

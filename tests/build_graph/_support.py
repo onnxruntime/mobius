@@ -248,7 +248,6 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "fun_asr",
     "mms",
     "qwen3_asr",
-    "qwen2_5_omni",
     "qwen3_forced_aligner",
     "qwen3_tts",
     "qwen3_tts_tokenizer_12hz",

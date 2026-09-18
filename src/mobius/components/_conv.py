@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 

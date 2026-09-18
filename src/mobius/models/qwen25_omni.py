@@ -23,23 +23,21 @@ from onnxscript import OpBuilder, nn
 from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
+    DecoderLayer,
+    Embedding,
     GatedMLP,
+    LayerNorm,
+    Linear,
     Qwen25OmniAudioEncoderLayer,
     Qwen25VLPatchMerger,
     Qwen25VLVisionAttention,
     Qwen25VLVisionBlock,
     Qwen25VLVisionModel,
-)
-from mobius.components._common import (
-    Embedding,
-    LayerNorm,
-    Linear,
+    RMSNorm,
     create_attention_bias,
+    initialize_rope,
 )
 from mobius.components._conv import Conv1d
-from mobius.components._decoder import DecoderLayer
-from mobius.components._rms_norm import RMSNorm
-from mobius.components._rotary_embedding import initialize_rope
 
 
 def _sinusoidal_position_embedding(max_positions: int, d_model: int) -> np.ndarray:
@@ -112,7 +110,7 @@ class Qwen25OmniAudioEncoder(nn.Module):
         )
 
         # Post-encoder normalization
-        self.ln_post = LayerNorm(d_model)
+        self.ln_post = LayerNorm(d_model, eps=1e-5)
 
         # Output projection: d_model -> output_dim
         self.proj = Linear(d_model, output_dim)
@@ -431,7 +429,7 @@ class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
 
     - ``decoder``: Qwen2.5 text decoder taking ``inputs_embeds``
     - ``vision_encoder``: Qwen2.5-VL ViT (pixel_values + grid_thw → image features)
-    - ``audio_tower``: 2x Conv1d + transformer audio tower (mel → audio features)
+    - ``audio_encoder``: 2x Conv1d + transformer audio tower (mel → audio features)
     - ``embedding``: word embedding + multimodal feature fusion
 
     HuggingFace class: ``Qwen2_5OmniForConditionalGeneration`` (Thinker only —

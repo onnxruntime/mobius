@@ -39,6 +39,9 @@ class Qwen25OmniTask(QwenVLTask):
 
     def build(self, module: nn.Module, config: ArchitectureConfig) -> ModelPackage:
         self._validate_components(module)
+        for name in ("audio_encoder", "vision_encoder"):
+            if getattr(module, name) is None:
+                raise ValueError(f"Qwen25OmniTask requires a non-None {name}.")
         models = {
             "audio_encoder": self._build_audio(module.audio_encoder, config),
             "vision_encoder": self._build_vision(module.vision_encoder, config),
@@ -57,7 +60,7 @@ class Qwen25OmniTask(QwenVLTask):
         graph, builder = _make_graph(name="audio_encoder")
         input_features = builder.input(
             "input_features",
-            dtype=ir.DataType.FLOAT,
+            dtype=config.dtype,
             shape=[num_chunks, n_mels, chunk_len],
         )
         chunk_lengths = builder.input(
