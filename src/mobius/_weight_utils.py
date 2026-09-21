@@ -14,8 +14,10 @@ model-specific to generalize here and remain inline.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
+import re
 from collections.abc import Collection, Sequence
 
 import torch
@@ -157,6 +159,138 @@ def supported_qmoe_quantization(
     if block_size < 16 or (block_size & (block_size - 1)) != 0:
         return None
     return quantization
+
+
+@dataclasses.dataclass(frozen=True)
+class QMoEQuantizationLayout:
+    """Projection-specific integer-affine layout for native ``QMoE``."""
+
+    fallback: QuantizationConfig
+    fc1: QuantizationConfig
+    fc2: QuantizationConfig
+
+    @property
+    def is_mixed_width(self) -> bool:
+        return self.fc1.bits != self.fc2.bits
+
+
+def _resolve_qmoe_module(
+    quantization: QuantizationConfig,
+    source_module_names: tuple[str, ...],
+) -> QuantizationConfig | None:
+    """Resolve Olive's QMoE override semantics for authoritative source names."""
+
+    def _matches_exclusion(pattern: str, module_name: str) -> bool:
+        if pattern.startswith("re:"):
+            return re.fullmatch(pattern[3:], module_name) is not None
+        return bool(pattern) and pattern in module_name
+
+    if any(
+        _matches_exclusion(pattern, module_name)
+        for pattern in quantization.modules_to_not_convert
+        for module_name in source_module_names
+    ):
+        return None
+    for pattern, override in quantization.overrides.items():
+        if pattern.startswith("re:"):
+            matches = any(
+                re.fullmatch(pattern[3:], module_name) is not None
+                for module_name in source_module_names
+            )
+        else:
+            matches = pattern in source_module_names
+        if matches:
+            return override.apply(quantization)
+    return quantization
+
+
+def resolve_qmoe_quantization(
+    quantization: QuantizationConfig | None,
+    source_moe_paths: tuple[str, ...],
+) -> QMoEQuantizationLayout | None:
+    """Resolve and validate FC1/FC2 layouts for one native QMoE layer.
+
+    Legacy uniform INT4 layouts retain the existing predicate and behavior.
+    The first mixed layout is intentionally narrower: Olive integer-affine
+    FC1 INT2 plus FC2 INT4, with a common QMoE block size and the model-wide
+    INT4 layout as the fallback for non-expert projections.
+    """
+    if quantization is None:
+        return None
+    if not source_moe_paths:
+        uniform = supported_qmoe_quantization(quantization)
+        return (
+            QMoEQuantizationLayout(uniform, uniform, uniform) if uniform is not None else None
+        )
+
+    fc1 = _resolve_qmoe_module(
+        quantization,
+        tuple(f"{path}.experts.gate_up_proj" for path in source_moe_paths),
+    )
+    fc2 = _resolve_qmoe_module(
+        quantization,
+        tuple(f"{path}.experts.down_proj" for path in source_moe_paths),
+    )
+    if fc1 is None and fc2 is None:
+        return None
+    if fc1 is None or fc2 is None:
+        raise ValueError(
+            "Native QMoE requires both routed expert projections to be quantized; "
+            f"resolved FC1={fc1 is not None}, FC2={fc2 is not None} "
+            f"for {source_moe_paths!r}."
+        )
+
+    fallback = supported_qmoe_quantization(quantization)
+    fc1_uniform = supported_qmoe_quantization(fc1)
+    fc2_uniform = supported_qmoe_quantization(fc2)
+    if fc1_uniform is not None and fc2_uniform is not None:
+        if fallback is None:
+            return None
+        if (
+            fc1.group_size != fc2.group_size
+            or fc1.sym != fc2.sym
+            or fc1.float_zero_point != fc2.float_zero_point
+        ):
+            raise ValueError(
+                "Native QMoE uniform INT4 projections must share one layout; "
+                f"FC1=(group_size={fc1.group_size}, sym={fc1.sym}), "
+                f"FC2=(group_size={fc2.group_size}, sym={fc2.sym})."
+            )
+        return QMoEQuantizationLayout(fallback, fc1, fc2)
+
+    requested_mixed = (
+        fc1.bits != fc2.bits or fc1.group_size != fc2.group_size or fc1.sym != fc2.sym
+    )
+    if not requested_mixed:
+        return None
+    layouts = (fc1, fc2)
+    if any(
+        layout.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
+        or layout.float_zero_point
+        or layout.quant_method != "olive"
+        for layout in layouts
+    ):
+        raise ValueError(
+            "Mixed native QMoE requires Olive integer-affine weights with packed "
+            "uint8 zero points."
+        )
+    if fallback is None or (fc1.bits, fc2.bits) != (2, 4):
+        raise ValueError(
+            "Unsupported mixed native QMoE expert widths: expected model-wide "
+            f"INT4 with FC1 INT2 and FC2 INT4, got fallback={quantization.bits}, "
+            f"FC1={fc1.bits}, FC2={fc2.bits}."
+        )
+    if fc1.group_size != fc2.group_size:
+        raise ValueError(
+            "Mixed native QMoE requires one common FC1/FC2 group_size, got "
+            f"{fc1.group_size} and {fc2.group_size}."
+        )
+    block_size = fc1.group_size
+    if block_size < 16 or (block_size & (block_size - 1)) != 0:
+        raise ValueError(
+            f"Mixed native QMoE requires a power-of-two group_size >= 16, got {block_size}."
+        )
+    return QMoEQuantizationLayout(fallback, fc1, fc2)
 
 
 def merge_lora_weights(
@@ -850,10 +984,204 @@ def pack_qmoe_expert_weights(
             if source in key:
                 key = key.replace(source, target)
                 if flatten_blocks:
-                    value = value.flatten(-2)
+                    # Older packers retain separate packed block and byte axes.
+                    # Current fused Olive tensors are already rank 3 and must
+                    # not have their logical output and packed-K axes merged.
+                    if value.ndim >= 4:
+                        value = value.flatten(-2)
                 break
         packed[key] = value
     return packed
+
+
+def _mixed_olive_qmoe_roots(
+    quantization: QuantizationConfig,
+    *,
+    expected_moe_paths: tuple[str, ...],
+    source_moe_paths: tuple[str, ...],
+) -> dict[str, QMoEQuantizationLayout]:
+    if len(expected_moe_paths) != len(source_moe_paths):
+        raise ValueError(
+            "QMoE canonical checkpoint roots and source module paths must align "
+            f"one-to-one, got {len(expected_moe_paths)} and {len(source_moe_paths)}."
+        )
+    source_by_root = dict(zip(expected_moe_paths, source_moe_paths))
+    layouts = {
+        root: resolve_qmoe_quantization(quantization, (source_path,))
+        for root, source_path in source_by_root.items()
+    }
+    return {
+        root: layout
+        for root, layout in layouts.items()
+        if layout is not None and layout.is_mixed_width
+    }
+
+
+def _preprocess_mixed_olive_qmoe_weights(
+    state_dict: dict[str, torch.Tensor],
+    quantization: QuantizationConfig,
+    layouts: dict[str, QMoEQuantizationLayout],
+    *,
+    qmoe_target_path: str,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    tie_embeddings: bool,
+    embed_key: str,
+    head_key: str,
+) -> dict[str, torch.Tensor]:
+    """Validate and bind fused K-last Olive sidecars for mixed-width QMoE."""
+    expert_keys = {
+        key
+        for key in state_dict
+        if qmoe_target_path in key and ".experts." in key and is_packed_quant_key(key)
+    }
+    expected_roots = set(layouts)
+    unknown = next(
+        (
+            key
+            for key in expert_keys
+            if not any(key.startswith(f"{root}.experts.") for root in expected_roots)
+        ),
+        None,
+    )
+    if unknown is not None:
+        raise ValueError(
+            "Mixed native QMoE only supports fused Olive K-last expert sidecars; "
+            f"cannot map {unknown!r}."
+        )
+
+    renamed_experts: dict[str, torch.Tensor] = {}
+    accepted_keys: set[str] = set()
+    for root, layout in layouts.items():
+        for projection, projection_layout in (
+            ("gate_up_proj", layout.fc1),
+            ("down_proj", layout.fc2),
+        ):
+            stem = f"{root}.experts.{projection}"
+            accepted_keys.update((f"{stem}_qweight", f"{stem}_scales"))
+            if not projection_layout.sym:
+                accepted_keys.add(f"{stem}_qzeros")
+    stale = expert_keys - accepted_keys
+    if stale:
+        raise ValueError(
+            "Mixed native QMoE found an unknown or stale packed expert sidecar "
+            f"under a recognized root: {min(stale)!r}."
+        )
+
+    for root, layout in layouts.items():
+        block_size = layout.fc1.group_size
+        if hidden_size % block_size or intermediate_size % block_size:
+            raise ValueError(
+                f"Mixed QMoE dimensions for {root!r} must be divisible by "
+                f"group_size={block_size}: hidden_size={hidden_size}, "
+                f"intermediate_size={intermediate_size}."
+            )
+        projections = {
+            "gate_up_proj": (
+                layout.fc1,
+                (num_experts, 2 * intermediate_size),
+                hidden_size,
+                "fc1",
+            ),
+            "down_proj": (
+                layout.fc2,
+                (num_experts, hidden_size),
+                intermediate_size,
+                "fc2",
+            ),
+        }
+        for projection, (
+            projection_layout,
+            leading_shape,
+            logical_k,
+            label,
+        ) in projections.items():
+            stem = f"{root}.experts.{projection}"
+            required = {
+                "qweight": f"{stem}_qweight",
+                "scales": f"{stem}_scales",
+            }
+            if not projection_layout.sym:
+                required["qzeros"] = f"{stem}_qzeros"
+            missing = [name for name, key in required.items() if key not in state_dict]
+            if missing:
+                raise ValueError(
+                    f"Mixed QMoE {label.upper()} sidecars for {root!r} are incomplete; "
+                    f"missing {missing!r}."
+                )
+            unexpected_qzeros = projection_layout.sym and f"{stem}_qzeros" in state_dict
+            if unexpected_qzeros:
+                raise ValueError(
+                    f"Mixed QMoE {label.upper()} is symmetric but checkpoint contains "
+                    f"{stem + '_qzeros'!r}."
+                )
+
+            qweight = state_dict[required["qweight"]]
+            scales = state_dict[required["scales"]]
+            qzeros = state_dict[required["qzeros"]] if "qzeros" in required else None
+            expected_weight = (
+                *leading_shape,
+                logical_k * projection_layout.bits // 8,
+            )
+            expected_scales = (*leading_shape, logical_k // block_size)
+            expected_zeros = (
+                *leading_shape,
+                math.ceil((logical_k // block_size) * projection_layout.bits / 8),
+            )
+            tensors = (
+                ("qweight", qweight, expected_weight),
+                ("scales", scales, expected_scales),
+                *((("qzeros", qzeros, expected_zeros),) if qzeros is not None else ()),
+            )
+            for name, tensor, expected_shape in tensors:
+                assert tensor is not None
+                if tensor.ndim != 3:
+                    raise ValueError(
+                        f"Mixed QMoE {label.upper()} {name} for {root!r} must be "
+                        f"rank 3, got rank {tensor.ndim}."
+                    )
+                if tuple(tensor.shape) != expected_shape:
+                    raise ValueError(
+                        f"Mixed QMoE {label.upper()} {name} shape for {root!r} must "
+                        f"be {expected_shape}, got {tuple(tensor.shape)}."
+                    )
+            if qweight.dtype != torch.uint8:
+                raise ValueError(
+                    f"Mixed QMoE {label.upper()} qweight must be uint8, got {qweight.dtype}."
+                )
+            if scales.dtype not in {
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            }:
+                raise ValueError(
+                    f"Mixed QMoE {label.upper()} scales must be float16, bfloat16, "
+                    f"or float32, got {scales.dtype}."
+                )
+            if qzeros is not None and qzeros.dtype != torch.uint8:
+                raise ValueError(
+                    f"Mixed QMoE {label.upper()} qzeros must be uint8, got {qzeros.dtype}."
+                )
+
+            renamed_experts[f"{stem}.weight"] = qweight.contiguous()
+            renamed_experts[f"{stem}.scales"] = scales
+            if qzeros is not None:
+                renamed_experts[f"{stem}.zero_points"] = qzeros.contiguous()
+
+    ordinary = {key: value for key, value in state_dict.items() if key not in expert_keys}
+    result = preprocess_olive_weights(
+        ordinary,
+        bits=quantization.bits,
+        group_size=quantization.group_size,
+        quantize_embeddings=quantization.quantize_embeddings,
+        quantize_lm_head=quantization.quantize_lm_head,
+        tie_word_embeddings=tie_embeddings or quantization.tie_word_embeddings,
+        embed_key=embed_key,
+        head_key=head_key,
+    )
+    result.update(renamed_experts)
+    return pack_qmoe_expert_weights(result, target_moe_path=qmoe_target_path)
 
 
 def preprocess_gptq_weights(
@@ -1157,6 +1485,11 @@ def preprocess_quantized_weights(
     head_key: str = "lm_head.weight",
     qmoe_target_path: str | None = None,
     qmoe_quant_methods: Collection[str] = ("gptq", "awq", "olive"),
+    qmoe_num_experts: int | None = None,
+    qmoe_hidden_size: int | None = None,
+    qmoe_intermediate_size: int | None = None,
+    qmoe_expected_moe_paths: tuple[str, ...] = (),
+    qmoe_source_moe_paths: tuple[str, ...] = (),
     reject_quantized_embeddings_lm_head: bool = False,
     defer_non_expert_sidecars: bool = False,
 ) -> dict[str, torch.Tensor]:
@@ -1173,6 +1506,13 @@ def preprocess_quantized_weights(
             ``None`` means this model does not support or require QMoE handling.
         qmoe_quant_methods: Quantization methods supported by this caller when
             the config matches the native QMoE ABI.
+        qmoe_num_experts: Expected routed expert count for mixed layouts.
+        qmoe_hidden_size: Expected logical FC1 input dimension.
+        qmoe_intermediate_size: Expected logical FC2 input dimension.
+        qmoe_expected_moe_paths: Canonical target paths for every routed layer.
+            When any mixed expert sidecar is present, every path is required.
+        qmoe_source_moe_paths: Authoritative Hugging Face module paths aligned
+            with ``qmoe_expected_moe_paths`` for override resolution.
         reject_quantized_embeddings_lm_head: Reject packed embedding/head
             weights because the caller's graph requires float parameters.
         defer_non_expert_sidecars: Keep ordinary packed sidecars raw for the
@@ -1187,11 +1527,21 @@ def preprocess_quantized_weights(
     :func:`preprocess_olive_weights` must handle quantized embedding/head tying
     internally before optional QMoE packing.
     """
-    use_qmoe = (
+    uniform_qmoe = (
         supported_qmoe_quantization(quantization) is not None
         if qmoe_target_path is not None
         else False
     )
+    mixed_layouts = (
+        _mixed_olive_qmoe_roots(
+            quantization,
+            expected_moe_paths=qmoe_expected_moe_paths,
+            source_moe_paths=qmoe_source_moe_paths or qmoe_expected_moe_paths,
+        )
+        if qmoe_target_path is not None and quantization is not None
+        else {}
+    )
+    use_qmoe = uniform_qmoe or bool(mixed_layouts)
     if (
         use_qmoe
         and quantization is not None
@@ -1289,6 +1639,35 @@ def preprocess_quantized_weights(
             state_dict, bits=quantization.bits, group_size=quantization.group_size
         )
     elif quantization is not None and quantization.quant_method == "olive":
+        if mixed_layouts:
+            assert qmoe_target_path is not None
+            geometry = (
+                qmoe_num_experts,
+                qmoe_hidden_size,
+                qmoe_intermediate_size,
+            )
+            if any(value is None for value in geometry):
+                raise ValueError(
+                    "Mixed QMoE preprocessing requires num_experts, hidden_size, "
+                    "and intermediate_size for strict sidecar validation."
+                )
+            assert qmoe_num_experts is not None
+            assert qmoe_hidden_size is not None
+            assert qmoe_intermediate_size is not None
+            return_state_dict = _preprocess_mixed_olive_qmoe_weights(
+                state_dict,
+                quantization,
+                mixed_layouts,
+                qmoe_target_path=qmoe_target_path,
+                num_experts=qmoe_num_experts,
+                hidden_size=qmoe_hidden_size,
+                intermediate_size=qmoe_intermediate_size,
+                tie_embeddings=tie_embeddings,
+                embed_key=embed_key,
+                head_key=head_key,
+            )
+            return_state_dict.update(deferred)
+            return return_state_dict
         olive_tie = tie_embeddings or quantization.tie_word_embeddings
         return_state_dict = preprocess_olive_weights(
             state_dict,

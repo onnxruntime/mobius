@@ -437,6 +437,25 @@ preprocessor can still pack QMoE expert banks and tie floating-point tables.
 A per-component `WeightBundle` adapter is a future migration target, not the
 currently implemented interface.
 
+Native QMoE additionally has a projection-specific adapter for Olive fused
+K-last routed experts. The initial mixed layout is deliberately narrow:
+model-wide INT4, FC1 `gate_up_proj` overridden to INT2, FC2 `down_proj`
+remaining INT4, and one common power-of-two group size of at least 16. Exact
+and `re:` module overrides are resolved against the original Hugging Face
+paths before FC1 and FC2 buffers are validated independently. The adapter
+requires every routed layer and validates rank, dtype, expert count, packed
+byte width, scale geometry, and optional zero-point geometry before binding.
+Qwen3.5-VL keeps the decoder's full module plan
+(``preserve_module_plan=True``) while constructing the split package: expert
+overrides are resolved against authoritative ``model.language_model`` source
+paths, while validation and binding use the decoder-prefixed checkpoint roots
+created by the VL weight router.
+It emits QMoE's FC-specific bit attributes (including FC3=FC1 for fused
+SwiGLU). Uniform INT4 omits those attributes and retains the legacy payload
+path. Mixed-width execution remains an ONNX Runtime `NOT_IMPLEMENTED`
+boundary; Mobius tests this serialized graph contract without claiming
+runtime numerical support.
+
 Appropriate model-specific operations include:
 
 - HuggingFace-to-ONNX name alignment;

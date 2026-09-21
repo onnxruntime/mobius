@@ -100,8 +100,9 @@ class QuantizationConfig:
     # Full HuggingFace module paths (including descendants) or ``re:``-prefixed
     # full-match regexes that remain floating point inside this component.
     modules_to_not_convert: tuple[str, ...] = ()
-    # The same path/regex matching rules apply to per-module overrides.
-    # Insertion order is significant: the first matching override wins.
+    # Generic component collapse treats a plain path as a subtree. Producer-
+    # specific adapters may apply stricter matching (Olive uses literal
+    # equality); insertion order remains significant in either case.
     overrides: dict[str, QuantizationOverride] = dataclasses.field(default_factory=dict)
     # Keep this field last: QuantizationConfig has historically supported
     # positional construction, so inserting a field earlier would silently

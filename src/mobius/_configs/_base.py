@@ -651,6 +651,8 @@ class ArchitectureConfig(BaseModelConfig):
     num_experts_per_tok: int | None = None
     moe_intermediate_size: int | None = None
     shared_expert_intermediate_size: int | None = None
+    # Internal HF path aliases used to resolve routed-expert module overrides.
+    qmoe_source_paths: tuple[str, ...] = ()
     norm_topk_prob: bool = True
     # When True, the decoder layer uses post-norm style (FlexOLMo): norms are applied
     # to sub-layer outputs instead of inputs, with an extra post_feedforward_layernorm.

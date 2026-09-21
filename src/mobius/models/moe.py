@@ -38,6 +38,17 @@ from mobius.models.deepseek import DeepSeekMoEGate
 from mobius.models.phi3 import split_fused_qkv
 
 
+def _config_for_qmoe_layer(
+    config: ArchitectureConfig,
+    layer_idx: int,
+) -> ArchitectureConfig:
+    """Copy config with the canonical HF source path for one routed MoE layer."""
+    return dataclasses.replace(
+        config,
+        qmoe_source_paths=(f"model.layers.{layer_idx}.mlp",),
+    )
+
+
 def _quantized_linear_class(config: ArchitectureConfig) -> type | None:
     """Return a QuantizedLinear factory when the checkpoint is quantized.
 
@@ -93,6 +104,17 @@ def _preprocess_moe_weights(model: CausalLMModel, state_dict) -> dict:
         tie_embeddings=model.config.tie_word_embeddings,
         qmoe_target_path=".mlp",
         qmoe_quant_methods=("gptq", "awq", "olive"),
+        qmoe_num_experts=model.config.num_local_experts,
+        qmoe_hidden_size=model.config.hidden_size,
+        qmoe_intermediate_size=model.config.moe_intermediate_size,
+        qmoe_expected_moe_paths=tuple(
+            f"model.layers.{layer_idx}.mlp"
+            for layer_idx in range(model.config.num_hidden_layers)
+        ),
+        qmoe_source_moe_paths=tuple(
+            f"model.layers.{layer_idx}.mlp"
+            for layer_idx in range(model.config.num_hidden_layers)
+        ),
         defer_non_expert_sidecars=(
             model.config.component_quantization is not None
             or (quantization is not None and quantization.has_module_plan)
@@ -251,8 +273,12 @@ class MoETextModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                _layer_class(config, gate=_make_gate(), norm_class=norm_class)
-                for _ in range(config.num_hidden_layers)
+                _layer_class(
+                    _config_for_qmoe_layer(config, layer_idx),
+                    gate=_make_gate(),
+                    norm_class=norm_class,
+                )
+                for layer_idx in range(config.num_hidden_layers)
             ]
         )
         self.norm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
