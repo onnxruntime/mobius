@@ -24,6 +24,7 @@ Usage::
 from __future__ import annotations
 
 import contextvars
+import dataclasses
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -32,17 +33,51 @@ import onnx_ir as ir
 from mobius._execution_providers import EpCapabilities
 
 __all__ = [
+    "BuildContract",
     "build_context",
     "ep_capabilities",
+    "get_build_contract",
     "get_build_dtype",
     "is_prefill_prefix_pruning_enabled",
     "prefill_prefix_pruning",
 ]
 
+
+@dataclasses.dataclass(frozen=True)
+class BuildContract:
+    """Target-specific structural requirements that do not select graph rewrites."""
+
+    target_execution_provider: str = "default"
+    target_device: str | None = None
+    max_buffer_size: int | None = None
+    layered_per_layer_inputs: bool = False
+    supports_range: bool = True
+
+    @classmethod
+    def from_capabilities(
+        cls,
+        capabilities: EpCapabilities,
+        *,
+        target_device: str | None = None,
+    ) -> BuildContract:
+        """Create a structural build contract from an EP capability descriptor."""
+        return cls(
+            target_execution_provider=capabilities.name,
+            target_device=target_device,
+            max_buffer_size=capabilities.max_buffer_size,
+            layered_per_layer_inputs=capabilities.layered_per_layer_inputs,
+            supports_range=capabilities.supports_range,
+        )
+
+
 _DEFAULT_CAPABILITIES = EpCapabilities(name="default")
+_DEFAULT_BUILD_CONTRACT = BuildContract()
 
 _current_ep: contextvars.ContextVar[EpCapabilities] = contextvars.ContextVar(
     "mobius_ep_capabilities", default=_DEFAULT_CAPABILITIES
+)
+_current_build_contract: contextvars.ContextVar[BuildContract] = contextvars.ContextVar(
+    "mobius_build_contract", default=_DEFAULT_BUILD_CONTRACT
 )
 _current_dtype: contextvars.ContextVar[ir.DataType] = contextvars.ContextVar(
     "mobius_build_dtype", default=ir.DataType.FLOAT
@@ -56,6 +91,8 @@ _prune_prefill_prefix: contextvars.ContextVar[bool] = contextvars.ContextVar(
 def build_context(
     capabilities: EpCapabilities,
     dtype: ir.DataType = ir.DataType.FLOAT,
+    *,
+    contract: BuildContract | None = None,
 ) -> Iterator[None]:
     """Activate EP capabilities for the duration of graph construction.
 
@@ -66,6 +103,8 @@ def build_context(
         capabilities: EP capability descriptor to activate. Typically obtained
             via ``ep_registry.require(execution_provider)``.
         dtype: Active build dtype. Defaults to ``ir.DataType.FLOAT``.
+        contract: Structural target requirements. When omitted, derives them
+            from ``capabilities`` to preserve existing EP-aware builds.
 
     Example::
 
@@ -76,12 +115,15 @@ def build_context(
         with build_context(capabilities, ir.DataType.FLOAT16):
             pkg = task.build(module, config)
     """
+    contract = contract or BuildContract.from_capabilities(capabilities)
     capabilities_token = _current_ep.set(capabilities)
+    contract_token = _current_build_contract.set(contract)
     dtype_token = _current_dtype.set(dtype)
     try:
         yield
     finally:
         _current_ep.reset(capabilities_token)
+        _current_build_contract.reset(contract_token)
         _current_dtype.reset(dtype_token)
 
 
@@ -102,6 +144,11 @@ def ep_capabilities() -> EpCapabilities:
             ...
     """
     return _current_ep.get()
+
+
+def get_build_contract() -> BuildContract:
+    """Return the active target-specific structural build contract."""
+    return _current_build_contract.get()
 
 
 def get_build_dtype() -> ir.DataType:

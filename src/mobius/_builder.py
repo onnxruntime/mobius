@@ -24,7 +24,7 @@ import torch
 from onnx_ir import tensor_adapters
 from onnxscript import nn
 
-from mobius._build_context import build_context
+from mobius._build_context import BuildContract, build_context
 from mobius._component_manifest import ComponentManifest
 from mobius._component_quantization import configure_component_quantization
 from mobius._configs import BaseModelConfig
@@ -134,6 +134,8 @@ def build_from_module(
     task: str | ModelTask = "text-generation",
     *,
     execution_provider: str = "default",
+    target_execution_provider: str | None = None,
+    target_device: str | None = None,
     trace_optimization: bool = False,
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
@@ -148,7 +150,10 @@ def build_from_module(
         config: Architecture configuration. Its ``dtype`` controls model
             precision and its ``validate`` method runs before build.
         task: Task name or :class:`ModelTask` instance.
-        execution_provider: Target for EP-aware optimizations.
+        execution_provider: Target for graph optimizations.
+        target_execution_provider: Optional target whose structural build
+            contract is applied independently of graph optimizations.
+        target_device: Optional target device recorded in the build contract.
         trace_optimization: Log optimization diagnostics when true.
         fp8_kv_cache: Store supported decoder KV caches as FLOAT8E4M3FN.
         kv_cache_scales: Optional per-layer FP8 key/value scales.
@@ -172,7 +177,12 @@ def build_from_module(
     )
     _cast_module_dtype(module, dtype)
     capabilities = ep_registry.require(execution_provider)
-    with build_context(capabilities, dtype):
+    target_capabilities = ep_registry.require(target_execution_provider or execution_provider)
+    contract = BuildContract.from_capabilities(
+        target_capabilities,
+        target_device=target_device,
+    )
+    with build_context(capabilities, dtype, contract=contract):
         package = resolved_task.build(module, config)
 
     for name, model in package.items():

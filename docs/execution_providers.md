@@ -44,6 +44,25 @@ pkg = build_from_module(
 )
 ```
 
+Graph optimization and structural target requirements can be selected
+independently. This is useful when a consumer needs strict ONNX operators but
+also requires an EP-specific model interface:
+
+```python
+pkg = mobius.build(
+    "google/gemma-4-E2B-it",
+    execution_provider="onnx-standard",
+    target_execution_provider="openvino",
+    target_device="npu",
+)
+```
+
+This example keeps the OpenVINO-required rank-4 Gemma4 `per_layer_inputs`
+contract while the graph optimizer still produces strict ONNX with no
+non-standard-domain nodes. `target_execution_provider` controls only structural
+requirements such as component interfaces, static range materialization, and
+buffer-size limits; it does not enable EP fusion or lowering rules.
+
 ---
 
 ## Supported Execution Providers

@@ -350,10 +350,20 @@ class TestGemma4EmbeddingModel:
 
 class TestGemma4PerLayerInputLayout:
     @pytest.mark.parametrize(
-        ("execution_provider", "expected_rank"),
-        [("default", 3), ("onnx-standard", 3), ("openvino", 4)],
+        ("execution_provider", "target_execution_provider", "expected_rank"),
+        [
+            ("default", None, 3),
+            ("onnx-standard", None, 3),
+            ("openvino", None, 4),
+            ("onnx-standard", "openvino", 4),
+        ],
     )
-    def test_layout_matches_execution_provider(self, execution_provider, expected_rank):
+    def test_layout_matches_execution_provider(
+        self,
+        execution_provider,
+        target_execution_provider,
+        expected_rank,
+    ):
         from mobius._builder import build_from_module
         from mobius.tasks._gemma4 import Gemma4Task
 
@@ -368,6 +378,7 @@ class TestGemma4PerLayerInputLayout:
             config,
             task=Gemma4Task(),
             execution_provider=execution_provider,
+            target_execution_provider=target_execution_provider,
         )
         decoder_input = next(
             value
@@ -382,6 +393,14 @@ class TestGemma4PerLayerInputLayout:
 
         assert len(decoder_input.shape) == expected_rank
         assert len(embedding_output.shape) == expected_rank
+        if execution_provider == "onnx-standard":
+            non_standard_nodes = [
+                (node.domain, node.op_type)
+                for model in package.values()
+                for node in model.graph.all_nodes()
+                if node.domain not in ("", "ai.onnx")
+            ]
+            assert not non_standard_nodes
         if expected_rank == 4:
             assert list(decoder_input.shape[-2:]) == [
                 config.num_hidden_layers,

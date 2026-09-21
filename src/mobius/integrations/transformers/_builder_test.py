@@ -1086,6 +1086,7 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     package = ModelPackage({"model": model}, config=config)
     stream = mock.Mock()
     built_configs = []
+    built_kwargs = []
 
     monkeypatch.setattr(
         transformers_builder,
@@ -1106,6 +1107,7 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
 
     def fake_build_from_module(_module, built_config, *args, **kwargs):
         built_configs.append(built_config)
+        built_kwargs.append(kwargs)
         return package
 
     monkeypatch.setattr(
@@ -1117,7 +1119,13 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     download = mock.Mock(side_effect=AssertionError("must not eagerly download"))
     monkeypatch.setattr(transformers_builder, "_download_weights", download)
 
-    result = transformers_builder.build_transformers_model("fake/model", revision="immutable")
+    result = transformers_builder.build_transformers_model(
+        "fake/model",
+        revision="immutable",
+        execution_provider="onnx-standard",
+        target_execution_provider="openvino",
+        target_device="npu",
+    )
 
     assert result is package
     download.assert_not_called()
@@ -1125,6 +1133,9 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     assert stream.call_args.kwargs["revision"] == "immutable"
     assert stream.call_args.kwargs["keep_quantized"] is True
     assert built_configs[0].dtype == ir.DataType.FLOAT16
+    assert built_kwargs[0]["execution_provider"] == "onnx-standard"
+    assert built_kwargs[0]["target_execution_provider"] == "openvino"
+    assert built_kwargs[0]["target_device"] == "npu"
 
 
 def test_transformers_build_can_explicitly_dequantize_compressed_tensors(

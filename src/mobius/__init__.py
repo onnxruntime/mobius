@@ -19,6 +19,7 @@ __all__ = [
     "AdapterWeights",
     "AudioConfig",
     "BaseModelConfig",
+    "BuildContract",
     "CausalLMConfig",
     "CausalLMTask",
     "ComponentInfo",
@@ -69,6 +70,7 @@ __all__ = [
     "load_peft_adapter",
     "generation",
     "get_build_dtype",
+    "get_build_contract",
     "get_ep",
     "inspect_components",
     "models",
@@ -82,7 +84,13 @@ __all__ = [
 __version__ = "0.1.0"
 
 from mobius import components, generation, models, tasks
-from mobius._build_context import build_context, ep_capabilities, get_build_dtype
+from mobius._build_context import (
+    BuildContract,
+    build_context,
+    ep_capabilities,
+    get_build_contract,
+    get_build_dtype,
+)
 from mobius._builder import build_from_module
 from mobius._configs import (
     ArchitectureConfig,

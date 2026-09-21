@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Independent target build contracts
+
+#### Added
+
+- `build()` and `build_from_module()` may apply structural requirements from
+  `target_execution_provider` and `target_device` independently of graph
+  optimization. A strict `onnx-standard` export can therefore retain
+  OpenVINO's rank-4 Gemma4 `per_layer_inputs` interface without introducing
+  non-standard operators.
+
 ### GPT-OSS MXFP4 export
 
 #### Added

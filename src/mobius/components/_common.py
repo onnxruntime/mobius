@@ -7,6 +7,8 @@ import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import get_build_contract
+
 # Used as Slice "end" to mean "all remaining elements along this axis".
 INT64_MAX = 9223372036854775807
 
@@ -343,9 +345,7 @@ def create_static_cache_attention_bias(
     # emit a precomputed Constant — max_seq_len is always a concrete int in
     # static-cache mode — and derive q_offsets via Slice, which both Constant
     # and Slice run on HTP without CPU fallback.
-    from mobius._build_context import ep_capabilities
-
-    if ep_capabilities().supports_range:
+    if get_build_contract().supports_range:
         zero_scalar = op.Constant(value_int=0)
         one_scalar = op.Constant(value_int=1)
         kv_slots = op.Range(
