@@ -1266,8 +1266,8 @@ def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
         default="default",
         metavar="EP",
         help=(
-            "Target execution provider for EP-aware optimizations "
-            "(default: 'default' → portable ONNX, no vendor fusions). "
+            "Target execution provider for structural build requirements and runtime metadata. "
+            "Mobius does not apply EP graph rewrites during export. "
             "Use 'mobius list eps' to see available EPs. "
             "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
         ),

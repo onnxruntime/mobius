@@ -335,6 +335,7 @@ class TestMatMulNBitsEpGating:
 
         from mobius._builder import build_from_module
         from mobius._configs import CausalLMConfig, QuantizationConfig
+        from mobius._optimizations import optimize_model
         from mobius._registry import registry
         from mobius.integrations.transformers._config_resolver import (
             _default_task_for_model,
@@ -366,6 +367,7 @@ class TestMatMulNBitsEpGating:
         model = build_from_module(
             module, cfg, task=_default_task_for_model("qwen2"), execution_provider=ep
         )["model"]
+        optimize_model(model, ep=ep, dtype=cfg.dtype, model_role="decoder")
         for node in model.graph.all_nodes():
             if node.op_type in {"BitwiseAnd", "BitShift"}:
                 assert all(value is not None for value in node.inputs)

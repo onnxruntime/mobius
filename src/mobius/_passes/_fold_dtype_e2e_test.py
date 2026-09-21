@@ -60,7 +60,7 @@ import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
-from mobius._optimizations import fold_initializers_after_weights
+from mobius._optimizations import fold_initializers_after_weights, optimize_model
 from mobius._registry import registry
 from mobius.integrations._weight_loading import apply_weights
 
@@ -101,11 +101,13 @@ def _build_fp16_decoder(config: ArchitectureConfig) -> ir.Model:
     graph is constructed — no GPU or onnxruntime execution is required. The fold
     passes have not run yet (they run when weights are loaded).
     """
-    return build_from_module(
+    model = build_from_module(
         registry.get("llama")(config),
         config,
         execution_provider="cuda",
     )["model"]
+    optimize_model(model, ep="cuda", dtype=config.dtype, model_role="decoder")
+    return model
 
 
 def _fp16_weight_tensors(model: ir.Model) -> dict[str, torch.Tensor]:

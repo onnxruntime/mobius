@@ -10,7 +10,7 @@ import onnx_ir as ir
 
 from mobius import build_from_module
 from mobius._configs import Lfm2Config, Lfm2MoeConfig
-from mobius._optimizations import SymbolicShapeInferencePass
+from mobius._optimizations import SymbolicShapeInferencePass, optimize_model
 from mobius._registry import registry
 from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 
@@ -95,6 +95,7 @@ def test_cuda_graph_uses_lfm2_fusions():
         task="hybrid-text-generation",
         execution_provider="cuda",
     )["model"]
+    optimize_model(model, ep="cuda", dtype=config.dtype, model_role="decoder")
 
     counts = Counter((node.domain or "", node.op_type) for node in model.graph)
     assert counts["", "Swish"] == 2

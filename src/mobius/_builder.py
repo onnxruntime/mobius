@@ -31,7 +31,8 @@ from mobius._configs import BaseModelConfig
 from mobius._execution_providers import ep_registry
 from mobius._flags import flags
 from mobius._model_package import ModelPackage
-from mobius._optimizations import optimize_model
+from mobius._optimizations import SymbolicShapeInferencePass
+from mobius.functions import register_function_bodies
 from mobius.tasks import ModelTask, get_task
 
 logger = logging.getLogger(__name__)
@@ -113,29 +114,13 @@ def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTas
     )
 
 
-# Map ModelPackage entry names to semantic model roles. GQA fusion is only
-# applied to decoder-role models.
-_MODEL_ROLE_MAP: dict[str, str] = {
-    "model": "decoder",
-    "decoder": "decoder",
-    "vision_encoder": "vision",
-    "embedding": "embedding",
-    "encoder": "encoder",
-    "audio_encoder": "encoder",
-    "vision": "vision",
-    "audio": "encoder",
-    "speech": "encoder",
-}
-
-
 def build_from_module(
     module: nn.Module,
     config: BaseModelConfig,
     task: str | ModelTask = "text-generation",
     *,
     execution_provider: str = "default",
-    target_execution_provider: str | None = None,
-    target_device: str | None = None,
+    device: str | None = None,
     trace_optimization: bool = False,
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
@@ -150,13 +135,12 @@ def build_from_module(
         config: Architecture configuration. Its ``dtype`` controls model
             precision and its ``validate`` method runs before build.
         task: Task name or :class:`ModelTask` instance.
-        execution_provider: Target for graph optimizations.
-        target_execution_provider: Optional target whose structural build
-            contract is applied independently of graph optimizations.
-        target_device: Optional target device recorded in the build contract.
-        trace_optimization: Log optimization diagnostics when true.
-        fp8_kv_cache: Store supported decoder KV caches as FLOAT8E4M3FN.
-        kv_cache_scales: Optional per-layer FP8 key/value scales.
+        execution_provider: Target whose structural build contract is applied.
+            Mobius does not apply graph rewrites based on this value.
+        device: Optional target device recorded in the build contract.
+        trace_optimization: Deprecated. Mobius export does not run graph rewrites.
+        fp8_kv_cache: Deprecated. Apply FP8 KV-cache rewrites downstream.
+        kv_cache_scales: Deprecated. Apply FP8 KV-cache rewrites downstream.
         prune_prefill_prefix: Retain only the final sequence position before
             the LM head for supported causal generation tasks.
 
@@ -165,42 +149,34 @@ def build_from_module(
     """
     if hasattr(config, "validate"):
         config.validate()
+    if trace_optimization or fp8_kv_cache or kv_cache_scales is not None:
+        raise ValueError(
+            "Mobius export no longer applies graph rewrites. Apply execution-provider "
+            "optimizations downstream (for example, with Olive)."
+        )
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)
     resolved_task = get_task(task)
-    component_manifest = configure_component_quantization(
+    configure_component_quantization(
         module,
         config,
         resolved_task,
         manifest=component_manifest,
     )
     _cast_module_dtype(module, dtype)
-    capabilities = ep_registry.require(execution_provider)
-    target_capabilities = ep_registry.require(target_execution_provider or execution_provider)
+    capabilities = ep_registry.require("default")
+    target_capabilities = ep_registry.require(execution_provider)
     contract = BuildContract.from_capabilities(
         target_capabilities,
-        target_device=target_device,
+        target_device=device,
     )
     with build_context(capabilities, dtype, contract=contract):
         package = resolved_task.build(module, config)
 
-    for name, model in package.items():
-        descriptor = component_manifest.get(name)
-        role = (
-            descriptor.role if descriptor is not None else _MODEL_ROLE_MAP.get(name, "decoder")
-        )
-        optimize_model(
-            model,
-            ep=execution_provider,
-            dtype=dtype,
-            model_role=role,
-            trace=trace_optimization,
-            fp8_kv_cache=fp8_kv_cache,
-            kv_cache_scales=kv_cache_scales,
-        )
-
-    _maybe_apply_opset_lowering(package, execution_provider)
+    for model in package.values():
+        register_function_bodies(model)
+        SymbolicShapeInferencePass()(model)
     return package
 
 

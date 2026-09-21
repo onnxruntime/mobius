@@ -18,6 +18,7 @@ from onnx_ir.passes.common import InlinePass
 
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
+from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius.functions import register_function_bodies
 from mobius.functions.skip_layer_normalization import (
@@ -102,6 +103,7 @@ class TestSkipSimplifiedInline:
         """
         config = _tiny_config()
         model = build_from_module(registry.get("qwen2")(config), config)["model"]
+        optimize_model(model, ep="default", dtype=config.dtype, model_role="decoder")
 
         fused = _count(model, "SkipSimplifiedLayerNormalization")
         assert fused > 0, "expected the build pipeline to fuse Add+RMSNorm"

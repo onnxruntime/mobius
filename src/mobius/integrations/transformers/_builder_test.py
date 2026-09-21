@@ -1122,9 +1122,8 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     result = transformers_builder.build_transformers_model(
         "fake/model",
         revision="immutable",
-        execution_provider="onnx-standard",
-        target_execution_provider="openvino",
-        target_device="npu",
+        execution_provider="openvino",
+        device="npu",
     )
 
     assert result is package
@@ -1133,9 +1132,8 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     assert stream.call_args.kwargs["revision"] == "immutable"
     assert stream.call_args.kwargs["keep_quantized"] is True
     assert built_configs[0].dtype == ir.DataType.FLOAT16
-    assert built_kwargs[0]["execution_provider"] == "onnx-standard"
-    assert built_kwargs[0]["target_execution_provider"] == "openvino"
-    assert built_kwargs[0]["target_device"] == "npu"
+    assert built_kwargs[0]["execution_provider"] == "openvino"
+    assert built_kwargs[0]["device"] == "npu"
 
 
 def test_transformers_build_can_explicitly_dequantize_compressed_tensors(

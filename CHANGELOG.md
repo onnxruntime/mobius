@@ -11,11 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Added
 
-- `build()` and `build_from_module()` may apply structural requirements from
-  `target_execution_provider` and `target_device` independently of graph
-  optimization. A strict `onnx-standard` export can therefore retain
-  OpenVINO's rank-4 Gemma4 `per_layer_inputs` interface without introducing
-  non-standard operators.
+- `build()` and `build_from_module()` now preserve a canonical graph without
+  automatically applying fusion, lowering, or cleanup rewrites. Their
+  `execution_provider` and `device` arguments select only structural build
+  requirements, allowing OpenVINO's rank-4 Gemma4 `per_layer_inputs` interface
+  while downstream tooling such as Olive chooses the graph representation.
 
 ### GPT-OSS MXFP4 export
 

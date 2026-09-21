@@ -13,6 +13,7 @@ from _test_configs import _base_config
 
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig, MMSConfig
+from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
 
@@ -857,6 +858,7 @@ class TestBuildMoshiLM:
             task=MoshiTemporalTask(),
             execution_provider="cuda",
         )
+        optimize_model(pkg["model"], ep="cuda", dtype=config.dtype, model_role="decoder")
         gqa_nodes = [n for n in pkg["model"].graph if n.op_type == "GroupQueryAttention"]
         assert len(gqa_nodes) == config.num_hidden_layers
         for node in gqa_nodes:

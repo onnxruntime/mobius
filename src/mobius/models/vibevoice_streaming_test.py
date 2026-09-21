@@ -22,6 +22,7 @@ from mobius._configs import (
     VibeVoiceStreamingDiffusionConfig,
     VibeVoiceStreamingTokenizerConfig,
 )
+from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.vibevoice_streaming import (
@@ -335,6 +336,12 @@ def test_vibevoice_streaming_cuda_fp16_uses_standard_gqa() -> None:
 
     for name in ("lm_backbone", "tts_backbone"):
         graph = package[name].graph
+        optimize_model(
+            package[name],
+            ep="cuda",
+            dtype=config.dtype,
+            model_role="decoder",
+        )
         assert any(node.op_type == "GroupQueryAttention" for node in graph)
         assert all(node.op_type != "Attention" for node in graph)
         assert "mobius.attention.requires_arbitrary_mask" not in graph.metadata_props

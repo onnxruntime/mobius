@@ -365,6 +365,7 @@ class TestDecomposeAttentionEpGating:
 
         from mobius._builder import build_from_module
         from mobius._configs import Gemma4Config, QuantizationConfig
+        from mobius._optimizations import optimize_model
         from mobius._registry import registry
         from mobius.integrations.transformers._config_resolver import (
             _default_task_for_model,
@@ -400,6 +401,7 @@ class TestDecomposeAttentionEpGating:
         model = build_from_module(
             module, cfg, task=_default_task_for_model("gemma4_text"), execution_provider=ep
         )["model"]
+        optimize_model(model, ep=ep, dtype=dtype, model_role="decoder")
         return Counter(n.op_type for n in model.graph)
 
     def test_cpu_keeps_fused_attention(self):

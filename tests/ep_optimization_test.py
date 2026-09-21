@@ -34,7 +34,9 @@ def _make_llama_pkg(ep: str, dtype: ir.DataType = ir.DataType.FLOAT):
     config = _base_config(dtype=dtype)
     module_cls = registry.get("llama")
     module = module_cls(config)
-    return build_from_module(module, config, execution_provider=ep)
+    package = build_from_module(module, config, execution_provider=ep)
+    optimize_model(package["model"], ep=ep, dtype=dtype, model_role="decoder")
+    return package
 
 
 def _make_qwen2_pkg(ep: str, dtype: ir.DataType = ir.DataType.FLOAT):
@@ -42,7 +44,9 @@ def _make_qwen2_pkg(ep: str, dtype: ir.DataType = ir.DataType.FLOAT):
     config = _base_config(dtype=dtype)
     module_cls = registry.get("qwen2")
     module = module_cls(config)
-    return build_from_module(module, config, execution_provider=ep)
+    package = build_from_module(module, config, execution_provider=ep)
+    optimize_model(package["model"], ep=ep, dtype=dtype, model_role="decoder")
+    return package
 
 
 def _make_qwen2_biased_pkg(ep: str, dtype: ir.DataType = ir.DataType.FLOAT):
@@ -50,7 +54,9 @@ def _make_qwen2_biased_pkg(ep: str, dtype: ir.DataType = ir.DataType.FLOAT):
     config = _base_config(dtype=dtype, attn_qkv_bias=True)
     module_cls = registry.get("qwen2")
     module = module_cls(config)
-    return build_from_module(module, config, execution_provider=ep)
+    package = build_from_module(module, config, execution_provider=ep)
+    optimize_model(package["model"], ep=ep, dtype=dtype, model_role="decoder")
+    return package
 
 
 def _check_op_constraint(
@@ -129,6 +135,7 @@ def test_ep_no_gqa_for_vision_encoder():
     # Vision encoder uses encoder-style attention — the GQA rewrite pattern
     # does not match. Verify no GQA was produced.
     model = pkg["model"]
+    optimize_model(model, ep="cuda", dtype=ir.DataType.FLOAT16, model_role="encoder")
     gqa_count = _count_ops(model, "GroupQueryAttention")
     assert gqa_count == 0, (
         f"Vision encoder should not have GQA fusion but found {gqa_count} GQA nodes"
@@ -168,6 +175,21 @@ def test_default_ep_produces_portable_onnx():
     assert _count_ops(model, "GroupQueryAttention") == 0
     # Llama uses RMSNorm; SkipLayerNorm fusion won't match
     assert _count_ops(model, "SkipLayerNormalization") == 0
+
+
+@pytest.mark.parametrize("target_ep", ["cpu", "cuda", "dml", "webgpu", "trt-rtx"])
+def test_build_target_ep_does_not_apply_automatic_rewrites(target_ep):
+    config = _base_config(dtype=ir.DataType.FLOAT16)
+    module_cls = registry.get("llama")
+    package = build_from_module(
+        module_cls(config),
+        config,
+        execution_provider=target_ep,
+    )
+    model = package["model"]
+
+    assert _count_ops(model, "GroupQueryAttention") == 0
+    assert _count_ops(model, "Attention") > 0
 
 
 def test_cuda_float16_has_gqa_llama():
@@ -238,8 +260,9 @@ def test_trace_optimization_produces_output(caplog):
     module_cls = registry.get("llama")
     module = module_cls(config)
 
+    model = build_from_module(module, config, execution_provider="cpu")["model"]
     with caplog.at_level(logging.INFO, logger="mobius._optimizations"):
-        build_from_module(module, config, execution_provider="cpu", trace_optimization=True)
+        optimize_model(model, ep="cpu", dtype=ir.DataType.FLOAT, trace=True)
 
     messages = [r.message for r in caplog.records]
 
@@ -269,8 +292,9 @@ def test_trace_optimization_no_matches_shows_zero(caplog):
     module_cls = registry.get("llama")
     module = module_cls(config)
 
+    model = build_from_module(module, config, execution_provider="cpu")["model"]
     with caplog.at_level(logging.INFO, logger="mobius._optimizations"):
-        build_from_module(module, config, execution_provider="cpu", trace_optimization=True)
+        optimize_model(model, ep="cpu", dtype=ir.DataType.FLOAT16, trace=True)
 
     messages = [r.message for r in caplog.records]
     # CPU+FLOAT16 has no GQA fusion in the support matrix, so GQAFusion should
@@ -296,12 +320,13 @@ def test_trace_optimization_is_noop_without_flag():
         def emit(self, record: _logging.LogRecord) -> None:
             captured.append(record.getMessage())
 
+    model = build_from_module(module, config, execution_provider="cpu")["model"]
     builder_logger = _logging.getLogger("mobius._optimizations")
     handler = _Capture()
     handler.setLevel(_logging.INFO)
     builder_logger.addHandler(handler)
     try:
-        build_from_module(module, config, execution_provider="cpu", trace_optimization=False)
+        optimize_model(model, ep="cpu", dtype=ir.DataType.FLOAT, trace=False)
     finally:
         builder_logger.removeHandler(handler)
 

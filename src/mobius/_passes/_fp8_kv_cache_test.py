@@ -30,6 +30,7 @@ sys.path.insert(0, "tests")
 from _test_configs import _base_config
 
 from mobius import build_from_module
+from mobius._optimizations import optimize_model
 from mobius._passes._fp8_kv_cache import (
     Fp8KvCachePass,
     _retype_fp8,
@@ -71,10 +72,17 @@ def _build_fp8_decoder(fp8_kv_cache=True, kv_cache_scales=None):
         config,
         "text-generation",
         execution_provider="cuda",
+    )
+    model = pkg["model"]
+    optimize_model(
+        model,
+        ep="cuda",
+        dtype=config.dtype,
+        model_role="decoder",
         fp8_kv_cache=fp8_kv_cache,
         kv_cache_scales=kv_cache_scales,
     )
-    return pkg["model"], config
+    return model, config
 
 
 class TestFp8KvCacheGraph:
@@ -149,14 +157,15 @@ class TestFp8KvCacheGraph:
         config = _base_config(dtype=ir.DataType.FLOAT)
         module = registry.get("qwen2")(config)
         with pytest.warns(UserWarning, match="fp8_kv_cache=True"):
-            pkg = build_from_module(
-                module,
-                config,
-                "text-generation",
-                execution_provider="default",
+            model = build_from_module(module, config, "text-generation")["model"]
+            optimize_model(
+                model,
+                ep="default",
+                dtype=config.dtype,
+                model_role="decoder",
                 fp8_kv_cache=True,
             )
-        ins = {v.name: v for v in pkg["model"].graph.inputs}
+        ins = {v.name: v for v in model.graph.inputs}
         assert ins["past_key_values.0.key"].dtype == ir.DataType.FLOAT
 
     def test_ignored_and_warns_on_non_fp8_ep_with_gqa(self):
@@ -169,14 +178,15 @@ class TestFp8KvCacheGraph:
         config = _base_config(dtype=ir.DataType.FLOAT)
         module = registry.get("qwen2")(config)
         with pytest.warns(UserWarning, match="fp8_kv_cache=True"):
-            pkg = build_from_module(
-                module,
-                config,
-                "text-generation",
-                execution_provider="cpu",
+            model = build_from_module(module, config, "text-generation")["model"]
+            optimize_model(
+                model,
+                ep="cpu",
+                dtype=config.dtype,
+                model_role="decoder",
                 fp8_kv_cache=True,
             )
-        ins = {v.name: v for v in pkg["model"].graph.inputs}
+        ins = {v.name: v for v in model.graph.inputs}
         assert ins["past_key_values.0.key"].dtype == ir.DataType.FLOAT
 
     def test_pass_is_idempotent(self):

@@ -1,10 +1,11 @@
-# Execution Provider (EP) Aware Building
+# Execution Provider (EP) Graph Profiles
 
-Mobius can generate ONNX graphs optimized for a specific runtime **execution
-provider** (EP). The default output is portable ONNX that runs on any
-conformant runtime. Passing `execution_provider` to `build()` or
-`build_from_module()` activates EP-specific fusions and lowering passes that
-make the graph faster — or correct — for that target.
+Mobius exports a canonical ONNX graph and does not automatically apply
+execution-provider fusions or lowerings. Passing `execution_provider` to
+`build()` or `build_from_module()` selects only structural requirements such
+as component interfaces, static range materialization, and buffer limits.
+Downstream tooling such as Olive decides which custom functions to retain,
+which to expand to strict ONNX, and which EP-specific rewrites to apply.
 
 ---
 
@@ -13,19 +14,14 @@ make the graph faster — or correct — for that target.
 ```python
 import mobius
 
-# Default: portable ONNX — runs on any conformant runtime
+# Default: canonical graph with function-backed custom operators preserved
 pkg = mobius.build("Qwen/Qwen2.5-7B")
 
-# CUDA-optimized: GQA fusion, SkipLayerNorm
-pkg = mobius.build("Qwen/Qwen2.5-7B", execution_provider="cuda")
-
-# With trace output: see exactly what each rule changed
-import logging
-logging.basicConfig(level=logging.INFO)
+# OpenVINO build contract without automatic graph rewrites
 pkg = mobius.build(
-    "Qwen/Qwen2.5-7B",
-    execution_provider="cuda",
-    trace_optimization=True,
+    "google/gemma-4-E2B-it",
+    execution_provider="openvino",
+    device="npu",
 )
 ```
 
@@ -40,7 +36,6 @@ pkg = build_from_module(
     CausalLMModel(config),
     config,
     execution_provider="cuda",
-    trace_optimization=True,
 )
 ```
 
@@ -51,23 +46,22 @@ also requires an EP-specific model interface:
 ```python
 pkg = mobius.build(
     "google/gemma-4-E2B-it",
-    execution_provider="onnx-standard",
-    target_execution_provider="openvino",
-    target_device="npu",
+    execution_provider="openvino",
+    device="npu",
 )
 ```
 
 This example keeps the OpenVINO-required rank-4 Gemma4 `per_layer_inputs`
-contract while the graph optimizer still produces strict ONNX with no
-non-standard-domain nodes. `target_execution_provider` controls only structural
-requirements such as component interfaces, static range materialization, and
-buffer-size limits; it does not enable EP fusion or lowering rules.
+contract while Mobius still produces strict ONNX with no non-standard-domain
+nodes. `execution_provider` and `device` control only structural requirements
+such as component interfaces, static range materialization, and buffer-size
+limits; they do not enable EP fusion or lowering rules.
 
 ---
 
 ## Supported Execution Providers
 
-| EP name | Pass to `execution_provider=` | Description |
+| EP name | Pass to `optimize_model(ep=...)` | Rewrite profile |
 |---|---|---|
 | **default** | `"default"` (built-in default) | Portable ONNX. All custom ops with function bodies are kept as-is — function bodies are the executable fallback. No vendor-specific fusions. |
 | **CPU** | `"cpu"` | ORT CPU EP. GQA fusion for FP32. INT4 accuracy level 4. |
@@ -229,24 +223,21 @@ GQA fusion only applies to decoder-role models. Vision encoders use standard
 
 ---
 
-## The Default EP: Portable ONNX
+## Canonical Mobius Export
 
-When `execution_provider` is omitted (or set to `"default"`), mobius produces
-**portable ONNX**:
+Mobius export preserves the graph produced by its model/task definitions:
 
 - Standard ops (`Attention`, `LayerNormalization`, etc.) are emitted as-is.
 - Custom ops with ONNX function bodies (`LinearAttention`, `FusedMatMul`,
   `SkipLayerNormalization`, etc.) are emitted with their function bodies intact.
   Any conformant runtime can expand the body if it does not recognise the
   custom op.
-- Standard fusions (SkipNorm, FusedMatMul, Gelu) are applied — they produce
-  `com.microsoft` ops that are portable thanks to their ONNX function bodies.
-- No EP-specific fused ops are emitted (`GroupQueryAttention`, PackQKV are
-  not applied).
-- Only cleanup, standard fusion, and constant folding run (Stages 1, 2, and 4).
+- No automatic fusion, lowering, cleanup, or constant-folding rewrite pipeline
+  runs during export.
+- Target-only fused ops such as `GroupQueryAttention` are not introduced.
 
-This means the default output is the broadest possible ONNX — maximum
-compatibility, minimum performance assumptions.
+Olive can subsequently preserve supported custom ops, inline all model-local
+functions for strict ONNX, or apply an EP rewrite profile.
 
 ---
 
@@ -500,7 +491,7 @@ but not ORT custom ops. The distinction matters for cross-framework export:
 a `"default"` model can be loaded by any ONNX-conformant runtime (TFLite,
 CoreML, ONNX Runtime, etc.), while a `"cpu"` model is ORT-specific.
 
-### Why is `"onnx-standard"` separate from `"default"`?
+### How do `"default"` and `"onnx-standard"` differ?
 
 Both target non-ORT runtimes, but they differ in how they handle `com.microsoft`
 custom ops:
@@ -510,16 +501,12 @@ custom ops:
   the ops are still present in the graph. Some runtimes reject models that contain
   unrecognised op domains, even with function bodies.
 
-- **`"onnx-standard"`** proactively expands all `com.microsoft` ops via
-  InlinePass at export time. The output graph contains **zero custom-domain ops**
-  — only standard ONNX opset ops. This is the safest choice for runtimes that
-  strictly refuse any non-standard domain (e.g. WASM runtimes, embedded
-  inference engines, or validation pipelines that fail on unknown domains).
+- **`"onnx-standard"`** is an explicit downstream rewrite profile that expands
+  all function-backed custom ops. Olive exposes this behavior through
+  `capture-onnx-graph --onnx_standard`.
 
-The trade-off: `"onnx-standard"` models may be larger (FusedMatMul expands to
-Transpose + MatMul) and slower (no GQA, no packed KV cache). Use `"default"`
-when the target runtime can silently expand function bodies; use
-`"onnx-standard"` when it cannot.
+The strict graph may be larger and slower. Canonical export keeps the information
+needed for downstream tooling to choose the correct target representation.
 
 ---
 
@@ -527,15 +514,13 @@ when the target runtime can silently expand function bodies; use
 
 ### The normal path: `build()` / `build_from_module()`
 
-For most users, `build()` and `build_from_module()` are the only entry points
-you need. They automatically:
+`build()` and `build_from_module()`:
 
-1. Set the build context (`build_context()`) for the duration of graph
-   construction so components can query EP capabilities.
-2. Call `optimize_model()` on every model in the package after the graph
-   is built.
+1. Apply the target's structural `BuildContract`.
+2. Construct the canonical graph.
+3. Attach standard fallback function bodies for known custom operators.
 
-You do not need to call `build_context()` or `optimize_model()` yourself.
+They do not call `optimize_model()`.
 
 ### When to call `optimize_model()` directly
 
@@ -587,38 +572,31 @@ integrating mobius into a custom build pipeline.
 
 ---
 
-## Build-Time EP Queries
+## Build-Time Target Queries
 
-During graph construction, components can query the active EP capabilities
-using the **build context API**. This lets a component branch on the target
-EP without requiring the caller to thread capability objects through every
-layer.
+During graph construction, components query the structural
+:class:`BuildContract` rather than using target EP rewrite capabilities.
 
 ### Reading the active context
 
 ```python
-from mobius import ep_capabilities, get_build_dtype
-import onnx_ir as ir
+from mobius import get_build_contract
 
 def forward(self, op, ...):
-    capabilities = ep_capabilities()
-    dtype = get_build_dtype()
+    contract = get_build_contract()
 
-    if dtype in capabilities.gqa_dtypes:
-        # Emit a GQA-specific op for this EP
-        ...
-    else:
-        # Fall back to portable ONNX
+    if contract.layered_per_layer_inputs:
+        # Preserve the target-required component interface.
         ...
 ```
 
-The context is automatically set by `build_from_module()` and `build()` for
-the duration of graph construction. No explicit passing is required.
+`build_from_module()` and `build()` activate neutral graph capabilities and
+derive the contract from `execution_provider` and `device`. They do not expose
+target rewrite capabilities to model components.
 
 ### Accessing from outside a build
 
-When called outside any active `build_context`, both functions return safe
-defaults: the `"default"` EP capabilities (no fusions) and `ir.DataType.FLOAT`.
+Outside an active context, `get_build_contract()` returns a portable default.
 
 ### Setting the context manually
 

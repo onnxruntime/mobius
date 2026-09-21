@@ -246,7 +246,7 @@ def test_transformer_graph_is_fused_and_post_weight_optimized():
     from collections import Counter
 
     from mobius import build_from_module
-    from mobius._optimizations import fold_initializers_after_weights
+    from mobius._optimizations import fold_initializers_after_weights, optimize_model
 
     config = QwenImageConfig(
         in_channels=16,
@@ -266,6 +266,7 @@ def test_transformer_graph_is_fused_and_post_weight_optimized():
         task="qwen-image-denoising",
         execution_provider="cuda",
     )["model"]
+    optimize_model(model, ep="cuda", dtype=config.dtype, model_role="encoder")
     counts = Counter(node.op_type for node in model.graph.all_nodes())
 
     # Main's fused-Swish path plus CSE shares the common timestep modulation

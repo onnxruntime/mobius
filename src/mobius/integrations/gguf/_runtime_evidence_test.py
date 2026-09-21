@@ -18,6 +18,7 @@ import pytest
 
 from mobius._builder import build_from_module
 from mobius._configs import NemotronHConfig
+from mobius._optimizations import optimize_model
 from mobius.integrations.gguf import _runtime_evidence
 from mobius.integrations.gguf._arch_registry import get_arch_spec
 from mobius.integrations.gguf._reader import _descriptor_identity
@@ -243,12 +244,14 @@ def test_nemotron_h_runtime_blocker_graph_census_matches_pinned_config() -> None
     )
     assert len(raw_graph) == evidence.pre_optimization_graph_node_count
 
-    production_graph = build_from_module(
+    production_model = build_from_module(
         NemotronHCausalLMModel(config),
         config,
         task="hybrid-text-generation",
         execution_provider="cpu",
-    )["model"].graph
+    )["model"]
+    optimize_model(production_model, ep="cpu", dtype=config.dtype, model_role="decoder")
+    production_graph = production_model.graph
     op_counts = Counter(node.op_type for node in production_graph)
 
     assert len(production_graph) == evidence.graph_node_count

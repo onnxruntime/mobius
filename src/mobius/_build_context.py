@@ -1,23 +1,23 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Build-time EP context for components.
+"""Build-time graph and structural context for components.
 
-Provides a thread-safe, async-safe mechanism for components to query
-EP capabilities during graph construction. Uses contextvars so
-concurrent builds (threads, asyncio) are fully isolated.
+Provides thread-safe, async-safe contexts for graph-construction capabilities
+and target-specific structural requirements. Public Mobius export activates
+neutral graph capabilities and derives a :class:`BuildContract` from the target
+EP/device; graph rewrites run downstream.
 
 Usage::
 
     from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 
-    # Components can read the active EP capabilities at any point:
-    capabilities = ep_capabilities()
-    if ir.DataType.FLOAT16 in capabilities.gqa_dtypes:
-        ...  # emit GQA-specific ops
+    contract = get_build_contract()
+    if contract.layered_per_layer_inputs:
+        ...  # preserve a target-required component interface
 
-    # Build orchestration wraps graph construction in a context:
-    with build_context(cuda_capabilities, ir.DataType.FLOAT16):
+    # Build orchestration keeps graph and structural policies independent:
+    with build_context(canonical_capabilities, ir.DataType.FLOAT16, contract=contract):
         pkg = task.build(module, config)
 """
 
@@ -100,8 +100,7 @@ def build_context(
     maintains its own independent context stack.
 
     Args:
-        capabilities: EP capability descriptor to activate. Typically obtained
-            via ``ep_registry.require(execution_provider)``.
+        capabilities: Graph-construction capability descriptor to activate.
         dtype: Active build dtype. Defaults to ``ir.DataType.FLOAT``.
         contract: Structural target requirements. When omitted, derives them
             from ``capabilities`` to preserve existing EP-aware builds.
@@ -139,9 +138,6 @@ def ep_capabilities() -> EpCapabilities:
         import onnx_ir as ir
 
         capabilities = ep_capabilities()
-        if ir.DataType.FLOAT16 in capabilities.gqa_dtypes:
-            # emit GQA with fp16 inputs
-            ...
     """
     return _current_ep.get()
 
