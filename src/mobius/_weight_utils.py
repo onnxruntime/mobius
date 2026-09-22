@@ -209,6 +209,7 @@ def _resolve_qmoe_module(
     def _matches_exclusion(pattern: str, module_name: str) -> bool:
         if pattern.startswith("re:"):
             return re.fullmatch(pattern[3:], module_name) is not None
+        # Olive plain exclusions use substring matching, unlike exact plain overrides.
         return bool(pattern) and pattern in module_name
 
     if any(
@@ -282,15 +283,13 @@ def resolve_qmoe_quantization(
                 "Per-layer routed expert overrides cannot enable native QMoE when "
                 "the model-wide fallback is unsupported."
             )
-        if (
-            fc1.group_size != fc2.group_size
-            or fc1.sym != fc2.sym
-            or fc1.float_zero_point != fc2.float_zero_point
-        ):
+        if fc1.group_size != fc2.group_size or fc1.float_zero_point != fc2.float_zero_point:
             raise ValueError(
-                "Native QMoE uniform INT4 projections must share one layout; "
-                f"FC1=(group_size={fc1.group_size}, sym={fc1.sym}), "
-                f"FC2=(group_size={fc2.group_size}, sym={fc2.sym})."
+                "Native QMoE uniform INT4 projections must share one block layout; "
+                f"FC1=(group_size={fc1.group_size}, "
+                f"float_zero_point={fc1.float_zero_point}), "
+                f"FC2=(group_size={fc2.group_size}, "
+                f"float_zero_point={fc2.float_zero_point})."
             )
         layout = QMoEQuantizationLayout(fallback, fc1, fc2)
         if quantization.quant_method != "olive" and layout.requires_projection_preprocessing:
@@ -1112,6 +1111,11 @@ def _preprocess_olive_qmoe_weights(
             required_keys = [f"{stem}_qweight", f"{stem}_scales"]
             if not projection_layout.sym:
                 required_keys.append(f"{stem}_qzeros")
+            elif f"{stem}_qzeros" in state_dict:
+                raise ValueError(
+                    f"QMoE {projection} is symmetric but checkpoint contains "
+                    f"{stem + '_qzeros'!r}."
+                )
             accepted_keys.update(required_keys)
             missing = [key for key in required_keys if key not in state_dict]
             if missing:
@@ -1125,7 +1129,7 @@ def _preprocess_olive_qmoe_weights(
             f"under a recognized root: {min(stale)!r}."
         )
 
-    for root, layout in projection_layouts.items():
+    for root, layout in layouts.items():
         block_size = layout.fc1.group_size
         if hidden_size % block_size or intermediate_size % block_size:
             raise ValueError(
@@ -1160,13 +1164,6 @@ def _preprocess_olive_qmoe_weights(
             }
             if not projection_layout.sym:
                 required["qzeros"] = f"{stem}_qzeros"
-            unexpected_qzeros = projection_layout.sym and f"{stem}_qzeros" in state_dict
-            if unexpected_qzeros:
-                raise ValueError(
-                    f"Mixed QMoE {label.upper()} is symmetric but checkpoint contains "
-                    f"{stem + '_qzeros'!r}."
-                )
-
             qweight = state_dict[required["qweight"]]
             scales = state_dict[required["scales"]]
             qzeros = state_dict[required["qzeros"]] if "qzeros" in required else None
@@ -1214,10 +1211,12 @@ def _preprocess_olive_qmoe_weights(
                     f"Mixed QMoE {label.upper()} qzeros must be uint8, got {qzeros.dtype}."
                 )
 
-            renamed_experts[f"{stem}.weight"] = qweight.contiguous()
-            renamed_experts[f"{stem}.scales"] = scales
-            if qzeros is not None:
-                renamed_experts[f"{stem}.zero_points"] = qzeros.contiguous()
+            if root in projection_layouts:
+                # Legacy roots are validated here but renamed by preprocess_olive_weights.
+                renamed_experts[f"{stem}.weight"] = qweight.contiguous()
+                renamed_experts[f"{stem}.scales"] = scales
+                if qzeros is not None:
+                    renamed_experts[f"{stem}.zero_points"] = qzeros.contiguous()
 
     projection_expert_keys = {
         key

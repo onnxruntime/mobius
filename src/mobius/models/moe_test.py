@@ -555,6 +555,31 @@ class TestMixedWidthQMoEExport:
                 atol=0,
             )
 
+    @pytest.mark.parametrize(
+        ("mutation", "message"),
+        [
+            ("wrong_rank", "rank 3"),
+            ("wrong_experts", "FC1 qweight shape"),
+            ("wrong_scale_dtype", "must be float16, bfloat16, or float32"),
+        ],
+    )
+    def test_malformed_legacy_layer_in_mixed_plan_fails_closed(self, mutation, message):
+        model = MoECausalLMModel(_moe_config(_mixed_quantization(), num_hidden_layers=2))
+        state = {}
+        state.update(_mixed_expert_state_dict())
+        state.update(_mixed_expert_state_dict(layer_index=1, fc1_bits=4))
+        weight = "model.layers.1.mlp.experts.gate_up_proj_qweight"
+        scales = "model.layers.1.mlp.experts.gate_up_proj_scales"
+        if mutation == "wrong_rank":
+            state[weight] = state[weight].flatten(1)
+        elif mutation == "wrong_experts":
+            state[weight] = state[weight][:-1]
+        elif mutation == "wrong_scale_dtype":
+            state[scales] = state[scales].to(torch.float64)
+
+        with pytest.raises(ValueError, match=message):
+            model.preprocess_weights(state)
+
     def test_uniform_per_layer_group_size_uses_resolved_layout(self):
         quantization = QuantizationConfig(
             bits=4,
@@ -583,6 +608,23 @@ class TestMixedWidthQMoEExport:
             rtol=0,
             atol=0,
         )
+
+    def test_uniform_int4_projections_allow_independent_symmetry(self):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method="olive",
+            sym=True,
+            overrides={f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(sym=False)},
+        )
+        model = MoECausalLMModel(_moe_config(quantization))
+        out = model.preprocess_weights(
+            _mixed_expert_state_dict(fc1_bits=4, fc1_sym=False, fc2_sym=True)
+        )
+        prefix = f"{_LAYER}mlp."
+
+        assert prefix + "fc1_experts_zero_points" in out
+        assert prefix + "fc2_experts_zero_points" not in out
 
     @pytest.mark.parametrize("dense_mode", ["unsupported_uniform", "excluded"])
     def test_per_layer_expert_plan_rejects_unbindable_dense_fallback(self, dense_mode):
@@ -658,7 +700,7 @@ class TestMixedWidthQMoEExport:
             ("wrong_rank", "rank 3"),
             ("wrong_dtype", "must be uint8"),
             ("wrong_scale_dtype", "must be float16, bfloat16, or float32"),
-            ("wrong_experts", "shape"),
+            ("wrong_experts", "FC1 qweight shape"),
             ("wrong_packed_bytes", "shape"),
             ("wrong_scale_geometry", "shape"),
         ],
@@ -694,6 +736,16 @@ class TestMixedWidthQMoEExport:
         model = MoECausalLMModel(_moe_config(_mixed_quantization()))
 
         with pytest.raises(ValueError, match="unknown or stale packed expert sidecar"):
+            model.preprocess_weights(state)
+
+    def test_symmetric_projection_rejects_zero_point_sidecar(self):
+        state = _mixed_expert_state_dict()
+        state[f"{_LAYER}mlp.experts.gate_up_proj_qzeros"] = torch.zeros(
+            _E, 2 * _INT, 1, dtype=torch.uint8
+        )
+        model = MoECausalLMModel(_moe_config(_mixed_quantization()))
+
+        with pytest.raises(ValueError, match="is symmetric but checkpoint contains"):
             model.preprocess_weights(state)
 
     def test_unknown_packed_sidecar_root_fails_closed(self):
