@@ -902,6 +902,9 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
             elif stripped.startswith("language_model.lm_head."):
                 if not self.config.tie_word_embeddings:
                     renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
+            elif stripped.startswith("lm_head."):
+                if not self.config.tie_word_embeddings:
+                    renamed[f"decoder.{stripped}"] = value
             elif stripped.startswith("language_model."):
                 # language_model.layers.* → decoder.model.layers.*
                 suffix = stripped[len("language_model.") :]

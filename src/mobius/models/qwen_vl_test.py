@@ -253,6 +253,26 @@ class TestQwen3VL3ModelCausalLMModelTiedWeights:
         head = result["decoder.lm_head.weight"]
         assert embed.data_ptr() == head.data_ptr()
 
+    def test_routes_top_level_packed_lm_head(self):
+        config = dataclasses.replace(
+            _BASE_CONFIG,
+            model_type="qwen3_vl",
+            tie_word_embeddings=False,
+        )
+        model = Qwen3VL3ModelCausalLMModel(config)
+        qweight = torch.zeros(100, 16, dtype=torch.uint8)
+        scales = torch.ones(100, 4)
+
+        result = model.preprocess_weights(
+            {
+                "lm_head.weight_qweight": qweight,
+                "lm_head.weight_scales": scales,
+            }
+        )
+
+        assert result["decoder.lm_head.weight_qweight"] is qweight
+        assert result["decoder.lm_head.weight_scales"] is scales
+
 
 class TestQwen3VLDecoderModelTiedWeights:
     """Standalone Qwen3-VL decoder."""
