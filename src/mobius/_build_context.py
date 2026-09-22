@@ -1,29 +1,30 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Build-time EP context for components.
+"""Build-time graph and structural context for components.
 
-Provides a thread-safe, async-safe mechanism for components to query
-EP capabilities during graph construction. Uses contextvars so
-concurrent builds (threads, asyncio) are fully isolated.
+Provides thread-safe, async-safe contexts for graph-construction capabilities
+and target-specific structural requirements. Public Mobius export activates
+neutral graph capabilities and derives a :class:`BuildContract` from the target
+EP/device; graph rewrites run downstream.
 
 Usage::
 
     from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 
-    # Components can read the active EP capabilities at any point:
-    capabilities = ep_capabilities()
-    if ir.DataType.FLOAT16 in capabilities.gqa_dtypes:
-        ...  # emit GQA-specific ops
+    contract = get_build_contract()
+    if contract.layered_per_layer_inputs:
+        ...  # preserve a target-required component interface
 
-    # Build orchestration wraps graph construction in a context:
-    with build_context(cuda_capabilities, ir.DataType.FLOAT16):
+    # Build orchestration keeps graph and structural policies independent:
+    with build_context(canonical_capabilities, ir.DataType.FLOAT16, contract=contract):
         pkg = task.build(module, config)
 """
 
 from __future__ import annotations
 
 import contextvars
+import dataclasses
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -32,17 +33,51 @@ import onnx_ir as ir
 from mobius._execution_providers import EpCapabilities
 
 __all__ = [
+    "BuildContract",
     "build_context",
     "ep_capabilities",
+    "get_build_contract",
     "get_build_dtype",
     "is_prefill_prefix_pruning_enabled",
     "prefill_prefix_pruning",
 ]
 
+
+@dataclasses.dataclass(frozen=True)
+class BuildContract:
+    """Target-specific structural requirements that do not select graph rewrites."""
+
+    target_execution_provider: str = "default"
+    target_device: str | None = None
+    max_buffer_size: int | None = None
+    layered_per_layer_inputs: bool = False
+    supports_range: bool = True
+
+    @classmethod
+    def from_capabilities(
+        cls,
+        capabilities: EpCapabilities,
+        *,
+        target_device: str | None = None,
+    ) -> BuildContract:
+        """Create a structural build contract from an EP capability descriptor."""
+        return cls(
+            target_execution_provider=capabilities.name,
+            target_device=target_device,
+            max_buffer_size=capabilities.max_buffer_size,
+            layered_per_layer_inputs=capabilities.layered_per_layer_inputs,
+            supports_range=capabilities.supports_range,
+        )
+
+
 _DEFAULT_CAPABILITIES = EpCapabilities(name="default")
+_DEFAULT_BUILD_CONTRACT = BuildContract()
 
 _current_ep: contextvars.ContextVar[EpCapabilities] = contextvars.ContextVar(
     "mobius_ep_capabilities", default=_DEFAULT_CAPABILITIES
+)
+_current_build_contract: contextvars.ContextVar[BuildContract] = contextvars.ContextVar(
+    "mobius_build_contract", default=_DEFAULT_BUILD_CONTRACT
 )
 _current_dtype: contextvars.ContextVar[ir.DataType] = contextvars.ContextVar(
     "mobius_build_dtype", default=ir.DataType.FLOAT
@@ -56,6 +91,8 @@ _prune_prefill_prefix: contextvars.ContextVar[bool] = contextvars.ContextVar(
 def build_context(
     capabilities: EpCapabilities,
     dtype: ir.DataType = ir.DataType.FLOAT,
+    *,
+    contract: BuildContract | None = None,
 ) -> Iterator[None]:
     """Activate EP capabilities for the duration of graph construction.
 
@@ -63,9 +100,10 @@ def build_context(
     maintains its own independent context stack.
 
     Args:
-        capabilities: EP capability descriptor to activate. Typically obtained
-            via ``ep_registry.require(execution_provider)``.
+        capabilities: Graph-construction capability descriptor to activate.
         dtype: Active build dtype. Defaults to ``ir.DataType.FLOAT``.
+        contract: Structural target requirements. When omitted, derives them
+            from ``capabilities`` to preserve existing EP-aware builds.
 
     Example::
 
@@ -76,12 +114,15 @@ def build_context(
         with build_context(capabilities, ir.DataType.FLOAT16):
             pkg = task.build(module, config)
     """
+    contract = contract or BuildContract.from_capabilities(capabilities)
     capabilities_token = _current_ep.set(capabilities)
+    contract_token = _current_build_contract.set(contract)
     dtype_token = _current_dtype.set(dtype)
     try:
         yield
     finally:
         _current_ep.reset(capabilities_token)
+        _current_build_contract.reset(contract_token)
         _current_dtype.reset(dtype_token)
 
 
@@ -97,11 +138,13 @@ def ep_capabilities() -> EpCapabilities:
         import onnx_ir as ir
 
         capabilities = ep_capabilities()
-        if ir.DataType.FLOAT16 in capabilities.gqa_dtypes:
-            # emit GQA with fp16 inputs
-            ...
     """
     return _current_ep.get()
+
+
+def get_build_contract() -> BuildContract:
+    """Return the active target-specific structural build contract."""
+    return _current_build_contract.get()
 
 
 def get_build_dtype() -> ir.DataType:

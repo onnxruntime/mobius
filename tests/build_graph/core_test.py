@@ -191,8 +191,8 @@ class TestTextDecoderBatchGreaterThanOne:
 
     @pytest.mark.parametrize("model_type", ["qwen2", "llama", "mistral", "gemma2"])
     def test_batch2_prefill_runs(self, model_type: str):
+        from mobius._testing import fill_random_weights
         from mobius._testing.ort_inference import OnnxModelSession
-        from mobius.rewrite_rules._testing_utils import fill_random_weights
 
         overrides = dict(_MODEL_CONFIGS)[model_type]
         config = _base_config(**overrides)

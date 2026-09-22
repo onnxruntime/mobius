@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Independent target build contracts
+
+#### Added
+
+- `build()` and `build_from_module()` now preserve a canonical graph without
+  automatically applying fusion, lowering, or cleanup rewrites. Their
+  `execution_provider` and `device` arguments select only structural build
+  requirements, allowing OpenVINO's rank-4 Gemma4 `per_layer_inputs` interface
+  while downstream tooling such as Olive chooses the graph representation.
+
+#### Removed
+
+- Mobius' execution-provider rewrite package, `optimize_model` orchestration,
+  CLI `--optimize` surface, and FP8 KV-cache graph pass moved to Olive graph
+  surgery. Mobius now owns canonical graph construction and structural build
+  contracts only.
+
 ### GPT-OSS MXFP4 export
 
 #### Added

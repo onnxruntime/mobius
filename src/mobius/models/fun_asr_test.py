@@ -22,9 +22,9 @@ import numpy as np
 import pytest
 
 from mobius._configs import ArchitectureConfig, AudioConfig
+from mobius._testing import fill_random_weights
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.fun_asr import FunASRForConditionalGeneration
-from mobius.rewrite_rules._testing_utils import fill_random_weights
 from mobius.tasks import FunASRSpeechLanguageTask
 
 # Add tests/ to path so we can import the shared _base_config helper

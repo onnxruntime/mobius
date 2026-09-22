@@ -11,10 +11,7 @@ import logging
 import os
 import re
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
+from typing import Any
 
 from mobius._builder import (
     DTYPE_MAP,
@@ -32,7 +29,6 @@ logger = logging.getLogger(__name__)
 # repeated `--features`) is the canonical way to toggle these build modes.
 _BUILD_FEATURES: dict[str, str] = {
     "static-cache": "static_cache",
-    "fp8-kv-cache": "fp8_kv_cache",
     "prune-prefill-prefix": "prune_prefill_prefix",
     "text-only": "text_only",
     "glm-full-attention": "glm_full_attention",
@@ -43,10 +39,7 @@ _BUILD_FEATURES: dict[str, str] = {
 def _resolve_build_features(args: argparse.Namespace) -> None:
     """Fold ``--features`` values into the boolean build-mode attributes.
 
-    ``--features`` accepts a comma-separated list and may be repeated (cargo
-    style), e.g. ``--features fp8-kv-cache,static-cache`` or
-    ``--features fp8-kv-cache --features static-cache``. Each recognised feature
-    sets its corresponding attribute (``fp8-kv-cache`` -> ``args.fp8_kv_cache``).
+    ``--features`` accepts a comma-separated list and may be repeated.
     Unknown feature names raise ``SystemExit``.
     """
     for dest in _BUILD_FEATURES.values():
@@ -74,45 +67,6 @@ def _parse_size(size_str: str) -> int:
         if size_str.endswith(suffix):
             return int(float(size_str[: -len(suffix)]) * mult)
     return int(size_str)
-
-
-def _apply_optimize(model: ir.Model, optimize: str | None) -> None:
-    """Apply rewrite rules if --optimize is specified."""
-    if not optimize:
-        return
-
-    from onnxscript.rewriter import rewrite
-
-    from mobius.rewrite_rules import (
-        bias_gelu_rules,
-        group_query_attention_rules,
-        packed_attention_rules,
-        skip_layer_norm_rules,
-        skip_norm_rules,
-    )
-
-    rule_map = {
-        "bias_gelu": bias_gelu_rules,
-        "group_query_attention": group_query_attention_rules,
-        "packed_attention": packed_attention_rules,
-        "skip_layer_norm": skip_layer_norm_rules,
-        "skip_norm": skip_norm_rules,
-    }
-
-    if optimize == "all":
-        rule_names = list(rule_map)
-    else:
-        rule_names = [r.strip() for r in optimize.split(",")]
-        for name in rule_names:
-            if name not in rule_map:
-                raise ValueError(
-                    f"Unknown rewrite rule '{name}'. Available: {sorted(rule_map)}"
-                )
-
-    for name in rule_names:
-        rules = rule_map[name]()
-        rewrite(model, pattern_rewrite_rules=rules)
-        print(f"Applied rewrite rule: {name}")
 
 
 def _cmd_build(args: argparse.Namespace) -> None:
@@ -231,20 +185,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     keep_quantized = not getattr(args, "dequantize", False)
     task: str | ModelTask | None = args.task
 
-    # FP8 KV cache: resolve the optional per-layer scale file up front so both
-    # the --config and --model build paths can pass the same scales.
-    fp8_kv_cache = getattr(args, "fp8_kv_cache", False)
     prune_prefill_prefix = getattr(args, "prune_prefill_prefix", False)
-    kv_cache_scales: dict[int, tuple[float, float]] | None = None
-    scale_file = getattr(args, "kv_cache_scale_file", None)
-    if scale_file is not None and not fp8_kv_cache:
-        raise SystemExit(
-            "Error: --kv-cache-scale-file can only be used with --features fp8-kv-cache."
-        )
-    if fp8_kv_cache and scale_file is not None:
-        from mobius._passes._fp8_kv_cache import load_kv_cache_scale_file
-
-        kv_cache_scales = load_kv_cache_scale_file(scale_file)
 
     if args.static_cache:
         # Defer task creation — we need to know the model type first.
@@ -299,7 +240,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
             revision = vibevoice_sources.weight_revision
     output_dir = args.output_dir
     dtype_override = resolve_dtype(args.dtype)
-    optimize = args.optimize
     component_filter = args.component
     execution_provider = args.execution_provider
 
@@ -335,7 +275,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 components=pipeline_components,
                 execution_provider=execution_provider,
             )
-            _save_package(pkg, output_dir, args, optimize, component_filter)
+            _save_package(pkg, output_dir, args, component_filter)
             return
 
     # Auto-detect NeMo .nemo archives (local file or HF ref like
@@ -351,7 +291,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             dtype=dtype_override,
             execution_provider=execution_provider,
         )
-        _save_package(pkg, output_dir, args, optimize, component_filter)
+        _save_package(pkg, output_dir, args, component_filter)
         return
 
     # Build from HuggingFace model ID or local config
@@ -373,8 +313,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 trust_remote_code=trust_remote_code,
                 execution_provider=execution_provider,
                 text_only=args.text_only,
-                fp8_kv_cache=fp8_kv_cache,
-                kv_cache_scales=kv_cache_scales,
                 prune_prefill_prefix=prune_prefill_prefix,
                 glm_full_attention=args.glm_full_attention,
                 export_paged_attention=export_paged_attention,
@@ -382,7 +320,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 input_sampling_rate=input_sampling_rate,
                 bwe_sampling_rate=bwe_sampling_rate,
             )
-            _save_package(pkg, output_dir, args, optimize, component_filter)
+            _save_package(pkg, output_dir, args, component_filter)
             return
 
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
@@ -403,7 +341,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 input_sampling_rate=input_sampling_rate,
                 bwe_sampling_rate=bwe_sampling_rate,
             )
-            _save_package(pkg, output_dir, args, optimize, component_filter)
+            _save_package(pkg, output_dir, args, component_filter)
             return
         if input_sampling_rate is not None or bwe_sampling_rate is not None:
             raise SystemExit(
@@ -439,8 +377,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
-            fp8_kv_cache=fp8_kv_cache,
-            kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
@@ -474,8 +410,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
             text_only=args.text_only,
-            fp8_kv_cache=fp8_kv_cache,
-            kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
@@ -484,7 +418,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             bwe_sampling_rate=bwe_sampling_rate,
         )
 
-    _save_package(pkg, output_dir, args, optimize, component_filter)
+    _save_package(pkg, output_dir, args, component_filter)
 
 
 def _runtime_asset_source(
@@ -524,21 +458,16 @@ def _runtime_source_revision(pkg, explicit_revision: str | None) -> str | None:
     return next(iter(revisions)) if len(revisions) == 1 else None
 
 
-def _save_package(
-    pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
-) -> None:
-    """Save a ModelPackage to disk, applying optimizations and runtime configs."""
+def _save_package(pkg, output_dir: str, args, component_filter: str | None) -> None:
+    """Save a ModelPackage to disk with optional runtime configuration."""
     runtime = getattr(args, "runtime", None)
 
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
         if components is not None and not components(name):
             continue
-        _apply_optimize(model, optimize)
         if args.release:
-            # Last thing before saving, so metadata that later stages read (and
-            # that rewrite rules add as they run) is still present while they
-            # need it.
+            # Last thing before saving so runtime metadata remains available.
             strip_debug_metadata(model)
 
     max_shard_size_bytes = _parse_size(args.max_shard_size) if args.max_shard_size else None
@@ -665,14 +594,15 @@ def _cmd_list(args: argparse.Namespace) -> None:
         print(f"Registered execution providers ({len(eps)}):\n")
         for ep_name in eps:
             caps = ep_registry.require(ep_name)
-            gqa = ", ".join(dt.name for dt in sorted(caps.gqa_dtypes, key=lambda d: d.name))
             extras = []
-            if not caps.supports_fused_rope:
-                extras.append("no-fused-rope")
-            if not caps.supports_skip_layer_norm:
-                extras.append("no-skip-layer-norm")
+            if caps.layered_per_layer_inputs:
+                extras.append("layered-inputs")
+            if not caps.supports_range:
+                extras.append("static-range")
+            if caps.max_buffer_size:
+                extras.append(f"max-buffer={caps.max_buffer_size}")
             flags = f"  [{', '.join(extras)}]" if extras else ""
-            print(f"  {ep_name:<12} gqa_dtypes=[{gqa}]{flags}")
+            print(f"  {ep_name:<12}{flags}")
     else:
         print(f"Unknown resource '{resource}'. Use: models, tasks, dtypes, eps")
 
@@ -1266,8 +1196,8 @@ def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
         default="default",
         metavar="EP",
         help=(
-            "Target execution provider for EP-aware optimizations "
-            "(default: 'default' → portable ONNX, no vendor fusions). "
+            "Target execution provider for structural build requirements and runtime metadata. "
+            "Mobius does not apply EP graph rewrites during export. "
             "Use 'mobius list eps' to see available EPs. "
             "Examples: default, cpu, cuda, dml, webgpu, trt-rtx."
         ),
@@ -1333,19 +1263,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build_parser.add_argument(
-        "--optimize",
-        nargs="?",
-        const="all",
-        default=None,
-        metavar="RULES",
-        help=(
-            "Apply rewrite rules after building. "
-            "Use without value for all rules, or specify comma-separated rule names "
-            "(e.g. --optimize=group_query_attention,skip_norm). "
-            "Available: group_query_attention, packed_attention, skip_norm."
-        ),
-    )
-    build_parser.add_argument(
         "--component",
         default=None,
         metavar="NAME",
@@ -1360,7 +1277,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Comma-separated list of build features to enable (cargo-style; "
             "may be repeated). Available: "
             + ", ".join(sorted(_BUILD_FEATURES))
-            + ". Example: --features fp8-kv-cache,static-cache. This is the "
+            + ". Example: --features static-cache,text-only. This is the "
             "canonical way to enable these build modes."
         ),
     )
@@ -1420,18 +1337,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Build RE-USE with NVIDIA BWE semantics: resample input audio to this "
             "target rate and use consistently scaled FFT geometry."
-        ),
-    )
-    build_parser.add_argument(
-        "--kv-cache-scale-file",
-        dest="kv_cache_scale_file",
-        default=None,
-        metavar="PATH",
-        help=(
-            "Optional JSON file of calibrated per-layer FP8 KV-cache scales "
-            "(onnxruntime-genai format: {'scales': {'k_scales': [...], "
-            "'v_scales': [...]}}). Only used with --features fp8-kv-cache; "
-            "without it all layers use a unit scale of 1.0."
         ),
     )
     build_parser.add_argument(

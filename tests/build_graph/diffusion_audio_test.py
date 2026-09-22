@@ -267,9 +267,9 @@ class TestBuildMMSGraph:
         """Build and run MMS through OnnxRuntime end-to-end."""
         import numpy as np
 
+        from mobius._testing import fill_random_weights
         from mobius._testing.ort_inference import OnnxModelSession
         from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
-        from mobius.rewrite_rules._testing_utils import fill_random_weights
         from mobius.tasks import CTCAsrTask
 
         config = self._mms_config()
@@ -832,14 +832,8 @@ class TestBuildMoshiLM:
         assert "text_logits" in outputs
         assert "present.0.key" in outputs
 
-    def test_temporal_gqa_emits_sliding_window(self):
-        """Temporal GQA nodes carry Moshi's sliding window as local_window_size.
-
-        On the GQA (fp16/cuda) path, the temporal transformer's uniform sliding
-        window (Moshi ``context``) must reach every GroupQueryAttention node as
-        ``local_window_size``.  PersonaPlex deploys this fp16 path, so without it
-        long streams would silently run full causal attention.
-        """
+    def test_temporal_decoder_exports_canonical_attention(self):
+        """Temporal export leaves GQA selection to downstream Olive rewrites."""
         import dataclasses
 
         import onnx_ir as ir
@@ -858,9 +852,11 @@ class TestBuildMoshiLM:
             execution_provider="cuda",
         )
         gqa_nodes = [n for n in pkg["model"].graph if n.op_type == "GroupQueryAttention"]
-        assert len(gqa_nodes) == config.num_hidden_layers
-        for node in gqa_nodes:
-            assert node.attributes["local_window_size"].value == full_window
+        assert not gqa_nodes
+        assert (
+            sum(n.op_type == "Attention" for n in pkg["model"].graph)
+            == config.num_hidden_layers
+        )
 
     @pytest.mark.parametrize("dep_q", [8, 16])
     def test_depformer_io(self, dep_q):

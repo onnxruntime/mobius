@@ -26,7 +26,7 @@ from typing import ClassVar
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
-from mobius._build_context import ep_capabilities, prefill_prefix_pruning
+from mobius._build_context import get_build_contract, prefill_prefix_pruning
 from mobius._configs import Gemma4Config
 from mobius._constants import (
     STATIC_CACHE_KV_SEQUENCE_LENGTH,
@@ -483,15 +483,15 @@ class Gemma4Task(ModelTask):
         # Decide whether to split the fused [V, L*D] per-layer embedding table
         # into L separate [V, D] tables.  Required when the fused table exceeds
         # the EP's max_buffer_size (e.g. WebGPU's 256 MiB limit).
-        caps = ep_capabilities()
+        contract = get_build_contract()
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         vocab_per_layer = getattr(config, "vocab_size_per_layer_input", 0)
-        if caps.max_buffer_size and per_layer_dim and vocab_per_layer:
+        if contract.max_buffer_size and per_layer_dim and vocab_per_layer:
             dtype_bytes = int(config.dtype.itemsize)
             fused_bytes = (
                 vocab_per_layer * config.num_hidden_layers * per_layer_dim * dtype_bytes
             )
-            config.split_per_layer_embedding = fused_bytes > caps.max_buffer_size
+            config.split_per_layer_embedding = fused_bytes > contract.max_buffer_size
         else:
             config.split_per_layer_embedding = False
         models: dict[str, ir.Model] = {}
@@ -569,10 +569,9 @@ class Gemma4Task(ModelTask):
         per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         if per_layer_dim and not config.split_per_layer_embedding:
-            caps = ep_capabilities()
             per_layer_shape = (
                 [batch, seq_len, config.num_hidden_layers, per_layer_dim]
-                if caps.layered_per_layer_inputs
+                if get_build_contract().layered_per_layer_inputs
                 else [batch, seq_len, config.num_hidden_layers * per_layer_dim]
             )
             per_layer_inputs_val = builder.input(

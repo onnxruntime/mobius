@@ -1086,6 +1086,7 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     package = ModelPackage({"model": model}, config=config)
     stream = mock.Mock()
     built_configs = []
+    built_kwargs = []
 
     monkeypatch.setattr(
         transformers_builder,
@@ -1106,6 +1107,7 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
 
     def fake_build_from_module(_module, built_config, *args, **kwargs):
         built_configs.append(built_config)
+        built_kwargs.append(kwargs)
         return package
 
     monkeypatch.setattr(
@@ -1117,7 +1119,12 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     download = mock.Mock(side_effect=AssertionError("must not eagerly download"))
     monkeypatch.setattr(transformers_builder, "_download_weights", download)
 
-    result = transformers_builder.build_transformers_model("fake/model", revision="immutable")
+    result = transformers_builder.build_transformers_model(
+        "fake/model",
+        revision="immutable",
+        execution_provider="openvino",
+        device="npu",
+    )
 
     assert result is package
     download.assert_not_called()
@@ -1125,6 +1132,8 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     assert stream.call_args.kwargs["revision"] == "immutable"
     assert stream.call_args.kwargs["keep_quantized"] is True
     assert built_configs[0].dtype == ir.DataType.FLOAT16
+    assert built_kwargs[0]["execution_provider"] == "openvino"
+    assert built_kwargs[0]["device"] == "npu"
 
 
 def test_transformers_build_can_explicitly_dequantize_compressed_tensors(
@@ -1217,85 +1226,6 @@ def test_transformers_build_can_explicitly_dequantize_compressed_tensors(
     )
 
     assert stream.call_args.kwargs["keep_quantized"] is False
-
-
-def test_compressed_checkpoint_fp8_kv_cache_requires_checkpoint_scales(
-    monkeypatch,
-) -> None:
-    hf_config = type("HFConfig", (), {"model_type": "qwen2"})()
-    compressed = type("Compressed", (), {"kv_cache_scheme": object()})()
-    config = make_config(
-        model_type="qwen2",
-        num_hidden_layers=2,
-        layer_types=["linear_attention", "full_attention"],
-    )
-    monkeypatch.setattr(
-        transformers_builder,
-        "_load_transformers_config",
-        lambda *args, **kwargs: (hf_config, False),
-    )
-    monkeypatch.setattr(
-        transformers_builder,
-        "_select_primary_config",
-        lambda value: (value, value, "qwen2"),
-    )
-    monkeypatch.setattr(
-        transformers_builder.CompressedTensorsConfig,
-        "from_hf_config",
-        lambda value: compressed,
-    )
-    monkeypatch.setattr(
-        transformers_builder,
-        "_resolve_module_class",
-        lambda *args, **kwargs: (_DummyModule, "text-generation", "qwen2"),
-    )
-    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
-
-    with pytest.raises(ValueError, match=r"complete per-layer.*Missing layers: \[1\]"):
-        transformers_builder.build_transformers_model(
-            "fake/model",
-            fp8_kv_cache=True,
-        )
-
-
-def test_compressed_checkpoint_fp8_kv_cache_rejects_partial_scale_map(
-    monkeypatch,
-) -> None:
-    hf_config = type("HFConfig", (), {"model_type": "qwen2"})()
-    compressed = type("Compressed", (), {"kv_cache_scheme": object()})()
-    config = make_config(
-        model_type="qwen2",
-        num_hidden_layers=3,
-        layer_types=["full_attention", "linear_attention", "full_attention"],
-    )
-    monkeypatch.setattr(
-        transformers_builder,
-        "_load_transformers_config",
-        lambda *args, **kwargs: (hf_config, False),
-    )
-    monkeypatch.setattr(
-        transformers_builder,
-        "_select_primary_config",
-        lambda value: (value, value, "qwen2"),
-    )
-    monkeypatch.setattr(
-        transformers_builder.CompressedTensorsConfig,
-        "from_hf_config",
-        lambda value: compressed,
-    )
-    monkeypatch.setattr(
-        transformers_builder,
-        "_resolve_module_class",
-        lambda *args, **kwargs: (_DummyModule, "text-generation", "qwen2"),
-    )
-    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
-
-    with pytest.raises(ValueError, match=r"Missing layers: \[2\]"):
-        transformers_builder.build_transformers_model(
-            "fake/model",
-            fp8_kv_cache=True,
-            kv_cache_scales={0: (1.0, 1.0)},
-        )
 
 
 def test_glm_full_attention_overrides_use_dsa_for_glm_moe_dsa(monkeypatch) -> None:
