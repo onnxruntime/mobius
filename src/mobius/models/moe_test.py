@@ -585,7 +585,7 @@ class TestMixedWidthQMoEExport:
         )
 
     @pytest.mark.parametrize("dense_mode", ["unsupported_uniform", "excluded"])
-    def test_packed_sidecars_fail_when_layer_resolves_to_dense(self, dense_mode):
+    def test_per_layer_expert_plan_rejects_unbindable_dense_fallback(self, dense_mode):
         if dense_mode == "unsupported_uniform":
             quantization = QuantizationConfig(
                 bits=4,
@@ -601,11 +601,8 @@ class TestMixedWidthQMoEExport:
                 _quantization(),
                 modules_to_not_convert=(f"{_LAYER}mlp.experts",),
             )
-        model = MoECausalLMModel(_moe_config(quantization))
-
-        assert model.model.layers[0].mlp.experts is not None
-        with pytest.raises(ValueError, match="resolved quantization layout"):
-            model.preprocess_weights(_mixed_expert_state_dict())
+        with pytest.raises(ValueError, match="routed expert"):
+            MoECausalLMModel(_moe_config(quantization))
 
     @pytest.mark.parametrize(
         ("fc1_sym", "fc2_sym"),
@@ -757,7 +754,7 @@ class TestMixedWidthQMoEExport:
         assert "fc2_expert_weight_bits" not in qmoe.attributes
         assert "fc3_expert_weight_bits" not in qmoe.attributes
 
-    def test_uniform_int4_experts_do_not_bypass_unsupported_global_fallback(self):
+    def test_uniform_int4_expert_override_requires_supported_global_fallback(self):
         quantization = QuantizationConfig(
             bits=2,
             group_size=_BLK,
@@ -768,10 +765,39 @@ class TestMixedWidthQMoEExport:
             },
         )
 
+        with pytest.raises(ValueError, match="model-wide fallback is unsupported"):
+            MoECausalLMModel(_moe_config(quantization))
+
+    def test_redundant_unsupported_override_keeps_dense_fallback(self):
+        quantization = QuantizationConfig(
+            bits=8,
+            group_size=_BLK,
+            quant_method="olive",
+            overrides={
+                f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=8),
+                f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=8),
+            },
+        )
+
         block = MoECausalLMModel(_moe_config(quantization)).model.layers[0].mlp
 
         assert block._qmoe_quantization is None
         assert block.experts is not None
+
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq"])
+    def test_non_olive_projection_specific_layout_fails_at_construction(self, quant_method):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method=quant_method,
+            overrides={
+                f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(group_size=32),
+                f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(group_size=32),
+            },
+        )
+
+        with pytest.raises(ValueError, match="require Olive preprocessing"):
+            MoECausalLMModel(_moe_config(quantization))
 
     def test_model_package_roundtrip_preserves_mixed_attrs_and_bytes(self, tmp_path):
         from mobius._builder import build_from_module
@@ -849,6 +875,16 @@ class TestMixedWidthQMoEExport:
         )
         config = dataclasses.replace(
             _moe_config(quantization),
+            num_hidden_layers=2,
+        )
+        model = MoECausalLMModel(config)
+
+        with pytest.raises(ValueError, match=r"model\.layers\.1\.mlp.*incomplete"):
+            model.preprocess_weights(_mixed_expert_state_dict())
+
+    def test_missing_legacy_layer_in_mixed_plan_fails_closed(self):
+        config = dataclasses.replace(
+            _moe_config(_mixed_quantization()),
             num_hidden_layers=2,
         )
         model = MoECausalLMModel(config)

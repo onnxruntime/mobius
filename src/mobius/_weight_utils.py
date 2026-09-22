@@ -175,22 +175,29 @@ class QMoEQuantizationLayout:
 
     @property
     def requires_projection_preprocessing(self) -> bool:
-        fallback_layout = (
-            self.fallback.bits,
-            self.fallback.group_size,
-            self.fallback.sym,
-            self.fallback.float_zero_point,
-        )
         return any(
-            (
-                projection.bits,
-                projection.group_size,
-                projection.sym,
-                projection.float_zero_point,
-            )
-            != fallback_layout
+            not _same_qmoe_packing_layout(projection, self.fallback)
             for projection in (self.fc1, self.fc2)
         )
+
+
+def _same_qmoe_packing_layout(
+    left: QuantizationConfig,
+    right: QuantizationConfig,
+) -> bool:
+    return (
+        left.bits,
+        left.group_size,
+        left.sym,
+        left.float_zero_point,
+        left.weight_format,
+    ) == (
+        right.bits,
+        right.group_size,
+        right.sym,
+        right.float_zero_point,
+        right.weight_format,
+    )
 
 
 def _resolve_qmoe_module(
@@ -233,6 +240,9 @@ def resolve_qmoe_quantization(
     The first mixed layout is intentionally narrower: Olive integer-affine
     FC1 INT2 plus FC2 INT4, with a common QMoE block size and the model-wide
     INT4 layout as the fallback for non-expert projections.
+
+    Explicit per-layer plans must either resolve to a bindable native layout
+    or raise; they never silently select an incompatible dense fallback.
     """
     if quantization is None:
         return None
@@ -251,7 +261,11 @@ def resolve_qmoe_quantization(
         tuple(f"{path}.experts.down_proj" for path in source_moe_paths),
     )
     if fc1 is None and fc2 is None:
-        return None
+        raise ValueError(
+            "Per-layer routed expert exclusions are not supported: the dense fallback "
+            "cannot bind fused expert tensors. Keep both expert projections quantized "
+            f"for {source_moe_paths!r}."
+        )
     if fc1 is None or fc2 is None:
         raise ValueError(
             "Native QMoE requires both routed expert projections to be quantized; "
@@ -264,7 +278,10 @@ def resolve_qmoe_quantization(
     fc2_uniform = supported_qmoe_quantization(fc2)
     if fc1_uniform is not None and fc2_uniform is not None:
         if fallback is None:
-            return None
+            raise ValueError(
+                "Per-layer routed expert overrides cannot enable native QMoE when "
+                "the model-wide fallback is unsupported."
+            )
         if (
             fc1.group_size != fc2.group_size
             or fc1.sym != fc2.sym
@@ -275,12 +292,26 @@ def resolve_qmoe_quantization(
                 f"FC1=(group_size={fc1.group_size}, sym={fc1.sym}), "
                 f"FC2=(group_size={fc2.group_size}, sym={fc2.sym})."
             )
-        return QMoEQuantizationLayout(fallback, fc1, fc2)
+        layout = QMoEQuantizationLayout(fallback, fc1, fc2)
+        if quantization.quant_method != "olive" and layout.requires_projection_preprocessing:
+            raise ValueError(
+                "Projection-specific QMoE layouts currently require Olive "
+                "preprocessing; GPTQ and AWQ only support the model-wide layout."
+            )
+        return layout
 
     requested_mixed = (
         fc1.bits != fc2.bits or fc1.group_size != fc2.group_size or fc1.sym != fc2.sym
     )
     if not requested_mixed:
+        if not (
+            _same_qmoe_packing_layout(fc1, quantization)
+            and _same_qmoe_packing_layout(fc2, quantization)
+        ):
+            raise ValueError(
+                "Unsupported per-layer routed expert override: the resolved layout "
+                "cannot bind the dense expert fallback."
+            )
         return None
     layouts = (fc1, fc2)
     if any(
@@ -1078,9 +1109,15 @@ def _preprocess_olive_qmoe_weights(
             ("down_proj", layout.fc2),
         ):
             stem = f"{root}.experts.{projection}"
-            accepted_keys.update((f"{stem}_qweight", f"{stem}_scales"))
+            required_keys = [f"{stem}_qweight", f"{stem}_scales"]
             if not projection_layout.sym:
-                accepted_keys.add(f"{stem}_qzeros")
+                required_keys.append(f"{stem}_qzeros")
+            accepted_keys.update(required_keys)
+            missing = [key for key in required_keys if key not in state_dict]
+            if missing:
+                raise ValueError(
+                    f"QMoE sidecars for {root!r} are incomplete; missing {missing!r}."
+                )
     stale = expert_keys - accepted_keys
     if stale:
         raise ValueError(
@@ -1123,12 +1160,6 @@ def _preprocess_olive_qmoe_weights(
             }
             if not projection_layout.sym:
                 required["qzeros"] = f"{stem}_qzeros"
-            missing = [name for name, key in required.items() if key not in state_dict]
-            if missing:
-                raise ValueError(
-                    f"Mixed QMoE {label.upper()} sidecars for {root!r} are incomplete; "
-                    f"missing {missing!r}."
-                )
             unexpected_qzeros = projection_layout.sym and f"{stem}_qzeros" in state_dict
             if unexpected_qzeros:
                 raise ValueError(

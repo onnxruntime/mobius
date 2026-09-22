@@ -453,6 +453,15 @@ class TestQwen35MoEQMoEExport:
         assert not block._qmoe_quantization.is_mixed_width
         assert block._qmoe_quantization.fc1.bits == 4
 
+    def test_excluded_routed_experts_fail_at_construction(self):
+        quantization = dataclasses.replace(
+            _mixed_qwen35_quantization(),
+            modules_to_not_convert=("experts.gate_up_proj", "experts.down_proj"),
+        )
+
+        with pytest.raises(ValueError, match="routed expert exclusions"):
+            Qwen35MoECausalLMModel(_moe_config(quantization))
+
     def test_moe_block_uses_qmoe_when_quantized(self):
         model = _moe_config(
             QuantizationConfig(bits=4, group_size=_BLK, quant_method="olive", sym=False)
