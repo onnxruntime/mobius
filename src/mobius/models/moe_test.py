@@ -59,9 +59,11 @@ def _quantization(*, sym: bool = True, **overrides) -> QuantizationConfig:
     )
 
 
-def _moe_config(quantization: QuantizationConfig | None) -> object:
+def _moe_config(
+    quantization: QuantizationConfig | None, *, num_hidden_layers: int = 1
+) -> object:
     return make_config(
-        num_hidden_layers=1,
+        num_hidden_layers=num_hidden_layers,
         hidden_size=_H,
         intermediate_size=64,
         moe_intermediate_size=_INT,
@@ -389,23 +391,25 @@ def _mixed_quantization(
 
 def _mixed_expert_state_dict(
     *,
+    layer_index: int = 0,
     num_experts: int = _E,
     hidden_size: int = _H,
     intermediate_size: int = _INT,
     block_size: int = _BLK,
+    fc1_bits: int = 2,
     fc1_sym: bool = True,
     fc2_sym: bool = True,
 ) -> dict[str, torch.Tensor]:
-    prefix = f"{_LAYER}mlp.experts."
+    prefix = f"model.layers.{layer_index}.mlp.experts."
     fc1_out = 2 * intermediate_size
     state = {
         prefix + "gate_up_proj_qweight": torch.arange(
-            num_experts * fc1_out * (hidden_size * 2 // 8),
+            num_experts * fc1_out * (hidden_size * fc1_bits // 8),
             dtype=torch.int64,
         )
         .remainder(256)
         .to(torch.uint8)
-        .reshape(num_experts, fc1_out, hidden_size * 2 // 8),
+        .reshape(num_experts, fc1_out, hidden_size * fc1_bits // 8),
         prefix + "gate_up_proj_scales": torch.rand(
             num_experts,
             fc1_out,
@@ -433,7 +437,7 @@ def _mixed_expert_state_dict(
             (
                 num_experts,
                 fc1_out,
-                math.ceil((hidden_size // block_size) * 2 / 8),
+                math.ceil((hidden_size // block_size) * fc1_bits / 8),
             ),
             dtype=torch.uint8,
         )
@@ -517,6 +521,91 @@ class TestMixedWidthQMoEExport:
             rtol=0,
             atol=0,
         )
+
+    @pytest.mark.parametrize("mixed_layer", [0, 1])
+    def test_mixed_and_legacy_uniform_layers_bind_with_per_layer_layouts(self, mixed_layer):
+        quantization = _mixed_quantization(
+            pattern=f"model.layers.{mixed_layer}.mlp.experts.gate_up_proj"
+        )
+        model = MoECausalLMModel(_moe_config(quantization, num_hidden_layers=2))
+        raw = {}
+        for layer_index in range(2):
+            raw.update(
+                _mixed_expert_state_dict(
+                    layer_index=layer_index,
+                    fc1_bits=2 if layer_index == mixed_layer else 4,
+                )
+            )
+
+        out = model.preprocess_weights(raw)
+
+        for layer_index in range(2):
+            source = f"model.layers.{layer_index}.mlp.experts."
+            target = f"model.layers.{layer_index}.mlp."
+            torch.testing.assert_close(
+                out[target + "fc1_experts_weights"],
+                raw[source + "gate_up_proj_qweight"],
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                out[target + "fc2_experts_weights"],
+                raw[source + "down_proj_qweight"],
+                rtol=0,
+                atol=0,
+            )
+
+    def test_uniform_per_layer_group_size_uses_resolved_layout(self):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method="olive",
+            overrides={
+                f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(group_size=32),
+                f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(group_size=32),
+            },
+        )
+        model = MoECausalLMModel(_moe_config(quantization))
+        raw = _mixed_expert_state_dict(block_size=32, fc1_bits=4)
+
+        out = model.preprocess_weights(raw)
+
+        prefix = f"{_LAYER}mlp."
+        torch.testing.assert_close(
+            out[prefix + "fc1_experts_weights"],
+            raw[f"{_LAYER}mlp.experts.gate_up_proj_qweight"],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            out[prefix + "fc2_experts_weights"],
+            raw[f"{_LAYER}mlp.experts.down_proj_qweight"],
+            rtol=0,
+            atol=0,
+        )
+
+    @pytest.mark.parametrize("dense_mode", ["unsupported_uniform", "excluded"])
+    def test_packed_sidecars_fail_when_layer_resolves_to_dense(self, dense_mode):
+        if dense_mode == "unsupported_uniform":
+            quantization = QuantizationConfig(
+                bits=4,
+                group_size=_BLK,
+                quant_method="olive",
+                overrides={
+                    f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=8),
+                    f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=8),
+                },
+            )
+        else:
+            quantization = dataclasses.replace(
+                _quantization(),
+                modules_to_not_convert=(f"{_LAYER}mlp.experts",),
+            )
+        model = MoECausalLMModel(_moe_config(quantization))
+
+        assert model.model.layers[0].mlp.experts is not None
+        with pytest.raises(ValueError, match="resolved quantization layout"):
+            model.preprocess_weights(_mixed_expert_state_dict())
 
     @pytest.mark.parametrize(
         ("fc1_sym", "fc2_sym"),

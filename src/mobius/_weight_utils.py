@@ -173,6 +173,25 @@ class QMoEQuantizationLayout:
     def is_mixed_width(self) -> bool:
         return self.fc1.bits != self.fc2.bits
 
+    @property
+    def requires_projection_preprocessing(self) -> bool:
+        fallback_layout = (
+            self.fallback.bits,
+            self.fallback.group_size,
+            self.fallback.sym,
+            self.fallback.float_zero_point,
+        )
+        return any(
+            (
+                projection.bits,
+                projection.group_size,
+                projection.sym,
+                projection.float_zero_point,
+            )
+            != fallback_layout
+            for projection in (self.fc1, self.fc2)
+        )
+
 
 def _resolve_qmoe_module(
     quantization: QuantizationConfig,
@@ -994,30 +1013,25 @@ def pack_qmoe_expert_weights(
     return packed
 
 
-def _mixed_olive_qmoe_roots(
+def _resolve_olive_qmoe_layouts(
     quantization: QuantizationConfig,
     *,
     expected_moe_paths: tuple[str, ...],
     source_moe_paths: tuple[str, ...],
-) -> dict[str, QMoEQuantizationLayout]:
+) -> dict[str, QMoEQuantizationLayout | None]:
     if len(expected_moe_paths) != len(source_moe_paths):
         raise ValueError(
             "QMoE canonical checkpoint roots and source module paths must align "
             f"one-to-one, got {len(expected_moe_paths)} and {len(source_moe_paths)}."
         )
     source_by_root = dict(zip(expected_moe_paths, source_moe_paths))
-    layouts = {
+    return {
         root: resolve_qmoe_quantization(quantization, (source_path,))
         for root, source_path in source_by_root.items()
     }
-    return {
-        root: layout
-        for root, layout in layouts.items()
-        if layout is not None and layout.is_mixed_width
-    }
 
 
-def _preprocess_mixed_olive_qmoe_weights(
+def _preprocess_olive_qmoe_weights(
     state_dict: dict[str, torch.Tensor],
     quantization: QuantizationConfig,
     layouts: dict[str, QMoEQuantizationLayout],
@@ -1051,6 +1065,11 @@ def _preprocess_mixed_olive_qmoe_weights(
             f"cannot map {unknown!r}."
         )
 
+    projection_layouts = {
+        root: layout
+        for root, layout in layouts.items()
+        if layout.requires_projection_preprocessing
+    }
     renamed_experts: dict[str, torch.Tensor] = {}
     accepted_keys: set[str] = set()
     for root, layout in layouts.items():
@@ -1069,7 +1088,7 @@ def _preprocess_mixed_olive_qmoe_weights(
             f"under a recognized root: {min(stale)!r}."
         )
 
-    for root, layout in layouts.items():
+    for root, layout in projection_layouts.items():
         block_size = layout.fc1.group_size
         if hidden_size % block_size or intermediate_size % block_size:
             raise ValueError(
@@ -1169,7 +1188,14 @@ def _preprocess_mixed_olive_qmoe_weights(
             if qzeros is not None:
                 renamed_experts[f"{stem}.zero_points"] = qzeros.contiguous()
 
-    ordinary = {key: value for key, value in state_dict.items() if key not in expert_keys}
+    projection_expert_keys = {
+        key
+        for key in expert_keys
+        if any(key.startswith(f"{root}.experts.") for root in projection_layouts)
+    }
+    ordinary = {
+        key: value for key, value in state_dict.items() if key not in projection_expert_keys
+    }
     result = preprocess_olive_weights(
         ordinary,
         bits=quantization.bits,
@@ -1532,8 +1558,8 @@ def preprocess_quantized_weights(
         if qmoe_target_path is not None
         else False
     )
-    mixed_layouts = (
-        _mixed_olive_qmoe_roots(
+    resolved_qmoe_layouts = (
+        _resolve_olive_qmoe_layouts(
             quantization,
             expected_moe_paths=qmoe_expected_moe_paths,
             source_moe_paths=qmoe_source_moe_paths or qmoe_expected_moe_paths,
@@ -1541,7 +1567,25 @@ def preprocess_quantized_weights(
         if qmoe_target_path is not None and quantization is not None
         else {}
     )
-    use_qmoe = uniform_qmoe or bool(mixed_layouts)
+    packed_expert_keys = [
+        key
+        for key in state_dict
+        if qmoe_target_path is not None
+        and qmoe_target_path in key
+        and ".experts." in key
+        and is_packed_quant_key(key)
+    ]
+    unsupported_roots = {
+        root for root, layout in resolved_qmoe_layouts.items() if layout is None
+    }
+    if unsupported_roots and packed_expert_keys:
+        raise ValueError(
+            "Quantized MoE expert weights were found for routed layers whose resolved "
+            "quantization layout does not match the native QMoE ABI: "
+            f"{sorted(unsupported_roots)!r}."
+        )
+    layer_qmoe = bool(resolved_qmoe_layouts) and not unsupported_roots
+    use_qmoe = uniform_qmoe if not resolved_qmoe_layouts else layer_qmoe
     if (
         use_qmoe
         and quantization is not None
@@ -1561,11 +1605,6 @@ def preprocess_quantized_weights(
         )
 
     if qmoe_target_path is not None and not use_qmoe:
-        packed_expert_keys = [
-            key
-            for key in state_dict
-            if qmoe_target_path in key and ".experts." in key and is_packed_quant_key(key)
-        ]
         if packed_expert_keys:
             raise ValueError(
                 "Quantized MoE expert weights were found for this model "
@@ -1639,7 +1678,12 @@ def preprocess_quantized_weights(
             state_dict, bits=quantization.bits, group_size=quantization.group_size
         )
     elif quantization is not None and quantization.quant_method == "olive":
-        if mixed_layouts:
+        projection_layouts = {
+            root: layout
+            for root, layout in resolved_qmoe_layouts.items()
+            if layout is not None and layout.requires_projection_preprocessing
+        }
+        if projection_layouts:
             assert qmoe_target_path is not None
             geometry = (
                 qmoe_num_experts,
@@ -1654,10 +1698,14 @@ def preprocess_quantized_weights(
             assert qmoe_num_experts is not None
             assert qmoe_hidden_size is not None
             assert qmoe_intermediate_size is not None
-            return_state_dict = _preprocess_mixed_olive_qmoe_weights(
+            return_state_dict = _preprocess_olive_qmoe_weights(
                 state_dict,
                 quantization,
-                mixed_layouts,
+                {
+                    root: layout
+                    for root, layout in resolved_qmoe_layouts.items()
+                    if layout is not None
+                },
                 qmoe_target_path=qmoe_target_path,
                 num_experts=qmoe_num_experts,
                 hidden_size=qmoe_hidden_size,
