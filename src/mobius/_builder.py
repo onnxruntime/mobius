@@ -121,9 +121,6 @@ def build_from_module(
     *,
     execution_provider: str = "default",
     device: str | None = None,
-    trace_optimization: bool = False,
-    fp8_kv_cache: bool = False,
-    kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
     component_manifest: ComponentManifest | None = None,
 ) -> ModelPackage:
@@ -138,9 +135,6 @@ def build_from_module(
         execution_provider: Target whose structural build contract is applied.
             Mobius does not apply graph rewrites based on this value.
         device: Optional target device recorded in the build contract.
-        trace_optimization: Deprecated. Mobius export does not run graph rewrites.
-        fp8_kv_cache: Deprecated. Apply FP8 KV-cache rewrites downstream.
-        kv_cache_scales: Deprecated. Apply FP8 KV-cache rewrites downstream.
         prune_prefill_prefix: Retain only the final sequence position before
             the LM head for supported causal generation tasks.
 
@@ -149,11 +143,6 @@ def build_from_module(
     """
     if hasattr(config, "validate"):
         config.validate()
-    if trace_optimization or fp8_kv_cache or kv_cache_scales is not None:
-        raise ValueError(
-            "Mobius export no longer applies graph rewrites. Apply execution-provider "
-            "optimizations downstream (for example, with Olive)."
-        )
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)

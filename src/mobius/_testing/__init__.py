@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
+import numpy as np
 import onnx_ir as ir
 from onnxscript import GraphBuilder
 
@@ -107,6 +110,20 @@ def count_op_type(graph: ir.Graph, op_type: str) -> int:
         if node.op_type == op_type:
             count += 1
     return count
+
+
+def count_ops(model: ir.Model) -> Counter:
+    """Count operation types in a model's main graph."""
+    return Counter(node.op_type for node in model.graph)
+
+
+def fill_random_weights(model: ir.Model) -> None:
+    """Fill uninitialized test parameters with random float32 values."""
+    for initializer in model.graph.initializers.values():
+        if initializer.const_value is None:
+            initializer.const_value = ir.tensor(
+                np.random.randn(*list(initializer.shape)).astype(np.float32)
+            )
 
 
 def make_config(**overrides) -> ArchitectureConfig:

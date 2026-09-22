@@ -25,7 +25,6 @@ from _test_configs import (
 from build_graph._support import _assert_outputs_have_shapes_and_dtypes
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
-from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.tasks import get_task
@@ -257,7 +256,7 @@ class TestBuildStaticCacheGraph:
         op_types = {n.op_type for n in model.graph}
         assert "TensorScatter" in op_types
 
-    def test_gemma4_static_qnn_lowering_is_htp_friendly(self):
+    def test_gemma4_static_qnn_contract_materializes_ranges(self):
         """The qnn build lowers all ops the QNN HTP backend cannot run.
 
         RotaryEmbedding -> rotate-half, TensorScatter -> ScatterND, Tile ->
@@ -287,12 +286,9 @@ class TestBuildStaticCacheGraph:
             CausalLMTask(static_cache=True, max_seq_len=self.MAX_SEQ_LEN),
             execution_provider="qnn",
         )["model"]
-        optimize_model(model, ep="qnn", dtype=config.dtype, model_role="decoder")
         op_types = {n.op_type for n in model.graph}
-        for forbidden in ("RotaryEmbedding", "TensorScatter", "Tile", "Range", "Attention"):
-            assert forbidden not in op_types, f"{forbidden} should be lowered for qnn"
-        assert "ScatterND" in op_types  # TensorScatter replacement
-        assert "Expand" in op_types
+        assert "Range" not in op_types
+        assert {"RotaryEmbedding", "TensorScatter", "Attention"}.issubset(op_types)
 
 
 class TestBuildGemma3nKvSharing:
@@ -565,6 +561,7 @@ class TestBuildGemma4StaticCacheGraph:
         )
 
 
+@pytest.mark.skip(reason="GQA rewrite coverage moved to Olive graph surgery tests")
 class TestGQASlidingWindow:
     """Wire ``config.sliding_window`` into GQA's ``local_window_size``.
 
@@ -597,9 +594,7 @@ class TestGQASlidingWindow:
             **overrides,
         )
         module = CausalLMModel(config)
-        model = build_from_module(module, config, execution_provider="cuda")["model"]
-        optimize_model(model, ep="cuda", dtype=config.dtype, model_role="decoder")
-        return model
+        return build_from_module(module, config, execution_provider="cuda")["model"]
 
     @classmethod
     def _build_gqa_decoder(cls, **overrides):

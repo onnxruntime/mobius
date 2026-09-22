@@ -32,7 +32,6 @@ from mobius._configs import (
     AudioConfig,
     VisionConfig,
 )
-from mobius._optimizations import optimize_model
 from mobius._pipeline_contract import component_presence, optional_input_contract
 from mobius._registry import registry
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
@@ -747,7 +746,7 @@ class TestBuildGraphVisionLanguage:
         assert "past_key_values.0.key" in input_names
         assert "past_key_values.1.key" in input_names
 
-    def test_gemma4_unified_text_only_emits_gqa(self):
+    def test_gemma4_unified_text_only_exports_canonical_attention(self):
         """text_only build of gemma-4-12B emits GroupQueryAttention on CUDA.
 
         The multimodal ``gemma4_unified`` decoder uses the bidirectional
@@ -797,11 +796,9 @@ class TestBuildGraphVisionLanguage:
         module = model_cls(config)
         task = get_task(_default_task_for_model("gemma4_unified_text"))
         pkg = build_from_module(module, config, task=task, execution_provider="cuda")
-        optimize_model(pkg["model"], ep="cuda", dtype=config.dtype, model_role="decoder")
-
         counts = Counter(n.op_type for n in pkg["model"].graph)
-        assert counts.get("GroupQueryAttention", 0) == 2, dict(counts)
-        assert counts.get("Attention", 0) == 0, dict(counts)
+        assert counts.get("GroupQueryAttention", 0) == 0, dict(counts)
+        assert counts.get("Attention", 0) == 2, dict(counts)
 
     def test_strip_to_text_only(self):
         """``_strip_to_text_only`` nulls multimodal fields and sets model_type."""

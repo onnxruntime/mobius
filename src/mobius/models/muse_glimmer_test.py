@@ -12,7 +12,6 @@ import torch
 
 from mobius import build_from_module
 from mobius._configs import MuseGlimmerConfig
-from mobius._optimizations import optimize_model
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations._weight_loading import apply_weights
@@ -37,7 +36,7 @@ def test_scale_free_rms_norm_preserves_input_dtype(dtype):
     assert rms_node.inputs[1].shape == ir.Shape([16])
 
 
-def test_muse_glimmer_uses_fused_rms_normalization():
+def test_muse_glimmer_exports_canonical_rms_normalization():
     config = MuseGlimmerConfig(
         hidden_size=64,
         intermediate_size=128,
@@ -64,11 +63,10 @@ def test_muse_glimmer_uses_fused_rms_normalization():
     )
     module = MuseGlimmerTextCausalLMModel(config)
     model = build_from_module(module, config, execution_provider="cuda")["model"]
-    optimize_model(model, ep="cuda", dtype=config.dtype, model_role="decoder")
     counts = Counter(node.op_type for node in model.graph)
 
-    assert counts["RMSNormalization"] == 25
-    assert counts["SkipSimplifiedLayerNormalization"] == 1
+    assert counts["RMSNormalization"] == 26
+    assert counts["SkipSimplifiedLayerNormalization"] == 0
     assert counts["ReduceMean"] == 0
     assert counts["Pow"] == 0
 

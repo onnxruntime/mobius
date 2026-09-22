@@ -336,10 +336,7 @@ def build_transformers_model(
     trust_remote_code: bool = False,
     execution_provider: str = "default",
     device: str | None = None,
-    trace_optimization: bool = False,
     text_only: bool = False,
-    fp8_kv_cache: bool = False,
-    kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
@@ -375,11 +372,8 @@ def build_transformers_model(
             "task": task is not None,
             "module_class": module_class is not None,
             "output_layer_indices": output_layer_indices is not None,
-            "trace_optimization": trace_optimization,
             "dequantize": not keep_quantized,
             "text_only": text_only,
-            "fp8_kv_cache": fp8_kv_cache,
-            "kv_cache_scales": kv_cache_scales is not None,
             "prune_prefill_prefix": prune_prefill_prefix,
             "glm_full_attention": glm_full_attention,
             "export_paged_attention": export_paged_attention,
@@ -465,8 +459,6 @@ def build_transformers_model(
             unsupported = {
                 "output_layer_indices": output_layer_indices is not None,
                 "text_only": text_only,
-                "fp8_kv_cache": fp8_kv_cache,
-                "kv_cache_scales": kv_cache_scales is not None,
                 "prune_prefill_prefix": prune_prefill_prefix,
                 "glm_full_attention": glm_full_attention,
                 "export_paged_attention": export_paged_attention,
@@ -548,31 +540,6 @@ def build_transformers_model(
         parent_config=parent_config,
         module_class=module_class,
     )
-    if (
-        compressed_tensors_config is not None
-        and fp8_kv_cache
-        and compressed_tensors_config.kv_cache_scheme is not None
-    ):
-        layer_types = config.layer_types
-        if not layer_types:
-            raise ValueError(
-                "Cannot validate this compressed-tensors checkpoint's FP8 KV-cache "
-                "scales because the decoder does not declare per-layer attention types."
-            )
-        expected_scale_layers = {
-            index
-            for index, layer_type in enumerate(layer_types)
-            if layer_type == "full_attention"
-        }
-        provided_scale_layers = set(kv_cache_scales or {})
-        if provided_scale_layers != expected_scale_layers:
-            missing = sorted(expected_scale_layers - provided_scale_layers)
-            extra = sorted(provided_scale_layers - expected_scale_layers)
-            raise ValueError(
-                "fp8_kv_cache=True requires the checkpoint's complete per-layer "
-                "k_scale/v_scale map; partial maps would silently use unit scales. "
-                f"Missing layers: {missing}; unexpected layers: {extra}."
-            )
 
     if text_only:
         decoder_source_paths: tuple[str, ...] = ()
@@ -666,9 +633,6 @@ def build_transformers_model(
         task,
         execution_provider=execution_provider,
         device=device,
-        trace_optimization=trace_optimization,
-        fp8_kv_cache=fp8_kv_cache,
-        kv_cache_scales=kv_cache_scales,
         prune_prefill_prefix=prune_prefill_prefix,
         component_manifest=component_manifest,
     )
@@ -755,7 +719,6 @@ def build_transformers_model(
                 compressed_tensors_config,
                 preprocess_weights=getattr(model_module, "preprocess_weights", None),
                 revision=revision,
-                fp8_kv_cache=fp8_kv_cache,
                 keep_quantized=keep_quantized,
             )
         else:

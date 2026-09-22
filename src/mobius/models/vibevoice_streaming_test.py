@@ -22,7 +22,6 @@ from mobius._configs import (
     VibeVoiceStreamingDiffusionConfig,
     VibeVoiceStreamingTokenizerConfig,
 )
-from mobius._optimizations import optimize_model
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.vibevoice_streaming import (
@@ -324,8 +323,8 @@ def test_vibevoice_streaming_states_and_host_protocol_are_explicit() -> None:
     }
 
 
-def test_vibevoice_streaming_cuda_fp16_uses_standard_gqa() -> None:
-    """The prefix-valid causal mask permits the normal CUDA fp16 GQA lowering."""
+def test_vibevoice_streaming_cuda_target_keeps_canonical_attention() -> None:
+    """A CUDA target contract does not rewrite the canonical attention graph."""
     config = dataclasses.replace(_config(), dtype=ir.DataType.FLOAT16)
     package = build_from_module(
         VibeVoiceStreamingForConditionalGeneration(config),
@@ -336,14 +335,8 @@ def test_vibevoice_streaming_cuda_fp16_uses_standard_gqa() -> None:
 
     for name in ("lm_backbone", "tts_backbone"):
         graph = package[name].graph
-        optimize_model(
-            package[name],
-            ep="cuda",
-            dtype=config.dtype,
-            model_role="decoder",
-        )
-        assert any(node.op_type == "GroupQueryAttention" for node in graph)
-        assert all(node.op_type != "Attention" for node in graph)
+        assert all(node.op_type != "GroupQueryAttention" for node in graph)
+        assert any(node.op_type == "Attention" for node in graph)
         assert "mobius.attention.requires_arbitrary_mask" not in graph.metadata_props
 
 

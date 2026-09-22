@@ -3743,11 +3743,7 @@ def build_gemma4_vlm_from_gguf(
             quantize_lm_head,
         )
 
-    # 2. Build the multimodal graph (decoder + vision + embedding [+ audio]).
-    #    Route through build_from_module so each component gets the EP-aware
-    #    optimize_model passes (GQA fusion, etc.) — the same pipeline the
-    #    text-only build_from_gguf path uses; calling Gemma4Task().build()
-    #    directly would skip those optimizations.
+    # 2. Build the canonical multimodal graph (decoder + vision + embedding [+ audio]).
     from mobius._builder import build_from_module
 
     module = Gemma4UnifiedModel(config) if is_unified else Gemma4Model(config)

@@ -94,21 +94,7 @@ Olive surgeons, but Mobius does not apply them automatically.
 
 ---
 
-## 4. Develop or test rewrite rules explicitly
+## 4. Add target graph behavior
 
-Mobius retains `optimize_model()` as a low-level rule-development API while
-rewrites migrate to Olive. Calling it is explicit and separate from export:
-
-```python
-import onnx_ir as ir
-from mobius import optimize_model
-
-optimize_model(
-    model,
-    ep="cuda",
-    dtype=ir.DataType.FLOAT16,
-    model_role="decoder",
-)
-```
-
-Production export should use Olive's EP profiles rather than calling this API.
+Add target fusions and lowerings to Olive's `graph_surgery` package. Mobius
+target registrations contain only structural build and runtime requirements.

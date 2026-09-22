@@ -6,10 +6,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from mobius._testing import make_config
+from mobius._testing import fill_random_weights, make_config
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.plm import PLMCausalLMModel
-from mobius.rewrite_rules._testing_utils import fill_random_weights
 from mobius.tasks import CausalLMTask
 
 

@@ -92,7 +92,6 @@ def build_and_export(
         dtype,
         "--ep",
         ep,
-        "--optimize",
         "--runtime",
         "ort-genai",
         output_dir,

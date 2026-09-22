@@ -359,7 +359,7 @@ class TestGQAContextDispatch:
         """A CUDA target contract does not introduce GroupQueryAttention during export."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         config = make_config(
             dtype=ir.DataType.FLOAT16,
@@ -380,7 +380,7 @@ class TestGQAContextDispatch:
         """A WebGPU target contract does not introduce GroupQueryAttention during export."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         config = make_config(
             dtype=ir.DataType.FLOAT16,
@@ -403,7 +403,7 @@ class TestGQAContextDispatch:
         """build_from_module with default EP keeps standard ONNX Attention (no GQA)."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         config = make_config(
             max_position_embeddings=128,
@@ -431,7 +431,7 @@ class TestGQAContextDispatch:
         from mobius._builder import build_from_module
         from mobius._configs import ArchitectureConfig
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         # Minimal Qwen2.5-VL-style config with mrope_section (activates ChunkedMRope).
         mrope_config = ArchitectureConfig(
@@ -462,14 +462,11 @@ class TestGQAContextDispatch:
         assert ops.get("GroupQueryAttention", 0) == 0
         assert ops.get("Attention", 0) == mrope_config.num_hidden_layers
 
-    def test_target_contract_does_not_change_explicit_gqa_rewrite(self):
-        """CPU and default target contracts produce the same graph for an explicit GQA rewrite."""
-        from onnxscript.rewriter import rewrite
-
+    def test_target_contract_does_not_change_canonical_attention(self):
+        """CPU and default target contracts produce the same canonical attention graph."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules import group_query_attention_rules
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         config = make_config(
             max_position_embeddings=128,
@@ -490,13 +487,10 @@ class TestGQAContextDispatch:
             config,
             execution_provider="default",
         )
-        rewrite(pkg_cpu["model"], group_query_attention_rules())
-        rewrite(pkg_default["model"], group_query_attention_rules())
-
         ops_cpu = count_ops(pkg_cpu["model"])
         ops_rewrite = count_ops(pkg_default["model"])
 
-        assert ops_cpu.get("GroupQueryAttention", 0) == num_layers
-        assert ops_rewrite.get("GroupQueryAttention", 0) == num_layers
-        assert ops_cpu.get("Attention", 0) == 0
-        assert ops_rewrite.get("Attention", 0) == 0
+        assert ops_cpu.get("GroupQueryAttention", 0) == 0
+        assert ops_rewrite.get("GroupQueryAttention", 0) == 0
+        assert ops_cpu.get("Attention", 0) == num_layers
+        assert ops_rewrite.get("Attention", 0) == num_layers

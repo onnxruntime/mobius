@@ -74,7 +74,6 @@ __all__ = [
     "get_ep",
     "inspect_components",
     "models",
-    "optimize_model",
     "register_ep",
     "registry",
     "stream_safetensors_to_model",
@@ -123,7 +122,6 @@ from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, reg
 from mobius._export_report import ComponentExportDisposition, ComponentExportReport
 from mobius._inspect import ComponentInfo, inspect_components
 from mobius._model_package import ModelPackage
-from mobius._optimizations import optimize_model
 from mobius._registry import (
     ModelRegistration,
     ModelRegistry,

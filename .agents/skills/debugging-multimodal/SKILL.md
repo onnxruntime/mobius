@@ -290,9 +290,9 @@ the model will fail to run on CUDA EP.
 
 ### EP-aware building
 
-`--ep` flag drives both graph construction and optimization (e.g. GQA
-fusion with `do_rotary=1`). `--optimize` is for post-hoc rewrite rules
-only (separate from EP). After EP-aware optimization, unused graph inputs
+`--ep` selects structural build requirements and runtime metadata. Graph
+rewrites such as GQA fusion run downstream in Olive. After downstream
+optimization, unused graph inputs
 (e.g. `position_ids` absorbed by GQA) are removed by
 `RemoveDeadGraphInputsPass`.
 

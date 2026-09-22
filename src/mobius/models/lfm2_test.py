@@ -10,7 +10,7 @@ import onnx_ir as ir
 
 from mobius import build_from_module
 from mobius._configs import Lfm2Config, Lfm2MoeConfig
-from mobius._optimizations import SymbolicShapeInferencePass, optimize_model
+from mobius._optimizations import SymbolicShapeInferencePass
 from mobius._registry import registry
 from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 
@@ -71,7 +71,7 @@ def test_model_uses_effective_intermediate_size():
     assert tuple(mlp.down_proj.weight.shape) == (2048, 4608)
 
 
-def test_cuda_graph_uses_lfm2_fusions():
+def test_cuda_target_exports_canonical_lfm2_graph():
     config = Lfm2Config.from_transformers(
         _hf_config(
             hidden_size=64,
@@ -95,15 +95,10 @@ def test_cuda_graph_uses_lfm2_fusions():
         task="hybrid-text-generation",
         execution_provider="cuda",
     )["model"]
-    optimize_model(model, ep="cuda", dtype=config.dtype, model_role="decoder")
-
     counts = Counter((node.domain or "", node.op_type) for node in model.graph)
-    assert counts["", "Swish"] == 2
-    # CUDA has no CausalConvWithState kernel. Its standard Conv function body
-    # must be inlined or ORT aborts while assigning providers.
-    assert counts["com.microsoft", "CausalConvWithState"] == 0
-    assert counts["", "Conv"] == 1
-    assert counts["com.microsoft", "SkipSimplifiedLayerNormalization"] == 4
+    assert counts["com.microsoft", "CausalConvWithState"] == 1
+    assert counts["", "Conv"] == 0
+    assert counts["com.microsoft", "SkipSimplifiedLayerNormalization"] == 0
 
     remaining_norms = [node for node in model.graph if node.op_type == "RMSNormalization"]
     assert remaining_norms

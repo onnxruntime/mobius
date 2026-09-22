@@ -312,7 +312,7 @@ class TestCLIBuild:
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         assert pkg.save.call_args.kwargs["max_workers"] == 1
 
@@ -772,16 +772,11 @@ class TestCLIBuild:
             )
         assert mock_build.call_args.kwargs.get("text_only") is True
 
-    def test_features_fp8_kv_cache_passed_through(self):
-        """--features fp8-kv-cache sets fp8_kv_cache on the build() call."""
+    def test_features_fp8_kv_cache_is_rejected(self):
+        """FP8 KV-cache rewriting moved to Olive."""
         with (
             tempfile.TemporaryDirectory() as tmpdir,
-            mock.patch(
-                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
-                return_value=None,
-            ),
-            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
-            mock.patch("mobius.__main__._save_package"),
+            pytest.raises(SystemExit, match=r"unknown feature 'fp8-kv-cache'"),
         ):
             main(
                 [
@@ -794,7 +789,6 @@ class TestCLIBuild:
                     "fp8-kv-cache",
                 ]
             )
-        assert mock_build.call_args.kwargs.get("fp8_kv_cache") is True
 
     def test_features_prune_prefill_prefix_passed_through(self):
         """--features prune-prefill-prefix sets the build option."""
@@ -839,12 +833,11 @@ class TestCLIBuild:
                     tmpdir,
                     "--no-weights",
                     "--features",
-                    "text-only,fp8-kv-cache,prune-prefill-prefix",
+                    "text-only,prune-prefill-prefix",
                 ]
             )
         kwargs = mock_build.call_args.kwargs
         assert kwargs.get("text_only") is True
-        assert kwargs.get("fp8_kv_cache") is True
         assert kwargs.get("prune_prefill_prefix") is True
 
     def test_features_unknown_errors(self):
@@ -899,23 +892,6 @@ class TestCLIBuild:
                     "static-cache",
                     "--task",
                     "text-generation",
-                ]
-            )
-
-    def test_kv_cache_scale_file_without_fp8_feature_errors(self):
-        with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            pytest.raises(SystemExit, match=r"--features fp8-kv-cache"),
-        ):
-            main(
-                [
-                    "build",
-                    "--model",
-                    "Qwen/Qwen2.5-0.5B",
-                    tmpdir,
-                    "--no-weights",
-                    "--kv-cache-scale-file",
-                    "scales.json",
                 ]
             )
 
@@ -1138,7 +1114,7 @@ class TestCLIBuildRuntime:
         with mock.patch(
             "mobius.integrations.ort_genai.write_ort_genai_config"
         ) as config_writer:
-            _save_package(pkg, str(tmp_path), args, None, None)
+            _save_package(pkg, str(tmp_path), args, None)
 
         pkg.save.assert_called_once()
         config_writer.assert_called_once()
@@ -1246,7 +1222,7 @@ class TestCLIBuildRuntime:
                 return_value={},
             ) as vlm_writer,
         ):
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         vlm_writer.assert_called_once_with(
             pkg,
@@ -1281,7 +1257,7 @@ class TestCLIBuildRuntime:
                 return_value={},
             ) as writer,
         ):
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         assert writer.call_args.kwargs["guidance_scale"] == pytest.approx(6.0)
         assert writer.call_args.kwargs["revision"] == "pinned-revision"
@@ -1316,7 +1292,7 @@ class TestCLIBuildRuntime:
                 return_value={},
             ) as writer,
         ):
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         assert writer.call_args.kwargs["revision"] == (
             "edc39f80f5cae656da37baf8faa8f5502bf7081f"
@@ -1352,7 +1328,7 @@ class TestCLIBuildRuntime:
             ) as vlm_writer,
             pytest.raises(SystemExit, match=r"regenerate.*register"),
         ):
-            _save_package(pkg, tmpdir, args, None, None)
+            _save_package(pkg, tmpdir, args, None)
 
         vlm_writer.assert_called_once_with(
             pkg,

@@ -8,7 +8,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -16,9 +15,7 @@ from types import MappingProxyType, SimpleNamespace
 import onnx_ir as ir
 import pytest
 
-from mobius._builder import build_from_module
 from mobius._configs import NemotronHConfig
-from mobius._optimizations import optimize_model
 from mobius.integrations.gguf import _runtime_evidence
 from mobius.integrations.gguf._arch_registry import get_arch_spec
 from mobius.integrations.gguf._reader import _descriptor_identity
@@ -35,8 +32,6 @@ from mobius.integrations.gguf._runtime_evidence import (
     validate_quant_runtime_evidence_ids,
     validate_runtime_evidence_ids,
 )
-from mobius.models.nemotron_h import NemotronHCausalLMModel
-from mobius.tasks import HybridCausalLMTask
 
 
 def _file_identity(path) -> tuple[int, int, int, int, int]:
@@ -228,37 +223,6 @@ def test_nemotron_h_runtime_blocker_is_pinned_without_support_claim() -> None:
     assert "does not beam-reorder recurrent state" in record.blockers[2]
     assert "rejects nonzero recurrent-state rewind" in record.blockers[2]
     assert all("cannot describe" not in blocker for blocker in record.blockers)
-
-
-def test_nemotron_h_runtime_blocker_graph_census_matches_pinned_config() -> None:
-    evidence = iter_runtime_blocker_evidence()[0]
-    config = _pinned_nemotron_h_config()
-
-    raw_graph = (
-        HybridCausalLMTask()
-        .build(
-            NemotronHCausalLMModel(config),
-            config,
-        )["model"]
-        .graph
-    )
-    assert len(raw_graph) == evidence.pre_optimization_graph_node_count
-
-    production_model = build_from_module(
-        NemotronHCausalLMModel(config),
-        config,
-        task="hybrid-text-generation",
-        execution_provider="cpu",
-    )["model"]
-    optimize_model(production_model, ep="cpu", dtype=config.dtype, model_role="decoder")
-    production_graph = production_model.graph
-    op_counts = Counter(node.op_type for node in production_graph)
-
-    assert len(production_graph) == evidence.graph_node_count
-    assert len(production_graph.initializers) == evidence.graph_initializer_count
-    assert op_counts["MatMul"] == evidence.graph_matmul_count
-    assert len(production_graph.inputs) == 60
-    assert len(production_graph.outputs) == 59
 
 
 def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
