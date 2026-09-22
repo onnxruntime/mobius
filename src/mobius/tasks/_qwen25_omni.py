@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Qwen2.5-Omni Thinker four-model split task."""
+"""Qwen2.5-Omni Thinker and Talker split task."""
 
 from __future__ import annotations
 
@@ -16,19 +16,24 @@ from mobius.tasks._base import (
     ComponentSpec,
     _make_graph,
     _make_model,
-    build_decoder_from_embeds,
+)
+from mobius.tasks._cache_utils import (
+    _make_kv_cache_inputs,
+    _register_kv_cache_outputs,
 )
 from mobius.tasks._vision_language_3model import QwenVLTask
 
 
 class Qwen25OmniTask(QwenVLTask):
-    """Build the Thinker's audio, vision, embedding, and decoder ONNX models."""
+    """Build the Thinker models and optional Talker ONNX models."""
 
     model_roles: ClassVar[dict[str, str]] = {
         "audio_encoder": "encoder",
         "vision_encoder": "encoder",
         "embedding": "embedding",
         "decoder": "decoder",
+        "talker_embedding": "embedding",
+        "talker": "decoder",
     }
     components = ComponentSpec(
         audio_encoder="audio_encoder",
@@ -42,13 +47,147 @@ class Qwen25OmniTask(QwenVLTask):
         for name in ("audio_encoder", "vision_encoder"):
             if getattr(module, name) is None:
                 raise ValueError(f"Qwen25OmniTask requires a non-None {name}.")
-        models = {
+        models: dict[str, ir.Model] = {
             "audio_encoder": self._build_audio(module.audio_encoder, config),
             "vision_encoder": self._build_vision(module.vision_encoder, config),
             "embedding": self._build_embedding(module.embedding, config),
-            "decoder": build_decoder_from_embeds(module.decoder, config, mrope=True),
+            "decoder": self._build_decoder(module.decoder, config),
         }
+        if module.talker is not None and config.talker is not None:
+            models["talker_embedding"] = self._build_talker_embedding(
+                module.talker.model.embed_tokens, config.talker
+            )
+            models["talker"] = self._build_talker(module.talker, config.talker)
         return ModelPackage(models, config=config)
+
+    def _build_decoder(
+        self,
+        decoder: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build Thinker logits, normalized hidden states, and KV cache."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+        graph, builder = _make_graph(name="decoder")
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, config.hidden_size],
+        )
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_sequence_len + sequence_len"],
+        )
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[3, batch, seq_len],
+        )
+        past_key_values = _make_kv_cache_inputs(
+            builder,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+        logits, hidden_states, present_key_values = decoder(
+            builder.op,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+        builder.add_output(logits, "logits")
+        builder.add_output(hidden_states, "hidden_states")
+        _register_kv_cache_outputs(
+            builder,
+            present_key_values,
+            batch=batch,
+            num_kv_heads=config.num_key_value_heads,
+            key_head_dim=config.head_dim,
+            value_head_dim=config.head_dim,
+            total_seq_len="past_sequence_len + sequence_len",
+            dtype=config.dtype,
+        )
+        return _make_model(graph)
+
+    def _build_talker_embedding(
+        self,
+        embedding: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build codec-token embeddings in the shared Thinker-width space."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        graph, builder = _make_graph(name="talker_embedding")
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
+        )
+        codec_embeds = embedding(builder.op, input_ids)
+        builder.add_output(codec_embeds, "codec_embeds")
+        return _make_model(graph)
+
+    def _build_talker(
+        self,
+        talker: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build speech-token logits from preconstructed shared-space embeddings."""
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        past_seq_len = ir.SymbolicDim("past_sequence_len")
+        embedding_size = config.embedding_size or config.hidden_size
+
+        graph, builder = _make_graph(name="talker")
+        inputs_embeds = builder.input(
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, seq_len, embedding_size],
+        )
+        attention_mask = builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_sequence_len + sequence_len"],
+        )
+        position_ids = builder.input(
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[3, batch, seq_len],
+        )
+        past_key_values = _make_kv_cache_inputs(
+            builder,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+            batch,
+            past_seq_len,
+        )
+        logits, present_key_values = talker(
+            builder.op,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+        builder.add_output(logits, "logits")
+        _register_kv_cache_outputs(
+            builder,
+            present_key_values,
+            batch=batch,
+            num_kv_heads=config.num_key_value_heads,
+            key_head_dim=config.head_dim,
+            value_head_dim=config.head_dim,
+            total_seq_len="past_sequence_len + sequence_len",
+            dtype=config.dtype,
+        )
+        return _make_model(graph)
 
     def _build_audio(self, audio_encoder: nn.Module, config: ArchitectureConfig) -> ir.Model:
         """Build packed audio chunks into packed LLM audio tokens."""

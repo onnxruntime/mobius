@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Qwen2.5-Omni Thinker: audio + vision + text.
+"""Qwen2.5-Omni: Thinker and Talker models.
 
 Architecture (Thinker only):
   - Audio encoder: Conv1d x2 → sinusoidal PE → 32 encoder layers → AvgPool → proj
@@ -419,21 +419,101 @@ class Qwen25OmniDecoderModel(nn.Module):
 
         hidden_states = self.norm(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
-        return logits, present_key_values
+        return logits, hidden_states, present_key_values
+
+
+class Qwen25OmniTalkerModel(nn.Module):
+    """Talker backbone with codec embedding, MRoPE decoder layers, and final norm."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        embedding_size = config.embedding_size or config.hidden_size
+        self._dtype = config.dtype
+        self.embed_tokens = Embedding(config.vocab_size, embedding_size)
+        self.layers = nn.ModuleList(
+            [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = initialize_rope(config)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values=None,
+    ):
+        hidden_states = inputs_embeds
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
+        )
+        attention_bias = create_attention_bias(
+            op,
+            input_ids=inputs_embeds,
+            attention_mask=attention_mask,
+            dtype=self._dtype,
+        )
+
+        present_key_values = []
+        past_kvs = past_key_values or [None] * len(self.layers)
+        for layer, past_kv in zip(self.layers, past_kvs):
+            hidden_states, present_kv = layer(
+                op,
+                hidden_states=hidden_states,
+                attention_bias=attention_bias,
+                position_embeddings=position_embeddings,
+                past_key_value=past_kv,
+            )
+            present_key_values.append(present_kv)
+
+        return self.norm(op, hidden_states), present_key_values
+
+
+class Qwen25OmniTalkerForConditionalGeneration(nn.Module):
+    """Generate codec-token logits from Thinker-width input embeddings."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        embedding_size = config.embedding_size or config.hidden_size
+        self.thinker_to_talker_proj = Linear(embedding_size, config.hidden_size, bias=True)
+        self.model = Qwen25OmniTalkerModel(config)
+        self.codec_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values=None,
+    ):
+        # The host combines Thinker reply states, text embeddings, and codec
+        # embeddings in the shared embedding space before this projection.
+        hidden_states = self.thinker_to_talker_proj(op, inputs_embeds)
+        hidden_states, present_key_values = self.model(
+            op,
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+        )
+        return self.codec_head(op, hidden_states), present_key_values
 
 
 class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
-    """Qwen2.5-Omni Thinker: composite audio + vision + text model.
+    """Qwen2.5-Omni composite Thinker and optional Talker model.
 
-    Builds four separate ONNX models:
+    Builds four Thinker models and, when configured, two Talker models:
 
     - ``decoder``: Qwen2.5 text decoder taking ``inputs_embeds``
     - ``vision_encoder``: Qwen2.5-VL ViT (pixel_values + grid_thw → image features)
     - ``audio_encoder``: 2x Conv1d + transformer audio tower (mel → audio features)
     - ``embedding``: word embedding + multimodal feature fusion
+    - ``talker_embedding``: codec token embedding in the Thinker-width space
+    - ``talker``: projection + speech-token decoder + codec logits
 
-    HuggingFace class: ``Qwen2_5OmniForConditionalGeneration`` (Thinker only —
-    the Talker / streaming code generation head is out of scope for now).
+    HuggingFace class: ``Qwen2_5OmniForConditionalGeneration``.
     """
 
     default_task: str = "qwen25-omni"
@@ -451,12 +531,17 @@ class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
         self.audio_encoder: Qwen25OmniAudioEncoder | None = (
             Qwen25OmniAudioEncoder(config) if config.audio is not None else None
         )
+        self.talker: Qwen25OmniTalkerForConditionalGeneration | None = (
+            Qwen25OmniTalkerForConditionalGeneration(config.talker)
+            if config.talker is not None
+            else None
+        )
 
     def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
             "Qwen25OmniThinkerForConditionalGeneration is a multi-model split; the corresponding "
             "Qwen25OmniTask builds each sub-module (decoder, embedding, vision_encoder, "
-            "audio_encoder) "
+            "audio_encoder, talker, and talker_embedding) "
             "separately."
         )
 
@@ -474,17 +559,27 @@ class Qwen25OmniThinkerForConditionalGeneration(nn.Module):
         - ``thinker.lm_head.*`` → ``decoder.lm_head.*``
         - ``thinker.model.rotary_emb.*`` → ``decoder.rotary_emb.*``
 
-        The Talker sub-tree (``talker.*``) and the audio-output codec head
-        are not consumed by this model and are silently dropped.
+        Talker keys already align with the nested ``talker.*`` module and are
+        retained when audio output is enabled.
         """
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
+            if key == "talker.model.embed_tokens.weight":
+                # The embedding component traces this nested module directly,
+                # so its initializer has no outer Talker scopes.
+                cleaned["embed_tokens.weight"] = value
+                continue
+            if key.startswith("talker."):
+                if self.talker is not None:
+                    cleaned[key] = value
+                continue
+
             # Strip the thinker. prefix if present.
             if key.startswith("thinker."):
                 key = key[len("thinker.") :]
 
-            # Drop talker.* and any codec output keys — not part of Thinker.
-            if key.startswith(("talker.", "token2wav.", "code_predictor.")):
+            # Token2wav is exported independently from the Talker.
+            if key.startswith(("token2wav.", "code_predictor.")):
                 continue
 
             if key.startswith("audio_tower."):
