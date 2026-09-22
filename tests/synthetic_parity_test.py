@@ -252,6 +252,148 @@ def test_qwen2_5_omni_thinker_synthetic_parity():
         session.close()
 
 
+def test_qwen2_5_omni_talker_synthetic_parity():
+    """Compare codec embedding, width projection, MRoPE, and cached codec logits."""
+    from _test_configs import SPEECH_CONFIGS
+    from transformers import (
+        Qwen2_5OmniTalkerConfig,
+        Qwen2_5OmniTalkerForConditionalGeneration,
+    )
+
+    from mobius._builder import build_from_module
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    hf_config = Qwen2_5OmniTalkerConfig(
+        vocab_size=256,
+        tts_text_start_token_id=240,
+        tts_text_end_token_id=241,
+        tts_text_pad_token_id=242,
+        tts_codec_start_token_id=243,
+        tts_codec_end_token_id=244,
+        tts_codec_pad_token_id=245,
+        tts_codec_mask_token_id=246,
+        vision_start_token_id=247,
+        vision_end_token_id=248,
+        audio_start_token_id=249,
+        audio_end_token_id=250,
+        embedding_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        max_position_embeddings=128,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 1_000_000.0,
+            "mrope_section": [2, 1, 1],
+        },
+    )
+    torch.manual_seed(42)
+    reference = Qwen2_5OmniTalkerForConditionalGeneration._from_config(
+        hf_config, attn_implementation="eager"
+    ).eval()
+    # HF initializes biases to zero; nonzero biases catch missing bias routing.
+    with torch.no_grad():
+        for name, parameter in reference.named_parameters():
+            if name.endswith(".bias"):
+                parameter.normal_(std=0.02)
+
+    overrides = next(o for mt, o, _ in SPEECH_CONFIGS if mt == "qwen2_5_omni")
+    config = _base_config(**overrides)
+    config.talker = ArchitectureConfig.from_transformers(hf_config)
+    module = registry.get("qwen2_5_omni")(config)
+    package = build_from_module(module, config, task="qwen25-omni")
+    weights = module.preprocess_weights(
+        {f"talker.{name}": value for name, value in reference.state_dict().items()}
+    )
+    for component in ("talker_embedding", "talker"):
+        model = package[component]
+        missing = {
+            name
+            for name, value in model.graph.initializers.items()
+            if value.const_value is None and name not in weights
+        }
+        assert not missing, f"Unmapped HF parameters: {missing}"
+        apply_weights(
+            model,
+            {
+                name: value
+                for name, value in weights.items()
+                if name in model.graph.initializers
+            },
+        )
+
+    embedding_session = OnnxModelSession(package["talker_embedding"])
+    try:
+        codec_ids = torch.tensor([[5, 6, 7, 8], [9, 10, 11, 12]])
+        decode_ids = torch.tensor([[13], [14]])
+        codec_embeds = []
+        for ids in (codec_ids, decode_ids):
+            actual = embedding_session.run({"input_ids": ids.numpy()})["codec_embeds"]
+            with torch.no_grad():
+                expected = reference.get_input_embeddings()(ids).numpy()
+            np.testing.assert_allclose(actual, expected, atol=0, rtol=0)
+            codec_embeds.append(actual)
+    finally:
+        embedding_session.close()
+
+    session = OnnxModelSession(package["talker"])
+    cache = None
+    feeds = {
+        f"past_key_values.{layer}.{kind}": np.zeros(
+            (2, hf_config.num_key_value_heads, 0, hf_config.head_dim), np.float32
+        )
+        for layer in range(hf_config.num_hidden_layers)
+        for kind in ("key", "value")
+    }
+    try:
+        for embeds, offset in zip(codec_embeds, (0, 4)):
+            length = embeds.shape[1]
+            reply = torch.randn(2, length, hf_config.embedding_size)
+            # Feed the exported codec embedding into the shared Thinker-width input.
+            inputs_embeds = embeds + reply.numpy()
+            positions = np.broadcast_to(
+                np.arange(offset, offset + length), (3, 2, length)
+            ).copy()
+            positions[1] = positions[1] * 2 + 1
+            positions[2] = positions[2] * 3 + 2
+            mask = np.ones((2, offset + length), np.int64)
+            mask[1, 2] = 0
+            feeds.update(
+                inputs_embeds=inputs_embeds, attention_mask=mask, position_ids=positions
+            )
+            outputs = session.run(feeds)
+            with torch.no_grad():
+                reference_inputs = (
+                    {"inputs_embeds": reference.get_input_embeddings()(codec_ids) + reply}
+                    if offset == 0
+                    else {"input_ids": decode_ids, "thinker_reply_part": reply}
+                )
+                result = reference(
+                    **reference_inputs,
+                    attention_mask=torch.from_numpy(mask),
+                    position_ids=torch.from_numpy(positions),
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+            np.testing.assert_allclose(
+                outputs["logits"], result.logits.numpy(), atol=1e-5, rtol=1e-4
+            )
+            cache = result.past_key_values
+            for layer in range(hf_config.num_hidden_layers):
+                for kind, expected in (
+                    ("key", cache.layers[layer].keys),
+                    ("value", cache.layers[layer].values),
+                ):
+                    actual = outputs[f"present.{layer}.{kind}"]
+                    np.testing.assert_allclose(actual, expected.numpy(), atol=1e-5, rtol=1e-4)
+                    feeds[f"past_key_values.{layer}.{kind}"] = actual
+    finally:
+        session.close()
+
+
 def test_vibevoice_synthetic_pipeline_parity():
     """Run the dedicated eight-stage continuous-token parity harness."""
     from mobius.models.vibevoice_test import run_vibevoice_synthetic_stage_parity

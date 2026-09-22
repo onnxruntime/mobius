@@ -86,8 +86,18 @@ def _hf_config():
     )
 
 
-def test_qwen25_omni_extracts_nested_thinker_config():
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {},
+        {"enable_audio_output": True},
+        {"enable_talker": True},
+        {"enable_audio_output": True, "enable_talker": False},
+    ],
+)
+def test_qwen25_omni_extracts_nested_thinker_config(flags):
     text, parent = _hf_config()
+    vars(parent).update(flags)
     config = ArchitectureConfig.from_transformers(text, parent_config=parent)
 
     assert config.attn_qkv_bias
@@ -108,7 +118,10 @@ def test_qwen25_omni_extracts_nested_thinker_config():
 
 
 @pytest.mark.parametrize("raw_json", [False, True])
-def test_qwen25_omni_full_checkpoint_builds_thinker_and_talker(monkeypatch, raw_json):
+@pytest.mark.parametrize("enable_audio_output", [False, True])
+def test_qwen25_omni_full_checkpoint_builds_thinker_and_talker(
+    monkeypatch, raw_json, enable_audio_output
+):
     from transformers import Qwen2_5OmniConfig
 
     from mobius.integrations.transformers import _builder
@@ -119,7 +132,8 @@ def test_qwen25_omni_full_checkpoint_builds_thinker_and_talker(monkeypatch, raw_
         thinker_config={
             name: vars(value) if isinstance(value, SimpleNamespace) else value
             for name, value in vars(parent.thinker_config).items()
-        }
+        },
+        enable_audio_output=enable_audio_output,
     )
     if raw_json:
         hf_config = _dict_to_pretrained_config(hf_config.to_dict())
@@ -130,14 +144,16 @@ def test_qwen25_omni_full_checkpoint_builds_thinker_and_talker(monkeypatch, raw_
 
     package = _builder.build_transformers_model("test/qwen25-omni", load_weights=False)
 
-    assert set(package) == {
+    expected = {
         "audio_encoder",
         "vision_encoder",
         "embedding",
         "decoder",
-        "talker_embedding",
-        "talker",
     }
+    if enable_audio_output:
+        expected.update(("talker_embedding", "talker"))
+    assert set(package) == expected
+    assert (package.config.talker is not None) == enable_audio_output
     assert package.config.vocab_size == 256
     assert package.config.hidden_size == 64
     assert package.config.audio.audio_token_id == 100
@@ -232,10 +248,19 @@ def test_qwen25_omni_package_builds_talker_models():
         ]
 
 
-def test_qwen25_omni_package_omits_talker_models_when_disabled():
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"enable_audio_output": False},
+        {"enable_talker": False},
+        {"enable_audio_output": False, "enable_talker": True},
+    ],
+)
+def test_qwen25_omni_package_omits_talker_models_when_disabled(flags):
     text, parent = _hf_config()
+    vars(parent).update(flags)
     config = ArchitectureConfig.from_transformers(text, parent_config=parent)
-    config.talker = None
+    assert config.talker is None
     module = Qwen25OmniThinkerForConditionalGeneration(config)
     package = build_from_module(module, config, task=Qwen25OmniTask())
 

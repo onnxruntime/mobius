@@ -1510,7 +1510,12 @@ class ArchitectureConfig(BaseModelConfig):
 
         if model_type == "qwen2_5_omni_text" and parent_config is not None:
             talker_config = getattr(parent_config, "talker_config", None)
-            if talker_config is not None:
+            enable_audio_output = getattr(
+                parent_config,
+                "enable_audio_output",
+                getattr(parent_config, "enable_talker", True),
+            )
+            if enable_audio_output and talker_config is not None:
                 if isinstance(talker_config, dict):
                     talker_config = type("TalkerConfig", (), talker_config)()
                 options["talker"] = ArchitectureConfig.from_transformers(talker_config)
