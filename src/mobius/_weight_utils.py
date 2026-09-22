@@ -204,7 +204,9 @@ def _resolve_qmoe_module(
     quantization: QuantizationConfig,
     source_module_names: tuple[str, ...],
 ) -> QuantizationConfig | None:
-    """Resolve Olive's QMoE override semantics for authoritative source names."""
+    """Resolve producer-specific QMoE rules for authoritative source names."""
+    if quantization.quant_method != "olive":
+        return quantization.for_module(source_module_names)
 
     def _matches_exclusion(pattern: str, module_name: str) -> bool:
         if pattern.startswith("re:"):

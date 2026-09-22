@@ -905,6 +905,45 @@ class TestMixedWidthQMoEExport:
         with pytest.raises(ValueError, match="require Olive preprocessing"):
             MoECausalLMModel(_moe_config(quantization))
 
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq"])
+    def test_non_olive_parent_override_uses_subtree_matching(self, quant_method):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method=quant_method,
+            overrides={f"{_LAYER}mlp": QuantizationOverride(group_size=32)},
+        )
+
+        with pytest.raises(ValueError, match="require Olive preprocessing"):
+            MoECausalLMModel(_moe_config(quantization))
+
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq"])
+    def test_non_olive_plain_override_does_not_use_substring_matching(self, quant_method):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method=quant_method,
+            overrides={"model.layers.0.ml": QuantizationOverride(group_size=32)},
+        )
+
+        block = MoECausalLMModel(_moe_config(quantization)).model.layers[0].mlp
+
+        assert block._qmoe_quantization is not None
+        assert block._qmoe_quantization.fc1.group_size == _BLK
+        assert block._qmoe_quantization.fc2.group_size == _BLK
+
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq"])
+    def test_non_olive_parent_exclusion_uses_subtree_matching(self, quant_method):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method=quant_method,
+            modules_to_not_convert=(f"{_LAYER}mlp",),
+        )
+
+        with pytest.raises(ValueError, match="routed expert exclusions"):
+            MoECausalLMModel(_moe_config(quantization))
+
     def test_model_package_roundtrip_preserves_mixed_attrs_and_bytes(self, tmp_path):
         from mobius._builder import build_from_module
 

@@ -441,10 +441,12 @@ Native QMoE additionally has a projection-specific adapter for Olive fused
 K-last routed experts. The initial mixed layout is deliberately narrow:
 model-wide INT4, FC1 `gate_up_proj` overridden to INT2, FC2 `down_proj`
 remaining INT4, and one common power-of-two group size of at least 16. Exact
-and `re:` module overrides are resolved against the original Hugging Face
-paths before FC1 and FC2 buffers are validated independently. The adapter
-requires every routed layer and validates rank, dtype, expert count, packed
-byte width, scale geometry, and optional zero-point geometry before binding.
+and `re:` Olive overrides are resolved against the original Hugging Face paths;
+plain Olive exclusions retain their producer-defined substring matching.
+GPTQ and AWQ instead use the generic plain-path subtree and `re:` full-match
+rules. FC1 and FC2 buffers are then validated independently. The adapter
+requires every routed layer and validates rank, dtype, expert count, packed byte
+width, scale geometry, and optional zero-point geometry before binding.
 Qwen3.5-VL keeps the decoder's full module plan
 (``preserve_module_plan=True``) while constructing the split package: expert
 overrides are resolved against authoritative ``model.language_model`` source
