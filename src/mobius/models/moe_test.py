@@ -524,10 +524,14 @@ class TestMixedWidthQMoEExport:
 
     @pytest.mark.parametrize("mixed_layer", [0, 1])
     def test_mixed_and_legacy_uniform_layers_bind_with_per_layer_layouts(self, mixed_layer):
+        from mobius._builder import build_from_module
+
         quantization = _mixed_quantization(
             pattern=f"model.layers.{mixed_layer}.mlp.experts.gate_up_proj"
         )
-        model = MoECausalLMModel(_moe_config(quantization, num_hidden_layers=2))
+        config = _moe_config(quantization, num_hidden_layers=2)
+        model = MoECausalLMModel(config)
+        package = build_from_module(model, config)
         raw = {}
         for layer_index in range(2):
             raw.update(
@@ -539,9 +543,46 @@ class TestMixedWidthQMoEExport:
 
         out = model.preprocess_weights(raw)
 
+        def _fc1_initializer_name(qmoe: ir.Node) -> str:
+            pending = [qmoe.inputs[2]]
+            visited = set()
+            while pending:
+                value = pending.pop()
+                if value is None or id(value) in visited:
+                    continue
+                visited.add(id(value))
+                if value.is_initializer() and value.name.endswith("fc1_experts_weights"):
+                    return value.name
+                if producer := value.producer():
+                    pending.extend(producer.inputs)
+            raise AssertionError(f"QMoE node {qmoe.name!r} has no FC1 initializer input")
+
+        qmoe_by_fc1 = {
+            _fc1_initializer_name(node): node
+            for node in package["model"].graph
+            if node.op_type == "QMoE"
+        }
+        assert set(qmoe_by_fc1) == {
+            f"model.layers.{layer_index}.mlp.fc1_experts_weights" for layer_index in range(2)
+        }
         for layer_index in range(2):
             source = f"model.layers.{layer_index}.mlp.experts."
             target = f"model.layers.{layer_index}.mlp."
+            qmoe = qmoe_by_fc1[target + "fc1_experts_weights"]
+            assert qmoe.attributes["expert_weight_bits"].value == 4
+            projection_attrs = {
+                name: attribute.value
+                for name, attribute in qmoe.attributes.items()
+                if name.startswith("fc") and name.endswith("_expert_weight_bits")
+            }
+            if layer_index == mixed_layer:
+                assert projection_attrs == {
+                    "fc1_expert_weight_bits": 2,
+                    "fc2_expert_weight_bits": 4,
+                    "fc3_expert_weight_bits": 2,
+                }
+            else:
+                assert projection_attrs == {}
             torch.testing.assert_close(
                 out[target + "fc1_experts_weights"],
                 raw[source + "gate_up_proj_qweight"],
@@ -554,6 +595,19 @@ class TestMixedWidthQMoEExport:
                 rtol=0,
                 atol=0,
             )
+
+        package.apply_weights(out, fold_constants=False)
+        for layer_index in range(2):
+            source = f"model.layers.{layer_index}.mlp.experts."
+            target = f"model.layers.{layer_index}.mlp."
+            expected = {
+                target + "fc1_experts_weights": raw[source + "gate_up_proj_qweight"],
+                target + "fc2_experts_weights": raw[source + "down_proj_qweight"],
+            }
+            for name, tensor in expected.items():
+                initializer = package["model"].graph.initializers[name]
+                assert initializer.const_value is not None
+                assert initializer.const_value.numpy().tobytes() == tensor.numpy().tobytes()
 
     @pytest.mark.parametrize(
         ("mutation", "message"),
