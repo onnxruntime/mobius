@@ -10,6 +10,8 @@ import pytest
 import mobius
 from mobius._inspect import (
     ComponentInfo,
+    SharedWeightEndpoint,
+    SharedWeightInfo,
     _get_hf_component_sources,
     _resolve_task_model_type_and_config,
     inspect_components,
@@ -98,6 +100,38 @@ def test_qwen3_vl_returns_hf_source_paths(monkeypatch):
     )
     assert components["vision_encoder"].source_paths == ("model.visual",)
     assert components["embedding"].source_paths == ("model.language_model.embed_tokens",)
+
+
+def test_gemma4_reports_cross_component_tied_word_embeddings(monkeypatch):
+    _patch_autoconfig(
+        monkeypatch,
+        SimpleNamespace(
+            model_type="gemma4",
+            tie_word_embeddings=True,
+            text_config=SimpleNamespace(tie_word_embeddings=True),
+        ),
+    )
+
+    components = {component.name: component for component in inspect_components("fake/gemma4")}
+    shared_weight = SharedWeightInfo(
+        name="word_embeddings",
+        kind="tied_word_embeddings",
+        canonical=SharedWeightEndpoint(
+            component="embedding",
+            parameter="model.language_model.embed_tokens.weight",
+        ),
+        aliases=(
+            SharedWeightEndpoint(
+                component="decoder",
+                parameter="lm_head.weight",
+            ),
+        ),
+    )
+
+    assert components["decoder"].shared_weights == (shared_weight,)
+    assert components["embedding"].shared_weights == (shared_weight,)
+    assert components["vision_encoder"].shared_weights == ()
+    assert components["audio_encoder"].shared_weights == ()
 
 
 def test_qwen3_tts_embedders_return_shared_hf_source_paths(monkeypatch):

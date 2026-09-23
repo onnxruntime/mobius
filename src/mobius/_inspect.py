@@ -16,12 +16,100 @@ subfolder names ``ModelPackage.save`` writes for multi-component models).
 
 from __future__ import annotations
 
-__all__ = ["ComponentInfo", "inspect_components"]
+__all__ = [
+    "ComponentInfo",
+    "SharedWeightEndpoint",
+    "SharedWeightInfo",
+    "inspect_components",
+]
 
 import dataclasses
 import logging
+from collections.abc import Mapping
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class SharedWeightEndpoint:
+    """One component-local consumer of a shared HuggingFace parameter."""
+
+    component: str
+    parameter: str
+
+    def __post_init__(self) -> None:
+        if not self.component:
+            raise ValueError("shared-weight component must not be empty")
+        if not self.parameter:
+            raise ValueError("shared-weight parameter must not be empty")
+
+    @classmethod
+    def from_value(cls, value: object) -> SharedWeightEndpoint:
+        """Normalize a mapping or duck-typed endpoint."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, Mapping):
+            return cls(
+                component=str(value["component"]),
+                parameter=str(value["parameter"]),
+            )
+        duck_value = cast(Any, value)
+        return cls(
+            component=str(duck_value.component),
+            parameter=str(duck_value.parameter),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class SharedWeightInfo:
+    """A logical HuggingFace parameter consumed by multiple components."""
+
+    name: str
+    canonical: SharedWeightEndpoint
+    aliases: tuple[SharedWeightEndpoint, ...]
+    kind: str = "parameter_alias"
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("shared-weight name must not be empty")
+        if not self.kind:
+            raise ValueError(f"shared weight {self.name!r} kind must not be empty")
+        if not self.aliases:
+            raise ValueError(f"shared weight {self.name!r} must declare at least one alias")
+        endpoints = (self.canonical, *self.aliases)
+        if len(set(endpoints)) != len(endpoints):
+            raise ValueError(f"shared weight {self.name!r} contains duplicate endpoints")
+
+    @classmethod
+    def from_value(cls, value: object) -> SharedWeightInfo:
+        """Normalize a mapping or duck-typed shared-weight declaration."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, Mapping):
+            return cls(
+                name=str(value["name"]),
+                canonical=SharedWeightEndpoint.from_value(value["canonical"]),
+                aliases=tuple(
+                    SharedWeightEndpoint.from_value(alias)
+                    for alias in value.get("aliases", ())
+                ),
+                kind=str(value.get("kind", "parameter_alias")),
+            )
+        duck_value = cast(Any, value)
+        return cls(
+            name=str(duck_value.name),
+            canonical=SharedWeightEndpoint.from_value(duck_value.canonical),
+            aliases=tuple(
+                SharedWeightEndpoint.from_value(alias) for alias in duck_value.aliases
+            ),
+            kind=str(getattr(duck_value, "kind", "parameter_alias")),
+        )
+
+    @property
+    def endpoints(self) -> tuple[SharedWeightEndpoint, ...]:
+        """Canonical endpoint followed by every alias."""
+        return (self.canonical, *self.aliases)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -45,11 +133,16 @@ class ComponentInfo:
             tuple. Empty when the component is the whole model or the layout is
             unknown. Tools such as Olive use these to optimize a submodule in
             place before exporting the full model.
+        shared_weights: Cross-component shared parameters involving this
+            component. The same immutable declaration is attached to every
+            participating component so each independently selected build keeps
+            the complete relationship.
     """
 
     name: str
     role: str
     source_paths: tuple[str, ...] = ()
+    shared_weights: tuple[SharedWeightInfo, ...] = ()
 
 
 def _resolve_task_model_type_and_config(
@@ -119,6 +212,45 @@ def _get_hf_component_sources(
     return get_hf_component_sources(module_class, model_type, hf_config)
 
 
+def _get_hf_shared_weights(
+    module_class: type,
+    hf_config: object,
+) -> tuple[SharedWeightInfo, ...]:
+    """Read architecture-declared cross-component shared parameters."""
+    resolver = getattr(module_class, "get_hf_shared_weights", None)
+    if resolver is None:
+        return ()
+    return tuple(SharedWeightInfo.from_value(value) for value in resolver(hf_config=hf_config))
+
+
+def _validate_shared_weights(shared_weights, manifest) -> None:
+    """Validate component ownership and runtime paths for shared parameters."""
+    seen_names: set[str] = set()
+    for shared_weight in shared_weights:
+        if shared_weight.name in seen_names:
+            raise ValueError(
+                f"shared weight {shared_weight.name!r} is declared more than once"
+            )
+        seen_names.add(shared_weight.name)
+        for endpoint in shared_weight.endpoints:
+            if endpoint.component not in manifest:
+                raise ValueError(
+                    f"shared weight {shared_weight.name!r} references unknown "
+                    f"component {endpoint.component!r}"
+                )
+            source_paths = manifest[endpoint.component].source_paths
+            module_path = endpoint.parameter.rpartition(".")[0]
+            if source_paths and not any(
+                module_path == source_path or module_path.startswith(f"{source_path}.")
+                for source_path in source_paths
+            ):
+                raise ValueError(
+                    f"shared weight {shared_weight.name!r} parameter "
+                    f"{endpoint.parameter!r} is outside component "
+                    f"{endpoint.component!r} source paths {source_paths!r}"
+                )
+
+
 def inspect_components(
     model_id: str,
     task=None,
@@ -158,12 +290,27 @@ def inspect_components(
         model_type=model_type,
         hf_config=hf_config,
     )
+    shared_weights = (
+        _get_hf_shared_weights(module_class, hf_config)
+        if module_class is not None and hf_config is not None
+        else ()
+    )
+    _validate_shared_weights(shared_weights, manifest)
+    shared_by_component = {
+        name: tuple(
+            shared_weight
+            for shared_weight in shared_weights
+            if any(endpoint.component == name for endpoint in shared_weight.endpoints)
+        )
+        for name in manifest
+    }
 
     components = [
         ComponentInfo(
             name=component.name,
             role=component.role,
             source_paths=component.source_paths,
+            shared_weights=shared_by_component[component.name],
         )
         for component in manifest.values()
     ]

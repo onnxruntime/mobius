@@ -36,6 +36,7 @@ from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_ena
 from mobius._configs import ArchitectureConfig, Gemma4Config, QuantizationConfig
 from mobius._weight_utils import (
     is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
     preprocess_quantized_weights,
     vlm_decoder_weights,
     vlm_embedding_weights,
@@ -57,7 +58,11 @@ from mobius.components import (
 from mobius.components._activations import get_activation
 from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._mlp import GatedMLP
-from mobius.models.base import CausalLMModel, _retain_last_sequence_token
+from mobius.models.base import (
+    CausalLMModel,
+    _retain_last_sequence_token,
+    effective_tie_word_embeddings,
+)
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
@@ -89,6 +94,58 @@ _GEMMA4_COMPONENT_SOURCES: dict[str, tuple[str, ...]] = {
         "model.language_model.per_layer_projection_norm",
     ),
 }
+
+
+def _gemma4_hf_shared_weights(*, hf_config):
+    """Declare the tied token table when the HuggingFace config enables it."""
+    text_config = getattr(hf_config, "text_config", None)
+    tied = getattr(
+        text_config,
+        "tie_word_embeddings",
+        getattr(hf_config, "tie_word_embeddings", False),
+    )
+    if not tied:
+        return ()
+    return (
+        {
+            "name": "word_embeddings",
+            "kind": "tied_word_embeddings",
+            "canonical": {
+                "component": "embedding",
+                "parameter": "model.language_model.embed_tokens.weight",
+            },
+            "aliases": (
+                {
+                    "component": "decoder",
+                    "parameter": "lm_head.weight",
+                },
+            ),
+        },
+    )
+
+
+def _materialize_gemma4_split_tied_lm_head(
+    state_dict: dict[str, torch.Tensor],
+    config: Gemma4Config,
+) -> None:
+    """Materialize the decoder head from the canonical packed token table."""
+    if not effective_tie_word_embeddings(config) or config.component_quantization is None:
+        return
+    materialize_split_tied_olive_lm_head(
+        state_dict,
+        embed_key="model.language_model.embed_tokens.weight",
+        head_key="lm_head.weight",
+        embedding_quantization=config.quantization_for_source_paths(
+            "embedding",
+            ("model.language_model.embed_tokens",),
+            ignored_source_names=(),
+        ),
+        head_quantization=config.quantization_for_source_paths(
+            "decoder",
+            ("lm_head",),
+            ignored_source_names=(),
+        ),
+    )
 
 
 def _split_per_layer_projection_weight(
@@ -3406,6 +3463,7 @@ class Gemma4Model(nn.Module):
 
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = _GEMMA4_COMPONENT_SOURCES
+    get_hf_shared_weights = staticmethod(_gemma4_hf_shared_weights)
     HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
         "decoder": {
             "model": "model.language_model",
@@ -3476,17 +3534,17 @@ class Gemma4Model(nn.Module):
         ``input_ids``, so ``embed_tokens`` is not a decoder initializer — the
         token embedding lives only in the ``embedding`` sub-model.
         """
+        _materialize_gemma4_split_tied_lm_head(state_dict, self.config)
+
         # Strip top-level "model." prefix used by HF multimodal checkpoints.
         state_dict = {
             (key[len("model.") :] if key.startswith("model.") else key): value
             for key, value in state_dict.items()
         }
 
-        # Synthesize lm_head from embed_tokens when weights are tied. For a
-        # float checkpoint this copies ``embed_tokens.weight``; for a quantized
-        # checkpoint the tied MatMulNBits head tensors (weight/scales/
-        # zero_points) are emitted directly by the loader, so nothing to do here.
-        if self.config.tie_word_embeddings:
+        # Float checkpoints still need the tied table copied to the split head.
+        # Packed Olive sidecars were materialized before prefix stripping above.
+        if effective_tie_word_embeddings(self.config):
             embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
@@ -3667,6 +3725,7 @@ class Gemma4UnifiedModel(nn.Module):
         "audio_encoder": ("model.embed_audio",),
         "embedding": ("model.language_model.embed_tokens",),
     }
+    get_hf_shared_weights = staticmethod(_gemma4_hf_shared_weights)
     HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
         "decoder": {
             "model": "model.language_model",
@@ -3718,6 +3777,8 @@ class Gemma4UnifiedModel(nn.Module):
         - ``embed_{vision,audio}.*.embedding_pre_projection_norm.*`` → skip
           (scale-free RMSNorm, no learnable weight)
         """
+        _materialize_gemma4_split_tied_lm_head(state_dict, self.config)
+
         # Strip top-level "model." prefix used by HF multimodal checkpoints.
         state_dict = {
             (key[len("model.") :] if key.startswith("model.") else key): value
@@ -3725,7 +3786,7 @@ class Gemma4UnifiedModel(nn.Module):
         }
 
         # Synthesize lm_head from embed_tokens when weights are tied.
-        if self.config.tie_word_embeddings:
+        if effective_tie_word_embeddings(self.config):
             embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
