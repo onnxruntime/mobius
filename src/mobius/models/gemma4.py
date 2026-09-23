@@ -1410,7 +1410,7 @@ class Gemma4TextAttention(nn.Module):
         is_static = static_kv_seqlen is not None
 
         if (
-            ep_capabilities().requires_rank4_attention
+            ep_capabilities().name == "openvino"
             and not use_gqa
             and not is_static
             and attention_bias is not None
@@ -2776,7 +2776,7 @@ class Gemma4TextModel(nn.Module):
                     fallback_bias_dict = {
                         key: (
                             _retain_last_bias_query_row_openvino(op, value)
-                            if caps.requires_rank4_attention
+                            if caps.name == "openvino"
                             else _retain_last_bias_query_row(op, value)
                         )
                         for key, value in fallback_bias_dict.items()

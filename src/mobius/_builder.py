@@ -201,8 +201,7 @@ _ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX = 6
 
 def _maybe_apply_opset_lowering(package: ModelPackage, execution_provider: str) -> None:
     """Lower default-domain opset 24 to 23 for sub-models where it is safe."""
-    capabilities = ep_registry.require(execution_provider)
-    if not flags.ort_lower_opset_for_ep and not capabilities.requires_attention_opset23:
+    if not flags.ort_lower_opset_for_ep and execution_provider != "openvino":
         return
     if execution_provider in ("default", "cpu"):
         return
@@ -226,7 +225,7 @@ def _maybe_apply_opset_lowering(package: ModelPackage, execution_provider: str) 
         for function in functions:
             if "" in function.opset_imports:
                 function.opset_imports[""] = 23
-        if capabilities.requires_attention_opset23:
+        if execution_provider == "openvino":
             logger.info(
                 "Lowered opset %d→23 for '%s' (EP=%s) to avoid the OpenVINO "
                 "opset-24 Attention mask Pad.",

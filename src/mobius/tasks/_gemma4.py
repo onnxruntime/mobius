@@ -539,9 +539,8 @@ class Gemma4Task(ModelTask):
         graph, builder = _make_graph(name="decoder")
         op = builder.op
         caps = ep_capabilities()
-        decoder_io_dtype = (
-            ir.DataType.FLOAT if caps.requires_float32_decoder_io else config.dtype
-        )
+        is_openvino = caps.name == "openvino"
+        decoder_io_dtype = ir.DataType.FLOAT if is_openvino else config.dtype
 
         inputs_embeds_input = builder.input(
             "inputs_embeds",
@@ -640,7 +639,7 @@ class Gemma4Task(ModelTask):
                 input_ids=input_ids_val,
             )
 
-        if caps.requires_float32_decoder_io and logits.dtype != ir.DataType.FLOAT:
+        if is_openvino and logits.dtype != ir.DataType.FLOAT:
             logits_f32 = op.Cast(logits, to=ir.DataType.FLOAT)
             logits_f32.type = ir.DataType.FLOAT
             logits_f32.shape = logits.shape
@@ -825,7 +824,7 @@ class Gemma4Task(ModelTask):
 
         # ``embedding`` returns a dict of named outputs: always
         # ``inputs_embeds``; optionally ``per_layer_inputs`` (per-layer gating).
-        cast_outputs = ep_capabilities().requires_float32_decoder_io
+        cast_outputs = ep_capabilities().name == "openvino"
 
         def component_output(value: ir.Value) -> ir.Value:
             if not cast_outputs or value.dtype == ir.DataType.FLOAT:

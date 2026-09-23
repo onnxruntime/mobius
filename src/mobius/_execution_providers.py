@@ -147,19 +147,6 @@ class EpCapabilities:
             graph-capture-safe.  Set ``True`` only for EPs that cannot execute
             ``Shape`` / ``ConstantOfShape`` under graph capture (currently
             WebGPU).
-        requires_rank4_attention: Whether Gemma4 should feed rank-4 BNSH
-            query/key/value tensors to Attention instead of the generic
-            rank-3 projection layout. OpenVINO uses this topology so the ONNX
-            frontend can create SDPA without inserting redundant dynamic
-            Reshape nodes around every projection and cache tensor.
-        requires_attention_opset23: Whether Attention models must be declared
-            as opset 23. OpenVINO uses this because its opset-24 Attention
-            translator always pads the mask dynamically, while the equivalent
-            opset-23 path feeds the complete mask directly to SDPA.
-        requires_float32_decoder_io: Whether multimodal decoder embeddings and
-            logits must use FLOAT at the component boundary. OpenVINO NPUW's
-            VLM path requires FLOAT ``inputs_embeds`` even when the decoder
-            computes internally in FLOAT16.
     """
 
     name: str
@@ -184,9 +171,6 @@ class EpCapabilities:
     max_buffer_size: int | None = None
     layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
-    requires_rank4_attention: bool = False
-    requires_attention_opset23: bool = False
-    requires_float32_decoder_io: bool = False
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -318,9 +302,6 @@ def _register_builtins() -> None:
             supports_skip_layer_norm=False,
             provider_options={"device_type": "NPU"},
             layered_per_layer_inputs=True,
-            requires_rank4_attention=True,
-            requires_attention_opset23=True,
-            requires_float32_decoder_io=True,
         ),
         EpCapabilities(
             name="cpu",
