@@ -31,6 +31,7 @@ class VibeVoiceTokenizerConfig:
     rms_norm_eps: float = 1e-5
     layer_scale_init_value: float = 1e-6
     vae_std: float = 0.625
+    std_dist_type: str = "gaussian"
 
     @property
     def hop_length(self) -> int:
@@ -372,3 +373,141 @@ class VibeVoiceStreamingConfig(ArchitectureConfig):
             raise ValueError(
                 "VibeVoice Realtime diffusion latent_size must match acoustic vae_dim"
             )
+
+
+def _asr_streaming_tokenizer_config(
+    config, *, default_hidden_size: int
+) -> VibeVoiceTokenizerConfig:
+    """Extract the streaming-ASR encoder schema into the shared causal-tokenizer geometry."""
+    source = _as_attribute_config(config)
+    encoder_ratios = list(getattr(source, "encoder_ratios", [8, 5, 5, 4, 2, 2]))
+    required_values = {
+        "channels": (getattr(source, "channels", 1), 1),
+        "causal": (getattr(source, "causal", True), True),
+        "mixer_layer": (getattr(source, "mixer_layer", "depthwise_conv"), "depthwise_conv"),
+        "conv_norm": (getattr(source, "conv_norm", "none"), "none"),
+        "pad_mode": (getattr(source, "pad_mode", "constant"), "constant"),
+        "disable_last_norm": (getattr(source, "disable_last_norm", True), True),
+        "layernorm": (getattr(source, "layernorm", "RMSNorm"), "RMSNorm"),
+        "layernorm_elementwise_affine": (
+            getattr(source, "layernorm_elementwise_affine", True),
+            True,
+        ),
+        "conv_bias": (getattr(source, "conv_bias", True), True),
+    }
+    unsupported = [
+        f"{name}={actual!r}"
+        for name, (actual, expected) in required_values.items()
+        if actual != expected
+    ]
+    if unsupported:
+        raise ValueError(
+            "Unsupported VibeVoice streaming ASR tokenizer configuration: "
+            + ", ".join(unsupported)
+            + "."
+        )
+    if not encoder_ratios or any(int(ratio) <= 0 for ratio in encoder_ratios):
+        raise ValueError(
+            "VibeVoice streaming ASR encoder_ratios must contain positive integers."
+        )
+    return VibeVoiceTokenizerConfig(
+        channels=int(getattr(source, "channels", 1)),
+        hidden_size=int(getattr(source, "vae_dim", default_hidden_size)),
+        kernel_size=int(getattr(source, "kernel_size", 7)),
+        num_filters=int(getattr(source, "encoder_n_filters", 32)),
+        downsampling_ratios=list(reversed(encoder_ratios)),
+        depths=[
+            int(depth)
+            for depth in str(getattr(source, "encoder_depths", "3-3-3-3-3-3-8")).split("-")
+        ],
+        ffn_expansion=int(getattr(source, "ffn_expansion", 4)),
+        hidden_act=str(getattr(source, "hidden_act", "gelu")),
+        rms_norm_eps=float(getattr(source, "layernorm_eps", 1e-5)),
+        layer_scale_init_value=float(getattr(source, "layer_scale_init_value", 1e-6)),
+        vae_std=float(getattr(source, "fix_std", 0.625)),
+        std_dist_type=str(getattr(source, "std_dist_type", "gaussian")),
+    )
+
+
+@dataclasses.dataclass
+class VibeVoiceASRStreamingConfig(ArchitectureConfig):
+    """Configuration for VibeVoice streaming ASR's causal audio encoders and Qwen2 decoder."""
+
+    acoustic_tokenizer: VibeVoiceTokenizerConfig = dataclasses.field(
+        default_factory=VibeVoiceTokenizerConfig
+    )
+    semantic_tokenizer: VibeVoiceTokenizerConfig = dataclasses.field(
+        default_factory=lambda: VibeVoiceTokenizerConfig(hidden_size=128, std_dist_type="none")
+    )
+    speech_start_token_id: int = 151646
+    speech_end_token_id: int = 151647
+    speech_placeholder_token_id: int = 151648
+    text_chunk_end_token_id: int = 151665
+    compression_ratio: int = 3200
+    sampling_rate: int = 24_000
+    chunk_frames: int = 22
+    lookahead_frames: int = 4
+
+    @classmethod
+    def from_transformers(
+        cls,
+        config,
+        parent_config=None,
+        *,
+        allow_block_fp8_dense_fallback: bool = False,
+    ) -> VibeVoiceASRStreamingConfig:
+        """Extract the public streaming-ASR composite while preserving Qwen2 decoder config."""
+        parent = _as_attribute_config(parent_config or config)
+        decoder = _as_attribute_config(getattr(parent, "decoder_config", config))
+        result = super().from_transformers(
+            decoder,
+            parent_config=parent,
+            allow_block_fp8_dense_fallback=allow_block_fp8_dense_fallback,
+        )
+        acoustic = _asr_streaming_tokenizer_config(
+            getattr(parent, "acoustic_tokenizer_config", None),
+            default_hidden_size=64,
+        )
+        semantic = _asr_streaming_tokenizer_config(
+            getattr(parent, "semantic_tokenizer_config", None),
+            default_hidden_size=128,
+        )
+        if acoustic.std_dist_type != "gaussian" or semantic.std_dist_type != "none":
+            raise ValueError(
+                "VibeVoice streaming ASR requires a gaussian acoustic tokenizer and "
+                "a deterministic semantic tokenizer."
+            )
+        compression_ratio = int(
+            getattr(parent, "speech_tok_compress_ratio", acoustic.hop_length)
+        )
+        if acoustic.hop_length != compression_ratio:
+            raise ValueError(
+                "VibeVoice streaming ASR acoustic tokenizer ratios must match the "
+                "configured speech tokenizer compression ratio."
+            )
+        if semantic.hop_length != acoustic.hop_length:
+            raise ValueError(
+                "VibeVoice streaming ASR acoustic and semantic tokenizer hop lengths must match."
+            )
+        # The composite ASR config controls the tokenizer and connector precision,
+        # while decoder_config independently records Qwen's checkpoint storage dtype.
+        pipeline_dtype = _resolve_dtype_value(getattr(parent, "dtype", None))
+        if pipeline_dtype is None:
+            pipeline_dtype = _resolve_dtype_value(getattr(parent, "torch_dtype", None))
+        return dataclasses.replace(
+            result,
+            model_type="vibevoice_asr_streaming",
+            acoustic_tokenizer=acoustic,
+            semantic_tokenizer=semantic,
+            speech_start_token_id=int(getattr(parent, "object_ref_start_token_id", 151646)),
+            speech_end_token_id=int(getattr(parent, "object_ref_end_token_id", 151647)),
+            speech_placeholder_token_id=int(getattr(parent, "speech_pad_token_id", 151648)),
+            text_chunk_end_token_id=int(getattr(parent, "text_chunk_end_token_id", 151665)),
+            compression_ratio=compression_ratio,
+            sampling_rate=int(getattr(parent, "target_sample_rate", 24_000)),
+            chunk_frames=int(getattr(parent, "chunk_frames", 22)),
+            lookahead_frames=int(getattr(parent, "lookahead_frames", 4)),
+            eos_token_id=getattr(parent, "eos_token_id", 151643),
+            pad_token_id=getattr(parent, "pad_token_id", 151655),
+            dtype=pipeline_dtype or result.dtype,
+        )

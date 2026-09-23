@@ -155,10 +155,10 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("qwen2_5_vl_text") == "qwen2_5_vl"
 
     def test_gemma4_unified_model_types(self):
-        # The gemma-4-12B unified checkpoint (model_type "gemma4_unified")
-        # reuses the multimodal "gemma4" ORT GenAI pipeline; its standalone
-        # text decoder ("gemma4_unified_text") maps to "gemma4_text".
-        assert _resolve_ort_genai_model_type("gemma4_unified") == "gemma4"
+        # The gemma-4-12B unified checkpoint (model_type "gemma4_unified") maps
+        # to the dedicated "gemma4_unified" ORT GenAI multimodal pipeline; its
+        # standalone text decoder ("gemma4_unified_text") maps to "gemma4_text".
+        assert _resolve_ort_genai_model_type("gemma4_unified") == "gemma4_unified"
         assert _resolve_ort_genai_model_type("gemma4_unified_text") == "gemma4_text"
         # Released gemma4 mappings remain unchanged.
         assert _resolve_ort_genai_model_type("gemma4") == "gemma4"
@@ -194,12 +194,12 @@ class TestSelectOrtModelType:
     def test_multimodal_keeps_hf_type(self):
         # Full multimodal export: build() unwraps the composite to its text
         # sub-config, so config.model_type may be a text type even though the
-        # package is multimodal. Must keep the HF parent type -> gemma4.
+        # package is multimodal. Must keep the HF parent type -> gemma4_unified.
         assert (
             _select_ort_model_type(
                 "gemma4_unified_text", "gemma4_unified", is_decoder_only=False
             )
-            == "gemma4"
+            == "gemma4_unified"
         )
 
     def test_decoder_only_falls_back_to_hf_when_config_missing(self):
@@ -420,14 +420,29 @@ class TestWriteProcessorConfig:
             trust_remote_code=True,
         )
 
-    def test_gemma4_unified_skips_image_processor(self, tmp_path):
-        """Encoder-free gemma4_unified has no native transform: no image_processor.json."""
+    def test_gemma4_unified_image_processor(self, tmp_path):
+        """Encoder-free gemma4_unified writes a 48px merged-patch transform."""
         vision = mock.MagicMock()
         vision.model_type = None
+        vision.patch_size = 16
+        vision.pooling_kernel_size = 3
+        vision.mm_tokens_per_image = 280
         config = mock.MagicMock()
         config.vision = vision
         config.model_type = "gemma4_unified"
-        assert _write_vision_processor_config(config, str(tmp_path)) is None
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("image_processor.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        transform = data["processor"]["transforms"][1]["operation"]
+        assert transform["type"] == "Gemma4ImageTransform"
+        # 48px merged patches (16*3), no further pooling.
+        assert transform["attrs"]["patch_size"] == 48
+        assert transform["attrs"]["pooling_kernel_size"] == 1
+        assert transform["attrs"]["max_soft_tokens"] == 280
 
     def test_pixtral_vision_config(self, tmp_path):
         """Generates pixtral-specific processor config with 7 transforms."""
@@ -973,12 +988,30 @@ class TestFixChatTemplate:
         config.model_type = "whisper"
         assert _write_audio_processor_config(config, str(tmp_path)) is None
 
-    def test_audio_gemma4_unified_skips_audio_processor(self, tmp_path):
-        """Encoder-free gemma4_unified has no native transform: no audio_processor.json."""
+    def test_audio_gemma4_unified_writes_raw_frames(self, tmp_path):
+        """Encoder-free gemma4_unified writes a raw-waveform-frame extractor."""
         config = mock.MagicMock()
         config.audio = mock.MagicMock()
+        config.audio.hidden_size = 640
         config.model_type = "gemma4_unified"
-        assert _write_audio_processor_config(config, str(tmp_path)) is None
+
+        path = _write_audio_processor_config(config, str(tmp_path))
+        assert path is not None
+        assert path.endswith("audio_feature_extraction.json")
+        with open(path) as f:
+            data = json.load(f)
+
+        seq = data["feature_extraction"]["sequence"]
+        assert seq[0]["operation"]["type"] == "AudioDecoder"
+        op = seq[1]["operation"]
+        assert op["name"] == "gemma4_audio"
+        assert op["type"] == "Gemma4Audio"
+        assert op["attrs"] == {
+            "type": "raw_frames",
+            "audio_samples_per_token": 640,
+            "sampling_rate": 16000,
+            "padding_value": 0.0,
+        }
 
     def test_audio_gemma4_writes_feature_extraction_json(self, tmp_path):
         config = mock.MagicMock()
@@ -996,8 +1029,9 @@ class TestFixChatTemplate:
         seq = data["feature_extraction"]["sequence"]
         assert len(seq) == 2
         assert seq[0]["operation"]["type"] == "AudioDecoder"
-        assert seq[1]["operation"]["type"] == "Gemma4LogMel"
+        assert seq[1]["operation"]["type"] == "Gemma4Audio"
         attrs = seq[1]["operation"]["attrs"]
+        assert attrs["type"] == "log_mel"
         assert attrs["feature_size"] == 128
         assert attrs["sampling_rate"] == 16000
         assert attrs["frame_length_ms"] == 20.0  # noqa: RUF069
@@ -1934,9 +1968,10 @@ class TestExportForOrtGenai:
         op0 = seq[0]["operation"]
         assert op0["type"] == "AudioDecoder"
 
-        # Second op: Gemma4LogMel with expected attrs
+        # Second op: Gemma4Audio (type=log_mel) with expected attrs
         op1 = seq[1]["operation"]
-        assert op1["type"] == "Gemma4LogMel"
+        assert op1["type"] == "Gemma4Audio"
+        assert op1["attrs"]["type"] == "log_mel"
         assert op1["attrs"]["feature_size"] == 128
         assert op1["attrs"]["sampling_rate"] == 16000
         assert op1["attrs"]["mel_floor"] == 0.001  # noqa: RUF069
@@ -4050,6 +4085,131 @@ class TestGemma4RealModel:
         assert data["model"]["vision"]["spatial_merge_size"] == 2
         assert data["model"]["vision"]["config_filename"] == "image_processor.json"
 
+    def test_gemma4_unified_native_processor_contract(self, tmp_path):
+        """Export a real unified package and lock its Extensions/GenAI ABI."""
+        from mobius._builder import build_from_module
+        from mobius._configs import Gemma4AudioConfig, Gemma4Config, VisionConfig
+        from mobius._registry import registry
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
+        from mobius.tasks import get_task
+
+        config = Gemma4Config(
+            model_type="gemma4_unified",
+            num_hidden_layers=2,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            rms_norm_eps=1e-6,
+            hidden_act="gelu_pytorch_tanh",
+            attn_qk_norm=True,
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=8,
+            global_head_dim=32,
+            global_rope_theta=1_000_000.0,
+            global_partial_rotary_factor=0.25,
+            final_logit_softcapping=30.0,
+            hidden_size_per_layer_input=0,
+            num_global_key_value_heads=1,
+            attention_k_eq_v=True,
+            use_bidirectional_attention="vision",
+            image_token_id=253,
+            audio_token_id=252,
+            boa_token_id=251,
+            bos_token_id=2,
+            pad_token_id=0,
+            tie_word_embeddings=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                position_embedding_size=1120,
+                patch_size=16,
+                pooling_kernel_size=3,
+                out_hidden_size=32,
+                norm_eps=1e-6,
+                mm_tokens_per_image=280,
+            ),
+            audio=Gemma4AudioConfig(
+                hidden_size=640,
+                output_proj_dims=640,
+                audio_token_id=252,
+            ),
+        )
+        module = registry.get("gemma4_unified")(config)
+        task = get_task(_default_task_for_model("gemma4_unified"))
+        pkg = build_from_module(module, config, task=task)
+        pkg.config = config
+
+        vision_inputs = {value.name: value for value in pkg["vision_encoder"].graph.inputs}
+        pixel_values = vision_inputs["pixel_values"]
+        pixel_position_ids = vision_inputs["pixel_position_ids"]
+        assert pixel_values.dtype == ir.DataType.FLOAT
+        assert len(pixel_values.shape) == 3
+        assert pixel_values.shape[-1] == 48 * 48 * 3
+        assert pixel_position_ids.dtype == ir.DataType.INT64
+        assert len(pixel_position_ids.shape) == 3
+        assert pixel_position_ids.shape[-1] == 2
+
+        audio_inputs = {value.name: value for value in pkg["audio_encoder"].graph.inputs}
+        input_features = audio_inputs["input_features"]
+        input_features_mask = audio_inputs["input_features_mask"]
+        assert input_features.dtype == ir.DataType.FLOAT
+        assert len(input_features.shape) == 3
+        assert input_features.shape[-1] == 640
+        assert input_features_mask.dtype == ir.DataType.BOOL
+        assert len(input_features_mask.shape) == 2
+
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        with open(result["genai_config"], encoding="utf-8") as f:
+            data = json.load(f)
+
+        model = data["model"]
+        assert model["type"] == "gemma4_unified"
+        assert model["image_token_id"] == 253
+        assert model["audio_token_id"] == 252
+        assert model["boa_token_id"] == 251
+        assert model["vision"]["config_filename"] == "image_processor.json"
+        assert model["vision"]["inputs"] == {
+            "pixel_values": "pixel_values",
+            "pixel_position_ids": "pixel_position_ids",
+        }
+        assert model["speech"]["config_filename"] == "audio_feature_extraction.json"
+        assert model["speech"]["inputs"] == {
+            "audio_embeds": "input_features",
+            "attention_mask": "input_features_mask",
+        }
+        assert model["speech"]["outputs"] == {"audio_features": "audio_features"}
+
+        with open(result["processor_config"], encoding="utf-8") as f:
+            image_processor = json.load(f)
+        image_op = image_processor["processor"]["transforms"][1]["operation"]
+        assert image_op == {
+            "name": "gemma4_image_transform",
+            "type": "Gemma4ImageTransform",
+            "attrs": {
+                "patch_size": 48,
+                "max_soft_tokens": 280,
+                "pooling_kernel_size": 1,
+            },
+        }
+
+        with open(result["audio_processor"], encoding="utf-8") as f:
+            audio_processor = json.load(f)
+        audio_op = audio_processor["feature_extraction"]["sequence"][1]["operation"]
+        assert audio_op == {
+            "name": "gemma4_audio",
+            "type": "Gemma4Audio",
+            "attrs": {
+                "type": "raw_frames",
+                "audio_samples_per_token": 640,
+                "sampling_rate": 16000,
+                "padding_value": 0.0,
+            },
+        }
+
     def test_text_only_genai_config_is_decoder_only(self, tmp_path):
         """text_only gemma4_unified export -> decoder-only genai config.
 
@@ -4134,6 +4294,8 @@ class TestGemma4RealModel:
         with open(result["genai_config"]) as f:
             data = json.load(f)
 
+        # Decoder-only package: the generic "decoder" type, NOT the
+        # multimodal HF gemma4_unified -> gemma4_unified.
         assert data["model"]["type"] == "decoder"
         # Decoder-only: input_ids decoder, no multimodal sections.
         assert "vision" not in data["model"]

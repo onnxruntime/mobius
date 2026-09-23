@@ -189,6 +189,7 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | `moonshine_streaming` | `MoonshineStreamingForConditionalGeneration` | `speech-to-text` | `moonshine-ai/moonshine-streaming-tiny` |
 | `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 | `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
+| `VibeVoiceForASRStreamingTraining` | `VibeVoiceASRStreamingForConditionalGeneration` | `vibevoice-asr-streaming` | `microsoft/VibeVoice-ASR-Streaming-1.5B`, `microsoft/VibeVoice-ASR-Streaming-7B` |
 
 ### Text-to-Speech
 
@@ -197,6 +198,7 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | `qwen3_tts` | `Qwen3TTSForConditionalGeneration` | `tts` | — |
 | `qwen3_tts_tokenizer_12hz` | `Qwen3TTSTokenizerV2Model` | `codec` | — |
 | `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `vibevoice/VibeVoice-1.5B-hf` |
+| `vibevoice_asr` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr` | `microsoft/VibeVoice-ASR-HF` |
 
 ### Audio Feature Extraction
 

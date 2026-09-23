@@ -481,6 +481,35 @@ class TestQwen35MoEQMoEExport:
 
 
 class TestQwen35MoEVL3ModelQMoEExport:
+    def test_plan_only_quantization_keeps_graph_and_qmoe_weights_aligned(self):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method="olive",
+            sym=False,
+        )
+        config = dataclasses.replace(
+            _moe_vl_config(None),
+            component_quantization={"decoder": quantization},
+        )
+        model = Qwen35MoEVL3ModelCausalLMModel(config)
+
+        block = model.decoder.model.layers[0].mlp
+        assert block.experts is None
+        assert hasattr(block, "fc1_experts_weights")
+
+        result = model.preprocess_weights(_olive_expert_state_dict())
+        prefix = "decoder.model.layers.0.mlp."
+        parameter_names = {name for name, _ in model.named_parameters()}
+        for suffix in (
+            "fc1_experts_weights",
+            "fc1_scales",
+            "fc2_experts_weights",
+            "fc2_scales",
+        ):
+            assert prefix + suffix in result
+            assert prefix + suffix in parameter_names
+
     def test_olive_preprocess_packs_qmoe_and_binds(self):
         config = _moe_vl_config(
             QuantizationConfig(bits=4, group_size=_BLK, quant_method="olive", sym=False)
@@ -944,6 +973,8 @@ class TestQwen35MixedPrecisionDecoder:
         assert isinstance(model.model.layers[1].self_attn.q_proj, QuantizedLinear)
 
     def test_vl_decoder_override_uses_same_layout_for_graph_and_weights(self):
+        from mobius._component_quantization import normalize_component_quantized_weights
+
         quantization = QuantizationConfig(
             bits=4,
             group_size=16,
@@ -957,24 +988,29 @@ class TestQwen35MixedPrecisionDecoder:
         model = Qwen35VL3ModelCausalLMModel(config)
         configure_component_quantization(model, config, model.default_task)
         q_proj = model.decoder.model.layers[0].self_attn.q_proj
-
+        packed = torch.arange(q_proj._n * _H).reshape(q_proj._n, _H).to(torch.uint8)
         result = model.preprocess_weights(
             {
-                "model.language_model.layers.0.self_attn.q_proj.weight_qweight": torch.zeros(
-                    _H, _H, dtype=torch.uint8
-                ),
+                "model.language_model.layers.0.self_attn.q_proj.weight_qweight": packed,
                 "model.language_model.layers.0.self_attn.q_proj.weight_scales": torch.ones(
-                    _H, 1
+                    q_proj._n, 1
                 ),
             }
         )
 
         assert isinstance(q_proj, QuantizedLinear)
         assert (q_proj._bits, q_proj._block_size) == (8, 32)
-        assert result["decoder.model.layers.0.self_attn.q_proj.weight"].shape == (
-            _H,
-            1,
-            32,
+        assert result["decoder.model.layers.0.self_attn.q_proj.weight_qweight"] is packed
+        result = normalize_component_quantized_weights(
+            result,
+            model,
+            config,
+            ("decoder", "vision_encoder", "embedding"),
+            task=model.default_task,
+        )
+        torch.testing.assert_close(
+            result["decoder.model.layers.0.self_attn.q_proj.weight"],
+            packed.reshape(tuple(q_proj.weight.shape)),
         )
 
     def test_moe_vl_decoder_override_sizes_fused_qmoe_parameters(self):

@@ -27,6 +27,7 @@ from build_graph._support import (
     _assert_outputs_have_shapes_and_dtypes,
     _make_params,
     _run_onnx_checker,
+    _with_component_quantization,
 )
 from mobius._builder import build_from_module
 from mobius._configs import (
@@ -67,6 +68,14 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
         "diffusion_head",
         "audio_decoder",
     },
+    "vibevoice-asr": {
+        "acoustic_encoder",
+        "semantic_encoder",
+        "connectors",
+        "embedding",
+        "decoder",
+    },
+    "vibevoice-asr-streaming": {"audio_encoder", "embedding", "decoder"},
 }
 
 
@@ -1214,6 +1223,19 @@ class TestBuildSpeechGraph:
             assert model.graph is not None, f"{model_type}/{name} graph is None"
             assert len(model.graph.inputs) > 0, f"{model_type}/{name} has no inputs"
             assert len(model.graph.outputs) > 0, f"{model_type}/{name} has no outputs"
+
+    def test_component_quantization_builds(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        task = get_task(_default_task_for_model(model_type))
+        config = _with_component_quantization(config, task)
+
+        package = build_from_module(
+            registry.get(model_type)(config),
+            config,
+            task=task,
+        )
+
+        assert package
 
     def test_has_initializers(self, model_type: str, config_overrides: dict):
         """Verify all sub-models have non-empty initializers."""

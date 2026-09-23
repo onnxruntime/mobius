@@ -16,7 +16,8 @@ from onnxscript import nn
 from mobius._builder import build_from_module, resolve_dtype
 from mobius._component_quantization import (
     attach_hf_component_sources,
-    preprocess_component_quantized_state_dict,
+    normalize_component_quantized_weights,
+    validate_quantized_component_bindings,
 )
 from mobius._configs import QuantizedWeightFormat
 from mobius._model_package import ModelPackage
@@ -31,6 +32,7 @@ from mobius.integrations.compressed_tensors import (
     stream_compressed_tensors_to_package,
 )
 from mobius.tasks import ModelTask
+from mobius.weights import adapt_model_weights
 
 logger = logging.getLogger(__name__)
 
@@ -185,12 +187,28 @@ def _load_transformers_config(
 
     from mobius.integrations.transformers._config_resolver import _try_load_config_json
 
+    class _MissingStrictDataclassClassValidationError(Exception):
+        """Sentinel that cannot match errors from older Hub installations."""
+
+    try:
+        from huggingface_hub import errors as hub_errors
+    except ImportError:
+        strict_validation_error = _MissingStrictDataclassClassValidationError
+    else:
+        strict_validation_error = getattr(
+            hub_errors,
+            "StrictDataclassClassValidationError",
+            _MissingStrictDataclassClassValidationError,
+        )
     try:
         kwargs = {"trust_remote_code": trust_remote_code}
         if revision is not None:
             kwargs["revision"] = revision
         return transformers.AutoConfig.from_pretrained(model_id, **kwargs), False
-    except (ValueError, KeyError, OSError):
+    except (ValueError, KeyError, OSError, strict_validation_error):
+        # Legacy VibeVoice-ASR reused the TTS model type and needs an inference-
+        # native conversion. The supported HF release has model_type
+        # ``vibevoice_asr`` and never reaches this compatibility fallback.
         return _try_load_config_json(model_id, revision=revision), True
 
 
@@ -211,7 +229,14 @@ def _select_primary_config(hf_config):
             thinker = _dict_to_pretrained_config(thinker)
         if getattr(thinker, "text_config", None) is not None:
             hf_config = thinker.text_config
-    elif hasattr(hf_config, "decoder_config") and model_type == "qwen3_tts_tokenizer_12hz":
+    elif hasattr(hf_config, "decoder_config") and (
+        model_type == "qwen3_tts_tokenizer_12hz"
+        or (
+            model_type == "vibevoice"
+            and getattr(hf_config, "architectures", None)
+            == ["VibeVoiceForASRStreamingTraining"]
+        )
+    ):
         decoder = hf_config.decoder_config
         if isinstance(decoder, dict):
             decoder = type("DecoderConfig", (), {**decoder, "model_type": model_type})()
@@ -244,6 +269,30 @@ def _resolve_module_class(
 ) -> tuple[type[nn.Module], str | ModelTask | None, str]:
     """Resolve architecture aliases and structural fallback registrations."""
     architectures = getattr(parent_config, "architectures", None) or []
+    if model_type == "vibevoice":
+        if len(architectures) != 1:
+            raise ValueError(
+                "VibeVoice checkpoints must declare exactly one recognized architecture; "
+                "Mobius will not guess between incompatible TTS and streaming ASR pipelines."
+            )
+        architecture = architectures[0]
+        if architecture == "VibeVoiceForConditionalGeneration":
+            pass
+        elif architecture == "VibeVoiceForASRStreamingTraining":
+            model_type = architecture
+        else:
+            raise ValueError(
+                f"Unsupported VibeVoice architecture {architecture!r}; supported architectures "
+                "are 'VibeVoiceForConditionalGeneration' and "
+                "'VibeVoiceForASRStreamingTraining'."
+            )
+    if model_type == "vibevoice_asr":
+        supported_architectures = {"VibeVoiceAsrForConditionalGeneration"}
+        if set(architectures) != supported_architectures:
+            raise ValueError(
+                "Unsupported VibeVoice ASR architecture. Expected exactly "
+                f"{sorted(supported_architectures)}, got {architectures!r}."
+            )
     if allow_parent_architecture_override and architectures and architectures[0] in registry:
         architecture_key = architectures[0]
         model_type_class = registry.get(model_type) if model_type in registry else None
@@ -357,13 +406,19 @@ def build_transformers_model(
     )
 
     detection_revision = revision
-    if model_id == "vibevoice/VibeVoice-1.5B-hf" and detection_revision is None:
-        from mobius.models.vibevoice import VIBEVOICE_REVISION
+    vibevoice_sources = None
+    config_model_id = model_id
+    if "vibevoice" in model_id.casefold():
+        from mobius.models.vibevoice import resolve_vibevoice_sources
 
-        # The native conversion is the executable source of truth. Pin the
-        # first config probe and every later processor/weight call together.
-        revision = VIBEVOICE_REVISION
-        detection_revision = VIBEVOICE_REVISION
+        vibevoice_sources = resolve_vibevoice_sources(model_id, revision)
+        if vibevoice_sources is not None:
+            # The official checkpoint has legacy metadata, so resolve executable
+            # assets from the pinned Transformers-native sidecar while retaining
+            # the requested checkpoint as the exclusive weight source.
+            revision = vibevoice_sources.weight_revision
+            config_model_id = vibevoice_sources.config_model_id
+            detection_revision = vibevoice_sources.config_revision
     if model_id == "microsoft/VibeVoice-Realtime-0.5B" and detection_revision is None:
         from mobius.models.vibevoice_streaming import VIBEVOICE_STREAMING_REVISION
 
@@ -371,6 +426,18 @@ def build_transformers_model(
         # raw-config probe and every subsequent Hub operation to one checkpoint.
         revision = VIBEVOICE_STREAMING_REVISION
         detection_revision = VIBEVOICE_STREAMING_REVISION
+    if model_id == "microsoft/VibeVoice-ASR":
+        raise ValueError(
+            "microsoft/VibeVoice-ASR is a legacy training checkpoint; use "
+            "microsoft/VibeVoice-ASR-HF instead."
+        )
+    if model_id == "microsoft/VibeVoice-ASR-HF" and detection_revision is None:
+        from mobius.models.vibevoice_asr import VIBEVOICE_ASR_REVISION
+
+        # ASR shares VibeVoice's model_type but has a different source and
+        # processor contract. Keep config detection and weight loading pinned.
+        revision = VIBEVOICE_ASR_REVISION
+        detection_revision = VIBEVOICE_ASR_REVISION
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -380,7 +447,7 @@ def build_transformers_model(
         detection_revision = REUSE_REVISION
 
     hf_config, loaded_from_raw_json = _load_transformers_config(
-        model_id,
+        config_model_id,
         revision=detection_revision,
         trust_remote_code=trust_remote_code,
     )
@@ -576,6 +643,14 @@ def build_transformers_model(
     if task is None:
         task = _default_task_for_model(model_type)
 
+    from mobius.tasks import get_task
+
+    resolved_task = get_task(task)
+    component_manifest = resolved_task.component_manifest(
+        module_class=module_class,
+        model_type=model_type,
+        hf_config=parent_config,
+    )
     model_module = module_class(config)
     if dequantize_gptoss_mxfp4:
         model_module._dequantize_mxfp4_checkpoint = True
@@ -593,14 +668,27 @@ def build_transformers_model(
         fp8_kv_cache=fp8_kv_cache,
         kv_cache_scales=kv_cache_scales,
         prune_prefill_prefix=prune_prefill_prefix,
+        component_manifest=component_manifest,
     )
     graph_source_name = (
         model_type if is_gptoss_mxfp4_source and pathlib.Path(model_id).is_dir() else model_id
     )
     for name, model in package.items():
         model.graph.name = f"{graph_source_name}/{name}"
-        if model_type in _QWEN4_MODEL_TYPES | {"vibevoice", "vibevoice_streaming"}:
+        if model_type in _QWEN4_MODEL_TYPES | {
+            "vibevoice",
+            "vibevoice_streaming",
+            "vibevoice_asr",
+            "VibeVoiceForASRStreamingTraining",
+        }:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
+        if vibevoice_sources is not None:
+            model.metadata_props["mobius.executable_source"] = (
+                f"{vibevoice_sources.config_model_id}@{vibevoice_sources.config_revision}"
+            )
+            model.metadata_props["mobius.processor_source"] = (
+                f"{vibevoice_sources.processor_model_id}@{vibevoice_sources.processor_revision}"
+            )
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
@@ -676,19 +764,35 @@ def build_transformers_model(
                     "memory. The default native MXFP4 streaming path is bounded."
                 )
             state_dict = _download_weights(model_id, revision=revision)
-            if hasattr(model_module, "preprocess_weights"):
-                state_dict = model_module.preprocess_weights(state_dict)
-            state_dict = preprocess_component_quantized_state_dict(
+            if (
+                vibevoice_sources is not None
+                and vibevoice_sources.weight_layout is not None
+                and hasattr(model_module, "preprocess_weights")
+            ):
+                state_dict = model_module.preprocess_weights(
+                    state_dict,
+                    checkpoint_layout=vibevoice_sources.weight_layout,
+                )
+            else:
+                state_dict = adapt_model_weights(
+                    model_module,
+                    state_dict,
+                    config=config,
+                    manifest=component_manifest,
+                )
+            state_dict = normalize_component_quantized_weights(
                 state_dict,
                 model_module,
                 config,
-                task,
                 package.keys(),
+                manifest=component_manifest,
+                task=resolved_task,
             )
             package.apply_weights(
                 state_dict,
                 prefix_map=getattr(model_module, "weight_prefix_map", None),
             )
+        validate_quantized_component_bindings(package, config)
     return package
 
 

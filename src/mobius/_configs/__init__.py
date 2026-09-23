@@ -115,6 +115,7 @@ from mobius._configs._sub_configs import (
 from mobius._configs._wan_vae import WanVAEConfig
 from mobius._configs._world_model import LatentDynamicsConfig, WorldModelConfig
 from mobius._configs.vibevoice import (
+    VibeVoiceASRStreamingConfig,
     VibeVoiceConfig,
     VibeVoiceDiffusionConfig,
     VibeVoiceStreamingConfig,
@@ -122,6 +123,7 @@ from mobius._configs.vibevoice import (
     VibeVoiceStreamingTokenizerConfig,
     VibeVoiceTokenizerConfig,
 )
+from mobius._configs.vibevoice_asr import VibeVoiceASRConfig
 
 __all__ = [
     "DEFAULT_INT",
@@ -190,6 +192,8 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "WanVAEConfig",
+    "VibeVoiceASRConfig",
+    "VibeVoiceASRStreamingConfig",
     "VibeVoiceConfig",
     "VibeVoiceDiffusionConfig",
     "VibeVoiceStreamingConfig",

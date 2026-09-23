@@ -27,6 +27,7 @@ from build_graph._support import (
     _assert_outputs_have_shapes_and_dtypes,
     _make_params,
     _run_onnx_checker,
+    _with_component_quantization,
     known_untested_model_types,
     specialized_test_model_types,
 )
@@ -331,6 +332,19 @@ class TestBuildSeq2SeqGraph:
 
         dec_outputs = {out.name for out in pkg["decoder"].graph.outputs}
         assert "logits" in dec_outputs
+
+    def test_component_quantization_builds(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        task = get_task(_default_task_for_model(model_type))
+        config = _with_component_quantization(config, task)
+
+        package = build_from_module(
+            registry.get(model_type)(config),
+            config,
+            task=task,
+        )
+
+        assert set(package) == {"encoder", "decoder"}
 
     def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
         """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
