@@ -154,6 +154,15 @@ def _retain_last_bias_query_row(op: OpBuilder, bias: ir.Value | None) -> ir.Valu
     return op.Unsqueeze(last, op.Constant(value_ints=[2]))
 
 
+def _retain_last_bias_query_row_openvino(
+    op: OpBuilder, bias: ir.Value | None
+) -> ir.Value | None:
+    """Narrow an OpenVINO attention bias with a fusion-friendly Slice."""
+    if bias is None:
+        return None
+    return op.Slice(bias, starts=[-1], ends=[np.iinfo(np.int64).max], axes=[2])
+
+
 def _active_quantization(
     quantization: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
@@ -1110,6 +1119,246 @@ class Gemma4TextAttention(nn.Module):
                 )
             self.k_norm = RMSNorm(head_dim, eps=config.rms_norm_eps)
 
+    @staticmethod
+    def _apply_rotary_4d(
+        op: OpBuilder,
+        states: ir.Value,
+        position_embeddings: tuple,
+        head_dim: int,
+    ) -> ir.Value:
+        """Apply Gemma4's half-split RoPE directly to [B, S, H, D]."""
+        cos, sin = position_embeddings[:2]
+        cos = op.Concat(cos, cos, axis=-1)
+        sin = op.Concat(sin, sin, axis=-1)
+        cos = op.Unsqueeze(cos, [2])
+        sin = op.Unsqueeze(sin, [2])
+        if head_dim % 2:
+            raise ValueError(
+                f"Gemma4 OpenVINO RoPE requires an even head dimension, got {head_dim}."
+            )
+        first, second = op.Split(states, [head_dim // 2, head_dim // 2], axis=-1, _outputs=2)
+        rotated = op.Concat(op.Neg(second), first, axis=-1)
+        left = op.Mul(states, cos)
+        right = op.Mul(rotated, sin)
+        result = op.Add(left, right)
+        for value in (left, right, result):
+            value.type = states.type
+            value.shape = states.shape
+        return result
+
+    @staticmethod
+    def _broadcast_kv_heads(
+        op: OpBuilder,
+        states: ir.Value,
+        attention_bias: ir.Value,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        head_dim: int,
+    ) -> ir.Value:
+        """Broadcast BNSH K/V heads using the MQA pattern OpenVINO fuses."""
+        if num_attention_heads == num_key_value_heads:
+            return states
+        if num_attention_heads % num_key_value_heads:
+            raise ValueError(
+                f"num_attention_heads ({num_attention_heads}) must be divisible by "
+                f"num_key_value_heads ({num_key_value_heads})."
+            )
+        repeats = num_attention_heads // num_key_value_heads
+        states_5d = op.Unsqueeze(states, [2])
+        batch_shape = op.Shape(attention_bias, start=0, end=1)
+        sequence_shape = op.Shape(attention_bias, start=3, end=4)
+        target_5d = op.Concat(
+            batch_shape,
+            [num_key_value_heads],
+            [repeats],
+            sequence_shape,
+            [head_dim],
+            axis=0,
+        )
+        states_5d = op.Expand(states_5d, target_5d)
+        states_5d.type = states.type
+        states_5d.shape = ir.Shape(
+            [states.shape[0], num_key_value_heads, repeats, states.shape[2], head_dim]
+        )
+        result = op.Reshape(
+            states_5d,
+            op.Concat(
+                batch_shape,
+                [num_attention_heads],
+                sequence_shape,
+                [head_dim],
+                axis=0,
+            ),
+        )
+        result.type = states.type
+        result.shape = ir.Shape(
+            [states.shape[0], num_attention_heads, states.shape[2], head_dim]
+        )
+        return result
+
+    def _forward_openvino_attention(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value,
+        position_embeddings: tuple | None,
+        shared_kv_states: dict | None,
+        past_key_value: tuple | None,
+    ) -> tuple[ir.Value, tuple[ir.Value, ir.Value]]:
+        """Emit rank-4 Attention so OpenVINO can form SDPA without layout churn."""
+        batch_dim = (
+            hidden_states.shape[0]
+            if hidden_states.shape is not None
+            else "component.decoder.batch"
+        )
+        query_sequence_dim = (
+            hidden_states.shape[1]
+            if hidden_states.shape is not None
+            else (1 if self.is_kv_shared_layer else "component.decoder.sequence_len")
+        )
+        query_states = self.q_proj(op, hidden_states)
+        query_states = op.Reshape(
+            query_states,
+            [0, 0, self.num_attention_heads, self.head_dim],
+        )
+        query_states.shape = ir.Shape(
+            [batch_dim, query_sequence_dim, self.num_attention_heads, self.head_dim]
+        )
+        query_states = self.q_norm(op, query_states)
+        if position_embeddings is not None:
+            query_states = self._apply_rotary_4d(
+                op, query_states, position_embeddings, self.head_dim
+            )
+        query_states = op.Transpose(query_states, perm=[0, 2, 1, 3])
+        query_states.type = hidden_states.type
+        query_states.shape = ir.Shape(
+            [batch_dim, self.num_attention_heads, query_sequence_dim, self.head_dim]
+        )
+
+        if self.is_kv_shared_layer:
+            present_key, present_value = shared_kv_states[self.kv_shared_layer_index][:2]
+        else:
+            key_raw = self.k_proj(op, hidden_states)
+            key_states = op.Reshape(
+                key_raw,
+                [0, 0, self.num_key_value_heads, self.head_dim],
+            )
+            key_states.shape = ir.Shape(
+                [batch_dim, query_sequence_dim, self.num_key_value_heads, self.head_dim]
+            )
+            key_states = self.k_norm(op, key_states)
+            if position_embeddings is not None:
+                key_states = self._apply_rotary_4d(
+                    op, key_states, position_embeddings, self.head_dim
+                )
+            key_states = op.Transpose(key_states, perm=[0, 2, 1, 3])
+            key_states.type = hidden_states.type
+            key_states.shape = ir.Shape(
+                [batch_dim, self.num_key_value_heads, query_sequence_dim, self.head_dim]
+            )
+
+            value_raw = (
+                key_raw if self._use_alternative_attention else self.v_proj(op, hidden_states)
+            )
+            value_states = op.Reshape(
+                value_raw,
+                [0, 0, self.num_key_value_heads, self.head_dim],
+            )
+            value_states.shape = ir.Shape(
+                [batch_dim, query_sequence_dim, self.num_key_value_heads, self.head_dim]
+            )
+            value_f32 = op.Cast(value_states, to=ir.DataType.FLOAT)
+            value_f32.shape = value_states.shape
+            mean_sq = op.ReduceMean(op.Mul(value_f32, value_f32), [-1], keepdims=1)
+            rms = op.Sqrt(op.Add(mean_sq, op.Constant(value_floats=[self._v_norm_eps])))
+            value_states = op.CastLike(op.Div(value_f32, rms), value_states)
+            value_states.type = hidden_states.type
+            value_states.shape = ir.Shape(
+                [batch_dim, query_sequence_dim, self.num_key_value_heads, self.head_dim]
+            )
+            value_states = op.Transpose(value_states, perm=[0, 2, 1, 3])
+            value_states.type = hidden_states.type
+            value_states.shape = ir.Shape(
+                [batch_dim, self.num_key_value_heads, query_sequence_dim, self.head_dim]
+            )
+            if past_key_value is not None:
+                present_key = op.Concat(past_key_value[0], key_states, axis=2)
+                present_value = op.Concat(past_key_value[1], value_states, axis=2)
+                present_sequence = "past_sequence_length + sequence_len"
+            else:
+                present_key, present_value = key_states, value_states
+                present_sequence = query_sequence_dim
+            present_shape = ir.Shape(
+                [batch_dim, self.num_key_value_heads, present_sequence, self.head_dim]
+            )
+            for value in (present_key, present_value):
+                value.type = hidden_states.type
+                value.shape = present_shape
+
+        key_states = self._broadcast_kv_heads(
+            op,
+            present_key,
+            attention_bias,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+        value_states = self._broadcast_kv_heads(
+            op,
+            present_value,
+            attention_bias,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+        attn_output = op.Attention(
+            query_states,
+            key_states,
+            value_states,
+            attention_bias,
+            None,
+            None,
+            scale=self.scaling,
+            softcap=self.softcap,
+            is_causal=0,
+            _outputs=1,
+        )
+        attn_output.type = query_states.type
+        attn_output.shape = ir.Shape(
+            [batch_dim, self.num_attention_heads, query_sequence_dim, self.head_dim]
+        )
+
+        if (
+            not self.is_kv_shared_layer
+            and self.provides_shared_kv
+            and shared_kv_states is not None
+        ):
+            shared_kv_states[self.layer_idx] = (present_key, present_value, None)
+
+        attn_output = op.Transpose(attn_output, perm=[0, 2, 1, 3])
+        attn_output.type = query_states.type
+        attn_output.shape = ir.Shape(
+            [
+                query_states.shape[0],
+                query_states.shape[2],
+                self.num_attention_heads,
+                self.head_dim,
+            ]
+        )
+        attn_output = op.Reshape(
+            attn_output,
+            [0, 0, self.num_attention_heads * self.head_dim],
+        )
+        attn_output.type = query_states.type
+        attn_output.shape = ir.Shape(
+            [
+                query_states.shape[0],
+                query_states.shape[2],
+                self.num_attention_heads * self.head_dim,
+            ]
+        )
+        return self.o_proj(op, attn_output), (present_key, present_value)
+
     def forward(
         self,
         op: OpBuilder,
@@ -1134,6 +1383,21 @@ class Gemma4TextAttention(nn.Module):
         # additionally receive their own StaticCacheState via static_cache; KV-shared
         # layers receive static_cache=None and read the source layer's full buffer.
         is_static = static_kv_seqlen is not None
+
+        if (
+            ep_capabilities().requires_rank4_attention
+            and not use_gqa
+            and not is_static
+            and attention_bias is not None
+        ):
+            return self._forward_openvino_attention(
+                op,
+                hidden_states,
+                attention_bias,
+                position_embeddings,
+                shared_kv_states,
+                past_key_value,
+            )
 
         # Q projection + per-head Q norm
         # For GQA, skip manual RoPE — the op applies it internally.
@@ -2234,7 +2498,7 @@ class Gemma4TextModel(nn.Module):
                 )
             )
             per_layer_list = [
-                op.Squeeze(op.Slice(per_layer_4d, starts=[i], ends=[i + 1], axes=[2]), [2])
+                op.Gather(per_layer_4d, op.Constant(value_int=i), axis=2)
                 for i in range(num_layers)
             ]
             for layer_idx in range(self._first_kv_shared_layer, num_layers):
@@ -2452,7 +2716,7 @@ class Gemma4TextModel(nn.Module):
         # layers without truncation.
         if past_key_values is not None:
             kv_iter = iter(past_key_values)
-            past_kvs: list = [
+            past_kvs = [
                 None if layer.self_attn.is_kv_shared_layer else next(kv_iter)
                 for layer in self.layers
             ]
@@ -2485,7 +2749,11 @@ class Gemma4TextModel(nn.Module):
                             for key, value in fallback_pos_dict.items()
                         }
                     fallback_bias_dict = {
-                        key: _retain_last_bias_query_row(op, value)
+                        key: (
+                            _retain_last_bias_query_row_openvino(op, value)
+                            if caps.requires_rank4_attention
+                            else _retain_last_bias_query_row(op, value)
+                        )
                         for key, value in fallback_bias_dict.items()
                     }
             per_layer_input = per_layer_list[i] if per_layer_list is not None else None

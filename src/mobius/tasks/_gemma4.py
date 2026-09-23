@@ -538,12 +538,21 @@ class Gemma4Task(ModelTask):
 
         graph, builder = _make_graph(name="decoder")
         op = builder.op
+        caps = ep_capabilities()
+        decoder_io_dtype = (
+            ir.DataType.FLOAT if caps.requires_float32_decoder_io else config.dtype
+        )
 
-        inputs_embeds = builder.input(
+        inputs_embeds_input = builder.input(
             "inputs_embeds",
-            dtype=config.dtype,
+            dtype=decoder_io_dtype,
             shape=[batch, seq_len, config.hidden_size],
         )
+        inputs_embeds = inputs_embeds_input
+        if decoder_io_dtype != config.dtype:
+            inputs_embeds = op.Cast(inputs_embeds_input, to=config.dtype)
+            inputs_embeds.type = config.dtype
+            inputs_embeds.shape = inputs_embeds_input.shape
 
         past_seq_len = ir.SymbolicDim("past_sequence_len")
         # A static-cache layer masks itself from ``write_indices`` and
@@ -569,17 +578,21 @@ class Gemma4Task(ModelTask):
         per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         if per_layer_dim and not config.split_per_layer_embedding:
-            caps = ep_capabilities()
             per_layer_shape = (
                 [batch, seq_len, config.num_hidden_layers, per_layer_dim]
                 if caps.layered_per_layer_inputs
                 else [batch, seq_len, config.num_hidden_layers * per_layer_dim]
             )
-            per_layer_inputs_val = builder.input(
+            per_layer_inputs_input = builder.input(
                 "per_layer_inputs",
-                dtype=config.dtype,
+                dtype=decoder_io_dtype,
                 shape=per_layer_shape,
             )
+            per_layer_inputs_val = per_layer_inputs_input
+            if decoder_io_dtype != config.dtype:
+                per_layer_inputs_val = op.Cast(per_layer_inputs_input, to=config.dtype)
+                per_layer_inputs_val.type = config.dtype
+                per_layer_inputs_val.shape = per_layer_inputs_input.shape
 
         # Vision-block bidirectional attention: the decoder receives the raw
         # ``input_ids`` (alongside ``inputs_embeds``) and derives the block
@@ -627,6 +640,11 @@ class Gemma4Task(ModelTask):
                 input_ids=input_ids_val,
             )
 
+        if caps.requires_float32_decoder_io and logits.dtype != ir.DataType.FLOAT:
+            logits_f32 = op.Cast(logits, to=ir.DataType.FLOAT)
+            logits_f32.type = ir.DataType.FLOAT
+            logits_f32.shape = logits.shape
+            logits = logits_f32
         builder.add_output(logits, "logits")
         if static:
             _register_hybrid_cache_outputs(builder, present_key_values, config)
@@ -807,9 +825,21 @@ class Gemma4Task(ModelTask):
 
         # ``embedding`` returns a dict of named outputs: always
         # ``inputs_embeds``; optionally ``per_layer_inputs`` (per-layer gating).
-        builder.add_output(result["inputs_embeds"], "inputs_embeds")
+        cast_outputs = ep_capabilities().requires_float32_decoder_io
+
+        def component_output(value: ir.Value) -> ir.Value:
+            if not cast_outputs or value.dtype == ir.DataType.FLOAT:
+                return value
+            output = op.Cast(value, to=ir.DataType.FLOAT)
+            output.type = ir.DataType.FLOAT
+            output.shape = value.shape
+            return output
+
+        builder.add_output(component_output(result["inputs_embeds"]), "inputs_embeds")
         if "per_layer_inputs" in result:
-            builder.add_output(result["per_layer_inputs"], "per_layer_inputs")
+            builder.add_output(
+                component_output(result["per_layer_inputs"]), "per_layer_inputs"
+            )
         return _make_model(graph)
 
 
