@@ -151,6 +151,37 @@ class TestGemma4ModelPreprocessWeights:
         with pytest.raises(NotImplementedError, match="Quantized Gemma4 MoE experts"):
             Gemma4Model(config).preprocess_weights(state_dict)
 
+    def test_shared_kv_layer_drops_redundant_kv_weights(self):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            num_hidden_layers=2,
+            num_kv_shared_layers=1,
+            layer_types=["sliding_attention", "sliding_attention"],
+        )
+        state_dict = {
+            "model.language_model.layers.1.self_attn.k_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.k_proj.weight_scales": torch.ones(64, 4),
+            "model.language_model.layers.1.self_attn.v_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.v_proj.weight_scales": torch.ones(64, 4),
+            "model.language_model.layers.1.self_attn.k_norm.weight": torch.ones(16),
+            "model.language_model.layers.1.self_attn.q_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.q_proj.weight_scales": torch.ones(64, 4),
+        }
+
+        result = Gemma4Model(config).preprocess_weights(state_dict)
+
+        assert not any(
+            token in key for key in result for token in ("k_proj", "v_proj", "k_norm")
+        )
+        assert "decoder.model.layers.1.self_attn.q_proj.weight_qweight" in result
+        assert "decoder.model.layers.1.self_attn.q_proj.weight_scales" in result
+
     def test_olive_quantized_decoder_sidecars_are_preprocessed(self):
         config = _tiny_gemma4_config(
             enable_moe_block=False,
@@ -383,6 +414,8 @@ class TestGemma4PerLayerInputLayout:
         assert len(decoder_input.shape) == expected_rank
         assert len(embedding_output.shape) == expected_rank
         if expected_rank == 4:
+            assert decoder_input.dtype == ir.DataType.FLOAT
+            assert embedding_output.dtype == ir.DataType.FLOAT
             assert list(decoder_input.shape[-2:]) == [
                 config.num_hidden_layers,
                 config.hidden_size_per_layer_input,
@@ -396,6 +429,14 @@ class TestGemma4PerLayerInputLayout:
                 and any(value is decoder_input for value in node.inputs if value is not None)
                 for node in package["decoder"].graph
             )
+            per_layer_gathers = [
+                node
+                for node in package["decoder"].graph
+                if node.op_type == "Gather"
+                and node.attributes.get("axis") is not None
+                and node.attributes["axis"].value == 2
+            ]
+            assert len(per_layer_gathers) == config.num_hidden_layers
         else:
             assert (
                 decoder_input.shape[-1]
@@ -405,6 +446,40 @@ class TestGemma4PerLayerInputLayout:
                 embedding_output.shape[-1]
                 == config.num_hidden_layers * config.hidden_size_per_layer_input
             )
+
+
+class TestGemma4OpenVINOAttention:
+    def test_openvino_emits_rank4_attention_topology(self):
+        from collections import Counter
+
+        from mobius._builder import build_from_module
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=256,
+            num_kv_shared_layers=0,
+        )
+        package = build_from_module(
+            Gemma4Model(config),
+            config,
+            task=Gemma4Task(),
+            execution_provider="openvino",
+        )
+        counts = Counter(node.op_type for node in package["decoder"].graph)
+        decoder = package["decoder"].graph
+        inputs_embeds = next(
+            value for value in decoder.inputs if value.name == "inputs_embeds"
+        )
+        logits = next(value for value in decoder.outputs if value.name == "logits")
+
+        assert counts["Attention"] == config.num_hidden_layers
+        assert counts["RotaryEmbedding"] == 0
+        assert counts["Softmax"] == 0
+        assert counts["CumSum"] == 1
+        assert inputs_embeds.dtype == ir.DataType.FLOAT
+        assert logits.dtype == ir.DataType.FLOAT
 
 
 class TestGemma4VisionQuantization:
