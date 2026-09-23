@@ -25,106 +25,10 @@ __all__ = [
 
 import dataclasses
 import logging
-from collections.abc import Mapping
-from typing import Any, cast
+
+from mobius._component_manifest import SharedWeightEndpoint, SharedWeightInfo
 
 logger = logging.getLogger(__name__)
-
-_INPUT_EMBEDDING_MODULE_NAMES = {
-    "codec_embedding",
-    "embed_tokens",
-    "shared",
-    "text_embedding",
-    "tok_embeddings",
-}
-_OUTPUT_HEAD_MODULE_NAMES = {
-    "codec_head",
-    "lm_head",
-    "output",
-    "output_projection",
-    "proj_out",
-}
-
-
-@dataclasses.dataclass(frozen=True)
-class SharedWeightEndpoint:
-    """One component-local consumer of a shared HuggingFace parameter."""
-
-    component: str
-    parameter: str
-
-    def __post_init__(self) -> None:
-        if not self.component:
-            raise ValueError("shared-weight component must not be empty")
-        if not self.parameter:
-            raise ValueError("shared-weight parameter must not be empty")
-
-    @classmethod
-    def from_value(cls, value: object) -> SharedWeightEndpoint:
-        """Normalize a mapping or duck-typed endpoint."""
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, Mapping):
-            return cls(
-                component=str(value["component"]),
-                parameter=str(value["parameter"]),
-            )
-        duck_value = cast(Any, value)
-        return cls(
-            component=str(duck_value.component),
-            parameter=str(duck_value.parameter),
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class SharedWeightInfo:
-    """A logical HuggingFace parameter consumed by multiple components."""
-
-    name: str
-    canonical: SharedWeightEndpoint
-    aliases: tuple[SharedWeightEndpoint, ...]
-    kind: str = "parameter_alias"
-
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("shared-weight name must not be empty")
-        if not self.kind:
-            raise ValueError(f"shared weight {self.name!r} kind must not be empty")
-        if not self.aliases:
-            raise ValueError(f"shared weight {self.name!r} must declare at least one alias")
-        endpoints = (self.canonical, *self.aliases)
-        if len(set(endpoints)) != len(endpoints):
-            raise ValueError(f"shared weight {self.name!r} contains duplicate endpoints")
-
-    @classmethod
-    def from_value(cls, value: object) -> SharedWeightInfo:
-        """Normalize a mapping or duck-typed shared-weight declaration."""
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, Mapping):
-            return cls(
-                name=str(value["name"]),
-                canonical=SharedWeightEndpoint.from_value(value["canonical"]),
-                aliases=tuple(
-                    SharedWeightEndpoint.from_value(alias)
-                    for alias in value.get("aliases", ())
-                ),
-                kind=str(value.get("kind", "parameter_alias")),
-            )
-        duck_value = cast(Any, value)
-        return cls(
-            name=str(duck_value.name),
-            canonical=SharedWeightEndpoint.from_value(duck_value.canonical),
-            aliases=tuple(
-                SharedWeightEndpoint.from_value(alias) for alias in duck_value.aliases
-            ),
-            kind=str(getattr(duck_value, "kind", "parameter_alias")),
-        )
-
-    @property
-    def endpoints(self) -> tuple[SharedWeightEndpoint, ...]:
-        """Canonical endpoint followed by every alias."""
-        return (self.canonical, *self.aliases)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,100 +131,6 @@ def _get_hf_component_sources(
     return get_hf_component_sources(module_class, model_type, hf_config)
 
 
-def _config_ties_word_embeddings(hf_config: object) -> bool:
-    """Whether the parent or nested text config declares tied embeddings."""
-    configs = (
-        hf_config,
-        getattr(hf_config, "text_config", None),
-        getattr(hf_config, "llm_config", None),
-        getattr(hf_config, "language_config", None),
-    )
-    return any(
-        bool(getattr(config, "tie_word_embeddings", False))
-        for config in configs
-        if config is not None
-    )
-
-
-def _aliased_component_endpoint(
-    manifest,
-    *,
-    role: str,
-    local_names: set[str],
-) -> SharedWeightEndpoint | None:
-    """Resolve one explicitly aliased source module for a component role."""
-    candidates = {
-        SharedWeightEndpoint(
-            component=component.name,
-            parameter=f"{source_path}.weight",
-        )
-        for component in manifest.values()
-        if component.role == role
-        for local_path, source_path in component.source_path_aliases
-        if local_path.rsplit(".", 1)[-1] in local_names
-    }
-    if len(candidates) != 1:
-        return None
-    return candidates.pop()
-
-
-def _infer_hf_shared_weights(
-    hf_config: object,
-    manifest,
-) -> tuple[SharedWeightInfo, ...]:
-    """Infer standard tied word embeddings from config plus explicit aliases."""
-    if not _config_ties_word_embeddings(hf_config):
-        return ()
-    canonical = _aliased_component_endpoint(
-        manifest,
-        role="embedding",
-        local_names=_INPUT_EMBEDDING_MODULE_NAMES,
-    )
-    output = _aliased_component_endpoint(
-        manifest,
-        role="decoder",
-        local_names=_OUTPUT_HEAD_MODULE_NAMES,
-    )
-    if canonical is None or output is None or canonical.component == output.component:
-        return ()
-    return (
-        SharedWeightInfo(
-            name="word_embeddings",
-            kind="tied_word_embeddings",
-            canonical=canonical,
-            aliases=(output,),
-        ),
-    )
-
-
-def _validate_shared_weights(shared_weights, manifest) -> None:
-    """Validate component ownership and runtime paths for shared parameters."""
-    seen_names: set[str] = set()
-    for shared_weight in shared_weights:
-        if shared_weight.name in seen_names:
-            raise ValueError(
-                f"shared weight {shared_weight.name!r} is declared more than once"
-            )
-        seen_names.add(shared_weight.name)
-        for endpoint in shared_weight.endpoints:
-            if endpoint.component not in manifest:
-                raise ValueError(
-                    f"shared weight {shared_weight.name!r} references unknown "
-                    f"component {endpoint.component!r}"
-                )
-            source_paths = manifest[endpoint.component].source_paths
-            module_path = endpoint.parameter.rpartition(".")[0]
-            if source_paths and not any(
-                module_path == source_path or module_path.startswith(f"{source_path}.")
-                for source_path in source_paths
-            ):
-                raise ValueError(
-                    f"shared weight {shared_weight.name!r} parameter "
-                    f"{endpoint.parameter!r} is outside component "
-                    f"{endpoint.component!r} source paths {source_paths!r}"
-                )
-
-
 def inspect_components(
     model_id: str,
     task=None,
@@ -360,10 +170,7 @@ def inspect_components(
         model_type=model_type,
         hf_config=hf_config,
     )
-    shared_weights = (
-        _infer_hf_shared_weights(hf_config, manifest) if hf_config is not None else ()
-    )
-    _validate_shared_weights(shared_weights, manifest)
+    shared_weights = manifest.shared_weights
     shared_by_component = {
         name: tuple(
             shared_weight

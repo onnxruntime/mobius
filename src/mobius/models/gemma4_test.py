@@ -20,6 +20,7 @@ from mobius._configs import (
     QuantizationOverride,
 )
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
+from mobius.weights import adapt_model_weights
 
 
 def _tiny_gemma4_config(**overrides) -> Gemma4Config:
@@ -929,11 +930,14 @@ class TestGemma4ComponentWeightAdapters:
         qweight = torch.zeros(256, 64, dtype=torch.uint8)
         scales = torch.ones(256, 4)
 
-        renamed = module.preprocess_weights(
+        renamed = adapt_model_weights(
+            module,
             {
                 "model.language_model.embed_tokens.weight_qweight": qweight,
                 "model.language_model.embed_tokens.weight_scales": scales,
-            }
+            },
+            config=config,
+            manifest=manifest,
         )
 
         assert renamed["embedding.embed_tokens.weight_qweight"] is qweight
