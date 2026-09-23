@@ -151,6 +151,37 @@ class TestGemma4ModelPreprocessWeights:
         with pytest.raises(NotImplementedError, match="Quantized Gemma4 MoE experts"):
             Gemma4Model(config).preprocess_weights(state_dict)
 
+    def test_shared_kv_layer_drops_redundant_kv_weights(self):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            num_hidden_layers=2,
+            num_kv_shared_layers=1,
+            layer_types=["sliding_attention", "sliding_attention"],
+        )
+        state_dict = {
+            "model.language_model.layers.1.self_attn.k_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.k_proj.weight_scales": torch.ones(64, 4),
+            "model.language_model.layers.1.self_attn.v_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.v_proj.weight_scales": torch.ones(64, 4),
+            "model.language_model.layers.1.self_attn.k_norm.weight": torch.ones(16),
+            "model.language_model.layers.1.self_attn.q_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.q_proj.weight_scales": torch.ones(64, 4),
+        }
+
+        result = Gemma4Model(config).preprocess_weights(state_dict)
+
+        assert not any(
+            token in key for key in result for token in ("k_proj", "v_proj", "k_norm")
+        )
+        assert "decoder.model.layers.1.self_attn.q_proj.weight_qweight" in result
+        assert "decoder.model.layers.1.self_attn.q_proj.weight_scales" in result
+
     def test_olive_quantized_decoder_sidecars_are_preprocessed(self):
         config = _tiny_gemma4_config(
             enable_moe_block=False,

@@ -444,6 +444,31 @@ def _dtype_safe_compress(
 # ---------------------------------------------------------------------------
 
 
+def _drop_shared_kv_weights(
+    state_dict: dict[str, torch.Tensor],
+    config: Gemma4Config,
+    *,
+    prefix: str,
+) -> None:
+    """Drop redundant K/V weights for layers that borrow a shared KV cache."""
+    num_shared_layers = config.num_kv_shared_layers
+    if not num_shared_layers:
+        return
+
+    first_shared_layer = config.num_hidden_layers - num_shared_layers
+    layers_prefix = f"{prefix}layers."
+    unused_suffixes = ("self_attn.k_proj.", "self_attn.v_proj.", "self_attn.k_norm.")
+    for key in list(state_dict):
+        if not key.startswith(layers_prefix):
+            continue
+        layer_and_suffix = key[len(layers_prefix) :]
+        layer_index, separator, suffix = layer_and_suffix.partition(".")
+        if not separator or not layer_index.isdigit():
+            continue
+        if int(layer_index) >= first_shared_layer and suffix.startswith(unused_suffixes):
+            state_dict.pop(key)
+
+
 def _remap_moe_expert_weights(
     state_dict: dict[str, torch.Tensor],
     config: Gemma4Config,
@@ -2941,6 +2966,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         # to our fused embedding table — no splitting needed.
         # (For WebGPU, splitting is handled by _Gemma4DecoderModel.preprocess_weights.)
         # Map HF expert weight names and fold router scale
+        _drop_shared_kv_weights(state_dict, self.config, prefix="model.")
         _remap_moe_expert_weights(state_dict, self.config)
         _split_per_layer_projection_weight(state_dict, "model.", self.config)
         return super().preprocess_weights(state_dict)
@@ -3011,6 +3037,7 @@ class _Gemma4DecoderModel(nn.Module):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        _drop_shared_kv_weights(state_dict, self.config, prefix="model.")
         _split_per_layer_projection_weight(state_dict, "model.", self.config)
         # For WebGPU: split the fused [V, L*D] per-layer embedding into L separate [V, D] tables.
         per_layer_dim = self.config.hidden_size_per_layer_input
@@ -3855,6 +3882,8 @@ class Gemma4Model(nn.Module):
             else:
                 renamed[key] = value
 
+        _drop_shared_kv_weights(renamed, self.config, prefix="decoder.model.")
+
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
 
@@ -4033,4 +4062,5 @@ class Gemma4UnifiedModel(nn.Module):
             else:
                 renamed[key] = value
 
+        _drop_shared_kv_weights(renamed, self.config, prefix="decoder.model.")
         return renamed
