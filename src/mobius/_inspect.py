@@ -30,6 +30,21 @@ from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
+_INPUT_EMBEDDING_MODULE_NAMES = {
+    "codec_embedding",
+    "embed_tokens",
+    "shared",
+    "text_embedding",
+    "tok_embeddings",
+}
+_OUTPUT_HEAD_MODULE_NAMES = {
+    "codec_head",
+    "lm_head",
+    "output",
+    "output_projection",
+    "proj_out",
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class SharedWeightEndpoint:
@@ -212,15 +227,70 @@ def _get_hf_component_sources(
     return get_hf_component_sources(module_class, model_type, hf_config)
 
 
-def _get_hf_shared_weights(
-    module_class: type,
+def _config_ties_word_embeddings(hf_config: object) -> bool:
+    """Whether the parent or nested text config declares tied embeddings."""
+    configs = (
+        hf_config,
+        getattr(hf_config, "text_config", None),
+        getattr(hf_config, "llm_config", None),
+        getattr(hf_config, "language_config", None),
+    )
+    return any(
+        bool(getattr(config, "tie_word_embeddings", False))
+        for config in configs
+        if config is not None
+    )
+
+
+def _aliased_component_endpoint(
+    manifest,
+    *,
+    role: str,
+    local_names: set[str],
+) -> SharedWeightEndpoint | None:
+    """Resolve one explicitly aliased source module for a component role."""
+    candidates = {
+        SharedWeightEndpoint(
+            component=component.name,
+            parameter=f"{source_path}.weight",
+        )
+        for component in manifest.values()
+        if component.role == role
+        for local_path, source_path in component.source_path_aliases
+        if local_path.rsplit(".", 1)[-1] in local_names
+    }
+    if len(candidates) != 1:
+        return None
+    return candidates.pop()
+
+
+def _infer_hf_shared_weights(
     hf_config: object,
+    manifest,
 ) -> tuple[SharedWeightInfo, ...]:
-    """Read architecture-declared cross-component shared parameters."""
-    resolver = getattr(module_class, "get_hf_shared_weights", None)
-    if resolver is None:
+    """Infer standard tied word embeddings from config plus explicit aliases."""
+    if not _config_ties_word_embeddings(hf_config):
         return ()
-    return tuple(SharedWeightInfo.from_value(value) for value in resolver(hf_config=hf_config))
+    canonical = _aliased_component_endpoint(
+        manifest,
+        role="embedding",
+        local_names=_INPUT_EMBEDDING_MODULE_NAMES,
+    )
+    output = _aliased_component_endpoint(
+        manifest,
+        role="decoder",
+        local_names=_OUTPUT_HEAD_MODULE_NAMES,
+    )
+    if canonical is None or output is None or canonical.component == output.component:
+        return ()
+    return (
+        SharedWeightInfo(
+            name="word_embeddings",
+            kind="tied_word_embeddings",
+            canonical=canonical,
+            aliases=(output,),
+        ),
+    )
 
 
 def _validate_shared_weights(shared_weights, manifest) -> None:
@@ -291,9 +361,7 @@ def inspect_components(
         hf_config=hf_config,
     )
     shared_weights = (
-        _get_hf_shared_weights(module_class, hf_config)
-        if module_class is not None and hf_config is not None
-        else ()
+        _infer_hf_shared_weights(hf_config, manifest) if hf_config is not None else ()
     )
     _validate_shared_weights(shared_weights, manifest)
     shared_by_component = {

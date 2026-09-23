@@ -96,34 +96,6 @@ _GEMMA4_COMPONENT_SOURCES: dict[str, tuple[str, ...]] = {
 }
 
 
-def _gemma4_hf_shared_weights(*, hf_config):
-    """Declare the tied token table when the HuggingFace config enables it."""
-    text_config = getattr(hf_config, "text_config", None)
-    tied = getattr(
-        text_config,
-        "tie_word_embeddings",
-        getattr(hf_config, "tie_word_embeddings", False),
-    )
-    if not tied:
-        return ()
-    return (
-        {
-            "name": "word_embeddings",
-            "kind": "tied_word_embeddings",
-            "canonical": {
-                "component": "embedding",
-                "parameter": "model.language_model.embed_tokens.weight",
-            },
-            "aliases": (
-                {
-                    "component": "decoder",
-                    "parameter": "lm_head.weight",
-                },
-            ),
-        },
-    )
-
-
 def _materialize_gemma4_split_tied_lm_head(
     state_dict: dict[str, torch.Tensor],
     config: Gemma4Config,
@@ -3463,7 +3435,6 @@ class Gemma4Model(nn.Module):
 
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = _GEMMA4_COMPONENT_SOURCES
-    get_hf_shared_weights = staticmethod(_gemma4_hf_shared_weights)
     HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
         "decoder": {
             "model": "model.language_model",
@@ -3725,7 +3696,6 @@ class Gemma4UnifiedModel(nn.Module):
         "audio_encoder": ("model.embed_audio",),
         "embedding": ("model.language_model.embed_tokens",),
     }
-    get_hf_shared_weights = staticmethod(_gemma4_hf_shared_weights)
     HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
         "decoder": {
             "model": "model.language_model",
