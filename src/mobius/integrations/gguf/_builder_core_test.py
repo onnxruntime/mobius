@@ -114,6 +114,22 @@ def test_existing_routes_ignore_absent_component_quantization() -> None:
     assert changed != legacy
 
 
+def test_existing_routes_ignore_empty_qmoe_source_paths() -> None:
+    from mobius._testing import make_config
+    from mobius.integrations.gguf._builder import _serialize_route_graph_config
+
+    config = make_config()
+    legacy = _serialize_route_graph_config(config, "llama")
+    changed = _serialize_route_graph_config(
+        dataclasses.replace(config, qmoe_source_paths=("model.layers.0.mlp",)),
+        "llama",
+    )
+
+    assert "qmoe_source_paths" not in json.loads(legacy)
+    assert json.loads(changed)["qmoe_source_paths"] == ["model.layers.0.mlp"]
+    assert changed != legacy
+
+
 class TestReuseGgufWeights:
     """Tests for mixed GGUF references plus converted ONNX sidecar weights."""
 

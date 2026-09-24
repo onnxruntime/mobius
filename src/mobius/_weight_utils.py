@@ -240,9 +240,9 @@ def resolve_qmoe_quantization(
     """Resolve and validate FC1/FC2 layouts for one native QMoE layer.
 
     Legacy uniform INT4 layouts retain the existing predicate and behavior.
-    The first mixed layout is intentionally narrower: Olive integer-affine
-    FC1 INT2 plus FC2 INT4, with a common QMoE block size and the model-wide
-    INT4 layout as the fallback for non-expert projections.
+    Projection overrides support Olive integer-affine FC1/FC2 widths (2, 4)
+    and (4, 8), (8, 4), or (8, 8), with a common QMoE block size and the
+    model-wide INT4 layout as the fallback for non-expert projections.
 
     Explicit per-layer plans must either resolve to a bindable native layout
     or raise; they never silently select an incompatible dense fallback.
@@ -302,7 +302,10 @@ def resolve_qmoe_quantization(
         return layout
 
     requested_mixed = (
-        fc1.bits != fc2.bits or fc1.group_size != fc2.group_size or fc1.sym != fc2.sym
+        fc1.bits != fc2.bits
+        or fc1.group_size != fc2.group_size
+        or fc1.sym != fc2.sym
+        or (fallback is not None and fc1.bits == fc2.bits == 8)
     )
     if not requested_mixed:
         if not (
@@ -325,10 +328,11 @@ def resolve_qmoe_quantization(
             "Mixed native QMoE requires Olive integer-affine weights with packed "
             "uint8 zero points."
         )
-    if fallback is None or (fc1.bits, fc2.bits) != (2, 4):
+    if fallback is None or (fc1.bits, fc2.bits) not in {(2, 4), (4, 8), (8, 4), (8, 8)}:
         raise ValueError(
             "Unsupported mixed native QMoE expert widths: expected model-wide "
-            f"INT4 with FC1 INT2 and FC2 INT4, got fallback={quantization.bits}, "
+            "INT4 with FC1/FC2 in {(2, 4), (4, 8), (8, 4), (8, 8)}, "
+            f"got fallback={quantization.bits}, "
             f"FC1={fc1.bits}, FC2={fc2.bits}."
         )
     if fc1.group_size != fc2.group_size:

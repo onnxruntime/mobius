@@ -438,9 +438,9 @@ A per-component `WeightBundle` adapter is a future migration target, not the
 currently implemented interface.
 
 Native QMoE additionally has a projection-specific adapter for Olive fused
-K-last routed experts. The initial mixed layout is deliberately narrow:
-model-wide INT4, FC1 `gate_up_proj` overridden to INT2, FC2 `down_proj`
-remaining INT4, and one common power-of-two group size of at least 16. Exact
+K-last routed experts. Under a model-wide INT4 fallback, supported FC1/FC2
+expert widths are (2,4), (4,8), (8,4), and (8,8), with one common power-of-two
+group size of at least 16. A model-wide INT8 fallback is not enabled. Exact
 and `re:` Olive overrides are resolved against the original Hugging Face paths;
 plain Olive exclusions retain their producer-defined substring matching.
 GPTQ and AWQ instead use the generic plain-path subtree and `re:` full-match
@@ -452,11 +452,17 @@ Qwen3.5-VL keeps the decoder's full module plan
 overrides are resolved against authoritative ``model.language_model`` source
 paths, while validation and binding use the decoder-prefixed checkpoint roots
 created by the VL weight router.
-It emits QMoE's FC-specific bit attributes (including FC3=FC1 for fused
-SwiGLU). Uniform INT4 omits those attributes and retains the legacy payload
-path. Mixed-width execution remains an ONNX Runtime `NOT_IMPLEMENTED`
-boundary; Mobius tests this serialized graph contract without claiming
-runtime numerical support.
+It emits QMoE's FC-specific bit attributes for differing widths (including
+FC3=FC1 for fused SwiGLU). Uniform INT4 retains the legacy payload path;
+uniform 8/8 uses global `expert_weight_bits=8` without FC-specific attributes.
+The new INT8-containing layouts (4/8, 8/4, 8/8) are graph-only exports:
+this work does not establish CPU or CUDA execution for them. Legacy 2/4 may
+execute on CUDA in ORT builds containing microsoft/onnxruntime#32743, subject
+to that fallback's bounds: raw weights, 3-D scales, block size 16–256,
+FP16/BF16, and its scratch-memory budget. This export test does not validate
+runtime execution. The packed-decode path in #32761 is open (not merged) and
+covers only the 2/4-bit set, not INT8. Do not silently replace unsupported QMoE
+layouts with dense expert execution; runtime support is a separate follow-up.
 
 Appropriate model-specific operations include:
 

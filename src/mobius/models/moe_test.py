@@ -397,6 +397,7 @@ def _mixed_expert_state_dict(
     intermediate_size: int = _INT,
     block_size: int = _BLK,
     fc1_bits: int = 2,
+    fc2_bits: int = 4,
     fc1_sym: bool = True,
     fc2_sym: bool = True,
 ) -> dict[str, torch.Tensor]:
@@ -417,12 +418,12 @@ def _mixed_expert_state_dict(
             dtype=torch.bfloat16,
         ),
         prefix + "down_proj_qweight": torch.arange(
-            num_experts * hidden_size * (intermediate_size * 4 // 8),
+            num_experts * hidden_size * (intermediate_size * fc2_bits // 8),
             dtype=torch.int64,
         )
         .remainder(256)
         .to(torch.uint8)
-        .reshape(num_experts, hidden_size, intermediate_size * 4 // 8),
+        .reshape(num_experts, hidden_size, intermediate_size * fc2_bits // 8),
         prefix + "down_proj_scales": torch.rand(
             num_experts,
             hidden_size,
@@ -448,7 +449,7 @@ def _mixed_expert_state_dict(
             (
                 num_experts,
                 hidden_size,
-                math.ceil((intermediate_size // block_size) * 4 / 8),
+                math.ceil((intermediate_size // block_size) * fc2_bits / 8),
             ),
             dtype=torch.uint8,
         )
@@ -456,6 +457,229 @@ def _mixed_expert_state_dict(
 
 
 class TestMixedWidthQMoEExport:
+    @pytest.mark.parametrize(("fc1_bits", "fc2_bits"), [(4, 8), (8, 4), (8, 8)])
+    @pytest.mark.parametrize("asymmetric", [False, True])
+    def test_int8_expert_layout_attrs_geometry_and_binding(
+        self, fc1_bits, fc2_bits, asymmetric
+    ):
+        from mobius._builder import build_from_module
+
+        overrides = {
+            f"{_LAYER}mlp.experts.{projection}": QuantizationOverride(
+                bits=bits, sym=not asymmetric
+            )
+            for projection, bits in (("gate_up_proj", fc1_bits), ("down_proj", fc2_bits))
+        }
+        config = _moe_config(_quantization(overrides=overrides))
+        model = MoECausalLMModel(config)
+        block = model.model.layers[0].mlp
+        assert block.experts is None
+        raw = _mixed_expert_state_dict(
+            fc1_bits=fc1_bits,
+            fc2_bits=fc2_bits,
+            fc1_sym=not asymmetric,
+            fc2_sym=not asymmetric,
+        )
+        out = model.preprocess_weights(raw)
+        prefix = f"{_LAYER}mlp."
+        for projection, label, bits, rows, k in (
+            ("gate_up_proj", "fc1", fc1_bits, _FC1_OUT, _H),
+            ("down_proj", "fc2", fc2_bits, _H, _INT),
+        ):
+            target = prefix + label + "_experts_weights"
+            source = prefix + "experts." + projection + "_qweight"
+            assert tuple(getattr(block, label + "_experts_weights").shape) == (
+                _E,
+                rows,
+                k * bits // 8,
+            )
+            assert out[target].numpy().tobytes() == raw[source].numpy().tobytes()
+            if asymmetric:
+                zeros = prefix + label + "_experts_zero_points"
+                assert out[zeros].shape == (_E, rows, math.ceil((k // _BLK) * bits / 8))
+                assert (
+                    out[zeros].numpy().tobytes()
+                    == raw[prefix + "experts." + projection + "_qzeros"].numpy().tobytes()
+                )
+
+        package = build_from_module(model, config)
+        package.apply_weights(out, fold_constants=False)
+        qmoe = next(node for node in package["model"].graph if node.op_type == "QMoE")
+        assert qmoe.attributes["expert_weight_bits"].value == (
+            8 if fc1_bits == fc2_bits else 4
+        )
+        attrs = {
+            name: attribute.value
+            for name, attribute in qmoe.attributes.items()
+            if name.startswith("fc") and name.endswith("_expert_weight_bits")
+        }
+        assert attrs == (
+            {}
+            if fc1_bits == fc2_bits
+            else {
+                "fc1_expert_weight_bits": fc1_bits,
+                "fc2_expert_weight_bits": fc2_bits,
+                "fc3_expert_weight_bits": fc1_bits,
+            }
+        )
+        for label in ("fc1", "fc2"):
+            name = prefix + label + "_experts_weights"
+            assert package["model"].graph.initializers[name].const_value.numpy().tobytes() == (
+                out[name].numpy().tobytes()
+            )
+
+    def test_uniform_int8_roundtrip_preserves_global_width_and_weights(self, tmp_path):
+        from mobius._builder import build_from_module
+
+        config = _moe_config(
+            _quantization(
+                overrides={
+                    f"{_LAYER}mlp.experts.{projection}": QuantizationOverride(bits=8)
+                    for projection in ("gate_up_proj", "down_proj")
+                }
+            )
+        )
+        module = MoECausalLMModel(config)
+        processed = module.preprocess_weights(_mixed_expert_state_dict(fc1_bits=8, fc2_bits=8))
+        package = build_from_module(module, config)
+        package.apply_weights(processed, fold_constants=False)
+        package.save(str(tmp_path), check_weights=False, progress_bar=False)
+        graph = ModelPackage.load(str(tmp_path))["model"].graph
+        qmoe = next(node for node in graph if node.op_type == "QMoE")
+
+        assert qmoe.attributes["expert_weight_bits"].value == 8
+        assert not any(
+            name in qmoe.attributes
+            for name in (
+                "fc1_expert_weight_bits",
+                "fc2_expert_weight_bits",
+                "fc3_expert_weight_bits",
+            )
+        )
+        for projection in ("fc1", "fc2"):
+            name = f"{_LAYER}mlp.{projection}_experts_weights"
+            assert graph.initializers[name].const_value.numpy().tobytes() == (
+                processed[name].numpy().tobytes()
+            )
+
+    def test_adjacent_int8_layouts_save_load(self, tmp_path):
+        from mobius._builder import build_from_module
+
+        config = _moe_config(
+            _quantization(
+                overrides={
+                    f"model.layers.{layer}.mlp.experts.{proj}": QuantizationOverride(bits=8)
+                    for layer, proj in ((0, "down_proj"), (1, "gate_up_proj"))
+                }
+            ),
+            num_hidden_layers=2,
+        )
+        model = MoECausalLMModel(config)
+        raw = {}
+        for layer, bits in enumerate(((4, 8), (8, 4))):
+            raw.update(
+                _mixed_expert_state_dict(layer_index=layer, fc1_bits=bits[0], fc2_bits=bits[1])
+            )
+        out = model.preprocess_weights(raw)
+        package = build_from_module(model, config)
+        package.apply_weights(out, fold_constants=False)
+        package.save(str(tmp_path), check_weights=False, progress_bar=False)
+        loaded = ModelPackage.load(str(tmp_path))["model"].graph
+        assert sorted(
+            (
+                node.attributes["fc1_expert_weight_bits"].value,
+                node.attributes["fc2_expert_weight_bits"].value,
+                node.attributes["fc3_expert_weight_bits"].value,
+            )
+            for node in loaded
+            if node.op_type == "QMoE"
+        ) == [(4, 8, 4), (8, 4, 8)]
+        for layer, bits in enumerate(((4, 8), (8, 4))):
+            for proj, label, width in (
+                ("gate_up_proj", "fc1", bits[0]),
+                ("down_proj", "fc2", bits[1]),
+            ):
+                prefix = f"model.layers.{layer}.mlp."
+                name = prefix + label + "_experts_weights"
+                expected = raw[prefix + "experts." + proj + "_qweight"]
+                assert loaded.initializers[name].const_value.numpy().tobytes() == (
+                    expected.numpy().tobytes()
+                )
+                assert out[name].shape[-1] == (_H if label == "fc1" else _INT) * width // 8
+
+    def test_int8_missing_layer_and_bad_sidecar_fail_closed(self):
+        config = _moe_config(
+            _quantization(
+                overrides={
+                    r"re:model\.layers\.\d+\.mlp\.experts\.down_proj": QuantizationOverride(
+                        bits=8
+                    )
+                }
+            ),
+            num_hidden_layers=2,
+        )
+        model = MoECausalLMModel(config)
+        with pytest.raises(ValueError, match=r"model\.layers\.1\.mlp.*incomplete"):
+            model.preprocess_weights(_mixed_expert_state_dict(fc1_bits=4, fc2_bits=8))
+        state = _mixed_expert_state_dict(fc1_bits=4, fc2_bits=8)
+        state[f"{_LAYER}mlp.experts.down_proj_qweight"] = state[
+            f"{_LAYER}mlp.experts.down_proj_qweight"
+        ][..., :-1]
+        state.update(_mixed_expert_state_dict(layer_index=1, fc1_bits=4, fc2_bits=8))
+        with pytest.raises(ValueError, match="FC2 qweight shape"):
+            model.preprocess_weights(state)
+
+    def test_olive_int8_plain_override_requires_exact_source_path(self):
+        quantization = _quantization(
+            overrides={"model.layers.0.mlp.experts.down": QuantizationOverride(bits=8)}
+        )
+        block = MoECausalLMModel(_moe_config(quantization)).model.layers[0].mlp
+        assert block._qmoe_quantization.fc2.bits == 4
+
+    @pytest.mark.parametrize("mutation", ["missing", "shape", "dtype"])
+    def test_int8_asymmetric_zero_points_fail_closed(self, mutation):
+        quantization = _quantization(
+            overrides={
+                f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=8, sym=False)
+            }
+        )
+        state = _mixed_expert_state_dict(fc1_bits=4, fc2_bits=8, fc2_sym=False)
+        key = f"{_LAYER}mlp.experts.down_proj_qzeros"
+        if mutation == "missing":
+            del state[key]
+        elif mutation == "shape":
+            state[key] = state[key][..., :-1]
+        else:
+            state[key] = state[key].to(torch.int8)
+        with pytest.raises(
+            ValueError,
+            match={
+                "missing": "incomplete",
+                "shape": "FC2 qzeros shape",
+                "dtype": "FC2 qzeros must be uint8",
+            }[mutation],
+        ):
+            MoECausalLMModel(_moe_config(quantization)).preprocess_weights(state)
+
+    def test_int8_mismatched_group_size_rejected(self):
+        quantization = _quantization(
+            overrides={
+                f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=8, group_size=32)
+            }
+        )
+        with pytest.raises(ValueError, match="common FC1/FC2 group_size"):
+            MoECausalLMModel(_moe_config(quantization))
+
+    def test_int8_non_olive_override_rejected(self):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method="gptq",
+            overrides={f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=8)},
+        )
+        with pytest.raises(ValueError, match="requires Olive integer-affine"):
+            MoECausalLMModel(_moe_config(quantization))
+
     @pytest.mark.parametrize(
         "pattern",
         [
@@ -688,8 +912,8 @@ class TestMixedWidthQMoEExport:
                 group_size=_BLK,
                 quant_method="olive",
                 overrides={
-                    f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=8),
-                    f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=8),
+                    f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=2),
+                    f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=2),
                 },
             )
         else:
@@ -1003,10 +1227,11 @@ class TestMixedWidthQMoEExport:
                     group_size=_BLK,
                     quant_method="olive",
                     overrides={
-                        f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=8)
+                        f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=2),
+                        f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=8),
                     },
                 ),
-                "expected model-wide INT4 with FC1 INT2 and FC2 INT4",
+                "expected model-wide INT4",
             ),
         ],
     )

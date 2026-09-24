@@ -626,7 +626,13 @@ class MoELayer(nn.Module):
             activation_type="swiglu",
             normalize_routing_weights=int(normalize),
             k=self.top_k,
-            expert_weight_bits=quantization.fallback.bits,
+            # A uniform override can use the global attribute directly.
+            # Differing widths retain the model-wide INT4 fallback and FC attrs.
+            expert_weight_bits=(
+                quantization.fallback.bits
+                if quantization.is_mixed_width
+                else quantization.fc1.bits
+            ),
             block_size=quantization.fc1.group_size,
             swiglu_fusion=1,
             quant_type="int",
