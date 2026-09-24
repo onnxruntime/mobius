@@ -455,14 +455,18 @@ created by the VL weight router.
 It emits QMoE's FC-specific bit attributes for differing widths (including
 FC3=FC1 for fused SwiGLU). Uniform INT4 retains the legacy payload path;
 uniform 8/8 uses global `expert_weight_bits=8` without FC-specific attributes.
-The new INT8-containing layouts (4/8, 8/4, 8/8) are graph-only exports:
-this work does not establish CPU or CUDA execution for them. Legacy 2/4 may
-execute on CUDA in ORT builds containing microsoft/onnxruntime#32743, subject
-to that fallback's bounds: raw weights, 3-D scales, block size 16–256,
-FP16/BF16, and its scratch-memory budget. This export test does not validate
-runtime execution. The packed-decode path in #32761 is open (not merged) and
-covers only the 2/4-bit set, not INT8. Do not silently replace unsupported QMoE
-layouts with dense expert execution; runtime support is a separate follow-up.
+ORT's merged CUDA fallback in microsoft/onnxruntime#32743 executes integer
+mixed-width QMoE, including tested (4,8) and (8,4) widths. It dequantizes
+both expert banks into FP16/BF16 scratch, subject to canonical raw weights,
+3-D blockwise scales, block size 16–256, divisible reduction dimensions,
+and a scratch-memory limit. ORT tests cover these INT8 combinations without
+fused SwiGLU; only (2,4) has a fused-SwiGLU test. Mobius validates graph
+export and weight binding here, not end-to-end numerical execution of its
+exported Qwen graphs on this ORT build. CPU mixed-width execution and uniform
+8/8 runtime behavior have not been qualified by these tests. The packed
+decode path in microsoft/onnxruntime#32761 is open (not merged) and covers
+only the 2/4-bit set, not INT8. Do not silently replace an unsupported QMoE
+configuration with the dense expert-loop exporter.
 
 Appropriate model-specific operations include:
 
