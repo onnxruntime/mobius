@@ -564,5 +564,24 @@ def test_unsupported_geometry_keeps_dense_fallback() -> None:
     assert _count(graph, "TopK") == 1
 
 
+def test_mixed_projection_widths_keep_dense_fallback() -> None:
+    """The legacy rewrite must not pack INT2 FC1 bytes as uniform INT4 QMoE."""
+    model, _, _ = _build_dense_graph()
+    graph = model.graph
+    for node in graph:
+        if (
+            node.op_type == "MatMulNBits"
+            and node.name
+            and (".gate_proj" in node.name or ".up_proj" in node.name)
+        ):
+            node.attributes["bits"] = ir.AttrInt64("bits", 2)
+
+    fused = fuse_dense_moe_to_qmoe(model)
+
+    assert fused == 0
+    assert _count(graph, "QMoE") == 0
+    assert _count(graph, "TopK") == 1
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

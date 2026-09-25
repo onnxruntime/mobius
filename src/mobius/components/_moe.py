@@ -12,11 +12,20 @@ from collections.abc import Callable
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._weight_utils import (
-    supported_qmoe_quantization as _supported_qmoe_quantization,
+    QMoEQuantizationLayout,
+    resolve_qmoe_quantization,
+    supported_qmoe_quantization,
 )
 from mobius.components._mlp import MLP
+
+
+def _supported_qmoe_quantization(
+    quantization: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Preserve the legacy predicate imported by model-specific MoE modules."""
+    return supported_qmoe_quantization(quantization)
 
 
 def _interleave_gate_up_rows(
@@ -457,11 +466,15 @@ class MoELayer(nn.Module):
             if config.component_quantization is not None
             else config.quantization
         )
-        self._qmoe_quantization = (
+        quantization_layout = (
             None
             if getattr(config, "disable_qmoe", False)
-            else _supported_qmoe_quantization(quantization)
+            else resolve_qmoe_quantization(
+                quantization,
+                config.qmoe_source_paths,
+            )
         )
+        self._qmoe_quantization: QMoEQuantizationLayout | None = quantization_layout
         # Clipped-SwiGLU attributes (QMoE's ``activation_alpha``/``activation_beta``/
         # ``swiglu_limit``). Left ``None`` by default so existing callers get a
         # byte-identical QMoE call (the attributes are simply omitted, even though
@@ -505,8 +518,9 @@ class MoELayer(nn.Module):
         assert quantization is not None
         hidden_size = expert_config.hidden_size
         intermediate_size = expert_config.intermediate_size
-        block_size = quantization.group_size
-        bits = quantization.bits
+        block_size = quantization.fc1.group_size
+        fc1_bits = quantization.fc1.bits
+        fc2_bits = quantization.fc2.bits
         fc1_out = 2 * intermediate_size
         self._fc1_out = fc1_out
         if hidden_size % block_size or intermediate_size % block_size:
@@ -515,34 +529,36 @@ class MoELayer(nn.Module):
             )
 
         self.fc1_experts_weights = nn.Parameter(
-            [self.num_experts, fc1_out, hidden_size * bits // 8],
+            [self.num_experts, fc1_out, hidden_size * fc1_bits // 8],
             dtype=ir.DataType.UINT8,
         )
         self.fc1_scales = nn.Parameter([self.num_experts, fc1_out, hidden_size // block_size])
         self.fc2_experts_weights = nn.Parameter(
-            [self.num_experts, hidden_size, intermediate_size * bits // 8],
+            [self.num_experts, hidden_size, intermediate_size * fc2_bits // 8],
             dtype=ir.DataType.UINT8,
         )
         self.fc2_scales = nn.Parameter(
             [self.num_experts, hidden_size, intermediate_size // block_size]
         )
-        if quantization.sym:
+        if quantization.fc1.sym:
             self.fc1_experts_zero_points = None
-            self.fc2_experts_zero_points = None
         else:
             self.fc1_experts_zero_points = nn.Parameter(
                 [
                     self.num_experts,
                     fc1_out,
-                    math.ceil((hidden_size // block_size) * bits / 8),
+                    math.ceil((hidden_size // block_size) * fc1_bits / 8),
                 ],
                 dtype=ir.DataType.UINT8,
             )
+        if quantization.fc2.sym:
+            self.fc2_experts_zero_points = None
+        else:
             self.fc2_experts_zero_points = nn.Parameter(
                 [
                     self.num_experts,
                     hidden_size,
-                    math.ceil((intermediate_size // block_size) * bits / 8),
+                    math.ceil((intermediate_size // block_size) * fc2_bits / 8),
                 ],
                 dtype=ir.DataType.UINT8,
             )
@@ -582,6 +598,15 @@ class MoELayer(nn.Module):
             activation_kwargs["activation_beta"] = self.activation_beta
         if self.swiglu_limit is not None:
             activation_kwargs["swiglu_limit"] = self.swiglu_limit
+        bit_width_kwargs = {}
+        if quantization.is_mixed_width:
+            bit_width_kwargs = {
+                "fc1_expert_weight_bits": quantization.fc1.bits,
+                "fc2_expert_weight_bits": quantization.fc2.bits,
+                # Fused SwiGLU stores FC3 in FC1. ORT requires the effective
+                # FC3 width to match FC1; omission would inherit fallback INT4.
+                "fc3_expert_weight_bits": quantization.fc1.bits,
+            }
         result = op.QMoE(
             hidden_states,
             router_probs,
@@ -601,13 +626,20 @@ class MoELayer(nn.Module):
             activation_type="swiglu",
             normalize_routing_weights=int(normalize),
             k=self.top_k,
-            expert_weight_bits=quantization.bits,
-            block_size=quantization.group_size,
+            # A uniform override can use the global attribute directly.
+            # Differing widths retain the model-wide INT4 fallback and FC attrs.
+            expert_weight_bits=(
+                quantization.fallback.bits
+                if quantization.is_mixed_width
+                else quantization.fc1.bits
+            ),
+            block_size=quantization.fc1.group_size,
             swiglu_fusion=1,
             quant_type="int",
             weights_prepacked=0,
             _domain="com.microsoft",
             **activation_kwargs,
+            **bit_width_kwargs,
         )
         if output_scale != 1.0:  # noqa: RUF069
             result = op.Mul(result, op.CastLike(output_scale, result))
