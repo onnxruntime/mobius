@@ -237,7 +237,7 @@ def get_hf_component_sources(
 
 
 def _config_ties_word_embeddings(hf_config: object) -> bool:
-    """Whether model or quantization metadata declares tied embeddings."""
+    """Honor text-config precedence, except for an explicit quantized tie."""
 
     def field(value: object, name: str) -> object | None:
         if isinstance(value, Mapping):
@@ -246,21 +246,30 @@ def _config_ties_word_embeddings(hf_config: object) -> bool:
 
     configs = (
         hf_config,
-        getattr(hf_config, "text_config", None),
-        getattr(hf_config, "llm_config", None),
-        getattr(hf_config, "language_config", None),
+        field(hf_config, "text_config"),
+        field(hf_config, "llm_config"),
+        field(hf_config, "language_config"),
     )
-    return any(
+    if any(
         bool(field(declaration, "tie_word_embeddings"))
         for config in configs
         if config is not None
         for declaration in (
-            config,
             field(config, "quantization_config"),
             field(config, "quantization"),
         )
         if declaration is not None
-    )
+    ):
+        return True
+    text_config = next((config for config in configs[1:] if config is not None), None)
+    for config in (text_config, hf_config):
+        if config is None:
+            continue
+        for name in ("tie_word_embeddings", "weight_tying"):
+            value = field(config, name)
+            if value is not None:
+                return bool(value)
+    return False
 
 
 def _aliased_component_endpoint(
@@ -289,7 +298,7 @@ def _infer_shared_weights(
     hf_config: object,
     manifest: ComponentManifest,
 ) -> tuple[SharedWeightInfo, ...]:
-    """Infer standard tied word embeddings from config plus explicit aliases."""
+    """Infer tied embeddings only for explicit, unique component source aliases."""
     if not _config_ties_word_embeddings(hf_config):
         return ()
     canonical = _aliased_component_endpoint(

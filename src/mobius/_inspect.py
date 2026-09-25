@@ -54,8 +54,9 @@ class ComponentInfo:
             place before exporting the full model.
         shared_weights: Cross-component shared parameters involving this
             component. The same immutable declaration is attached to every
-            participating component so each independently selected build keeps
-            the complete relationship.
+            participating component. Automatic inference requires an
+            unambiguous embedding/head pair with explicit source-path aliases;
+            source paths alone do not establish weight sharing.
     """
 
     name: str

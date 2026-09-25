@@ -174,6 +174,40 @@ def test_gemma4_inspection_honors_parsed_quantization_only_tie(monkeypatch):
     assert components["decoder"].shared_weights
 
 
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
+@pytest.mark.parametrize(
+    ("parent_tie", "text_tie", "expected"),
+    [
+        (True, False, False),
+        (False, True, True),
+        (True, None, True),
+        (False, None, False),
+    ],
+)
+def test_gemma4_inspection_respects_text_tie_precedence(
+    monkeypatch, model_type, parent_tie, text_tie, expected
+):
+    from mobius._configs import Gemma4Config
+
+    hf_config = SimpleNamespace(
+        model_type=model_type,
+        tie_word_embeddings=parent_tie,
+        text_config=SimpleNamespace(model_type="gemma4_text", tie_word_embeddings=text_tie),
+    )
+    _patch_autoconfig(monkeypatch, hf_config)
+
+    components = {component.name: component for component in inspect_components("fake/gemma4")}
+
+    assert bool(components["decoder"].shared_weights) is expected
+    assert components["decoder"].shared_weights == components["embedding"].shared_weights
+    assert (
+        Gemma4Config.from_transformers(
+            hf_config.text_config, parent_config=hf_config
+        ).tie_word_embeddings
+        is expected
+    )
+
+
 def test_qwen3_tts_embedders_return_shared_hf_source_paths(monkeypatch):
     _patch_autoconfig(monkeypatch, SimpleNamespace(model_type="qwen3_tts"))
     components = {c.name: c for c in inspect_components("fake/qwen3-tts")}
