@@ -460,13 +460,22 @@ mixed-width QMoE, including tested (4,8) and (8,4) widths. It dequantizes
 both expert banks into FP16/BF16 scratch, subject to canonical raw weights,
 3-D blockwise scales, block size 16–256, divisible reduction dimensions,
 and a scratch-memory limit. ORT tests cover these INT8 combinations without
-fused SwiGLU; only (2,4) has a fused-SwiGLU test. Mobius validates graph
-export and weight binding here, not end-to-end numerical execution of its
-exported Qwen graphs on this ORT build. CPU mixed-width execution and uniform
-8/8 runtime behavior have not been qualified by these tests. The packed
-decode path in microsoft/onnxruntime#32761 is open (not merged) and covers
-only the 2/4-bit set, not INT8. Do not silently replace an unsupported QMoE
-configuration with the dense expert-loop exporter.
+fused SwiGLU; only (2,4) has a fused-SwiGLU test. The opt-in
+`tests/integration/qmoe_cuda_test.py` runs a synthetic, nontrivial Qwen3-MoE
+export with adjacent (4,8)/(8,4) layers and uniform (8,8) on an ORT build
+containing #32743. It checks full logits against an independently
+dequantized reference (FP16 `rtol=atol=0.01`) and profiles QMoE on CUDA.
+Uniform (8,8) takes the existing packed INT8 path, which also requires a
+block size divisible by 32 and both reduction dimensions divisible by 64;
+the mixed dequantization fallback accepts a block size of 16. These tiny
+synthetic checks do not qualify real Qwen weights, throughput, or peak VRAM.
+For Qwen3-30B-A3B, the FP16 FC1+FC2 scratch alone is approximately 1.125 GiB
+per MoE layer, above the fallback's default 1 GiB limit; adjust
+`ep.cuda.qmoe_int_dequant_max_scratch_bytes` and measure the actual memory
+cost before deployment. CPU mixed-width execution remains unverified. The
+packed decode path in microsoft/onnxruntime#32761 is open (not merged) and
+covers only the 2/4-bit set, not INT8. Do not silently replace an unsupported
+QMoE configuration with the dense expert-loop exporter.
 
 Appropriate model-specific operations include:
 
