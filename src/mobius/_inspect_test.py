@@ -134,6 +134,46 @@ def test_gemma4_reports_cross_component_tied_word_embeddings(monkeypatch):
     assert components["audio_encoder"].shared_weights == ()
 
 
+@pytest.mark.parametrize(
+    "quantization",
+    [
+        {"tie_word_embeddings": True},
+        SimpleNamespace(tie_word_embeddings=True),
+    ],
+)
+def test_gemma4_inspection_honors_quantization_only_tie(monkeypatch, quantization):
+    _patch_autoconfig(
+        monkeypatch,
+        SimpleNamespace(
+            model_type="gemma4",
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(tie_word_embeddings=False),
+            quantization_config=quantization,
+        ),
+    )
+
+    components = {component.name: component for component in inspect_components("fake/gemma4")}
+
+    assert components["embedding"].shared_weights
+    assert components["decoder"].shared_weights == components["embedding"].shared_weights
+
+
+def test_gemma4_inspection_honors_parsed_quantization_only_tie(monkeypatch):
+    _patch_autoconfig(
+        monkeypatch,
+        SimpleNamespace(
+            model_type="gemma4",
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(tie_word_embeddings=False),
+            quantization=SimpleNamespace(tie_word_embeddings=True),
+        ),
+    )
+
+    components = {component.name: component for component in inspect_components("fake/gemma4")}
+
+    assert components["decoder"].shared_weights
+
+
 def test_qwen3_tts_embedders_return_shared_hf_source_paths(monkeypatch):
     _patch_autoconfig(monkeypatch, SimpleNamespace(model_type="qwen3_tts"))
     components = {c.name: c for c in inspect_components("fake/qwen3-tts")}

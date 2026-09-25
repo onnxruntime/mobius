@@ -237,7 +237,13 @@ def get_hf_component_sources(
 
 
 def _config_ties_word_embeddings(hf_config: object) -> bool:
-    """Whether the parent or nested text config declares tied embeddings."""
+    """Whether model or quantization metadata declares tied embeddings."""
+
+    def field(value: object, name: str) -> object | None:
+        if isinstance(value, Mapping):
+            return value.get(name)
+        return getattr(value, name, None)
+
     configs = (
         hf_config,
         getattr(hf_config, "text_config", None),
@@ -245,9 +251,15 @@ def _config_ties_word_embeddings(hf_config: object) -> bool:
         getattr(hf_config, "language_config", None),
     )
     return any(
-        bool(getattr(config, "tie_word_embeddings", False))
+        bool(field(declaration, "tie_word_embeddings"))
         for config in configs
         if config is not None
+        for declaration in (
+            config,
+            field(config, "quantization_config"),
+            field(config, "quantization"),
+        )
+        if declaration is not None
     )
 
 
