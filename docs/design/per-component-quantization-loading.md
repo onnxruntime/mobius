@@ -465,10 +465,25 @@ fused SwiGLU; only (2,4) has a fused-SwiGLU test. The opt-in
 export with adjacent (4,8)/(8,4) layers and uniform (8,8) on an ORT build
 containing #32743. It checks full logits against an independently
 dequantized reference (FP16 `rtol=atol=0.01`) and profiles QMoE on CUDA.
+The same opt-in test also reads layer 0, experts 0–3 of the pinned
+Qwen3-30B-A3B checkpoint, quantizes those real weights with Olive's RTN
+tensor producer, saves and reloads the sidecars, and exports one reduced
+four-expert decoder layer. On ORT CUDA at `ee5f6e7`, both (4,8) and (8,4)
+execute QMoE on CUDA and match an independently unpacked full-logits
+reference within `rtol=atol=0.01` (observed maximum absolute differences
+0.005148 and 0.004774, respectively). The checkpoint embedding and router
+are sliced; attention is zeroed, and the output head and normalization weights
+are artificial. Set `MOBIUS_QMOE_REAL_SLICE_CUDA_TEST=1` to run this local-only
+test with the pinned checkpoint, Olive producer source, and compatible ORT
+CUDA build; it saves the selected tensor hashes, serialized sidecars, and
+profiles under `/datadisks/disk5/titaiwang/qmoe-real-slice-744/`. This
+demonstrates real expert-weight loading and reduced
+routing, not full-model Hugging Face parity or complete Olive pass orchestration.
 Uniform (8,8) takes the existing packed INT8 path, which also requires a
 block size divisible by 32 and both reduction dimensions divisible by 64;
 the mixed dequantization fallback accepts a block size of 16. These tiny
-synthetic checks do not qualify real Qwen weights, throughput, or peak VRAM.
+synthetic and reduced real-weight checks do not qualify production-size
+throughput or peak VRAM.
 For Qwen3-30B-A3B, the FP16 FC1+FC2 scratch alone is approximately 1.125 GiB
 per MoE layer, above the fallback's default 1 GiB limit; adjust
 `ep.cuda.qmoe_int_dequant_max_scratch_bytes` and measure the actual memory
