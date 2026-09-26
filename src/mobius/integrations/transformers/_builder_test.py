@@ -391,6 +391,17 @@ def test_qwen38_multimodal_config_keeps_parent_fields(monkeypatch) -> None:
     assert built_configs[0].image_token_id == 248056
 
 
+def test_qwen3_tts_primary_config_remains_talker() -> None:
+    talker = SimpleNamespace(model_type="qwen3_tts_talker")
+    hf_config = SimpleNamespace(model_type="qwen3_tts", talker_config=talker)
+
+    primary, parent, model_type = transformers_builder._select_primary_config(hf_config)
+
+    assert primary is talker
+    assert parent is hf_config
+    assert model_type == "qwen3_tts"
+
+
 def test_vibevoice_architecture_dispatch_keeps_native_asr_separate() -> None:
     """Native ASR has its own model_type and cannot fall through to VibeVoice TTS."""
     from mobius.models import (
