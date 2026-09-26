@@ -16,10 +16,17 @@ subfolder names ``ModelPackage.save`` writes for multi-component models).
 
 from __future__ import annotations
 
-__all__ = ["ComponentInfo", "inspect_components"]
+__all__ = [
+    "ComponentInfo",
+    "SharedWeightEndpoint",
+    "SharedWeightInfo",
+    "inspect_components",
+]
 
 import dataclasses
 import logging
+
+from mobius._component_manifest import SharedWeightEndpoint, SharedWeightInfo
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +52,17 @@ class ComponentInfo:
             tuple. Empty when the component is the whole model or the layout is
             unknown. Tools such as Olive use these to optimize a submodule in
             place before exporting the full model.
+        shared_weights: Cross-component shared parameters involving this
+            component. The same immutable declaration is attached to every
+            participating component. Automatic inference requires an
+            unambiguous embedding/head pair with explicit source-path aliases;
+            source paths alone do not establish weight sharing.
     """
 
     name: str
     role: str
     source_paths: tuple[str, ...] = ()
+    shared_weights: tuple[SharedWeightInfo, ...] = ()
 
 
 def _resolve_task_model_type_and_config(
@@ -158,12 +171,22 @@ def inspect_components(
         model_type=model_type,
         hf_config=hf_config,
     )
+    shared_weights = manifest.shared_weights
+    shared_by_component = {
+        name: tuple(
+            shared_weight
+            for shared_weight in shared_weights
+            if any(endpoint.component == name for endpoint in shared_weight.endpoints)
+        )
+        for name in manifest
+    }
 
     components = [
         ComponentInfo(
             name=component.name,
             role=component.role,
             source_paths=component.source_paths,
+            shared_weights=shared_by_component[component.name],
         )
         for component in manifest.values()
     ]
