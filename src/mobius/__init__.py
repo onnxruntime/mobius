@@ -21,6 +21,14 @@ __all__ = [
     "BaseModelConfig",
     "CausalLMConfig",
     "CausalLMTask",
+    "Cosmos3AVAEAudioDecoderOnlyTokenizer",
+    "Cosmos3AVAEAudioDecoderTask",
+    "Cosmos3AVAEAudioTokenizer",
+    "Cosmos3AVAEAudioTokenizerTask",
+    "Cosmos3AudioConfig",
+    "Cosmos3OmniGeneratorConfig",
+    "Cosmos3OmniGeneratorModel",
+    "Cosmos3OmniGeneratorTask",
     "ComponentInfo",
     "SharedWeightEndpoint",
     "SharedWeightInfo",
@@ -34,6 +42,8 @@ __all__ = [
     "Gemma3nMultiModalConfig",
     "Gemma4AudioConfig",
     "Gemma4Config",
+    "GeneratedInputRule",
+    "LatentDynamicsConfig",
     "MambaConfig",
     "MllamaConfig",
     "MoonshineConfig",
@@ -42,27 +52,51 @@ __all__ = [
     "ModelRegistration",
     "ModelRegistry",
     "ModelTask",
+    "MLPLatentDynamicsModel",
     "MLPWorldModel",
     "MMSConfig",
     "OPSET_VERSION",
+    "PipelineBuilder",
+    "PipelineComponent",
+    "PipelineConnection",
+    "PipelineInput",
+    "PipelineManifest",
+    "PipelineOutput",
+    "PipelinePackage",
+    "PipelinePort",
+    "PipelineProfile",
+    "PipelineState",
+    "PipelineStage",
+    "PipelineValidationError",
     "Sam2Config",
     "SegformerConfig",
     "SpeechToTextConfig",
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
+    "WorldModelBuilderRegistry",
+    "WorldModelBuildConfig",
     "WorldModelConfig",
+    "WorldModelGenerationConfig",
+    "WorldModelPipelineConfig",
     "WorldModelTask",
+    "WanVAEConfig",
+    "WanVAETask",
+    "AutoencoderKLWanModel",
+    "LatentDynamicsTask",
     "YolosConfig",
     "apply_weights",
     "adapter_source_from_onnx_adapter",
     "attach_peft_adapter",
     "build",
     "build_context",
+    "build_cosmos3_edge_world_model",
+    "build_cosmos3_world_model",
     "build_diffusers_pipeline",
     "build_from_gguf",
     "build_from_module",
     "build_from_nemo",
+    "build_world_model",
     "compose_adapter_deltas",
     "components",
     "ep_capabilities",
@@ -76,9 +110,16 @@ __all__ = [
     "models",
     "optimize_model",
     "register_ep",
+    "register_generated_input",
+    "register_phase",
+    "register_role",
+    "register_strategy",
+    "register_state",
+    "register_transform",
     "registry",
     "stream_safetensors_to_model",
     "tasks",
+    "world_model_registry",
 ]
 
 __version__ = "0.1.0"
@@ -91,6 +132,8 @@ from mobius._configs import (
     AudioConfig,
     BaseModelConfig,
     CausalLMConfig,
+    Cosmos3AudioConfig,
+    Cosmos3OmniGeneratorConfig,
     DepthAnythingConfig,
     EncoderConfig,
     Gemma2Config,
@@ -98,6 +141,7 @@ from mobius._configs import (
     Gemma3nMultiModalConfig,
     Gemma4AudioConfig,
     Gemma4Config,
+    LatentDynamicsConfig,
     MambaConfig,
     MllamaConfig,
     MMSConfig,
@@ -108,11 +152,14 @@ from mobius._configs import (
     SpeechToTextConfig,
     VisionConfig,
     VisionLanguageConfig,
+    WanVAEConfig,
     WhisperConfig,
     WorldModelConfig,
     YolosConfig,
 )
 from mobius._constants import OPSET_VERSION
+from mobius._cosmos3_edge_world_model import build_cosmos3_edge_world_model
+from mobius._cosmos3_world_model import build_cosmos3_world_model
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
 from mobius._export_report import ComponentExportDisposition, ComponentExportReport
 from mobius._inspect import (
@@ -123,10 +170,41 @@ from mobius._inspect import (
 )
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
+from mobius._pipeline import (
+    GeneratedInputRule,
+    PipelineBuilder,
+    PipelineComponent,
+    PipelineConnection,
+    PipelineInput,
+    PipelineManifest,
+    PipelineOutput,
+    PipelinePackage,
+    PipelinePort,
+    PipelineProfile,
+    PipelineStage,
+    PipelineState,
+    PipelineValidationError,
+    register_generated_input,
+    register_phase,
+    register_role,
+    register_state,
+    register_strategy,
+    register_transform,
+)
 from mobius._registry import (
     ModelRegistration,
     ModelRegistry,
     registry,
+)
+from mobius._world_model_builder import (
+    WorldModelBuilderRegistry,
+    build_world_model,
+    world_model_registry,
+)
+from mobius._world_model_config import (
+    WorldModelBuildConfig,
+    WorldModelGenerationConfig,
+    WorldModelPipelineConfig,
 )
 from mobius.adapter_io import (
     adapter_source_from_onnx_adapter,
@@ -154,5 +232,21 @@ from mobius.integrations.diffusers import build_diffusers_pipeline
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo
 from mobius.integrations.transformers import build
-from mobius.models import MLPWorldModel
-from mobius.tasks import CausalLMTask, ModelTask, WorldModelTask
+from mobius.models import (
+    AutoencoderKLWanModel,
+    Cosmos3AVAEAudioDecoderOnlyTokenizer,
+    Cosmos3AVAEAudioTokenizer,
+    Cosmos3OmniGeneratorModel,
+    MLPLatentDynamicsModel,
+    MLPWorldModel,
+)
+from mobius.tasks import (
+    CausalLMTask,
+    Cosmos3AVAEAudioDecoderTask,
+    Cosmos3AVAEAudioTokenizerTask,
+    Cosmos3OmniGeneratorTask,
+    LatentDynamicsTask,
+    ModelTask,
+    WanVAETask,
+    WorldModelTask,
+)

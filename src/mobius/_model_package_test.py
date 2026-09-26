@@ -9,6 +9,7 @@ import logging
 import threading
 import types
 from pathlib import Path
+from unittest import mock
 
 import onnx_ir as ir
 import pytest
@@ -1476,6 +1477,36 @@ class TestModelPackageApplyWeights:
             prefix_map={"text.": "text", "vision_encoder.": "vision_encoder"},
         )
         assert model1.graph.initializers[init_name].const_value is not None
+
+    @pytest.mark.parametrize("partial", [False, True])
+    def test_partial_weights_defer_folding_until_finalize(self, partial):
+        config = make_config()
+        pkg = build_from_module(CausalLMModel(config), config)
+        model = pkg["model"]
+        init_name = next(iter(model.graph.initializers))
+        shape = list(model.graph.initializers[init_name].shape)
+
+        with mock.patch(
+            "mobius._model_package.fold_initializers_after_weights"
+        ) as fold_initializers:
+            if partial:
+                applied = pkg.apply_weights_partial({init_name: torch.ones(shape)})
+                assert applied == {init_name}
+            else:
+                pkg.apply_weights({init_name: torch.ones(shape)}, fold_constants=False)
+            fold_initializers.assert_not_called()
+
+            pkg.finalize_weights()
+
+        assert model.graph.initializers[init_name].const_value is not None
+        fold_initializers.assert_called_once_with(model)
+
+    def test_validate_weights_rejects_unassigned_initializers(self):
+        config = make_config()
+        pkg = build_from_module(CausalLMModel(config), config)
+
+        with pytest.raises(ValueError, match="without weights"):
+            pkg.validate_weights()
 
 
 class TestBuildPackageFromModule:

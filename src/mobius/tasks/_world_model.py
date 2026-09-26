@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Single-step world-model task."""
+"""Single-step latent-dynamics task."""
 
 from __future__ import annotations
 
@@ -10,13 +10,13 @@ from typing import ClassVar
 import onnx_ir as ir
 from onnxscript import nn
 
-from mobius._configs import WorldModelConfig
+from mobius._configs import LatentDynamicsConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 
 
-class WorldModelTask(ModelTask):
-    """Build a stateful one-step world-model graph.
+class LatentDynamicsTask(ModelTask):
+    """Build a stateful one-step latent-dynamics graph.
 
     Inputs:
         - observation: ``[batch, *observation_shape]``
@@ -42,7 +42,7 @@ class WorldModelTask(ModelTask):
     def build(
         self,
         module: nn.Module,
-        config: WorldModelConfig,
+        config: LatentDynamicsConfig,
     ) -> ModelPackage:
         config.validate()
         batch = ir.SymbolicDim("batch")
@@ -82,3 +82,8 @@ class WorldModelTask(ModelTask):
             builder.add_output(value, name)
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
+
+
+# Backward-compatible alias for the task name introduced by the initial
+# single-step implementation.
+WorldModelTask = LatentDynamicsTask
