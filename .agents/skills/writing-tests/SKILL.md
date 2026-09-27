@@ -161,9 +161,8 @@ like prefix replacement corrupting names or fused weight names being dropped.
 
 ### Rewrite rule unit tests
 
-Place rewrite rule tests **next to** the source file:
-- Source: `src/mobius/rewrite_rules/_packed_attention.py`
-- Test: `src/mobius/rewrite_rules/_packed_attention_test.py`
+Execution-provider rewrite rules and their tests live in Olive's
+`olive/passes/onnx/graph_surgery` package.
 
 ---
 

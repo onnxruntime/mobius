@@ -147,8 +147,8 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 - [ ] `ort_lower_opset_for_ep` flag available for opset 24→23 lowering
       on older ORT builds (disabled by default in `src/mobius/_flags.py`,
       opt-in via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`)
-- [ ] Dead graph inputs removed after EP-aware optimization
-      (`RemoveDeadGraphInputsPass` in Stage 4 of `optimize_model()`)
+- [ ] Downstream Olive graph-surgery validation covers target-specific cleanup
+      and dead-input removal.
 - [ ] Vision/audio graph inputs match the real processor (normally float32);
       reduced-precision encoders cast once at graph entry
 - [ ] Representative graph evidence covers raw/post-Mobius/post-weight and

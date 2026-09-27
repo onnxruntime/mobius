@@ -25,11 +25,9 @@ class GQAContext(NamedTuple):
     emit ``GroupQueryAttention`` directly instead of the generic
     ``Attention + RotaryEmbedding`` sequence.
 
-    Using this context skips the post-hoc
-    :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
-    rewrite rule for models that use the standard :class:`TextModel` backbone.
-    The rewrite rule remains as a fallback for models with non-standard RoPE
-    (e.g. Qwen3.5 with 3D mRoPE).
+    This context is retained for explicit fused-operator construction tests;
+    production Mobius export uses canonical Attention and downstream Olive
+    graph surgeries select GQA when supported.
 
     Fields:
         seqlens_k: Per-batch last valid KV index ``[batch]`` INT32.
@@ -432,9 +430,7 @@ class Attention(nn.Module):
         Called from :meth:`forward` when ``attention_bias`` is a
         :class:`GQAContext`.  Bypasses the external
         :class:`~mobius.components._rotary_embedding.RotaryEmbeddingBase`
-        forward pass and the post-hoc
-        :class:`~mobius.rewrite_rules._group_query_attention.RotaryAttentionToGQA`
-        rewrite rule; RoPE is handled by the ``do_rotary=1`` attribute instead.
+        forward pass; RoPE is handled by the ``do_rotary=1`` attribute instead.
 
         Returns ``(attn_output, (present_key, present_value))`` in the same
         shape as the standard :meth:`forward` path.

@@ -1,22 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Graph optimization passes for mobius ONNX models.
-
-This module provides IR passes that operate on the ONNX graph structure,
-complementing the rewrite-rule infrastructure in :mod:`mobius.rewrite_rules`.
-
-**Split between** ``passes/`` **and** ``_optimizations.py``
-------------------------------------------------------------
-- ``mobius/_passes/`` contains **individual, composable** IR pass classes.
-  Each pass has a single responsibility (e.g. fold Transpose nodes, fold
-  Concat nodes) and can be used, tested, and benchmarked independently.
-
-- ``mobius/_optimizations.py`` is the **orchestration layer**: it sequences
-  passes and rewrite rules into a coherent pipeline (``optimize_model``),
-  encodes all EP-specific gating logic, and exposes the
-  :func:`~mobius._optimizations.fold_initializers_after_weights` convenience
-  function that runs the post-weight-loading pipeline in one call.
+"""Post-weight materialization passes for Mobius ONNX models.
 
 Passes here are designed to run **after weights are loaded** so that
 initializer data is available for pre-computation.  All passes use
@@ -42,11 +27,9 @@ from __future__ import annotations
 __all__ = [
     "FoldTransposedInitializerPass",
     "FoldConcatInitializersPass",
-    "Fp8KvCachePass",
     "RemoveDeadGraphInputsPass",
 ]
 
 from mobius._passes._fold_concat import FoldConcatInitializersPass
 from mobius._passes._fold_transpose import FoldTransposedInitializerPass
-from mobius._passes._fp8_kv_cache import Fp8KvCachePass
 from mobius._passes._remove_dead_inputs import RemoveDeadGraphInputsPass

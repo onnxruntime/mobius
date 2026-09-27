@@ -355,11 +355,11 @@ class TestGQAContextDispatch:
         assert count_op_type(graph, "Attention") >= 1
         assert count_op_type(graph, "GroupQueryAttention") == 0
 
-    def test_build_with_cuda_ep_emits_gqa_directly(self):
-        """build_from_module with CUDA EP and float16 config emits GroupQueryAttention directly."""
+    def test_build_with_cuda_target_keeps_canonical_attention(self):
+        """A CUDA target contract does not introduce GroupQueryAttention during export."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         config = make_config(
             dtype=ir.DataType.FLOAT16,
@@ -373,16 +373,14 @@ class TestGQAContextDispatch:
             execution_provider="cuda",
         )
         ops = count_ops(pkg["model"])
-        # Direct generation: each layer should have a GroupQueryAttention node
-        assert ops.get("GroupQueryAttention", 0) == config.num_hidden_layers
-        # Standard ONNX Attention should not appear
-        assert ops.get("Attention", 0) == 0
+        assert ops.get("GroupQueryAttention", 0) == 0
+        assert ops.get("Attention", 0) == config.num_hidden_layers
 
-    def test_build_with_webgpu_ep_emits_gqa_directly(self):
-        """WebGPU float16 builds keep attention and KV updates in GQA."""
+    def test_build_with_webgpu_target_keeps_canonical_attention(self):
+        """A WebGPU target contract does not introduce GroupQueryAttention during export."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         config = make_config(
             dtype=ir.DataType.FLOAT16,
@@ -398,19 +396,14 @@ class TestGQAContextDispatch:
         model = pkg["model"]
         ops = count_ops(model)
 
-        assert ops.get("GroupQueryAttention", 0) == config.num_hidden_layers
-        assert ops.get("Attention", 0) == 0
-        assert all(
-            node.domain == "com.microsoft"
-            for node in model.graph
-            if node.op_type == "GroupQueryAttention"
-        )
+        assert ops.get("GroupQueryAttention", 0) == 0
+        assert ops.get("Attention", 0) == config.num_hidden_layers
 
     def test_build_with_default_ep_uses_standard_attention(self):
         """build_from_module with default EP keeps standard ONNX Attention (no GQA)."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         config = make_config(
             max_position_embeddings=128,
@@ -438,7 +431,7 @@ class TestGQAContextDispatch:
         from mobius._builder import build_from_module
         from mobius._configs import ArchitectureConfig
         from mobius._registry import registry
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         # Minimal Qwen2.5-VL-style config with mrope_section (activates ChunkedMRope).
         mrope_config = ArchitectureConfig(
@@ -466,23 +459,14 @@ class TestGQAContextDispatch:
             execution_provider="cuda",
         )
         ops = count_ops(pkg["model"])
-        # MRoPE model must NOT use direct GQA (do_rotary=1 is 1D only).
-        # The rewrite rule path still applies GroupQueryAttention after graph construction.
-        assert ops.get("GroupQueryAttention", 0) == mrope_config.num_hidden_layers
+        assert ops.get("GroupQueryAttention", 0) == 0
+        assert ops.get("Attention", 0) == mrope_config.num_hidden_layers
 
-    def test_direct_gqa_and_rewrite_rule_produce_same_structure(self):
-        """Direct GQA and rewrite-rule paths both produce GroupQueryAttention per layer.
-
-        Verifies that for a standard 1D-RoPE model:
-        - CPU EP (direct path): num_layers GQA nodes
-        - Default EP + manual rewrite rule: same count
-        """
-        from onnxscript.rewriter import rewrite
-
+    def test_target_contract_does_not_change_canonical_attention(self):
+        """CPU and default target contracts produce the same canonical attention graph."""
         from mobius._builder import build_from_module
         from mobius._registry import registry
-        from mobius.rewrite_rules import group_query_attention_rules
-        from mobius.rewrite_rules._testing_utils import count_ops
+        from mobius._testing import count_ops
 
         config = make_config(
             max_position_embeddings=128,
@@ -491,8 +475,7 @@ class TestGQAContextDispatch:
         )
         num_layers = config.num_hidden_layers
 
-        # Direct path: CPU EP uses GQA directly (FLOAT is in cpu.gqa_dtypes)
-        pkg_direct = build_from_module(
+        pkg_cpu = build_from_module(
             registry.get("llama")(config),
             config,
             execution_provider="cpu",
@@ -504,14 +487,10 @@ class TestGQAContextDispatch:
             config,
             execution_provider="default",
         )
-        rewrite(pkg_default["model"], group_query_attention_rules())
-
-        ops_direct = count_ops(pkg_direct["model"])
+        ops_cpu = count_ops(pkg_cpu["model"])
         ops_rewrite = count_ops(pkg_default["model"])
 
-        # Both paths must produce the same number of GroupQueryAttention nodes
-        assert ops_direct.get("GroupQueryAttention", 0) == num_layers
-        assert ops_rewrite.get("GroupQueryAttention", 0) == num_layers
-        # Neither path should leave any standard Attention nodes
-        assert ops_direct.get("Attention", 0) == 0
-        assert ops_rewrite.get("Attention", 0) == 0
+        assert ops_cpu.get("GroupQueryAttention", 0) == 0
+        assert ops_rewrite.get("GroupQueryAttention", 0) == 0
+        assert ops_cpu.get("Attention", 0) == num_layers
+        assert ops_rewrite.get("Attention", 0) == num_layers

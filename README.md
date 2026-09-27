@@ -82,20 +82,21 @@ pkg = build("meta-llama/Llama-3.2-1B", task=task)
 pkg.save("output/llama-3.2-1b-static/")
 ```
 
-**EP-aware optimization** generates graphs tuned for a specific runtime execution
-provider. Pass `execution_provider` to target CUDA, DirectML, WebGPU, and more —
-each with the right set of fused kernels and lowering passes applied automatically:
+Mobius exports a canonical graph without automatically applying execution-provider
+rewrites. `execution_provider` selects structural requirements such as component
+interfaces and buffer limits; downstream tooling such as Olive decides whether to
+retain custom functions, expand them to strict ONNX, or apply EP-specific rewrites:
 
 ```python
 from mobius import build
 
-# CUDA: GQA fusion, SkipLayerNorm, PackQKV
+# CUDA target contract; graph rewrites run downstream
 pkg = build("meta-llama/Llama-3.2-1B",
             execution_provider="cuda", dtype="f16")
 
-# WebGPU: GQA fusion, Shape ops replaced with portable alternatives
-pkg = build("meta-llama/Llama-3.2-1B",
-            execution_provider="webgpu", dtype="f16")
+# OpenVINO structural contract keeps Gemma4 per-layer inputs rank-4
+pkg = build("google/gemma-4-E2B-it",
+            execution_provider="openvino", device="npu")
 ```
 
 See the [EP quickstart](docs/ep_quickstart.md) and

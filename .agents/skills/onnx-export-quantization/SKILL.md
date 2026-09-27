@@ -40,8 +40,7 @@ mobius build \
 |------|-------------|
 | `--model <id>` | HuggingFace model ID (e.g. `google/gemma-4-27b-it`) |
 | `--dtype <f16\|bf16>` | Model precision — `f16` (float16) or `bf16` (bfloat16) |
-| `--optimize [RULES]` | Apply mobius rewrite rules after building (e.g. `group_query_attention`, `packed_attention`, `skip_norm`). Use without value for all rules, or specify comma-separated names. Not needed for basic exports. |
-| `--ep <variant>` | Execution provider variant (see below) |
+| `--ep <variant>` | Select structural build requirements and runtime metadata; graph rewrites run in Olive. |
 | `--runtime ort-genai` | Generate `genai_config.json` and copy tokenizer files for ORT GenAI runtime |
 | `--external-data safetensors` | Store weights externally in safetensors format |
 | `--max-shard-size 5GB` | Split external data into shards ≤ 5GB |

@@ -180,23 +180,15 @@ config = ArchitectureConfig.from_file("/path/to/model/")
 config.validate()  # Check field consistency
 ```
 
-### Apply graph optimizations
-
-```python
-from onnxscript.rewriter import rewrite
-from mobius import build
-from mobius.rewrite_rules import group_query_attention_rules, skip_norm_rules
-
-pkg = build("Qwen/Qwen2.5-0.5B")
-model = pkg["model"]
-rewrite(model, pattern_rewrite_rules=group_query_attention_rules())
-rewrite(model, pattern_rewrite_rules=skip_norm_rules())
-```
-
-Or via CLI:
+### Apply graph transformations in Olive
 
 ```bash
-mobius build --model Qwen/Qwen2.5-0.5B --output output/ --ep cuda --dtype f16
+olive capture-onnx-graph \
+  --model_name_or_path Qwen/Qwen2.5-0.5B \
+  --use_mobius_builder \
+  --execution_provider cuda \
+  --device gpu \
+  --output_path output/
 ```
 
 ## CLI Quick Start

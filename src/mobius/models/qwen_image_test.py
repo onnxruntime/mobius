@@ -242,7 +242,7 @@ def test_all_supported_dtypes_build(dtype: ir.DataType):
     assert not any(node.op_type == "Identity" for node in model.graph)
 
 
-def test_transformer_graph_is_fused_and_post_weight_optimized():
+def test_transformer_graph_is_canonical_and_post_weight_materialized():
     from collections import Counter
 
     from mobius import build_from_module
@@ -268,13 +268,7 @@ def test_transformer_graph_is_fused_and_post_weight_optimized():
     )["model"]
     counts = Counter(node.op_type for node in model.graph.all_nodes())
 
-    # Main's fused-Swish path plus CSE shares the common timestep modulation
-    # across image/text streams and transformer blocks.
-    assert counts["Swish"] == 2
-    assert counts["Sigmoid"] == 0
-    assert counts["SkipLayerNormalization"] == 6
-    assert counts["Gelu"] == 3
-    assert counts["Identity"] == 0
+    assert counts["SkipLayerNormalization"] == 0
     assert counts["Attention"] == config.num_layers
 
     rng = np.random.default_rng(17)
@@ -289,7 +283,7 @@ def test_transformer_graph_is_fused_and_post_weight_optimized():
 
     # All per-weight Linear transposes fold into the initializers; only dynamic
     # data-layout transposes for RoPE/attention remain.
-    assert transpose_count == 39
+    assert transpose_count == 42
     assert optimized_counts["Transpose"] == 8
     assert sum(optimized_counts.values()) < sum(counts.values())
 
@@ -449,6 +443,7 @@ def test_edit_vae_skips_temporal_convolutions_for_single_frame_images():
     np.testing.assert_allclose(actual_image, expected_image, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.skip(reason="BF16 target lowering moved to Olive graph surgery")
 @pytest.mark.parametrize("part", ["encoder", "decoder"])
 def test_edit_vae_bfloat16_graph_has_only_kernel_backed_ops(part):
     """bfloat16 VAE graphs must avoid ops onnxruntime has no bfloat16 kernel for.
@@ -459,11 +454,8 @@ def test_edit_vae_bfloat16_graph_has_only_kernel_backed_ops(part):
     between casts, and the bfloat16 lowering pass rewrites ``Clip`` into
     ``Min``/``Max``, so no bfloat16-typed instance of those ops may survive.
     """
-    from mobius._optimizations import optimize_model
-
     package = _temporal_vae(ir.DataType.BFLOAT16)[2]
     model = package[part]
-    optimize_model(model, ep="cuda", dtype=ir.DataType.BFLOAT16, model_role="encoder")
     unsupported = {"ReduceL2", "Resize", "Clip"}
     offenders = [
         node.op_type

@@ -9,8 +9,10 @@ import onnx_ir as ir
 import pytest
 
 from mobius._build_context import (
+    BuildContract,
     build_context,
     ep_capabilities,
+    get_build_contract,
     get_build_dtype,
     is_prefill_prefix_pruning_enabled,
     prefill_prefix_pruning,
@@ -37,6 +39,9 @@ class TestBuildContextDefaults:
         """No context active → returns FLOAT."""
         assert get_build_dtype() == ir.DataType.FLOAT
 
+    def test_default_build_contract_is_portable(self):
+        assert get_build_contract() == BuildContract()
+
     def test_prefill_prefix_pruning_is_disabled(self):
         assert not is_prefill_prefix_pruning_enabled()
 
@@ -51,12 +56,39 @@ class TestBuildContextDefaults:
         assert ir.DataType.FLOAT16 in capabilities.gqa_dtypes
         assert capabilities.supports_past_present_share_buffer
 
+    @pytest.mark.parametrize(
+        ("target", "field", "expected"),
+        [
+            ("openvino", "layered_per_layer_inputs", True),
+            ("webgpu", "max_buffer_size", 268_435_456),
+            ("qnn", "supports_range", False),
+        ],
+    )
+    def test_build_contract_projects_structural_capabilities(self, target, field, expected):
+        contract = BuildContract.from_capabilities(ep_registry.require(target))
+        assert getattr(contract, field) == expected
+
 
 class TestBuildContextScoping:
     def test_capabilities_visible_inside_context(self):
         with build_context(_CUDA_CAPABILITIES, ir.DataType.FLOAT16):
             assert ep_capabilities().name == "cuda"
+            assert get_build_contract().target_execution_provider == "cuda"
             assert get_build_dtype() == ir.DataType.FLOAT16
+
+    def test_explicit_contract_is_independent_of_graph_capabilities(self):
+        contract = BuildContract(
+            target_execution_provider="openvino",
+            target_device="npu",
+            layered_per_layer_inputs=True,
+        )
+        with build_context(
+            _CUDA_CAPABILITIES,
+            ir.DataType.FLOAT16,
+            contract=contract,
+        ):
+            assert ep_capabilities().name == "cuda"
+            assert get_build_contract() == contract
 
     def test_capabilities_restored_after_context(self):
         with build_context(_CUDA_CAPABILITIES, ir.DataType.FLOAT16):

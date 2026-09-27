@@ -101,8 +101,7 @@ def skip_simplified_layer_normalization() -> ir.Function:
     positional outputs — ``output`` (0), ``mean`` (1), ``inv_std_var`` (2) and
     ``input_skip_bias_sum`` (3). The residual sum lives at **index 3**, so the
     function body must expose it there for InlinePass to reconnect downstream
-    consumers correctly (see :mod:`mobius.rewrite_rules._skip_norm`, which reads
-    ``outputs[3]``). ``mean`` and ``inv_std_var`` are training-only outputs that
+    consumers correctly. ``mean`` and ``inv_std_var`` are training-only outputs that
     the simplified (RMS) variant does not compute and that ``RMSNormalization``
     (single-output) cannot supply; they are emitted as unused ``Constant``
     placeholders purely to keep the output arity aligned. Because the fusion

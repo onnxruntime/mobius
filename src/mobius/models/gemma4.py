@@ -32,7 +32,11 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
+from mobius._build_context import (
+    ep_capabilities,
+    get_build_contract,
+    is_prefill_prefix_pruning_enabled,
+)
 from mobius._configs import ArchitectureConfig, Gemma4Config, QuantizationConfig
 from mobius._weight_utils import (
     is_packed_quant_key,
@@ -2227,7 +2231,7 @@ class Gemma4TextModel(nn.Module):
             num_layers = len(self.layers)
             per_layer_4d = (
                 per_layer_inputs
-                if ep_capabilities().layered_per_layer_inputs
+                if get_build_contract().layered_per_layer_inputs
                 else op.Reshape(
                     per_layer_inputs,
                     op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
@@ -3027,7 +3031,7 @@ class Gemma4EmbeddingModel(nn.Module):
         combined = op.Mul(combined, float(0.5**0.5))
         per_layer_inputs = (
             combined
-            if ep_capabilities().layered_per_layer_inputs
+            if get_build_contract().layered_per_layer_inputs
             else op.Reshape(
                 combined,
                 op.Constant(value_ints=[0, 0, self._num_layers * self._per_layer_dim]),

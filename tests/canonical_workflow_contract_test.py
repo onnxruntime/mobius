@@ -38,7 +38,6 @@ import yaml
 
 from mobius import registry
 from mobius._configs import ArchitectureConfig
-from mobius._optimizations import optimize_model
 from mobius.integrations.onnx_genai._workflow_contract import (
     published_value_references,
 )
@@ -102,20 +101,6 @@ def _static_cache_decoder() -> tuple[Any, dict[str, Any]]:
     return pkg, build_decoder_workflow_metadata(pkg, config)
 
 
-def _fp8_decoder() -> tuple[Any, dict[str, Any]]:
-    """One ONNX file whose cache buffers are FP8 rather than the compute dtype."""
-    config = _text_config()
-    pkg = CausalLMTask().build(registry.get("qwen2")(config), config)
-    optimize_model(
-        pkg["model"],
-        ep="cuda",
-        dtype=ir.DataType.FLOAT16,
-        model_role="decoder",
-        fp8_kv_cache=True,
-    )
-    return pkg, build_decoder_workflow_metadata(pkg, config)
-
-
 def _heterogeneous_decoder() -> tuple[Any, dict[str, Any]]:
     """One ONNX file that publishes two state groups instead of one.
 
@@ -146,7 +131,6 @@ def _composite_vision_language() -> tuple[Any, dict[str, Any]]:
 _PACKAGES = {
     "dynamic": _dynamic_decoder,
     "static_cache": _static_cache_decoder,
-    "fp8": _fp8_decoder,
     "heterogeneous": _heterogeneous_decoder,
     "composite": _composite_vision_language,
 }

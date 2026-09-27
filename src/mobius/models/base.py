@@ -37,6 +37,7 @@ from mobius.components import (
     RMSNorm,
     TiedQuantizedLMHead,
     create_padding_mask,
+    create_sliding_window_mask,
     create_static_cache_attention_bias,
     initialize_rope,
     make_quantized_linear_factory,
@@ -259,23 +260,6 @@ class TextModel(nn.Module):
             # in Attention.forward() (which checks `if position_embeddings is not None`).
             position_embeddings = None
         else:
-            # This path (CPU fp32, DML, non-fused RoPE, mRoPE, static cache)
-            # builds at most a bool padding mask; it has no way to express a
-            # sliding window. Warn if the model expects one so the divergence
-            # from HuggingFace for sequences longer than the window is not
-            # silent. (For seq <= window the result is identical regardless.)
-            if self._gqa_local_window_size() > 0:
-                logger.warning(
-                    "Model declares a uniform sliding window "
-                    "(sliding_window=%s) but is being built through a non-GQA "
-                    "attention path (build dtype=%s); the exported graph uses "
-                    "full causal attention and will diverge from HuggingFace "
-                    "for sequences longer than the window. Build with a "
-                    "GQA-capable execution provider/dtype (e.g. CUDA or DML "
-                    "with float16/bfloat16) to apply the window.",
-                    getattr(self.config, "sliding_window", None),
-                    dtype,
-                )
             # NoPE models (e.g. NemotronH, GraniteMoeHybrid) have
             # ``rotary_emb = None`` because ``initialize_rope`` returned
             # ``None`` for ``config.rope_type is None``. Skip building
@@ -292,15 +276,32 @@ class TextModel(nn.Module):
             # handled by is_causal=1 on the Attention op (set in
             # _apply_attention), so we only need padding information here.
             if attention_mask is not None:
-                attention_bias = create_padding_mask(
-                    op,
-                    input_ids=hidden_states if input_ids is None else input_ids,
-                    attention_mask=attention_mask,
+                input_for_mask = hidden_states if input_ids is None else input_ids
+                local_window_size = self._gqa_local_window_size()
+                attention_bias = (
+                    create_sliding_window_mask(
+                        op,
+                        input_ids=input_for_mask,
+                        attention_mask=attention_mask,
+                        window_size=local_window_size,
+                    )
+                    if local_window_size > 0
+                    else create_padding_mask(
+                        op,
+                        input_ids=input_for_mask,
+                        attention_mask=attention_mask,
+                    )
                 )
             else:
                 attention_bias = self._maybe_static_cache_bias(
                     op, hidden_states, past_key_values
                 )
+                if attention_bias is None and self._gqa_local_window_size() > 0:
+                    logger.warning(
+                        "Static-cache export cannot represent sliding window %s "
+                        "without the static-cache bias feature.",
+                        getattr(self.config, "sliding_window", None),
+                    )
 
         present_key_values = []
         output_layer_indices = getattr(self, "output_layer_indices", None)

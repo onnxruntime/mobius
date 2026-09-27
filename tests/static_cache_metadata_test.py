@@ -371,103 +371,13 @@ class TestHeterogeneousStaticCache:
         assert "attention_mask" in _model_invoke(loop["setup"])
 
 
-class TestFp8KvCacheMetadata:
-    """FP8 storage is a graph-visible fact, so the metadata must repeat it.
-
-    A runtime allocates the KV buffers from these contracts. Publishing
-    ``float16`` for a cache the graph declares as ``float8_e4m3fn`` would size
-    every buffer at twice the bytes the model reads, so the declared dtype has
-    to be whatever the graph actually says — never the model's compute dtype.
-    """
-
-    @staticmethod
-    @pytest.fixture(scope="class")
-    def fp8_workflow():
-        import onnx_ir as ir
-
-        from mobius._optimizations import optimize_model
-
-        config = _text_config()
-        module = registry.get("qwen2")(config)
-        pkg = CausalLMTask().build(module, config)
-        optimize_model(
-            pkg["model"],
-            ep="cuda",
-            dtype=ir.DataType.FLOAT16,
-            model_role="decoder",
-            fp8_kv_cache=True,
-        )
-        return pkg, build_decoder_workflow_metadata(pkg, config)
-
-    def test_graph_ports_are_fp8(self, fp8_workflow):
-        pkg, _ = fp8_workflow
-        import onnx_ir as ir
-
-        caches = [
-            value
-            for value in [*pkg["model"].graph.inputs, *pkg["model"].graph.outputs]
-            if value.name.startswith(("past_key_values.", "present."))
-        ]
-        assert caches
-        assert {value.dtype for value in caches} == {ir.DataType.FLOAT8E4M3FN}
-
-    def test_state_contracts_declare_the_graph_dtype(self, fp8_workflow):
-        _, metadata = fp8_workflow
-        workflow = metadata["pipeline"]["workflow"]
-        cells = _cache_cells(workflow)
-        assert cells
-        for cell in cells:
-            assert workflow["state"][cell]["contract"]["dtype"] == "float8_e4m3fn"
-
-    def test_carried_cache_is_still_an_appending_cache(self, fp8_workflow):
-        # Quantizing the cells changes their dtype, not their update discipline.
-        _, metadata = fp8_workflow
-        group = next(
-            iter(
-                metadata["pipeline"]["workflow"]["serving"]["state_service"]["groups"].values()
-            )
-        )
-        assert group["sequence_axis"] == 2
-        assert group["layout"] == "bnsh"
-        assert group.get("update", {}).get("kind") != "indexed_scatter"
-
-
 class TestFeatureCombinations:
     """Which feature pairs are representable, and which are refused and why."""
 
-    def test_fp8_requires_an_operator_that_can_dequantize_the_cache(self):
-        # A static-cache graph scatters into buffers read by ai.onnx Attention,
-        # which has no k_scale/v_scale inputs. Retyping those buffers would
-        # declare FP8 over bytes that are read as float16, so the build must
-        # refuse rather than emit either a wrong graph or a silently fp16 one.
-        import onnx_ir as ir
-
-        from mobius._optimizations import optimize_model
-
+    def test_static_cache_metadata_uses_indexed_scatter(self):
         config = _text_config()
         module = registry.get("qwen2")(config)
         pkg = CausalLMTask(static_cache=True, max_seq_len=CAPACITY).build(module, config)
-        with pytest.raises(ValueError, match="no GroupQueryAttention KV cache"):
-            optimize_model(
-                pkg["model"],
-                ep="cuda",
-                dtype=ir.DataType.FLOAT16,
-                model_role="decoder",
-                fp8_kv_cache=True,
-            )
-
-    def test_static_cache_survives_cuda_optimization(self):
-        # Optimizing must not rewrite the scatter into an appending cache.
-        import onnx_ir as ir
-
-        from mobius._optimizations import optimize_model
-
-        config = _text_config()
-        module = registry.get("qwen2")(config)
-        pkg = CausalLMTask(static_cache=True, max_seq_len=CAPACITY).build(module, config)
-        optimize_model(
-            pkg["model"], ep="cuda", dtype=ir.DataType.FLOAT16, model_role="decoder"
-        )
         metadata = build_decoder_workflow_metadata(pkg, config)
         _, group = _scatter_group(metadata)
         assert group["update"]["kind"] == "indexed_scatter"
