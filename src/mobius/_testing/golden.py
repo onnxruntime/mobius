@@ -516,6 +516,90 @@ def load_drafter_inputs(
         return {k: data[k] for k in data.files}
 
 
+def diarization_probs_path_for_case(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> Path:
+    """Return the companion ``*_probs.npz`` path for a diarization test case.
+
+    Diarization models (``diarization`` / ``diarization-streaming``) emit
+    continuous per-frame per-speaker sigmoid probabilities rather than a
+    vocab logit vector, so ``compare_golden()``'s argmax/top-K gate does not
+    apply and the raw arrays cannot be compactly summarized the way
+    ``GoldenRef`` summarizes a logit vector. Streaming cases additionally
+    need the per-chunk Arrival-Order Speaker Cache (AOSC) + FIFO cache-state
+    tensors so a multi-chunk session can be replayed exactly. Both are
+    stored in this companion ``.npz`` (see :func:`save_diarization_golden`),
+    mirroring the ``*_inputs.npz`` pattern used by drafter tasks.
+
+    Maps ``testdata/cases/<task>/<name>.yaml``
+    to  ``testdata/golden/<task>/<name>_probs.npz``.
+    """
+    task_dir = case.yaml_path.parent.name
+    return golden_dir / task_dir / f"{case.case_id}_probs.npz"
+
+
+def save_diarization_golden(
+    json_path: Path,
+    *,
+    arrays: dict[str, np.ndarray],
+    provenance: dict[str, object] | None = None,
+) -> None:
+    """Save a diarization test case's golden reference.
+
+    The full-precision arrays (per-frame speaker probabilities and, for
+    streaming cases, the per-chunk cache-state tensors) are stored in a
+    companion ``*_probs.npz`` next to ``json_path`` (see
+    :func:`diarization_probs_path_for_case`); ``json_path`` itself records
+    only lightweight, human-diffable shape/provenance metadata so a reviewer
+    can sanity-check a regenerated golden without loading the ``.npz``.
+
+    Args:
+        json_path: Destination path for the metadata ``.json`` file.
+        arrays: Named reference arrays, e.g. ``{"probs": ...}`` for an
+            offline case or ``{"chunk0_probs": ..., "chunk0_past_fifo":
+            ..., ...}`` for a streaming session.
+        provenance: Immutable source identities used to generate the golden.
+    """
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    npz_path = json_path.with_name(json_path.stem + "_probs.npz")
+    np.savez(npz_path, **arrays)  # type: ignore[arg-type]
+
+    data: dict = {"array_shapes": {k: list(v.shape) for k, v in arrays.items()}}
+    if provenance:
+        data["provenance"] = provenance
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")  # trailing newline for POSIX compliance
+
+
+def load_diarization_golden(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> dict[str, np.ndarray] | None:
+    """Load a diarization test case's golden reference arrays.
+
+    Returns the ``.npz`` companion arrays saved by
+    :func:`save_diarization_golden` (e.g. ``{"probs": ...}`` or the
+    per-chunk ``chunk{i}_*`` streaming arrays), or ``None`` if either the
+    metadata ``.json`` or its companion ``.npz`` is missing.
+
+    Args:
+        case: The test case whose golden to load.
+        golden_dir: Root directory for golden files.
+    """
+    json_path = golden_path_for_case(case, golden_dir)
+    if not json_path.exists():
+        return None
+    npz_path = diarization_probs_path_for_case(case, golden_dir)
+    if not npz_path.exists():
+        return None
+    with np.load(npz_path, allow_pickle=False) as data:
+        return {k: data[k] for k in data.files}
+
+
 def discover_test_cases(
     task_type: str | None = None,
     level: str | None = None,

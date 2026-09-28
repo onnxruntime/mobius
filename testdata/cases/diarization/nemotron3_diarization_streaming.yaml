@@ -1,0 +1,27 @@
+model_id: "nvidia/Nemotron-3-Diarization"
+model_type: "nemotron3_diarization"
+revision: "f667ed73aee57d40cc39428eb768b4fd87a0a29e"
+task_type: "diarization-streaming"
+dtype: "float32"
+
+level: "L5"
+
+notes: >
+  3-chunk streaming diarization session. Each chunk is a full
+  (chunk_length + chunk_right_context) window of deterministic synthetic mel
+  (seeded torch.randn per chunk) run through HuggingFace's real per-chunk
+  forward() + Nemotron3DiarizationSpeakerCache bookkeeping. With this
+  checkpoint's default streaming config (FIFO capacity 264, speaker-cache
+  capacity 264, update period 222) a single default-sized chunk (340 encoder
+  frames) already overflows the FIFO, so this exercises both the
+  FIFO-to-cache eviction path and the top-k Arrival-Order Speaker Cache
+  (AOSC) compression path by the second chunk. The companion
+  nemotron3_diarization_streaming_probs.npz stores, per chunk i: the mel
+  input (chunk{i}_mel), per-frame speaker probabilities (chunk{i}_probs),
+  and the full AOSC + FIFO cache state after that chunk (chunk{i}_cache_*,
+  chunk{i}_fifo, chunk{i}_num_cache_frames, chunk{i}_num_fifo_frames,
+  chunk{i}_is_compressed) so the L5 test can thread the real exported
+  streaming ONNX graph's own outputs back in as the next chunk's cache
+  inputs and verify each step against the independently-computed HuggingFace
+  reference. Regenerate with
+  `python scripts/generate_golden.py --case testdata/cases/diarization/nemotron3_diarization_streaming.yaml`.

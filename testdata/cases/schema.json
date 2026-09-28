@@ -46,6 +46,8 @@
         "codec",
         "ctc-asr",
         "depth-estimation",
+        "diarization",
+        "diarization-streaming",
         "dflash-draft",
         "feature-extraction",
         "feature-ctc-asr",
@@ -443,10 +445,11 @@
       "type": "string",
       "enum": [
         "causal-lm",
-        "multimodal"
+        "multimodal",
+        "nemo"
       ],
       "default": "causal-lm",
-      "description": "HuggingFace loader used to generate the reference. Use multimodal when a text-only export is sourced from a composite checkpoint."
+      "description": "HuggingFace loader used to generate the reference. Use multimodal when a text-only export is sourced from a composite checkpoint. Use nemo when the reference is a NeMo toolkit model restored from a .nemo archive rather than a HuggingFace transformers checkpoint."
     },
     "skip_reason": {
       "type": [

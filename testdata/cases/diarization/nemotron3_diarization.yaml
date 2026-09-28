@@ -1,0 +1,24 @@
+model_id: "nvidia/Nemotron-3-Diarization"
+model_type: "nemotron3_diarization"
+revision: "f667ed73aee57d40cc39428eb768b4fd87a0a29e"
+task_type: "diarization"
+dtype: "float32"
+
+level: "L4"
+
+notes: >
+  Offline single-pass speaker diarization. The golden reference is a
+  deterministic synthetic mel fixture (seeded torch.randn, below
+  chunk_length * subsampling_factor so HuggingFace's own offline forward
+  does not internally re-chunk) run through the real HuggingFace
+  Nemotron3DiarizationForAudioFrameClassification checkpoint -- diarization
+  models take raw mel input_features directly (no audio-waveform processor
+  step), so a real recorded audio fixture is not required to exercise every
+  op in the exported graph. The reference stores per-frame per-speaker
+  sigmoid probabilities in the companion nemotron3_diarization_probs.npz
+  (see mobius._testing.golden.save_diarization_golden); compare_golden()'s
+  argmax/top-K gate does not apply to this continuous output, so this case
+  is compared with compare_diarization_golden() (elementwise atol/rtol,
+  with per-frame dominant-speaker argmax agreement and active-speaker-set
+  Jaccard as diagnostics). Regenerate with
+  `python scripts/generate_golden.py --case testdata/cases/diarization/nemotron3_diarization.yaml`.

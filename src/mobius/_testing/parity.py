@@ -6,6 +6,9 @@
 Provides ParityReport dataclass and level-appropriate comparison functions:
 - compare_synthetic(): atol/rtol-gated (for L3 synthetic parity)
 - compare_golden(): argmax-gated (for L4 golden comparison)
+- compare_diarization_golden(): atol/rtol-gated over continuous per-frame
+  per-speaker probabilities (for diarization L4/L5 golden comparison, where
+  argmax-over-vocab is not a meaningful gate)
 """
 
 from __future__ import annotations
@@ -345,5 +348,116 @@ def compare_golden(
         near_tie_margin=margin,
         result=result,
         level="L4",
+        message=message,
+    )
+
+
+# Default tolerances for diarization probability comparison, keyed by dtype.
+_DIARIZATION_TOLERANCES: dict[str, tuple[float, float]] = {
+    "float32": (1e-3, 1e-2),
+    "float16": (1e-2, 5e-2),
+    "bfloat16": (5e-2, 1e-1),
+}
+
+
+def compare_diarization_golden(
+    onnx_probs: np.ndarray,
+    golden_probs: np.ndarray,
+    atol: float | None = None,
+    rtol: float | None = None,
+    dtype: str = "float32",
+    level: str = "L4",
+) -> ParityReport:
+    """L4/L5 diarization golden comparison.  Gate: elementwise allclose.
+
+    Diarization models (``diarization`` / ``diarization-streaming`` task
+    types) emit continuous per-frame per-speaker sigmoid probabilities in
+    ``[0, 1]`` rather than a vocab logit vector, so ``compare_golden()``'s
+    argmax/top-K gate is not meaningful here. The gate is atol/rtol
+    allclose on the full probability tensor (mirroring ``compare_synthetic``'s
+    gate, but used at L4/L5 against a real-weights reference rather than a
+    synthetic one). Per-frame dominant-speaker argmax agreement and the
+    active-speaker-set Jaccard at the standard 0.5 decision threshold are
+    reported as diagnostics (repurposing ``argmax_match``/``top10_jaccard``
+    for the diarization-appropriate quantities of the same *kind*).
+    """
+    assert onnx_probs.shape == golden_probs.shape, (
+        f"Shape mismatch: ONNX {onnx_probs.shape} vs golden {golden_probs.shape}"
+    )
+    default_atol, default_rtol = _DIARIZATION_TOLERANCES.get(dtype, (1e-3, 1e-2))
+    atol = default_atol if atol is None else atol
+    rtol = default_rtol if rtol is None else rtol
+
+    a64 = onnx_probs.astype(np.float64)
+    b64 = golden_probs.astype(np.float64)
+
+    abs_diff = np.abs(a64 - b64)
+    max_abs_diff = float(abs_diff.max())
+    mean_abs_diff = float(abs_diff.mean())
+    atol_pass = bool(np.allclose(a64, b64, atol=atol, rtol=0))
+    rtol_pass = bool(np.allclose(a64, b64, atol=0, rtol=rtol))
+    allclose_pass = bool(np.allclose(a64, b64, atol=atol, rtol=rtol))
+
+    # Per-frame dominant-speaker argmax agreement (diagnostic).
+    onnx_dominant = np.argmax(a64, axis=-1)
+    golden_dominant = np.argmax(b64, axis=-1)
+    dominant_match_ratio = float(np.mean(onnx_dominant == golden_dominant))
+    dominant_match = dominant_match_ratio >= 1.0 - 1e-9
+
+    # Active-speaker-set Jaccard at the 0.5 decision threshold, averaged per
+    # frame (the diarization analogue of compare_golden's top10_jaccard).
+    onnx_active = a64 > 0.5
+    golden_active = b64 > 0.5
+    union = np.logical_or(onnx_active, golden_active).sum(axis=-1)
+    intersection = np.logical_and(onnx_active, golden_active).sum(axis=-1)
+    frame_jaccard = np.where(union > 0, intersection / np.maximum(union, 1), 1.0)
+    active_speaker_jaccard = float(np.mean(frame_jaccard))
+
+    norm_onnx = np.linalg.norm(a64.reshape(-1))
+    norm_golden = np.linalg.norm(b64.reshape(-1))
+    cosine_similarity = (
+        float(np.dot(a64.reshape(-1), b64.reshape(-1)) / (norm_onnx * norm_golden))
+        if norm_onnx > 0 and norm_golden > 0
+        else 0.0
+    )
+
+    if allclose_pass:
+        result = ParityResult.PASS
+        message = (
+            f"{level} PASS: diarization probs match within atol={atol}, "
+            f"rtol={rtol} (max_abs_diff={max_abs_diff:.4g})"
+        )
+    elif dominant_match:
+        # Every frame's dominant speaker still agrees even though raw
+        # magnitudes differ slightly -- downgrade to AMBIGUOUS rather than
+        # FAIL, mirroring compare_golden's near-tie AMBIGUOUS downgrade.
+        result = ParityResult.AMBIGUOUS
+        message = (
+            f"{level} AMBIGUOUS: diarization probs exceed atol={atol}/rtol={rtol} "
+            f"(max_abs_diff={max_abs_diff:.4g}), but every frame's dominant "
+            "speaker still agrees"
+        )
+    else:
+        result = ParityResult.FAIL
+        message = (
+            f"{level} FAIL: diarization probs diverge "
+            f"(max_abs_diff={max_abs_diff:.4g} > atol={atol}), "
+            f"dominant-speaker match={dominant_match_ratio:.2%}"
+        )
+
+    return ParityReport(
+        argmax_match=dominant_match,
+        atol_pass=atol_pass,
+        rtol_pass=rtol_pass,
+        max_abs_diff=max_abs_diff,
+        mean_abs_diff=mean_abs_diff,
+        top10_jaccard=active_speaker_jaccard,
+        cosine_similarity=cosine_similarity,
+        top1_logit=float("nan"),
+        top2_logit=float("nan"),
+        near_tie=False,
+        near_tie_margin=0.0,
+        result=result,
+        level=level,
         message=message,
     )

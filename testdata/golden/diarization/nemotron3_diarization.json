@@ -1,0 +1,23 @@
+{
+  "array_shapes": {
+    "mel": [
+      1,
+      128,
+      2000
+    ],
+    "probs": [
+      1,
+      2000,
+      8
+    ]
+  },
+  "provenance": {
+    "model_id": "nvidia/Nemotron-3-Diarization",
+    "revision": "f667ed73aee57d40cc39428eb768b4fd87a0a29e",
+    "transformers_version": "5.18.0.dev0",
+    "torch_version": "2.14.0+cu130",
+    "seed": 0,
+    "num_speakers": 8,
+    "mel_dim": 128
+  }
+}

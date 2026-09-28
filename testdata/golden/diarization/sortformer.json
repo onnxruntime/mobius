@@ -1,0 +1,32 @@
+{
+  "array_shapes": {
+    "mel": [
+      1,
+      128,
+      400
+    ],
+    "emb_seq": [
+      1,
+      50,
+      192
+    ],
+    "emb_len": [
+      1
+    ],
+    "probs": [
+      1,
+      50,
+      4
+    ]
+  },
+  "provenance": {
+    "model_id": "nvidia/diar_streaming_sortformer_4spk-v2.1",
+    "revision": "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d",
+    "nemo_version": "2.7.3",
+    "dtype": "float32",
+    "seed": 0,
+    "feat_dim": 128,
+    "input_frames": 400,
+    "num_spks": 4
+  }
+}
