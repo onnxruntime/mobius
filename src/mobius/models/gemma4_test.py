@@ -20,6 +20,7 @@ from mobius._configs import (
     QuantizationOverride,
 )
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
+from mobius.weights import adapt_model_weights
 
 
 def _tiny_gemma4_config(**overrides) -> Gemma4Config:
@@ -896,6 +897,67 @@ class TestGemma4ComponentWeightAdapters:
 
         assert result["embedding.embed_tokens.qweight"].shape == (256, 64)
         assert result["embedding.embed_tokens.scales"].shape == (256, 4)
+
+    def test_tied_quantized_embedding_materializes_decoder_lm_head(self):
+        from mobius._component_quantization import (
+            configure_component_quantization,
+            normalize_component_quantized_weights,
+        )
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config()
+        decoder_quantization = dataclasses.replace(
+            config.component_quantization["decoder"],
+            quantize_lm_head=True,
+            overrides={"lm_head": QuantizationOverride(bits=8)},
+        )
+        embedding_quantization = dataclasses.replace(
+            config.component_quantization["embedding"],
+            quantize_embeddings=True,
+        )
+        config = dataclasses.replace(
+            config,
+            tie_word_embeddings=True,
+            component_quantization={
+                **config.component_quantization,
+                "decoder": decoder_quantization,
+                "embedding": embedding_quantization,
+            },
+        )
+        module = Gemma4Model(config)
+        task = Gemma4Task()
+        manifest = configure_component_quantization(module, config, task)
+        qweight = torch.zeros(256, 64, dtype=torch.uint8)
+        scales = torch.ones(256, 4)
+
+        renamed = adapt_model_weights(
+            module,
+            {
+                "model.language_model.embed_tokens.weight_qweight": qweight,
+                "model.language_model.embed_tokens.weight_scales": scales,
+            },
+            config=config,
+            manifest=manifest,
+        )
+
+        assert renamed["embedding.embed_tokens.weight_qweight"] is qweight
+        assert renamed["embedding.embed_tokens.weight_scales"] is scales
+        assert renamed["decoder.lm_head.weight_qweight"] is qweight
+        assert renamed["decoder.lm_head.weight_scales"] is scales
+
+        result = normalize_component_quantized_weights(
+            renamed,
+            module,
+            config,
+            ("decoder", "vision_encoder", "audio_encoder", "embedding"),
+            manifest=manifest,
+            task=task,
+        )
+
+        assert "embedding.embed_tokens.qweight" in result
+        assert "embedding.embed_tokens.scales" in result
+        assert "decoder.lm_head.weight" in result
+        assert "decoder.lm_head.scales" in result
 
 
 class TestScaleFreeRMSNormOverflow:
