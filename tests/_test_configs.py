@@ -3559,6 +3559,12 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
             "head_hidden_size": 8,
             "num_speakers": 4,
             "partial_rotary_factor": 1.0,
+            # HuggingFace's Nemotron3Diarization audio encoder is always MHA
+            # (checkpoint's audio_config sets num_key_value_heads ==
+            # num_attention_heads); the shared tiny-config default is GQA
+            # (num_key_value_heads=TINY_KV_HEADS < TINY_HEADS), which builds a
+            # V-projection shape no real checkpoint could ever populate.
+            "num_key_value_heads": TINY_HEADS,
         },
         True,
     ),

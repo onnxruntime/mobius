@@ -365,20 +365,29 @@ def _get_frame_scores(
     convention for "no such frame") are never speech (``probs <= 0.5``), so
     they always resolve to ``-inf`` and are naturally excluded from top-k
     selection without extra masking.
+
+    All float literals below are cast to ``probs``'s dtype: this scoring path
+    runs entirely in ``config.dtype`` (fp16/bf16 exports included), and ONNX
+    elementwise ops require both operands to share a dtype — a bare FLOAT32
+    ``Constant`` combined with an fp16/bf16 tensor is an invalid graph.
     """
-    threshold_t = op.Constant(value_float=threshold)
+
+    def _lit(value: float) -> ir.Value:
+        return op.CastLike(op.Constant(value_float=value), probs)
+
+    threshold_t = _lit(threshold)
     log_probs = op.Log(op.Clip(probs, threshold_t))
-    complements = op.Sub(op.Constant(value_float=1.0), probs)
+    complements = op.Sub(_lit(1.0), probs)
     log_complements = op.Log(op.Clip(complements, threshold_t))
     sum_log_complements = op.ReduceSum(log_complements, [-1], keepdims=1)
-    log_half = op.Constant(value_float=math.log(0.5))
+    log_half = _lit(math.log(0.5))
     scores = op.Sub(op.Add(op.Sub(log_probs, log_complements), sum_log_complements), log_half)
 
-    neg_inf = op.Constant(value_float=float("-inf"))
-    is_speech = op.Greater(probs, op.Constant(value_float=0.5))
+    neg_inf = _lit(float("-inf"))
+    is_speech = op.Greater(probs, _lit(0.5))
     scores = op.Where(is_speech, scores, neg_inf)
 
-    is_positive = op.Greater(scores, op.Constant(value_float=0.0))
+    is_positive = op.Greater(scores, _lit(0.0))
     positive_count = op.ReduceSum(op.Cast(is_positive, to=ir.DataType.INT64), [1], keepdims=1)
     has_enough_positive = op.GreaterOrEqual(
         positive_count, op.Constant(value_int=min_positive_scores)
@@ -460,6 +469,10 @@ def _compress_speaker_cache(
         op.Constant(value_float=config.streaming_latest_frames_score_boost),
         op.Constant(value_float=0.0),
     )
+    # ``tail_boost`` is built from bare FLOAT32 literals (matching each
+    # other); cast once here to ``scores``'s dtype before combining, rather
+    # than casting each literal individually.
+    tail_boost = op.CastLike(tail_boost, scores)
     scores = op.Add(scores, op.Unsqueeze(tail_boost, [0, 2]))
 
     scores = _boost_scores(op, scores, num_strong_boosted, -2.0 * math.log(0.5))
@@ -483,7 +496,12 @@ def _compress_speaker_cache(
         op.Constant(value_ints=[0, num_silence_frames, 0]),
         axis=0,
     )
-    scores = op.Pad(scores, scores_pad, op.Constant(value_float=float("inf")), mode="constant")
+    scores = op.Pad(
+        scores,
+        scores_pad,
+        op.CastLike(op.Constant(value_float=float("inf")), scores),
+        mode="constant",
+    )
 
     num_scored_frames = op.Add(num_frames, op.Constant(value_int=num_silence_frames))
     sentinel = op.Mul(num_scored_frames, op.Constant(value_int=num_speakers))
@@ -499,7 +517,9 @@ def _compress_speaker_cache(
         sorted=0,
         _outputs=2,
     )
-    is_masked = op.Equal(topk_scores, op.Constant(value_float=float("-inf")))
+    is_masked = op.Equal(
+        topk_scores, op.CastLike(op.Constant(value_float=float("-inf")), topk_scores)
+    )
     topk_indices = op.Where(is_masked, op.Unsqueeze(sentinel, [0]), topk_indices)
     topk_indices = _sort_ascending(op, topk_indices, cache_length)
 

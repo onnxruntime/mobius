@@ -1457,7 +1457,17 @@ class TestBuildGraphNemotron3DiarizationStreaming:
         assert isinstance(get_task("diarization-streaming"), DiarizationStreamingTask)
 
     def test_runs_multiple_chunks_with_random_weights(self):
-        """Fill random weights and run 3 sequential streaming steps through ORT."""
+        """Fill random weights and run 3 sequential streaming steps through ORT.
+
+        This is a fast structural/shape smoke test only (random weights, no
+        HuggingFace comparison). For numeric parity against the real
+        HuggingFace checkpoint — including the lookahead trimming and the
+        FIFO-eviction / top-k AOSC-compression transitions — see
+        ``tests/e2e_golden_test.py::TestL5DiarizationSession``, which threads
+        the real exported streaming graph's own cache outputs back in as the
+        next chunk's inputs and checks each step against a real-weights
+        HuggingFace golden session.
+        """
         import os
         import tempfile
 
@@ -1499,7 +1509,11 @@ class TestBuildGraphNemotron3DiarizationStreaming:
             output_names = [out.name for out in sess.get_outputs()]
             for step in range(3):
                 lookahead = config.chunk_right_context if step < 2 else 0
-                feats = np.random.randn(1, config.feat_in, raw_window).astype(np.float32)
+                # The final chunk of a recording may be shorter than the
+                # default full window (no lookahead, no padding contract) —
+                # the graph's time axis is symbolic to allow this.
+                step_raw_window = raw_window if step < 2 else raw_window // 2
+                feats = np.random.randn(1, config.feat_in, step_raw_window).astype(np.float32)
                 inputs = {
                     "input_features": feats,
                     "num_lookahead_frames": np.array(lookahead, dtype=np.int64),
@@ -1509,6 +1523,10 @@ class TestBuildGraphNemotron3DiarizationStreaming:
 
                 speaker_probs = outs["speaker_probs"]
                 assert speaker_probs.min() >= 0.0 and speaker_probs.max() <= 1.0
+                # Output frames exclude the look-ahead suffix (see the task's
+                # docstring): chunk_window_frames - lookahead * subsampling_factor.
+                expected_frames = step_raw_window - lookahead * config.subsampling_factor
+                assert speaker_probs.shape[1] == expected_frames
                 assert outs["present_num_cache_frames"] <= cache_len
                 assert outs["present_num_fifo_frames"] <= fifo_len
 

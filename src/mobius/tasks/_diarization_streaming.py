@@ -25,10 +25,15 @@ class DiarizationStreamingTask(ModelTask):
     """Build an incremental, per-chunk ONNX graph for streaming speaker diarization.
 
     Input:
-        ``input_features`` — ``[batch, feat, chunk_length + chunk_right_context]``
-            raw (pre-subsampling) mel-spectrogram window: the chunk plus its
+        ``input_features`` — ``[batch, feat, chunk_window_frames]`` raw
+            (pre-subsampling) mel-spectrogram window: the chunk plus its
             look-ahead frames, at ``config.subsampling_factor`` frames per
-            encoder frame.
+            encoder frame. ``chunk_window_frames`` is a symbolic (dynamic)
+            axis — it defaults to ``(chunk_length + chunk_right_context) *
+            subsampling_factor`` but callers may pass a shorter window (with
+            ``num_lookahead_frames=0``) for a recording's final, partial
+            chunk; there is no padding/validity contract, so every frame in
+            the window must be real audio.
         ``num_lookahead_frames`` — scalar ``int64``: how many trailing encoder
             frames of the window are look-ahead only (attended to, but not
             emitted or pushed to the FIFO). ``0`` for the last chunk of a
@@ -44,8 +49,9 @@ class DiarizationStreamingTask(ModelTask):
 
     Output:
         ``speaker_probs`` — ``[batch, frames, num_spks]`` sigmoid
-        probabilities for this chunk only (``frames = chunk_length *
-        subsampling_factor``, trimmed to the input's raw length).
+        probabilities for this chunk only (``frames`` excludes the
+        look-ahead frames: ``chunk_window_frames`` minus ``num_lookahead_frames
+        * subsampling_factor``).
         ``present_cache_embeds`` / ``present_cache_probs`` / ``present_fifo``
         / ``present_num_cache_frames`` / ``present_num_fifo_frames`` /
         ``present_is_compressed`` — updated state, fed back as the ``past_*``
@@ -62,15 +68,20 @@ class DiarizationStreamingTask(ModelTask):
         graph, builder = _make_graph(name="nemotron3_diarization_streaming")
         op = builder.op
 
-        window = config.chunk_length + config.chunk_right_context
-        raw_window = window * config.subsampling_factor
         cache_capacity = config.streaming_speaker_cache_length
         fifo_capacity = config.streaming_fifo_length
 
+        # The time axis is symbolic (not the default full-window
+        # ``chunk_length + chunk_right_context`` frame count): HuggingFace's
+        # streaming API allows a shorter final chunk (with
+        # ``num_lookahead_frames=0``, no padding contract). ``forward_streaming``
+        # already derives every frame count it needs from this input's actual
+        # shape (``raw_num_frames = op.Shape(...)``), so no other graph logic
+        # assumes the default window length.
         input_features = builder.input(
             "input_features",
             dtype=config.dtype,
-            shape=["batch", config.feat_in, raw_window],
+            shape=["batch", config.feat_in, "chunk_window_frames"],
         )
         num_lookahead_frames = builder.input(
             "num_lookahead_frames", dtype=ir.DataType.INT64, shape=[]
