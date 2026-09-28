@@ -51,6 +51,7 @@ from mobius._configs import (
     MoonshineStreamingConfig,
     MuseGlimmerConfig,
     NanoChatConfig,
+    Nemotron3DiarizationConfig,
     NemotronHConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
@@ -3545,6 +3546,19 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
             "attention_bias": True,
             "convolution_bias": True,
             "scale_input": True,
+        },
+        True,
+    ),
+    # --- Nemotron 3 Diarization (bidirectional full-RoPE Sortformer head) ---
+    (
+        "nemotron3_diarization",
+        {
+            "_config_cls": Nemotron3DiarizationConfig,
+            "feat_in": 16,
+            "subsampling_factor": 2,
+            "head_hidden_size": 8,
+            "num_speakers": 4,
+            "partial_rotary_factor": 1.0,
         },
         True,
     ),

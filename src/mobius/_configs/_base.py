@@ -4985,3 +4985,77 @@ class ParakeetCTCConfig(ArchitectureConfig):
             scale_input=getattr(encoder, "scale_input", True),
             layer_norm_eps=getattr(encoder, "layer_norm_eps", 1e-5),
         )
+
+
+@dataclasses.dataclass
+class Nemotron3DiarizationConfig(ArchitectureConfig):
+    """Configuration for HuggingFace ``Nemotron3DiarizationForAudioFrameClassification``.
+
+    Extracted from the nested ``audio_config`` (a bidirectional, partial-RoPE
+    Transformer encoder — its fields populate the base :class:`ArchitectureConfig`
+    fields directly), ``head_config`` (the speaker-classification head that
+    projects, upsamples, and classifies the encoder output), and
+    ``streaming_config`` (the Arrival-Order Speaker Cache / FIFO policy used by
+    the incremental streaming forward, see ``models/nemotron3_diarization.py``
+    for both the offline (single full-sequence) and streaming (per-chunk,
+    stateful) exports).
+    """
+
+    feat_in: int = 128
+    subsampling_factor: int = 8
+    head_hidden_size: int = 192
+    num_speakers: int = 8
+
+    # Offline chunking (also used as the default streaming step window).
+    chunk_length: int = 340
+    chunk_right_context: int = 40
+
+    # Arrival-Order Speaker Cache (AOSC) + FIFO queue policy, from
+    # ``config.streaming_config``. Used only by the streaming forward.
+    streaming_fifo_length: int = 264
+    streaming_speaker_cache_length: int = 264
+    streaming_speaker_cache_update_period: int = 222
+    streaming_silence_frames_per_speaker: int = 1
+    streaming_prediction_score_threshold: float = 0.25
+    streaming_latest_frames_score_boost: float = 0.05
+    streaming_min_positive_scores_rate: float = 0.5
+    streaming_strong_boost_rate: float = 0.75
+    streaming_weak_boost_rate: float = 1.5
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Nemotron3DiarizationConfig:
+        """Extract the nested Nemotron3Diarization audio, head, and streaming configs."""
+        audio = config.audio_config
+        head = config.head_config
+        streaming = getattr(config, "streaming_config", None)
+        base = ArchitectureConfig.from_transformers(audio, parent_config=config)
+        fields = _shallow_fields(base)
+        fields.update(model_type=getattr(config, "model_type", fields["model_type"]))
+        return cls(
+            **fields,
+            feat_in=getattr(audio, "num_mel_bins", 128),
+            subsampling_factor=getattr(audio, "subsampling_factor", 8),
+            head_hidden_size=getattr(head, "hidden_size", 192),
+            num_speakers=getattr(head, "num_speakers", 8),
+            chunk_length=getattr(config, "chunk_length", 340),
+            chunk_right_context=getattr(config, "chunk_right_context", 40),
+            streaming_fifo_length=getattr(streaming, "fifo_length", 264),
+            streaming_speaker_cache_length=getattr(streaming, "speaker_cache_length", 264),
+            streaming_speaker_cache_update_period=getattr(
+                streaming, "speaker_cache_update_period", 222
+            ),
+            streaming_silence_frames_per_speaker=getattr(
+                streaming, "speaker_cache_silence_frames_per_speaker", 1
+            ),
+            streaming_prediction_score_threshold=getattr(
+                streaming, "prediction_score_threshold", 0.25
+            ),
+            streaming_latest_frames_score_boost=getattr(
+                streaming, "latest_frames_score_boost", 0.05
+            ),
+            streaming_min_positive_scores_rate=getattr(
+                streaming, "min_positive_scores_rate", 0.5
+            ),
+            streaming_strong_boost_rate=getattr(streaming, "strong_boost_rate", 0.75),
+            streaming_weak_boost_rate=getattr(streaming, "weak_boost_rate", 1.5),
+        )

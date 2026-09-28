@@ -33,6 +33,7 @@ from mobius._builder import build_from_module
 from mobius._configs import (
     AudioConfig,
     CodePredictorConfig,
+    Nemotron3DiarizationConfig,
     SpeakerEncoderConfig,
     TTSConfig,
 )
@@ -1386,3 +1387,136 @@ class TestBuildGraphSortformer:
         assert out.shape == (1, n_time // config.fc_subsampling_factor, config.num_spks)
         # Sigmoid output must lie in [0, 1].
         assert out.min() >= 0.0 and out.max() <= 1.0
+
+
+class TestBuildGraphNemotron3DiarizationStreaming:
+    """Verify Nemotron3Diarization builds a streaming, per-chunk graph."""
+
+    def _config(self):
+        return _base_config(
+            Nemotron3DiarizationConfig,
+            feat_in=16,
+            subsampling_factor=2,
+            head_hidden_size=8,
+            num_speakers=4,
+            partial_rotary_factor=1.0,
+            chunk_length=4,
+            chunk_right_context=2,
+            streaming_fifo_length=6,
+            streaming_speaker_cache_length=6,
+            streaming_speaker_cache_update_period=4,
+        )
+
+    def test_package_builds(self):
+        """Build the streaming graph and verify a single 'model' component."""
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationStreamingTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationStreamingTask())
+
+        assert "model" in pkg
+
+    def test_model_io(self):
+        """Verify streaming input/output names, including cache state I/O."""
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationStreamingTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationStreamingTask())
+        model = pkg["model"]
+
+        input_names = {inp.name for inp in model.graph.inputs}
+        output_names = {out.name for out in model.graph.outputs}
+        assert input_names == {
+            "input_features",
+            "num_lookahead_frames",
+            "past_cache_embeds",
+            "past_cache_probs",
+            "past_fifo",
+            "past_num_cache_frames",
+            "past_num_fifo_frames",
+            "past_is_compressed",
+        }
+        assert output_names == {
+            "speaker_probs",
+            "present_cache_embeds",
+            "present_cache_probs",
+            "present_fifo",
+            "present_num_cache_frames",
+            "present_num_fifo_frames",
+            "present_is_compressed",
+        }
+
+    def test_task_registry_lookup(self):
+        """Verify the 'diarization-streaming' task resolves to DiarizationStreamingTask."""
+        from mobius.tasks import DiarizationStreamingTask, get_task
+
+        assert isinstance(get_task("diarization-streaming"), DiarizationStreamingTask)
+
+    def test_runs_multiple_chunks_with_random_weights(self):
+        """Fill random weights and run 3 sequential streaming steps through ORT."""
+        import os
+        import tempfile
+
+        import onnxruntime as ort
+
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationStreamingTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationStreamingTask())
+        model = pkg["model"]
+
+        for init in model.graph.initializers.values():
+            if init.const_value is not None:
+                continue
+            shape = [d if isinstance(d, int) else 1 for d in init.shape]
+            arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
+            init.const_value = ir.tensor(arr, name=init.name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.onnx")
+            ir.save(model, path, external_data="model.onnx.data")
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+
+            window = config.chunk_length + config.chunk_right_context
+            raw_window = window * config.subsampling_factor
+            cache_len = config.streaming_speaker_cache_length
+            fifo_len = config.streaming_fifo_length
+
+            state = {
+                "past_cache_embeds": np.zeros((1, cache_len, config.hidden_size), np.float32),
+                "past_cache_probs": np.zeros((1, cache_len, config.num_speakers), np.float32),
+                "past_fifo": np.zeros((1, fifo_len, config.hidden_size), np.float32),
+                "past_num_cache_frames": np.array(0, dtype=np.int64),
+                "past_num_fifo_frames": np.array(0, dtype=np.int64),
+                "past_is_compressed": np.array(False, dtype=bool),
+            }
+            output_names = [out.name for out in sess.get_outputs()]
+            for step in range(3):
+                lookahead = config.chunk_right_context if step < 2 else 0
+                feats = np.random.randn(1, config.feat_in, raw_window).astype(np.float32)
+                inputs = {
+                    "input_features": feats,
+                    "num_lookahead_frames": np.array(lookahead, dtype=np.int64),
+                    **state,
+                }
+                outs = dict(zip(output_names, sess.run(output_names, inputs)))
+
+                speaker_probs = outs["speaker_probs"]
+                assert speaker_probs.min() >= 0.0 and speaker_probs.max() <= 1.0
+                assert outs["present_num_cache_frames"] <= cache_len
+                assert outs["present_num_fifo_frames"] <= fifo_len
+
+                state = {
+                    "past_cache_embeds": outs["present_cache_embeds"],
+                    "past_cache_probs": outs["present_cache_probs"],
+                    "past_fifo": outs["present_fifo"],
+                    "past_num_cache_frames": outs["present_num_cache_frames"],
+                    "past_num_fifo_frames": outs["present_num_fifo_frames"],
+                    "past_is_compressed": outs["present_is_compressed"],
+                }
