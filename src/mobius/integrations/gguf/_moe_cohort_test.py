@@ -82,6 +82,7 @@ def test_new_cohort_fields_preserve_existing_route_fingerprint_bytes(
         "attention_clamp",
         "component_quantization",
         "moe_layer_frequency",
+        "qmoe_source_paths",
         "routing_weight_normalization_floor",
     ):
         legacy_fields.pop(field_name, None)
