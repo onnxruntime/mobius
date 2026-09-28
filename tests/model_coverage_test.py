@@ -320,6 +320,10 @@ _COVERAGE_SKIP: dict[str, str] = {
     "mms": "CTC ASR model — tested via TestBuildMMSGraph",
     "fastconformer_rnnt": "NeMo .nemo RNN-T ASR — tested via tests/nemo_rnnt_integration_test.py",
     "sortformer": "NeMo .nemo speaker diarization — tested via tests/sortformer_integration_test.py",
+    "nemotron3_diarization": "diarization/diarization-streaming task strings are not in the "
+    "generic testdata/cases/ schema + scripts/generate_golden.py task_type registry (same "
+    "limitation as sortformer) — tested via "
+    "tests/nemotron3_diarization_integration_test.py",
     "VibeVoiceForASRStreamingTraining": "Streaming ASR has host-owned dual-convolution "
     "state, arbitrary-mask decoder, hotword, and speaker-attribution orchestration that "
     "the generic L4/L5 runner cannot drive. Pinned L1-L3 graph/config/source-parity and "
