@@ -9,10 +9,12 @@ Qwen3-8B base revision: generic construction records the base as `unpinned`;
 `build_clm_package(..., base_revision=<sha>)` requires the caller's selected
 revision and records it as reproducible provenance.
 
-The v0.1 heads use depth 3: input `Linear + GELU`, one
+The v0.1 heads first L2-normalize each selected Qwen embedding, then use depth
+3: input `Linear + GELU`, one
 `Linear + LayerNorm + GELU` hidden block (optionally residual), output
 `Linear`, then L2 normalization. The headless encoder emits the complete
-`token_hidden_states` tensor and contains no vocabulary projection. CLM uses
+`token_hidden_states` tensor, contains no vocabulary projection, and has no
+generation-cache inputs or outputs. CLM uses
 last-token pooling, but neither the upstream padding side nor its EOS behavior
 is pinned. Callers must select the last attended position using their
 attention mask (the deterministic `clm_last_token_indices` helper is provided)
@@ -21,7 +23,10 @@ does not assume that sequence position `-1` is a real token.
 
 `jaredpalmer/kev-4b` similarly exports its headless Qwen3.5 backbone and grouped
 pointer head (`KevModel` + `KevTask`). Its published Qwen3.5 base revision is
-pinned. `build_kev_package` accepts a dense state dict after the published PEFT
+pinned. The backbone package exposes only input IDs, attention/position inputs,
+and token hidden states; KV, convolution, and recurrent generation caches are
+not part of this scoring export. `build_kev_package` accepts a dense state dict
+after the published PEFT
 adapter has been merged. Mobius does not currently merge arbitrary PEFT LoRA
 artifacts into Qwen3.5: passing separate base/adapter mappings fails with an
 actionable instruction to use PEFT `merge_and_unload()` first, rather than

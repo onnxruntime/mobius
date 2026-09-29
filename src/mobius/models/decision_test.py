@@ -9,15 +9,17 @@ import onnx_ir as ir
 import pytest
 import torch
 
+import mobius.models.decision as decision_model
 from mobius._configs import ArchitectureConfig
+from mobius._model_package import ModelPackage
 from mobius.models.decision import (
-    KEV_CONTROL_TOKEN_IDS,
     CLM_PROVENANCE,
+    KEV_CONTROL_TOKEN_IDS,
     KEV_TEMPERATURE,
     CheckpointContractError,
+    CLMModel,
     CLMProjectionHead,
     CLMScorer,
-    CLMModel,
     KevModel,
     KevPointerHead,
     batch_kev_rows,
@@ -40,7 +42,7 @@ from mobius.models.decision import (
     validate_kev_checkpoint,
     validate_temperature,
 )
-from mobius.tasks._decision import CLMTask, KevTask
+from mobius.tasks._decision import CLMTask, HeadlessBackboneTask, KevTask
 
 
 class _Tokenizer:
@@ -147,9 +149,7 @@ def test_kev_rows_validate_request_and_serving_limits():
 
 
 def test_kev_answer_mapping_rounding_and_confidence():
-    choice = kev_answer(
-        {"type": "choice"}, ["a", "b"], [0.123456, 0.876544]
-    )
+    choice = kev_answer({"type": "choice"}, ["a", "b"], [0.123456, 0.876544])
     assert choice == {
         "type": "choice",
         "choice": "b",
@@ -161,8 +161,8 @@ def test_kev_answer_mapping_rounding_and_confidence():
         ["0", "1", "2"],
         [0.1, 0.2, 0.7],
     )
-    assert score["score"] == 1.6
-    assert score["confidence"] == 0.8
+    assert score["score"] == pytest.approx(1.6)
+    assert score["confidence"] == pytest.approx(0.8)
     assert kev_answer({"type": "noul"}, ["false", "true"], [0.2, 0.8]) == {
         "type": "noul",
         "noul": 0.8,
@@ -173,9 +173,7 @@ def test_checkpoint_helpers_are_deterministic_and_mappable():
     first = synthetic_clm_checkpoint(hidden_size=4, width=3, projection_dim=2)
     second = synthetic_clm_checkpoint(hidden_size=4, width=3, projection_dim=2)
     assert first["state_head"].keys() == second["state_head"].keys()
-    assert first["state_head"]["inp.weight"].equal(
-        second["state_head"]["inp.weight"]
-    )
+    assert first["state_head"]["inp.weight"].equal(second["state_head"]["inp.weight"])
     assert "hidden.0.weight" in first["state_head"]
     assert "norms.0.weight" in first["state_head"]
     assert "hidden.1.weight" not in first["state_head"]
@@ -194,13 +192,9 @@ def test_head_graphs_export_without_model_downloads():
         CLMProjectionHead(hidden_size=4096, width=8),
         clm_config,
     )
-    scorer = CLMTask().build_component(
-        "scorer", None, CLMScorer(), clm_config
-    )
+    scorer = CLMTask().build_component("scorer", None, CLMScorer(), clm_config)
     kev_config = ArchitectureConfig(hidden_size=2560, dtype=ir.DataType.FLOAT)
-    pointer = KevTask().build_component(
-        "pointer_head", None, KevPointerHead(), kev_config
-    )
+    pointer = KevTask().build_component("pointer_head", None, KevPointerHead(), kev_config)
     assert [output.name for output in state.graph.outputs] == ["projections"]
     assert [output.name for output in scorer.graph.outputs] == [
         "logits",
@@ -211,6 +205,45 @@ def test_head_graphs_export_without_model_downloads():
         "probabilities",
     ]
     assert "mobius.provenance" in pointer.metadata_props
+
+    with pytest.raises(CheckpointContractError, match="unapplied weights"):
+        decision_model._apply_package_weights_strict(
+            ModelPackage({"state_head": state}, config=clm_config),
+            {"garbage": torch.ones(1)},
+            owner="test checkpoint",
+        )
+    with pytest.raises(CheckpointContractError, match="without weights"):
+        decision_model._apply_package_weights_strict(
+            ModelPackage({"state_head": state}, config=clm_config),
+            {},
+            owner="test checkpoint",
+        )
+
+
+def test_headless_backbone_contract_has_no_generation_cache():
+    class Backbone:
+        def __call__(
+            self,
+            op,
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+        ):
+            assert attention_mask is not None
+            assert position_ids is not None
+            assert past_key_values is None
+            return op.Cast(input_ids, to=ir.DataType.FLOAT), ["unused-cache"]
+
+    package = HeadlessBackboneTask().build(Backbone(), ArchitectureConfig())
+    graph = package["model"].graph
+
+    assert [value.name for value in graph.inputs] == [
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+    ]
+    assert [value.name for value in graph.outputs] == ["token_hidden_states"]
 
 
 def test_clm_head_depth_three_has_one_normalized_hidden_block():
@@ -238,7 +271,7 @@ def test_public_build_helpers_reject_unsafe_or_inexact_inputs():
             base_revision="caller-pin",
         )
     bad = {**checkpoint, "cfg": {**checkpoint["cfg"], "depth": 2}}
-    with pytest.raises(CheckpointContractError, match="cfg.depth"):
+    with pytest.raises(CheckpointContractError, match=r"cfg\.depth"):
         build_clm_package(
             config,
             base_weights={"model.embed_tokens.weight": _meta(1)},
@@ -324,10 +357,8 @@ def test_production_checkpoint_contracts_fail_closed_and_map_metadata():
     assert mapped_kev["pointer_head.q.weight"].shape == (256, 2560)
     with pytest.raises(CheckpointContractError, match="base_revision"):
         validate_kev_checkpoint({**kev, "base_revision": "wrong"})
-    with pytest.raises(CheckpointContractError, match="q.weight shape"):
-        validate_kev_checkpoint(
-            {**kev, "head": {**kev["head"], "q.weight": _meta(1, 1)}}
-        )
+    with pytest.raises(CheckpointContractError, match=r"q\.weight shape"):
+        validate_kev_checkpoint({**kev, "head": {**kev["head"], "q.weight": _meta(1, 1)}})
 
 
 def test_complete_packages_use_headless_hidden_state_backbones():

@@ -330,9 +330,7 @@ class MultiComponentModelTask(ModelTask):
             for name, role in roles.items()
             if role in {ComponentRole.BACKBONE.value, ComponentRole.ENCODER.value}
         ]
-        head_names = [
-            name for name, role in roles.items() if role == ComponentRole.HEAD.value
-        ]
+        head_names = [name for name, role in roles.items() if role == ComponentRole.HEAD.value]
         if len(backbone_names) != 1 or not head_names:
             raise ValueError(
                 f"{type(self).__name__} components must declare exactly one "
@@ -365,7 +363,6 @@ class MultiComponentModelTask(ModelTask):
         config: BaseModelConfig,
     ) -> ir.Model:
         """Build one graph for a declared component."""
-        ...
 
 
 # ---------------------------------------------------------------------------

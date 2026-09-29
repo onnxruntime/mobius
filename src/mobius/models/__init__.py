@@ -283,7 +283,6 @@ from mobius.models.controlnet import ControlNetModel
 from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel
 from mobius.models.cosmos3_omni import Cosmos3OmniReasonerModel
 from mobius.models.ctrl import CTRLCausalLMModel
-from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.decision import (
     CLM_PROVENANCE,
     KEV_PROVENANCE,
@@ -313,10 +312,11 @@ from mobius.models.decision import (
     render_kev,
     synthetic_clm_checkpoint,
     synthetic_kev_checkpoint,
-    validate_temperature,
     validate_clm_checkpoint,
     validate_kev_checkpoint,
+    validate_temperature,
 )
+from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
 from mobius.models.deepseek_v4 import DeepSeekV4CausalLMModel
 from mobius.models.dflash import DFlashDraftModel

@@ -146,8 +146,8 @@ from mobius.tasks._causal_lm import (
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._ctc_asr import CTCAsrTask, FeatureCTCAsrTask
-from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._decision import CLMTask, KevTask
+from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._diarization import DiarizationTask

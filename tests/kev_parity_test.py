@@ -64,8 +64,7 @@ def _assert_answers_close(
     def structure(value, path: str, numbers: dict[str, float]):
         if isinstance(value, dict):
             return {
-                key: structure(item, f"{path}.{key}", numbers)
-                for key, item in value.items()
+                key: structure(item, f"{path}.{key}", numbers) for key, item in value.items()
             }
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             numbers[path] = float(value)
@@ -96,9 +95,9 @@ def _pointer_reference(
     rows = torch.arange(decide_indices.numel(), device=hidden_states.device)
     decide = hidden_states[rows, decide_indices]
     options = hidden_states[option_owners, option_indices]
-    queries = torch_functional.linear(
-        decide, state["q.weight"], state["q.bias"]
-    )[option_owners]
+    queries = torch_functional.linear(decide, state["q.weight"], state["q.bias"])[
+        option_owners
+    ]
     keys = torch_functional.linear(options, state["k.weight"], state["k.bias"])
     logits = (queries * keys).sum(dim=-1)
     logits = logits / (KEV_POINTER_SIZE**0.5) / KEV_TEMPERATURE
@@ -188,7 +187,11 @@ def test_kev_pointer_head_matches_direct_torch_reference() -> None:
         atol=1e-6,
     )
     np.testing.assert_allclose(
-        [actual_probabilities[:2].sum(), actual_probabilities[2:5].sum(), actual_probabilities[5:].sum()],
+        [
+            actual_probabilities[:2].sum(),
+            actual_probabilities[2:5].sum(),
+            actual_probabilities[5:].sum(),
+        ],
         1.0,
         rtol=0,
         atol=1e-6,
@@ -202,15 +205,11 @@ def test_kev_pointer_head_matches_direct_torch_reference() -> None:
     offsets = (0, 2, 5, 7)
     actual_answers = [
         kev_answer(question, keys, actual_probabilities[start:stop])
-        for (question, keys), start, stop in zip(
-            questions, offsets[:-1], offsets[1:]
-        )
+        for (question, keys), start, stop in zip(questions, offsets[:-1], offsets[1:])
     ]
     expected_answers = [
         kev_answer(question, keys, expected_probabilities[start:stop].tolist())
-        for (question, keys), start, stop in zip(
-            questions, offsets[:-1], offsets[1:]
-        )
+        for (question, keys), start, stop in zip(questions, offsets[:-1], offsets[1:])
     ]
     assert actual_answers == expected_answers
     assert [answer["type"] for answer in actual_answers] == [
@@ -247,9 +246,7 @@ def test_kev_preprocessing_golden_rows_padding_and_indices() -> None:
             "criteria": {"false": "N", "true": "Y"},
         },
     }
-    rows = encode_kev_rows(
-        _CharacterTokenizer(), "S<|decide|>", questions
-    )
+    rows = encode_kev_rows(_CharacterTokenizer(), "S<|decide|>", questions)
     control = KEV_CONTROL_TOKEN_IDS
     state = [control["state"], *_characters("S<¦decide¦>")]
     expected_pick = [
@@ -285,14 +282,10 @@ def test_kev_preprocessing_golden_rows_padding_and_indices() -> None:
     assert rows[1].keys == ("false", "true")
 
     pick_options = tuple(
-        index
-        for index, token in enumerate(expected_pick)
-        if token == control["option_end"]
+        index for index, token in enumerate(expected_pick) if token == control["option_end"]
     )
     ready_options = tuple(
-        index
-        for index, token in enumerate(expected_ready)
-        if token == control["option_end"]
+        index for index, token in enumerate(expected_ready) if token == control["option_end"]
     )
     assert rows[0].decide_index == len(expected_pick) - 1
     assert rows[1].decide_index == len(expected_ready) - 1
@@ -393,14 +386,10 @@ def test_kev_export_matches_pinned_cuda_reference() -> None:
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    checkpoint = torch.load(
-        adapter_path / "head.pt", map_location="cpu", weights_only=True
-    )
+    checkpoint = torch.load(adapter_path / "head.pt", map_location="cpu", weights_only=True)
     validate_kev_checkpoint(checkpoint)
     export_tokenizer = AutoTokenizer.from_pretrained(root, local_files_only=True)
-    reference_tokenizer = AutoTokenizer.from_pretrained(
-        base_path, local_files_only=True
-    )
+    reference_tokenizer = AutoTokenizer.from_pretrained(base_path, local_files_only=True)
     questions = {
         "choice": {
             "type": "choice",
@@ -413,12 +402,8 @@ def test_kev_export_matches_pinned_cuda_reference() -> None:
         },
     }
     export_rows = encode_kev_rows(export_tokenizer, {"request": "blue"}, questions)
-    reference_rows = encode_kev_rows(
-        reference_tokenizer, {"request": "blue"}, questions
-    )
-    export_batch = batch_kev_rows(
-        export_rows, pad_token_id=export_tokenizer.pad_token_id
-    )
+    reference_rows = encode_kev_rows(reference_tokenizer, {"request": "blue"}, questions)
+    export_batch = batch_kev_rows(export_rows, pad_token_id=export_tokenizer.pad_token_id)
     reference_batch = batch_kev_rows(
         reference_rows, pad_token_id=reference_tokenizer.pad_token_id
     )
@@ -433,9 +418,11 @@ def test_kev_export_matches_pinned_cuda_reference() -> None:
         dtype=torch.float32,
         low_cpu_mem_usage=True,
     )
-    reference_model = PeftModel.from_pretrained(
-        base_container.model, adapter_path, local_files_only=True
-    ).eval().to(device)
+    reference_model = (
+        PeftModel.from_pretrained(base_container.model, adapter_path, local_files_only=True)
+        .eval()
+        .to(device)
+    )
     input_ids = np.asarray(export_batch.input_ids, dtype=np.int64)
     attention_mask = np.asarray(export_batch.attention_mask, dtype=np.int64)
     position_ids = np.asarray(export_batch.position_ids, dtype=np.int64)
@@ -470,15 +457,18 @@ def test_kev_export_matches_pinned_cuda_reference() -> None:
     torch_decide = torch.from_numpy(decide).to(device)
     torch_options = torch.from_numpy(options).to(device)
     torch_owners = torch.from_numpy(owners).to(device)
-    reference_positions = torch.cat(
-        (
-            reference_hidden[torch_rows, torch_decide],
-            reference_hidden[torch_owners, torch_options],
+    reference_positions = (
+        torch.cat(
+            (
+                reference_hidden[torch_rows, torch_decide],
+                reference_hidden[torch_owners, torch_options],
+            )
         )
-    ).float().cpu().numpy()
-    ort_positions = np.concatenate(
-        (ort_hidden[rows, decide], ort_hidden[owners, options])
+        .float()
+        .cpu()
+        .numpy()
     )
+    ort_positions = np.concatenate((ort_hidden[rows, decide], ort_hidden[owners, options]))
     _assert_close(
         "decide/option hidden states",
         ort_positions,

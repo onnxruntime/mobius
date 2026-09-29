@@ -181,8 +181,8 @@ from mobius.tasks import (
     ComponentConfig,
     ComponentRole,
     ComponentSpec,
+    KevTask,
     ModelTask,
     MultiComponentModelTask,
-    KevTask,
     WorldModelTask,
 )

@@ -1415,7 +1415,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         prefix_map: dict[str, str] | None = None,
         *,
         fold_constants: bool = True,
-    ) -> None:
+    ) -> set[str]:
         """Apply weights from a state dict across component models.
 
         For single-component packages, all weights are applied to the sole
@@ -1432,6 +1432,9 @@ class ModelPackage(UserDict[str, ir.Model]):
                 Weights whose name starts with a prefix are applied to the
                 named component (with the prefix stripped). Unmatched weights
                 are applied to all components.
+
+        Returns:
+            The original state-dict names that matched package initializers.
         """
         applied: set[str] = set()
 
@@ -1477,13 +1480,14 @@ class ModelPackage(UserDict[str, ir.Model]):
         _log_weight_mapping(state_dict, applied)
 
         if not fold_constants:
-            return
+            return applied
 
         # Fold constants now that weights have been loaded.
         # PackQKV emits Concat(w_q, w_k, w_v) in the graph; those nodes can only
         # be constant-folded once the weight tensors carry their const_value.
         for model in self.data.values():
             fold_initializers_after_weights(model)
+        return applied
 
 
 @contextmanager

@@ -59,12 +59,11 @@ def _torch_projection(
     weights: Mapping[str, torch.Tensor],
 ) -> torch.Tensor:
     """Independent checkpoint-order reference for the published depth-three head."""
+    embeddings = functional.normalize(embeddings, dim=-1)
     value = functional.gelu(
         functional.linear(embeddings, weights["inp.weight"], weights["inp.bias"])
     )
-    value = functional.linear(
-        value, weights["hidden.0.weight"], weights["hidden.0.bias"]
-    )
+    value = functional.linear(value, weights["hidden.0.weight"], weights["hidden.0.bias"])
     value = functional.layer_norm(
         value,
         (value.shape[-1],),
@@ -74,9 +73,7 @@ def _torch_projection(
     )
     value = functional.gelu(value)
     value = functional.linear(value, weights["out.weight"], weights["out.bias"])
-    return value / torch.linalg.vector_norm(value, dim=-1, keepdim=True).clamp_min(
-        1e-12
-    )
+    return value / torch.linalg.vector_norm(value, dim=-1, keepdim=True).clamp_min(1e-12)
 
 
 def _torch_score(
@@ -192,12 +189,10 @@ def test_synthetic_clm_onnx_heads_and_scorer_match_direct_torch():
     )
     assert probabilities[:2].sum() == pytest.approx(1.0)
     assert probabilities[2:].sum() == pytest.approx(1.0)
-    assert clm_answer(
-        {"type": "choice"}, ["first", "second"], [0.5, 0.5]
-    )["choice"] == "first"
-    assert clm_answer(
-        {"type": "choice"}, ["first", "second"], [0.25, 0.75]
-    )["choice"] == "second"
+    assert clm_answer({"type": "choice"}, ["first", "second"], [0.5, 0.5])["choice"] == "first"
+    assert (
+        clm_answer({"type": "choice"}, ["first", "second"], [0.25, 0.75])["choice"] == "second"
+    )
 
 
 class _GoldenTokenizer:
@@ -215,17 +210,13 @@ class _GoldenTokenizer:
         length = max(map(len, rows))
         return {
             "input_ids": [row + [0] * (length - len(row)) for row in rows],
-            "attention_mask": [
-                [1] * len(row) + [0] * (length - len(row)) for row in rows
-            ],
+            "attention_mask": [[1] * len(row) + [0] * (length - len(row)) for row in rows],
         }
 
 
 def test_clm_render_tokenization_and_last_token_golden():
     """Lock exact rendering, candidate text, token ids, and padding-aware pooling."""
-    state_text = clm_state_text(
-        {"ready": True, "items": ["red", "blue"]}, "Choose."
-    )
+    state_text = clm_state_text({"ready": True, "items": ["red", "blue"]}, "Choose.")
     keys, actions = clm_candidates(
         {"type": "choice", "criteria": {"alpha": None, "letter": "A letter"}}
     )
@@ -289,17 +280,19 @@ def _load_reference():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         CLM_BASE_MODEL_ID, revision=revision
     )
-    encoder = transformers.AutoModel.from_pretrained(
-        CLM_BASE_MODEL_ID,
-        revision=revision,
-        dtype=torch.float32,
-    ).eval().cuda()
+    encoder = (
+        transformers.AutoModel.from_pretrained(
+            CLM_BASE_MODEL_ID,
+            revision=revision,
+            dtype=torch.float32,
+        )
+        .eval()
+        .cuda()
+    )
     filename = os.getenv("CLM_HEAD_FILENAME", "CLM_v0.1-8B.pt")
     local = os.getenv("CLM_HEAD_CHECKPOINT_PATH")
     checkpoint_path = (
-        local
-        if local
-        else hub.hf_hub_download(CLM_MODEL_ID, filename, revision=CLM_REVISION)
+        local if local else hub.hf_hub_download(CLM_MODEL_ID, filename, revision=CLM_REVISION)
     )
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     return tokenizer, encoder, checkpoint
@@ -399,20 +392,14 @@ def _run_full_parity(root: Path) -> dict[str, Any]:
     ]
     state_ids_batched = [
         ids[mask.bool()].tolist()
-        for ids, mask in zip(
-            state_tokens["input_ids"], state_tokens["attention_mask"]
-        )
+        for ids, mask in zip(state_tokens["input_ids"], state_tokens["attention_mask"])
     ]
     assert state_ids_batched == state_ids_unbatched, (
         "batched CLM token IDs differ from per-text tokenization: "
         f"batched={state_ids_batched!r}, unbatched={state_ids_unbatched!r}"
     )
-    state_hidden_ref = functional.normalize(
-        _last_hidden(encoder, state_tokens), dim=-1
-    )
-    action_hidden_ref = functional.normalize(
-        _last_hidden(encoder, action_tokens), dim=-1
-    )
+    state_hidden_ref = functional.normalize(_last_hidden(encoder, state_tokens), dim=-1)
+    action_hidden_ref = functional.normalize(_last_hidden(encoder, action_tokens), dim=-1)
     state_hidden_ort = _encoder_ort(sessions["encoder"], state_tokens)
     action_hidden_ort = _encoder_ort(sessions["encoder"], action_tokens)
     state_hidden_ort /= np.maximum(
@@ -472,9 +459,7 @@ def _run_full_parity(root: Path) -> dict[str, Any]:
                 f"onnx={answers[-1]!r}, torch={reference_answer!r}"
             )
         elif question["type"] == "noul":
-            assert answers[-1]["noul"] == pytest.approx(
-                reference_answer["noul"], abs=2e-4
-            )
+            assert answers[-1]["noul"] == pytest.approx(reference_answer["noul"], abs=2e-4)
         offset += size
     return {
         "sessions": sessions,
@@ -531,9 +516,7 @@ def test_official_clm_vllm_embeddings_endpoint_matches_onnx():
     texts = [*result["state_texts"], *result["action_texts"]]
     endpoint = _post_embeddings(url, model, texts)
     state_count = len(result["state_texts"])
-    onnx_hidden = np.concatenate(
-        [result["state_hidden"], result["action_hidden"]], axis=0
-    )
+    onnx_hidden = np.concatenate([result["state_hidden"], result["action_hidden"]], axis=0)
     np.testing.assert_allclose(
         endpoint,
         onnx_hidden,
