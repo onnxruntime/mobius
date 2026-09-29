@@ -1976,14 +1976,14 @@ def _generate_diarization_offline(case: TestCase, json_path: Path, device: str) 
         nemo_path = hf_hub_download(
             repo_id=case.model_id, filename=filename, revision=case.revision
         )
-        model = SortformerEncLabelModel.restore_from(nemo_path, map_location="cpu")
+        model = SortformerEncLabelModel.restore_from(nemo_path, map_location=device)
         model.eval()
         model.streaming_mode = False  # offline: full-context attention.
 
         num_frames = int(case.generation_params.get("num_frames", 400))
         feat_dim = int(model.cfg.encoder.feat_in)
-        mel = torch.randn(1, feat_dim, num_frames)
-        mel_len = torch.tensor([num_frames], dtype=torch.long)
+        mel = torch.randn(1, feat_dim, num_frames, device=device)
+        mel_len = torch.tensor([num_frames], dtype=torch.long, device=device)
         with torch.no_grad():
             emb_seq, emb_len = model.frontend_encoder(
                 processed_signal=mel, processed_signal_length=mel_len
@@ -1991,10 +1991,10 @@ def _generate_diarization_offline(case: TestCase, json_path: Path, device: str) 
             preds = model.forward_infer(emb_seq, emb_len)
 
         arrays = {
-            "mel": mel.numpy().astype(np.float32),
-            "emb_seq": emb_seq.numpy().astype(np.float32),
-            "emb_len": emb_len.numpy().astype(np.int64),
-            "probs": preds.numpy().astype(np.float32),
+            "mel": mel.cpu().numpy().astype(np.float32),
+            "emb_seq": emb_seq.cpu().numpy().astype(np.float32),
+            "emb_len": emb_len.cpu().numpy().astype(np.int64),
+            "probs": preds.cpu().numpy().astype(np.float32),
         }
         provenance = {
             "model_id": case.model_id,
@@ -2013,19 +2013,20 @@ def _generate_diarization_offline(case: TestCase, json_path: Path, device: str) 
         model = AutoModelForAudioFrameClassification.from_pretrained(
             case.model_id, revision=case.revision, dtype=torch.float32
         )
+        model = model.to(device)
         model.eval()
 
         mel_dim = model.config.audio_config.num_mel_bins
         # Below chunk_length * subsampling_factor so HuggingFace's own
         # offline forward does not internally re-chunk.
         num_frames = int(case.generation_params.get("num_frames", 2000))
-        mel = torch.randn(1, num_frames, mel_dim)
+        mel = torch.randn(1, num_frames, mel_dim, device=device)
         with torch.no_grad():
             out = model(input_features=mel)
 
         arrays = {
-            "mel": np.transpose(mel.numpy(), (0, 2, 1)).astype(np.float32),
-            "probs": out.logits.sigmoid().numpy().astype(np.float32),
+            "mel": np.transpose(mel.cpu().numpy(), (0, 2, 1)).astype(np.float32),
+            "probs": out.logits.sigmoid().cpu().numpy().astype(np.float32),
         }
         provenance = {
             "model_id": case.model_id,
@@ -2072,6 +2073,7 @@ def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str
     model = AutoModelForAudioFrameClassification.from_pretrained(
         case.model_id, revision=case.revision, dtype=torch.float32
     )
+    model = model.to(device)
     model.eval()
 
     mel_dim = model.config.audio_config.num_mel_bins
@@ -2084,7 +2086,7 @@ def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str
     cache = None
     for i in range(num_chunks):
         torch.manual_seed(seed + 100 + i)
-        mel = torch.randn(1, raw_window, mel_dim)
+        mel = torch.randn(1, raw_window, mel_dim, device=device)
         is_last = i == num_chunks - 1
         lookahead = 0 if is_last else chunk_right_context
         with torch.no_grad():
@@ -2095,13 +2097,13 @@ def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str
         # HF's input_features are channel-last; transpose to the mobius
         # DiarizationStreamingTask's channel-first contract.
         arrays[f"chunk{i}_mel"] = (
-            np.transpose(mel.numpy(), (0, 2, 1)).astype(np.float32).copy()
+            np.transpose(mel.cpu().numpy(), (0, 2, 1)).astype(np.float32).copy()
         )
         arrays[f"chunk{i}_lookahead"] = np.array(lookahead, dtype=np.int64)
-        arrays[f"chunk{i}_probs"] = out.logits.sigmoid().numpy().copy()
-        arrays[f"chunk{i}_cache_embeds"] = cache.embeds.numpy().copy()
-        arrays[f"chunk{i}_cache_probs"] = cache.probs.numpy().copy()
-        arrays[f"chunk{i}_fifo"] = cache.fifo.numpy().copy()
+        arrays[f"chunk{i}_probs"] = out.logits.sigmoid().cpu().numpy().copy()
+        arrays[f"chunk{i}_cache_embeds"] = cache.embeds.cpu().numpy().copy()
+        arrays[f"chunk{i}_cache_probs"] = cache.probs.cpu().numpy().copy()
+        arrays[f"chunk{i}_fifo"] = cache.fifo.cpu().numpy().copy()
         arrays[f"chunk{i}_num_cache_frames"] = np.array(cache.num_cache_frames, dtype=np.int64)
         arrays[f"chunk{i}_num_fifo_frames"] = np.array(cache.num_fifo_frames, dtype=np.int64)
         arrays[f"chunk{i}_is_compressed"] = np.array(cache.is_compressed, dtype=np.bool_)

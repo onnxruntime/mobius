@@ -37,7 +37,12 @@ class DiarizationStreamingTask(ModelTask):
         ``num_lookahead_frames`` — scalar ``int64``: how many trailing encoder
             frames of the window are look-ahead only (attended to, but not
             emitted or pushed to the FIFO). ``0`` for the last chunk of a
-            recording.
+            recording. Contract: ``0 <= num_lookahead_frames < num_new_embeds``
+            (the number of encoder frames the window embeds to, i.e.
+            ``chunk_window_frames // subsampling_factor``, rounded up); the
+            graph clamps out-of-range values into this range defensively
+            (see ``forward_streaming``) rather than failing, but callers
+            should not rely on the clamped result being meaningful.
         ``past_cache_embeds`` / ``past_cache_probs`` / ``past_fifo`` — fixed
             capacity AOSC + FIFO state buffers from the previous call (all
             zeros for the first chunk of a stream).

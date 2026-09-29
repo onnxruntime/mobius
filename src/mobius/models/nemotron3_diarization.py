@@ -604,8 +604,11 @@ class Nemotron3DiarizationModel(nn.Module):
         self.model = _DiarizationBackbone(config)
         self.classifier = _ClassificationHead(config)
         # Learned embedding filling reserved silence slots when the AOSC is
-        # compressed. Unused (and pruned by the optimizer) by the offline,
-        # non-streaming graph.
+        # compressed. Shared by both the offline and streaming forwards:
+        # the offline ``forward``'s chunked ``Loop`` calls the same
+        # ``_run_chunk_and_update_cache`` compression branch as
+        # ``forward_streaming``, so this is realized and consumed whenever
+        # a multi-chunk offline recording triggers AOSC compression too.
         self.silence_embeds = nn.Parameter([config.hidden_size])
 
     def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
@@ -979,6 +982,14 @@ class Nemotron3DiarizationModel(nn.Module):
 
         chunk_embeds = self._call_backbone_scoped(op, "embed", input_features)
         num_new_embeds = op.Squeeze(op.Shape(chunk_embeds, start=1, end=2), [0])
+        # Callers must supply ``0 <= num_lookahead_frames < num_new_embeds``
+        # (see ``DiarizationStreamingTask``'s docstring); clamp defensively so
+        # a caller-supplied out-of-range value can't corrupt the FIFO/cache
+        # occupancy bookkeeping below or produce a negative slice length.
+        num_lookahead_frames = op.Max(
+            op.Constant(value_int=0),
+            op.Min(num_lookahead_frames, op.Sub(num_new_embeds, op.Constant(value_int=1))),
+        )
         num_chunk_frames = op.Sub(num_new_embeds, num_lookahead_frames)
 
         cached_length = op.Add(past_num_cache_frames, past_num_fifo_frames)
