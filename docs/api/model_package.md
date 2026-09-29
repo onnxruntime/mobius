@@ -114,6 +114,35 @@ pkg.save("output/llama/", external_data="safetensors")
 pkg.save("output/llama-serial/", max_workers=1)
 ```
 
+### Generic backbone-and-head packages
+
+Use `MultiComponentModelTask` when one non-generative package contains exactly
+one backbone or encoder and one or more named head graphs:
+
+```python
+from mobius import (
+    ComponentConfig,
+    ComponentRole,
+    ComponentSpec,
+    MultiComponentModelTask,
+)
+
+
+class EncoderWithHeadsTask(MultiComponentModelTask):
+    components = ComponentSpec(
+        encoder=ComponentConfig("encoder", ComponentRole.ENCODER),
+        classifier=ComponentConfig("heads.classifier", ComponentRole.HEAD),
+    )
+
+    def build_component(self, name, component, module, config):
+        ...
+```
+
+The component names become `ModelPackage` keys. Roles are also exposed through
+`model_roles`, so existing inspection and optimization code treats head graphs
+as heads rather than decoder models. Dotted module paths allow components such
+as `heads.classifier` to be resolved from the root module.
+
 ## Output Layout
 
 - **Single model**: `directory/model.onnx` + `directory/model.onnx.data`
