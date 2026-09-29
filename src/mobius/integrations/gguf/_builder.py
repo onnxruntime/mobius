@@ -6701,6 +6701,9 @@ _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
 def _graph_config_fields_for_fingerprint(config, gguf_arch: str) -> dict[str, object]:
     """Serialize only fields consumed by an architecture's imported graph."""
     fields = asdict(config)
+    if not fields.get("qmoe_source_paths"):
+        # This field postdates pinned GGUF routes; its empty default must preserve their hashes.
+        fields.pop("qmoe_source_paths", None)
     if fields.get("component_quantization") is None:
         # This field postdates the pinned GGUF evidence routes. An absent
         # component plan preserves legacy graph behavior and fingerprint bytes;

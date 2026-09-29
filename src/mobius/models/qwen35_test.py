@@ -362,6 +362,27 @@ def _olive_expert_state_dict() -> dict[str, torch.Tensor]:
     }
 
 
+def _mixed_olive_expert_state_dict() -> dict[str, torch.Tensor]:
+    state = _olive_expert_state_dict()
+    prefix = "model.language_model.layers.0.mlp.experts."
+    state[prefix + "gate_up_proj_qweight"] = state[prefix + "gate_up_proj_qweight"][
+        ..., : _H * 2 // 8
+    ].contiguous()
+    return state
+
+
+def _mixed_qwen35_quantization(
+    pattern: str = "model.language_model.layers.0.mlp.experts.gate_up_proj",
+) -> QuantizationConfig:
+    return QuantizationConfig(
+        bits=4,
+        group_size=_BLK,
+        quant_method="olive",
+        sym=False,
+        overrides={pattern: QuantizationOverride(bits=2)},
+    )
+
+
 def _moe_vl_config(
     quantization: QuantizationConfig | None, *, tie_word_embeddings: bool = False
 ) -> object:
@@ -395,6 +416,52 @@ def _moe_vl_config(
 
 
 class TestQwen35MoEQMoEExport:
+    def test_language_model_source_prefix_resolves_mixed_layout(self):
+        model = Qwen35MoECausalLMModel(_moe_config(_mixed_qwen35_quantization()))
+        block = model.model.layers[0].mlp
+
+        assert block.experts is None
+        assert block.fc1_experts_weights.shape[-1] == _H * 2 // 8
+        assert block.fc2_experts_weights.shape[-1] == _INT * 4 // 8
+
+        out = model.preprocess_weights(_mixed_olive_expert_state_dict())
+        prefix = "model.layers.0.mlp."
+        assert out[prefix + "fc1_experts_weights"].shape[-1] == _H * 2 // 8
+        assert out[prefix + "fc2_experts_weights"].shape[-1] == _INT * 4 // 8
+
+    def test_language_model_regex_resolves_mixed_layout_and_sidecars(self):
+        quantization = _mixed_qwen35_quantization(
+            r"re:model\.language_model\.layers\.\d+\.mlp\.experts\.gate_up_proj"
+        )
+        model = Qwen35MoECausalLMModel(_moe_config(quantization))
+
+        out = model.preprocess_weights(_mixed_olive_expert_state_dict())
+        block = model.model.layers[0].mlp
+
+        assert block._qmoe_quantization is not None
+        assert block._qmoe_quantization.fc1.bits == 2
+        assert out["model.layers.0.mlp.fc1_experts_weights"].shape[-1] == _H * 2 // 8
+
+    def test_qwen3_only_regex_does_not_match_qwen35_source_alias(self):
+        quantization = _mixed_qwen35_quantization(
+            r"re:model\.layers\.\d+\.mlp\.experts\.gate_up_proj"
+        )
+
+        block = Qwen35MoECausalLMModel(_moe_config(quantization)).model.layers[0].mlp
+
+        assert block._qmoe_quantization is not None
+        assert not block._qmoe_quantization.is_mixed_width
+        assert block._qmoe_quantization.fc1.bits == 4
+
+    def test_excluded_routed_experts_fail_at_construction(self):
+        quantization = dataclasses.replace(
+            _mixed_qwen35_quantization(),
+            modules_to_not_convert=("experts.gate_up_proj", "experts.down_proj"),
+        )
+
+        with pytest.raises(ValueError, match="routed expert exclusions"):
+            Qwen35MoECausalLMModel(_moe_config(quantization))
+
     def test_moe_block_uses_qmoe_when_quantized(self):
         model = _moe_config(
             QuantizationConfig(bits=4, group_size=_BLK, quant_method="olive", sym=False)
@@ -481,6 +548,22 @@ class TestQwen35MoEQMoEExport:
 
 
 class TestQwen35MoEVL3ModelQMoEExport:
+    def test_component_plan_preserves_mixed_expert_overrides(self):
+        quantization = _mixed_qwen35_quantization()
+        config = dataclasses.replace(
+            _moe_vl_config(None),
+            component_quantization={"decoder": quantization},
+        )
+        model = Qwen35MoEVL3ModelCausalLMModel(config)
+        block = model.decoder.model.layers[0].mlp
+
+        assert block.experts is None
+        assert block.fc1_experts_weights.shape[-1] == _H * 2 // 8
+        result = model.preprocess_weights(_mixed_olive_expert_state_dict())
+        assert (
+            result["decoder.model.layers.0.mlp.fc1_experts_weights"].shape[-1] == _H * 2 // 8
+        )
+
     def test_plan_only_quantization_keeps_graph_and_qmoe_weights_aligned(self):
         quantization = QuantizationConfig(
             bits=4,
@@ -1018,7 +1101,9 @@ class TestQwen35MixedPrecisionDecoder:
             bits=4,
             group_size=16,
             quant_method="olive",
-            overrides={"model.language_model": QuantizationOverride(bits=4, group_size=32)},
+            overrides={
+                r"re:model\.language_model\..*": QuantizationOverride(bits=4, group_size=32)
+            },
         )
         config = dataclasses.replace(
             _moe_vl_config(quantization),
@@ -1030,7 +1115,7 @@ class TestQwen35MixedPrecisionDecoder:
         block = model.decoder.model.layers[0].mlp
 
         assert block._qmoe_quantization is not None
-        assert block._qmoe_quantization.group_size == 32
+        assert block._qmoe_quantization.fc1.group_size == 32
         assert tuple(block.fc1_scales.shape) == (_E, 64, 1)
         assert tuple(block.fc2_scales.shape) == (_E, _H, 1)
 

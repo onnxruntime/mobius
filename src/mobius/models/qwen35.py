@@ -96,11 +96,17 @@ _FLOAT_MODULE_QUANT_METHODS = frozenset({"olive"})
 def _decoder_component_config(
     config: ArchitectureConfig,
     source_paths: tuple[str, ...],
+    *,
+    preserve_module_plan: bool = False,
 ) -> ArchitectureConfig:
     """Use the effective decoder layout while constructing its expert parameters."""
     if config.component_quantization is None:
         return config
-    quantization = config.quantization_for_source_paths("decoder", source_paths)
+    quantization = (
+        config.quantization_for("decoder")
+        if preserve_module_plan
+        else config.quantization_for_source_paths("decoder", source_paths)
+    )
     return dataclasses.replace(config, quantization=quantization, component_quantization=None)
 
 
@@ -421,7 +427,14 @@ class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
 
     def __init__(self, config: ArchitectureConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        self.mlp = Qwen35MoEBlock(config, linear_class=_linear_factory(config))
+        layer_config = dataclasses.replace(
+            config,
+            qmoe_source_paths=(f"model.language_model.layers.{layer_idx}.mlp",),
+        )
+        self.mlp = Qwen35MoEBlock(
+            layer_config,
+            linear_class=_linear_factory(config),
+        )
 
 
 class Qwen35MoETextModel(nn.Module):
@@ -586,6 +599,17 @@ class Qwen35MoECausalLMModel(CausalLMModel):
             tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=".mlp",
             qmoe_quant_methods=("gptq", "awq", "olive"),
+            qmoe_num_experts=self.config.num_local_experts,
+            qmoe_hidden_size=self.config.hidden_size,
+            qmoe_intermediate_size=self.config.moe_intermediate_size,
+            qmoe_expected_moe_paths=tuple(
+                f"model.layers.{layer_idx}.mlp"
+                for layer_idx in range(self.config.num_hidden_layers)
+            ),
+            qmoe_source_moe_paths=tuple(
+                f"model.language_model.layers.{layer_idx}.mlp"
+                for layer_idx in range(self.config.num_hidden_layers)
+            ),
             defer_non_expert_sidecars=(
                 self.config.component_quantization is not None
                 or (quantization is not None and quantization.has_module_plan)
@@ -899,6 +923,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         decoder_config = _decoder_component_config(
             config,
             self.HF_COMPONENT_SOURCES["decoder"],
+            preserve_module_plan=True,
         )
         self.decoder = Qwen35MoEVLDecoderModel(decoder_config)
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
@@ -927,10 +952,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         """
         quantization = self.config.quantization
         decoder_quantization = (
-            self.config.quantization_for_source_paths(
-                "decoder",
-                self.HF_COMPONENT_SOURCES["decoder"],
-            )
+            self.config.quantization_for("decoder")
             if self.config.component_quantization is not None
             else quantization
         )
@@ -1006,6 +1028,17 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=".mlp",
                 qmoe_quant_methods=("olive",),
+                qmoe_num_experts=self.config.num_local_experts,
+                qmoe_hidden_size=self.config.hidden_size,
+                qmoe_intermediate_size=self.config.moe_intermediate_size,
+                qmoe_expected_moe_paths=tuple(
+                    f"decoder.model.layers.{layer_idx}.mlp"
+                    for layer_idx in range(self.config.num_hidden_layers)
+                ),
+                qmoe_source_moe_paths=tuple(
+                    f"model.language_model.layers.{layer_idx}.mlp"
+                    for layer_idx in range(self.config.num_hidden_layers)
+                ),
                 reject_quantized_embeddings_lm_head=True,
                 defer_non_expert_sidecars=True,
             )
@@ -1019,6 +1052,17 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=".mlp",
                 qmoe_quant_methods=("olive",),
+                qmoe_num_experts=self.config.num_local_experts,
+                qmoe_hidden_size=self.config.hidden_size,
+                qmoe_intermediate_size=self.config.moe_intermediate_size,
+                qmoe_expected_moe_paths=tuple(
+                    f"decoder.model.layers.{layer_idx}.mlp"
+                    for layer_idx in range(self.config.num_hidden_layers)
+                ),
+                qmoe_source_moe_paths=tuple(
+                    f"model.language_model.layers.{layer_idx}.mlp"
+                    for layer_idx in range(self.config.num_hidden_layers)
+                ),
                 reject_quantized_embeddings_lm_head=True,
             )
         if tie:
