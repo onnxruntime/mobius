@@ -8,6 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 
 from mobius._configs import BaseModelConfig
+from mobius._model_package import ModelPackage
 from mobius.models.decision import (
     CLM_PROVENANCE,
     KEV_PROVENANCE,
@@ -20,11 +21,11 @@ from mobius.tasks._base import (
     ComponentConfig,
     ComponentRole,
     ComponentSpec,
+    ModelTask,
     MultiComponentModelTask,
     _make_graph,
     _make_model,
 )
-from mobius.tasks._causal_lm import CausalLMTask, HybridCausalLMTask
 
 
 def _stamp(model: ir.Model, provenance, contract: str) -> ir.Model:
@@ -32,6 +33,29 @@ def _stamp(model: ir.Model, provenance, contract: str) -> ir.Model:
     model.metadata_props["mobius.provenance"] = provenance_json(provenance)
     model.metadata_props["mobius.decision_contract"] = contract
     return model
+
+
+class HeadlessBackboneTask(ModelTask):
+    """Export one full-sequence backbone without generation cache state."""
+
+    def build(self, module, config):
+        """Expose token IDs, masks, positions, and token hidden states only."""
+        batch = ir.SymbolicDim("batch")
+        sequence = ir.SymbolicDim("sequence_length")
+        graph, builder = _make_graph("backbone")
+        input_ids = builder.input("input_ids", ir.DataType.INT64, [batch, sequence])
+        attention_mask = builder.input("attention_mask", ir.DataType.INT64, [batch, sequence])
+        position_ids = builder.input("position_ids", ir.DataType.INT64, [batch, sequence])
+        outputs = module(
+            builder.op,
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values=None,
+        )
+        hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+        builder.add_output(hidden_states, "token_hidden_states")
+        return ModelPackage({"model": _make_model(graph)}, config=config)
 
 
 class CLMTask(MultiComponentModelTask):
@@ -56,14 +80,14 @@ class CLMTask(MultiComponentModelTask):
     def build_component(self, name, component, module, config):
         """Build a headless encoder, projection head, or grouped scorer graph."""
         if name == "encoder":
-            package = CausalLMTask().build(module, config)
+            package = HeadlessBackboneTask().build(module, config)
             model = package["model"]
             model.graph.name = name
-            model.graph.outputs[0].name = "token_hidden_states"
             return _stamp(
                 model,
                 self.provenance,
-                "qwen3-token-hidden-states;caller-selects-last-token",
+                "qwen3-token-hidden-states;caller-selects-last-token;"
+                "projection-head-normalizes-input",
             )
         if isinstance(module, CLMProjectionHead):
             graph, builder = _make_graph(name)
@@ -73,9 +97,7 @@ class CLMTask(MultiComponentModelTask):
                 [ir.SymbolicDim("items"), config.hidden_size],
             )
             builder.add_output(module(builder.op, embeddings), "projections")
-            return _stamp(
-                _make_model(graph), self.provenance, "l2-normalized-projection"
-            )
+            return _stamp(_make_model(graph), self.provenance, "l2-normalized-projection")
         if isinstance(module, CLMScorer):
             graph, builder = _make_graph(name)
             states = builder.input(
@@ -125,10 +147,9 @@ class KevTask(MultiComponentModelTask):
         stable probability distribution within each question.
         """
         if name == "backbone":
-            package = HybridCausalLMTask().build(module, config)
+            package = HeadlessBackboneTask().build(module, config)
             model = package["model"]
             model.graph.name = name
-            model.graph.outputs[0].name = "token_hidden_states"
             return _stamp(model, KEV_PROVENANCE, "one-causal-row-per-question")
         if not isinstance(module, KevPointerHead):
             raise TypeError("Kev pointer_head has an unexpected module type")

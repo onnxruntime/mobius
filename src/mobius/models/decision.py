@@ -61,9 +61,7 @@ class ModelProvenance:
         }
 
 
-CLM_PROVENANCE = ModelProvenance(
-    CLM_MODEL_ID, CLM_REVISION, CLM_BASE_MODEL_ID, None
-)
+CLM_PROVENANCE = ModelProvenance(CLM_MODEL_ID, CLM_REVISION, CLM_BASE_MODEL_ID, None)
 KEV_PROVENANCE = ModelProvenance(
     KEV_MODEL_ID, KEV_REVISION, KEV_BASE_MODEL_ID, KEV_BASE_REVISION
 )
@@ -84,9 +82,7 @@ def _metadata_matches(actual: Any, expected: Any) -> bool:
     return isinstance(actual, type(expected)) and actual == expected
 
 
-def _validate_weight_mapping(
-    weights: Mapping[str, Any], *, owner: str
-) -> None:
+def _validate_weight_mapping(weights: Mapping[str, Any], *, owner: str) -> None:
     """Require a non-empty string-to-tensor weight mapping."""
     if not isinstance(weights, Mapping) or not weights:
         raise CheckpointContractError(f"{owner} weights must be a non-empty mapping")
@@ -98,6 +94,32 @@ def _validate_weight_mapping(
     if invalid:
         raise CheckpointContractError(
             f"{owner} weights must contain only string-to-tensor entries"
+        )
+
+
+def _apply_package_weights_strict(
+    package, weights: dict[str, torch.Tensor], *, owner: str
+) -> None:
+    """Apply every supplied weight and require every initializer to be bound."""
+    applied = package.apply_weights(weights)
+    unapplied = sorted(set(weights) - applied)
+    if unapplied:
+        examples = ", ".join(repr(name) for name in unapplied[:5])
+        suffix = f" and {len(unapplied) - 5} more" if len(unapplied) > 5 else ""
+        raise CheckpointContractError(
+            f"{owner} contains unapplied weights: {examples}{suffix}"
+        )
+    missing = [
+        f"{component}.{name}"
+        for component, model in package.items()
+        for name, initializer in model.graph.initializers.items()
+        if initializer.const_value is None
+    ]
+    if missing:
+        examples = ", ".join(repr(name) for name in missing[:5])
+        suffix = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
+        raise CheckpointContractError(
+            f"{owner} leaves initializers without weights: {examples}{suffix}"
         )
 
 
@@ -135,13 +157,9 @@ def validate_clm_checkpoint(checkpoint: Mapping[str, Any]) -> None:
             raise CheckpointContractError(
                 f"CLM checkpoint cfg.{key} must be {value!r}, got {cfg.get(key)!r}"
             )
-    projection_dim = checkpoint.get(
-        "projection_dim", cfg.get("projection_dim")
-    )
+    projection_dim = checkpoint.get("projection_dim", cfg.get("projection_dim"))
     if not _metadata_matches(projection_dim, CLM_PROJECTION_DIM):
-        raise CheckpointContractError(
-            "CLM checkpoint projection_dim must be 512"
-        )
+        raise CheckpointContractError("CLM checkpoint projection_dim must be 512")
     shapes = {
         "inp.weight": (CLM_WIDTH, CLM_HIDDEN_SIZE),
         "inp.bias": (CLM_WIDTH,),
@@ -155,9 +173,7 @@ def validate_clm_checkpoint(checkpoint: Mapping[str, Any]) -> None:
     for name in ("state_head", "action_head"):
         head = checkpoint.get(name)
         if not isinstance(head, Mapping):
-            raise CheckpointContractError(
-                f"CLM checkpoint must contain a {name} state dict"
-            )
+            raise CheckpointContractError(f"CLM checkpoint must contain a {name} state dict")
         if set(head) != set(shapes):
             missing = sorted(map(str, set(shapes) - set(head)))
             extra = sorted(map(str, set(head) - set(shapes)))
@@ -337,12 +353,16 @@ def grouped_softmax(
         raise ValueError("group_sizes must be positive and consume every logit")
     result, offset = [], 0
     for size in group_sizes:
-        result.append(stable_softmax([value / temperature for value in logits[offset : offset + size]]))
+        result.append(
+            stable_softmax([value / temperature for value in logits[offset : offset + size]])
+        )
         offset += size
     return result
 
 
-def rank_probabilities(candidates: Sequence[str], probabilities: Sequence[float]) -> list[dict]:
+def rank_probabilities(
+    candidates: Sequence[str], probabilities: Sequence[float]
+) -> list[dict]:
     """Rank candidates by descending probability with stable input-order ties."""
     if len(candidates) != len(probabilities):
         raise ValueError("candidates and probabilities must have equal lengths")
@@ -420,9 +440,7 @@ class CLMProjectionHead(nn.Module):
         if depth < 2:
             raise ValueError("CLM projection depth must be at least 2")
         self.inp = Linear(hidden_size, width)
-        self.hidden = nn.ModuleList(
-            [Linear(width, width) for _ in range(depth - 2)]
-        )
+        self.hidden = nn.ModuleList([Linear(width, width) for _ in range(depth - 2)])
         self.norms = nn.ModuleList(
             [
                 LayerNorm(width, eps=1e-5) if layernorm else _Identity()
@@ -445,7 +463,9 @@ class CLMProjectionHead(nn.Module):
 
     def forward(self, op: OpBuilder, embeddings: ir.Value) -> ir.Value:
         """Project ``[items, hidden]`` embeddings and L2-normalize each row."""
-        value = self._activate(op, self.inp(op, embeddings))
+        input_norm = op.ReduceL2(embeddings, [-1], keepdims=1)
+        normalized = op.Div(embeddings, op.Max(input_norm, op.CastLike(1e-12, input_norm)))
+        value = self._activate(op, self.inp(op, normalized))
         for linear, norm in zip(self.hidden, self.norms):
             projected = self._activate(op, norm(op, linear(op, value)))
             value = op.Add(value, projected) if self.residual else projected
@@ -515,9 +535,7 @@ class CLMModel(nn.Module):
         if config.hidden_size != 4096:
             raise ValueError("CLM-v0.1-8B requires Qwen3-8B hidden_size=4096")
         self.config = config
-        self.provenance = dataclasses.replace(
-            CLM_PROVENANCE, base_revision=base_revision
-        )
+        self.provenance = dataclasses.replace(CLM_PROVENANCE, base_revision=base_revision)
         self.encoder = Qwen3EncoderModel(config)
         options = {
             "hidden_size": config.hidden_size,
@@ -595,9 +613,7 @@ def render_kev(value: JSONContent, indent: int = 0) -> str:
     if isinstance(value, (str, int, float, bool)):
         return str(value)
     if isinstance(value, list):
-        return "\n".join(
-            f"{pad}- {render_kev(item, indent + 1).lstrip()}" for item in value
-        )
+        return "\n".join(f"{pad}- {render_kev(item, indent + 1).lstrip()}" for item in value)
     return "\n".join(
         (
             f"{pad}{key}:\n{render_kev(item, indent + 1)}"
@@ -609,7 +625,7 @@ def render_kev(value: JSONContent, indent: int = 0) -> str:
 
 
 def kev_question_options(question: Mapping[str, Any]) -> tuple[list[str], list[str]]:
-    """Return exact Kev answer keys/texts, enforcing type and 1–255 bounds."""
+    """Return exact Kev answer keys/texts, enforcing type and 1-255 bounds."""
     question_type = question.get("type")
     criteria = question.get("criteria")
     if question_type == "noul":
@@ -619,10 +635,7 @@ def kev_question_options(question: Mapping[str, Any]) -> tuple[list[str], list[s
             _kev_option_text("yes", criteria.get("true")),
         ]
     if question_type == "choice":
-        if (
-            not isinstance(criteria, Mapping)
-            or not 1 <= len(criteria) <= KEV_MAX_OPTIONS
-        ):
+        if not isinstance(criteria, Mapping) or not 1 <= len(criteria) <= KEV_MAX_OPTIONS:
             raise ValueError("choice question needs 1..255 criteria")
         keys = list(criteria)
         return keys, [_kev_option_text(key, criteria[key]) for key in keys]
@@ -712,9 +725,7 @@ def encode_kev_rows(
             option_indices.append(len(ids) - 1)
         ids.append(KEV_CONTROL_TOKEN_IDS["decide"])
         if len(ids) > max_row_tokens:
-            raise ValueError(
-                f"state+question row exceeds {max_row_tokens} tokens: {len(ids)}"
-            )
+            raise ValueError(f"state+question row exceeds {max_row_tokens} tokens: {len(ids)}")
         # The final decide token is the pointer Q location for this row.
         rows.append(
             KevQuestionRow(
@@ -780,8 +791,7 @@ def kev_score_confidence(probabilities: Sequence[float]) -> float:
     return max(
         0.0,
         1.0
-        - sum(value * abs(index - mode) for index, value in enumerate(probs))
-        / (count - 1),
+        - sum(value * abs(index - mode) for index, value in enumerate(probs)) / (count - 1),
     )
 
 
@@ -859,14 +869,10 @@ class KevPointerHead(nn.Module):
         decide = op.GatherND(hidden_states, decide_coordinates)
         options = op.GatherND(hidden_states, option_coordinates)
         queries = op.Gather(self.q(op, decide), option_owners, axis=0)
-        logits = op.ReduceSum(
-            op.Mul(self.k(op, options), queries), [-1], keepdims=0
-        )
+        logits = op.ReduceSum(op.Mul(self.k(op, options), queries), [-1], keepdims=0)
         logits = op.Div(logits, op.CastLike(math.sqrt(KEV_POINTER_SIZE), logits))
         logits = op.Div(logits, op.CastLike(self.temperature, logits))
-        probabilities = _grouped_softmax_graph(
-            op, logits, option_owners, decide_indices
-        )
+        probabilities = _grouped_softmax_graph(op, logits, option_owners, decide_indices)
         return logits, probabilities
 
 
@@ -899,8 +905,10 @@ def _grouped_softmax_graph(
     maxima = op.ReduceMax(masked, [0], keepdims=0)
     stable = op.Sub(logits, op.Gather(maxima, owners))
     exponentials = op.Exp(stable)
+    weighted_mask = op.CastLike(mask, exponentials)
     totals = op.MatMul(
-        op.Transpose(mask, perm=[1, 0]), op.Unsqueeze(exponentials, [1])
+        op.Transpose(weighted_mask, perm=[1, 0]),
+        op.Unsqueeze(exponentials, [1]),
     )
     totals = op.Squeeze(totals, [1])
     return op.Div(exponentials, op.Gather(totals, owners))
@@ -1009,13 +1017,9 @@ def synthetic_kev_checkpoint(
     generator = torch.Generator().manual_seed(seed)
     return {
         "head": {
-            "q.weight": torch.randn(
-                KEV_POINTER_SIZE, hidden_size, generator=generator
-            ),
+            "q.weight": torch.randn(KEV_POINTER_SIZE, hidden_size, generator=generator),
             "q.bias": torch.randn(KEV_POINTER_SIZE, generator=generator),
-            "k.weight": torch.randn(
-                KEV_POINTER_SIZE, hidden_size, generator=generator
-            ),
+            "k.weight": torch.randn(KEV_POINTER_SIZE, hidden_size, generator=generator),
             "k.bias": torch.randn(KEV_POINTER_SIZE, generator=generator),
         },
         "temperature": KEV_TEMPERATURE,
@@ -1066,9 +1070,7 @@ def build_clm_package(
     from mobius._builder import build_from_module
     from mobius.tasks._decision import CLMTask
 
-    package = build_from_module(
-        module, config, task=CLMTask(module.provenance)
-    )
+    package = build_from_module(module, config, task=CLMTask(module.provenance))
     weights = {
         f"encoder.{key}": value
         for key, value in module.encoder.preprocess_weights(dict(base_weights)).items()
@@ -1078,7 +1080,7 @@ def build_clm_package(
     # ``encoder.model.layers...`` and ``state_head.inp...``). Trying to route by
     # those same prefixes would strip them and leave every initializer unbound.
     # Let ModelPackage match the fully qualified names across all components.
-    package.apply_weights(weights)
+    _apply_package_weights_strict(package, weights, owner="CLM checkpoint")
     return package
 
 
@@ -1123,15 +1125,13 @@ def build_kev_package(
     package = build_from_module(module, config, task=KevTask())
     weights = {
         f"backbone.{key}": value
-        for key, value in module.backbone.preprocess_weights(
-            dict(merged_base_weights)
-        ).items()
+        for key, value in module.backbone.preprocess_weights(dict(merged_base_weights)).items()
     }
     weights.update(map_kev_checkpoint(head_checkpoint))
     # As with CLM, these graphs retain ``backbone.`` and ``pointer_head.`` in
     # their initializer names, so applying the fully qualified mapping directly
     # is required.
-    package.apply_weights(weights)
+    _apply_package_weights_strict(package, weights, owner="Kev checkpoint")
     return package
 
 
