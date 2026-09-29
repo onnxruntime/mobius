@@ -1047,22 +1047,22 @@ class Nemotron3DiarizationModel(nn.Module):
             _scalar(op, end_logit_idx),
             op.Constant(value_ints=[1]),
         )
-        # Trim to *this chunk's* raw (pre-feature-stacking-padding) length,
-        # not the whole window's raw length: for a non-final chunk
-        # (lookahead > 0) whose window isn't a multiple of
-        # ``subsampling_factor``, feature-stacking's zero-padding would
-        # otherwise let up to ``subsampling_factor - 1`` extra
-        # padding-derived frames leak into ``speaker_probs`` beyond the
-        # documented ``chunk_window_frames - num_lookahead_frames * factor``
-        # output length.
-        lookahead_raw_frames = op.Mul(
-            _scalar(op, num_lookahead_frames), op.Constant(value_int=factor)
-        )
-        chunk_raw_num_frames = op.Sub(raw_num_frames, lookahead_raw_frames)
+        # Trim to this call's raw (pre-feature-stacking-padding) window
+        # length, matching HF's reference `logits[:, :num_frames]` exactly
+        # (see `Nemotron3DiarizationForAudioFrameClassification.forward`).
+        # No lookahead subtraction here: `num_chunk_frames * factor` (the
+        # length of `chunk_region` above) is already <= `raw_num_frames`
+        # whenever `num_lookahead_frames > 0`, because the one padded
+        # feature-stacking frame (if any) falls inside the excluded
+        # look-ahead suffix. This `Slice` is therefore a no-op except on a
+        # final chunk (lookahead == 0) whose window isn't a multiple of
+        # `subsampling_factor`, where it trims off the padding-derived
+        # frame(s) — relying on `Slice`'s documented clamping of an
+        # out-of-range `ends` value to the actual dimension size.
         chunk_region = op.Slice(
             chunk_region,
             op.Constant(value_ints=[0]),
-            chunk_raw_num_frames,
+            raw_num_frames,
             op.Constant(value_ints=[1]),
         )
         speaker_probs = op.Sigmoid(chunk_region)

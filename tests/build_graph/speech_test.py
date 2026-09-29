@@ -1656,15 +1656,20 @@ class TestBuildGraphNemotron3DiarizationStreaming:
                 }
 
     def test_non_final_chunk_with_misaligned_window_has_exact_frame_count(self):
-        """Regression test for the review-flagged feature-stacking pad-leak.
+        """Regression test for titaiwangms's PR #748 review.
 
-        A non-final chunk (``lookahead > 0``) whose raw window isn't a
-        multiple of ``subsampling_factor`` used to risk leaking up to
-        ``subsampling_factor - 1`` extra, padding-derived frames into
-        ``speaker_probs`` beyond the documented
-        ``chunk_window_frames - lookahead * subsampling_factor`` output
-        length. Verify the output frame count is exact even for such a
-        misaligned window.
+        Streaming output length must never desync from the number of frames
+        committed to the FIFO/cache, even for a non-final,
+        non-``subsampling_factor``-aligned window.
+
+        Verifies, across two consecutive calls (an unaligned non-final chunk
+        followed by a second chunk consuming the returned cache state), that
+        ``speaker_probs``'s frame count always exactly matches
+        ``(present_num_fifo_frames - past_num_fifo_frames) *
+        subsampling_factor`` — the number of raw frames actually committed to
+        the cache this call. A caller advancing a sliding window using either
+        number therefore always stays in sync; neither frame double-counting
+        nor frame dropping is possible.
         """
         import os
         import tempfile
@@ -1674,7 +1679,22 @@ class TestBuildGraphNemotron3DiarizationStreaming:
         from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
         from mobius.tasks import DiarizationStreamingTask
 
-        config = self._config()
+        config = _base_config(
+            Nemotron3DiarizationConfig,
+            feat_in=16,
+            subsampling_factor=2,
+            head_hidden_size=8,
+            num_speakers=4,
+            partial_rotary_factor=1.0,
+            chunk_length=4,
+            chunk_right_context=2,
+            # Deliberately larger than either call's FIFO growth (5, then 4)
+            # so FIFO eviction/compaction -- a separately-tested mechanism --
+            # never triggers and can't confound this test's invariant check.
+            streaming_fifo_length=20,
+            streaming_speaker_cache_length=20,
+            streaming_speaker_cache_update_period=20,
+        )
         module = Nemotron3DiarizationModel(config)
         pkg = build_from_module(module, config, task=DiarizationStreamingTask())
         model = pkg["model"]
@@ -1694,16 +1714,34 @@ class TestBuildGraphNemotron3DiarizationStreaming:
             cache_len = config.streaming_speaker_cache_length
             fifo_len = config.streaming_fifo_length
             lookahead = config.chunk_right_context
-            assert config.subsampling_factor == 2
+            factor = config.subsampling_factor
+            assert factor == 2
             # Deliberately misaligned: one raw frame more than a multiple of
             # subsampling_factor (2), i.e. an odd raw window length.
             misaligned_raw_window = (
                 config.chunk_length + config.chunk_right_context
-            ) * config.subsampling_factor + 1
+            ) * factor + 1
 
-            feats = np.random.randn(1, config.feat_in, misaligned_raw_window).astype(
-                np.float32
-            )
+            output_names = [out.name for out in sess.get_outputs()]
+
+            def run_chunk(raw_window: int, num_lookahead: int, state: dict):
+                feats = np.random.randn(1, config.feat_in, raw_window).astype(np.float32)
+                inputs = {
+                    "input_features": feats,
+                    "num_lookahead_frames": np.array(num_lookahead, dtype=np.int64),
+                    **state,
+                }
+                outs = dict(zip(output_names, sess.run(output_names, inputs)))
+                next_state = {
+                    "past_cache_embeds": outs["present_cache_embeds"],
+                    "past_cache_probs": outs["present_cache_probs"],
+                    "past_fifo": outs["present_fifo"],
+                    "past_num_cache_frames": outs["present_num_cache_frames"],
+                    "past_num_fifo_frames": outs["present_num_fifo_frames"],
+                    "past_is_compressed": outs["present_is_compressed"],
+                }
+                return outs, next_state
+
             state = {
                 "past_cache_embeds": np.zeros((1, cache_len, config.hidden_size), np.float32),
                 "past_cache_probs": np.zeros((1, cache_len, config.num_speakers), np.float32),
@@ -1712,13 +1750,37 @@ class TestBuildGraphNemotron3DiarizationStreaming:
                 "past_num_fifo_frames": np.array(0, dtype=np.int64),
                 "past_is_compressed": np.array(False, dtype=bool),
             }
-            inputs = {
-                "input_features": feats,
-                "num_lookahead_frames": np.array(lookahead, dtype=np.int64),
-                **state,
-            }
-            output_names = [out.name for out in sess.get_outputs()]
-            outs = dict(zip(output_names, sess.run(output_names, inputs)))
 
-            expected_frames = misaligned_raw_window - lookahead * config.subsampling_factor
-            assert outs["speaker_probs"].shape[1] == expected_frames
+            # Call 1: a non-final (lookahead > 0), misaligned window. The
+            # correct emitted length matches HuggingFace's reference trim
+            # (`logits[:, :num_frames]`, no lookahead subtraction) rather
+            # than the previously buggy `raw_window - lookahead * factor`.
+            num_new_embeds_1 = -(-misaligned_raw_window // factor)  # ceil division
+            num_chunk_embeds_1 = num_new_embeds_1 - lookahead
+            expected_frames_1 = min(misaligned_raw_window, num_chunk_embeds_1 * factor)
+
+            outs1, state = run_chunk(misaligned_raw_window, lookahead, state)
+            assert outs1["speaker_probs"].shape[1] == expected_frames_1
+
+            fifo_growth_1 = int(state["past_num_fifo_frames"]) - 0
+            assert fifo_growth_1 == num_chunk_embeds_1
+            # Core invariant: output length exactly matches the frames
+            # committed to the cache this call (no desync).
+            assert outs1["speaker_probs"].shape[1] == fifo_growth_1 * factor
+
+            # Call 2: a second, final (lookahead == 0) aligned window,
+            # consuming the state returned by call 1 — verifies the
+            # invariant continues to hold across calls, not just in
+            # isolation.
+            aligned_raw_window = config.chunk_length * factor
+            num_new_embeds_2 = aligned_raw_window // factor
+            num_chunk_embeds_2 = num_new_embeds_2  # lookahead == 0
+            expected_frames_2 = min(aligned_raw_window, num_chunk_embeds_2 * factor)
+
+            prev_fifo_frames = int(state["past_num_fifo_frames"])
+            outs2, state = run_chunk(aligned_raw_window, 0, state)
+            assert outs2["speaker_probs"].shape[1] == expected_frames_2
+
+            fifo_growth_2 = int(state["past_num_fifo_frames"]) - prev_fifo_frames
+            assert fifo_growth_2 == num_chunk_embeds_2
+            assert outs2["speaker_probs"].shape[1] == fifo_growth_2 * factor

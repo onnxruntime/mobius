@@ -54,12 +54,17 @@ class DiarizationStreamingTask(ModelTask):
 
     Output:
         ``speaker_probs`` — ``[batch, frames, num_spks]`` sigmoid
-        probabilities for this chunk only (``frames`` excludes the
-        look-ahead frames: ``chunk_window_frames`` minus ``num_lookahead_frames
-        * subsampling_factor``, exactly — including for a non-final chunk
-        whose window isn't a multiple of ``subsampling_factor``, where
-        feature-stacking's internal zero-padding never leaks into the
-        output).
+        probabilities for this chunk only. ``frames`` equals
+        ``min(chunk_window_frames, (num_new_embeds - num_lookahead_frames) *
+        subsampling_factor)`` — i.e. it excludes the look-ahead frames and is
+        capped to the actual raw window length (matching HuggingFace's
+        reference ``logits[:, :num_frames]`` trim exactly). This is always
+        exactly the number of frames committed to the FIFO/cache this call
+        (``num_chunk_frames * subsampling_factor``), so the output length
+        never desyncs from cache growth — including for a non-final chunk
+        whose window isn't a multiple of ``subsampling_factor``, where the
+        cap only ever activates on a final (``num_lookahead_frames == 0``)
+        chunk with a padding-derived trailing frame.
         ``present_cache_embeds`` / ``present_cache_probs`` / ``present_fifo``
         / ``present_num_cache_frames`` / ``present_num_fifo_frames`` /
         ``present_is_compressed`` — updated state, fed back as the ``past_*``

@@ -4997,10 +4997,11 @@ class Nemotron3DiarizationConfig(ArchitectureConfig):
     Transformer encoder — its fields populate the base :class:`ArchitectureConfig`
     fields directly), ``head_config`` (the speaker-classification head that
     projects, upsamples, and classifies the encoder output), and
-    ``streaming_config`` (the Arrival-Order Speaker Cache / FIFO policy used by
-    the incremental streaming forward, see ``models/nemotron3_diarization.py``
-    for both the offline (single full-sequence) and streaming (per-chunk,
-    stateful) exports).
+    ``    streaming_config`` (the Arrival-Order Speaker Cache / FIFO policy shared by
+    both the offline and streaming forwards' cache-update logic, see
+    ``models/nemotron3_diarization.py`` for both the offline (chunked
+    internally via an ONNX ``Loop``, not a single full-sequence pass) and
+    streaming (one chunk per call, stateful across calls) exports).
     """
 
     feat_in: int = 128
@@ -5020,7 +5021,10 @@ class Nemotron3DiarizationConfig(ArchitectureConfig):
     offline_speaker_cache_update_period: int = 300
 
     # Arrival-Order Speaker Cache (AOSC) + FIFO queue policy, from
-    # ``config.streaming_config``. Used only by the streaming forward.
+    # ``config.streaming_config``. Shared by both the offline and streaming
+    # forwards (via ``_run_chunk_and_update_cache``'s cache-update/compression
+    # logic) — only ``fifo_length``/``speaker_cache_update_period`` differ
+    # per mode (offline uses its own ``offline_*`` pair above instead).
     streaming_fifo_length: int = 264
     streaming_speaker_cache_length: int = 264
     streaming_speaker_cache_update_period: int = 222
