@@ -23,11 +23,14 @@ __all__ = [
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
     "CausalLMTask",
+    "CLMTask",
     "SmallThinkerGGUFCausalLMTask",
     "CTCAsrTask",
     "FeatureCTCAsrTask",
     "RNNTTask",
     "CodecTask",
+    "ComponentConfig",
+    "ComponentRole",
     "ComponentSpec",
     "ControlNetTask",
     "DeepSeekV4Task",
@@ -68,8 +71,10 @@ __all__ = [
     "ImageClassificationTask",
     "KimiK3CausalLMTask",
     "KimiLinearCausalLMTask",
+    "KevTask",
     "Lfm2VlTask",
     "ModelTask",
+    "MultiComponentModelTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
     "Mistral4GGUFCausalLMTask",
@@ -125,8 +130,11 @@ from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_ctc import AudioCTCTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
 from mobius.tasks._base import (
+    ComponentConfig,
+    ComponentRole,
     ComponentSpec,
     ModelTask,
+    MultiComponentModelTask,
     build_decoder_from_embeds,
     build_embedding_from_features,
 )
@@ -139,6 +147,7 @@ from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._ctc_asr import CTCAsrTask, FeatureCTCAsrTask
 from mobius.tasks._deepseek_v4 import DeepSeekV4Task
+from mobius.tasks._decision import CLMTask, KevTask
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._diarization import DiarizationTask
@@ -243,6 +252,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "ctc-asr": CTCAsrTask,
     "feature-ctc-asr": FeatureCTCAsrTask,
     "codec": CodecTask,
+    "clm-scoring": CLMTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
     "diarization": DiarizationTask,
@@ -269,6 +279,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "hy-v3-mtp": HyV3MtpTask,
     "kimi-k3-text-generation": KimiK3CausalLMTask,
     "kimi-linear-text-generation": KimiLinearCausalLMTask,
+    "kev-scoring": KevTask,
     "falcon-h1-text-generation": FalconH1CausalLMTask,
     "plamo-text-generation": PlamoCausalLMTask,
     "plamo2-text-generation": Plamo2CausalLMTask,

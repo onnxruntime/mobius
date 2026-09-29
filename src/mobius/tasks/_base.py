@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import TYPE_CHECKING, ClassVar
 
 import onnx_ir as ir
@@ -20,6 +22,49 @@ if TYPE_CHECKING:
     from mobius._component_manifest import ComponentManifest
 
 
+class ComponentRole(str, Enum):
+    """Neutral roles for non-generative package components."""
+
+    BACKBONE = "backbone"
+    ENCODER = "encoder"
+    HEAD = "head"
+
+
+@dataclasses.dataclass(frozen=True)
+class ComponentConfig:
+    """Configuration for one named component of a multi-component task.
+
+    ``role`` accepts a :class:`ComponentRole` or one of its string values:
+    ``"backbone"``, ``"encoder"``, and ``"head"``.
+    """
+
+    module_attribute_path: str
+    role: str | ComponentRole | None = None
+
+    def __post_init__(self) -> None:
+        """Validate and normalize the dotted path and optional neutral role."""
+        path = self.module_attribute_path
+        if not isinstance(path, str):
+            raise TypeError("component module_attribute_path must be a string")
+        if not path or any(not part or not part.strip() for part in path.split(".")):
+            raise ValueError(
+                "component module_attribute_path must be a non-empty dotted attribute path"
+            )
+        role = self.role
+        if role is None:
+            return
+        if not isinstance(role, (str, ComponentRole)):
+            raise TypeError("component role must be a ComponentRole or string")
+        try:
+            normalized_role = ComponentRole(role)
+        except ValueError:
+            supported = ", ".join(role.value for role in ComponentRole)
+            raise ValueError(
+                f"unsupported component role {role!r}; expected one of: {supported}"
+            ) from None
+        object.__setattr__(self, "role", normalized_role.value)
+
+
 class ComponentSpec:
     """Declares which sub-module attributes a multi-component task requires.
 
@@ -29,28 +74,29 @@ class ComponentSpec:
     cryptic ``AttributeError`` that would otherwise surface deep inside
     ``build()``.
 
-    Map output model names to the module attribute that builds each component::
+    Map output model names to the module attribute that builds each component.
+    A :class:`ComponentConfig` additionally declares a neutral component role::
 
         ComponentSpec(
-            decoder="decoder",
-            vision_encoder="vision_encoder",
-            embedding="embedding",
+            encoder=ComponentConfig("encoder", ComponentRole.ENCODER),
+            classifier=ComponentConfig("heads.classifier", ComponentRole.HEAD),
         )
 
     The keys are the names used in the output :class:`ModelPackage`; the
-    values are the attribute names on the ``nn.Module`` passed to
-    ``task.build()``.  Dot notation is supported for nested attributes
-    (e.g. ``"model.encoder"``).
+    values are attribute names or component configurations for the ``nn.Module``
+    passed to ``task.build()``. Dot notation is supported for nested attributes.
 
     Args:
-        **components: Keyword arguments mapping output name → module attribute
-            name.  For example, ``vision_encoder="vision_encoder"`` means
-            the task expects ``module.vision_encoder`` and will store the
-            result as ``package["vision_encoder"]``.
+        **components: Keyword arguments mapping output name to a module
+            attribute name or :class:`ComponentConfig`.
     """
 
-    def __init__(self, **components: str) -> None:
-        self._components: dict[str, str] = dict(components)
+    def __init__(self, **components: str | ComponentConfig) -> None:
+        """Store component declarations, normalizing plain paths to configs."""
+        self._components = {
+            name: value if isinstance(value, ComponentConfig) else ComponentConfig(value)
+            for name, value in components.items()
+        }
 
     def validate(self, module: nn.Module, task_name: str) -> None:
         """Check that all required sub-module attributes exist on *module*.
@@ -64,6 +110,7 @@ class ComponentSpec:
         """
 
         def _has_nested(obj: object, dotted: str) -> bool:
+            """Return whether *obj* exposes every segment of a dotted path."""
             for part in dotted.split("."):
                 if not hasattr(obj, part):
                     return False
@@ -71,9 +118,9 @@ class ComponentSpec:
             return True
 
         missing = [
-            (output_name, attr_name)
-            for output_name, attr_name in self._components.items()
-            if not _has_nested(module, attr_name)
+            (output_name, component.module_attribute_path)
+            for output_name, component in self._components.items()
+            if not _has_nested(module, component.module_attribute_path)
         ]
         if not missing:
             return
@@ -89,7 +136,29 @@ class ComponentSpec:
 
     def items(self):
         """Iterate over ``(output_name, attribute_name)`` pairs."""
+        return (
+            (name, component.module_attribute_path)
+            for name, component in self._components.items()
+        )
+
+    def configs(self):
+        """Iterate over ``(output_name, component_config)`` pairs."""
         return self._components.items()
+
+    def roles(self) -> dict[str, str]:
+        """Return roles explicitly declared by component configurations."""
+        return {
+            name: str(component.role)
+            for name, component in self._components.items()
+            if component.role is not None
+        }
+
+    def resolve(self, module: nn.Module, name: str) -> object:
+        """Resolve a declared component module from the root module."""
+        value: object = module
+        for part in self._components[name].module_attribute_path.split("."):
+            value = getattr(value, part)
+        return value
 
     def keys(self):
         """Return the output model names declared by this spec."""
@@ -100,7 +169,13 @@ class ComponentSpec:
         return item in self._components
 
     def __repr__(self) -> str:
-        parts = ", ".join(f"{k}={v!r}" for k, v in self._components.items())
+        """Return a constructor-like representation of this component spec."""
+        parts = ", ".join(
+            f"{name}={component.module_attribute_path!r}"
+            if component.role is None
+            else f"{name}={component!r}"
+            for name, component in self._components.items()
+        )
         return f"ComponentSpec({parts})"
 
 
@@ -209,6 +284,87 @@ class ModelTask(ABC):
         Returns:
             A :class:`ModelPackage` containing the built model(s).
         """
+        ...
+
+
+class MultiComponentModelTask(ModelTask):
+    """Base task for a named backbone/encoder and one or more named heads.
+
+    Subclasses declare :attr:`components` with :class:`ComponentConfig` values
+    and implement :meth:`build_component`. The common build implementation
+    validates the layout and returns every graph in one :class:`ModelPackage`.
+    """
+
+    model_roles: ClassVar[dict[str, str]] = {}
+    components: ClassVar[ComponentSpec | None] = None
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        """Derive optimization roles from the subclass component declaration."""
+        super().__init_subclass__(**kwargs)
+        components = cls.components
+        if components is None:
+            return
+        declared_roles = components.roles()
+        explicit_roles = cls.__dict__.get("model_roles")
+        if explicit_roles is not None:
+            declared_roles.update(explicit_roles)
+        cls.model_roles = declared_roles
+
+    def build(
+        self,
+        module: nn.Module,
+        config: BaseModelConfig,
+    ) -> ModelPackage:
+        """Build every declared component into one atomic model package.
+
+        The declaration must contain exactly one backbone or encoder and at
+        least one head. Component paths are validated before graph creation;
+        each :meth:`build_component` result must be an ``ir.Model``.
+        """
+        components = self.components
+        if components is None:
+            raise TypeError(f"{type(self).__name__} must declare components")
+        roles = components.roles()
+        backbone_names = [
+            name
+            for name, role in roles.items()
+            if role in {ComponentRole.BACKBONE.value, ComponentRole.ENCODER.value}
+        ]
+        head_names = [
+            name for name, role in roles.items() if role == ComponentRole.HEAD.value
+        ]
+        if len(backbone_names) != 1 or not head_names:
+            raise ValueError(
+                f"{type(self).__name__} components must declare exactly one "
+                "backbone/encoder and at least one head"
+            )
+
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        for name, component in components.configs():
+            model = self.build_component(
+                name,
+                component,
+                components.resolve(module, name),
+                config,
+            )
+            if not isinstance(model, ir.Model):
+                raise TypeError(
+                    f"{type(self).__name__}.build_component({name!r}) "
+                    "must return an onnx_ir.Model"
+                )
+            models[name] = model
+        return ModelPackage(models, config=config)
+
+    @abstractmethod
+    def build_component(
+        self,
+        name: str,
+        component: ComponentConfig,
+        module: object,
+        config: BaseModelConfig,
+    ) -> ir.Model:
+        """Build one graph for a declared component."""
         ...
 
 
