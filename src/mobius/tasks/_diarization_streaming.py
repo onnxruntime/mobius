@@ -51,7 +51,10 @@ class DiarizationStreamingTask(ModelTask):
         ``speaker_probs`` — ``[batch, frames, num_spks]`` sigmoid
         probabilities for this chunk only (``frames`` excludes the
         look-ahead frames: ``chunk_window_frames`` minus ``num_lookahead_frames
-        * subsampling_factor``).
+        * subsampling_factor``, exactly — including for a non-final chunk
+        whose window isn't a multiple of ``subsampling_factor``, where
+        feature-stacking's internal zero-padding never leaks into the
+        output).
         ``present_cache_embeds`` / ``present_cache_probs`` / ``present_fifo``
         / ``present_num_cache_frames`` / ``present_num_fifo_frames`` /
         ``present_is_compressed`` — updated state, fed back as the ``past_*``

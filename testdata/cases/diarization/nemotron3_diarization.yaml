@@ -20,5 +20,11 @@ notes: >
   argmax/top-K gate does not apply to this continuous output, so this case
   is compared with compare_diarization_golden() (elementwise atol/rtol,
   with per-frame dominant-speaker argmax agreement and active-speaker-set
-  Jaccard as diagnostics). Regenerate with
+  Jaccard as diagnostics). The reference was generated with an unreleased
+  transformers snapshot (Nemotron3Diarization was not yet in any released
+  version) -- the golden's provenance.transformers_commit records the
+  exact upstream git commit used, for reproducibility. Regenerate with a
+  matching pinned install, e.g.
+  `pip install "git+https://github.com/huggingface/transformers.git@<commit>"`,
+  then
   `python scripts/generate_golden.py --case testdata/cases/diarization/nemotron3_diarization.yaml`.

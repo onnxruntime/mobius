@@ -156,7 +156,10 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
             # That orphaned initializer is then serialized into the ONNX file
             # and triggers an ORT warning:
             #   "Removing initializer X. It is not used by any node"
-            model.graph.remove(node, safe=True)
+            # `model.graph.all_nodes()` recurses into subgraphs (e.g. a Loop
+            # body), so `node` may not belong to the top-level `model.graph`
+            # -- remove it from its own (sub)graph instead.
+            node.graph.remove(node, safe=True)
             folded_nodes += 1
             modified = True
 

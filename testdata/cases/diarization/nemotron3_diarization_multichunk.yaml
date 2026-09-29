@@ -1,0 +1,40 @@
+model_id: "nvidia/Nemotron-3-Diarization"
+model_type: "nemotron3_diarization"
+revision: "f667ed73aee57d40cc39428eb768b4fd87a0a29e"
+task_type: "diarization"
+dtype: "float32"
+
+level: "L4"
+
+generation:
+  num_frames: 6000
+
+notes: >
+  Offline multi-chunk speaker diarization (a longer companion to
+  nemotron3_diarization.yaml). 6000 mel frames subsample to 750 encoder
+  embeddings -- well above config.chunk_length (340) -- so HuggingFace's own
+  offline forward internally re-chunks into 3 iterations (340 + 340 + 70
+  frames), threading its Arrival-Order Speaker Cache (AOSC) + FIFO queue
+  (config.fifo_length / config.speaker_cache_update_period, distinct from
+  streaming_config's sizes) across chunk boundaries and, since
+  speaker_cache_update_period (300) is exceeded partway through, exercising
+  cache compression too. This is the reference this case's mobius ONNX
+  export must match: an ONNX Loop-based chunked offline forward (see
+  Nemotron3DiarizationForAudioFrameClassification.forward's
+  `for start_idx in range(0, num_chunk_embeds, chunk_length)` loop), not the
+  single flat non-causal pass nemotron3_diarization.yaml's shorter (single-
+  chunk) fixture exercises. The reference stores per-frame per-speaker
+  sigmoid probabilities in the companion
+  nemotron3_diarization_multichunk_probs.npz (see
+  mobius._testing.golden.save_diarization_golden); compare_golden()'s
+  argmax/top-K gate does not apply to this continuous output, so this case
+  is compared with compare_diarization_golden() (elementwise atol/rtol,
+  with per-frame dominant-speaker argmax agreement and active-speaker-set
+  Jaccard as diagnostics). The reference was generated with an unreleased
+  transformers snapshot (Nemotron3Diarization was not yet in any released
+  version) -- the golden's provenance.transformers_commit records the
+  exact upstream git commit used, for reproducibility. Regenerate with a
+  matching pinned install, e.g.
+  `pip install "git+https://github.com/huggingface/transformers.git@<commit>"`,
+  then
+  `python scripts/generate_golden.py --case testdata/cases/diarization/nemotron3_diarization_multichunk.yaml`.

@@ -24,10 +24,12 @@ Pipeline (matching ``Nemotron3DiarizationAudioModel`` + ``Nemotron3DiarizationMo
 Two forwards/tasks are exported:
 
 * **Offline** (``diarization`` task, :class:`~mobius.tasks.DiarizationTask`):
-  a single full-sequence forward, no chunking or cache state. Matches
-  HuggingFace's own offline forward exactly whenever the whole input fits in
-  a single chunk (``config.chunk_length`` encoder frames, ~27s of audio at
-  the default subsampling factor of 8).
+  the whole input is embedded once, then an ONNX ``Loop`` iterates over
+  fixed-size ``config.chunk_length`` embed chunks with
+  ``config.chunk_right_context`` look-ahead, reusing the same Arrival-Order
+  Speaker Cache (AOSC) + FIFO bookkeeping as streaming but with
+  offline-specific cache sizes. Matches HuggingFace's offline forward for
+  recordings of any length, not just single-chunk ones.
 * **Streaming** (``diarization-streaming`` task,
   :class:`~mobius.tasks.DiarizationStreamingTask`): a per-chunk, stateful
   forward. Every call consumes one chunk of audio (plus a few look-ahead
@@ -313,6 +315,33 @@ class _ClassificationHead(nn.Module):
         return self.out_proj(op, op.Relu(hidden_states))
 
 
+def _prerealize_parameters(builder, module: nn.Module, prefix: str) -> None:
+    """Registers every parameter under ``module`` as a root-graph initializer.
+
+    Uses ``named_parameters()``'s pre-computed dotted names directly.
+
+    ``Parameter._realize`` normally qualifies a name via the *root* graph
+    builder's current module-scope stack (``push_module``/``pop_module``)
+    -- but that scope stack belongs to whichever builder happens to call
+    ``_realize`` first, which is wrong when a parameter is first referenced
+    from *inside* a ``Loop``/``If`` subgraph's own separate sub-builder (its
+    scope-stack pushes never touch the *root* builder's stack that
+    ``_realize`` actually reads). Bypassing that mechanism here -- while
+    still at plain root scope, before any subgraph is built -- realizes
+    every descendant parameter up front with the exact same fully-qualified
+    name ``Module.__call__``'s automatic realization would have produced.
+    ``_realize`` is idempotent, so every later (redirect) call becomes a
+    no-op regardless of which builder performs it.
+    """
+    root = builder.root
+    for name, param in module.named_parameters(prefix=prefix):
+        if param._realized:  # pylint: disable=protected-access
+            continue
+        param.name = name
+        root.graph.initializers[name] = param
+        param._realized = True  # pylint: disable=protected-access
+
+
 def _scalar(op: OpBuilder, value: ir.Value) -> ir.Value:
     """Reshapes a scalar (rank-0) value to rank-1 shape ``[1]`` for Slice bounds."""
     return op.Reshape(value, op.Constant(value_ints=[1]))
@@ -546,9 +575,9 @@ class Nemotron3DiarizationModel(nn.Module):
     Two forwards are exported (see ``tasks/_diarization.py`` and
     ``tasks/_diarization_streaming.py``):
 
-    * :meth:`forward` — the **offline** single full-sequence pass (``diarization``
-      task). Matches HuggingFace exactly whenever the whole input fits within
-      one chunk (``config.chunk_length`` encoder frames, ~27s of audio).
+    * :meth:`forward` — the **offline** whole-recording pass (``diarization``
+      task), chunked via an ONNX ``Loop`` exactly like HuggingFace's offline
+      forward (any recording length, not just single-chunk ones).
     * :meth:`forward_streaming` — the **streaming**, per-chunk pass
       (``diarization-streaming`` task): consumes one chunk of audio plus a
       few look-ahead frames, together with the previous step's Arrival-Order
@@ -580,18 +609,299 @@ class Nemotron3DiarizationModel(nn.Module):
         self.silence_embeds = nn.Parameter([config.hidden_size])
 
     def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
+        """Offline (whole-recording) forward, chunked exactly like HuggingFace.
+
+        Matches ``Nemotron3DiarizationForAudioFrameClassification.forward``'s
+        offline path: the whole input is embedded once, then an ``ONNX Loop``
+        iterates over fixed-size ``config.chunk_length`` embed chunks (with
+        ``config.chunk_right_context`` look-ahead), reusing the same
+        Arrival-Order Speaker Cache (AOSC) + FIFO bookkeeping as the streaming
+        forward but with offline-specific cache sizes
+        (``config.offline_fifo_length`` / ``config.offline_speaker_cache_update_period``).
+        This makes the offline graph exact for recordings of any length, not
+        just ones that fit within a single chunk.
+        """
+        config = self.config
+        factor = config.subsampling_factor
+        chunk_length = config.chunk_length
+        chunk_right_context = config.chunk_right_context
+        cache_length = config.streaming_speaker_cache_length
+        fifo_capacity = config.offline_fifo_length
+        update_period = config.offline_speaker_cache_update_period
+        hidden_size = config.hidden_size
+        num_speakers = config.num_speakers
+
+        # ``Parameter._realize`` qualifies a parameter's name using the
+        # *root* graph builder's current module-scope stack, not the scope
+        # stack of whatever (sub-)builder happens to invoke it -- so calling
+        # ``encode``/``project_upsample``/``classifier`` for the first time
+        # from *inside* the ``Loop`` body below (a separate sub-builder, via
+        # ``op.builder.subgraph(...)``) would both lose hierarchical name
+        # qualification *and* (since the sub-builder's own node-name counter
+        # independently reaches the same count as an equivalent outer-scope
+        # trace) risk colliding with an unrelated node's auto-generated name.
+        # Pre-realize every parameter with its final, fully-qualified dotted
+        # name (from ``named_parameters()``) directly, while still at root
+        # scope, bypassing ``_realize``'s scope-stack-based qualification
+        # entirely -- ``_realize`` is idempotent, so this makes every later
+        # call (from ``embed`` here and from ``encode``/``project_upsample``/
+        # ``classifier`` inside the loop body) a no-op.
+        self.silence_embeds._realize(op.builder)  # type: ignore[attr-defined]
+        _prerealize_parameters(op.builder, self.model, "model")
+        _prerealize_parameters(op.builder, self.classifier, "classifier")
+
         # input_features: [B, feat_in, T] -> [B, T, feat_in], matching the
         # shared ``DiarizationTask`` input contract (also used by sortformer).
         input_features = op.Transpose(input_features, perm=[0, 2, 1])
         # Original (pre-padding) frame count, to trim the upsampled output.
-        num_frames = op.Shape(input_features, start=1, end=2)
+        raw_num_frames = op.Shape(input_features, start=1, end=2)
 
-        hidden_states = self.model(op, input_features)
-        logits = self.classifier(op, hidden_states)
+        # One embedding pass over the *whole* input (matches HuggingFace:
+        # ``inputs_embeds = embedder(input_features)`` computed once, then
+        # chunks are sliced directly from it -- not re-embedded per chunk).
+        all_chunk_embeds = self._call_backbone_scoped(op, "embed", input_features)
+        num_embeds = op.Squeeze(op.Shape(all_chunk_embeds, start=1, end=2), [0])
+        batch = op.Shape(all_chunk_embeds, start=0, end=1)
+
+        chunk_length_c = op.Constant(value_int=chunk_length)
+        num_iterations = op.Div(
+            op.Sub(op.Add(num_embeds, chunk_length_c), op.Constant(value_int=1)),
+            chunk_length_c,
+        )
+        # Fixed total accumulator length (all frames the loop will ever
+        # produce), computed once outside the loop -- lets
+        # ``accumulated_logits`` be a *fixed-shape* loop-carried buffer
+        # (each iteration adds its own zero-padded, non-overlapping region
+        # via ``Add`` rather than growing the tensor via ``Concat``). This
+        # sidesteps a real optimizer pitfall: a naive shape-inference pass
+        # can mistake a ``Concat`` whose first operand starts out empty
+        # (shape ``[B, 0, S]``) for a compile-time identity and fold it away
+        # -- which would silently keep only the *last* iteration's chunk.
+        total_raw_length = op.Mul(num_embeds, op.Constant(value_int=factor))
+
+        def _loop_body(
+            body_op: OpBuilder,
+            iter_num: ir.Value,
+            cond_in: ir.Value,
+            start_idx: ir.Value,
+            accumulated_logits: ir.Value,
+            cache_embeds: ir.Value,
+            cache_probs: ir.Value,
+            fifo: ir.Value,
+            num_cache_frames: ir.Value,
+            num_fifo_frames: ir.Value,
+            is_compressed: ir.Value,
+        ):
+            end_idx = body_op.Min(
+                body_op.Add(start_idx, body_op.Constant(value_int=chunk_length)),
+                num_embeds,
+            )
+            num_chunk_frames = body_op.Sub(end_idx, start_idx)
+            context_end_idx = body_op.Min(
+                body_op.Add(end_idx, body_op.Constant(value_int=chunk_right_context)),
+                num_embeds,
+            )
+            chunk_embeds = body_op.Slice(
+                all_chunk_embeds,
+                _scalar(body_op, start_idx),
+                _scalar(body_op, context_end_idx),
+                body_op.Constant(value_ints=[1]),
+            )
+
+            cached_length = body_op.Add(num_cache_frames, num_fifo_frames)
+            cached_embeds = body_op.Concat(
+                body_op.Slice(
+                    cache_embeds,
+                    body_op.Constant(value_ints=[0]),
+                    _scalar(body_op, num_cache_frames),
+                    body_op.Constant(value_ints=[1]),
+                ),
+                body_op.Slice(
+                    fifo,
+                    body_op.Constant(value_ints=[0]),
+                    _scalar(body_op, num_fifo_frames),
+                    body_op.Constant(value_ints=[1]),
+                ),
+                axis=1,
+            )
+            chunk_input_embeds = body_op.Concat(cached_embeds, chunk_embeds, axis=1)
+
+            (
+                chunk_logits,
+                new_cache_embeds,
+                new_cache_probs,
+                new_fifo,
+                new_num_cache_frames,
+                new_num_fifo_frames,
+                new_is_compressed,
+            ) = self._run_chunk_and_update_cache(
+                body_op,
+                chunk_input_embeds,
+                cached_length,
+                num_chunk_frames,
+                cache_embeds,
+                cache_probs,
+                fifo,
+                num_cache_frames,
+                num_fifo_frames,
+                is_compressed,
+                cache_length=cache_length,
+                fifo_capacity=fifo_capacity,
+                update_period=update_period,
+            )
+
+            start_logit_idx = body_op.Mul(cached_length, body_op.Constant(value_int=factor))
+            end_logit_idx = body_op.Mul(
+                body_op.Add(cached_length, num_chunk_frames),
+                body_op.Constant(value_int=factor),
+            )
+            chunk_region = body_op.Slice(
+                chunk_logits,
+                _scalar(body_op, start_logit_idx),
+                _scalar(body_op, end_logit_idx),
+                body_op.Constant(value_ints=[1]),
+            )
+            # Place this iteration's (non-overlapping) contribution into the
+            # fixed-size global accumulator by zero-padding it out to the
+            # full length and adding -- see ``total_raw_length``'s comment
+            # above for why this avoids a growing ``Concat``.
+            global_pad_before = body_op.Mul(start_idx, body_op.Constant(value_int=factor))
+            global_pad_after = body_op.Sub(
+                total_raw_length, body_op.Mul(end_idx, body_op.Constant(value_int=factor))
+            )
+            zero1d = body_op.Constant(value_ints=[0])
+            global_pads = body_op.Concat(
+                zero1d,
+                _scalar(body_op, global_pad_before),
+                zero1d,
+                zero1d,
+                _scalar(body_op, global_pad_after),
+                zero1d,
+                axis=0,
+            )
+            padded_chunk_region = body_op.Pad(chunk_region, global_pads, mode="constant")
+            new_accumulated_logits = body_op.Add(accumulated_logits, padded_chunk_region)
+
+            cond_out = body_op.Constant(value=ir.tensor(True))
+            return (
+                cond_out,
+                end_idx,
+                new_accumulated_logits,
+                new_cache_embeds,
+                new_cache_probs,
+                new_fifo,
+                new_num_cache_frames,
+                new_num_fifo_frames,
+                new_is_compressed,
+            )
+
+        zero_logits = op.CastLike(
+            op.Expand(
+                op.Constant(value_float=0.0),
+                op.Concat(
+                    batch,
+                    _scalar(op, total_raw_length),
+                    op.Constant(value_ints=[num_speakers]),
+                    axis=0,
+                ),
+            ),
+            all_chunk_embeds,
+        )
+        init_cache_embeds = op.CastLike(
+            op.Expand(
+                op.Constant(value_float=0.0),
+                op.Concat(batch, op.Constant(value_ints=[cache_length, hidden_size]), axis=0),
+            ),
+            all_chunk_embeds,
+        )
+        init_cache_probs = op.CastLike(
+            op.Expand(
+                op.Constant(value_float=0.0),
+                op.Concat(batch, op.Constant(value_ints=[cache_length, num_speakers]), axis=0),
+            ),
+            all_chunk_embeds,
+        )
+        init_fifo = op.CastLike(
+            op.Expand(
+                op.Constant(value_float=0.0),
+                op.Concat(batch, op.Constant(value_ints=[fifo_capacity, hidden_size]), axis=0),
+            ),
+            all_chunk_embeds,
+        )
+
+        # ``subgraph()`` snapshots the *calling* builder's current scope
+        # stack into the new sub-builder, and node/value names auto-
+        # generated with an EMPTY scope stack carry no qualifying prefix at
+        # all (just e.g. ``v_Constant_19``) -- so two graphs built back to
+        # back at the same (root) scope, each with their own independent
+        # per-graph node counter starting at 0, can trivially produce
+        # colliding names once their node counts happen to line up. Push a
+        # dedicated scope here so every node/value auto-named *inside* the
+        # loop body (including further-nested ``If`` branches it builds, by
+        # inheritance) gets a prefix that can never collide with root-scope
+        # or other-scope names.
+        op.builder.push_module("offline_chunk_loop_body")
+        loop_body = op.builder.subgraph(
+            _loop_body,
+            inputs=[
+                ir.Value(
+                    name="iter_num", type=ir.TensorType(ir.DataType.INT64), shape=ir.Shape([])
+                ),
+                ir.Value(
+                    name="cond_in", type=ir.TensorType(ir.DataType.BOOL), shape=ir.Shape([])
+                ),
+                ir.Value(name="start_idx"),
+                ir.Value(name="accumulated_logits"),
+                ir.Value(name="cache_embeds"),
+                ir.Value(name="cache_probs"),
+                ir.Value(name="fifo"),
+                ir.Value(name="num_cache_frames"),
+                ir.Value(name="num_fifo_frames"),
+                ir.Value(name="is_compressed"),
+            ],
+            outputs=[
+                ir.Value(name="cond_out"),
+                ir.Value(name="start_idx_out"),
+                ir.Value(name="accumulated_logits_out"),
+                ir.Value(name="cache_embeds_out"),
+                ir.Value(name="cache_probs_out"),
+                ir.Value(name="fifo_out"),
+                ir.Value(name="num_cache_frames_out"),
+                ir.Value(name="num_fifo_frames_out"),
+                ir.Value(name="is_compressed_out"),
+            ],
+            name="offline_chunk_loop_body",
+        )
+        op.builder.pop_module()
+
+        (
+            _,
+            accumulated_logits,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+        ) = op.Loop(
+            num_iterations,
+            op.Constant(value=ir.tensor(True)),
+            op.Constant(value_int=0),
+            zero_logits,
+            init_cache_embeds,
+            init_cache_probs,
+            init_fifo,
+            op.Constant(value_int=0),
+            op.Constant(value_int=0),
+            op.Constant(value=ir.tensor(False)),
+            body=loop_body,
+            _outputs=8,
+        )
+
         logits = op.Slice(
-            logits,
+            accumulated_logits,
             op.Constant(value_ints=[0]),
-            num_frames,
+            raw_num_frames,
             op.Constant(value_ints=[1]),
         )
         return op.Sigmoid(logits)
@@ -689,9 +999,29 @@ class Nemotron3DiarizationModel(nn.Module):
         )
         chunk_input_embeds = op.Concat(cached_embeds, chunk_embeds, axis=1)
 
-        encoded = self._call_backbone_scoped(op, "encode", chunk_input_embeds)
-        upsampled = self._call_backbone_scoped(op, "project_upsample", encoded)
-        chunk_logits = self.classifier(op, upsampled)
+        (
+            chunk_logits,
+            new_cache_embeds,
+            new_cache_probs,
+            new_fifo,
+            new_num_cache_frames,
+            new_num_fifo_frames,
+            new_is_compressed,
+        ) = self._run_chunk_and_update_cache(
+            op,
+            chunk_input_embeds,
+            cached_length,
+            num_chunk_frames,
+            past_cache_embeds,
+            past_cache_probs,
+            past_fifo,
+            past_num_cache_frames,
+            past_num_fifo_frames,
+            past_is_compressed,
+            cache_length=cache_length,
+            fifo_capacity=fifo_capacity,
+            update_period=update_period,
+        )
 
         # This step's speaker-probability output: the chunk region only
         # (excludes both the cached prefix and the look-ahead suffix),
@@ -706,13 +1036,74 @@ class Nemotron3DiarizationModel(nn.Module):
             _scalar(op, end_logit_idx),
             op.Constant(value_ints=[1]),
         )
+        # Trim to *this chunk's* raw (pre-feature-stacking-padding) length,
+        # not the whole window's raw length: for a non-final chunk
+        # (lookahead > 0) whose window isn't a multiple of
+        # ``subsampling_factor``, feature-stacking's zero-padding would
+        # otherwise let up to ``subsampling_factor - 1`` extra
+        # padding-derived frames leak into ``speaker_probs`` beyond the
+        # documented ``chunk_window_frames - num_lookahead_frames * factor``
+        # output length.
+        lookahead_raw_frames = op.Mul(
+            _scalar(op, num_lookahead_frames), op.Constant(value_int=factor)
+        )
+        chunk_raw_num_frames = op.Sub(raw_num_frames, lookahead_raw_frames)
         chunk_region = op.Slice(
             chunk_region,
             op.Constant(value_ints=[0]),
-            raw_num_frames,
+            chunk_raw_num_frames,
             op.Constant(value_ints=[1]),
         )
         speaker_probs = op.Sigmoid(chunk_region)
+
+        return (
+            speaker_probs,
+            new_cache_embeds,
+            new_cache_probs,
+            new_fifo,
+            new_num_cache_frames,
+            new_num_fifo_frames,
+            new_is_compressed,
+        )
+
+    def _run_chunk_and_update_cache(
+        self,
+        op: OpBuilder,
+        chunk_input_embeds: ir.Value,
+        cached_length: ir.Value,
+        num_chunk_frames: ir.Value,
+        past_cache_embeds: ir.Value,
+        past_cache_probs: ir.Value,
+        past_fifo: ir.Value,
+        past_num_cache_frames: ir.Value,
+        past_num_fifo_frames: ir.Value,
+        past_is_compressed: ir.Value,
+        *,
+        cache_length: int,
+        fifo_capacity: int,
+        update_period: int,
+    ) -> tuple[ir.Value, ir.Value, ir.Value, ir.Value, ir.Value, ir.Value, ir.Value]:
+        """Runs the encoder + classifier over one (already cache-prefixed) chunk.
+
+        Updates the Arrival-Order Speaker Cache (AOSC) + FIFO queue.
+
+        Shared by :meth:`forward_streaming` (streaming-sized cache) and
+        :meth:`forward`'s offline ``Loop`` body (offline-sized cache) -- see
+        ``Nemotron3DiarizationSpeakerCache.update``. ``cache_length`` /
+        ``fifo_capacity`` / ``update_period`` are plain ints (not graph
+        values) since both callers know their cache sizes statically.
+
+        Returns ``(chunk_logits, new_cache_embeds, new_cache_probs, new_fifo,
+        new_num_cache_frames, new_num_fifo_frames, new_is_compressed)`` where
+        ``chunk_logits`` is the *full* ``chunk_input_embeds``-length logits
+        (unsliced) -- callers slice the chunk-only region themselves.
+        """
+        config = self.config
+        factor = config.subsampling_factor
+
+        encoded = self._call_backbone_scoped(op, "encode", chunk_input_embeds)
+        upsampled = self._call_backbone_scoped(op, "project_upsample", encoded)
+        chunk_logits = self.classifier(op, upsampled)
 
         # --- Arrival-Order Speaker Cache (AOSC) + FIFO update ---
         probs = _avg_pool_probs(op, chunk_logits, factor)
@@ -806,6 +1197,15 @@ class Nemotron3DiarizationModel(nn.Module):
             count_out = branch_op.Add(past_num_cache_frames, num_popped)
             return embeds_out, probs_out, count_out
 
+        # Each ``If`` branch is its own subgraph with an independent node
+        # counter; without a distinguishing scope, two branches unlucky
+        # enough to reach the same node count (e.g. both start with a
+        # ``Constant``) produce colliding auto-generated names -- push a
+        # unique scope per branch so this can never happen, even when this
+        # ``If`` is built at the same (or repeatedly re-entered, e.g. inside
+        # a ``Loop`` body) outer scope. See ``_prerealize_parameters``'s
+        # docstring for the related root/subgraph collision this mirrors.
+        op.builder.push_module("compress_speaker_cache")
         then_branch = op.builder.subgraph(
             _compress_branch,
             inputs=[],
@@ -816,6 +1216,8 @@ class Nemotron3DiarizationModel(nn.Module):
             ],
             name="compress_speaker_cache",
         )
+        op.builder.pop_module()
+        op.builder.push_module("passthrough_speaker_cache")
         else_branch = op.builder.subgraph(
             _passthrough_branch,
             inputs=[],
@@ -826,6 +1228,7 @@ class Nemotron3DiarizationModel(nn.Module):
             ],
             name="passthrough_speaker_cache",
         )
+        op.builder.pop_module()
         new_cache_embeds, new_cache_probs, new_num_cache_frames = op.If(
             needs_compress, then_branch=then_branch, else_branch=else_branch, _outputs=3
         )
@@ -841,7 +1244,7 @@ class Nemotron3DiarizationModel(nn.Module):
         new_fifo = _pad_time_axis(op, new_fifo_content, op.Constant(value_int=fifo_capacity))
 
         return (
-            speaker_probs,
+            chunk_logits,
             new_cache_embeds,
             new_cache_probs,
             new_fifo,

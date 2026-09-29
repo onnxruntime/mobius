@@ -1389,6 +1389,122 @@ class TestBuildGraphSortformer:
         assert out.min() >= 0.0 and out.max() <= 1.0
 
 
+class TestBuildGraphNemotron3DiarizationOffline:
+    """Verify Nemotron3Diarization builds a chunked (``Loop``-based) offline graph."""
+
+    def _config(self, **overrides):
+        defaults = dict(
+            feat_in=16,
+            subsampling_factor=2,
+            head_hidden_size=8,
+            num_speakers=4,
+            partial_rotary_factor=1.0,
+            chunk_length=4,
+            chunk_right_context=2,
+            streaming_speaker_cache_length=6,
+            offline_fifo_length=3,
+            offline_speaker_cache_update_period=4,
+        )
+        defaults.update(overrides)
+        return _base_config(Nemotron3DiarizationConfig, **defaults)
+
+    def test_package_builds(self):
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+
+        assert "model" in pkg
+
+    def test_graph_contains_loop(self):
+        """Verify the offline graph is chunked via an ONNX ``Loop`` node."""
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+        model = pkg["model"]
+
+        op_types = {node.op_type for node in model.graph}
+        assert "Loop" in op_types
+
+    def _run_with_random_weights(self, config, num_raw_frames: int) -> np.ndarray:
+        import os
+        import tempfile
+
+        import onnxruntime as ort
+
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+        model = pkg["model"]
+
+        for init in model.graph.initializers.values():
+            if init.const_value is not None:
+                continue
+            shape = [d if isinstance(d, int) else 1 for d in init.shape]
+            arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
+            init.const_value = ir.tensor(arr, name=init.name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.onnx")
+            ir.save(model, path, external_data="model.onnx.data")
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            feats = np.random.randn(1, config.feat_in, num_raw_frames).astype(np.float32)
+            return sess.run(None, {sess.get_inputs()[0].name: feats})[0]
+
+    def test_single_chunk_matches_expected_shape(self):
+        """A recording that fits in one ``chunk_length`` still runs (1 Loop iteration)."""
+        config = self._config()
+        # One encoder-frame chunk's worth of raw frames (no lookahead needed
+        # since it's the only/final chunk).
+        num_raw_frames = config.chunk_length * config.subsampling_factor
+        out = self._run_with_random_weights(config, num_raw_frames)
+
+        assert out.shape == (1, num_raw_frames, config.num_speakers)
+        assert out.min() >= 0.0 and out.max() <= 1.0
+
+    def test_multi_chunk_recording_runs_the_loop_multiple_times(self):
+        """A recording spanning several ``chunk_length``-sized chunks.
+
+        This is the scenario the previous (non-chunked, single-pass) offline
+        graph got wrong for long recordings: exercise more than one ``Loop``
+        iteration end-to-end through ORT.
+        """
+        config = self._config()
+        # A little over 3 chunks' worth of raw frames -> 4 Loop iterations.
+        num_raw_frames = (config.chunk_length * 3 + 1) * config.subsampling_factor
+        out = self._run_with_random_weights(config, num_raw_frames)
+
+        assert out.shape == (1, num_raw_frames, config.num_speakers)
+        assert out.min() >= 0.0 and out.max() <= 1.0
+        assert not np.isnan(out).any()
+
+    def test_multi_chunk_triggers_cache_compression(self):
+        """A long-enough recording that the AOSC actually needs to compress.
+
+        Uses a small ``streaming_speaker_cache_length`` and several chunks so
+        the cache overflows and the ``If``-based compress branch (nested
+        inside the ``Loop`` body) is actually exercised.
+        """
+        config = self._config(
+            streaming_speaker_cache_length=3,
+            offline_fifo_length=2,
+            offline_speaker_cache_update_period=2,
+        )
+        num_raw_frames = (config.chunk_length * 4 + 1) * config.subsampling_factor
+        out = self._run_with_random_weights(config, num_raw_frames)
+
+        assert out.shape == (1, num_raw_frames, config.num_speakers)
+        assert out.min() >= 0.0 and out.max() <= 1.0
+        assert not np.isnan(out).any()
+
+
 class TestBuildGraphNemotron3DiarizationStreaming:
     """Verify Nemotron3Diarization builds a streaming, per-chunk graph."""
 
@@ -1538,3 +1654,71 @@ class TestBuildGraphNemotron3DiarizationStreaming:
                     "past_num_fifo_frames": outs["present_num_fifo_frames"],
                     "past_is_compressed": outs["present_is_compressed"],
                 }
+
+    def test_non_final_chunk_with_misaligned_window_has_exact_frame_count(self):
+        """Regression test for the review-flagged feature-stacking pad-leak.
+
+        A non-final chunk (``lookahead > 0``) whose raw window isn't a
+        multiple of ``subsampling_factor`` used to risk leaking up to
+        ``subsampling_factor - 1`` extra, padding-derived frames into
+        ``speaker_probs`` beyond the documented
+        ``chunk_window_frames - lookahead * subsampling_factor`` output
+        length. Verify the output frame count is exact even for such a
+        misaligned window.
+        """
+        import os
+        import tempfile
+
+        import onnxruntime as ort
+
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationStreamingTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationStreamingTask())
+        model = pkg["model"]
+
+        for init in model.graph.initializers.values():
+            if init.const_value is not None:
+                continue
+            shape = [d if isinstance(d, int) else 1 for d in init.shape]
+            arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
+            init.const_value = ir.tensor(arr, name=init.name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.onnx")
+            ir.save(model, path, external_data="model.onnx.data")
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+
+            cache_len = config.streaming_speaker_cache_length
+            fifo_len = config.streaming_fifo_length
+            lookahead = config.chunk_right_context
+            assert config.subsampling_factor == 2
+            # Deliberately misaligned: one raw frame more than a multiple of
+            # subsampling_factor (2), i.e. an odd raw window length.
+            misaligned_raw_window = (
+                config.chunk_length + config.chunk_right_context
+            ) * config.subsampling_factor + 1
+
+            feats = np.random.randn(1, config.feat_in, misaligned_raw_window).astype(
+                np.float32
+            )
+            state = {
+                "past_cache_embeds": np.zeros((1, cache_len, config.hidden_size), np.float32),
+                "past_cache_probs": np.zeros((1, cache_len, config.num_speakers), np.float32),
+                "past_fifo": np.zeros((1, fifo_len, config.hidden_size), np.float32),
+                "past_num_cache_frames": np.array(0, dtype=np.int64),
+                "past_num_fifo_frames": np.array(0, dtype=np.int64),
+                "past_is_compressed": np.array(False, dtype=bool),
+            }
+            inputs = {
+                "input_features": feats,
+                "num_lookahead_frames": np.array(lookahead, dtype=np.int64),
+                **state,
+            }
+            output_names = [out.name for out in sess.get_outputs()]
+            outs = dict(zip(output_names, sess.run(output_names, inputs)))
+
+            expected_frames = misaligned_raw_window - lookahead * config.subsampling_factor
+            assert outs["speaker_probs"].shape[1] == expected_frames

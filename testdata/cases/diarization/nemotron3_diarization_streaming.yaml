@@ -23,5 +23,11 @@ notes: >
   chunk{i}_is_compressed) so the L5 test can thread the real exported
   streaming ONNX graph's own outputs back in as the next chunk's cache
   inputs and verify each step against the independently-computed HuggingFace
-  reference. Regenerate with
+  reference. The reference was generated with an unreleased transformers
+  snapshot (Nemotron3Diarization was not yet in any released version) --
+  the golden's provenance.transformers_commit records the exact upstream
+  git commit used, for reproducibility. Regenerate with a matching pinned
+  install, e.g.
+  `pip install "git+https://github.com/huggingface/transformers.git@<commit>"`,
+  then
   `python scripts/generate_golden.py --case testdata/cases/diarization/nemotron3_diarization_streaming.yaml`.

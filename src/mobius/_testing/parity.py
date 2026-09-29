@@ -379,7 +379,13 @@ def compare_diarization_golden(
     synthetic one). Per-frame dominant-speaker argmax agreement and the
     active-speaker-set Jaccard at the standard 0.5 decision threshold are
     reported as diagnostics (repurposing ``argmax_match``/``top10_jaccard``
-    for the diarization-appropriate quantities of the same *kind*).
+    for the diarization-appropriate quantities of the same *kind*). Unlike
+    ``compare_golden()``, there is no AMBIGUOUS downgrade for an allclose
+    failure: dominant-speaker argmax agreement is not a valid substitute for
+    full elementwise tolerance on a multi-label sigmoid output, since a
+    secondary (non-dominant) speaker's probability can cross the 0.5
+    activation threshold -- a real diarization error -- while the dominant
+    argmax stays unchanged. Every allclose failure is a hard FAIL.
     """
     assert onnx_probs.shape == golden_probs.shape, (
         f"Shape mismatch: ONNX {onnx_probs.shape} vs golden {golden_probs.shape}"
@@ -427,22 +433,20 @@ def compare_diarization_golden(
             f"{level} PASS: diarization probs match within atol={atol}, "
             f"rtol={rtol} (max_abs_diff={max_abs_diff:.4g})"
         )
-    elif dominant_match:
-        # Every frame's dominant speaker still agrees even though raw
-        # magnitudes differ slightly -- downgrade to AMBIGUOUS rather than
-        # FAIL, mirroring compare_golden's near-tie AMBIGUOUS downgrade.
-        result = ParityResult.AMBIGUOUS
-        message = (
-            f"{level} AMBIGUOUS: diarization probs exceed atol={atol}/rtol={rtol} "
-            f"(max_abs_diff={max_abs_diff:.4g}), but every frame's dominant "
-            "speaker still agrees"
-        )
     else:
+        # No AMBIGUOUS downgrade here: dominant-speaker argmax agreement is
+        # not a valid substitute for full elementwise tolerance on a
+        # multi-label sigmoid output -- a secondary speaker's probability
+        # can cross the 0.5 activation threshold (a real diarization error)
+        # while the single dominant argmax happens to stay unchanged. Report
+        # dominant-speaker match and active-speaker-set Jaccard as
+        # diagnostics only; any allclose failure is a hard FAIL.
         result = ParityResult.FAIL
         message = (
             f"{level} FAIL: diarization probs diverge "
             f"(max_abs_diff={max_abs_diff:.4g} > atol={atol}), "
-            f"dominant-speaker match={dominant_match_ratio:.2%}"
+            f"dominant-speaker match={dominant_match_ratio:.2%}, "
+            f"active-speaker Jaccard={active_speaker_jaccard:.2%}"
         )
 
     return ParityReport(

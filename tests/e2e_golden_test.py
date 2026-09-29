@@ -2240,7 +2240,10 @@ def _assert_diarization_offline_golden(case: GoldenTestCase, level: str) -> None
             f"{report.top10_jaccard:.2f} < {tolerances.top10_jaccard_warn}",
             stacklevel=1,
         )
-    assert report.result != ParityResult.FAIL, report.message
+    # compare_diarization_golden() has no AMBIGUOUS downgrade (see its
+    # docstring), so PASS is the only non-FAIL result -- require it
+    # explicitly rather than merely excluding FAIL.
+    assert report.result == ParityResult.PASS, report.message
 
     if level == "L5":
         # Downstream diarization decisions: dominant speaker per frame
@@ -2305,7 +2308,8 @@ def _run_diarization_streaming_session(
                 dtype=case.dtype,
                 level="L5",
             )
-            assert report.result != ParityResult.FAIL, f"chunk {i}: {report.message}"
+            # No AMBIGUOUS downgrade for diarization -- require PASS.
+            assert report.result == ParityResult.PASS, f"chunk {i}: {report.message}"
 
             num_cache = int(out["present_num_cache_frames"])
             num_fifo = int(out["present_num_fifo_frames"])

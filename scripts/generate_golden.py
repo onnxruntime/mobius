@@ -53,6 +53,30 @@ import numpy as np
 _MISSING_ATTRIBUTE = object()
 
 
+def _best_effort_package_commit(package_name: str) -> str | None:
+    """Best-effort immutable VCS commit for a pip-installed package.
+
+    When a dependency is installed from a git URL (``pip install
+    git+https://...@<ref>``) -- the only way to get pre-release/unreleased
+    HuggingFace model code such as Nemotron3Diarization's -- pip records the
+    resolved commit SHA in the package's ``direct_url.json`` metadata. This
+    lets golden-data provenance capture an immutable source identity instead
+    of just a mutable, potentially ambiguous ``X.Y.Z.devN`` version string.
+    Returns ``None`` (rather than raising) for a normal PyPI install, or if
+    the metadata is missing/malformed, since this is diagnostic-only.
+    """
+    try:
+        import json
+        from importlib.metadata import distribution
+
+        direct_url = json.loads(
+            distribution(package_name).read_text("direct_url.json") or "{}"
+        )
+        return direct_url.get("vcs_info", {}).get("commit_id")
+    except Exception:
+        return None
+
+
 @contextlib.contextmanager
 def _temporary_processor_max_pixels(processor: object, max_pixels: int | None):
     """Temporarily override processor pixel limits and restore their exact state."""
@@ -1976,6 +2000,7 @@ def _generate_diarization_offline(case: TestCase, json_path: Path, device: str) 
             "model_id": case.model_id,
             "revision": case.revision,
             "nemo_version": nemo.__version__,
+            "nemo_commit": _best_effort_package_commit("nemo_toolkit"),
             "seed": seed,
             "feat_dim": feat_dim,
             "num_frames": num_frames,
@@ -2006,6 +2031,7 @@ def _generate_diarization_offline(case: TestCase, json_path: Path, device: str) 
             "model_id": case.model_id,
             "revision": case.revision,
             "transformers_version": transformers.__version__,
+            "transformers_commit": _best_effort_package_commit("transformers"),
             "torch_version": torch.__version__,
             "seed": seed,
             "num_speakers": int(model.config.head_config.num_speakers),
@@ -2084,6 +2110,7 @@ def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str
         "model_id": case.model_id,
         "revision": case.revision,
         "transformers_version": transformers.__version__,
+        "transformers_commit": _best_effort_package_commit("transformers"),
         "torch_version": torch.__version__,
         "seed": seed,
         "num_speakers": int(model.config.head_config.num_speakers),

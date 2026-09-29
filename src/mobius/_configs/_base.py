@@ -5010,6 +5010,13 @@ class Nemotron3DiarizationConfig(ArchitectureConfig):
     chunk_length: int = 340
     chunk_right_context: int = 40
 
+    # Offline-only AOSC/FIFO policy, from the top-level ``config`` (distinct
+    # from ``streaming_config``'s values below): the offline forward reuses
+    # ``streaming_speaker_cache_length`` (AOSC capacity) but has its own
+    # ``fifo_length``/``speaker_cache_update_period``.
+    offline_fifo_length: int = 40
+    offline_speaker_cache_update_period: int = 300
+
     # Arrival-Order Speaker Cache (AOSC) + FIFO queue policy, from
     # ``config.streaming_config``. Used only by the streaming forward.
     streaming_fifo_length: int = 264
@@ -5039,6 +5046,10 @@ class Nemotron3DiarizationConfig(ArchitectureConfig):
             num_speakers=getattr(head, "num_speakers", 8),
             chunk_length=getattr(config, "chunk_length", 340),
             chunk_right_context=getattr(config, "chunk_right_context", 40),
+            offline_fifo_length=getattr(config, "fifo_length", 40),
+            offline_speaker_cache_update_period=getattr(
+                config, "speaker_cache_update_period", 300
+            ),
             streaming_fifo_length=getattr(streaming, "fifo_length", 264),
             streaming_speaker_cache_length=getattr(streaming, "speaker_cache_length", 264),
             streaming_speaker_cache_update_period=getattr(

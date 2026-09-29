@@ -20,6 +20,7 @@ notes: >
   checks that the two downstream diarization decisions a consumer reads --
   the per-frame dominant-speaker argmax and the binarized (threshold 0.5)
   active-speaker set -- reproduce NeMo's exactly over the whole utterance.
-  Regenerate with
+  The golden's provenance.nemo_commit records the exact upstream nemo_toolkit
+  git commit used, for reproducibility. Regenerate with
   `python scripts/generate_golden.py --case testdata/cases/diarization/sortformer.yaml`
   inside an environment with `pip install "nemo_toolkit[asr]"`.

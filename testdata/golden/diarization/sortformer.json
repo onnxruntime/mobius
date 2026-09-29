@@ -22,11 +22,11 @@
   "provenance": {
     "model_id": "nvidia/diar_streaming_sortformer_4spk-v2.1",
     "revision": "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d",
-    "nemo_version": "2.7.3",
-    "dtype": "float32",
+    "nemo_version": "3.1.0+abb8254da",
+    "nemo_commit": "abb8254dac2bf5a011e6069fcaa7df71c7e3b8c1",
     "seed": 0,
     "feat_dim": 128,
-    "input_frames": 400,
-    "num_spks": 4
+    "num_frames": 400,
+    "num_speakers": 4
   }
 }
