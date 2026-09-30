@@ -33,6 +33,7 @@ from mobius._builder import build_from_module
 from mobius._configs import (
     AudioConfig,
     CodePredictorConfig,
+    Nemotron3DiarizationConfig,
     SpeakerEncoderConfig,
     TTSConfig,
 )
@@ -1386,3 +1387,400 @@ class TestBuildGraphSortformer:
         assert out.shape == (1, n_time // config.fc_subsampling_factor, config.num_spks)
         # Sigmoid output must lie in [0, 1].
         assert out.min() >= 0.0 and out.max() <= 1.0
+
+
+class TestBuildGraphNemotron3DiarizationOffline:
+    """Verify Nemotron3Diarization builds a chunked (``Loop``-based) offline graph."""
+
+    def _config(self, **overrides):
+        defaults = dict(
+            feat_in=16,
+            subsampling_factor=2,
+            head_hidden_size=8,
+            num_speakers=4,
+            partial_rotary_factor=1.0,
+            chunk_length=4,
+            chunk_right_context=2,
+            streaming_speaker_cache_length=6,
+            offline_fifo_length=3,
+            offline_speaker_cache_update_period=4,
+        )
+        defaults.update(overrides)
+        return _base_config(Nemotron3DiarizationConfig, **defaults)
+
+    def test_package_builds(self):
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+
+        assert "model" in pkg
+
+    def test_graph_contains_loop(self):
+        """Verify the offline graph is chunked via an ONNX ``Loop`` node."""
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+        model = pkg["model"]
+
+        op_types = {node.op_type for node in model.graph}
+        assert "Loop" in op_types
+
+    def _run_with_random_weights(self, config, num_raw_frames: int) -> np.ndarray:
+        import os
+        import tempfile
+
+        import onnxruntime as ort
+
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationTask
+
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationTask())
+        model = pkg["model"]
+
+        for init in model.graph.initializers.values():
+            if init.const_value is not None:
+                continue
+            shape = [d if isinstance(d, int) else 1 for d in init.shape]
+            arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
+            init.const_value = ir.tensor(arr, name=init.name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.onnx")
+            ir.save(model, path, external_data="model.onnx.data")
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            feats = np.random.randn(1, config.feat_in, num_raw_frames).astype(np.float32)
+            return sess.run(None, {sess.get_inputs()[0].name: feats})[0]
+
+    def test_single_chunk_matches_expected_shape(self):
+        """A recording that fits in one ``chunk_length`` still runs (1 Loop iteration)."""
+        config = self._config()
+        # One encoder-frame chunk's worth of raw frames (no lookahead needed
+        # since it's the only/final chunk).
+        num_raw_frames = config.chunk_length * config.subsampling_factor
+        out = self._run_with_random_weights(config, num_raw_frames)
+
+        assert out.shape == (1, num_raw_frames, config.num_speakers)
+        assert out.min() >= 0.0 and out.max() <= 1.0
+
+    def test_multi_chunk_recording_runs_the_loop_multiple_times(self):
+        """A recording spanning several ``chunk_length``-sized chunks.
+
+        This is the scenario the previous (non-chunked, single-pass) offline
+        graph got wrong for long recordings: exercise more than one ``Loop``
+        iteration end-to-end through ORT.
+        """
+        config = self._config()
+        # A little over 3 chunks' worth of raw frames -> 4 Loop iterations.
+        num_raw_frames = (config.chunk_length * 3 + 1) * config.subsampling_factor
+        out = self._run_with_random_weights(config, num_raw_frames)
+
+        assert out.shape == (1, num_raw_frames, config.num_speakers)
+        assert out.min() >= 0.0 and out.max() <= 1.0
+        assert not np.isnan(out).any()
+
+    def test_multi_chunk_triggers_cache_compression(self):
+        """A long-enough recording that the AOSC actually needs to compress.
+
+        Uses a small ``streaming_speaker_cache_length`` and several chunks so
+        the cache overflows and the ``If``-based compress branch (nested
+        inside the ``Loop`` body) is actually exercised.
+        """
+        config = self._config(
+            streaming_speaker_cache_length=3,
+            offline_fifo_length=2,
+            offline_speaker_cache_update_period=2,
+        )
+        num_raw_frames = (config.chunk_length * 4 + 1) * config.subsampling_factor
+        out = self._run_with_random_weights(config, num_raw_frames)
+
+        assert out.shape == (1, num_raw_frames, config.num_speakers)
+        assert out.min() >= 0.0 and out.max() <= 1.0
+        assert not np.isnan(out).any()
+
+
+class TestBuildGraphNemotron3DiarizationStreaming:
+    """Verify Nemotron3Diarization builds a streaming, per-chunk graph."""
+
+    def _config(self):
+        return _base_config(
+            Nemotron3DiarizationConfig,
+            feat_in=16,
+            subsampling_factor=2,
+            head_hidden_size=8,
+            num_speakers=4,
+            partial_rotary_factor=1.0,
+            chunk_length=4,
+            chunk_right_context=2,
+            streaming_fifo_length=6,
+            streaming_speaker_cache_length=6,
+            streaming_speaker_cache_update_period=4,
+        )
+
+    def test_package_builds(self):
+        """Build the streaming graph and verify a single 'model' component."""
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationStreamingTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationStreamingTask())
+
+        assert "model" in pkg
+
+    def test_model_io(self):
+        """Verify streaming input/output names, including cache state I/O."""
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationStreamingTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationStreamingTask())
+        model = pkg["model"]
+
+        input_names = {inp.name for inp in model.graph.inputs}
+        output_names = {out.name for out in model.graph.outputs}
+        assert input_names == {
+            "input_features",
+            "num_lookahead_frames",
+            "past_cache_embeds",
+            "past_cache_probs",
+            "past_fifo",
+            "past_num_cache_frames",
+            "past_num_fifo_frames",
+            "past_is_compressed",
+        }
+        assert output_names == {
+            "speaker_probs",
+            "present_cache_embeds",
+            "present_cache_probs",
+            "present_fifo",
+            "present_num_cache_frames",
+            "present_num_fifo_frames",
+            "present_is_compressed",
+        }
+
+    def test_task_registry_lookup(self):
+        """Verify the 'diarization-streaming' task resolves to DiarizationStreamingTask."""
+        from mobius.tasks import DiarizationStreamingTask, get_task
+
+        assert isinstance(get_task("diarization-streaming"), DiarizationStreamingTask)
+
+    def test_runs_multiple_chunks_with_random_weights(self):
+        """Fill random weights and run 3 sequential streaming steps through ORT.
+
+        This is a fast structural/shape smoke test only (random weights, no
+        HuggingFace comparison). For numeric parity against the real
+        HuggingFace checkpoint — including the lookahead trimming and the
+        FIFO-eviction / top-k AOSC-compression transitions — see
+        ``tests/e2e_golden_test.py::TestL5DiarizationSession``, which threads
+        the real exported streaming graph's own cache outputs back in as the
+        next chunk's inputs and checks each step against a real-weights
+        HuggingFace golden session.
+        """
+        import os
+        import tempfile
+
+        import onnxruntime as ort
+
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationStreamingTask
+
+        config = self._config()
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationStreamingTask())
+        model = pkg["model"]
+
+        for init in model.graph.initializers.values():
+            if init.const_value is not None:
+                continue
+            shape = [d if isinstance(d, int) else 1 for d in init.shape]
+            arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
+            init.const_value = ir.tensor(arr, name=init.name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.onnx")
+            ir.save(model, path, external_data="model.onnx.data")
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+
+            window = config.chunk_length + config.chunk_right_context
+            raw_window = window * config.subsampling_factor
+            cache_len = config.streaming_speaker_cache_length
+            fifo_len = config.streaming_fifo_length
+
+            state = {
+                "past_cache_embeds": np.zeros((1, cache_len, config.hidden_size), np.float32),
+                "past_cache_probs": np.zeros((1, cache_len, config.num_speakers), np.float32),
+                "past_fifo": np.zeros((1, fifo_len, config.hidden_size), np.float32),
+                "past_num_cache_frames": np.array(0, dtype=np.int64),
+                "past_num_fifo_frames": np.array(0, dtype=np.int64),
+                "past_is_compressed": np.array(False, dtype=bool),
+            }
+            output_names = [out.name for out in sess.get_outputs()]
+            for step in range(3):
+                lookahead = config.chunk_right_context if step < 2 else 0
+                # The final chunk of a recording may be shorter than the
+                # default full window (no lookahead, no padding contract) —
+                # the graph's time axis is symbolic to allow this.
+                step_raw_window = raw_window if step < 2 else raw_window // 2
+                feats = np.random.randn(1, config.feat_in, step_raw_window).astype(np.float32)
+                inputs = {
+                    "input_features": feats,
+                    "num_lookahead_frames": np.array(lookahead, dtype=np.int64),
+                    **state,
+                }
+                outs = dict(zip(output_names, sess.run(output_names, inputs)))
+
+                speaker_probs = outs["speaker_probs"]
+                assert speaker_probs.min() >= 0.0 and speaker_probs.max() <= 1.0
+                # Output frames exclude the look-ahead suffix (see the task's
+                # docstring): chunk_window_frames - lookahead * subsampling_factor.
+                expected_frames = step_raw_window - lookahead * config.subsampling_factor
+                assert speaker_probs.shape[1] == expected_frames
+                assert outs["present_num_cache_frames"] <= cache_len
+                assert outs["present_num_fifo_frames"] <= fifo_len
+
+                state = {
+                    "past_cache_embeds": outs["present_cache_embeds"],
+                    "past_cache_probs": outs["present_cache_probs"],
+                    "past_fifo": outs["present_fifo"],
+                    "past_num_cache_frames": outs["present_num_cache_frames"],
+                    "past_num_fifo_frames": outs["present_num_fifo_frames"],
+                    "past_is_compressed": outs["present_is_compressed"],
+                }
+
+    def test_non_final_chunk_with_misaligned_window_has_exact_frame_count(self):
+        """Regression test for titaiwangms's PR #748 review.
+
+        Streaming output length must never desync from the number of frames
+        committed to the FIFO/cache, even for a non-final,
+        non-``subsampling_factor``-aligned window.
+
+        Verifies, across two consecutive calls (an unaligned non-final chunk
+        followed by a second chunk consuming the returned cache state), that
+        ``speaker_probs``'s frame count always exactly matches
+        ``(present_num_fifo_frames - past_num_fifo_frames) *
+        subsampling_factor`` — the number of raw frames actually committed to
+        the cache this call. A caller advancing a sliding window using either
+        number therefore always stays in sync; neither frame double-counting
+        nor frame dropping is possible.
+        """
+        import os
+        import tempfile
+
+        import onnxruntime as ort
+
+        from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
+        from mobius.tasks import DiarizationStreamingTask
+
+        config = _base_config(
+            Nemotron3DiarizationConfig,
+            feat_in=16,
+            subsampling_factor=2,
+            head_hidden_size=8,
+            num_speakers=4,
+            partial_rotary_factor=1.0,
+            chunk_length=4,
+            chunk_right_context=2,
+            # Deliberately larger than either call's FIFO growth (5, then 4)
+            # so FIFO eviction/compaction -- a separately-tested mechanism --
+            # never triggers and can't confound this test's invariant check.
+            streaming_fifo_length=20,
+            streaming_speaker_cache_length=20,
+            streaming_speaker_cache_update_period=20,
+        )
+        module = Nemotron3DiarizationModel(config)
+        pkg = build_from_module(module, config, task=DiarizationStreamingTask())
+        model = pkg["model"]
+
+        for init in model.graph.initializers.values():
+            if init.const_value is not None:
+                continue
+            shape = [d if isinstance(d, int) else 1 for d in init.shape]
+            arr = (np.random.randn(*shape) * 0.02).astype(np.float32)
+            init.const_value = ir.tensor(arr, name=init.name)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.onnx")
+            ir.save(model, path, external_data="model.onnx.data")
+            sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+
+            cache_len = config.streaming_speaker_cache_length
+            fifo_len = config.streaming_fifo_length
+            lookahead = config.chunk_right_context
+            factor = config.subsampling_factor
+            assert factor == 2
+            # Deliberately misaligned: one raw frame more than a multiple of
+            # subsampling_factor (2), i.e. an odd raw window length.
+            misaligned_raw_window = (
+                config.chunk_length + config.chunk_right_context
+            ) * factor + 1
+
+            output_names = [out.name for out in sess.get_outputs()]
+
+            def run_chunk(raw_window: int, num_lookahead: int, state: dict):
+                feats = np.random.randn(1, config.feat_in, raw_window).astype(np.float32)
+                inputs = {
+                    "input_features": feats,
+                    "num_lookahead_frames": np.array(num_lookahead, dtype=np.int64),
+                    **state,
+                }
+                outs = dict(zip(output_names, sess.run(output_names, inputs)))
+                next_state = {
+                    "past_cache_embeds": outs["present_cache_embeds"],
+                    "past_cache_probs": outs["present_cache_probs"],
+                    "past_fifo": outs["present_fifo"],
+                    "past_num_cache_frames": outs["present_num_cache_frames"],
+                    "past_num_fifo_frames": outs["present_num_fifo_frames"],
+                    "past_is_compressed": outs["present_is_compressed"],
+                }
+                return outs, next_state
+
+            state = {
+                "past_cache_embeds": np.zeros((1, cache_len, config.hidden_size), np.float32),
+                "past_cache_probs": np.zeros((1, cache_len, config.num_speakers), np.float32),
+                "past_fifo": np.zeros((1, fifo_len, config.hidden_size), np.float32),
+                "past_num_cache_frames": np.array(0, dtype=np.int64),
+                "past_num_fifo_frames": np.array(0, dtype=np.int64),
+                "past_is_compressed": np.array(False, dtype=bool),
+            }
+
+            # Call 1: a non-final (lookahead > 0), misaligned window. The
+            # correct emitted length matches HuggingFace's reference trim
+            # (`logits[:, :num_frames]`, no lookahead subtraction) rather
+            # than the previously buggy `raw_window - lookahead * factor`.
+            num_new_embeds_1 = -(-misaligned_raw_window // factor)  # ceil division
+            num_chunk_embeds_1 = num_new_embeds_1 - lookahead
+            expected_frames_1 = min(misaligned_raw_window, num_chunk_embeds_1 * factor)
+
+            outs1, state = run_chunk(misaligned_raw_window, lookahead, state)
+            assert outs1["speaker_probs"].shape[1] == expected_frames_1
+
+            fifo_growth_1 = int(state["past_num_fifo_frames"]) - 0
+            assert fifo_growth_1 == num_chunk_embeds_1
+            # Core invariant: output length exactly matches the frames
+            # committed to the cache this call (no desync).
+            assert outs1["speaker_probs"].shape[1] == fifo_growth_1 * factor
+
+            # Call 2: a second, final (lookahead == 0) aligned window,
+            # consuming the state returned by call 1 — verifies the
+            # invariant continues to hold across calls, not just in
+            # isolation.
+            aligned_raw_window = config.chunk_length * factor
+            num_new_embeds_2 = aligned_raw_window // factor
+            num_chunk_embeds_2 = num_new_embeds_2  # lookahead == 0
+            expected_frames_2 = min(aligned_raw_window, num_chunk_embeds_2 * factor)
+
+            prev_fifo_frames = int(state["past_num_fifo_frames"])
+            outs2, state = run_chunk(aligned_raw_window, 0, state)
+            assert outs2["speaker_probs"].shape[1] == expected_frames_2
+
+            fifo_growth_2 = int(state["past_num_fifo_frames"]) - prev_fifo_frames
+            assert fifo_growth_2 == num_chunk_embeds_2
+            assert outs2["speaker_probs"].shape[1] == fifo_growth_2 * factor

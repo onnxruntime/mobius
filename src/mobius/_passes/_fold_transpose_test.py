@@ -558,3 +558,105 @@ class TestFoldTransposeDtype:
         )
         assert packed.const_value.dtype == ir.DataType.FLOAT16
         assert packed.const_value.numpy().dtype == np.float16
+
+
+def test_transpose_inside_loop_body_folds_against_root_initializer():
+    """A Transpose inside a Loop body, consuming an outer-scope initializer.
+
+    Folds correctly and registers the new pre-transposed initializer at the
+    root graph — not a per-name collision risk.
+
+    This documents (and guards) the invariant the pass's ``folded`` cache
+    relies on: it is keyed by initializer *name* only, and always inserts
+    into ``model.graph`` (the root), regardless of which (sub)graph the
+    consuming ``Transpose`` node actually lives in. That is only safe if two
+    *different* initializers can never share a name across sibling
+    subgraphs.
+
+    onnxscript's ``OpBuilder`` enforces exactly that: every initializer
+    (constant or parameter) is always registered on the **root** graph via
+    ``self._root._graph.register_initializer(...)`` (see
+    ``onnxscript._internal.builder``), even when the builder is currently
+    emitting into a Loop/If body. Subgraphs only ever reference outer-scope
+    initializers by name — they never declare their own local initializers.
+    So every mobius-built graph has a single, globally unique initializer
+    namespace by construction, and this pass's name-only cache can never
+    conflate two distinct initializers. This test builds a Loop body
+    manually (bypassing the builder) to pin that expectation directly.
+    """
+    weight_data = np.arange(6, dtype=np.float32).reshape(2, 3)
+    weight_val = ir.Value(name="weight")
+    weight_val.shape = ir.Shape([2, 3])
+    weight_val.dtype = ir.DataType.FLOAT
+    weight_val.const_value = ir.tensor(weight_data)
+
+    # Loop body: (iter_num, cond_in) -> (cond_out, y), with a Transpose of the
+    # *outer-scope* root initializer plus a MatMul against the loop-carried x.
+    iter_num = ir.Value(name="iter_num")
+    iter_num.dtype = ir.DataType.INT64
+    iter_num.shape = ir.Shape([])
+    cond_in = ir.Value(name="cond_in")
+    cond_in.dtype = ir.DataType.BOOL
+    cond_in.shape = ir.Shape([])
+    x_carried = ir.Value(name="x_carried")
+    x_carried.shape = ir.Shape([2, 2])
+    x_carried.dtype = ir.DataType.FLOAT
+
+    body_transpose = ir.Node(
+        "",
+        "Transpose",
+        inputs=[weight_val],
+        attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+        num_outputs=1,
+    )
+    body_w_t = body_transpose.outputs[0]
+    body_matmul = ir.Node("", "MatMul", inputs=[x_carried, body_w_t], num_outputs=1)
+    cond_out = ir.Node("", "Identity", inputs=[cond_in], num_outputs=1).outputs[0]
+
+    body_graph = ir.Graph(
+        inputs=[iter_num, cond_in, x_carried],
+        outputs=[cond_out, body_matmul.outputs[0]],
+        nodes=[body_transpose, body_matmul, cond_out.producer()],
+        name="loop_body",
+        opset_imports={"": 20},
+    )
+
+    x_init = ir.Value(name="x_init")
+    x_init.shape = ir.Shape([2, 2])
+    x_init.dtype = ir.DataType.FLOAT
+    trip_count = ir.Value(name="trip_count")
+    trip_count.dtype = ir.DataType.INT64
+    trip_count.shape = ir.Shape([])
+    cond = ir.Value(name="cond")
+    cond.dtype = ir.DataType.BOOL
+    cond.shape = ir.Shape([])
+
+    loop_node = ir.Node(
+        "",
+        "Loop",
+        inputs=[trip_count, cond, x_init],
+        attributes=[ir.Attr("body", ir.AttributeType.GRAPH, body_graph)],
+        num_outputs=1,
+    )
+
+    root_graph = ir.Graph(
+        inputs=[trip_count, cond, x_init],
+        outputs=[loop_node.outputs[0]],
+        nodes=[loop_node],
+        name="root_graph",
+        opset_imports={"": 20},
+    )
+    root_graph.register_initializer(weight_val)
+    model = ir.Model(root_graph, ir_version=10)
+
+    result = FoldTransposedInitializerPass()(model)
+    assert result.modified
+
+    # The pre-transposed initializer is registered at the root, and the
+    # subgraph's Transpose node is gone.
+    assert "weight_t" in model.graph.initializers
+    node_types = [n.op_type for n in model.graph.all_nodes()]
+    assert "Transpose" not in node_types
+
+    w_t = model.graph.initializers["weight_t"]
+    np.testing.assert_array_equal(w_t.const_value.numpy(), weight_data.T)

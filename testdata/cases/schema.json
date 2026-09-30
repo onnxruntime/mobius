@@ -46,6 +46,8 @@
         "codec",
         "ctc-asr",
         "depth-estimation",
+        "diarization",
+        "diarization-streaming",
         "dflash-draft",
         "feature-extraction",
         "feature-ctc-asr",
@@ -429,10 +431,28 @@
         "target_model_id": {
           "type": "string",
           "description": "Paired target model HF ID for speculative-decoding drafter tasks (e.g. dflash-draft): the target supplies the hidden states / shared KV used to build the drafter's golden inputs at generation time. Only read by generate_golden.py; the e2e test replays stored tensors and never loads the target."
+        },
+        "num_frames": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of synthetic mel frames to generate for audio/diarization fixtures. Only read by generate_golden.py when synthesizing input features; not a HuggingFace GenerationConfig field."
+        },
+        "num_chunks": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of streaming chunks to synthesize for streaming audio/diarization fixtures. Only read by generate_golden.py; not a HuggingFace GenerationConfig field."
+        },
+        "seed": {
+          "type": "integer",
+          "description": "Random seed used to synthesize deterministic fixture inputs (e.g. mel features). Only read by generate_golden.py; not a HuggingFace GenerationConfig field."
+        },
+        "nemo_filename": {
+          "type": "string",
+          "description": "Filename of a NeMo-format checkpoint asset to load for fixture generation. Only read by generate_golden.py; not a HuggingFace GenerationConfig field."
         }
       },
       "additionalProperties": false,
-      "description": "HuggingFace GenerationConfig overrides. Only applicable for L5 generation tests."
+      "description": "Generation-time overrides read by generate_golden.py. Most properties are HuggingFace GenerationConfig overrides applicable only to L5 generation tests; num_frames/num_chunks/seed/nemo_filename instead configure synthetic audio/diarization fixture generation and are unrelated to GenerationConfig."
     },
     "trust_remote_code": {
       "type": "boolean",
@@ -443,10 +463,11 @@
       "type": "string",
       "enum": [
         "causal-lm",
-        "multimodal"
+        "multimodal",
+        "nemo"
       ],
       "default": "causal-lm",
-      "description": "HuggingFace loader used to generate the reference. Use multimodal when a text-only export is sourced from a composite checkpoint."
+      "description": "HuggingFace loader used to generate the reference. Use multimodal when a text-only export is sourced from a composite checkpoint. Use nemo when the reference is a NeMo toolkit model restored from a .nemo archive rather than a HuggingFace transformers checkpoint."
     },
     "skip_reason": {
       "type": [

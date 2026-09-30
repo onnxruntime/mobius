@@ -39,6 +39,7 @@ __all__ = [
     "Qwen4ExpVisionLanguageTask",
     "DenoisingTask",
     "DiarizationTask",
+    "DiarizationStreamingTask",
     "FeatureExtractionTask",
     "GGUFEncoderFeatureExtractionTask",
     "GGUFAudioProjectorModel",
@@ -142,6 +143,7 @@ from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._diarization import DiarizationTask
+from mobius.tasks._diarization_streaming import DiarizationStreamingTask
 from mobius.tasks._draft_target import DraftTargetCausalLMTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._falcon_h1 import FalconH1CausalLMTask
@@ -246,6 +248,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
     "diarization": DiarizationTask,
+    "diarization-streaming": DiarizationStreamingTask,
     "feature-extraction": FeatureExtractionTask,
     "gguf-encoder-feature-extraction": GGUFEncoderFeatureExtractionTask,
     "gguf-embedding-feature-extraction": GGUFEmbeddingFeatureExtractionTask,
