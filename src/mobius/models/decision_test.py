@@ -9,7 +9,6 @@ import onnx_ir as ir
 import pytest
 import torch
 
-import mobius.models.decision as decision_model
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.models.decision import (
@@ -22,6 +21,7 @@ from mobius.models.decision import (
     CLMScorer,
     KevModel,
     KevPointerHead,
+    _apply_package_weights_strict,
     batch_kev_rows,
     build_clm_package,
     build_kev_package,
@@ -207,13 +207,13 @@ def test_head_graphs_export_without_model_downloads():
     assert "mobius.provenance" in pointer.metadata_props
 
     with pytest.raises(CheckpointContractError, match="unapplied weights"):
-        decision_model._apply_package_weights_strict(
+        _apply_package_weights_strict(
             ModelPackage({"state_head": state}, config=clm_config),
             {"garbage": torch.ones(1)},
             owner="test checkpoint",
         )
     with pytest.raises(CheckpointContractError, match="without weights"):
-        decision_model._apply_package_weights_strict(
+        _apply_package_weights_strict(
             ModelPackage({"state_head": state}, config=clm_config),
             {},
             owner="test checkpoint",
@@ -251,6 +251,23 @@ def test_clm_head_depth_three_has_one_normalized_hidden_block():
     assert len(head.hidden) == 1
     assert len(head.norms) == 1
     assert hasattr(head.norms[0], "weight")
+
+
+def test_clm_fp16_head_normalizes_in_float32():
+    config = ArchitectureConfig(hidden_size=4, dtype=ir.DataType.FLOAT16)
+    model = CLMTask().build_component(
+        "state_head",
+        None,
+        CLMProjectionHead(hidden_size=4, width=3, projection_dim=2),
+        config,
+    )
+    casts_to_float = [
+        node
+        for node in model.graph.all_nodes()
+        if node.op_type == "Cast" and node.attributes["to"].value == ir.DataType.FLOAT
+    ]
+
+    assert len(casts_to_float) == 2
 
 
 def test_public_build_helpers_reject_unsafe_or_inexact_inputs():

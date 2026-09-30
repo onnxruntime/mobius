@@ -1451,7 +1451,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             routed: dict[str, dict[str, torch.Tensor]] = {name: {} for name in self.data}
             unmatched: dict[str, torch.Tensor] = {}
             # Track original HF names for weights that get stripped
-            stripped_to_original: dict[str, str] = {}
+            stripped_to_original: dict[str, dict[str, str]] = {name: {} for name in self.data}
 
             for weight_name, tensor in state_dict.items():
                 matched = False
@@ -1459,7 +1459,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                     if weight_name.startswith(prefix):
                         stripped = weight_name[len(prefix) :].lstrip(".")
                         routed[component][stripped] = tensor
-                        stripped_to_original[stripped] = weight_name
+                        stripped_to_original[component][stripped] = weight_name
                         matched = True
                         break
                 if not matched:
@@ -1470,7 +1470,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                     self.data[component_name], component_weights
                 )
                 for s in applied_stripped:
-                    applied.add(stripped_to_original.get(s, s))
+                    applied.add(stripped_to_original[component_name].get(s, s))
 
             # Try unmatched weights against all models
             if unmatched:
