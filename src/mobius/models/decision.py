@@ -463,15 +463,23 @@ class CLMProjectionHead(nn.Module):
 
     def forward(self, op: OpBuilder, embeddings: ir.Value) -> ir.Value:
         """Project ``[items, hidden]`` embeddings and L2-normalize each row."""
-        input_norm = op.ReduceL2(embeddings, [-1], keepdims=1)
-        normalized = op.Div(embeddings, op.Max(input_norm, op.CastLike(1e-12, input_norm)))
+        embeddings_float = op.Cast(embeddings, to=ir.DataType.FLOAT)
+        input_norm = op.ReduceL2(embeddings_float, [-1], keepdims=1)
+        normalized = op.CastLike(
+            op.Div(embeddings_float, op.Max(input_norm, op.CastLike(1e-12, input_norm))),
+            embeddings,
+        )
         value = self._activate(op, self.inp(op, normalized))
         for linear, norm in zip(self.hidden, self.norms):
             projected = self._activate(op, norm(op, linear(op, value)))
             value = op.Add(value, projected) if self.residual else projected
         value = self.out(op, value)
-        norm = op.ReduceL2(value, [-1], keepdims=1)
-        return op.Div(value, op.Max(norm, op.CastLike(1e-12, norm)))
+        value_float = op.Cast(value, to=ir.DataType.FLOAT)
+        norm = op.ReduceL2(value_float, [-1], keepdims=1)
+        return op.CastLike(
+            op.Div(value_float, op.Max(norm, op.CastLike(1e-12, norm))),
+            value,
+        )
 
 
 class _Identity(nn.Module):
