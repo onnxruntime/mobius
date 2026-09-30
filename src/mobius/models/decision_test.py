@@ -11,6 +11,7 @@ import torch
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
+from mobius._testing import make_config
 from mobius.models.decision import (
     CLM_PROVENANCE,
     KEV_CONTROL_TOKEN_IDS,
@@ -21,6 +22,7 @@ from mobius.models.decision import (
     CLMScorer,
     KevModel,
     KevPointerHead,
+    Qwen35EncoderModel,
     _apply_package_weights_strict,
     batch_kev_rows,
     build_clm_package,
@@ -244,6 +246,28 @@ def test_headless_backbone_contract_has_no_generation_cache():
         "position_ids",
     ]
     assert [value.name for value in graph.outputs] == ["token_hidden_states"]
+
+
+def test_qwen35_headless_backbone_initializes_hybrid_state():
+    config = make_config(
+        hidden_size=64,
+        num_hidden_layers=2,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+    )
+    package = HeadlessBackboneTask().build(Qwen35EncoderModel(config), config)
+    graph = package["model"].graph
+
+    assert [value.name for value in graph.outputs] == ["token_hidden_states"]
+    assert sum(node.op_type == "Expand" for node in graph) >= 2
 
 
 def test_clm_head_depth_three_has_one_normalized_hidden_block():
