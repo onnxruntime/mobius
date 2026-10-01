@@ -136,8 +136,38 @@ class TestCausalLMTask:
                 assert present_dims[1] == past_dims[1]
                 assert present_dims[3] == past_dims[3]
                 # present covers past + current tokens.
-                assert present_dims[2] == "past_sequence_len + sequence_len"
+                assert present_dims[2] == "total_sequence_length"
                 assert present.dtype == past.dtype
+
+    def test_dynamic_dimensions_use_ort_genai_names_after_serialization(self, tmp_path):
+        """Decoder ports retain the ORT GenAI symbolic contract on disk."""
+        config = make_config()
+        module = CausalLMModel(config)
+        model = CausalLMTask().build(module, config)["model"]
+        model_path = tmp_path / "model.onnx"
+        ir.save(model, model_path)
+        model = ir.load(model_path)
+        inputs = {value.name: value for value in model.graph.inputs}
+        outputs = {value.name: value for value in model.graph.outputs}
+
+        def dims(value):
+            return [dim if isinstance(dim, int) else str(dim) for dim in value.shape]
+
+        assert dims(inputs["input_ids"]) == ["batch_size", "sequence_length"]
+        assert dims(inputs["position_ids"]) == ["batch_size", "sequence_length"]
+        assert dims(inputs["attention_mask"]) == ["batch_size", "total_sequence_length"]
+        assert dims(inputs["past_key_values.0.key"]) == [
+            "batch_size",
+            config.num_key_value_heads,
+            "past_sequence_length",
+            config.head_dim,
+        ]
+        assert dims(outputs["present.0.key"]) == [
+            "batch_size",
+            config.num_key_value_heads,
+            "total_sequence_length",
+            config.head_dim,
+        ]
 
     def test_build_producer_info(self):
         config = make_config()
@@ -1048,6 +1078,33 @@ class TestBuildDecoderFromEmbeds:
         output_names = {v.name for v in model.graph.outputs}
         assert "logits" in output_names
         assert "present.0.key" in output_names
+
+    def test_serialized_inputs_use_ort_genai_dimension_names(self, tmp_path):
+        config, decoder = self._make_decoder_module()
+        model = build_decoder_from_embeds(decoder, config)
+        model_path = tmp_path / "decoder.onnx"
+        ir.save(model, model_path)
+        model = ir.load(model_path)
+        inputs = {value.name: value for value in model.graph.inputs}
+
+        def dims(value):
+            return [dim if isinstance(dim, int) else str(dim) for dim in value.shape]
+
+        assert dims(inputs["inputs_embeds"]) == [
+            "batch_size",
+            "sequence_length",
+            config.hidden_size,
+        ]
+        assert dims(inputs["attention_mask"]) == [
+            "batch_size",
+            "total_sequence_length",
+        ]
+        assert dims(inputs["past_key_values.0.key"]) == [
+            "batch_size",
+            config.num_key_value_heads,
+            "past_sequence_length",
+            config.head_dim,
+        ]
 
     def test_mrope_position_ids_are_3d(self):
         config, decoder = self._make_decoder_module()

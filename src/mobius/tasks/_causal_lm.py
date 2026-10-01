@@ -40,11 +40,13 @@ class CausalLMTask(ModelTask):
         are concatenated internally by the Attention op.
 
         Inputs:
-            - input_ids: [batch, sequence_len] INT64
-            - attention_mask: [batch, total_seq_len] INT64
-            - position_ids: [batch, sequence_len] INT64
-            - past_key_values.{i}.key: [batch, num_kv_heads, past_seq_len, head_dim]
-            - past_key_values.{i}.value: [batch, num_kv_heads, past_seq_len, head_dim]
+            - input_ids: [batch_size, sequence_length] INT64
+            - attention_mask: [batch_size, total_sequence_length] INT64
+            - position_ids: [batch_size, sequence_length] INT64
+            - past_key_values.{i}.key:
+              [batch_size, num_kv_heads, past_sequence_length, head_dim]
+            - past_key_values.{i}.value:
+              [batch_size, num_kv_heads, past_sequence_length, head_dim]
         Outputs:
             - logits: FLOAT
             - present.{i}.key / present.{i}.value: FLOAT
@@ -127,8 +129,8 @@ class CausalLMTask(ModelTask):
             _validate_static_cache_support(module)
 
         # --- Graph input dims ---
-        batch = ir.SymbolicDim("batch")
-        seq_len = ir.SymbolicDim("sequence_len")
+        batch = ir.SymbolicDim("batch_size")
+        seq_len = ir.SymbolicDim("sequence_length")
 
         # --- Build graph first, then create inputs via builder ---
         graph, builder = _make_graph()
@@ -163,11 +165,11 @@ class CausalLMTask(ModelTask):
                 cache_specs=cache_specs,
             )
         else:
-            past_seq_len = ir.SymbolicDim("past_sequence_len")
+            past_seq_len = ir.SymbolicDim("past_sequence_length")
             attention_mask = builder.input(
                 "attention_mask",
                 dtype=ir.DataType.INT64,
-                shape=[batch, "past_seq_len + seq_len"],
+                shape=[batch, "total_sequence_length"],
             )
             position_ids = builder.input(
                 "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
@@ -248,7 +250,7 @@ class CausalLMTask(ModelTask):
                 num_kv_heads=num_kv_cache_heads,
                 key_head_dim=kv_key_head_dim,
                 value_head_dim=kv_value_head_dim,
-                total_seq_len="past_sequence_len + sequence_len",
+                total_seq_len="total_sequence_length",
                 dtype=config.dtype,
                 cache_specs=cache_specs,
             )
@@ -359,9 +361,9 @@ class HybridCausalLMTask(ModelTask):
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
-        batch = ir.SymbolicDim("batch")
-        seq_len = ir.SymbolicDim("sequence_len")
-        past_seq_len = ir.SymbolicDim("past_sequence_len")
+        batch = ir.SymbolicDim("batch_size")
+        seq_len = ir.SymbolicDim("sequence_length")
+        past_seq_len = ir.SymbolicDim("past_sequence_length")
 
         graph, builder = _make_graph()
         op = builder.op
@@ -370,7 +372,7 @@ class HybridCausalLMTask(ModelTask):
         attention_mask = builder.input(
             "attention_mask",
             dtype=ir.DataType.INT64,
-            shape=[batch, "past_seq_len + seq_len"],
+            shape=[batch, "total_sequence_length"],
         )
         position_ids = builder.input(
             "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
