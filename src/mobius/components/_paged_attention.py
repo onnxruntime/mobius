@@ -21,8 +21,11 @@ def dense_paged_rejection(config: ArchitectureConfig) -> str | None:
     """Return the reason this config cannot use the dense packed-token ABI."""
     if config.model_type not in DENSE_PAGED_MODEL_TYPES:
         return "dense PagedAttention supports only text-only qwen2/Qwen2.5 and qwen3."
-    if config.dtype not in (ir.DataType.FLOAT16, ir.DataType.BFLOAT16):
-        return "dense PagedAttention requires float16 or bfloat16."
+    if config.dtype != ir.DataType.FLOAT16:
+        return (
+            "dense PagedAttention requires float16; bfloat16 is disabled pending "
+            "full-logit numerical parity validation."
+        )
     if (
         config.num_attention_heads <= 0
         or config.num_key_value_heads <= 0

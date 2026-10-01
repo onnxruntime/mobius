@@ -349,11 +349,10 @@ class CausalLMTask(ModelTask):
         ep = ep_capabilities().name
         if (ep, config.dtype) not in {
             ("cuda", ir.DataType.FLOAT16),
-            ("cuda", ir.DataType.BFLOAT16),
             ("webgpu", ir.DataType.FLOAT16),
         }:
             raise ValueError(
-                f"Dense PagedAttention requires CUDA FP16/BF16 or WebGPU FP16, got {ep}/{config.dtype}."
+                f"Dense PagedAttention requires CUDA FP16 or WebGPU FP16, got {ep}/{config.dtype}."
             )
         if not config.export_paged_attention:
             raise ValueError("Dense paged_cache requires export_paged_attention=True.")

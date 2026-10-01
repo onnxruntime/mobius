@@ -25,8 +25,11 @@ def _validate_dense_paged_engine_ep(ep: str, dtype: ir.DataType | None) -> None:
             "ORT GenAI dense PagedAttention Engine export requires CUDA; "
             "WebGPU page allocation is unsupported."
         )
-    if dtype not in (ir.DataType.FLOAT16, ir.DataType.BFLOAT16):
-        raise ValueError("ORT GenAI dense PagedAttention Engine export requires FP16/BF16.")
+    if dtype != ir.DataType.FLOAT16:
+        raise ValueError(
+            "ORT GenAI dense PagedAttention Engine export requires FP16; "
+            "BF16 is disabled pending full-logit numerical parity validation."
+        )
 
 
 _SPECIALIZED_DECODER_MODEL_TYPES = {
@@ -209,7 +212,7 @@ class GenaiConfigGenerator:
         has_specialized_topology: Preserve the supplied type for packages with
             auxiliary graphs or runtime-managed pipelines.
         dtype: Decoder cache dtype. Required for direct dense paged Engine
-            generation (FP16 or BF16); ``from_config`` derives it from the
+            generation (FP16 only); ``from_config`` derives it from the
             model config.
     """
 

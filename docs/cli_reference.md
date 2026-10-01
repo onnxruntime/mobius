@@ -237,7 +237,8 @@ mobius build --model Qwen/Qwen2.5-0.5B --output output/ \
 Qwen2/2.5 and Qwen3 **text-only, standard full-RoPE dense GQA** exports use
 `com.microsoft::PagedAttention` v1 with separate K/V pages. The GenAI Engine
 config enables `dynamic_batching` (block size 256) with paged KV caches.
-CUDA FP16/BF16 or WebGPU FP16 is required for the graph; the ORT GenAI Engine
+CUDA FP16 or WebGPU FP16 is required for the graph; BF16 is disabled pending
+full-logit numerical parity validation. The ORT GenAI Engine
 export currently requires CUDA because its WebGPU paged-cache allocation is
 unsupported. MoE, multimodal, hybrid, sliding-window and MTP variants
 are not supported by this dense path. Dense Qwen paged export also cannot be
@@ -248,7 +249,7 @@ The packed decoder accepts `input_ids` `[T]` (not padded `[B,S]`) and returns
 FP32 logits `[T,vocab]`. The Engine owns `block_table` `[B,max_blocks]`,
 `cumulative_sequence_lengths` `[B+1]`, `past_sequence_lengths` `[B]`,
 `attention_metadata` `[2]` or `[3]` (INT32), and separate per-layer K/V pools
-`[P,256,Hkv,D]` (FP16/BF16). The output pages alias those pools. Do not feed
+`[P,256,Hkv,D]` (FP16). The output pages alias those pools. Do not feed
 `position_ids`, `attention_mask`, or `slot_mapping`; fused RoPE and cache
 slot derivation happen inside the operator. Native `onnx-genai` workflows
 cannot schedule this packed ABI; select `--runtime ort-genai`.

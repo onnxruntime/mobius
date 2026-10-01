@@ -168,7 +168,7 @@ def build_from_module(
         and (fp8_kv_cache or kv_cache_scales is not None)
     ):
         raise ValueError(
-            "Dense PagedAttention requires FP16/BF16 page pools; fp8_kv_cache "
+            "Dense PagedAttention requires FP16 page pools; fp8_kv_cache "
             "and kv_cache_scales are unsupported."
         )
     if (

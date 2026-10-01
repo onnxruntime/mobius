@@ -198,8 +198,9 @@ def test_paged_generator_rejects_webgpu_engine():
     "ep,dtype,reason",
     [
         ("webgpu", ir.DataType.FLOAT16, "WebGPU page allocation is unsupported"),
-        ("cuda", None, "requires FP16/BF16"),
-        ("cuda", ir.DataType.FLOAT, "requires FP16/BF16"),
+        ("cuda", None, "requires FP16"),
+        ("cuda", ir.DataType.FLOAT, "requires FP16"),
+        ("cuda", ir.DataType.BFLOAT16, "BF16 is disabled"),
     ],
 )
 def test_direct_paged_generator_requires_supported_engine(ep, dtype, reason):
@@ -256,23 +257,20 @@ def test_paged_generator_rechecks_provider_before_generation():
         generator.generate()
 
 
-def test_bfloat16_page_pools():
-    config = _config("qwen3", dtype=ir.DataType.BFLOAT16)
-    graph = _build(config)["model"].graph
-    assert (
-        next(v for v in graph.inputs if v.name == "past_key_values.0.key").dtype
-        == ir.DataType.BFLOAT16
-    )
-    assert (
-        next(v for v in graph.outputs if v.name == "present.0.value").dtype
-        == ir.DataType.BFLOAT16
-    )
+@pytest.mark.parametrize("model_type", ["qwen2", "qwen3"])
+def test_bfloat16_paged_export_rejected(model_type):
+    config = _config(model_type, dtype=ir.DataType.BFLOAT16)
+    with pytest.raises(ValueError, match="bfloat16 is disabled"):
+        _build(config)
+    with pytest.raises(ValueError, match="BF16 is disabled"):
+        GenaiConfigGenerator.from_config(config, model_type, ep="cuda")
 
 
 @pytest.mark.parametrize(
     "change,reason",
     [
         ({"dtype": ir.DataType.FLOAT}, "float16"),
+        ({"dtype": ir.DataType.BFLOAT16}, "bfloat16 is disabled"),
         ({"sliding_window": 32}, "sliding"),
         ({"head_dim": 15}, "divisible"),
         ({"qk_rope_head_dim": 8}, "full standard RoPE"),
@@ -302,7 +300,6 @@ def test_flag_off_keeps_standard_graph():
     [
         ("qwen2", ir.DataType.FLOAT16),
         ("qwen3", ir.DataType.FLOAT16),
-        ("qwen3", ir.DataType.BFLOAT16),
     ],
 )
 def test_ort_config_from_real_graph(tmp_path, model_type, dtype):
@@ -354,6 +351,7 @@ def test_cli_export_rejects_webgpu_before_saving(tmp_path):
     "change,reason",
     [
         ({"export_paged_attention": False}, "disagrees"),
+        ({"dtype": ir.DataType.BFLOAT16}, "BF16 is disabled"),
         ({"model_type": "llama"}, "incompatible with config.model_type"),
         ({"model_type": "qwen3_5_text"}, "incompatible with config.model_type"),
         ({"max_position_embeddings": 128}, "RoPE cache length"),
