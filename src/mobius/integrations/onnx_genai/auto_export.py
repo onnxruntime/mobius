@@ -1041,6 +1041,22 @@ def write_onnx_genai_config(
     """
     package_config = getattr(pkg, "config", None)
     resolved_config = config if config is not None else package_config
+    if any(
+        any(
+            value.name == "input_ids" and value.shape is not None and len(value.shape) == 1
+            for value in model.graph.inputs
+        )
+        and any(
+            node.op_type == "PagedAttention" and node.domain == "com.microsoft"
+            for node in model.graph
+        )
+        for model in pkg.values()
+        if isinstance(model, ir.Model)
+    ):
+        raise ValueError(
+            "Native onnx-genai cannot orchestrate packed PagedAttention inputs/pages. "
+            "Use the ORT GenAI Engine dynamic_batching config instead."
+        )
     if isinstance(resolved_config, ReUseConfig):
         _validate_reuse_rate_selection(resolved_config)
     config_types = {

@@ -8,7 +8,7 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
-from mobius._build_context import prefill_prefix_pruning
+from mobius._build_context import ep_capabilities, prefill_prefix_pruning
 from mobius._configs import ArchitectureConfig
 from mobius._constants import (
     STATIC_CACHE_KV_SEQUENCE_LENGTH,
@@ -111,7 +111,18 @@ class CausalLMTask(ModelTask):
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
+        from mobius.components._paged_attention import DENSE_PAGED_MODEL_TYPES
+
         static = self._static_cache
+        if (
+            config.export_paged_attention
+            and config.model_type in DENSE_PAGED_MODEL_TYPES
+            and not self._paged_cache
+        ):
+            raise ValueError(
+                "Dense export_paged_attention requires CausalLMTask(paged_cache=True); "
+                "static or dynamic caches cannot implement the packed page contract."
+            )
 
         # --- Static-cache pre-validation ---
         if static:
@@ -135,10 +146,21 @@ class CausalLMTask(ModelTask):
         op = builder.op
 
         # --- Inputs common to both modes ---
-        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        if self._paged_cache and config.model_type in DENSE_PAGED_MODEL_TYPES:
+            input_ids = builder.input(
+                "input_ids", dtype=ir.DataType.INT64, shape=["num_tokens"]
+            )
+        else:
+            input_ids = builder.input(
+                "input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+            )
 
         # --- Paged-cache mode: caller-owned LATENT PagedAttention cache. ---
         if self._paged_cache:
+            if config.model_type in DENSE_PAGED_MODEL_TYPES:
+                return self._build_dense_paged(
+                    module, config, graph, builder, op, input_ids, batch
+                )
             return self._build_paged(module, config, graph, builder, op, input_ids, batch)
 
         # --- Cache setup (static vs dynamic) ---
@@ -311,6 +333,101 @@ class CausalLMTask(ModelTask):
 
         builder.add_output(logits, "logits")
         _register_paged_cache_outputs(builder, present_key_values)
+        return ModelPackage({"model": _make_model(graph)}, config=config)
+
+    def _build_dense_paged(self, module, config, graph, builder, op, input_ids, batch):
+        """Build a packed-token text decoder; the GenAI scheduler owns the pages."""
+        from mobius.components._paged_attention import (
+            PAGED_BLOCK_SIZE,
+            DensePagedState,
+            dense_paged_rejection,
+        )
+
+        reason = dense_paged_rejection(config)
+        if reason:
+            raise ValueError(reason)
+        ep = ep_capabilities().name
+        if (ep, config.dtype) not in {
+            ("cuda", ir.DataType.FLOAT16),
+            ("cuda", ir.DataType.BFLOAT16),
+            ("webgpu", ir.DataType.FLOAT16),
+        }:
+            raise ValueError(
+                f"Dense PagedAttention requires CUDA FP16/BF16 or WebGPU FP16, got {ep}/{config.dtype}."
+            )
+        if not config.export_paged_attention:
+            raise ValueError("Dense paged_cache requires export_paged_attention=True.")
+        if self._prune_prefill_prefix:
+            raise ValueError("Packed logits cannot use prefill-prefix pruning.")
+        from mobius.models.base import CausalLMModel
+        from mobius.models.qwen import Qwen3CausalLMModel
+
+        expected = Qwen3CausalLMModel if config.model_type == "qwen3" else CausalLMModel
+        if type(module) is not expected:
+            raise ValueError("Dense paged cache requires the standard Qwen text-only decoder.")
+        block_table = builder.input(
+            "block_table", dtype=ir.DataType.INT32, shape=[batch, "max_blocks_per_seq"]
+        )
+        cumulative = builder.input(
+            "cumulative_sequence_lengths", dtype=ir.DataType.INT32, shape=["batch + 1"]
+        )
+        past_lengths = builder.input(
+            "past_sequence_lengths", dtype=ir.DataType.INT32, shape=[batch]
+        )
+        metadata = builder.input(
+            "attention_metadata",
+            dtype=ir.DataType.INT32,
+            shape=["attention_metadata_length"],
+        )
+        states = []
+        for i in range(config.num_hidden_layers):
+            key = builder.input(
+                f"past_key_values.{i}.key",
+                dtype=config.dtype,
+                shape=[
+                    "num_blocks",
+                    PAGED_BLOCK_SIZE,
+                    config.num_key_value_heads,
+                    config.head_dim,
+                ],
+            )
+            value = builder.input(
+                f"past_key_values.{i}.value",
+                dtype=config.dtype,
+                shape=[
+                    "num_blocks",
+                    PAGED_BLOCK_SIZE,
+                    config.num_key_value_heads,
+                    config.head_dim,
+                ],
+            )
+            states.append(
+                DensePagedState(key, value, cumulative, past_lengths, block_table, metadata)
+            )
+        # The text model's embedding and LM head operate on [B,S,H].
+        packed_as_batch = op.Unsqueeze(input_ids, [0])
+        logits, present = module(
+            op,
+            input_ids=packed_as_batch,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=states,
+        )
+        logits = op.Cast(op.Squeeze(logits, [0]), to=ir.DataType.FLOAT)
+        builder.add_output(logits, "logits")
+        for i, (key, value) in enumerate(present):
+            for cache in (key, value):
+                cache.shape = ir.Shape(
+                    [
+                        "num_blocks",
+                        PAGED_BLOCK_SIZE,
+                        config.num_key_value_heads,
+                        config.head_dim,
+                    ]
+                )
+                cache.type = ir.TensorType(config.dtype)
+            builder.add_output(key, f"present.{i}.key")
+            builder.add_output(value, f"present.{i}.value")
         return ModelPackage({"model": _make_model(graph)}, config=config)
 
 

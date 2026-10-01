@@ -208,6 +208,7 @@ Available features:
 | Feature | Effect |
 |---------|--------|
 | `static-cache` | Pre-allocate fixed-size KV cache buffers using `TensorScatter` (pair with `--max-seq-len N`). Requires `DecoderLayer` / `MoEDecoderLayer` models. Cannot combine with `--task`. |
+| `paged-attention` | Export caller-owned PagedAttention caches for text-only Qwen2/Qwen2.5/Qwen3 dense GQA or supported dense MLA. Cannot combine with `--task` or `static-cache`. |
 | `fp8-kv-cache` | Store the `GroupQueryAttention` KV cache as `FLOAT8E4M3FN` (per-tensor E4M3), halving KV-cache memory. Requires a GQA build (e.g. `--ep cuda --dtype f16`) and an ORT runtime with the FP8 KV-cache kernel (SM89+). Pair with `--kv-cache-scale-file` for calibrated scales. |
 | `prune-prefill-prefix` | Emit logits shaped `[B, 1, vocab]` by selecting the final token before the LM head. Gemma 4 also prunes its KV-sharing layer suffix and per-layer inputs to reduce prefill compute. |
 | `text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM (see below). |
@@ -225,6 +226,39 @@ mobius build --model Qwen/Qwen2.5-0.5B --output output/ \
 mobius build --model meta-llama/Llama-3.2-1B --output output/ \
     --features prune-prefill-prefix
 ```
+
+### Dense Qwen PagedAttention (`--features paged-attention`)
+
+```bash
+mobius build --model Qwen/Qwen2.5-0.5B --output output/ \
+    --ep cuda --dtype f16 --runtime ort-genai --features paged-attention
+```
+
+Qwen2/2.5 and Qwen3 **text-only, standard full-RoPE dense GQA** exports use
+`com.microsoft::PagedAttention` v1 with separate K/V pages. The GenAI Engine
+config enables `dynamic_batching` (block size 256) with paged KV caches.
+CUDA FP16/BF16 or WebGPU FP16 is required for the graph; the ORT GenAI Engine
+export currently requires CUDA because its WebGPU paged-cache allocation is
+unsupported. MoE, multimodal, hybrid, sliding-window and MTP variants
+are not supported by this dense path. Dense Qwen paged export also cannot be
+combined with `fp8-kv-cache` or `prune-prefill-prefix`. Dense MLA models retain
+their separate LATENT PagedAttention path.
+
+The packed decoder accepts `input_ids` `[T]` (not padded `[B,S]`) and returns
+FP32 logits `[T,vocab]`. The Engine owns `block_table` `[B,max_blocks]`,
+`cumulative_sequence_lengths` `[B+1]`, `past_sequence_lengths` `[B]`,
+`attention_metadata` `[2]` or `[3]` (INT32), and separate per-layer K/V pools
+`[P,256,Hkv,D]` (FP16/BF16). The output pages alias those pools. Do not feed
+`position_ids`, `attention_mask`, or `slot_mapping`; fused RoPE and cache
+slot derivation happen inside the operator. Native `onnx-genai` workflows
+cannot schedule this packed ABI; select `--runtime ort-genai`.
+
+The Engine supplies `attention_metadata` as host-side replay bounds
+`[max_query_length, max_kv_length, optional max_kv_len_lower_bound]`.
+The first two values must be at least the corresponding maximum query and KV
+lengths across all sequences in every graph-capture replay; the optional third
+must not exceed the maximum per-sequence KV length on any replay. Context
+length cannot exceed the exported RoPE table capacity (`max_position_embeddings`).
 
 ### Static Cache (`--features static-cache`)
 

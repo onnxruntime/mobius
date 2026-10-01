@@ -5,8 +5,7 @@
 
 This module takes an ``ArchitectureConfig`` (or ``BaseModelConfig``) and a
 model type string and produces the config dict that onnxruntime-genai
-expects. It does NOT import from core model/task/component layers — it
-only reads config dataclass fields.
+expects.
 """
 
 from __future__ import annotations
@@ -14,6 +13,21 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+
+import onnx_ir as ir
+
+from mobius.components._paged_attention import DENSE_PAGED_MODEL_TYPES, PAGED_BLOCK_SIZE
+
+
+def _validate_dense_paged_engine_ep(ep: str, dtype: ir.DataType | None) -> None:
+    if ep != "cuda":
+        raise ValueError(
+            "ORT GenAI dense PagedAttention Engine export requires CUDA; "
+            "WebGPU page allocation is unsupported."
+        )
+    if dtype not in (ir.DataType.FLOAT16, ir.DataType.BFLOAT16):
+        raise ValueError("ORT GenAI dense PagedAttention Engine export requires FP16/BF16.")
+
 
 _SPECIALIZED_DECODER_MODEL_TYPES = {
     "gpt2": "gpt2",
@@ -194,6 +208,9 @@ class GenaiConfigGenerator:
             runtime must recompute LongRoPE caches across the context threshold.
         has_specialized_topology: Preserve the supplied type for packages with
             auxiliary graphs or runtime-managed pipelines.
+        dtype: Decoder cache dtype. Required for direct dense paged Engine
+            generation (FP16 or BF16); ``from_config`` derives it from the
+            model config.
     """
 
     def __init__(
@@ -221,6 +238,8 @@ class GenaiConfigGenerator:
         sliding_window: dict[str, Any] | None = None,
         uses_longrope: bool = False,
         has_specialized_topology: bool = False,
+        dense_paged: bool = False,
+        dtype: ir.DataType | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -252,6 +271,8 @@ class GenaiConfigGenerator:
         self._sliding_window = sliding_window
         self._uses_longrope = uses_longrope
         self._has_specialized_topology = has_specialized_topology
+        self._dense_paged = dense_paged
+        self._dtype = dtype
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
@@ -271,7 +292,7 @@ class GenaiConfigGenerator:
         config: Any,
         model_type: str,
         *,
-        context_length: int = 4096,
+        context_length: int | None = None,
         ep: str = "cpu",
         bos_token_id: int | None = None,
         eos_token_id: int | list[int] | None = None,
@@ -307,8 +328,26 @@ class GenaiConfigGenerator:
                 pad = raw_pad
 
         max_pos = getattr(config, "max_position_embeddings", None)
-        if max_pos and max_pos > 0 and max_pos != -42:
-            context_length = max(context_length, max_pos)
+        dense_paged = bool(
+            getattr(config, "export_paged_attention", False)
+            and getattr(config, "model_type", None) in DENSE_PAGED_MODEL_TYPES
+        )
+        if dense_paged:
+            _validate_dense_paged_engine_ep(ep, config.dtype)
+            if max_pos is None or max_pos <= 0 or max_pos == -42:
+                raise ValueError("Dense PagedAttention requires a positive RoPE cache length.")
+            if context_length is None:
+                context_length = max_pos
+            elif not 0 < context_length <= max_pos:
+                raise ValueError(
+                    "Dense PagedAttention context_length must be positive and no greater "
+                    f"than its RoPE cache length ({max_pos})."
+                )
+        else:
+            if context_length is None:
+                context_length = 4096
+            if max_pos and max_pos > 0 and max_pos != -42:
+                context_length = max(context_length, max_pos)
 
         return cls(
             model_type,
@@ -343,6 +382,8 @@ class GenaiConfigGenerator:
                 and getattr(config, "rope_type", None) == "longrope"
             ),
             has_specialized_topology=has_specialized_topology,
+            dense_paged=dense_paged,
+            dtype=config.dtype if dense_paged else None,
         )
 
     def with_vision(
@@ -584,6 +625,36 @@ class GenaiConfigGenerator:
             # dynamic attention KV; shared in-place KV buffers are unsupported.
             search["past_present_share_buffer"] = False
         search.update(self._search_overrides)
+        if self._dense_paged:
+            _validate_dense_paged_engine_ep(self.ep, self._dtype)
+            if search["max_length"] > self.context_length:
+                raise ValueError(
+                    "Dense PagedAttention search.max_length cannot exceed the "
+                    "exported RoPE context_length."
+                )
+            required_inputs = {
+                "input_ids": "input_ids",
+                "block_table": "block_table",
+                "cumulative_sequence_lengths": "cumulative_sequence_lengths",
+                "past_sequence_lengths": "past_sequence_lengths",
+                "attention_metadata": "attention_metadata",
+                "past_key_names": "past_key_values.%d.key",
+                "past_value_names": "past_key_values.%d.value",
+            }
+            required_outputs = {
+                "logits": "logits",
+                "present_key_names": "present.%d.key",
+                "present_value_names": "present.%d.value",
+            }
+            if (
+                self._decoder_inputs != required_inputs
+                or self._decoder_outputs != required_outputs
+            ):
+                raise ValueError(
+                    "Dense PagedAttention requires complete graph-derived decoder "
+                    "inputs and outputs."
+                )
+            search["past_present_share_buffer"] = True
 
         # Decoder section — use explicit inputs when available (from
         # graph introspection), otherwise fall back to defaults.
@@ -627,7 +698,6 @@ class GenaiConfigGenerator:
             decoder["outputs"].setdefault("present_conv_names", "present.%d.conv_state")
         if self._sliding_window is not None:
             decoder["sliding_window"] = self._sliding_window
-
         # Model section
         model: dict[str, Any] = {
             "type": emitted_model_type,
@@ -658,10 +728,19 @@ class GenaiConfigGenerator:
             model["speech"] = self._audio
         model.update(self._vlm_token_ids)
 
-        return {
+        result = {
             "model": model,
             "search": search,
         }
+        if self._dense_paged:
+            result["engine"] = {
+                "dynamic_batching": {
+                    "block_size": PAGED_BLOCK_SIZE,
+                    "gpu_utilization_factor": 0.6,
+                    "max_batch_size": 100,
+                }
+            }
+        return result
 
     def write(self, output_dir: str) -> str:
         """Write genai_config.json to the output directory.

@@ -631,15 +631,37 @@ def build_transformers_model(
             )
         config = dataclasses.replace(config, use_dsa=False)
     if export_paged_attention:
+        from mobius.components._paged_attention import (
+            DENSE_PAGED_MODEL_TYPES,
+            dense_paged_rejection,
+        )
         from mobius.components._paged_mla import paged_attention_rejection
 
         config = dataclasses.replace(config, export_paged_attention=True)
-        reason = paged_attention_rejection(config)
+        reason = (
+            dense_paged_rejection(config)
+            if model_type in DENSE_PAGED_MODEL_TYPES
+            else paged_attention_rejection(config)
+        )
         if reason is not None:
             raise ValueError(
                 "export_paged_attention=True (--features paged-attention) is not "
                 f"supported for model_type '{model_type}': {reason}"
             )
+        if model_type in DENSE_PAGED_MODEL_TYPES:
+            from mobius.tasks import CausalLMTask
+
+            if task is None:
+                task = CausalLMTask(paged_cache=True)
+            elif (
+                not isinstance(task, CausalLMTask)
+                or not task._paged_cache
+                or task._static_cache
+            ):
+                raise ValueError(
+                    "Dense PagedAttention requires CausalLMTask(paged_cache=True); "
+                    "remove the explicit task or select the paged cache task."
+                )
     if task is None:
         task = _default_task_for_model(model_type)
 
