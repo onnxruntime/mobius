@@ -631,11 +631,11 @@ def build_transformers_model(
             )
         config = dataclasses.replace(config, use_dsa=False)
     if export_paged_attention:
-        from mobius.components._paged_attention import (
+        from mobius.components._paged_mla import paged_attention_rejection
+        from mobius.tasks._causal_lm import (
             DENSE_PAGED_MODEL_TYPES,
             dense_paged_rejection,
         )
-        from mobius.components._paged_mla import paged_attention_rejection
 
         config = dataclasses.replace(config, export_paged_attention=True)
         reason = (

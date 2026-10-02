@@ -554,6 +554,10 @@ def _save_package(
         from mobius.integrations.ort_genai.auto_export import _preflight_dense_paged_decoder
 
         _preflight_dense_paged_decoder(pkg, args.execution_provider)
+    elif runtime == "onnx-genai":
+        from mobius.integrations.onnx_genai.auto_export import _reject_packed_paged_decoder
+
+        _reject_packed_paged_decoder(pkg)
 
     pkg.save(
         output_dir,

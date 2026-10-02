@@ -160,7 +160,7 @@ def build_from_module(
     """
     if hasattr(config, "validate"):
         config.validate()
-    from mobius.components._paged_attention import DENSE_PAGED_MODEL_TYPES
+    from mobius.tasks._causal_lm import DENSE_PAGED_MODEL_TYPES
 
     if (
         getattr(config, "export_paged_attention", False)

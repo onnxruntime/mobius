@@ -16,7 +16,8 @@ from typing import Any
 
 import onnx_ir as ir
 
-from mobius.components._paged_attention import DENSE_PAGED_MODEL_TYPES, PAGED_BLOCK_SIZE
+from mobius.components._paged_attention import PAGED_BLOCK_SIZE
+from mobius.tasks._causal_lm import DENSE_PAGED_MODEL_TYPES
 
 
 def _validate_dense_paged_engine_ep(ep: str, dtype: ir.DataType | None) -> None:

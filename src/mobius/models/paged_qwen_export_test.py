@@ -16,7 +16,6 @@ from mobius.__main__ import _save_package
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._testing import make_config
-from mobius.components._paged_attention import dense_paged_rejection
 from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
 from mobius.integrations.ort_genai.auto_export import (
     _preflight_dense_paged_decoder,
@@ -27,6 +26,7 @@ from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
 from mobius.models.base import CausalLMModel
 from mobius.models.qwen import Qwen3CausalLMModel
 from mobius.tasks import CausalLMTask
+from mobius.tasks._causal_lm import dense_paged_rejection
 
 
 def _config(model_type="qwen2", **changes):
@@ -445,10 +445,29 @@ def test_native_workflow_rejects_packed_page_contract(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("model_type", ["qwen2", "qwen3"])
+def test_native_cli_rejects_packed_pages_before_saving(tmp_path, model_type):
+    pkg = _build(_config(model_type))
+    args = SimpleNamespace(
+        runtime="onnx-genai",
+        release=False,
+        max_shard_size=None,
+        external_data="onnx",
+        execution_provider="cuda",
+    )
+    output = tmp_path / "export"
+    with pytest.raises(ValueError, match="ORT GenAI Engine"):
+        _save_package(pkg, str(output), args, None, None)
+    assert not output.exists()
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("model_type", ["qwen2", "qwen3"])
 @pytest.mark.parametrize("metadata_with_lower_bound", [False, True])
-def test_cuda_prefill_and_decode_match_dynamic_gqa(model_type, metadata_with_lower_bound):
+@pytest.mark.parametrize("head_dim", [16, 64, 128])
+def test_cuda_prefill_and_decode_match_dynamic_gqa(
+    model_type, metadata_with_lower_bound, head_dim
+):
     """Exercise in-place page binding and compare logits/cache over two invocations."""
     import numpy as np
 
@@ -456,7 +475,13 @@ def test_cuda_prefill_and_decode_match_dynamic_gqa(model_type, metadata_with_low
 
     if "CUDAExecutionProvider" not in ort.get_available_providers():
         pytest.skip("ORT CUDA provider is unavailable")
-    config = _config(model_type, num_hidden_layers=1)
+    config = _config(
+        model_type,
+        num_hidden_layers=1,
+        hidden_size=4 * head_dim,
+        intermediate_size=8 * head_dim,
+        head_dim=head_dim,
+    )
     paged = _build(config)["model"]
     baseline_config = dataclasses.replace(config, export_paged_attention=False)
     model_class = Qwen3CausalLMModel if model_type == "qwen3" else CausalLMModel
@@ -496,11 +521,14 @@ def test_cuda_prefill_and_decode_match_dynamic_gqa(model_type, metadata_with_low
 
     pools = {
         kind: ort.OrtValue.ortvalue_from_numpy(
-            np.zeros((1, 256, 2, 16), dtype=np.float16), "cuda", 0
+            np.zeros((1, 256, 2, head_dim), dtype=np.float16), "cuda", 0
         )
         for kind in ("key", "value")
     }
-    baseline_cache = {kind: np.zeros((1, 2, 0, 16), dtype=np.float16) for kind in pools}
+    baseline_cache = {kind: np.zeros((1, 2, 0, head_dim), dtype=np.float16) for kind in pools}
+    # Preserve the stricter existing small-head gate; use the FP16 full-logit
+    # budget for the representative Qwen head widths.
+    rtol, atol = (0.02, 0.002) if head_dim == 16 else (0.01, 0.01)
     for tokens, past in (([1, 2, 3], 0), ([4], 3)):
         binding = paged_session.io_binding()
         metadata = [len(tokens), past + len(tokens)]
@@ -527,28 +555,36 @@ def test_cuda_prefill_and_decode_match_dynamic_gqa(model_type, metadata_with_low
             **{f"past_key_values.0.{kind}": cache for kind, cache in baseline_cache.items()},
         }
         outputs = baseline_session.run(None, feed)
-        np.testing.assert_allclose(packed_logits, outputs[0][0], rtol=0.02, atol=0.002)
+        np.testing.assert_allclose(packed_logits, outputs[0][0], rtol=rtol, atol=atol)
         for index, (kind, pool) in enumerate(pools.items(), start=1):
             baseline_cache[kind] = outputs[index]
             page_slice = pool.numpy()[:, : past + len(tokens)]
             np.testing.assert_allclose(
                 np.transpose(page_slice, (0, 2, 1, 3)),
                 baseline_cache[kind],
-                rtol=0.02,
-                atol=0.002,
+                rtol=rtol,
+                atol=atol,
             )
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("model_type", ["qwen2", "qwen3"])
-def test_cuda_packed_batch_crosses_page_boundary(model_type):
+@pytest.mark.parametrize("head_dim", [16, 64, 128])
+def test_cuda_packed_batch_crosses_page_boundary(model_type, head_dim):
     import numpy as np
 
     ort = pytest.importorskip("onnxruntime")
     if "CUDAExecutionProvider" not in ort.get_available_providers():
         pytest.skip("ORT CUDA provider is unavailable")
 
-    config = _config(model_type, num_hidden_layers=1, max_position_embeddings=512)
+    config = _config(
+        model_type,
+        num_hidden_layers=1,
+        max_position_embeddings=512,
+        hidden_size=4 * head_dim,
+        intermediate_size=8 * head_dim,
+        head_dim=head_dim,
+    )
     baseline_config = dataclasses.replace(config, export_paged_attention=False)
     model_class = Qwen3CausalLMModel if model_type == "qwen3" else CausalLMModel
     paged = _build(config)["model"]
@@ -580,13 +616,15 @@ def test_cuda_packed_batch_crosses_page_boundary(model_type):
     )
     pools = {
         kind: ort.OrtValue.ortvalue_from_numpy(
-            np.zeros((4, 256, 2, 16), dtype=np.float16), "cuda", 0
+            np.zeros((4, 256, 2, head_dim), dtype=np.float16), "cuda", 0
         )
         for kind in ("key", "value")
     }
     baseline_caches = [
-        {kind: np.zeros((1, 2, 0, 16), dtype=np.float16) for kind in pools} for _ in range(2)
+        {kind: np.zeros((1, 2, 0, head_dim), dtype=np.float16) for kind in pools}
+        for _ in range(2)
     ]
+    rtol, atol = (0.02, 0.002) if head_dim == 16 else (0.01, 0.01)
     block_table = np.array([[2, 0], [3, 1]], dtype=np.int32)
     token_batches = [
         [[i % 120 + 1 for i in range(254)], [2, 3, 4]],
@@ -638,17 +676,17 @@ def test_cuda_packed_batch_crosses_page_boundary(model_type):
             np.testing.assert_allclose(
                 packed_logits[cumulative[row] : cumulative[row + 1]],
                 outputs[0][0],
-                rtol=0.02,
-                atol=0.002,
+                rtol=rtol,
+                atol=atol,
             )
             for index, kind in enumerate(pools, start=1):
                 baseline_caches[row][kind] = outputs[index]
                 physical_pages = pools[kind].numpy()[block_table[row]]
-                linear_cache = physical_pages.reshape(-1, 2, 16)[: past + len(tokens)]
+                linear_cache = physical_pages.reshape(-1, 2, head_dim)[: past + len(tokens)]
                 np.testing.assert_allclose(
                     linear_cache.transpose(1, 0, 2)[None],
                     baseline_caches[row][kind],
-                    rtol=0.02,
-                    atol=0.002,
+                    rtol=rtol,
+                    atol=atol,
                 )
             past_lengths[row] += len(tokens)

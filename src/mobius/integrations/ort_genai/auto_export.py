@@ -2130,8 +2130,8 @@ def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
 
 def _preflight_dense_paged_decoder(pkg: ModelPackage, ep: str) -> None:
     """Validate packed Qwen Engine exports before saving models or config."""
-    from mobius.components._paged_attention import DENSE_PAGED_MODEL_TYPES
     from mobius.integrations.ort_genai.genai_config import _validate_dense_paged_engine_ep
+    from mobius.tasks._causal_lm import DENSE_PAGED_MODEL_TYPES
 
     config = getattr(pkg, "config", None)
     if config is None:
