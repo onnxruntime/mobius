@@ -768,13 +768,29 @@ def validate_quantized_component_bindings(
                 if index >= len(node.inputs):
                     continue
                 value = node.inputs[index]
-                if value is None or value.producer() is not None:
+                if value is None:
                     continue
-                if value.const_value is None:
-                    raise ValueError(
-                        f"Quantized component {component!r} has unbound "
-                        f"{node.op_type} parameter {value.name!r}"
-                    )
+                pending = [value]
+                visited: set[ir.Value] = set()
+                while pending:
+                    parameter = pending.pop()
+                    if parameter in visited:
+                        continue
+                    visited.add(parameter)
+                    producer = parameter.producer()
+                    if producer is not None:
+                        if (
+                            producer.domain == ""
+                            and producer.op_type == "Concat"
+                            and producer.attributes.get_int("axis", None) == 0
+                        ):
+                            pending.extend(v for v in producer.inputs if v is not None)
+                        continue
+                    if parameter.const_value is None:
+                        raise ValueError(
+                            f"Quantized component {component!r} has unbound "
+                            f"{node.op_type} parameter {parameter.name!r}"
+                        )
 
 
 def attach_hf_component_sources(

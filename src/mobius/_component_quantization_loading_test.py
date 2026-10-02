@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 from pathlib import Path
 
@@ -16,7 +17,10 @@ import pytest
 import torch
 
 from mobius import ModelPackage, build, build_from_module
-from mobius._component_quantization import normalize_component_quantized_weights
+from mobius._component_quantization import (
+    normalize_component_quantized_weights,
+    validate_quantized_component_bindings,
+)
 from mobius._configs import (
     ArchitectureConfig,
     Gemma4Config,
@@ -25,6 +29,8 @@ from mobius._configs import (
     VisionConfig,
     WhisperConfig,
 )
+from mobius._execution_providers import ep_registry
+from mobius._optimizations import fold_initializers_after_weights, optimize_model
 from mobius._testing import make_config
 from mobius.components import Linear, QuantizedLinear
 from mobius.models import CausalLMModel
@@ -48,6 +54,234 @@ def _quantization(**overrides) -> QuantizationConfig:
         QuantizationConfig(bits=4, group_size=16, quant_method="olive", sym=True),
         **overrides,
     )
+
+
+def _cuda_int4_decoder(*, norm, trace=False, zp=False, bias=False):
+    config = make_config(
+        model_type="qwen3" if norm else "llama",
+        dtype=ir.DataType.FLOAT16,
+        num_hidden_layers=1,
+        attn_qk_norm=norm,
+        attn_qkv_bias=bias,
+        quantization=_quantization(group_size=32, sym=not zp),
+    )
+    module = CausalLMModel(config)
+    return config, build_from_module(
+        module, config, execution_provider="cuda", trace_optimization=trace
+    )
+
+
+def _random_canonical_weights(package):
+    rng = np.random.default_rng(41)
+    weights = {}
+    for name, tensor in _canonical_checkpoint(package).items():
+        if tensor.dtype == torch.uint8:
+            data = rng.integers(1, 256, tuple(tensor.shape), dtype=np.uint8)
+        elif name.endswith(".scales"):
+            data = rng.uniform(0.003, 0.01, tuple(tensor.shape)).astype(np.float16)
+        elif "norm" in name:
+            data = rng.uniform(0.8, 1.2, tuple(tensor.shape)).astype(np.float16)
+        else:
+            data = rng.normal(0, 0.05, tuple(tensor.shape)).astype(np.float16)
+        weights[name] = torch.from_numpy(data)
+    return weights
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("fold", [False, True])
+@pytest.mark.parametrize("zp", [False, True])
+def test_cuda_qkv_original_names_binding_and_default_external_roundtrip(
+    tmp_path, norm, fold, zp
+):
+    config, package = _cuda_int4_decoder(norm=norm, zp=zp)
+    model = package["model"]
+    original_names = set(model.graph.initializers)
+    for _ in range(2):
+        optimize_model(model, ep="cuda", dtype=ir.DataType.FLOAT16)
+        fold_initializers_after_weights(model)
+    assert set(model.graph.initializers) == original_names
+    assert sum(node.op_type == "Concat" for node in model.graph) >= 2
+    weights = _random_canonical_weights(package)
+    expected = {
+        slot: np.concatenate(
+            [
+                weights[f"model.layers.0.self_attn.{projection}_proj.{slot}"].numpy()
+                for projection in ("q", "k", "v")
+            ],
+            axis=0,
+        )
+        for slot in (("weight", "scales", "zero_points") if zp else ("weight", "scales"))
+    }
+    package.apply_weights(weights, fold_constants=fold)
+    validate_quantized_component_bindings(package, config)
+    packed = next(
+        node
+        for node in model.graph
+        if node.op_type == "MatMulNBits"
+        and any(use.node.op_type == "Split" for use in node.outputs[0].uses())
+    )
+    for index, slot in enumerate(expected, start=1):
+        value = packed.inputs[index]
+        if fold:
+            assert value.producer() is None
+            np.testing.assert_array_equal(value.const_value.numpy(), expected[slot])
+            assert f"model.layers.0.self_attn.q_proj.{slot}" not in model.graph.initializers
+        else:
+            assert value.producer().op_type == "Concat"
+            assert f"model.layers.0.self_attn.q_proj.{slot}" in model.graph.initializers
+            actual = np.concatenate(
+                [leaf.const_value.numpy() for leaf in value.producer().inputs], axis=0
+            )
+            np.testing.assert_array_equal(actual, expected[slot])
+    package.save(str(tmp_path), progress_bar=False)
+    assert (tmp_path / "model.onnx.data").is_file()
+    restored = ModelPackage.load(str(tmp_path))
+    validate_quantized_component_bindings(restored, config)
+    assert [value.name for value in restored["model"].graph.outputs] == [
+        value.name for value in model.graph.outputs
+    ]
+    for name, value in model.graph.initializers.items():
+        np.testing.assert_array_equal(
+            restored["model"].graph.initializers[name].const_value.numpy(),
+            value.const_value.numpy(),
+        )
+
+
+@pytest.mark.parametrize("slot", ["weight", "scales", "zero_points"])
+def test_cuda_qkv_missing_concat_hidden_parameter_fails(tmp_path, slot):
+    config, package = _cuda_int4_decoder(norm=True, zp=slot == "zero_points")
+    weights = _random_canonical_weights(package)
+    missing = f"model.layers.0.self_attn.k_proj.{slot}"
+    weights.pop(missing)
+    package.apply_weights(weights, fold_constants=False)
+    with pytest.raises(ValueError, match=f"unbound MatMulNBits parameter '{missing}'"):
+        validate_quantized_component_bindings(package, config)
+    with pytest.raises(ValueError, match="without weights"):
+        package.save(str(tmp_path), progress_bar=False)
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_binding_validation_traverses_only_axis_zero_concat_chains(axis):
+    missing = ir.Value(
+        name="missing", type=ir.TensorType(ir.DataType.FLOAT16), shape=ir.Shape([2, 2])
+    )
+    bound = ir.Value(
+        name="bound",
+        type=ir.TensorType(ir.DataType.FLOAT16),
+        shape=ir.Shape([2, 2]),
+        const_value=ir.tensor(np.ones((2, 2), np.float16)),
+    )
+    inner, outer = ir.Value(name="inner"), ir.Value(name="outer")
+    nodes = [
+        ir.Node(
+            "",
+            "Concat",
+            [bound, missing],
+            outputs=[inner],
+            attributes={"axis": ir.AttrInt64("axis", axis)},
+        ),
+        ir.Node(
+            "",
+            "Concat",
+            [inner, bound],
+            outputs=[outer],
+            attributes={"axis": ir.AttrInt64("axis", 0)},
+        ),
+        ir.Node(
+            "com.microsoft",
+            "MatMulNBits",
+            [None, bound, outer],
+            outputs=[ir.Value(name="out")],
+        ),
+    ]
+    model = ir.Model(
+        ir.Graph(
+            [],
+            [nodes[-1].outputs[0]],
+            nodes=nodes,
+            initializers=[missing, bound],
+            opset_imports={"": 24},
+        ),
+        ir_version=10,
+    )
+    if axis == 0:
+        with pytest.raises(ValueError, match="parameter 'missing'"):
+            validate_quantized_component_bindings({"model": model}, make_config())
+    else:
+        validate_quantized_component_bindings({"model": model}, make_config())
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("zp", [False, True])
+def test_cuda_qkv_full_decoder_prefill_and_cached_decode(tmp_path, monkeypatch, norm, zp):
+    if "CUDAExecutionProvider" not in ort.get_available_providers():
+        pytest.skip("CUDAExecutionProvider is not available")
+    with monkeypatch.context() as context:
+        context.setitem(
+            ep_registry._entries,
+            "cuda",
+            dataclasses.replace(
+                ep_registry.require("cuda"), matmul_nbits_qkv_pack_dtypes=frozenset()
+            ),
+        )
+        _, source = _cuda_int4_decoder(norm=norm, zp=zp, bias=True)
+    _, packed = _cuda_int4_decoder(norm=norm, zp=zp, bias=True)
+    weights = _random_canonical_weights(source)
+    source.apply_weights(weights)
+    packed.apply_weights(weights)
+    sessions = []
+    for label, package in (("source", source), ("packed", packed)):
+        path = tmp_path / label
+        package.save(str(path), progress_bar=False)
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        options.intra_op_num_threads = 1
+        options.enable_profiling = True
+        options.profile_file_prefix = str(path / "profile")
+        sessions.append(
+            ort.InferenceSession(
+                str(path / "model.onnx"),
+                options,
+                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+        )
+    feeds = {
+        "input_ids": np.array([[1, 3, 5], [2, 4, 6]], dtype=np.int64),
+        "attention_mask": np.ones((2, 3), dtype=np.int64),
+        "past_key_values.0.key": np.empty((2, 2, 0, 16), dtype=np.float16),
+        "past_key_values.0.value": np.empty((2, 2, 0, 16), dtype=np.float16),
+    }
+    results = [session.run(None, feeds) for session in sessions]
+    for before, after in zip(*results, strict=True):
+        np.testing.assert_allclose(after, before, rtol=1e-2, atol=1e-2)
+    decoded = []
+    for session, result in zip(sessions, results, strict=True):
+        decoded.append(
+            session.run(
+                None,
+                {
+                    "input_ids": np.array([[7], [8]], dtype=np.int64),
+                    "attention_mask": np.ones((2, 4), dtype=np.int64),
+                    "past_key_values.0.key": result[1],
+                    "past_key_values.0.value": result[2],
+                },
+            )
+        )
+    for before, after in zip(*decoded, strict=True):
+        np.testing.assert_allclose(after, before, rtol=1e-2, atol=1e-2)
+    for label, session, expected in zip(("source", "packed"), sessions, (14, 10), strict=True):
+        events = json.loads(Path(session.end_profiling()).read_text())
+        providers = [
+            event["args"]["provider"]
+            for event in events
+            if event.get("cat") == "Node"
+            and event.get("args", {}).get("op_name") == "MatMulNBits"
+            and "provider" in event["args"]
+        ]
+        assert providers == ["CUDAExecutionProvider"] * expected
+        print(
+            f"decoder norm={norm} zp={zp} {label}: {len(providers)} native CUDA MatMulNBits events"
+        )
 
 
 def _bytes(*shape: int, offset: int = 0) -> torch.Tensor:

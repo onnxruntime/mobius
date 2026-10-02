@@ -52,7 +52,7 @@ pkg = build_from_module(
 |---|---|---|
 | **default** | `"default"` (built-in default) | Portable ONNX. All custom ops with function bodies are kept as-is — function bodies are the executable fallback. No vendor-specific fusions. |
 | **CPU** | `"cpu"` | ORT CPU EP. GQA fusion for FP32. INT4 accuracy level 4. |
-| **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16. SkipLayerNorm fusion. |
+| **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16. Compatible FP16/INT4 QKV projection packing. SkipLayerNorm fusion. |
 | **DirectML** | `"dml"` | DirectML (Windows GPU). GQA for FP16. RoPE and packed QKV lowered to separate ops. |
 | **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated. INT4 accuracy level 4. |
 | **MLX** | `"mlx"` | Apple-silicon MLX plugin EP. GQA for FP32/FP16/BF16 with unpacked Q/K/V and shared KV buffers. |
@@ -91,6 +91,30 @@ ops to fused equivalents:
 
 These are applied during **Stage 2: Fusion** of the optimization pipeline.
 
+CUDA also applies `PackMatMulNBitsQKV` at the start of this stage, before
+attention fusion or lowering. For decoder and masked-decoder graphs, three
+compatible FP16/INT4 `MatMulNBits` projections feeding standard `Attention`
+or `com.microsoft::GroupQueryAttention` become one `MatMulNBits` followed
+by a `Split` restoring the separate Q, K, and V values. Bias, Q/K RMS
+normalization (including per-head reshape pairs), rotary embeddings, masks,
+cache outputs, and other projection consumers stay unchanged. This does not
+require GQA fusion and does not pack the attention operator's inputs.
+
+The projections must share the same rank-3 FP16 activation and matching
+attributes (except output width), with `accuracy_level` omitted or zero.
+Weights must have canonical UINT8 blocked INT4 layout, scales must be FP16,
+and zero-points must be absent on all three projections or canonical packed
+UINT8 on all three. A power-of-two block size of at least 16 is required.
+Other bit-widths, dtypes, layouts, extra inputs, function overrides, and
+incompatible triples are left unchanged; a mixed 4/4/8 triple is **not**
+partially packed. Other built-in EPs do not enable this pass.
+
+Packing concatenates existing parameter storage without precision promotion
+or requantization. Original checkpoint parameter names remain available until
+weights are applied; the resulting parameter Concats fold after loading unless
+`apply_weights(..., fold_constants=False)` is used. No speed improvement is
+claimed without workload-specific measurement.
+
 ### Tier 3 — EP-specific constraints (required, correctness)
 
 Some EPs cannot execute certain ops. These are handled by **lowering rules**
@@ -118,6 +142,7 @@ class EpCapabilities:
     name: str
     gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
     qkv_pack_dtypes: frozenset[ir.DataType]          # dtypes where PackQKV fusion fires
+    matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType]  # projection-only INT4 packing
     supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
     supports_skip_layer_norm: bool = True            # False → InlinePass expansion
     supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
@@ -178,7 +203,7 @@ Stage 1:  Cleanup      EP-agnostic. Always applied.
             constant folding, symbolic shape inference, metadata cleanup.
 
 Stage 2:  Fusion       EP-gated. Promotes standard ops to EP-specific fused ops.
-          ↓ GQAFusion, SkipNorm, SkipLayerNorm, GeluFusion
+          ↓ PackMatMulNBitsQKV, GQAFusion, SkipNorm, SkipLayerNorm, GeluFusion
             (each only fires if the EP's capabilities support it)
 
 Stage 2b: InlinePass   EP-gated. Expands custom ops the EP cannot execute

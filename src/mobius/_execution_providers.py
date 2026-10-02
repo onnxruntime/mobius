@@ -58,6 +58,9 @@ class EpCapabilities:
             empty frozenset for EPs that do not support packed QKV inputs
             (e.g. DML, which always unpacks via UnpackQKV in the lowering
             stage).
+        matmul_nbits_qkv_pack_dtypes: dtypes for projection-only INT4 QKV
+            packing. Requires ``supports_matmul_nbits`` and is independent
+            of ``qkv_pack_dtypes`` (packed attention inputs).
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
@@ -171,6 +174,9 @@ class EpCapabilities:
     max_buffer_size: int | None = None
     layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
+    matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
+        default_factory=frozenset
+    )
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -312,6 +318,7 @@ def _register_builtins() -> None:
         ),
         EpCapabilities(
             name="cuda",
+            matmul_nbits_qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
             gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
             qkv_pack_dtypes=frozenset(
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
