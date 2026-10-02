@@ -100,7 +100,8 @@ print(sorted(ep_registry))
 # Inspect an EP's capabilities
 caps = get_ep("cuda")
 print(caps.gqa_dtypes)          # frozenset({FLOAT16, BFLOAT16})
-print(caps.qkv_pack_dtypes)     # frozenset({FLOAT, FLOAT16, BFLOAT16})
+print(caps.qkv_pack_dtypes)     # frozenset({FLOAT, FLOAT16, BFLOAT16}); float GQA input packing
+print(caps.matmul_nbits_qkv_pack_dtypes)  # frozenset({FLOAT16}); INT4 projection-only packing
 print(caps.supports_fused_rope) # True
 print(caps.enable_graph_capture) # True
 print(caps.provider_options)     # {'enable_skip_layer_norm_strict_mode': '1'}
@@ -141,7 +142,7 @@ graph construction or optimization starts — safe-fail by default.
 | Portable ONNX (maximum compatibility) | `"default"` | any | No EP-specific vendor fusions (e.g. no GQA/PackQKV) |
 | Strict standard ONNX (no custom ops at all) | `"onnx-standard"` | any | All `com.microsoft` ops expanded via InlinePass; safe for non-ORT runtimes |
 | ORT CPU inference | `"cpu"` | `"f32"` | GQA fusion for FP32 |
-| NVIDIA GPU | `"cuda"` | `"f16"` or `"bf16"` | GQA + SkipNorm + PackQKV |
+| NVIDIA GPU | `"cuda"` | `"f16"` or `"bf16"` | GQA + SkipNorm + float PackQKV (GQA input ABI); FP16 also enables compatible INT4 projection packing with separate Q/K/V outputs |
 | Windows GPU (DirectX) | `"dml"` | `"f16"` | RoPE lowered separately |
 | Browser / WebAssembly | `"webgpu"` | `"f16"` or `"f32"` | Shape ops replaced |
 | NVIDIA TensorRT-RTX | `"trt-rtx"` | `"f16"` or `"bf16"` | SkipLayerNorm expanded |

@@ -754,7 +754,11 @@ def validate_quantized_component_bindings(
     models: Mapping[str, ir.Model],
     config: BaseModelConfig,
 ) -> None:
-    """Require every affine quantized op input to carry a bound value."""
+    """Require affine quantized parameters to be bound.
+
+    For deferred axis-0 parameter Concats, validate the original parameter
+    leaves so packing can remain unfolded without hiding missing weights.
+    """
     quantized_input_slots = {
         "MatMulNBits": (1, 2, 3),
         "GatherBlockQuantized": (0, 2, 3),

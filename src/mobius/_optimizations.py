@@ -364,8 +364,9 @@ def _get_optimization_passes(
 
     Args:
         caps: EP capability descriptor from :data:`~mobius._execution_providers.ep_registry`.
-        dtype: Model dtype for GQA/PackedAttn support checks.
-        model_role: Semantic role. GQA fusion only applies to ``"decoder"``.
+        dtype: Model dtype for GQA/PackedAttn and INT4 projection-packing support checks.
+        model_role: Semantic role. GQA fusion only applies to ``"decoder"``;
+            INT4 projection packing also applies to ``"masked-decoder"``.
 
     Returns:
         ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``

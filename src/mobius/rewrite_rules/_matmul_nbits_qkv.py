@@ -6,6 +6,7 @@
 Only the projections change: bias, per-head normalization, rotary embeddings,
 attention masks, and cache consumers retain their original inputs and outputs.
 Parameter Concats defer packing until the original checkpoint names are bound.
+Packing requires standard opset >= 13 for the two-input Split it emits.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ def _trace(graph: ir.Graph, value: ir.Value | None, *, normalized: bool) -> ir.N
         return None
     node = value.producer()
     if normalized:
+        # Q/K may have bias -> per-head RMSNorm (reshape pair) -> RoPE; V has only bias.
         if _standard(node, "RotaryEmbedding"):
             assert node is not None
             value = node.inputs[0]
@@ -119,7 +121,11 @@ def _parameter(
 
 def _compatible(model: ir.Model, triple: _Triple) -> bool:
     graph = model.graph
-    if graph.opset_imports.get("com.microsoft") != 1 or len(set(triple)) != 3:
+    if (
+        graph.opset_imports.get("com.microsoft") != 1
+        or graph.opset_imports.get("", 0) < 13
+        or len(set(triple)) != 3
+    ):
         return False
     first = triple[0]
     if any(
@@ -150,8 +156,10 @@ def _compatible(model: ir.Model, triple: _Triple) -> bool:
         if node.overload not in ("", "default_zero_points"):
             return False
         function = model.functions.get(node.op_identifier())
+        # Only Mobius fallback bodies guarantee the native operator's storage semantics.
         if function is not None and function.metadata_props.get("mobius.function_body") != "1":
             return False
+        # The default-zero-points fallback must agree with the native absent-ZP convention.
         if node.overload == "default_zero_points" and has_zp:
             return False
         if set(node.attributes) - _ATTRIBUTES:
@@ -173,6 +181,7 @@ def _compatible(model: ir.Model, triple: _Triple) -> bool:
         zp = node.inputs[3] if len(node.inputs) > 3 else None
         if (zp is not None) != has_zp:
             return False
+        # Each block has one INT4 zero-point; odd block counts need a final half-used byte.
         if has_zp and not _parameter(graph, zp, ir.DataType.UINT8, [n, (blocks + 1) // 2]):
             return False
         output = node.outputs[0]

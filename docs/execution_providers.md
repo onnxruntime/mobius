@@ -107,13 +107,27 @@ and zero-points must be absent on all three projections or canonical packed
 UINT8 on all three. A power-of-two block size of at least 16 is required.
 Other bit-widths, dtypes, layouts, extra inputs, function overrides, and
 incompatible triples are left unchanged; a mixed 4/4/8 triple is **not**
-partially packed. Other built-in EPs do not enable this pass.
+partially packed. Standard opset >= 13 is required for the two-input `Split`;
+the pass leaves older opsets unchanged. Other built-in EPs do not enable this pass.
 
 Packing concatenates existing parameter storage without precision promotion
 or requantization. Original checkpoint parameter names remain available until
 weights are applied; the resulting parameter Concats fold after loading unless
 `apply_weights(..., fold_constants=False)` is used. No speed improvement is
 claimed without workload-specific measurement.
+
+**Experimental — larger-model numerical validation is pending.** Byte-exact
+parameter packing does not imply bit-identical FP16 outputs: the larger output
+width can change CUDA GEMM behavior. Representative large-dimension prefill and
+cached-decode logits exceeded the current `rtol=atol=1e-2` parity criterion.
+The optimization is not yet validated for real-checkpoint generation.
+
+When using `ORT_FPA_INTB_GEMM=1`, keep the default weight folding or enable ORT
+constant folding. With both exporter folding and runtime graph optimizations
+disabled, deferred parameter Concats can prevent the prepacking required by
+that opt-in CUDA path. The tested unfolded graph runs with ORT BASIC or ALL
+optimization, which folds those Concats; this does not establish support for
+every runtime version or configuration.
 
 ### Tier 3 — EP-specific constraints (required, correctness)
 
@@ -136,21 +150,28 @@ Every EP is fully described by a single `EpCapabilities` entry in the
 `EpRegistry`. To add a new EP, you add one entry to `_register_builtins()` in
 `src/mobius/_execution_providers.py` — no other code changes.
 
+The following is an abridged field sketch, not a positional constructor
+signature; use keyword arguments when configuring capabilities. The new
+projection-packing field is appended after **all** existing fields and defaults
+to an empty set, preserving existing positional arguments.
+
 ```python
 @dataclasses.dataclass(frozen=True)
 class EpCapabilities:
     name: str
-    gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
-    qkv_pack_dtypes: frozenset[ir.DataType]          # dtypes where PackQKV fusion fires
-    matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType]  # projection-only INT4 packing
+    gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
+    qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
     supports_skip_layer_norm: bool = True            # False → InlinePass expansion
-    supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
     supports_fused_moe: bool = True                  # False → decompose fused MoE ops
     supports_packed_multi_head_attention: bool = False  # True → PackedMultiHeadAttention kernel
     default_int4_accuracy_level: int = 0             # 0 = highest accuracy; 4 = fastest
-    provider_options: dict[str, str]                 # Default ORT GenAI provider options
+    provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False               # GPU graph capture default
+    # Other existing capability fields omitted.
+    matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
+        default_factory=frozenset
+    )  # projection-only INT4 packing; independent of float PackQKV's GQA input ABI
 ```
 
 ### Current registry

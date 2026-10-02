@@ -9,6 +9,7 @@ import dataclasses
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
@@ -238,13 +239,18 @@ def test_cuda_qkv_full_decoder_prefill_and_cached_decode(tmp_path, monkeypatch, 
         options.intra_op_num_threads = 1
         options.enable_profiling = True
         options.profile_file_prefix = str(path / "profile")
-        sessions.append(
-            ort.InferenceSession(
-                str(path / "model.onnx"),
-                options,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            )
+        session = ort.InferenceSession(
+            str(path / "model.onnx"),
+            options,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
+        if label == "source" and "CUDAExecutionProvider" not in session.get_providers():
+            pytest.skip("Baseline CUDAExecutionProvider could not initialize on this host")
+        if label == "packed":
+            assert "CUDAExecutionProvider" in session.get_providers(), (
+                "Packed session lost CUDAExecutionProvider after baseline CUDA initialization"
+            )
+        sessions.append(session)
     feeds = {
         "input_ids": np.array([[1, 3, 5], [2, 4, 6]], dtype=np.int64),
         "attention_mask": np.ones((2, 3), dtype=np.int64),
@@ -282,6 +288,27 @@ def test_cuda_qkv_full_decoder_prefill_and_cached_decode(tmp_path, monkeypatch, 
         print(
             f"decoder norm={norm} zp={zp} {label}: {len(providers)} native CUDA MatMulNBits events"
         )
+
+
+@pytest.mark.parametrize("baseline_cuda", [False, True])
+def test_cuda_qkv_full_decoder_runtime_guard(tmp_path, monkeypatch, baseline_cuda):
+    provider = "CUDAExecutionProvider"
+    monkeypatch.setattr(ort, "get_available_providers", lambda: [provider])
+    created = []
+
+    def session(path, options, providers):
+        created.append(Path(path).parent.name)
+        active = [provider] if baseline_cuda and created[-1] == "source" else []
+        return SimpleNamespace(get_providers=lambda: active)
+
+    monkeypatch.setattr(ort, "InferenceSession", session)
+    expected = AssertionError if baseline_cuda else pytest.skip.Exception
+    message = "Packed session lost CUDA" if baseline_cuda else "Baseline CUDA"
+    with pytest.raises(expected, match=message):
+        test_cuda_qkv_full_decoder_prefill_and_cached_decode(
+            tmp_path, monkeypatch, norm=False, zp=False
+        )
+    assert created == (["source", "packed"] if baseline_cuda else ["source"])
 
 
 def _bytes(*shape: int, offset: int = 0) -> torch.Tensor:

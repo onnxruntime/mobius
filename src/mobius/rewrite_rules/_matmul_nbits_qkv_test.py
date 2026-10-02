@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
@@ -224,6 +225,29 @@ def test_supported_anchors_and_missing_output_metadata(anchor_type, overload):
         ["batch", "sequence", width] for width in (8, 6, 10)
     ]
     assert all(value.dtype == ir.DataType.FLOAT16 for value in model.graph.outputs)
+
+
+@pytest.mark.parametrize("opset", [None, 12, 13])
+def test_standard_opset_split_boundary(opset):
+    model, _ = _model()
+    graph = model.graph
+    anchor = next(node for node in graph if node.op_type == "Attention")
+    anchor.domain = "com.microsoft"
+    anchor.op_type = "GroupQueryAttention"
+    if opset is None:
+        del graph.opset_imports[""]
+    else:
+        graph.opset_imports[""] = opset
+    original_nodes = list(graph)
+    original_initializers = dict(graph.initializers)
+    assert pack_matmul_nbits_qkv_pass()(model).modified == (opset == 13)
+    if opset != 13:
+        assert list(graph) == original_nodes
+        assert dict(graph.initializers) == original_initializers
+    else:
+        split = next(node for node in graph if node.op_type == "Split")
+        assert len(split.inputs) == 2
+    assert graph.opset_imports.get("") == opset
 
 
 _NEGATIVE_CASES = [
@@ -576,7 +600,13 @@ def test_projection_numerics_and_native_assignment(tmp_path, provider, k, block,
     )
     fold_initializers_after_weights(packed)
     source_session = _session(source, tmp_path, "source", provider)
+    if provider == "CUDAExecutionProvider" and provider not in source_session.get_providers():
+        pytest.skip("Baseline CUDAExecutionProvider could not initialize on this host")
     packed_session = _session(packed, tmp_path, "packed", provider)
+    if provider == "CUDAExecutionProvider":
+        assert provider in packed_session.get_providers(), (
+            "Packed session lost CUDAExecutionProvider after baseline CUDA initialization"
+        )
     rng = np.random.default_rng(23)
     for sequence in (3, 1):
         a = rng.standard_normal((2, sequence, k)).astype(np.float16)
@@ -593,6 +623,29 @@ def test_projection_numerics_and_native_assignment(tmp_path, provider, k, block,
         f"{provider} K={k} block={block} zp={zp}: "
         f"source={len(source_assignments)} packed={len(packed_assignments)} native events"
     )
+
+
+@pytest.mark.parametrize("baseline_cuda", [False, True])
+def test_native_cuda_skip_gate_requires_baseline_failure(tmp_path, monkeypatch, baseline_cuda):
+    provider = "CUDAExecutionProvider"
+    monkeypatch.setattr(ort, "get_available_providers", lambda: [provider])
+    created = []
+
+    def session(model, directory, label, requested_provider):
+        created.append(label)
+        providers = [provider] if baseline_cuda and label == "source" else []
+        return SimpleNamespace(get_providers=lambda: providers)
+
+    monkeypatch.setitem(
+        test_projection_numerics_and_native_assignment.__globals__, "_session", session
+    )
+    expected = AssertionError if baseline_cuda else pytest.skip.Exception
+    message = "Packed session lost CUDA" if baseline_cuda else "Baseline CUDA"
+    with pytest.raises(expected, match=message):
+        test_projection_numerics_and_native_assignment(
+            tmp_path, provider, k=64, block=32, zp=False
+        )
+    assert created == (["source", "packed"] if baseline_cuda else ["source"])
 
 
 def test_explicit_zero_accuracy_and_ordinary_builtin_overload():
