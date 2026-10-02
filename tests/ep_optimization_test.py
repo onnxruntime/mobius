@@ -20,9 +20,11 @@ import pytest
 from _test_configs import _base_config
 
 from mobius._builder import build_from_module
-from mobius._optimizations import _count_ops, optimize_model
+from mobius._optimizations import _count_ops, optimize_model, validate_standard_onnx
 from mobius._pipeline_contract import declare_arbitrary_attention_mask
 from mobius._registry import registry
+from mobius._testing import create_test_builder, create_test_input
+from mobius.components._scan_utils import create_body_graph
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -391,6 +393,135 @@ def test_unknown_ep_raises():
 
 
 _STANDARD_ONNX_DOMAINS = frozenset({"", "ai.onnx"})
+
+
+@pytest.mark.parametrize("location", ["main", "If", "Scan", "graphs", "signature", "body"])
+@pytest.mark.parametrize("domain,operator", [("test.custom", "Leak"), ("", "NotAnOnnxOp")])
+def test_onnx_standard_validator_rejects_recursive_leaks(location, domain, operator):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    if location == "main":
+        graph.outputs.append(getattr(op, operator)(x, _domain=domain))
+    elif location in {"If", "Scan", "graphs"}:
+        body, body_builder = create_body_graph([], [])
+        body.outputs.append(getattr(body_builder.op, operator)(x, _domain=domain))
+        if location == "If":
+            node = ir.Node(
+                "",
+                "If",
+                [x],
+                attributes=[
+                    ir.AttrGraph("then_branch", body),
+                    ir.AttrGraph("else_branch", body),
+                ],
+                num_outputs=1,
+            )
+        elif location == "Scan":
+            node = ir.Node(
+                "",
+                "Scan",
+                [x],
+                attributes=[ir.AttrGraph("body", body), ir.AttrInt64("num_scan_inputs", 1)],
+                num_outputs=1,
+            )
+        else:
+            node = ir.Node(
+                "",
+                "Identity",
+                [x],
+                attributes=[ir.AttrGraphs("nested", [body])],
+                num_outputs=1,
+            )
+        graph.append(node)
+        graph.outputs.append(node.outputs[0])
+    else:
+        graph.outputs.append(op.Identity(x))
+    model = ir.Model(graph, ir_version=11)
+    if location in {"signature", "body"}:
+        body, body_builder = create_body_graph([], [])
+        body.outputs.append(
+            getattr(body_builder.op, operator if location == "body" else "Identity")(
+                x,
+                _domain=domain if location == "body" else "",
+            )
+        )
+        function = ir.Function(
+            domain if location == "signature" else "",
+            operator if location == "signature" else "Identity",
+            graph=body,
+            attributes={},
+        )
+        model.functions[function.identifier()] = function
+    with pytest.raises(ValueError, match=rf"component 'decoder'.*{operator!r}.*decomposition"):
+        validate_standard_onnx(model, component="decoder")
+
+
+def test_onnx_standard_optimizer_rejects_unresolved_custom_node():
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.outputs.append(op.Leak(x, _domain="test.custom"))
+    model = ir.Model(graph, ir_version=11)
+    with pytest.raises(ValueError, match=r"test.custom.*Leak"):
+        optimize_model(model, ep="onnx-standard")
+
+
+def test_onnx_standard_validates_after_opset_lowering(monkeypatch):
+    import mobius._builder as builder_module
+
+    def insert_leak(package, _ep):
+        model = package["model"]
+        output = model.graph.outputs[0]
+        node = ir.Node("test.custom", "AfterLowering", [output], num_outputs=1)
+        model.graph.append(node)
+        model.graph.outputs[0] = node.outputs[0]
+
+    monkeypatch.setattr(builder_module, "_maybe_apply_opset_lowering", insert_leak)
+    with pytest.raises(ValueError, match=r"component 'model'.*AfterLowering"):
+        _make_llama_pkg("onnx-standard")
+
+
+def test_onnx_standard_validator_rejects_inapplicable_schema_version():
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.outputs.append(op.Identity(x))
+    graph.opset_imports[""] = 0
+    with pytest.raises(ValueError, match=r"opset=0.*no standard"):
+        validate_standard_onnx(ir.Model(graph, ir_version=11))
+
+
+def test_onnx_standard_validates_after_transformers_weight_binding(monkeypatch):
+    from types import SimpleNamespace
+
+    from mobius.integrations.transformers import _builder as transformers_builder
+    from mobius.integrations.transformers import _config_resolver
+
+    config = _base_config()
+    package = _make_llama_pkg("onnx-standard")
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (SimpleNamespace(model_type="llama"), False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (registry.get("llama"), "text-generation", "llama"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    monkeypatch.setattr(transformers_builder, "build_from_module", lambda *a, **k: package)
+    monkeypatch.setattr(transformers_builder, "_download_weights", lambda *a, **k: {})
+
+    def bind(_self, *args, **kwargs):
+        model = package["model"]
+        node = ir.Node("test.custom", "AfterWeights", [model.graph.outputs[0]], num_outputs=1)
+        model.graph.append(node)
+        model.graph.outputs[0] = node.outputs[0]
+
+    monkeypatch.setattr(type(package), "apply_weights", bind)
+    with pytest.raises(ValueError, match=r"component 'model'.*AfterWeights"):
+        transformers_builder.build_transformers_model(
+            "local-synthetic-llama", execution_provider="onnx-standard"
+        )
 
 
 def _non_standard_nodes(model: ir.Model) -> list[tuple[str, str]]:

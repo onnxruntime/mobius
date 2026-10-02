@@ -22,8 +22,11 @@ from onnxruntime.capi.onnxruntime_pybind11_state import (
     NotImplemented as OrtNotImplemented,
 )
 
-from mobius._builder import build_from_module
+from mobius._build_context import build_context
+from mobius._builder import _cast_module_dtype, build_from_module
 from mobius._configs import Qwen4ExpConfig, VisionConfig
+from mobius._execution_providers import EpCapabilities, ep_registry
+from mobius._optimizations import validate_standard_onnx
 from mobius._registry import registry
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
@@ -36,6 +39,7 @@ from mobius.integrations._weight_loading import (
 from mobius.models.qwen4_exp import (
     _PINNED_PLE_WEIGHT_SCALE,
     Qwen4ExpCausalLMModel,
+    Qwen4ExpExperts,
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpQSAIndexer,
     Qwen4ExpVLDecoderModel,
@@ -92,10 +96,12 @@ def _config(**overrides) -> Qwen4ExpConfig:
     return Qwen4ExpConfig(**values)
 
 
-def _build(config: Qwen4ExpConfig | None = None):
+def _build(config: Qwen4ExpConfig | None = None, ep: str = "default"):
     config = config or _config()
     module = Qwen4ExpCausalLMModel(config)
-    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    model = build_from_module(
+        module, config, task="qwen4-exp-text-generation", execution_provider=ep
+    )["model"]
     return config, module, model
 
 
@@ -988,6 +994,357 @@ def test_moe_graph_size_does_not_scale_with_expert_count():
     assert sum(node.op_type == "MoE" for node in four_experts.graph) == 2
 
 
+def test_moe_custom_capabilities_preserve_fused_path():
+    signatures = []
+    for capabilities in [ep_registry.require("default"), EpCapabilities(name="custom")]:
+        config = _config(num_experts_per_tok=2, dtype=ir.DataType.FLOAT16)
+        module = Qwen4ExpExperts(config)
+        _cast_module_dtype(module, config.dtype)
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 3, 16], config.dtype)
+        probabilities = create_test_input(builder, "probabilities", [1, 3, 2])
+        with build_context(capabilities, config.dtype):
+            output = module(op, hidden, probabilities)
+        graph.outputs.append(output)
+        signatures.append(
+            [
+                (n.domain, n.op_type, {k: a.value for k, a in n.attributes.items()})
+                for n in graph
+            ]
+        )
+        fused = next(n for n in graph if n.op_type == "MoE")
+        assert fused.domain == "com.microsoft"
+        assert fused.inputs[1].producer().attributes["to"].value == ir.DataType.FLOAT16
+        assert fused.attributes["k"].value == 2
+        assert module.gate_up_proj.shape == ir.Shape([2, 16, 16])
+        assert module.down_proj.shape == ir.Shape([2, 16, 8])
+        assert not any(n.op_type == "Scan" for n in graph)
+    assert signatures[0] == signatures[1]
+
+
+def _standard_experts(config, shape):
+    module = Qwen4ExpExperts(config)
+    _cast_module_dtype(module, config.dtype)
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", shape, config.dtype)
+    probabilities = create_test_input(
+        builder, "probabilities", [*shape[:-1], config.num_local_experts]
+    )
+    with build_context(ep_registry.require("onnx-standard"), config.dtype):
+        output = module(op, hidden, probabilities)
+    output.name = "output"
+    output.type = ir.TensorType(config.dtype)
+    output.shape = ir.Shape(shape)
+    graph.outputs.append(output)
+    return ir.Model(graph, ir_version=11)
+
+
+@pytest.mark.parametrize("experts", [2, 512])
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+def test_standard_moe_sparse_structure(experts, dtype):
+    config = _config(num_local_experts=experts, dtype=dtype)
+    model = _standard_experts(config, [2, 3, 16])
+    validate_standard_onnx(model)
+    nodes = list(model.graph.all_nodes())
+    assert sum(n.op_type == "MatMul" for n in nodes) == 2
+    scan = next(n for n in nodes if n.op_type == "Scan")
+    body = scan.attributes["body"].as_graph()
+    assert len(scan.inputs) == 2 and len(scan.outputs) == 1
+    assert len(body.inputs) == 2 and len(body.outputs) == 1
+    branch = next(n for n in body if n.op_type == "If")
+    active = branch.attributes["then_branch"].as_graph()
+    weight_gathers = [
+        n
+        for n in active
+        if n.op_type == "Gather"
+        and n.inputs[0].producer() is not None
+        and n.inputs[0].producer().op_type == "Identity"
+    ]
+    assert len(weight_gathers) == 2
+    assert all(n.inputs[1] is body.inputs[1] for n in weight_gathers)
+    assert body.inputs[1].shape == ir.Shape([])
+    assert {n.inputs[0].producer().inputs[0].name for n in weight_gathers} == {
+        "gate_up_proj",
+        "down_proj",
+    }
+    topk = next(n for n in nodes if n.op_type == "TopK")
+    assert topk.inputs[0].producer().attributes["to"].value == ir.DataType.FLOAT
+    assert topk.inputs[1].dtype == ir.DataType.INT64
+    assert topk.inputs[1].shape == ir.Shape([1])
+    route_gather = next(n for n in active if n.op_type == "GatherND")
+    route_cast = route_gather.inputs[0].producer()
+    assert route_cast.op_type == "Cast"
+    assert route_cast.attributes["to"].value == dtype
+    assert route_cast.inputs[0].dtype == ir.DataType.FLOAT
+    assert route_cast.inputs[0].producer().op_type == "Div"
+    assert not any(n.op_type in {"Cast", "CastLike"} for n in active)
+    assert (
+        topk.inputs[1].const_value is not None
+        or topk.inputs[1].producer().op_type == "Constant"
+    )
+    assert not any(n.op_type == "Softmax" for n in nodes)
+    for value in model.graph.initializers.values():
+        if value.const_value is not None:
+            continue
+        value.const_value = ir.tensor(
+            np.zeros(
+                [int(d) for d in value.shape],
+                dtype={
+                    ir.DataType.FLOAT: np.float32,
+                    ir.DataType.FLOAT16: np.float16,
+                    ir.DataType.BFLOAT16: ml_dtypes.bfloat16,
+                }[dtype],
+            )
+        )
+    onnx.checker.check_model(ir.to_proto(model), full_check=True)
+
+
+@pytest.mark.parametrize("top_k", [1, 2, 4])
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("shape", [[1, 1, 16], [2, 3, 16]])
+@pytest.mark.parametrize(
+    "routes", ["ties", "near_ties", "first", "last", "saturated", "mixed"]
+)
+def test_standard_moe_independent_reference(top_k, normalize, shape, routes):
+    config = _config(
+        num_local_experts=4,
+        num_experts_per_tok=top_k,
+        norm_topk_prob=normalize,
+        routed_scaling_factor=1.7,
+    )
+    model = _standard_experts(config, shape)
+    rng = np.random.default_rng(41)
+    hidden = rng.normal(0, 0.2, shape).astype(np.float32)
+    banks = {}
+    for name, value in model.graph.initializers.items():
+        if value.const_value is not None:
+            continue
+        banks[name] = rng.normal(0, 0.2, [int(d) for d in value.shape]).astype(np.float32)
+        value.const_value = ir.tensor(banks[name])
+    logits = {
+        "ties": [0, 0, 0, 0],
+        "near_ties": [0, 0.0001, 0.0002, 0.0003],
+        "first": [4, 0, -1, -2],
+        "last": [-2, -1, 0, 4],
+        "saturated": [-1000, -500, 500, 1000],
+        "mixed": [4, 0, -1, -2],
+    }[routes]
+    logits = np.broadcast_to(np.array(logits, dtype=np.float32), [*shape[:-1], 4])
+    if routes == "mixed":
+        logits = np.stack(
+            [np.roll(row, token % 4) for token, row in enumerate(logits.reshape(-1, 4))]
+        ).reshape(logits.shape)
+    exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probabilities = exp / exp.sum(axis=-1, keepdims=True)
+    flat_probs = probabilities.reshape(-1, 4)
+    # ONNX TopK breaks exact ties by lower index; stable descending sort is
+    # independent of the exported NonZero/Scan dispatch implementation.
+    selected = np.argsort(-flat_probs, axis=-1, kind="stable")[:, :top_k]
+    expected = np.zeros_like(hidden.reshape(-1, 16))
+    for token, x in enumerate(hidden.reshape(-1, 16)):
+        weights = flat_probs[token, selected[token]].copy()
+        if normalize:
+            weights /= weights.sum(dtype=np.float32)
+        for expert in range(4):
+            match = np.flatnonzero(selected[token] == expert)
+            if not len(match):
+                continue
+            gate, up = np.split(banks["gate_up_proj"][expert] @ x, 2)
+            activated = gate / (1 + np.exp(-gate)) * up
+            expected[token] += (banks["down_proj"][expert] @ activated) * weights[match[0]]
+    expected *= np.float32(1.7)
+    onnx.checker.check_model(ir.to_proto(model), full_check=True)
+    session = OnnxModelSession(model)
+    try:
+        actual = session.run({"hidden": hidden, "probabilities": probabilities})["output"]
+    finally:
+        session.close()
+    np.testing.assert_allclose(actual, expected.reshape(shape), rtol=2e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+def test_standard_all_components_before_after_weights(multimodal, dtype):
+    config = (_vl_config if multimodal else _config)(dtype=dtype, num_experts_per_tok=2)
+    module = (Qwen4ExpForConditionalGeneration if multimodal else Qwen4ExpCausalLMModel)(
+        config
+    )
+    package = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-vision-language" if multimodal else "qwen4-exp-text-generation",
+        execution_provider="onnx-standard",
+    )
+    for name, model in package.items():
+        validate_standard_onnx(model, component=name)
+        assert not model.functions
+        # Unbound parameters have no payload yet; checking the serialized graph
+        # uses tiny synthetic payloads, never checkpoint downloads.
+        for value in model.graph.initializers.values():
+            if value.const_value is None:
+                value.const_value = ir.tensor(
+                    np.zeros(
+                        [int(d) for d in value.shape],
+                        dtype={
+                            ir.DataType.FLOAT: np.float32,
+                            ir.DataType.FLOAT16: np.float16,
+                            ir.DataType.BFLOAT16: ml_dtypes.bfloat16,
+                        }[value.dtype],
+                    )
+                )
+        validate_standard_onnx(model, component=name)
+        onnx.checker.check_model(ir.to_proto(model), full_check=True)
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_standard_moe_low_precision_execution_and_routing(dtype, normalize):
+    np_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else ml_dtypes.bfloat16
+    config = _config(dtype=dtype, num_experts_per_tok=1, norm_topk_prob=normalize)
+    model = _standard_experts(config, [1, 1, 16])
+    for value in model.graph.initializers.values():
+        if value.const_value is None:
+            # Distinct constant experts make wrong near-tie selection observable.
+            data = np.ones([int(d) for d in value.shape], dtype=np_dtype) * np_dtype(0.1)
+            data[1] *= np_dtype(2)
+            value.const_value = ir.tensor(data)
+    probabilities = np.array([[[0.49998, 0.50002]]], dtype=np.float32)
+    assert probabilities.astype(np_dtype)[0, 0, 0] == probabilities.astype(np_dtype)[0, 0, 1]
+    hidden = np.full([1, 1, 16], 0.1, dtype=np_dtype)
+    torch_dtype = torch.float16 if dtype == ir.DataType.FLOAT16 else torch.bfloat16
+    x = torch.full((1, 16), 0.1, dtype=torch_dtype)
+    gate_up = torch.full((16, 16), 0.1, dtype=torch_dtype) * 2
+    down = torch.full((16, 8), 0.1, dtype=torch_dtype) * 2
+    gate, up = (x @ gate_up.T).chunk(2, dim=-1)
+    expected = ((gate * torch.sigmoid(gate) * up) @ down.T) * torch.tensor(
+        1.0 if normalize else 0.50002, dtype=torch_dtype
+    )
+    try:
+        session = OnnxModelSession(model)
+    except OrtNotImplemented as error:
+        if dtype != ir.DataType.BFLOAT16 or not re.fullmatch(
+            r"\[ONNXRuntimeError\] : 9 : NOT_IMPLEMENTED : Could not find an "
+            r"implementation for Expand\(13\) node with name 'Expand_node_\d+'",
+            str(error),
+        ):
+            raise
+        pytest.skip(f"ORT CPU BF16 capability gap: {error}")
+    try:
+        actual = session.run({"hidden": hidden, "probabilities": probabilities})["output"]
+    finally:
+        session.close()
+    np.testing.assert_allclose(
+        actual.astype(np.float32).reshape(1, 16),
+        expected.float().numpy(),
+        rtol=2e-3,
+        atol=1e-5,
+    )
+
+
+def test_standard_moe_node_count_independent_of_expert_count():
+    models = [_standard_experts(_config(num_local_experts=e), [1, 1, 16]) for e in [2, 512]]
+    assert len(list(models[0].graph.all_nodes())) == len(list(models[1].graph.all_nodes()))
+    for name in ["gate_up_proj", "down_proj"]:
+        assert (
+            models[0].graph.initializers[name].shape[1:]
+            == (models[1].graph.initializers[name].shape[1:])
+        )
+
+
+def test_standard_nonzero_image_features_pipeline():
+    config = _vl_config(num_experts_per_tok=2)
+    package = build_from_module(
+        Qwen4ExpForConditionalGeneration(config),
+        config,
+        task="qwen4-exp-vision-language",
+        execution_provider="onnx-standard",
+    )
+    rng = np.random.default_rng(93)
+    for model in package.values():
+        for value in model.graph.initializers.values():
+            if value.const_value is None:
+                value.const_value = ir.tensor(
+                    rng.normal(0, 0.02, [int(d) for d in value.shape]).astype(np.float32)
+                )
+        validate_standard_onnx(model)
+        onnx.checker.check_model(ir.to_proto(model), full_check=True)
+    vision = OnnxModelSession(package["vision_encoder"])
+    embedding = OnnxModelSession(package["embedding"])
+    decoder = OnnxModelSession(package["decoder"])
+    try:
+        features = vision.run(
+            {
+                "pixel_values": rng.normal(0, 0.2, [4, 1536]).astype(np.float32),
+                "image_grid_thw": np.array([[1, 2, 2]], dtype=np.int64),
+            }
+        )["image_features"]
+        assert features.shape == (1, config.hidden_size)
+        assert np.any(features != 0)
+        ids = np.array([[2, config.image_token_id, 3, 4, 5]], dtype=np.int64)
+        embeds = embedding.run({"input_ids": ids, "image_features": features})["inputs_embeds"]
+        np.testing.assert_array_equal(embeds[0, 1], features[0])
+        states = _initial_states()
+        states["past_position_ids"] = np.zeros((4, 1, 0), dtype=np.int64)
+        outputs = decoder.run(
+            states
+            | {
+                "inputs_embeds": embeds,
+                "ple_input_ids": ids,
+                "attention_mask": np.ones_like(ids),
+                "position_ids": np.broadcast_to(
+                    np.arange(5, dtype=np.int64), (4, 1, 5)
+                ).copy(),
+            }
+        )
+        assert outputs["logits"].shape == (1, 5, config.vocab_size)
+        assert all(np.all(np.isfinite(value)) for value in outputs.values())
+    finally:
+        vision.close()
+        embedding.close()
+        decoder.close()
+
+
+def test_standard_rejects_custom_node_inserted_by_qdq_binding(monkeypatch):
+    from mobius.integrations.transformers import _builder as transformers_builder
+    from mobius.integrations.transformers import _config_resolver
+
+    config = _fp8_config()
+    package = build_from_module(
+        Qwen4ExpCausalLMModel(config),
+        config,
+        task="qwen4-exp-text-generation",
+        execution_provider="onnx-standard",
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *a, **k: (SimpleNamespace(model_type="qwen4_exp_text"), False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *a, **k: (Qwen4ExpCausalLMModel, "qwen4-exp-text-generation", "qwen4_exp_text"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *a, **k: config)
+    monkeypatch.setattr(transformers_builder, "build_from_module", lambda *a, **k: package)
+
+    def bind(model, *args, **kwargs):
+        node = ir.Node("test.custom", "AfterQDQ", [model.graph.outputs[0]], num_outputs=1)
+        model.graph.append(node)
+        model.graph.outputs[0] = node.outputs[0]
+        return {}
+
+    monkeypatch.setattr(transformers_builder, "stream_qdq_safetensors_to_model", bind)
+    with pytest.raises(ValueError, match=r"component 'model'.*AfterQDQ"):
+        transformers_builder.build_transformers_model(
+            "synthetic-qwen4-fp8", execution_provider="onnx-standard"
+        )
+
+
 def test_preprocess_validates_packed_experts_and_joins_ple_shards():
     config = _config(split_ngram_parts=2)
     module = Qwen4ExpCausalLMModel(config)
@@ -1373,10 +1730,13 @@ def test_fp8_streaming_plan_prefers_composite_keys_and_classifies_sidecars():
     assert plan.report["excluded_tensors"]["visual"]["count"] == 1
 
 
-def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_path):
+@pytest.mark.parametrize("ep", ["default", "onnx-standard"])
+def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_path, ep):
     config = _fp8_config()
     module = Qwen4ExpCausalLMModel(config)
-    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    model = build_from_module(
+        module, config, task="qwen4-exp-text-generation", execution_provider=ep
+    )["model"]
     source, dense_targets = _reduced_fp8_checkpoint(module)
     safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
 
@@ -1386,11 +1746,14 @@ def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_pat
         module.build_fp8_streaming_plan,
         revision="reduced-independent-fixture",
     )
+    if ep == "onnx-standard":
+        validate_standard_onnx(model)
+        onnx.checker.check_model(ir.to_proto(model), full_check=True)
 
     reference_module = Qwen4ExpCausalLMModel(config)
-    reference = build_from_module(reference_module, config, task="qwen4-exp-text-generation")[
-        "model"
-    ]
+    reference = build_from_module(
+        reference_module, config, task="qwen4-exp-text-generation", execution_provider=ep
+    )["model"]
     apply_weights(reference, dense_targets)
     feeds = _initial_states() | {
         "input_ids": np.array([[2, 3, 4]], dtype=np.int64),
@@ -1515,13 +1878,15 @@ def test_fp8_qdq_source_recipe_matches_all_dense_fallback_targets():
         np.testing.assert_array_equal(actual.numpy(), expected.numpy())
 
 
-def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
+@pytest.mark.parametrize("ep", ["default", "onnx-standard"])
+def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path, ep):
     config = _fp8_config()
     module = Qwen4ExpCausalLMModel(config)
     package = build_from_module(
         module,
         config,
         task="qwen4-exp-text-generation",
+        execution_provider=ep,
     )
     source, _dense_targets = _reduced_fp8_checkpoint(module)
     names = sorted(source)
@@ -1545,6 +1910,8 @@ def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
         revision="reduced-multishard-fixture",
     )
     package.weight_loading_report = report
+    if ep == "onnx-standard":
+        validate_standard_onnx(model)
 
     fp8_names = {
         name for name, tensor in source.items() if tensor.dtype == torch.float8_e4m3fn
@@ -2152,8 +2519,9 @@ def _initial_states() -> dict[str, np.ndarray]:
     }
 
 
-def test_random_weight_prefill_matches_token_by_token_decode():
-    _config_value, _module, model = _build()
+@pytest.mark.parametrize("ep", ["default", "onnx-standard"])
+def test_random_weight_prefill_matches_token_by_token_decode(ep):
+    _config_value, _module, model = _build(_config(num_experts_per_tok=2), ep=ep)
     rng = np.random.default_rng(0)
     for value in model.graph.initializers.values():
         if value.const_value is None:
@@ -2161,17 +2529,18 @@ def test_random_weight_prefill_matches_token_by_token_decode():
                 rng.normal(0.0, 0.02, [int(dim) for dim in value.shape]).astype(np.float32)
             )
 
-    input_ids = np.array([[2, 3, 4, 5]], dtype=np.int64)
+    input_ids = np.arange(2, 12, dtype=np.int64)[None]
     session = OnnxModelSession(model)
     try:
-        full = session.run(
+        full_outputs = session.run(
             _initial_states()
             | {
                 "input_ids": input_ids,
-                "attention_mask": np.ones((1, 4), dtype=np.int64),
-                "position_ids": np.arange(4, dtype=np.int64)[None],
+                "attention_mask": np.ones_like(input_ids),
+                "position_ids": np.arange(input_ids.shape[1], dtype=np.int64)[None],
             }
-        )["logits"]
+        )
+        full = full_outputs["logits"]
 
         states = _initial_states()
         decode_logits = []
@@ -2204,13 +2573,18 @@ def test_random_weight_prefill_matches_token_by_token_decode():
         rtol=1e-5,
         atol=1e-6,
     )
+    for name in full_outputs:
+        if name != "logits":
+            np.testing.assert_allclose(outputs[name], full_outputs[name], rtol=1e-5, atol=1e-6)
 
 
-def test_multimodal_decoder_matches_text_route_with_identical_positions():
-    text_config, _text_module, text_model = _build()
-    vl_config = _vl_config()
+@pytest.mark.parametrize("ep", ["default", "onnx-standard"])
+def test_multimodal_decoder_matches_text_route_with_identical_positions(ep):
+    text_config, _text_module, text_model = _build(_config(num_experts_per_tok=2), ep=ep)
+    vl_config = _vl_config(num_experts_per_tok=2)
     vl_decoder = Qwen4ExpVLDecoderModel(vl_config)
-    vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
+    with build_context(ep_registry.require(ep), vl_config.dtype):
+        vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
 
     rng = np.random.default_rng(7)
     values: dict[str, np.ndarray] = {}
@@ -2238,14 +2612,15 @@ def test_multimodal_decoder_matches_text_route_with_identical_positions():
     text_session = OnnxModelSession(text_model)
     vl_session = OnnxModelSession(vl_model)
     try:
-        text_logits = text_session.run(
+        text_outputs = text_session.run(
             _initial_states()
             | {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": text_positions,
             }
-        )["logits"]
+        )
+        text_logits = text_outputs["logits"]
         vl_states = _initial_states()
         vl_states["past_position_ids"] = np.zeros((4, 1, 0), dtype=np.int64)
         vl_outputs = vl_session.run(
@@ -2304,13 +2679,23 @@ def test_multimodal_decoder_matches_text_route_with_identical_positions():
         vl_session.close()
 
     np.testing.assert_allclose(vl_logits, text_logits, rtol=1e-5, atol=1e-6)
+    for name in text_outputs:
+        if name == "logits":
+            continue
+        if name == "present_position_ids":
+            np.testing.assert_array_equal(vl_outputs[name][0], text_outputs[name])
+        else:
+            np.testing.assert_allclose(
+                vl_outputs[name], text_outputs[name], rtol=1e-5, atol=1e-6
+            )
     np.testing.assert_allclose(alternate_logits, vl_logits, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(alternate_decode_logits, decode_logits, rtol=1e-5, atol=1e-6)
     assert text_config.hidden_size == vl_config.hidden_size
 
 
-def test_left_padding_matches_unpadded_prefill_and_following_decode():
-    _config_value, _module, model = _build()
+@pytest.mark.parametrize("ep", ["default", "onnx-standard"])
+def test_left_padding_matches_unpadded_prefill_and_following_decode(ep):
+    _config_value, _module, model = _build(_config(num_experts_per_tok=2), ep=ep)
     rng = np.random.default_rng(1)
     for value in model.graph.initializers.values():
         if value.const_value is None:
@@ -2371,6 +2756,11 @@ def test_left_padding_matches_unpadded_prefill_and_following_decode():
         rtol=1e-5,
         atol=1e-6,
     )
+    for name in unpadded_decode:
+        if name != "logits":
+            np.testing.assert_allclose(
+                padded_decode[name], unpadded_decode[name], rtol=1e-5, atol=1e-6
+            )
 
 
 @pytest.mark.integration
