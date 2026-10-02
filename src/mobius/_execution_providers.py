@@ -408,6 +408,7 @@ def _register_builtins() -> None:
         # standard Attention's concat-grow semantics handle the cache.
         EpCapabilities(
             name="onnx-standard",
+            supports_fused_moe=False,
             gqa_dtypes=frozenset(),  # no GroupQueryAttention
             qkv_pack_dtypes=frozenset(),  # no PackQKV
             supports_fused_rope=False,  # no fused RoPE inside GQA (GQA not supported)
