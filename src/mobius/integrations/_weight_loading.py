@@ -20,6 +20,7 @@ __all__ = [
     "StreamingWeightPlan",
     "StreamingWeightSource",
     "apply_weights",
+    "iter_weight_shards",
     "stream_qdq_safetensors_to_model",
     "stream_preprocessed_safetensors_to_model",
     "stream_safetensors_to_model",
@@ -33,7 +34,7 @@ import json
 import logging
 import math
 import pathlib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import Literal, cast
 
 import onnx_ir as ir
@@ -503,6 +504,27 @@ def _resolve_shard_paths(model_id: str, revision: str | None = None) -> list[str
         all_files = [_SINGLE_WEIGHT_NAME]
 
     return _parallel_download(model_id, all_files, revision=revision, desc="safetensors")
+
+
+def iter_weight_shards(
+    model_id: str, revision: str | None = None
+) -> Iterator[dict[str, torch.Tensor]]:
+    """Yield raw checkpoint state dictionaries one safetensors shard at a time.
+
+    Index entries may reference safe relative subpaths, as used by unified
+    checkpoints whose transformer and vision weights share a top-level index.
+    *revision* pins the Hugging Face revision used for every downloaded file.
+    Keeping shard boundaries lets composite exporters route a tensor to
+    multiple component graphs before advancing to the next file.
+
+    FP8 dequantization is intentionally not performed here: a weight and its
+    ``weight_scale_inv`` may live in different shards. Callers that need
+    dequantized weights must merge the shards first, as :func:`_download_weights`
+    does, or implement an index-aware cross-shard scale resolver.
+    """
+    paths = _resolve_shard_paths(model_id, revision=revision)
+    for path in tqdm.tqdm(paths, desc="Loading weights"):
+        yield safetensors.torch.load_file(path)
 
 
 def _download_weights(model_id: str, revision: str | None = None) -> dict[str, torch.Tensor]:

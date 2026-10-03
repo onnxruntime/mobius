@@ -11,12 +11,14 @@ import torch.nn.functional as functional
 from onnxscript import nn
 
 from mobius import (
+    LatentDynamicsConfig,
+    MLPLatentDynamicsModel,
     MLPWorldModel,
     WorldModelConfig,
     WorldModelTask,
     build_from_module,
 )
-from mobius.tasks import TASK_REGISTRY, get_task
+from mobius.tasks import TASK_REGISTRY, LatentDynamicsTask, get_task
 
 
 class _TorchMLPWorldModel(torch.nn.Module):
@@ -100,8 +102,16 @@ class TestWorldModelConfig:
 
 class TestWorldModelTask:
     def test_registered(self):
+        assert TASK_REGISTRY["latent-dynamics"] is LatentDynamicsTask
         assert TASK_REGISTRY["world-model"] is WorldModelTask
+        assert WorldModelTask is LatentDynamicsTask
         assert isinstance(get_task("world-model"), WorldModelTask)
+        assert isinstance(get_task("latent-dynamics"), LatentDynamicsTask)
+
+    def test_backward_compatible_aliases(self):
+        assert WorldModelConfig is LatentDynamicsConfig
+        assert MLPWorldModel is MLPLatentDynamicsModel
+        assert MLPLatentDynamicsModel.default_task == "latent-dynamics"
 
     def test_graph_contract(self):
         config = _config()

@@ -14,6 +14,7 @@ getting-started
 cli_reference
 module-architecture
 model-catalog
+world-models
 models/index
 ```
 
