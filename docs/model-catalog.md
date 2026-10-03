@@ -1,5 +1,92 @@
 # Model Catalog
 
+## Non-generative decision models
+
+Mobius exports `Contrastive-LM/CLM-v0.1-8B` with one `ModelPackage`
+containing its headless Qwen3 encoder, state/action projection heads, and
+scaled-cosine scorer (`CLMModel` + `CLMTask`). The CLM release did **not** pin a
+Qwen3-8B base revision: generic construction records the base as `unpinned`;
+`build_clm_package(..., base_revision=<sha>)` requires the caller's selected
+revision and records it as reproducible provenance.
+
+The v0.1 heads first L2-normalize each selected Qwen embedding, then use depth
+3: input `Linear + GELU`, one
+`Linear + LayerNorm + GELU` hidden block (optionally residual), output
+`Linear`, then L2 normalization. The headless encoder emits the complete
+`token_hidden_states` tensor, contains no vocabulary projection, and has no
+generation-cache inputs or outputs. CLM uses
+last-token pooling, but neither the upstream padding side nor its EOS behavior
+is pinned. Callers must select the last attended position using their
+attention mask (the deterministic `clm_last_token_indices` helper is provided)
+before passing `[items, 4096]` embeddings to either projection head. Mobius
+does not assume that sequence position `-1` is a real token.
+
+`jaredpalmer/kev-4b` similarly exports its headless Qwen3.5 backbone and grouped
+pointer head (`KevModel` + `KevTask`). Its published Qwen3.5 base revision is
+pinned. The backbone package exposes only input IDs, attention/position inputs,
+and token hidden states; KV, convolution, and recurrent generation caches are
+not part of this scoring export. `build_kev_package` accepts a dense state dict
+after the published PEFT
+adapter has been merged. Mobius does not currently merge arbitrary PEFT LoRA
+artifacts into Qwen3.5: passing separate base/adapter mappings fails with an
+actionable instruction to use PEFT `merge_and_unload()` first, rather than
+silently exporting the unadapted base.
+
+The deterministic request adapters in `mobius.models.decision` implement each
+model's verified structured rendering, candidate mapping, stable grouped
+softmax, confidence, and ranking contracts. They require a caller-provided
+tokenizer and local tensors; export and preprocessing do not use an HTTP or
+session API. Checkpoint mapping helpers accept already-deserialized mappings,
+so applications retain control over pickle deserialization. Production build
+helpers validate the complete published checkpoint metadata, exact head key
+sets, tensor shapes, and scalar calibration before constructing any graph.
+Flexible `synthetic_*_checkpoint` helpers are test fixtures and intentionally
+do not pass these production contracts.
+
+The Kev adapter enforces the published 8,192-token causal-row limit, 1–255
+option bounds, and a non-empty question set. Non-strict mode truncates state
+user tokens to 8,191 before adding the state control token; strict mode rejects
+that overflow. Every question remains an independent state-plus-question row;
+`batch_kev_rows` produces padded backbone inputs and matching local
+decide/option indices for the pointer graph. Score confidence is
+`max(0, 1 - Σ pᵢ|i-mode|/(L-1))`, matching the public adapter.
+
+### Decision-model parity tests
+
+`tests/kev_parity_test.py` and `tests/clm_parity_test.py` contain fast synthetic
+ONNX-versus-PyTorch tests that run in the normal CPU test lane:
+
+```bash
+pytest tests/kev_parity_test.py tests/clm_parity_test.py -m "not integration"
+```
+
+The full tests are opt-in because they load the exported FP32 package and its
+reference model on CUDA. Keep user-site packages disabled when the selected
+Conda environment contains the intended ONNX Runtime GPU build.
+
+```bash
+# Pinned KEV base, adapter, preprocessing, hidden-state readouts, pointer head,
+# probabilities, and typed answers.
+PYTHONNOUSERSITE=1 \
+MOBIUS_DECISION_EXPORT_ROOT=/path/to/kev-4b-fp32 \
+MOBIUS_KEV_ALLOW_DOWNLOAD=1 \
+pytest tests/kev_parity_test.py -m integration
+
+# CLM with an explicitly selected Qwen3 revision.
+PYTHONNOUSERSITE=1 \
+CLM_RUN_FULL_PARITY=1 \
+CLM_BASE_REVISION=<immutable-qwen3-revision> \
+MOBIUS_DECISION_EXPORT_ROOT=/path/to/clm-v0.1-8b-fp32 \
+pytest tests/clm_parity_test.py -m integration -k exported_clm
+```
+
+CLM's official serving path remains a separate qualification because upstream
+did not pin Qwen3, vLLM, or tokenizer/pooling versions. Start and record an
+external `vllm serve ... --runner pooling` instance, then set
+`CLM_RUN_VLLM_PARITY=1`, `CLM_EMBED_URL`, `CLM_EMBED_MODEL`, and
+`CLM_VLLM_METADATA` to compare its normalized embeddings and probabilities
+against the same exported package.
+
 This user-facing catalog groups registered HuggingFace model types by task and lists
 their module classes and example model IDs. Diffusers pipeline components are described
 separately because they are not entries in the model registry. Neither list implies GGUF

@@ -21,6 +21,12 @@ __all__ = [
     "BaseModelConfig",
     "CausalLMConfig",
     "CausalLMTask",
+    "CLMModel",
+    "CLMProjectionHead",
+    "CLMTask",
+    "ComponentConfig",
+    "ComponentRole",
+    "ComponentSpec",
     "ComponentInfo",
     "SharedWeightEndpoint",
     "SharedWeightInfo",
@@ -42,6 +48,10 @@ __all__ = [
     "ModelRegistration",
     "ModelRegistry",
     "ModelTask",
+    "MultiComponentModelTask",
+    "KevModel",
+    "KevPointerHead",
+    "KevTask",
     "MLPWorldModel",
     "MMSConfig",
     "OPSET_VERSION",
@@ -58,11 +68,13 @@ __all__ = [
     "adapter_source_from_onnx_adapter",
     "attach_peft_adapter",
     "build",
+    "build_clm_package",
     "build_context",
     "build_diffusers_pipeline",
     "build_from_gguf",
     "build_from_module",
     "build_from_nemo",
+    "build_kev_package",
     "compose_adapter_deltas",
     "components",
     "ep_capabilities",
@@ -154,5 +166,23 @@ from mobius.integrations.diffusers import build_diffusers_pipeline
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo
 from mobius.integrations.transformers import build
-from mobius.models import MLPWorldModel
-from mobius.tasks import CausalLMTask, ModelTask, WorldModelTask
+from mobius.models import (
+    CLMModel,
+    CLMProjectionHead,
+    KevModel,
+    KevPointerHead,
+    MLPWorldModel,
+    build_clm_package,
+    build_kev_package,
+)
+from mobius.tasks import (
+    CausalLMTask,
+    CLMTask,
+    ComponentConfig,
+    ComponentRole,
+    ComponentSpec,
+    KevTask,
+    ModelTask,
+    MultiComponentModelTask,
+    WorldModelTask,
+)
