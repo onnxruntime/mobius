@@ -375,3 +375,243 @@ class Glm4VVisionModel(GlmOcrVisionModel):
         hidden_states = self.downsample(op, hidden_states)
         hidden_states = op.Reshape(hidden_states, [-1, self._out_hidden_size])
         return self.merger(op, hidden_states)
+
+
+class Glm5NextVisionAttention(Qwen25VLVisionAttention):
+    """GLM-5.3 packed vision attention with per-head Q/K RMS normalization."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        norm_eps: float,
+    ) -> None:
+        super().__init__(hidden_size, num_heads)
+        self.q_norm = RMSNorm(self.head_dim, eps=norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=norm_eps)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        cu_seqlens: ir.Value,
+        cos: ir.Value,
+        sin: ir.Value,
+    ) -> ir.Value:
+        seq_len = op.Shape(hidden_states, start=0, end=1)
+        qkv = op.Reshape(
+            self.qkv(op, hidden_states),
+            op.Concat(seq_len, [3, self.num_heads, self.head_dim], axis=0),
+        )
+        qkv = op.Transpose(qkv, perm=[1, 0, 2, 3])  # [3, N, heads, head_dim]
+        query = op.Squeeze(op.Gather(qkv, [0], axis=0), [0])
+        key = op.Squeeze(op.Gather(qkv, [1], axis=0), [0])
+        value = op.Squeeze(op.Gather(qkv, [2], axis=0), [0])
+
+        # Upstream normalizes in the model dtype, evaluates rotary math in
+        # float32, then casts Q/K back before packed attention.
+        query = self.q_norm(op, query)
+        key = self.k_norm(op, key)
+        query_rotated = self._apply_rotary(
+            op,
+            op.Cast(query, to=ir.DataType.FLOAT),
+            op.Cast(cos, to=ir.DataType.FLOAT),
+            op.Cast(sin, to=ir.DataType.FLOAT),
+        )
+        key_rotated = self._apply_rotary(
+            op,
+            op.Cast(key, to=ir.DataType.FLOAT),
+            op.Cast(cos, to=ir.DataType.FLOAT),
+            op.Cast(sin, to=ir.DataType.FLOAT),
+        )
+        query = op.CastLike(query_rotated, query)
+        key = op.CastLike(key_rotated, key)
+
+        from mobius._build_context import ep_capabilities
+
+        if ep_capabilities().supports_packed_multi_head_attention:
+            output = self._emit_packed_mha(op, query, key, value, cu_seqlens, seq_len)
+        else:
+            output = self._emit_standard_attention(op, query, key, value, cu_seqlens, seq_len)
+        return self.proj(op, output)
+
+
+class _Glm5NextClampedMLP(nn.Module):
+    """Bias-bearing SwiGLU with the checkpoint's finite activation clamp."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        swiglu_limit: float,
+    ) -> None:
+        super().__init__()
+        self.gate_proj = Linear(hidden_size, intermediate_size, bias=True)
+        self.up_proj = Linear(hidden_size, intermediate_size, bias=True)
+        self.down_proj = Linear(intermediate_size, hidden_size, bias=True)
+        self._limit = swiglu_limit
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        gate = op.Clip(self.gate_proj(op, hidden_states), None, self._limit)
+        up = op.Clip(self.up_proj(op, hidden_states), -self._limit, self._limit)
+        return self.down_proj(op, op.Mul(op.Swish(gate), up))
+
+
+class Glm5NextVisionBlock(nn.Module):
+    """GLM-5.3 RMS-pre-norm vision transformer block."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        norm_eps: float,
+        swiglu_limit: float,
+    ) -> None:
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_size, eps=norm_eps)
+        self.norm2 = RMSNorm(hidden_size, eps=norm_eps)
+        self.attn = Glm5NextVisionAttention(hidden_size, num_heads, norm_eps)
+        self.mlp = _Glm5NextClampedMLP(
+            hidden_size,
+            intermediate_size,
+            swiglu_limit,
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        cu_seqlens: ir.Value,
+        cos: ir.Value,
+        sin: ir.Value,
+    ) -> ir.Value:
+        residual = hidden_states
+        hidden_states = self.attn(
+            op,
+            self.norm1(op, hidden_states),
+            cu_seqlens=cu_seqlens,
+            cos=cos,
+            sin=sin,
+        )
+        hidden_states = op.Add(residual, hidden_states)
+
+        residual = hidden_states
+        hidden_states = self.mlp(op, self.norm2(op, hidden_states))
+        return op.Add(residual, hidden_states)
+
+
+class Glm5NextVisionPatchMerger(nn.Module):
+    """GLM-5.3 post-downsample projection, GELU, and clamped SwiGLU."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        swiglu_limit: float,
+    ) -> None:
+        super().__init__()
+        self.proj = Linear(hidden_size, hidden_size, bias=False)
+        self.post_projection_norm = LayerNorm(hidden_size, eps=1e-5)
+        self.gate_proj = Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = Linear(intermediate_size, hidden_size, bias=False)
+        self._limit = swiglu_limit
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        hidden_states = op.Gelu(
+            self.post_projection_norm(op, self.proj(op, hidden_states)),
+            approximate="none",
+        )
+        gate = op.Clip(self.gate_proj(op, hidden_states), None, self._limit)
+        up = op.Clip(self.up_proj(op, hidden_states), -self._limit, self._limit)
+        return self.down_proj(op, op.Mul(op.Swish(gate), up))
+
+
+class Glm5NextVisionModel(Glm4VVisionModel):
+    """GLM-5.3 packed image/video ViT with 2x2 learned downsampling."""
+
+    def __init__(
+        self,
+        *,
+        depth: int,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        patch_size: int,
+        temporal_patch_size: int,
+        in_channels: int,
+        out_hidden_size: int,
+        spatial_merge_size: int,
+        norm_eps: float,
+        projector_intermediate_size: int,
+        swiglu_limit: float,
+    ) -> None:
+        nn.Module.__init__(self)
+        if spatial_merge_size != 2:
+            raise ValueError("GLM-5.3 requires a 2x2 spatial merge")
+        if hidden_size % num_heads:
+            raise ValueError("GLM-5.3 vision hidden size must divide its head count")
+        self._spatial_merge_size = spatial_merge_size
+        self._spatial_merge_unit = spatial_merge_size**2
+        self._hidden_size = hidden_size
+        self._out_hidden_size = out_hidden_size
+        self.patch_embed: Any = GlmOcrVisionPatchEmbed(
+            patch_size=patch_size,
+            temporal_patch_size=temporal_patch_size,
+            in_channels=in_channels,
+            hidden_size=hidden_size,
+        )
+        self.rotary_pos_emb: Any = GlmOcrVisionRotaryEmbedding(hidden_size // num_heads // 2)
+        self.blocks = nn.ModuleList(
+            [
+                Glm5NextVisionBlock(
+                    hidden_size,
+                    intermediate_size,
+                    num_heads,
+                    norm_eps,
+                    swiglu_limit,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.post_layernorm = RMSNorm(hidden_size, eps=norm_eps)
+        self.downsample = Conv2d(
+            hidden_size,
+            out_hidden_size,
+            kernel_size=spatial_merge_size,
+            stride=spatial_merge_size,
+        )
+        self.merger: Any = Glm5NextVisionPatchMerger(
+            out_hidden_size,
+            projector_intermediate_size,
+            swiglu_limit,
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        image_grid_thw: ir.Value,
+    ) -> ir.Value:
+        # The processor emits merge-major packed patches for both images and
+        # videos. Per-frame boundaries prevent cross-frame visual attention.
+        pixel_values = self._guard_grid_contract(op, pixel_values, image_grid_thw)
+        hidden_states = self.patch_embed(op, pixel_values)  # [N, vision_hidden]
+        position_ids = self._compute_rotary_pos_ids(op, image_grid_thw)
+        cu_seqlens = self._compute_cu_seqlens(op, image_grid_thw)
+        cos, sin = self.rotary_pos_emb(op, position_ids)
+
+        for block in self.blocks:
+            hidden_states = block(op, hidden_states, cu_seqlens, cos, sin)
+        hidden_states = self.post_layernorm(op, hidden_states)
+
+        merge = self._spatial_merge_size
+        hidden_states = op.Reshape(
+            hidden_states,
+            [-1, merge, merge, self._hidden_size],
+        )
+        hidden_states = op.Transpose(hidden_states, perm=[0, 3, 1, 2])
+        hidden_states = self.downsample(op, hidden_states)
+        hidden_states = op.Reshape(hidden_states, [-1, self._out_hidden_size])
+        return self.merger(op, hidden_states)

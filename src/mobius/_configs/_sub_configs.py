@@ -86,6 +86,8 @@ class VisionConfig:
     # (HF: projector_config.merger_intermediate_size). ``None`` means the model
     # does not use a Cosmos-style merger projector.
     projector_intermediate_size: int | None = None
+    # Model-specific SwiGLU activation clamp used by GLM-5.3's vision tower.
+    swiglu_limit: float = 0.0
     # CLIP-style feature extraction: which ``hidden_states`` index to output
     # (HuggingFace convention, e.g. -2 for Phi-3.5-Vision). ``None`` means use
     # the final hidden state (all layers + post_layernorm).
