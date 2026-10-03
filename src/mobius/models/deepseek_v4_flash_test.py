@@ -880,8 +880,8 @@ def test_native_csa_threads_compressed_state_io():
     pres_kv = outputs["present_compressed_kv.1"]
     assert past_kv.dtype == ir.DataType.FLOAT
     assert pres_kv.dtype == ir.DataType.FLOAT
-    assert [str(d) for d in past_kv.shape] == ["batch", "past_compressed_records", "16"]
-    assert [str(d) for d in pres_kv.shape] == ["batch", "present_compressed_records", "16"]
+    assert [str(d) for d in past_kv.shape] == ["batch", "past_compressed_records.1", "16"]
+    assert [str(d) for d in pres_kv.shape] == ["batch", "present_compressed_records.1", "16"]
 
     past_carry = inputs["past_compression_carry.1"]
     pres_carry = outputs["present_compression_carry.1"]
@@ -1057,6 +1057,25 @@ def test_native_csa_emits_both_ratios_for_interleaved_schedule():
     assert ratio4.attributes["cache_format"].value == "fp8_e4m3_block64"
     assert ratio128.attributes["index_topk"].value == 0
     assert ratio4.attributes["index_topk"].value == 4
+
+    # Regression: a mixed schedule pools ratio-4 and ratio-128 layers at
+    # different rates, so their compressed-record axes MUST be distinct
+    # symbolic dims (a shared symbol makes ORT reject binding the same dim to
+    # two record counts). Within the ratio-4 layer the attention and index
+    # caches advance in lockstep, so they SHARE that layer's one record symbol.
+    inputs = _named(graph.inputs)
+    outputs = _named(graph.outputs)
+    r4_kv_axis = str(inputs["past_compressed_kv.1"].shape[1])
+    r4_ik_axis = str(inputs["past_index_key.1"].shape[1])
+    r128_kv_axis = str(inputs["past_compressed_kv.2"].shape[1])
+    assert r4_kv_axis == r4_ik_axis == "past_compressed_records.1"
+    assert r128_kv_axis == "past_compressed_records.2"
+    assert r4_kv_axis != r128_kv_axis
+    r4_present = str(outputs["present_compressed_kv.1"].shape[1])
+    r128_present = str(outputs["present_compressed_kv.2"].shape[1])
+    assert r4_present == "present_compressed_records.1"
+    assert r128_present == "present_compressed_records.2"
+    assert r4_present != r128_present
 
 
 def test_native_csa_ratio4_threads_index_state_io():
