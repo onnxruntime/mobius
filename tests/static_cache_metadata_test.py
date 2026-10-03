@@ -14,28 +14,107 @@ loop *invariant* rather than growing.
 These tests pin that contract against real exported packages, not synthetic
 graphs, so a change to the exporter's port names or scatter axis fails here
 rather than at runtime.
+
+Opt in to real TensorRT execution with ``MOBIUS_TEST_TENSORRT=1`` and set
+``TENSORRT_ROOT`` to a TensorRT 11.3+ SDK containing ``bin/trtexec``. The
+``tensorrt_static_cache_runtime`` test requires CUDA, TensorRT Python bindings,
+cuda-python and Transformers. It builds a tiny seeded model without downloads;
+once enabled, missing prerequisites or engine failures are test failures.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import onnx_ir as ir
 import pytest
+import yaml
+from onnxscript import GraphBuilder
 
 from mobius import registry
+from mobius._build_context import build_context
 from mobius._configs import ArchitectureConfig
 from mobius._constants import (
+    OPSET_VERSION,
     STATIC_CACHE_KV_SEQUENCE_LENGTH,
     STATIC_CACHE_SEQUENCE_AXIS,
     STATIC_CACHE_WRITE_INDICES,
 )
+from mobius._execution_providers import get_ep
+from mobius._flags import override_flags
+from mobius._testing.ort_inference import OnnxModelSession
+from mobius.components import create_static_cache_attention_bias
+from mobius.components._attention import StaticCacheState, _apply_attention
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_decoder_workflow_metadata,
+    write_decoder_workflow_metadata,
 )
 from mobius.tasks import CausalLMTask
 
 CAPACITY = 128
+
+
+def test_ep_capabilities_preserves_legacy_positional_arguments():
+    from mobius import EpCapabilities
+
+    legacy = {
+        "name": "custom",
+        "gqa_dtypes": frozenset({ir.DataType.FLOAT}),
+        "qkv_pack_dtypes": frozenset({ir.DataType.FLOAT16}),
+        "supports_fused_rope": True,
+        "supports_skip_layer_norm": False,
+        "supports_fused_moe": False,
+        "supports_packed_multi_head_attention": True,
+        "supports_rank4_rmsnorm": False,
+        "supports_attention": False,
+        "supports_matmul_nbits": False,
+        "supports_rotary_embedding": False,
+        "supports_tensor_scatter": False,
+        "supports_range": False,
+        "supports_fp8_kv_cache": True,
+        "default_int4_accuracy_level": 4,
+        "provider_options": {"custom_option": "1"},
+        "enable_graph_capture": True,
+        "supports_past_present_share_buffer": True,
+        "cap_kv_buffer_max_length": True,
+        "max_buffer_size": 1024,
+        "layered_per_layer_inputs": True,
+        "requires_graph_capture_rewrite": True,
+    }
+    caps = EpCapabilities(*legacy.values())
+    for name, expected in legacy.items():
+        assert getattr(caps, name) == expected
+    assert caps.static_cache_layout == "flattened"
+    assert caps.supports_attention_nonpad_kv_seqlen is True
+
+
+@pytest.mark.parametrize("task_name", ["generic", "text", "multimodal"])
+@pytest.mark.parametrize(
+    "ep_name,static_cache", [("tensorrt", True), ("tensorrt", False), ("default", True)]
+)
+def test_gemma4_static_cache_layout_support(task_name, ep_name, static_cache):
+    from gemma4_prefill_prefix_test import _make_config
+
+    from mobius.tasks._gemma4 import Gemma4Task, Gemma4TextCausalLMTask
+
+    config = _make_config(with_vision=task_name == "multimodal")
+    task_class = {
+        "generic": CausalLMTask,
+        "text": Gemma4TextCausalLMTask,
+        "multimodal": Gemma4Task,
+    }[task_name]
+    with build_context(get_ep(ep_name), dtype=config.dtype):
+        module = registry.get("gemma4" if task_name == "multimodal" else "gemma4_text")(config)
+        task = task_class(static_cache=static_cache, max_seq_len=CAPACITY)
+        if ep_name == "tensorrt" and static_cache:
+            with pytest.raises(ValueError, match="Gemma4 static cache requires the flattened"):
+                task.build(module, config)
+        else:
+            assert task.build(module, config)
 
 
 def _text_config(**overrides) -> ArchitectureConfig:
@@ -55,11 +134,283 @@ def _text_config(**overrides) -> ArchitectureConfig:
     return ArchitectureConfig(**params)
 
 
-def _static_package(**overrides):
+def _static_package(*, ep_name="default", **overrides):
     config = _text_config(**overrides)
-    module = registry.get("qwen2")(config)
-    task = CausalLMTask(static_cache=True, max_seq_len=CAPACITY)
-    return task.build(module, config), config
+    with build_context(get_ep(ep_name), dtype=config.dtype):
+        module = registry.get("qwen2")(config)
+        task = CausalLMTask(static_cache=True, max_seq_len=CAPACITY)
+        return task.build(module, config), config
+
+
+@pytest.mark.parametrize(
+    "ep_name,axis,layout", [("default", 1, "bsh"), ("tensorrt", 2, "bnsh")]
+)
+def test_static_cache_metadata_layout(ep_name, axis, layout, tmp_path):
+    package, config = _static_package(ep_name=ep_name)
+    metadata = build_decoder_workflow_metadata(package, config)
+    _, group = _scatter_group(metadata)
+    assert group["sequence_axis"] == axis
+    assert group["layout"] == layout
+    assert _static_cache_abi(metadata)["capacity"] == CAPACITY
+    path = write_decoder_workflow_metadata(package, str(tmp_path), config)
+    saved = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    _, saved_group = _scatter_group(saved)
+    assert saved_group["sequence_axis"] == axis
+    assert saved_group["layout"] == layout
+    abi = _static_cache_abi(saved)
+    assert abi == _static_cache_abi(metadata)
+    ports = _graph_ports(package)
+    for input_name, output_name in zip(abi["cache_inputs"], abi["cache_outputs"], strict=True):
+        assert ports[input_name].shape[axis] == CAPACITY
+        assert ports[output_name].shape == ports[input_name].shape
+
+
+@pytest.mark.parametrize("ep_name", ["default", "tensorrt"])
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+@pytest.mark.parametrize("static_cache", [False, True])
+def test_attention_cache_mask_ep_contract(ep_name, dtype, static_cache):
+    config = _text_config(dtype=dtype)
+    with build_context(get_ep(ep_name), dtype=dtype), override_flags(static_cache_bias=False):
+        module = registry.get("qwen2")(config)
+        package = CausalLMTask(static_cache=static_cache, max_seq_len=CAPACITY).build(
+            module, config
+        )
+    graph = package["model"].graph
+    attentions = [node for node in graph if node.op_type == "Attention"]
+    assert len(attentions) == 2
+    explicit_bias = static_cache and ep_name == "tensorrt"
+    for node in attentions:
+        if static_cache:
+            assert (node.inputs[3] is not None) == explicit_bias
+        assert node.attributes["is_causal"].as_int() == (0 if explicit_bias else 1)
+        native_nonpad = node.inputs[6] if len(node.inputs) > 6 else None
+        assert (native_nonpad is not None) == (static_cache and not explicit_bias)
+        if explicit_bias:
+            assert node.inputs[3].dtype == dtype
+            assert len(node.outputs) == 1
+            assert "q_num_heads" not in node.attributes
+            assert "kv_num_heads" not in node.attributes
+        if static_cache:
+            assert node.inputs[4] is None and node.inputs[5] is None
+            cache_input = next(value for value in graph.inputs if value.name == "key_cache.0")
+            assert len(cache_input.shape) == (4 if ep_name == "tensorrt" else 3)
+        else:
+            assert node.inputs[4] is not None and node.inputs[5] is not None
+            assert len(node.outputs) == 3
+    if explicit_bias:
+        assert attentions[0].inputs[3] is attentions[1].inputs[3]
+        graph_inputs = {value.name: value for value in graph.inputs}
+        assert graph_inputs["nonpad_kv_seqlen"].uses()
+        assert graph_inputs["write_indices"].uses()
+
+
+@pytest.mark.skipif(
+    os.environ.get("MOBIUS_TEST_TENSORRT") != "1",
+    reason="Set MOBIUS_TEST_TENSORRT=1 to build and execute a TensorRT engine",
+)
+def test_tensorrt_static_cache_runtime(tmp_path, monkeypatch):
+    import torch
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "examples"))
+    from tensorrt_debug.runtime import TensorRTRunner
+
+    assert torch.cuda.is_available(), "The enabled TensorRT runtime test requires CUDA"
+    sdk = Path(os.environ["TENSORRT_ROOT"])
+    trtexec = sdk / "bin" / ("trtexec.exe" if os.name == "nt" else "trtexec")
+    assert trtexec.is_file(), f"TensorRT builder not found: {trtexec}"
+    monkeypatch.setenv(
+        "PATH", os.pathsep.join([str(sdk / "bin"), str(sdk / "lib"), os.environ["PATH"]])
+    )
+    hf_config = Qwen2Config(
+        num_hidden_layers=2,
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=256,
+        max_position_embeddings=128,
+        tie_word_embeddings=False,
+    )
+    hf_config._attn_implementation = "eager"
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(42)
+        reference = Qwen2ForCausalLM(hf_config).float().eval()
+    config = ArchitectureConfig.from_transformers(hf_config)
+    config.dtype = ir.DataType.FLOAT
+    capacity = 16
+    with build_context(get_ep("tensorrt"), dtype=config.dtype):
+        module = registry.get("qwen2")(config)
+        package = CausalLMTask(static_cache=True, max_seq_len=capacity).build(module, config)
+    package.apply_weights(module.preprocess_weights(reference.state_dict()))
+    model = package["model"]
+    model_path = tmp_path / "model.onnx"
+    engine_path = tmp_path / "model.engine"
+    ir.save(model, model_path, external_data="model.onnx.data")
+    command = [
+        str(trtexec),
+        f"--onnx={model_path}",
+        f"--saveEngine={engine_path}",
+        "--skipInference",
+        "--noTF32",
+        "--decomposableAttentions=*",
+    ]
+    for option, length in (("minShapes", 1), ("optShapes", 4), ("maxShapes", 8)):
+        shapes = []
+        for value in model.graph.inputs:
+            shape = [
+                dimension if isinstance(dimension, int) else 1 for dimension in value.shape
+            ]
+            if value.name in ("input_ids", "position_ids"):
+                shape = [1, length]
+            shapes.append(f"{value.name}:{'x'.join(map(str, shape))}")
+        command.append(f"--{option}={','.join(shapes)}")
+    build_log = tmp_path / "build.log"
+    with build_log.open("w", encoding="utf-8") as log:
+        result = subprocess.run(
+            command, stdout=log, stderr=subprocess.STDOUT, timeout=300, check=False
+        )
+    assert result.returncode == 0, build_log.read_text(encoding="utf-8")[-12000:]
+
+    history = []
+    with TensorRTRunner(engine_path, sdk) as runner, torch.inference_mode():
+        assert runner.capacity == capacity
+        for tokens in ([5, 17, 23, 42], [71], [19, 11]):
+            position = len(history)
+            history.extend(tokens)
+            length = len(history)
+            feeds = {
+                "input_ids": np.asarray([tokens], dtype=np.int64),
+                "position_ids": np.arange(position, length, dtype=np.int64)[None, :],
+                "write_indices": np.asarray([position], dtype=np.int64),
+                "nonpad_kv_seqlen": np.asarray([length], dtype=np.int64),
+            }
+            runner.prepare_inputs(feeds)
+            before = {name: runner.read_tensor(name) for name in runner.caches}
+            for name in runner.caches:
+                assert runner.context.get_tensor_address(
+                    name
+                ) == runner.context.get_tensor_address("updated_" + name)
+            runner.execute()
+            actual_logits = runner.read_tensor("logits")
+            expected = reference(torch.tensor([history]), use_cache=True)
+            np.testing.assert_allclose(
+                actual_logits, expected.logits[:, position:].numpy(), atol=1e-3, rtol=1e-3
+            )
+            for layer in range(config.num_hidden_layers):
+                cache_layer = expected.past_key_values.layers[layer]
+                key, value = cache_layer.keys, cache_layer.values
+                for role, target in (("key", key), ("value", value)):
+                    name = f"{role}_cache.{layer}"
+                    actual = runner.read_tensor(name)
+                    assert actual.shape == (
+                        1,
+                        config.num_key_value_heads,
+                        capacity,
+                        config.head_dim,
+                    )
+                    np.testing.assert_allclose(
+                        actual[:, :, :length], target.numpy(), atol=1e-3, rtol=1e-3
+                    )
+                    np.testing.assert_array_equal(
+                        actual[:, :, :position], before[name][:, :, :position]
+                    )
+                    np.testing.assert_array_equal(
+                        actual[:, :, length:], before[name][:, :, length:]
+                    )
+        cached_logits = actual_logits.copy()
+        runner.reset_caches()
+        runner.prepare_inputs(
+            {
+                "input_ids": np.asarray([history], dtype=np.int64),
+                "position_ids": np.arange(len(history), dtype=np.int64)[None, :],
+                "write_indices": np.asarray([0], dtype=np.int64),
+                "nonpad_kv_seqlen": np.asarray([len(history)], dtype=np.int64),
+            }
+        )
+        runner.execute()
+        np.testing.assert_allclose(
+            cached_logits,
+            runner.read_tensor("logits")[:, -len(tokens) :],
+            atol=1e-3,
+            rtol=1e-3,
+        )
+
+
+@pytest.mark.parametrize("write,length,nonpad", [(0, 4, 4), (4, 1, 5), (4, 3, 7), (4, 3, 6)])
+def test_tensorrt_static_bias_slot_geometry(write, length, nonpad):
+    def input_value(name):
+        return ir.Value(name=name, shape=ir.Shape([1]), type=ir.TensorType(ir.DataType.INT64))
+
+    cursor = input_value("write_indices")
+    valid_length = input_value("nonpad_kv_seqlen")
+    graph = ir.Graph(
+        inputs=[cursor, valid_length],
+        outputs=[],
+        nodes=[],
+        opset_imports={"": OPSET_VERSION},
+        name="static_bias_geometry",
+    )
+    op = GraphBuilder(graph).op
+    with build_context(get_ep("tensorrt")):
+        bias = create_static_cache_attention_bias(
+            op,
+            write_indices=cursor,
+            seq_len=op.Constant(value_ints=[length]),
+            nonpad_kv_seqlen=valid_length,
+            max_seq_len=8,
+        )
+    bias.name = "bias"
+    graph.outputs.append(bias)
+    model = ir.Model(graph, ir_version=10)
+    actual = OnnxModelSession(model).run(
+        {
+            "write_indices": np.asarray([write], dtype=np.int64),
+            "nonpad_kv_seqlen": np.asarray([nonpad], dtype=np.int64),
+        }
+    )["bias"]
+    key_slots = np.arange(8)[None, :]
+    query_slots = write + np.arange(length)[:, None]
+    allowed = (key_slots <= query_slots) & (key_slots < nonpad)
+    expected = np.where(allowed, 0, np.finfo(np.float32).min).astype(np.float32)[None, None]
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_tensorrt_static_attention_rejects_missing_bias():
+    def value(name, shape):
+        return ir.Value(
+            name=name, shape=ir.Shape(shape), type=ir.TensorType(ir.DataType.FLOAT)
+        )
+
+    query = value("query", [1, 1, 64])
+    key = value("key", [1, 1, 32])
+    cache = value("cache", [1, 2, 8, 16])
+    index = ir.Value(name="index", shape=ir.Shape([1]), type=ir.TensorType(ir.DataType.INT64))
+    graph = ir.Graph(
+        inputs=[query, key, cache, index],
+        outputs=[],
+        nodes=[],
+        opset_imports={"": OPSET_VERSION},
+    )
+    with (
+        build_context(get_ep("tensorrt")),
+        pytest.raises(ValueError, match="explicit static-cache"),
+    ):
+        _apply_attention(
+            GraphBuilder(graph).op,
+            query,
+            key,
+            key,
+            None,
+            None,
+            None,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            scale=0.25,
+            static_cache=StaticCacheState(cache, cache, index, index),
+        )
 
 
 def _cache_cells(workflow) -> list[str]:

@@ -2215,6 +2215,19 @@ class Gemma4TextModel(nn.Module):
         per_layer_inputs: ir.Value | None = None,
         block_sequence_ids: ir.Value | None = None,
     ) -> tuple[ir.Value, list]:
+        from mobius.components._attention import StaticCacheState
+
+        if (
+            ep_capabilities().static_cache_layout != "flattened"
+            and past_key_values is not None
+            and any(isinstance(cache, StaticCacheState) for cache in past_key_values)
+        ):
+            raise ValueError(
+                "Gemma4 static cache requires the flattened layout; heads-first static "
+                "caches (including TensorRT) are not supported. Disable static cache "
+                "or select a target with flattened static caches."
+            )
+
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
