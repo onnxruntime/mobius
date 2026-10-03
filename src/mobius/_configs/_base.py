@@ -1091,6 +1091,7 @@ class ArchitectureConfig(BaseModelConfig):
                                         "bloom",
                                         "qwen2",
                                         "qwen2_5_vl_text",
+                                        "qwen2_5_omni_text",
                                         "qwen2_moe",
                                         "qwen2_vl_text",
                                     ),
