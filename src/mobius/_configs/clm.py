@@ -40,8 +40,8 @@ class CLMConfig(BaseModelConfig):
             raise ValueError("Unsupported CLM activation")
         if type(self.layernorm) is not bool or type(self.residual) is not bool:
             raise ValueError("CLM layernorm and residual must be booleans")
-        if not math.isfinite(self.scale) or not 0 < self.scale <= 100:
-            raise ValueError("CLM scale must be finite and in (0, 100]")
+        if not math.isfinite(self.scale) or not 0 <= self.scale <= 100:
+            raise ValueError("CLM scale must be finite and in [0, 100]")
         if self.dtype != ir.DataType.FLOAT:
             raise ValueError("CLM ranking heads currently support only dtype='f32'")
         if self.quantization is not None or self.component_quantization is not None:

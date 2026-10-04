@@ -483,6 +483,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         CLMRankingModel,
         task="contrastive-ranking-heads",
         config_class=CLMConfig,
+        test_model_id="Contrastive-LM/CLM-v0.1-8B",
+        test_revision="e939398d4556fcd9400c76fa8c5a513202f42b0a",
     ),
     # --- Text Generation (Llama-compatible) ---
     "baichuan": ModelRegistration(CausalLMModel),

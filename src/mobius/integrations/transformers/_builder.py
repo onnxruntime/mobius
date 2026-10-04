@@ -187,6 +187,19 @@ def _load_transformers_config(
 
     from mobius.integrations.transformers._config_resolver import _try_load_config_json
 
+    if trust_remote_code:
+        # Base PretrainedConfig reads JSON only, before any custom AutoConfig code.
+        raw_config, _ = transformers.PretrainedConfig.get_config_dict(
+            model_id, revision=revision
+        )
+        if raw_config.get("model_type") == "clm":
+            raise ValueError("CLM head export does not execute remote model code")
+        if not pathlib.Path(model_id).is_dir():
+            pinned_revision = raw_config.get("_commit_hash")
+            if not isinstance(pinned_revision, str) or len(pinned_revision) != 40:
+                raise ValueError("Cannot pin raw config before executing remote model code")
+            revision = pinned_revision
+
     class _MissingStrictDataclassClassValidationError(Exception):
         """Sentinel that cannot match errors from older Hub installations."""
 
@@ -493,6 +506,11 @@ def build_transformers_model(
             dtype=dtype,
             execution_provider=execution_provider,
             load_weights=load_weights,
+            task=(
+                task
+                if isinstance(task, ContrastiveRankingHeadsTask)
+                else "contrastive-ranking-heads"
+            ),
         )
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint

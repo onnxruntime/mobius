@@ -16,6 +16,7 @@ from mobius._builder import build_from_module, resolve_dtype
 from mobius._configs.clm import CLMConfig
 from mobius._model_package import ModelPackage
 from mobius.models.clm import CLMRankingModel
+from mobius.tasks import ContrastiveRankingHeadsTask
 
 CLM_MODEL_ID = "Contrastive-LM/CLM-v0.1-8B"
 CLM_REVISION = "e939398d4556fcd9400c76fa8c5a513202f42b0a"
@@ -135,6 +136,7 @@ def build_clm_heads(
     dtype,
     execution_provider: str,
     load_weights: bool,
+    task: str | ContrastiveRankingHeadsTask = "contrastive-ranking-heads",
 ) -> ModelPackage:
     """Build the ordinary ModelPackage using only the pinned head checkpoint."""
     from huggingface_hub import hf_hub_download
@@ -150,6 +152,8 @@ def build_clm_heads(
         if local
         else Path(hf_hub_download(model_id, CLM_CHECKPOINT, revision=revision))
     )
+    if path.stat().st_size > 256 * 1024 * 1024:
+        raise ValueError("CLM head checkpoint exceeds the 256 MiB loading limit")
     with path.open("rb") as stream:
         hasher = hashlib.sha256()
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -163,7 +167,7 @@ def build_clm_heads(
         raise ValueError("Pinned CLM checkpoint SHA256 mismatch")
     module, config, weights = load_clm_checkpoint(path, config)
     package = build_from_module(
-        module, config, task="contrastive-ranking-heads", execution_provider=execution_provider
+        module, config, task=task, execution_provider=execution_provider
     )
     if load_weights:
         package.apply_weights(weights)

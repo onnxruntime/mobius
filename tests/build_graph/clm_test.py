@@ -5,14 +5,20 @@
 
 from __future__ import annotations
 
+import pytest
+from _test_configs import CONTRASTIVE_RANKING_CONFIGS, _base_config
+
 from mobius import build_from_module
 from mobius._configs import CLMConfig
 from mobius._registry import registry
 from mobius.tasks import ContrastiveRankingHeadsTask, get_task
 
 
-def test_clm_registered_head_graph():
-    config = CLMConfig(hidden_size=8, width=6, depth=3, projection_dim=4)
+@pytest.mark.parametrize("model_type,overrides,is_representative", CONTRASTIVE_RANKING_CONFIGS)
+def test_clm_registered_head_graph(model_type, overrides, is_representative):
+    config = _base_config(**overrides)
+    assert is_representative
+    assert model_type == "clm"
     assert registry.get_config_class("clm") is CLMConfig
     assert isinstance(get_task(registry.get("clm").default_task), ContrastiveRankingHeadsTask)
     package = build_from_module(

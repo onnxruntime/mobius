@@ -175,6 +175,39 @@ def test_clm_config_rejects_invalid_dtype():
         dataclasses.replace(CLMConfig(), dtype=ir.DataType.BFLOAT16).validate()
 
 
+def test_clm_finite_logit_scale_underflow_matches_uniform_upstream_probs(tmp_path):
+    torch.manual_seed(29)
+    config = CLMConfig(hidden_size=8, width=6, projection_dim=4, depth=2)
+    checkpoint = _checkpoint(config)
+    checkpoint["logit_scale"] = torch.tensor(-1000.0, dtype=torch.float32)
+    path = tmp_path / "underflow.pt"
+    torch.save(checkpoint, path)
+    module, resolved, weights = load_clm_checkpoint(path, config)
+    assert resolved.scale == pytest.approx(0.0)
+    package = build_from_module(
+        module, resolved, "contrastive-ranking-heads", execution_provider="cpu"
+    )
+    package.apply_weights(weights)
+    package.save(str(tmp_path))
+    session = ort.InferenceSession(
+        str(tmp_path / "model.onnx"), providers=["CPUExecutionProvider"]
+    )
+    s, a = torch.randn(2, 8), torch.randn(5, 8)
+    states, actions = _ReferenceHead(config).eval(), _ReferenceHead(config).eval()
+    states.load_state_dict(checkpoint["state_head"])
+    actions.load_state_dict(checkpoint["action_head"])
+    with torch.no_grad():
+        scale = checkpoint["logit_scale"].float().exp().clamp(max=100)
+        zs, za = states(s), actions(a)
+        logits = scale * (zs @ za.T)
+        expected = (zs, za, logits, logits.softmax(-1))
+    actual = session.run(None, {"state_embeddings": s.numpy(), "action_embeddings": a.numpy()})
+    for value, reference in zip(actual, expected, strict=True):
+        np.testing.assert_allclose(value, reference.numpy(), atol=1e-6, rtol=1e-6)
+    np.testing.assert_array_equal(actual[2], np.zeros((2, 5), dtype=np.float32))
+    np.testing.assert_array_equal(actual[3], np.full((2, 5), 0.2, dtype=np.float32))
+
+
 @pytest.mark.parametrize("magnitude", [0.0, 1e-14, 1e-12, 1.0])
 def test_clm_projection_normalization_boundary(tmp_path, magnitude):
     config = CLMConfig(hidden_size=8, width=6, projection_dim=4, depth=2)

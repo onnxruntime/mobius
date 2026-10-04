@@ -28,6 +28,20 @@ parameters; all tensor contracts are checked before constructing the module tree
 The official pinned download is SHA256-verified. Even `load_weights=False`
 reads the checkpoint to determine topology and temperature, but does not bind
 the head parameters. Only float32/unquantized export is currently supported.
+All CLM sources reject `trust_remote_code=True` before custom `AutoConfig`
+execution, including non-official IDs and local directories. Trusted non-CLM
+configs are preflighted as plain JSON and pinned to that resolved commit before
+custom configuration code can run. The size limit is checked before hashing
+as well as before checkpoint deserialization. A caller-supplied
+`ContrastiveRankingHeadsTask` instance is preserved, including subclass build
+overrides and instance configuration.
+
+Test coverage uses a dedicated contrastive-ranking tiny-config inventory and
+the pinned official model ID/revision for config-only L2 graph validation.
+Synthetic CPU parity and opt-in real-head checkpoint parity are in
+`src/mobius/models/clm_test.py`. Generic token-prefill/generation goldens cannot
+drive this embedding-in/ranking-out contract and are explicitly exempted;
+this is not a waiver of the dedicated graph or numerical parity tests.
 
 | ONNX name | Shape | Meaning |
 |---|---|---|
@@ -61,6 +75,8 @@ layers, exact GELU, and optional hidden linear/LayerNorm/activation blocks;
 LayerNorm epsilon is `1e-5`. The official checkpoint has width 1536, depth 3,
 one LayerNorm block, no residual connection, and projection dimension 512.
 Scores are `min(exp(float32(logit_scale)), 100) * state_projection @ action_projection.T`.
+Finite negative log scales may underflow to zero in float32; this matches
+upstream zero logits and uniform candidate-relative probabilities.
 Export temperature is **1**. For upstream's other validated temperatures
 `0 < temperature <= 100`, use `softmax(logits / temperature)` outside this
 graph; the exported probabilities remain at temperature 1.
