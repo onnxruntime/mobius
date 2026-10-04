@@ -19,6 +19,7 @@ Example::
 from __future__ import annotations
 
 __all__ = [
+    "ContrastiveRankingHeadsTask",
     "AdapterTask",
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
@@ -137,6 +138,7 @@ from mobius.tasks._causal_lm import (
     SmallThinkerGGUFCausalLMTask,
 )
 from mobius.tasks._codec import CodecTask
+from mobius.tasks._contrastive_ranking import ContrastiveRankingHeadsTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._ctc_asr import CTCAsrTask, FeatureCTCAsrTask
 from mobius.tasks._deepseek_v4 import DeepSeekV4Task
@@ -239,6 +241,7 @@ from mobius.tasks._world_model import WorldModelTask
 # ---------------------------------------------------------------------------
 
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
+    "contrastive-ranking-heads": ContrastiveRankingHeadsTask,
     "adapter": AdapterTask,
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
