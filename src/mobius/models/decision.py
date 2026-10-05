@@ -1101,6 +1101,7 @@ def build_clm_package(
     base_weights: Mapping[str, torch.Tensor],
     head_checkpoint: Mapping[str, Any],
     base_revision: str,
+    execution_provider: str = "default",
 ):
     """Build and populate CLM-v0.1 from separate base and head checkpoints.
 
@@ -1134,7 +1135,12 @@ def build_clm_package(
     from mobius._builder import build_from_module
     from mobius.tasks._decision import CLMTask
 
-    package = build_from_module(module, config, task=CLMTask(module.provenance))
+    package = build_from_module(
+        module,
+        config,
+        task=CLMTask(module.provenance),
+        execution_provider=execution_provider,
+    )
     weights = {
         f"encoder.{key}": value
         for key, value in module.encoder.preprocess_weights(dict(base_weights)).items()
@@ -1155,6 +1161,7 @@ def build_kev_package(
     merged_base_weights: Mapping[str, torch.Tensor] | None = None,
     base_weights: Mapping[str, torch.Tensor] | None = None,
     peft_adapter_weights: Mapping[str, torch.Tensor] | None = None,
+    execution_provider: str = "default",
 ):
     """Build Kev from a correctly PEFT-merged Qwen3.5 state dict plus ``head.pt``.
 
@@ -1187,7 +1194,12 @@ def build_kev_package(
     from mobius._builder import build_from_module
     from mobius.tasks._decision import KevTask
 
-    package = build_from_module(module, config, task=KevTask())
+    package = build_from_module(
+        module,
+        config,
+        task=KevTask(),
+        execution_provider=execution_provider,
+    )
     weights = {
         f"backbone.{key}": value
         for key, value in module.backbone.preprocess_weights(dict(merged_base_weights)).items()
