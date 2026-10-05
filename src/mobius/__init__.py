@@ -75,6 +75,9 @@ __all__ = [
     "build_from_module",
     "build_from_nemo",
     "build_kev_package",
+    "KEV_08_PROVENANCE",
+    "KEV_VARIANTS",
+    "KevVariant",
     "compose_adapter_deltas",
     "components",
     "ep_capabilities",
@@ -167,10 +170,13 @@ from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo
 from mobius.integrations.transformers import build
 from mobius.models import (
+    KEV_08_PROVENANCE,
+    KEV_VARIANTS,
     CLMModel,
     CLMProjectionHead,
     KevModel,
     KevPointerHead,
+    KevVariant,
     MLPWorldModel,
     build_clm_package,
     build_kev_package,

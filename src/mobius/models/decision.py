@@ -31,8 +31,14 @@ KEV_REVISION = "139fdd94f1b6a6ad80cc15e08fcb99cac885a101"
 KEV_BASE_MODEL_ID = "Qwen/Qwen3.5-4B-Base"
 KEV_BASE_REVISION = "1001bb4d826a52d1f399e183466143f4da7b741b"
 KEV_HIDDEN_SIZE = 2560
+KEV_08_MODEL_ID = "jaredpalmer/kev-0.8b"
+KEV_08_REVISION = "bf75a6a8848ea6960ff2ed108d9ed44c2941174f"
+KEV_08_BASE_MODEL_ID = "Qwen/Qwen3.5-0.8B-Base"
+KEV_08_BASE_REVISION = "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68"
+KEV_08_HIDDEN_SIZE = 1024
 KEV_POINTER_SIZE = 256
 KEV_TEMPERATURE = 2.406050072164233
+KEV_08_TEMPERATURE = 2.3510958125672174
 KEV_MAX_OPTIONS = 255
 KEV_MAX_STATE_TOKENS = 8192
 KEV_MAX_ROW_TOKENS = 8192
@@ -65,6 +71,38 @@ CLM_PROVENANCE = ModelProvenance(CLM_MODEL_ID, CLM_REVISION, CLM_BASE_MODEL_ID, 
 KEV_PROVENANCE = ModelProvenance(
     KEV_MODEL_ID, KEV_REVISION, KEV_BASE_MODEL_ID, KEV_BASE_REVISION
 )
+KEV_08_PROVENANCE = ModelProvenance(
+    KEV_08_MODEL_ID,
+    KEV_08_REVISION,
+    KEV_08_BASE_MODEL_ID,
+    KEV_08_BASE_REVISION,
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class KevVariant:
+    """Immutable model-specific KEV export contract."""
+
+    name: str
+    provenance: ModelProvenance
+    hidden_size: int
+    temperature: float
+
+
+KEV_VARIANTS = {
+    KEV_BASE_MODEL_ID: KevVariant(
+        "kev-4b",
+        KEV_PROVENANCE,
+        KEV_HIDDEN_SIZE,
+        KEV_TEMPERATURE,
+    ),
+    KEV_08_BASE_MODEL_ID: KevVariant(
+        "kev-0.8b",
+        KEV_08_PROVENANCE,
+        KEV_08_HIDDEN_SIZE,
+        KEV_08_TEMPERATURE,
+    ),
+}
 
 
 class CheckpointContractError(ValueError):
@@ -191,16 +229,22 @@ def validate_clm_checkpoint(checkpoint: Mapping[str, Any]) -> None:
         raise CheckpointContractError("CLM logit_scale must be a scalar")
 
 
-def validate_kev_checkpoint(checkpoint: Mapping[str, Any]) -> None:
-    """Fail closed unless *checkpoint* matches the published Kev-4B head."""
+def validate_kev_checkpoint(checkpoint: Mapping[str, Any]) -> KevVariant:
+    """Validate and return the exact published KEV variant contract."""
     if not isinstance(checkpoint, Mapping):
         raise CheckpointContractError("Kev checkpoint must be a mapping")
+    base = checkpoint.get("base")
+    variant = KEV_VARIANTS.get(base)
+    if variant is None:
+        raise CheckpointContractError(
+            f"Kev checkpoint base must be one of {sorted(KEV_VARIANTS)}, got {base!r}"
+        )
     expected = {
-        "base": KEV_BASE_MODEL_ID,
-        "base_revision": KEV_BASE_REVISION,
+        "base": variant.provenance.base_model_id,
+        "base_revision": variant.provenance.base_revision,
         "head_dim": KEV_POINTER_SIZE,
         "option_isolation": False,
-        "temperature": KEV_TEMPERATURE,
+        "temperature": variant.temperature,
     }
     for key, value in expected.items():
         actual = checkpoint.get(key)
@@ -212,9 +256,9 @@ def validate_kev_checkpoint(checkpoint: Mapping[str, Any]) -> None:
     if not isinstance(head, Mapping):
         raise CheckpointContractError("Kev checkpoint must contain a head state dict")
     shapes = {
-        "q.weight": (KEV_POINTER_SIZE, KEV_HIDDEN_SIZE),
+        "q.weight": (KEV_POINTER_SIZE, variant.hidden_size),
         "q.bias": (KEV_POINTER_SIZE,),
-        "k.weight": (KEV_POINTER_SIZE, KEV_HIDDEN_SIZE),
+        "k.weight": (KEV_POINTER_SIZE, variant.hidden_size),
         "k.bias": (KEV_POINTER_SIZE,),
     }
     if set(head) != set(shapes):
@@ -225,6 +269,7 @@ def validate_kev_checkpoint(checkpoint: Mapping[str, Any]) -> None:
         )
     for key, shape in shapes.items():
         _require_tensor_shape(head, key, shape, owner="head")
+    return variant
 
 
 def render_clm(value: JSONContent, indent: int = 0) -> str:
@@ -835,14 +880,18 @@ def kev_answer(
 
 
 class KevPointerHead(nn.Module):
-    """Kev-4B checkpoint-compatible 256-dimensional pointer head."""
+    """KEV checkpoint-compatible 256-dimensional pointer head."""
 
-    def __init__(self, hidden_size: int = KEV_HIDDEN_SIZE):
+    def __init__(
+        self,
+        hidden_size: int = KEV_HIDDEN_SIZE,
+        temperature: float = KEV_TEMPERATURE,
+    ):
         """Create checkpoint-compatible Q/K projections and fixed calibration."""
         super().__init__()
         self.q = Linear(hidden_size, KEV_POINTER_SIZE)
         self.k = Linear(hidden_size, KEV_POINTER_SIZE)
-        self.temperature = KEV_TEMPERATURE
+        self.temperature = temperature
 
     def forward(
         self,
@@ -923,20 +972,27 @@ def _grouped_softmax_graph(
 
 
 class KevModel(nn.Module):
-    """Qwen3.5-4B backbone and Kev pointer readout in one exportable model."""
+    """Pinned Qwen3.5 backbone and KEV pointer readout."""
 
     default_task = "kev-scoring"
     category = "Text Classification"
-    provenance = KEV_PROVENANCE
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        variant: KevVariant | None = None,
+    ):
         """Construct the verified-width headless Qwen3.5 and pointer head."""
         super().__init__()
-        if config.hidden_size != KEV_HIDDEN_SIZE:
-            raise ValueError("kev-4b requires Qwen3.5 hidden_size=2560")
+        variant = variant or KEV_VARIANTS[KEV_BASE_MODEL_ID]
+        if config.hidden_size != variant.hidden_size:
+            raise ValueError(
+                f"{variant.name} requires Qwen3.5 hidden_size={variant.hidden_size}"
+            )
+        self.provenance = variant.provenance
         self.config = config
         self.backbone = Qwen35EncoderModel(config)
-        self.pointer_head = KevPointerHead(config.hidden_size)
+        self.pointer_head = KevPointerHead(config.hidden_size, variant.temperature)
 
     def preprocess_weights(self, state_dict: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         """Map merged backbone and pointer tensors into component paths."""
@@ -1112,12 +1168,13 @@ def build_kev_package(
     PEFT/base inputs fail explicitly rather than producing an unadapted model.
     """
     # A valid head cannot make an unmerged PEFT base safe; enforce both gates.
-    validate_kev_checkpoint(head_checkpoint)
+    variant = validate_kev_checkpoint(head_checkpoint)
     if merged_base_weights is None:
         if base_weights is not None or peft_adapter_weights is not None:
             raise NotImplementedError(
                 "Kev export cannot merge separate PEFT LoRA weights yet; load "
-                f"{KEV_BASE_MODEL_ID}@{KEV_BASE_REVISION}, merge the adapter with "
+                f"{variant.provenance.base_model_id}@"
+                f"{variant.provenance.base_revision}, merge the adapter with "
                 "PEFT merge_and_unload(), and pass merged_base_weights"
             )
         raise ValueError("merged_base_weights is required for Kev export")
@@ -1126,7 +1183,7 @@ def build_kev_package(
             "pass either merged_base_weights or separate base/adapter inputs, not both"
         )
     _validate_weight_mapping(merged_base_weights, owner="Kev merged base")
-    module = KevModel(config)
+    module = KevModel(config, variant)
     from mobius._builder import build_from_module
     from mobius.tasks._decision import KevTask
 
