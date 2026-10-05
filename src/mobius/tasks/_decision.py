@@ -133,6 +133,15 @@ class KevTask(MultiComponentModelTask):
         pointer_head=ComponentConfig("pointer_head", ComponentRole.HEAD),
     )
 
+    def __init__(self, provenance=KEV_PROVENANCE):
+        """Create the task with the selected immutable KEV provenance."""
+        self.provenance = provenance
+
+    def build(self, module: object, config: BaseModelConfig):
+        """Build one package while honoring provenance selected by the module."""
+        self.provenance = getattr(module, "provenance", self.provenance)
+        return super().build(module, config)
+
     def build_component(
         self,
         name: str,
@@ -150,7 +159,7 @@ class KevTask(MultiComponentModelTask):
             package = HeadlessBackboneTask().build(module, config)
             model = package["model"]
             model.graph.name = name
-            return _stamp(model, KEV_PROVENANCE, "one-causal-row-per-question")
+            return _stamp(model, self.provenance, "one-causal-row-per-question")
         if not isinstance(module, KevPointerHead):
             raise TypeError("Kev pointer_head has an unexpected module type")
         graph, builder = _make_graph(name)
@@ -181,4 +190,4 @@ class KevTask(MultiComponentModelTask):
         )
         builder.add_output(logits, "logits")
         builder.add_output(probabilities, "probabilities")
-        return _stamp(_make_model(graph), KEV_PROVENANCE, "grouped-pointer-softmax")
+        return _stamp(_make_model(graph), self.provenance, "grouped-pointer-softmax")

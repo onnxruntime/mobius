@@ -14,8 +14,11 @@ from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.models.decision import (
     CLM_PROVENANCE,
+    KEV_08_HIDDEN_SIZE,
+    KEV_08_TEMPERATURE,
     KEV_CONTROL_TOKEN_IDS,
     KEV_TEMPERATURE,
+    KEV_VARIANTS,
     CheckpointContractError,
     CLMModel,
     CLMProjectionHead,
@@ -376,6 +379,22 @@ def _valid_kev_checkpoint():
     }
 
 
+def _valid_kev_08_checkpoint():
+    return {
+        "base": "Qwen/Qwen3.5-0.8B-Base",
+        "base_revision": "dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68",
+        "head_dim": 256,
+        "option_isolation": False,
+        "temperature": KEV_08_TEMPERATURE,
+        "head": {
+            "q.weight": _meta(256, KEV_08_HIDDEN_SIZE),
+            "q.bias": _meta(256),
+            "k.weight": _meta(256, KEV_08_HIDDEN_SIZE),
+            "k.bias": _meta(256),
+        },
+    }
+
+
 def test_production_checkpoint_contracts_fail_closed_and_map_metadata():
     clm = _valid_clm_checkpoint()
     validate_clm_checkpoint(clm)
@@ -400,6 +419,53 @@ def test_production_checkpoint_contracts_fail_closed_and_map_metadata():
         validate_kev_checkpoint({**kev, "base_revision": "wrong"})
     with pytest.raises(CheckpointContractError, match=r"q\.weight shape"):
         validate_kev_checkpoint({**kev, "head": {**kev["head"], "q.weight": _meta(1, 1)}})
+
+    kev_08 = _valid_kev_08_checkpoint()
+    variant = validate_kev_checkpoint(kev_08)
+    assert variant is KEV_VARIANTS["Qwen/Qwen3.5-0.8B-Base"]
+    assert variant.hidden_size == 1024
+    mapped_kev_08 = map_kev_checkpoint(kev_08)
+    assert mapped_kev_08["pointer_head.q.weight"].shape == (256, 1024)
+    with pytest.raises(CheckpointContractError, match="base must be one of"):
+        validate_kev_checkpoint({**kev_08, "base": "Qwen/unknown"})
+
+
+def test_kev_08_model_uses_variant_width_and_temperature():
+    config = ArchitectureConfig(hidden_size=KEV_08_HIDDEN_SIZE)
+    model = KevModel(config, KEV_VARIANTS["Qwen/Qwen3.5-0.8B-Base"])
+
+    assert tuple(model.pointer_head.q.weight.shape) == (256, KEV_08_HIDDEN_SIZE)
+    assert model.pointer_head.temperature == KEV_08_TEMPERATURE
+    with pytest.raises(ValueError, match="hidden_size=1024"):
+        KevModel(
+            ArchitectureConfig(hidden_size=2560),
+            KEV_VARIANTS["Qwen/Qwen3.5-0.8B-Base"],
+        )
+
+    export_config = ArchitectureConfig(
+        vocab_size=32,
+        hidden_size=KEV_08_HIDDEN_SIZE,
+        intermediate_size=16,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=KEV_08_HIDDEN_SIZE,
+        max_position_embeddings=8,
+        rms_norm_eps=1e-6,
+        rope_theta=10_000.0,
+        rope_type="default",
+        dtype=ir.DataType.FLOAT,
+        layer_types=[],
+    )
+    package = KevTask().build(
+        KevModel(export_config, KEV_VARIANTS["Qwen/Qwen3.5-0.8B-Base"]),
+        export_config,
+    )
+    for component in package.values():
+        assert (
+            '"model_id":"jaredpalmer/kev-0.8b"'
+            in component.metadata_props["mobius.provenance"]
+        )
 
 
 def test_complete_packages_use_headless_hidden_state_backbones():
