@@ -38,7 +38,7 @@ from mobius.components import (
 from mobius.tasks import ModelTask, get_task
 from mobius.weights import FloatWeight, PackedWeight, codec_registry
 
-_AFFINE_METHODS = frozenset({"olive", "gptq", "awq"})
+_AFFINE_METHODS = frozenset({"olive", "gptq", "awq", "quark"})
 _TOKEN_EMBEDDING_NAMES = frozenset(
     {"embed_in", "embed_tokens", "shared", "word_embeddings", "wte"}
 )

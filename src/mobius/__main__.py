@@ -376,6 +376,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 fp8_kv_cache=fp8_kv_cache,
                 kv_cache_scales=kv_cache_scales,
                 prune_prefill_prefix=prune_prefill_prefix,
+                matmul_nbits_accuracy_level=args.int4_accuracy_level,
                 glm_full_attention=args.glm_full_attention,
                 export_paged_attention=export_paged_attention,
                 keep_quantized=keep_quantized,
@@ -442,6 +443,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
+            matmul_nbits_accuracy_level=args.int4_accuracy_level,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
             keep_quantized=keep_quantized,
@@ -477,6 +479,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
+            matmul_nbits_accuracy_level=args.int4_accuracy_level,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
             keep_quantized=keep_quantized,
@@ -1442,6 +1445,20 @@ def build_parser() -> argparse.ArgumentParser:
             "MXFP4 weights as dense floating point. Dense GPT-OSS reconstruction "
             "is eager and memory-intensive; the default preserves MXFP4 with "
             "bounded native streaming."
+        ),
+    )
+    build_parser.add_argument(
+        "--int4-accuracy-level",
+        type=int,
+        choices=[0, 1, 2, 3, 4],
+        default=None,
+        help=(
+            "Override the accuracy_level attribute on 4-bit MatMulNBits nodes. "
+            "Defaults to the target EP's preference (4 for cpu/webgpu), which "
+            "dynamically quantizes activations to int8 for a 2-4x CPU speedup. "
+            "Pass 0 to keep the fp32 dequant + fp32 GEMM path -- slower, but it "
+            "avoids an activation-quantization error that compounds with depth "
+            "and context length. All other EP optimizations are unaffected."
         ),
     )
     _add_shared_build_arguments(build_parser)

@@ -201,7 +201,7 @@ class _LegacyAffineCodec:
             in_features=in_features,
             defer_per_channel_sidecars=False,
         )
-        if kind == "embedding" and self.method in {"gptq", "awq"}:
+        if kind == "embedding" and self.method in {"gptq", "awq", "quark"}:
             # The affine packers produce [rows, blocks, bytes]; Gather consumes
             # the same packed bytes as a [rows, packed_columns] table.
             weight = normalized.pop(record.name)
@@ -210,5 +210,5 @@ class _LegacyAffineCodec:
 
 
 codec_registry = QuantizationCodecRegistry()
-for _method in ("olive", "gptq", "awq"):
+for _method in ("olive", "gptq", "awq", "quark"):
     codec_registry.register(_LegacyAffineCodec(_method))

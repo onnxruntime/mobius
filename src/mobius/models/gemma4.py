@@ -39,6 +39,7 @@ from mobius._constants import GEMMA4_CUSTOM_GEGLU_METADATA_KEY
 from mobius._flags import flags
 from mobius._weight_utils import (
     QMoEQuantizationLayout,
+    dequantize_quark_projections,
     is_packed_quant_key,
     preprocess_quantized_weights,
     resolve_qmoe_quantization,
@@ -237,6 +238,78 @@ def _extract_native_expert_weights(
     return result
 
 
+# Per-layer-embedding (PLE) projections. ``per_layer_input_gate``/
+# ``per_layer_projection`` are built per layer via
+# ``_per_layer_projection_linear_class``; ``per_layer_model_projection`` is built
+# via ``_per_layer_model_projection_linear_class`` in ``Gemma4EmbeddingModel``
+# (the split embedding component). Each may choose ``QuantizedLinear`` when the
+# checkpoint supplies real quantized weights for that specific module.
+#
+# ``Gemma4TextModel`` -- the fused single-graph text model -- still hardcodes
+# ``per_layer_model_projection`` to plain float ``Linear`` unconditionally: it
+# additionally splits that tensor by row below (``_split_per_layer_projection_weight``),
+# which is only meaningful on an unpacked dense tensor, and only the fused model
+# needs a producer/consumer split at all (the split embedding component computes
+# every layer's per-layer input uniformly, no split required).
+
+
+_GEMMA4_PER_LAYER_PROJECTIONS: tuple[str, ...] = (
+    "per_layer_input_gate",
+    "per_layer_projection",
+)
+
+
+def _dequantize_float_only_projections(
+    state_dict: dict[str, torch.Tensor],
+    config: Gemma4Config,
+) -> None:
+    """Reconstruct dense weights for PLE projections the graph keeps float.
+
+    All three PLE projections (``per_layer_input_gate``, ``per_layer_projection``,
+    ``per_layer_model_projection``) are only dequantized here when that specific
+    module's resolution says "not quantized" (``_per_layer_projection_linear_class``
+    / ``_per_layer_model_projection_linear_class`` returns ``None`` -- construction
+    built a plain ``Linear`` there). When it resolves to "quantized", construction
+    already built a ``QuantizedLinear``, and the packed sidecars must pass through
+    to ``preprocess_quantized_weights``/``preprocess_quark_weights`` untouched
+    instead of being dequantized here -- doing both would leave construction and
+    weight loading disagreeing about the module's type.
+    """
+    quantization = _active_quantization(config.quantization)
+    if quantization is None or quantization.quant_method != "quark":
+        return
+    stems: set[str] = set()
+    for key in state_dict:
+        if not key.endswith(".weight_scale"):
+            continue
+        stem = key[: -len(".weight_scale")]
+        if stem.endswith("per_layer_model_projection"):
+            if _per_layer_model_projection_linear_class(config) is None:
+                stems.add(stem)
+            continue
+        projection = next((p for p in _GEMMA4_PER_LAYER_PROJECTIONS if stem.endswith(p)), None)
+        if projection is None:
+            continue
+        parts = stem.split(".")
+        try:
+            layer_idx = int(parts[parts.index("layers") + 1])
+        except (ValueError, IndexError):
+            continue
+        if _per_layer_projection_linear_class(config, layer_idx, projection) is None:
+            stems.add(stem)
+    if not stems:
+        return
+    # float32 avoids double-rounding here; the weight loader casts each tensor
+    # to its initializer's declared dtype at save time.
+    dequantize_quark_projections(
+        state_dict,
+        stems,
+        bits=quantization.bits,
+        group_size=quantization.group_size,
+        dtype=torch.float32,
+    )
+
+
 def _split_per_layer_projection_weight(
     state_dict: dict[str, torch.Tensor],
     prefix: str,
@@ -377,6 +450,55 @@ def _text_linear_class(config: Gemma4Config) -> type | None:
         config,
         _component_quantization_config(config, "decoder"),
     )
+
+
+def _per_layer_projection_linear_class(
+    config: Gemma4Config, layer_idx: int, projection: str
+) -> type | None:
+    """QuantizedLinear factory for one per-layer-embedding (PLE) projection.
+
+    ``_text_linear_class`` is a per-component decision applied uniformly to every
+    decoder projection, so it cannot see a ``modules_to_not_convert``/``overrides``
+    pattern that targets one specific submodule (e.g. a checkpoint that quantizes
+    every attention/MLP projection but explicitly excludes ``per_layer_input_gate``).
+    Resolve per-module here via ``QuantizationConfig.for_module`` against the
+    literal HF dotted path, so a checkpoint that supplies real quantized weights for
+    this exact projection gets ``QuantizedLinear``, and one that excludes it keeps
+    plain float — matching whatever the checkpoint actually declares, for any
+    quant_method (awq/gptq/olive/quark).
+    """
+    quantization = _component_quantization_config(config, "decoder")
+    if quantization is None:
+        return None
+    source_path = f"model.language_model.layers.{layer_idx}.{projection}"
+    quantization = quantization.for_module((source_path,))
+    return _quantized_linear_class(config, quantization) if quantization else None
+
+
+def _per_layer_model_projection_linear_class(config: Gemma4Config) -> type | None:
+    """QuantizedLinear factory for ``per_layer_model_projection``, or ``None``.
+
+    ``_embedding_linear_class``/``_component_quantization_config`` categorically
+    return ``None`` for the ``embedding`` component on the root-quantization path
+    ("a top-level module plan does not opt package components into quantization
+    ... only legacy flags or an explicit component mapping do that") -- a
+    deliberate opt-in gate meant for embedding *tables* (``GatherBlockQuantized``),
+    not this module. ``per_layer_model_projection`` is an ordinary linear
+    projection that some checkpoints (e.g. AMD Quark AWQ) supply real quantized
+    weights for independently of that gate, so on that root path resolve it
+    directly against the root ``QuantizationConfig`` instead of going through the
+    categorical veto. When an explicit ``component_quantization`` mapping *is*
+    given, honour the embedding component's own layout as usual -- the veto
+    bypass is only for the implicit root-quantization case.
+    """
+    quantization = _component_quantization_config(config, "embedding")
+    if quantization is None and config.component_quantization is None:
+        quantization = _active_quantization(config.quantization)
+    if quantization is None:
+        return None
+    source_path = "model.language_model.per_layer_model_projection"
+    quantization = quantization.for_module((source_path,))
+    return _quantized_linear_class(config, quantization) if quantization else None
 
 
 def _embedding_linear_class(config: Gemma4Config) -> type | None:
@@ -524,6 +646,7 @@ def _preprocess_component_quantized_weights(
         "olive",
         "gptq",
         "awq",
+        "quark",
     }:
         return state_dict
     apply_tie = config.tie_word_embeddings and any(
@@ -1744,11 +1867,18 @@ class Gemma4DecoderLayer(nn.Module):
 
         self._per_layer_dim = config.hidden_size_per_layer_input
         if self._per_layer_dim > 0:
-            linear_class = _text_linear_class(config) or Linear
-            self.per_layer_input_gate = linear_class(
+            gate_class = (
+                _per_layer_projection_linear_class(config, layer_idx, "per_layer_input_gate")
+                or Linear
+            )
+            proj_class = (
+                _per_layer_projection_linear_class(config, layer_idx, "per_layer_projection")
+                or Linear
+            )
+            self.per_layer_input_gate = gate_class(
                 config.hidden_size, self._per_layer_dim, bias=False
             )
-            self.per_layer_projection = linear_class(
+            self.per_layer_projection = proj_class(
                 self._per_layer_dim, config.hidden_size, bias=False
             )
             self.post_per_layer_input_norm = RMSNorm(
@@ -2882,6 +3012,7 @@ class Gemma4CausalLMModel(CausalLMModel):
         native = _extract_native_expert_weights(state_dict, config, prefix="model.")
         # Map HF expert weight names and fold expert output scales.
         _remap_moe_expert_weights(state_dict, self.config)
+        _dequantize_float_only_projections(state_dict, self.config)
         _split_per_layer_projection_weight(state_dict, "model.", self.config)
         return super().preprocess_weights(state_dict) | native
 
@@ -2951,6 +3082,7 @@ class _Gemma4DecoderModel(nn.Module):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = vlm_decoder_weights(state_dict, tie=self.config.tie_word_embeddings)
+        _dequantize_float_only_projections(state_dict, self.config)
         _split_per_layer_projection_weight(state_dict, "model.", self.config)
         # For WebGPU: split the fused [V, L*D] per-layer embedding into L separate [V, D] tables.
         per_layer_dim = self.config.hidden_size_per_layer_input
@@ -3118,7 +3250,7 @@ class Gemma4EmbeddingModel(nn.Module):
                 float(self._per_layer_dim**0.5),
                 component="embedding",
             )
-            linear_class = _embedding_linear_class(config) or Linear
+            linear_class = _per_layer_model_projection_linear_class(config) or Linear
             self.per_layer_model_projection = linear_class(
                 config.hidden_size,
                 config.num_hidden_layers * self._per_layer_dim,
@@ -3703,6 +3835,16 @@ class Gemma4Model(nn.Module):
             (key[len("model.") :] if key.startswith("model.") else key): value
             for key, value in state_dict.items()
         }
+
+        # The split decoder builds per_layer_input_gate / per_layer_projection as
+        # float Linear, and the embedding builds per_layer_model_projection as
+        # float too (_embedding_linear_class returns None unless an explicit
+        # component_quantization opts in). A checkpoint that quantized them --
+        # AMD Quark does -- must be reconstructed here, before the component
+        # router runs: the router keys off the ``.weight_scale`` sidecars, so a
+        # packed [N, blocks, bytes] tensor would otherwise reach a float
+        # initializer and fail its shape check.
+        _dequantize_float_only_projections(state_dict, self.config)
 
         # Synthesize lm_head from embed_tokens when weights are tied. For a
         # float checkpoint this copies ``embed_tokens.weight``; for a quantized
