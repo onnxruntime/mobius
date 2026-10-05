@@ -269,6 +269,15 @@ class Qwen4ExpGroupedRMSNorm(nn.Module):
         self._eps = eps
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        if ep_capabilities().name == "cuda":
+            scale = op.Add(self.weight, op.CastLike(1.0, self.weight))
+            return op.BranchwiseRMSNorm(
+                hidden_states,
+                scale,
+                epsilon=self._eps,
+                num_branches=self._groups,
+                _domain="com.microsoft",
+            )
         original_shape = op.Shape(hidden_states)
         grouped = op.Reshape(
             op.Cast(hidden_states, to=ir.DataType.FLOAT),
@@ -313,24 +322,45 @@ class Qwen4ExpGatedResidual(nn.Module):
         # hyper_input: (B, S, hc_count * hidden_size)
         normalized = self.hc_norm(op, hyper_input)
         read = self.input_mix_weight_down(op, normalized)
-        read = op.Swish(op.Div(read, float(self._hc_count)))
+        native = ep_capabilities().name == "cuda"
+        if native:
+            read = op.ScaledSiLU(read, alpha=1.0 / self._hc_count, _domain="com.microsoft")
+        else:
+            read = op.Swish(op.Div(read, float(self._hc_count)))
         read = op.Sigmoid(self.input_mix_weight_up(op, read))
-        read = op.Reshape(read, [0, 0, self._hc_count, self._hidden_size])
-        streams = op.Reshape(normalized, [0, 0, self._hc_count, self._hidden_size])
-        mixed = op.ReduceMean(op.Mul(read, streams), [-2], keepdims=False)
+        if native:
+            mixed = op.HyperConnectionPreMix(
+                normalized,
+                read,
+                num_branches=self._hc_count,
+                reduction_scale=1.0 / self._hc_count,
+                _domain="com.microsoft",
+            )
+        else:
+            read = op.Reshape(read, [0, 0, self._hc_count, self._hidden_size])
+            streams = op.Reshape(normalized, [0, 0, self._hc_count, self._hidden_size])
+            mixed = op.ReduceMean(op.Mul(read, streams), [-2], keepdims=False)
         if self.block_inject_weight is None:
             return mixed
         inject = self.block_inject_weight(op, normalized)
         inject = op.Mul(op.Sigmoid(op.Div(inject, float(self._hc_count))), 2.0)
         return mixed, hyper_input, inject
 
-    @staticmethod
     def inject(
+        self,
         op: OpBuilder,
         block_output: ir.Value,
         hyper_input: ir.Value,
         injection_weights: ir.Value,
     ) -> ir.Value:
+        if ep_capabilities().name == "cuda":
+            return op.HyperConnectionPostMix(
+                hyper_input,
+                block_output,
+                injection_weights,
+                num_branches=self._hc_count,
+                _domain="com.microsoft",
+            )
         # Broadcast the block output into all residual streams, then flatten.
         injection = op.Mul(
             op.Unsqueeze(block_output, [-2]),
@@ -376,6 +406,15 @@ class _Qwen4ExpPostGatedRMSNorm(nn.Module):
         self._activation = activation
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value) -> ir.Value:
+        if ep_capabilities().name == "cuda":
+            return op.GatedRMSNorm(
+                hidden_states,
+                self.weight,
+                gate,
+                epsilon=self._eps,
+                activation=self._activation,
+                _domain="com.microsoft",
+            )
         hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
         variance = op.ReduceMean(op.Mul(hidden_f32, hidden_f32), [-1], keepdims=True)
         normalized_f32 = op.Mul(
@@ -917,16 +956,15 @@ class Qwen4ExpQSAIndexer(nn.Module):
             axis=-1,
             _outputs=2,
         )
-        real_block_ids = op.Range(
-            op.Constant(value_int=0),
-            op.Squeeze(max_blocks, [0]),
-            op.Constant(value_int=1),
+        real_selection = op.Less(selected_blocks, op.Squeeze(max_blocks, [0]))
+        safe_indices = op.Min(selected_blocks, op.Squeeze(op.Sub(max_blocks, 1), [0]))
+        selected = op.ScatterElements(
+            op.Expand(op.Constant(value_int=0), op.Shape(scores)),
+            safe_indices,
+            op.Cast(real_selection, to=ir.DataType.INT64),
+            axis=2,
+            reduction="max",
         )
-        selected = op.Equal(
-            op.Unsqueeze(selected_blocks, [-1]),
-            op.Unsqueeze(real_block_ids, [0, 1, 2]),
-        )
-        selected = op.ReduceMax(op.Cast(selected, to=ir.DataType.INT64), [2], keepdims=False)
         selected = op.Cast(selected, to=ir.DataType.BOOL)
         selected = op.And(selected, block_valid)
 
@@ -1255,11 +1293,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 qsa_full_position_embeddings,
                 past_state,
             )
-        hidden_states = Qwen4ExpGatedResidual.inject(op, output, residual, inject)
+        hidden_states = self.attn_hyper_connection.inject(op, output, residual, inject)
 
         mixed, residual, inject = self.mlp_hyper_connection(op, hidden_states)
         output = self.mlp(op, mixed)
-        hidden_states = Qwen4ExpGatedResidual.inject(op, output, residual, inject)
+        hidden_states = self.mlp_hyper_connection.inject(op, output, residual, inject)
         return hidden_states, present_state
 
 

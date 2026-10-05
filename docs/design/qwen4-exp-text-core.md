@@ -253,3 +253,24 @@ but FP8 visual-package loading is not claimed until every visual tensor is
 classified through the same strict streaming contract. The MTP sidecar remains
 excluded for the same authoritative-forward/cache-ABI reason documented above.
 NVFP4 checkpoint lowering remains out of scope.
+
+## CUDA numerical alignment and sparse selection
+
+The CUDA text graph uses `BranchwiseRMSNorm`, `ScaledSiLU`,
+`HyperConnectionPreMix`, `HyperConnectionPostMix`, and `GatedRMSNorm` from the
+`com.microsoft` domain. These fused operations align the residual-stream and
+gated-normalization rounding boundaries with the ONNX Runtime GenAI Qwen4-Exp
+decoder. The CUDA provider must implement these operations. Other execution
+providers, including `onnx-standard`, retain the standard-operator decompositions.
+
+QSA indexer block selection uses `ScatterElements(reduction="max")` to build
+the `[batch, query, blocks]` membership mask directly. Dummy top-k entries are
+clamped to a valid index and contribute zero; max reduction preserves a real
+selection when dummy entries collide with it. This avoids the larger
+`[batch, query, top_k, blocks]` comparison intermediate.
+
+These graph changes do not add native NVFP4 checkpoint loading, the separate
+fast-export serializer, or a GenAI-compatible cache/PLE package. Those remain
+separate integration work. Long-context validation of the experimental NVFP4
+export used 128-token prefill chunks at 32k; the legacy indexer still has an
+Expand element-count limit with 512-token chunks at that context length.

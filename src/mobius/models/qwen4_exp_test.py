@@ -974,6 +974,33 @@ def test_ple_shard_divisibility_error_reports_remainder():
         _build(_config(split_ngram_parts=5))
 
 
+def test_qsa_indexer_selection_uses_bounded_scatter_mask():
+    model = _build()[2]
+    indexer_nodes = [node for node in model.graph if "/indexer/" in node.name]
+    assert not any(node.op_type == "ReduceMax" for node in indexer_nodes)
+    scatter = [node for node in indexer_nodes if node.op_type == "ScatterElements"]
+    assert len(scatter) == 1
+    assert scatter[0].attributes["reduction"].value == "max"
+
+
+def test_cuda_emits_genai_hyper_connection_and_normalization_ops():
+    from mobius._optimizations import validate_standard_onnx
+
+    config = _config(dtype=ir.DataType.BFLOAT16)
+    native = _build(config, ep="cuda")[2]
+    required = {
+        "BranchwiseRMSNorm",
+        "ScaledSiLU",
+        "HyperConnectionPreMix",
+        "HyperConnectionPostMix",
+        "GatedRMSNorm",
+    }
+    assert required <= {node.op_type for node in native.graph}
+    standard = _build(config, ep="onnx-standard")[2]
+    validate_standard_onnx(standard)
+    assert not required & {node.op_type for node in standard.graph}
+
+
 def test_moe_executes_only_packed_topk_experts():
     _config_value, _module, model = _build()
     moe_nodes = [node for node in model.graph if node.op_type == "MoE"]
