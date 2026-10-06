@@ -26,7 +26,7 @@ from mobius._build_context import build_context
 from mobius._builder import _cast_module_dtype, build_from_module
 from mobius._configs import Qwen4ExpConfig, VisionConfig
 from mobius._execution_providers import EpCapabilities, ep_registry
-from mobius._optimizations import validate_standard_onnx
+from mobius._optimizations import optimize_model, validate_standard_onnx
 from mobius._registry import registry
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
@@ -513,6 +513,13 @@ def test_multimodal_embedding_preserves_global_image_order():
                 actual = device_actual
             else:
                 np.testing.assert_array_equal(device_actual, actual)
+            text_only = session.run(
+                {
+                    "input_ids": input_ids,
+                    "image_features": np.zeros((0, config.hidden_size), dtype=np.float32),
+                }
+            )["inputs_embeds"]
+            np.testing.assert_array_equal(text_only, weight[input_ids].numpy())
             video_input_ids = input_ids.copy()
             video_input_ids[0, 3] = config.unsupported_video_token_id
             with pytest.raises(
@@ -1202,7 +1209,10 @@ def test_standard_all_components_before_after_weights(multimodal, dtype):
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
 @pytest.mark.parametrize("normalize", [False, True])
-def test_standard_moe_low_precision_execution_and_routing(dtype, normalize):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_standard_moe_low_precision_execution_and_routing(dtype, normalize, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
     np_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else ml_dtypes.bfloat16
     config = _config(dtype=dtype, num_experts_per_tok=1, norm_topk_prob=normalize)
     model = _standard_experts(config, [1, 1, 16])
@@ -1224,16 +1234,22 @@ def test_standard_moe_low_precision_execution_and_routing(dtype, normalize):
         1.0 if normalize else 0.50002, dtype=torch_dtype
     )
     try:
-        session = OnnxModelSession(model)
+        session = OnnxModelSession(model, device=device)
     except OrtNotImplemented as error:
-        if dtype != ir.DataType.BFLOAT16 or not re.fullmatch(
-            r"\[ONNXRuntimeError\] : 9 : NOT_IMPLEMENTED : Could not find an "
-            r"implementation for Expand\(13\) node with name 'Expand_node_\d+'",
-            str(error),
+        if (
+            device != "cpu"
+            or dtype != ir.DataType.BFLOAT16
+            or not re.fullmatch(
+                r"\[ONNXRuntimeError\] : 9 : NOT_IMPLEMENTED : Could not find an "
+                r"implementation for Expand\(13\) node with name 'Expand_node_\d+'",
+                str(error),
+            )
         ):
             raise
         pytest.skip(f"ORT CPU BF16 capability gap: {error}")
     try:
+        if device == "cuda":
+            assert "CUDAExecutionProvider" in session.providers
         actual = session.run({"hidden": hidden, "probabilities": probabilities})["output"]
     finally:
         session.close()
@@ -2763,25 +2779,10 @@ def test_left_padding_matches_unpadded_prefill_and_following_decode(ep):
             )
 
 
-@pytest.mark.integration
-def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
-    """Compare the complete tiny core when the pinned Qwen4-Exp HF class is installed."""
-    try:
-        from transformers import (
-            DynamicCache,
-            Qwen4ExpForCausalLM,
-            Qwen4ExpTextConfig,
-        )
-    except ImportError:
-        pytest.skip(
-            "Installed transformers does not contain the pinned experimental "
-            "Qwen4-Exp implementation"
-        )
+def _reduced_huggingface_text_config(**overrides):
+    from transformers import Qwen4ExpTextConfig
 
-    from mobius.integrations._weight_loading import apply_weights
-
-    torch.manual_seed(0)
-    hf_config = Qwen4ExpTextConfig(
+    values = dict(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=32,
@@ -2797,7 +2798,7 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
             "rope_theta": 10_000.0,
             "partial_rotary_factor": 0.25,
         },
-        layer_types=["linear_attention", "qwen_sparse_attention"],
+        layer_types=["linear_attention", "full_attention"],
         linear_conv_kernel_dim=2,
         linear_key_head_dim=8,
         linear_value_head_dim=8,
@@ -2826,11 +2827,33 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
         pad_token_id=0,
         mtp_num_hidden_layers=0,
     )
+    values.update(overrides)
+    return Qwen4ExpTextConfig(**values)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("ep", ["default", "onnx-standard"])
+def test_reduced_random_weight_huggingface_prefill_and_decode_parity(ep):
+    """Compare the complete tiny core when the pinned Qwen4-Exp HF class is installed."""
+    try:
+        from transformers import DynamicCache, Qwen4ExpForCausalLM
+    except ImportError:
+        pytest.skip(
+            "Installed transformers does not contain the pinned experimental "
+            "Qwen4-Exp implementation"
+        )
+
+    torch.manual_seed(0)
+    hf_config = _reduced_huggingface_text_config()
     hf_model = Qwen4ExpForCausalLM(hf_config).eval()
     config = Qwen4ExpConfig.from_transformers(hf_config)
     module = Qwen4ExpCausalLMModel(config)
-    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    model = build_from_module(
+        module, config, task="qwen4-exp-text-generation", execution_provider=ep
+    )["model"]
     apply_weights(model, module.preprocess_weights(dict(hf_model.state_dict())))
+    if ep == "onnx-standard":
+        validate_standard_onnx(model)
 
     input_ids = np.array([[2, 3, 4, 5]], dtype=np.int64)
     with torch.no_grad():
@@ -2887,11 +2910,15 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
     # position channels equal (text-only), this route must remain identical.
     vl_config = _vl_config()
     vl_decoder = Qwen4ExpVLDecoderModel(vl_config)
-    vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
+    with build_context(ep_registry.require(ep), vl_config.dtype):
+        vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
+    optimize_model(vl_model, ep=ep, dtype=vl_config.dtype)
     apply_weights(
         vl_model,
         vl_decoder.preprocess_weights(dict(hf_model.state_dict())),
     )
+    if ep == "onnx-standard":
+        validate_standard_onnx(vl_model)
     with torch.no_grad():
         inputs_embeds = hf_model.model.embed_tokens(torch.from_numpy(input_ids)).numpy()
     position_ids_4d = np.broadcast_to(
@@ -2962,3 +2989,368 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
     np.testing.assert_allclose(vl_alternate, vl_logits, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(hf_alternate, hf_positioned, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(hf_decode_alternate, hf_decode_positioned, rtol=1e-3, atol=1e-3)
+
+
+def _reduced_next_states(outputs):
+    return {"past_position_ids": outputs["present_position_ids"]} | {
+        name.replace("present.", "past_key_values.", 1): value
+        for name, value in outputs.items()
+        if name.startswith("present.")
+    }
+
+
+def _reduced_huggingface_numpy(tensor):
+    tensor = tensor.detach().cpu().contiguous()
+    if tensor.dtype == torch.bfloat16:
+        return tensor.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+    return tensor.numpy()
+
+
+def _assert_reduced_float_parity(actual, reference, *, tolerance, err_msg=""):
+    assert actual.shape == reference.shape, err_msg
+    assert actual.dtype == reference.dtype, err_msg
+    np.testing.assert_allclose(
+        actual.astype(np.float32),
+        reference.astype(np.float32),
+        rtol=tolerance,
+        atol=tolerance,
+        err_msg=err_msg,
+        strict=True,
+    )
+
+
+def _reduced_initial_states(dtype):
+    states = _initial_states()
+    if dtype == ir.DataType.BFLOAT16:
+        for name, value in states.items():
+            if value.dtype == np.float32 and not name.endswith(".recurrent_state"):
+                states[name] = value.astype(ml_dtypes.bfloat16)
+    return states
+
+
+def _assert_reduced_huggingface_states(outputs, cache, *, multimodal=False, tolerance=1e-3):
+    assert outputs["present.0.recurrent_state"].dtype == np.float32
+    linear, attention = cache.layers
+    expected = {
+        "present.0.conv_state": linear.conv_states[0],
+        "present.0.recurrent_state": linear.recurrent_states[0],
+        "present.0.ple_conv_state": linear.conv_states[1],
+        "present.0.ple_context": linear.conv_states[2],
+        "present.1.key": attention.keys,
+        "present.1.value": attention.values,
+        "present.1.index_key": attention.indexer_keys,
+    }
+    assert set(outputs) == {"logits", "present_position_ids", *expected}
+    for name, reference in expected.items():
+        reference = _reduced_huggingface_numpy(reference)
+        if np.issubdtype(reference.dtype, np.integer):
+            np.testing.assert_array_equal(outputs[name], reference, err_msg=name, strict=True)
+        else:
+            _assert_reduced_float_parity(
+                outputs[name], reference, tolerance=tolerance, err_msg=name
+            )
+    positions = outputs["present_position_ids"]
+    if multimodal:
+        np.testing.assert_array_equal(positions[1:], cache.position_ids.numpy(), strict=True)
+        np.testing.assert_array_equal(
+            positions[0], np.arange(positions.shape[-1], dtype=np.int64)[None], strict=True
+        )
+    else:
+        np.testing.assert_array_equal(positions, cache.position_ids[0].numpy(), strict=True)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "device,dtype",
+    [
+        ("cpu", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.BFLOAT16),
+    ],
+    ids=["cpu-f32", "cuda-f32", "cuda-bf16"],
+)
+def test_reduced_standard_huggingface_cached_logits_and_states(device, dtype):
+    """Check every cache against HF through prefill, sparse selection, and greedy decode."""
+    try:
+        from transformers import DynamicCache, Qwen4ExpForCausalLM
+    except ImportError:
+        pytest.skip("Installed transformers does not contain Qwen4-Exp")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+
+    torch.manual_seed(17)
+    torch_dtype = torch.bfloat16 if dtype == ir.DataType.BFLOAT16 else torch.float32
+    tolerance = 1e-2 if dtype == ir.DataType.BFLOAT16 else 1e-3
+    hf_config = _reduced_huggingface_text_config(num_experts_per_tok=2, dtype=torch_dtype)
+    hf_model = Qwen4ExpForCausalLM(hf_config).to(torch_dtype).eval()
+    config = Qwen4ExpConfig.from_transformers(hf_config)
+    assert config.dtype == dtype
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+        execution_provider="onnx-standard",
+    )["model"]
+    apply_weights(model, module.preprocess_weights(dict(hf_model.state_dict())))
+    validate_standard_onnx(model)
+    cache = DynamicCache(config=hf_config)
+    session = OnnxModelSession(model, device=device)
+    try:
+        if device == "cuda":
+            assert "CUDAExecutionProvider" in session.providers
+        input_ids = np.arange(2, 12, dtype=np.int64)[None]
+        with torch.no_grad():
+            reference = _reduced_huggingface_numpy(
+                hf_model(
+                    torch.from_numpy(input_ids), past_key_values=cache, use_cache=True
+                ).logits
+            )
+        outputs = session.run(
+            _reduced_initial_states(dtype)
+            | {
+                "input_ids": input_ids,
+                "attention_mask": np.ones_like(input_ids),
+                "position_ids": np.arange(input_ids.shape[1], dtype=np.int64)[None],
+            }
+        )
+        _assert_reduced_float_parity(outputs["logits"], reference, tolerance=tolerance)
+        _assert_reduced_huggingface_states(outputs, cache, tolerance=tolerance)
+        # Independent token choices prevent the ONNX driver from hiding a divergence.
+        for step in range(6):
+            token = np.argmax(reference[:, -1], axis=-1)[:, None].astype(np.int64)
+            np.testing.assert_array_equal(
+                np.argmax(outputs["logits"][:, -1], axis=-1)[:, None], token
+            )
+            length = input_ids.shape[1] + step
+            with torch.no_grad():
+                reference = _reduced_huggingface_numpy(
+                    hf_model(
+                        torch.from_numpy(token), past_key_values=cache, use_cache=True
+                    ).logits
+                )
+            outputs = session.run(
+                _reduced_next_states(outputs)
+                | {
+                    "input_ids": token,
+                    "attention_mask": np.ones((1, length + 1), dtype=np.int64),
+                    "position_ids": np.array([[length]], dtype=np.int64),
+                }
+            )
+            _assert_reduced_float_parity(
+                outputs["logits"],
+                reference,
+                tolerance=tolerance,
+                err_msg=f"step {step}",
+            )
+            _assert_reduced_huggingface_states(outputs, cache, tolerance=tolerance)
+    finally:
+        session.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "device,dtype",
+    [
+        ("cpu", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.BFLOAT16),
+    ],
+    ids=["cpu-f32", "cuda-f32", "cuda-bf16"],
+)
+def test_reduced_standard_huggingface_image_pipeline_and_decode(device, dtype):
+    """Compare nonzero two-image vision, fusion, logits, and cached no-image decode."""
+    try:
+        from transformers import (
+            DynamicCache,
+            Qwen4ExpVisionConfig,
+        )
+        from transformers import (
+            Qwen4ExpConfig as HfConfig,
+        )
+        from transformers import (
+            Qwen4ExpForConditionalGeneration as HfModel,
+        )
+    except ImportError:
+        pytest.skip("Installed transformers does not contain Qwen4-Exp")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+
+    torch.manual_seed(23)
+    torch_dtype = torch.bfloat16 if dtype == ir.DataType.BFLOAT16 else torch.float32
+    np_dtype = ml_dtypes.bfloat16 if dtype == ir.DataType.BFLOAT16 else np.float32
+    tolerance = 1e-2 if dtype == ir.DataType.BFLOAT16 else 1e-3
+    text_config = _reduced_huggingface_text_config(
+        num_experts_per_tok=2,
+        dtype=torch_dtype,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10_000.0,
+            "partial_rotary_factor": 1.0,
+            "mrope_section": [1, 1, 2],
+            "mrope_interleaved": True,
+        },
+    )
+    hf_config = HfConfig(
+        text_config=text_config,
+        vision_config=Qwen4ExpVisionConfig(
+            depth=1,
+            hidden_size=32,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=16,
+            num_position_embeddings=16,
+            hidden_act="gelu_pytorch_tanh",
+            deepstack_visual_indexes=[],
+        ),
+        image_token_id=30,
+        video_token_id=31,
+        vision_start_token_id=29,
+        vision_end_token_id=28,
+        tie_word_embeddings=False,
+    )
+    hf_model = HfModel(hf_config).to(torch_dtype).eval()
+    # Published-config validation requires the production vision dimensions;
+    # the independent synthetic fixture deliberately uses a matching tiny pair.
+    config = _vl_config(
+        num_experts_per_tok=2,
+        partial_rotary_factor=1.0,
+        mrope_section=[1, 1, 2],
+        dtype=dtype,
+    )
+    module = Qwen4ExpForConditionalGeneration(config)
+    package = build_from_module(
+        module, config, task="qwen4-exp-vision-language", execution_provider="onnx-standard"
+    )
+    weights = module.preprocess_weights(dict(hf_model.state_dict()))
+    for model in package.values():
+        apply_weights(
+            model,
+            {
+                name: value
+                for name, value in weights.items()
+                if name in model.graph.initializers
+            },
+        )
+        assert all(
+            value.const_value is not None for value in model.graph.initializers.values()
+        )
+        validate_standard_onnx(model)
+
+    ids = torch.tensor([[2, 29, 30, 30, 28, 3, 29, 30, 30, 28, 4]])
+    grid = torch.tensor([[1, 2, 4], [1, 4, 2]])
+    pixels = torch.randn(16, 1536) * 0.2
+    mask = torch.ones_like(ids)
+    modality = (ids == hf_config.image_token_id).long()
+    rope_positions, _ = hf_model.model.get_rope_index(ids, modality, grid, attention_mask=mask)
+    positions = torch.cat([torch.arange(ids.shape[1])[None, None], rope_positions], dim=0)
+    fused_embeddings = []
+
+    def capture_fusion(_module, _args, kwargs):
+        fused_embeddings.append(_reduced_huggingface_numpy(kwargs["inputs_embeds"].clone()))
+
+    cache = DynamicCache(config=text_config)
+    hook = hf_model.model.language_model.register_forward_pre_hook(
+        capture_fusion, with_kwargs=True
+    )
+    try:
+        with torch.no_grad():
+            reference_features = _reduced_huggingface_numpy(
+                hf_model.model.visual(pixels.to(torch_dtype), grid_thw=grid).pooler_output
+            )
+            reference = _reduced_huggingface_numpy(
+                hf_model(
+                    input_ids=ids,
+                    pixel_values=pixels,
+                    image_grid_thw=grid,
+                    attention_mask=mask,
+                    position_ids=positions,
+                    past_key_values=cache,
+                    use_cache=True,
+                ).logits
+            )
+    finally:
+        hook.remove()
+    assert len(fused_embeddings) == 1
+
+    vision = OnnxModelSession(package["vision_encoder"], device=device)
+    embedding = OnnxModelSession(package["embedding"], device=device)
+    decoder = OnnxModelSession(package["decoder"], device=device)
+    try:
+        if device == "cuda":
+            assert all(
+                "CUDAExecutionProvider" in session.providers
+                for session in [vision, embedding, decoder]
+            )
+        features = vision.run(
+            {"pixel_values": pixels.numpy(), "image_grid_thw": grid.numpy()}
+        )["image_features"]
+        _assert_reduced_float_parity(features, reference_features, tolerance=tolerance)
+        embeds = embedding.run({"input_ids": ids.numpy(), "image_features": features})[
+            "inputs_embeds"
+        ]
+        _assert_reduced_float_parity(embeds, fused_embeddings[0], tolerance=tolerance)
+        states = _reduced_initial_states(dtype)
+        states["past_position_ids"] = np.zeros((4, 1, 0), dtype=np.int64)
+        outputs = decoder.run(
+            states
+            | {
+                "inputs_embeds": embeds,
+                "ple_input_ids": ids.numpy(),
+                "attention_mask": mask.numpy(),
+                "position_ids": positions.numpy(),
+            }
+        )
+        _assert_reduced_float_parity(outputs["logits"], reference, tolerance=tolerance)
+        _assert_reduced_huggingface_states(
+            outputs, cache, multimodal=True, tolerance=tolerance
+        )
+        for step in range(3):
+            token = np.argmax(reference[:, -1], axis=-1)[:, None].astype(np.int64)
+            np.testing.assert_array_equal(
+                np.argmax(outputs["logits"][:, -1], axis=-1)[:, None], token
+            )
+            next_positions = positions[:, :, -1:] + step + 1
+            next_positions[0] = ids.shape[1] + step
+            decode_mask = np.ones((1, ids.shape[1] + step + 1), dtype=np.int64)
+            with torch.no_grad():
+                reference = _reduced_huggingface_numpy(
+                    hf_model(
+                        input_ids=torch.from_numpy(token),
+                        attention_mask=torch.from_numpy(decode_mask),
+                        position_ids=next_positions,
+                        past_key_values=cache,
+                        use_cache=True,
+                    ).logits
+                )
+            embeds = embedding.run(
+                {
+                    "input_ids": token,
+                    "image_features": np.zeros((0, config.hidden_size), dtype=np_dtype),
+                }
+            )["inputs_embeds"]
+            outputs = decoder.run(
+                _reduced_next_states(outputs)
+                | {
+                    "inputs_embeds": embeds,
+                    "ple_input_ids": token,
+                    "attention_mask": decode_mask,
+                    "position_ids": next_positions.numpy(),
+                }
+            )
+            _assert_reduced_float_parity(
+                outputs["logits"],
+                reference,
+                tolerance=tolerance,
+                err_msg=f"step {step}",
+            )
+            _assert_reduced_huggingface_states(
+                outputs, cache, multimodal=True, tolerance=tolerance
+            )
+    finally:
+        vision.close()
+        embedding.close()
+        decoder.close()

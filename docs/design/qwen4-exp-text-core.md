@@ -59,9 +59,11 @@ embeddings. Mobius reuses the Qwen3 vision implementation with DeepStack
 disabled and the merger projected to the decoder width of 2560.
 
 The embedding graph scatters `image_features` at token 248056 while preserving
-the original token IDs for PLE. The processor contract follows the evidenced Qwen3
-image processor with vision start/end tokens 248053/248054. This package is
-explicitly image-only: config extraction validates the checkpoint's video token
+the original token IDs for PLE. With an empty image-feature stream, it preserves
+all lexical embeddings, including an image token emitted during cached decode,
+matching the HF forward without new pixels. The processor contract follows the
+evidenced Qwen3 image processor with vision start/end tokens 248053/248054. This
+package is explicitly image-only: config extraction validates the checkpoint's video token
 but removes it from runtime metadata, the embedding graph exposes no video
 feature input, and direct configs that request video support fail closed. The
 embedding graph also publishes `mobius.unsupported_token_ids` and carries a
@@ -129,6 +131,45 @@ checkpoint generation or performance benchmark is claimed.
 
 This change does not enable video, MTP execution, GGUF payload loading, GenAI
 engine integration, or a paged-cache ABI.
+
+### Independent reduced-model parity
+
+The focused integration tests use randomly initialized HF models, not outputs
+from another Mobius graph. The reference source is Transformers commit
+`598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1`; it requires
+`tokenizers>=0.23.1,<0.24.0`. Install or expose that reference in an isolated
+environment before running:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m pytest \
+  src/mobius/models/qwen4_exp_test.py -q -m integration \
+  -k "reduced_random_weight_huggingface or reduced_standard_huggingface"
+```
+
+The standard-ONNX cases run FP32 on CPU/CUDA and BF16 on CUDA. They compare full
+prefill and per-step logits, greedy token choices, linear convolution/recurrent
+state, PLE convolution/context,
+QSA key/value/indexer caches, and position history. Text prefill spans the sparse
+selection boundary and is followed by six cached decode steps. The image-text
+case compares two nonzero, differently shaped image grids through the actual
+ONNX vision-to-embedding-to-decoder pipeline, independently checking vision
+features and HF-fused embeddings, then three decode steps with no new images.
+Shapes and dtypes are checked alongside numerical values; tolerances are
+`rtol=atol=1e-3` for FP32 and `1e-2` for BF16. Recurrent state remains FP32
+even when weights, embeddings, and convolution/KV caches are BF16. The expert
+fixture separately checks FP16/BF16 CUDA dispatch with an empty expert branch
+and near-tie float32 routing probabilities.
+
+The hyper-connection mean retains the rounded model-dtype products, reduces
+them with an FP32 accumulator, then casts the result back to model dtype,
+matching the HF mean without requiring an ORT BF16 ReduceMean kernel. QSA
+compares the mask bias to zero in FP32, avoiding a BF16 Equal kernel without
+changing visibility.
+
+This is independent reduced-model evidence, not official checkpoint parity,
+semantic generation quality, full-size-model reduced-precision parity, or GenAI
+driver compatibility. Tests skip when the experimental HF classes are absent;
+CUDA cases additionally require an available CUDA device and ORT CUDA provider.
 
 ## Guarded features
 
