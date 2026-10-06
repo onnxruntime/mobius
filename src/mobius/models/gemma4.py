@@ -1150,19 +1150,43 @@ class Gemma4TextAttention(nn.Module):
         states: ir.Value,
         position_embeddings: tuple,
         head_dim: int,
+        *,
+        interleaved: bool,
     ) -> ir.Value:
-        """Apply Gemma4's half-split RoPE directly to [B, S, H, D]."""
+        """Apply Gemma4 RoPE directly to [B, S, H, D]."""
         cos, sin = position_embeddings[:2]
-        cos = op.Concat(cos, cos, axis=-1)
-        sin = op.Concat(sin, sin, axis=-1)
+        if interleaved:
+            cos = op.Reshape(
+                op.Concat(op.Unsqueeze(cos, [-1]), op.Unsqueeze(cos, [-1]), axis=-1),
+                [0, 0, head_dim],
+            )
+            sin = op.Reshape(
+                op.Concat(op.Unsqueeze(sin, [-1]), op.Unsqueeze(sin, [-1]), axis=-1),
+                [0, 0, head_dim],
+            )
+        else:
+            cos = op.Concat(cos, cos, axis=-1)
+            sin = op.Concat(sin, sin, axis=-1)
         cos = op.Unsqueeze(cos, [2])
         sin = op.Unsqueeze(sin, [2])
         if head_dim % 2:
             raise ValueError(
                 f"Gemma4 OpenVINO RoPE requires an even head dimension, got {head_dim}."
             )
-        first, second = op.Split(states, [head_dim // 2, head_dim // 2], axis=-1, _outputs=2)
-        rotated = op.Concat(op.Neg(second), first, axis=-1)
+        if interleaved:
+            pairs = op.Reshape(states, [0, 0, 0, head_dim // 2, 2])
+            first, second = op.Split(pairs, [1, 1], axis=-1, _outputs=2)
+            rotated = op.Reshape(
+                op.Concat(op.Neg(second), first, axis=-1), [0, 0, 0, head_dim]
+            )
+        else:
+            first, second = op.Split(
+                states,
+                [head_dim // 2, head_dim // 2],
+                axis=-1,
+                _outputs=2,
+            )
+            rotated = op.Concat(op.Neg(second), first, axis=-1)
         left = op.Mul(states, cos)
         right = op.Mul(rotated, sin)
         result = op.Add(left, right)
@@ -1252,7 +1276,11 @@ class Gemma4TextAttention(nn.Module):
         query_states = self.q_norm(op, query_states)
         if position_embeddings is not None:
             query_states = self._apply_rotary_4d(
-                op, query_states, position_embeddings, self.head_dim
+                op,
+                query_states,
+                position_embeddings,
+                self.head_dim,
+                interleaved=self._rope_interleave,
             )
         query_states = op.Transpose(query_states, perm=[0, 2, 1, 3])
         query_states.type = hidden_states.type
@@ -1274,7 +1302,11 @@ class Gemma4TextAttention(nn.Module):
             key_states = self.k_norm(op, key_states)
             if position_embeddings is not None:
                 key_states = self._apply_rotary_4d(
-                    op, key_states, position_embeddings, self.head_dim
+                    op,
+                    key_states,
+                    position_embeddings,
+                    self.head_dim,
+                    interleaved=self._rope_interleave,
                 )
             key_states = op.Transpose(key_states, perm=[0, 2, 1, 3])
             key_states.type = hidden_states.type
