@@ -1356,6 +1356,7 @@ def _write_audio_processor_config(
         # 128-dim log-mel frame. Reproduced natively by the ort-extensions
         # ``Gemma4Audio`` op with ``type="raw_frames"`` (pad to a whole number of
         # frames, reshape to (num_tokens, 640)).
+        # Disable the decoder's Whisper-compatible 30-second truncation.
         samples_per_token = getattr(audio, "hidden_size", None) or 640
         processor = {
             "feature_extraction": {
@@ -1364,6 +1365,7 @@ def _write_audio_processor_config(
                         "operation": {
                             "name": "audio_decoder",
                             "type": "AudioDecoder",
+                            "attrs": {"max_samples": 0},
                         }
                     },
                     {
