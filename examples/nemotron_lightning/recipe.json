@@ -2,7 +2,7 @@
   "schema_version": 1,
   "kind": "development_export_recipe",
   "checked_on": "2026-10-07",
-  "status": "PREFLIGHT_ONLY",
+  "status": "CPU_REGRESSION_TESTED_FULL_CHECKPOINT_BLOCKED",
   "export_status": "NOT_RUN",
   "certified": false,
   "exporter": {
@@ -62,20 +62,18 @@
       "max_position_embeddings": 262144,
       "checkpoint_tensor_bytes": 65842365568,
       "checkpoint_shards": 14,
-      "compatibility": "ARCHITECTURE_SOURCE_PRESENT_NOT_VALIDATED",
+      "compatibility": "NEXTN_CONTRACT_BLOCKED",
       "output_precision": "bf16",
-      "proposed_graph_export_argv": [
-        "mobius", "build", "--config", "<VERIFIED_LOCAL_BF16_SNAPSHOT>",
-        "--output", "<NEW_PRIVATE_OUTPUT_DIRECTORY>",
-        "--ep", "cuda", "--dtype", "bf16", "--external-data", "onnx"
-      ],
-      "command_status": "NOT_RUN",
+      "checkpoint_mtp_tensors": 270,
+      "checkpoint_non_mtp_tensors": 6243,
+      "proposed_graph_export_argv": null,
+      "command_status": "BLOCKED_MTP",
       "runtime_packaging_argv": null,
       "blockers": [
-        "No NVIDIA CUDA GPU or installed exporter on the preflight host.",
+        "No NVIDIA CUDA GPU; executed validation uses an isolated x64 CPU environment.",
         "A suitable host, dependency lock and resource budget have not been validated.",
         "Full Lightning checkpoint weight coverage and source/export parity are untested.",
-        "Nemotron-H MTP export is not implemented in the inspected model module.",
+        "NextN/MTP construction and mtp.* tensors explicitly fail closed; no target-only fallback.",
         "Mamba conv_state/ssm_state packaging is not verified against ORT-GenAI."
       ]
     },
@@ -105,15 +103,30 @@
       "quant_method": "modelopt",
       "weight_formats": ["FP8", "NVFP4"],
       "nvfp4_group_size": 16,
-      "compatibility": "UNSUPPORTED_BY_PINNED_EXPORTER",
+      "compatibility": "NATIVE_UNSUPPORTED_DENSE_RECONSTRUCTION_NEXTN_BLOCKED",
       "output_precision": null,
       "proposed_graph_export_argv": null,
-      "command_status": "NOT_RUN",
+      "command_status": "BLOCKED_MTP_AND_NATIVE_FORMAT",
+      "checkpoint_mtp_tensors": 270,
+      "source_format_counts": {"FP8": 46, "NVFP4": 5935},
+      "source_fp8_input_scales": 46,
+      "source_fp8_kv_cache_scales": 12,
+      "dense_reconstruction": {
+        "representation": "dense_bf16",
+        "api_options": {"keep_quantized": false, "dtype": "bf16"},
+        "cli_options": ["--dequantize", "--dtype", "bf16"],
+        "validation": "SYNTHETIC_CPU_BUILDER_CLI_SERIALIZATION_NUMERIC_TESTS",
+        "full_checkpoint_export": "NOT_RUN",
+        "native_weight_format_preserved": false,
+        "activation_quantization_preserved": false,
+        "kv_cache_quantization_preserved": false,
+        "requires_validated_nextn_contract": true
+      },
       "runtime_packaging_argv": null,
       "blockers": [
-        "QuantizationConfig.from_value explicitly raises NotImplementedError for ModelOpt NVFP4/FP8.",
-        "ModelOpt checkpoint loading and native routed-expert NVFP4 emission are not wired.",
-        "ReLU2 expert semantics require separate validation; a generic QMoE is not equivalent.",
+        "Generic/native ModelOpt NVFP4/FP8 remains unsupported; explicit reconstruction is separately dispatched.",
+        "Mixed-format loading/reconstruction is CPU-tested, not native routed-expert NVFP4 emission.",
+        "Portable ReLU2/sigmoid routing is CPU-tested; a generic QMoE is not equivalent.",
         "BF16 reconstruction or ORT INT4 quantization would be different artifacts, not preserved NVFP4.",
         "The BF16 host, checkpoint parity, MTP and runtime packaging blockers also apply."
       ]
