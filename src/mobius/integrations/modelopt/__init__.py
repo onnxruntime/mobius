@@ -11,11 +11,11 @@ checkpoints:
   scales and a per-tensor FP32 global scale (``weight_scale_2``).
 - FP8 (``E4M3``): per-tensor scaled float8 weights.
 
-The dequantization functions reconstruct BF16 weights so the standard mobius
-build path (plain ``Linear`` / ``bf16`` graph) can consume ModelOpt checkpoints
-without a native FP8/NVFP4 kernel. Native routed-expert NVFP4 QMoE emission
-(the CUDA-only, Blackwell ``QMoE`` ``quant_type="nvfp4"`` op) is intentionally
-out of scope here — see the module docstring in :mod:`._dequant`.
+Nemotron-H's explicit ``keep_quantized=False, dtype="bf16"`` builder route
+validates mixed-format inventories and reconstructs dense BF16 weights lazily.
+It validates and accounts for activation and KV-cache scales, but does not
+simulate their quantization. Native NVFP4/FP8 emission is unsupported; other
+architectures remain blocked. NextN/MTP requires a separate validated contract.
 """
 
 from __future__ import annotations

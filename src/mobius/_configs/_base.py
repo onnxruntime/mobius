@@ -4232,10 +4232,21 @@ class NemotronHConfig(ArchitectureConfig):
     mamba_proj_bias: bool = False
     mamba_time_step_min: float = 0.001
     moe_latent_size: int | None = None
+    mamba_ssm_dtype: ir.DataType | None = None
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronHConfig:
         base = ArchitectureConfig.from_transformers(config, parent_config)
+        if getattr(config, "n_group", 1) != 1 or getattr(config, "topk_group", 1) != 1:
+            raise NotImplementedError("Nemotron-H grouped expert selection is not implemented")
+        cache_dtype = getattr(config, "mamba_ssm_cache_dtype", None)
+        ssm_dtype = _resolve_dtype_value(cache_dtype)
+        if cache_dtype is not None and ssm_dtype not in {
+            ir.DataType.FLOAT,
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+        }:
+            raise ValueError(f"Unsupported Nemotron-H SSM cache dtype {cache_dtype!r}")
 
         # Get layer types from layers_block_type or hybrid_override_pattern
         layers_block_type = getattr(config, "layers_block_type", None)
@@ -4253,6 +4264,7 @@ class NemotronHConfig(ArchitectureConfig):
             # Convert HF names to mobius names
             type_map = {
                 "mamba": "mamba2",
+                "linear_attention": "mamba2",
                 "attention": "full_attention",
                 "moe": "moe",
             }
@@ -4305,6 +4317,7 @@ class NemotronHConfig(ArchitectureConfig):
             mamba_conv_bias=getattr(config, "use_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
             mamba_time_step_min=getattr(config, "time_step_min", 0.001),
+            mamba_ssm_dtype=ssm_dtype,
             moe_latent_size=getattr(config, "moe_latent_size", None),
             shared_expert_intermediate_size=shared_expert_intermediate_size,
         )

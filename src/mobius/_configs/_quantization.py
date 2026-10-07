@@ -149,20 +149,19 @@ class QuantizationConfig:
         # silently mis-dequantize. Checked before the ``quant_method == "none"``
         # early-return because ModelOpt may name its scheme only via
         # ``quant_algo``/``quant_cfg`` (no ``quant_method``). Fail loudly: the
-        # reconstruction math is available in :mod:`mobius.integrations.modelopt`,
-        # but the full weight-load integration + native routed-expert NVFP4 QMoE
-        # emission (CUDA/Blackwell, ``onnxruntime_USE_FP4_QMOE=ON``) are not wired.
+        # Nemotron-H's explicit BF16 reconstruction is dispatched separately by
+        # its checkpoint builder. This generic/native INT4 path must stay blocked.
         from mobius.integrations.modelopt import is_modelopt_quant_config
 
         if is_modelopt_quant_config(qc):
             raise NotImplementedError(
                 "NVIDIA ModelOpt NVFP4/FP8 checkpoints are not yet fully "
-                "supported for export. The weight-reconstruction core lives in "
-                "mobius.integrations.modelopt (dequantize_nvfp4 / dequantize_fp8); "
-                "remaining work is checkpoint weight-loading and native "
-                "routed-expert NVFP4 QMoE emission (CUDA/Blackwell, "
-                "onnxruntime_USE_FP4_QMOE=ON). Export the unquantized (bf16) "
-                "checkpoint instead, or quantize the bf16 export via Olive."
+                "supported by the generic/native quantized exporter. Nemotron-H "
+                "supports explicit dense BF16 weight reconstruction through "
+                "build(..., keep_quantized=False, dtype='bf16') / "
+                "--dequantize --dtype bf16, subject to its NextN/MTP contract. "
+                "This does not preserve native NVFP4/FP8 execution. Other model "
+                "architectures remain unsupported."
             )
         # compressed-tensors is a container format, not an INT4 method. Its
         # ``bits``/``group_size`` values live inside ordered config groups and

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import logging
 import pathlib
@@ -31,6 +32,7 @@ from mobius.integrations.compressed_tensors import (
     CompressedTensorsConfig,
     stream_compressed_tensors_to_package,
 )
+from mobius.integrations.modelopt._config import ModelOptConfig
 from mobius.tasks import ModelTask
 from mobius.weights import adapt_model_weights
 
@@ -43,6 +45,40 @@ _QWEN4_MODEL_TYPES = frozenset(
         "Qwen4ExpForConditionalGeneration",
     }
 )
+
+
+def _prepare_nemotron_modelopt_source(
+    hf_config,
+    parent_config,
+    *,
+    keep_quantized: bool,
+    dtype: str | ir.DataType | None,
+):
+    """Admit only explicit BF16 weight reconstruction; native ModelOpt stays blocked."""
+    from mobius.integrations.modelopt import is_modelopt_quant_config
+
+    raw = getattr(hf_config, "quantization_config", None)
+    if raw is not None and hasattr(raw, "to_dict"):
+        raw = raw.to_dict()
+    if getattr(hf_config, "model_type", None) != "nemotron_h" or not is_modelopt_quant_config(
+        raw
+    ):
+        return hf_config, parent_config, None
+    if keep_quantized:
+        raise NotImplementedError(
+            "Native Nemotron-H ModelOpt NVFP4/FP8 preservation is unsupported. "
+            "Explicit dense reconstruction requires --dequantize --dtype bf16 "
+            "(keep_quantized=False, dtype='bf16'); no automatic fallback is available."
+        )
+    if dtype is None or resolve_dtype(dtype) != ir.DataType.BFLOAT16:
+        raise ValueError("ModelOpt dense reconstruction requires explicit dtype='bf16'")
+    source = ModelOptConfig.parse(raw)
+    dense_config = copy.copy(hf_config)
+    dense_config.quantization_config = None
+    dense_parent = dense_config if parent_config is hf_config else copy.copy(parent_config)
+    if dense_parent is not dense_config:
+        raise NotImplementedError("ModelOpt Nemotron-H composite configs are unsupported")
+    return dense_config, dense_parent, source
 
 
 def _uses_affine_checkpoint_loader(config: object) -> bool:
@@ -517,6 +553,9 @@ def build_transformers_model(
         )
 
     hf_config, parent_config, model_type = _select_primary_config(hf_config)
+    hf_config, parent_config, modelopt_source = _prepare_nemotron_modelopt_source(
+        hf_config, parent_config, keep_quantized=keep_quantized, dtype=dtype
+    )
 
     compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
     source_model_type = model_type
@@ -675,6 +714,17 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{graph_source_name}/{name}"
+        if modelopt_source is not None:
+            model.metadata_props["mobius.storage_policy"] = (
+                "explicit-dense-bf16-reconstruction"
+            )
+            model.metadata_props["mobius.source_weight_format"] = modelopt_source.source_format
+            model.metadata_props["mobius.source_revision"] = revision or "local-or-unpinned"
+            model.metadata_props["mobius.weight_loading_status"] = "not_loaded"
+            model.metadata_props["mobius.source_kv_cache_format"] = (
+                "modelopt-fp8" if modelopt_source.kv_cache_fp8 else "floating"
+            )
+            model.metadata_props["mobius.kv_cache_quantization_preserved"] = "false"
         if model_type in _QWEN4_MODEL_TYPES | {
             "vibevoice",
             "vibevoice_streaming",
@@ -692,7 +742,30 @@ def build_transformers_model(
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
-        if is_gptoss_mxfp4_source and keep_quantized:
+        if modelopt_source is not None:
+            from mobius.integrations.transformers._nemotron_h_weights import (
+                build_nemotron_h_streaming_plan,
+            )
+
+            if len(package) != 1:
+                raise ValueError("Nemotron-H dense streaming requires one decoder component")
+            report = stream_preprocessed_safetensors_to_model(
+                next(iter(package.values())),
+                model_id,
+                lambda index, initializers: build_nemotron_h_streaming_plan(
+                    config, index, initializers, modelopt=modelopt_source
+                ),
+                revision=revision,
+            )
+            package.weight_loading_report = report
+            for model in package.values():
+                model.metadata_props["mobius.weight_loading_status"] = "lazy-bound"
+            logger.warning(
+                "Explicitly reconstructing ModelOpt weights to dense BF16; native "
+                "NVFP4/FP8 storage, FP8 activations and FP8 KV-cache quantization "
+                "are not preserved."
+            )
+        elif is_gptoss_mxfp4_source and keep_quantized:
             from mobius.integrations.transformers._gptoss_weights import (
                 stream_gptoss_mxfp4_safetensors_to_package,
             )

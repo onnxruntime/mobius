@@ -4,21 +4,19 @@
 """NVFP4 / FP8 weight reconstruction for NVIDIA ModelOpt checkpoints.
 
 NVIDIA TensorRT Model Optimizer (ModelOpt) exports mixed-precision checkpoints
-where different modules use different numeric formats. For Qwen3.6 the layout is:
+where different modules use different numeric formats. The supported numeric layout is:
 
 - **Routed MoE experts, shared expert, lm_head**: ``W4A16_NVFP4`` — block-16
   E2M1 (fp4) 4-bit weights, FP8-E4M3 per-block scales, and a per-tensor FP32
   global scale stored as ``weight_scale_2``.
-- **Attention / linear-attention projections**: ``FP8`` (E4M3) — float8 weights
+- **Selected dense projections**: ``FP8`` (E4M3) — float8 weights
   with a per-tensor ``weight_scale``.
 
-ONNX Runtime has no FP8 attention GEMM, so — following ORT GenAI's ModelOpt
-loader — the dense FP8 projections and the NVFP4 shared-expert / lm_head are
-**dequantized back to BF16**, which reconstructs them exactly and lets the
-standard (BF16) build path consume the checkpoint. Only the *routed* MoE experts
-are consumed natively by the CUDA QMoE ``quant_type="nvfp4"`` op; that native
-emission is Blackwell/``onnxruntime_USE_FP4_QMOE=ON``-only and is intentionally
-NOT implemented here (it cannot be built or verified without that runtime).
+The Nemotron-H loader can explicitly reconstruct ALL selected projections,
+including routed experts, to dense BF16 using these helpers. The final BF16
+rounding and removal of activation quantization do not preserve native
+quantized execution. There is no native NVFP4/QMoE emission here, nor an
+automatic fallback to dense weights or affine integer INT4.
 
 The functions below are the numeric core of the loader and are format-faithful
 to ModelOpt's on-disk encoding (verified in ``_dequant_test.py``).
