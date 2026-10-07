@@ -308,10 +308,18 @@ For a full ORT-GenAI text-only package (with `genai_config.json`), use
 
 Dense Qwen3.5-family composites, including `Qwen/Qwen3.8-27B`, also support
 `--features text-only`. Use `--ep onnx-standard` for standard-operator export.
+Omit `--features text-only` to retain the complete vision/embedding/hybrid
+decoder package. Both forms retain all hybrid decoder layers. The vision
+graph accepts processor FLOAT32 pixels and casts internally to model dtype.
+The split embedding graph's `image_features` input carries both image and
+video features in flattened batch/token placeholder order; its feature
+indices do not restart per batch row.
 When the checkpoint declares `mamba_ssm_dtype="float32"`, FP32 recurrent state
 is retained with FP16 weights/activations; without an explicit policy, state
-remains model dtype. Qwen3.8-27B evidence covers graph construction and reduced
-random-weight parity, not official-checkpoint execution. See
+remains model dtype. Qwen3.8-27B evidence covers graph construction, reduced
+random-weight text/image/video parity, and a saved/reloaded real-weight
+standard-only package. Official FP16 numerical qualification is not yet
+passing. See
 [Qwen3.8-27B qualification](design/qwen38-27b-standard-onnx.md).
 
 ### More Examples

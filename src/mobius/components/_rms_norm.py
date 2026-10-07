@@ -51,13 +51,18 @@ class OffsetRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        effective_weight = op.Add(self.weight, 1.0)
-        return op.RMSNormalization(
-            hidden_states,
+        # Keep the learned offset and scaling in FP32; rounding 1 + weight
+        # in model dtype loses small trained offsets before multiplication.
+        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        weight_f32 = op.Cast(self.weight, to=ir.DataType.FLOAT)
+        effective_weight = op.Add(weight_f32, 1.0)
+        normalized = op.RMSNormalization(
+            hidden_f32,
             effective_weight,
             epsilon=self.variance_epsilon,
             axis=-1,
         )
+        return op.CastLike(normalized, hidden_states)
 
 
 class GatedRMSNorm(nn.Module):

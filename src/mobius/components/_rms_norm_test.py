@@ -5,10 +5,40 @@
 
 from __future__ import annotations
 
+import numpy as np
+import onnx_ir as ir
+import onnxruntime as ort
+import pytest
 from onnxscript import nn
 
+from mobius._builder import _cast_module_dtype
 from mobius._testing import count_op_type, create_test_builder, create_test_input
-from mobius.components._rms_norm import RMSNorm, apply_rms_norm
+from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm, apply_rms_norm
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+def test_offset_rms_norm_learned_scale_precision(tmp_path, dtype):
+    """Keep the learned offset and scale multiplication in FP32 until output cast."""
+    values = np.asarray([[1.0, 3.0, 6.0, 10.0]], dtype=dtype.numpy())
+    weight = np.asarray([0.0004, -0.0004, 0.0003, -0.0003], dtype=dtype.numpy())
+    norm = OffsetRMSNorm(4, eps=1e-6)
+    _cast_module_dtype(norm, dtype)
+    norm.weight = nn.Parameter([4], data=ir.Tensor(weight))
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 4], dtype)
+    graph.outputs.append(norm(op, x))
+    path = tmp_path / "offset-norm.onnx"
+    ir.save(ir.Model(graph, ir_version=11), path)
+    actual = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]).run(
+        None, {"x": values}
+    )[0]
+    values_f32 = values.astype(np.float32)
+    expected = (
+        values_f32
+        / np.sqrt(np.mean(values_f32**2, axis=-1, keepdims=True) + 1e-6)
+        * (1.0 + weight.astype(np.float32))
+    ).astype(dtype.numpy())
+    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7, strict=True)
 
 
 class TestRMSNorm:

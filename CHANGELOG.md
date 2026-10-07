@@ -7,14 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Qwen3.8-27B standard-only text qualification
+### Qwen3.8-27B standard-only multimodal qualification
 
 #### Added
 
 - Dense Qwen3.5-family composites, including Qwen3.8-27B, support text-only
   export through the public Transformers builder. Offline tests cover the
-  pinned full-size config and reduced random-weight CUDA FP32/FP16
-  prefill/decode parity, not the official 27B checkpoint weights.
+  pinned full-size text and complete VLM graphs, plus reduced random-weight
+  CUDA FP32/FP16 text/image/video/mixed-media prefill/decode parity, not the
+  official 27B checkpoint weights.
 
 #### Fixed
 
@@ -25,8 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Existing saved models are unchanged. Missing or `auto` policies preserve
   the previous model-dtype state behavior.
 - Shared Qwen3.5 dense/MoE/VL DeltaNet layers use the HF reference's fixed
-  `1e-6` Q/K L2 normalization epsilon. Native GenAI and shared MoE/VL CUDA
-  numerical qualification remain separate from the text-only evidence.
+  `1e-6` Q/K L2 normalization epsilon. Native GenAI and other variants'
+  official-checkpoint qualification remain separate.
+- Shared Qwen3/Qwen3.5 split vision graphs cast processor FLOAT32 pixels to
+  model dtype before reduced-precision convolution.
+- Shared Qwen3/Qwen3.5 split embedding graphs recognize both image and video
+  placeholders and use feature offsets across the entire batch. Their
+  existing `image_features` input carries visual rows in flattened
+  batch/token placeholder order; no new graph input is required.
+- Learned offset RMS normalization keeps normalization and `1 + weight`
+  scaling in FP32 until the final model-dtype cast, avoiding premature
+  rounding of small trained offsets.
+
+#### Qualification status
+
+- The complete real-weight FP16 vision/embedding/hybrid-decoder package was
+  exported, saved and reloaded with standard ONNX operators only. Official
+  image vision and text prefill comparisons still exceed the unchanged
+  FP16 tolerance; this is not a full-checkpoint accuracy or generation pass.
 
 ### GPT-OSS MXFP4 export
 

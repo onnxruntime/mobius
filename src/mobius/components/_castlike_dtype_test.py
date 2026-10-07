@@ -36,20 +36,17 @@ class TestPythonLiteralAutocast:
     """Verify that Python float literals auto-cast to match tensor operand dtypes."""
 
     @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
-    def test_offset_rms_norm_constant_autocasts(self, dtype: ir.DataType):
-        """OffsetRMSNorm: `1.0` literal in op.Add auto-casts to weight dtype.
-
-        After _cast_module_dtype, the weight param is BF16/FP16. The Python
-        literal 1.0 in op.Add(self.weight, 1.0) must auto-cast to match.
-        """
+    def test_offset_rms_norm_preserves_fp32_scale(self, dtype: ir.DataType):
+        """Learned offsets use FP32 internally; only the final output is cast."""
         norm = OffsetRMSNorm(hidden_size=64, eps=1e-6)
         _cast_module_dtype(norm, dtype)
         builder_, op, graph = create_test_builder()
         x = create_test_input(builder_, "x", [2, 3, 64], dtype)
         result = norm(op, x)
         graph.outputs.append(result)
-        # No CastLike — auto-cast handles it; output stays in the expected dtype
-        assert count_op_type(graph, "CastLike") == 0
+        rms = next(node for node in graph if node.op_type == "RMSNormalization")
+        assert rms.inputs[0].dtype == ir.DataType.FLOAT
+        assert rms.inputs[1].dtype == ir.DataType.FLOAT
         assert _get_output_dtype(graph) == dtype
 
     @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
@@ -82,7 +79,6 @@ class TestPythonLiteralAutocast:
         x = create_test_input(builder_, "x", [2, 3, 64], ir.DataType.FLOAT)
         result = norm(op, x)
         graph.outputs.append(result)
-        assert count_op_type(graph, "CastLike") == 0
         assert _get_output_dtype(graph) == ir.DataType.FLOAT
 
 
