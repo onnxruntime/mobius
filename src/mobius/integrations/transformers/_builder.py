@@ -598,7 +598,16 @@ def build_transformers_model(
         )
     is_gptoss_mxfp4_source = _is_native_gptoss_mxfp4(config)
     if dtype is not None:
-        config = dataclasses.replace(config, dtype=resolve_dtype(dtype))
+        resolved_dtype = resolve_dtype(dtype)
+        talker_config = getattr(config, "talker", None)
+        if talker_config is not None:
+            config = dataclasses.replace(
+                config,
+                dtype=resolved_dtype,
+                talker=dataclasses.replace(talker_config, dtype=resolved_dtype),
+            )
+        else:
+            config = dataclasses.replace(config, dtype=resolved_dtype)
     elif compressed_tensors_config is not None and keep_quantized:
         # The pinned Microsoft block-weight ABI is W4A16/W8A16 with FP16 A/Y.
         config = dataclasses.replace(config, dtype=ir.DataType.FLOAT16)

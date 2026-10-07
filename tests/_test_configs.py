@@ -3625,7 +3625,7 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
-    # --- Qwen2.5-Omni Thinker (audio + vision + embedding + decoder) ---
+    # --- Qwen2.5-Omni (audio + vision + text Thinker, speech Talker) ---
     (
         "qwen2_5_omni",
         {
@@ -3660,6 +3660,21 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
             ),
             "image_token_id": 101,
             "video_token_id": 102,
+            "talker": ArchitectureConfig(
+                model_type="qwen2_5_omni_talker",
+                vocab_size=128,
+                embedding_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=8,
+                attn_qkv_bias=True,
+                hidden_act="silu",
+                mrope_section=[2, 1, 1],
+                rope_type="default",
+            ),
         },
         True,
     ),

@@ -8,8 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mobius import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius.models.qwen25_omni import Qwen25OmniThinkerForConditionalGeneration
+from mobius.tasks import Qwen25OmniTask
 
 
 def _hf_config():
@@ -60,11 +62,42 @@ def _hf_config():
         image_token_id=101,
         video_token_id=102,
     )
-    return text, SimpleNamespace(thinker_config=thinker, tie_word_embeddings=False)
+    talker = SimpleNamespace(
+        model_type="qwen2_5_omni_talker",
+        vocab_size=8448,
+        embedding_size=64,
+        hidden_size=32,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        max_position_embeddings=128,
+        rope_scaling={"rope_type": "default", "mrope_section": [2, 1, 1]},
+        rope_theta=1_000_000.0,
+    )
+    return text, SimpleNamespace(
+        model_type="qwen2_5_omni",
+        thinker_config=thinker,
+        talker_config=talker,
+        tie_word_embeddings=False,
+    )
 
 
-def test_qwen25_omni_extracts_nested_thinker_config():
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {},
+        {"enable_audio_output": True},
+        {"enable_talker": True},
+        {"enable_audio_output": True, "enable_talker": False},
+    ],
+)
+def test_qwen25_omni_extracts_nested_thinker_config(flags):
     text, parent = _hf_config()
+    vars(parent).update(flags)
     config = ArchitectureConfig.from_transformers(text, parent_config=parent)
 
     assert config.attn_qkv_bias
@@ -75,10 +108,20 @@ def test_qwen25_omni_extracts_nested_thinker_config():
     assert config.vision.hidden_size == 64
     assert config.image_token_id == 101
     assert config.video_token_id == 102
+    assert config.hidden_size == 64
+    assert config.talker is not None
+    assert config.talker.embedding_size == 64
+    assert config.talker.hidden_size == 32
+    assert config.talker.vocab_size == 8448
+    assert config.talker.attn_qkv_bias
+    assert config.talker.mrope_section == [2, 1, 1]
 
 
 @pytest.mark.parametrize("raw_json", [False, True])
-def test_qwen25_omni_full_checkpoint_builds_thinker(monkeypatch, raw_json):
+@pytest.mark.parametrize("enable_audio_output", [False, True])
+def test_qwen25_omni_full_checkpoint_builds_thinker_and_talker(
+    monkeypatch, raw_json, enable_audio_output
+):
     from transformers import Qwen2_5OmniConfig
 
     from mobius.integrations.transformers import _builder
@@ -89,7 +132,8 @@ def test_qwen25_omni_full_checkpoint_builds_thinker(monkeypatch, raw_json):
         thinker_config={
             name: vars(value) if isinstance(value, SimpleNamespace) else value
             for name, value in vars(parent.thinker_config).items()
-        }
+        },
+        enable_audio_output=enable_audio_output,
     )
     if raw_json:
         hf_config = _dict_to_pretrained_config(hf_config.to_dict())
@@ -100,7 +144,16 @@ def test_qwen25_omni_full_checkpoint_builds_thinker(monkeypatch, raw_json):
 
     package = _builder.build_transformers_model("test/qwen25-omni", load_weights=False)
 
-    assert set(package) == {"audio_encoder", "vision_encoder", "embedding", "decoder"}
+    expected = {
+        "audio_encoder",
+        "vision_encoder",
+        "embedding",
+        "decoder",
+    }
+    if enable_audio_output:
+        expected.update(("talker_embedding", "talker"))
+    assert set(package) == expected
+    assert (package.config.talker is not None) == enable_audio_output
     assert package.config.vocab_size == 256
     assert package.config.hidden_size == 64
     assert package.config.audio.audio_token_id == 100
@@ -123,7 +176,10 @@ def test_qwen25_omni_preprocess_weights_routes_thinker_components():
             "thinker.model.embed_tokens.weight": weight,
             "thinker.model.layers.0.self_attn.q_proj.bias": weight,
             "thinker.lm_head.weight": weight,
-            "talker.model.layers.0.weight": weight,
+            "talker.thinker_to_talker_proj.weight": weight,
+            "talker.model.embed_tokens.weight": weight,
+            "talker.model.layers.0.self_attn.q_proj.weight": weight,
+            "talker.codec_head.weight": weight,
             "token2wav.dit.weight": weight,
         }
     )
@@ -135,4 +191,82 @@ def test_qwen25_omni_preprocess_weights_routes_thinker_components():
         "embedding.embed_tokens.weight",
         "decoder.layers.0.self_attn.q_proj.bias",
         "decoder.lm_head.weight",
+        "talker.thinker_to_talker_proj.weight",
+        "embed_tokens.weight",
+        "talker.model.layers.0.self_attn.q_proj.weight",
+        "talker.codec_head.weight",
+    }
+
+
+def test_qwen25_omni_package_builds_talker_models():
+    text, parent = _hf_config()
+    config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+    module = Qwen25OmniThinkerForConditionalGeneration(config)
+    package = build_from_module(module, config, task=Qwen25OmniTask())
+
+    assert set(package) == {
+        "audio_encoder",
+        "vision_encoder",
+        "embedding",
+        "decoder",
+        "talker_embedding",
+        "talker",
+    }
+    assert {value.name for value in package["talker_embedding"].graph.inputs} == {"input_ids"}
+    assert set(package["talker_embedding"].graph.initializers) == {"embed_tokens.weight"}
+    decoder_outputs = {value.name: value for value in package["decoder"].graph.outputs}
+    assert set(decoder_outputs) >= {
+        "logits",
+        "hidden_states",
+        "present.0.key",
+        "present.0.value",
+    }
+    assert [str(dim) for dim in decoder_outputs["hidden_states"].shape] == [
+        "batch",
+        "sequence_len",
+        "64",
+    ]
+    assert {value.name for value in package["talker"].graph.inputs} >= {
+        "inputs_embeds",
+        "attention_mask",
+        "position_ids",
+        "past_key_values.0.key",
+        "past_key_values.0.value",
+    }
+    assert {value.name for value in package["talker"].graph.outputs} >= {
+        "logits",
+        "present.0.key",
+        "present.0.value",
+    }
+    talker_outputs = {value.name: value for value in package["talker"].graph.outputs}
+    for name in ("present.0.key", "present.0.value"):
+        assert [str(dim) for dim in talker_outputs[name].shape] == [
+            "batch",
+            "2",
+            "past_sequence_len + sequence_len",
+            "8",
+        ]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"enable_audio_output": False},
+        {"enable_talker": False},
+        {"enable_audio_output": False, "enable_talker": True},
+    ],
+)
+def test_qwen25_omni_package_omits_talker_models_when_disabled(flags):
+    text, parent = _hf_config()
+    vars(parent).update(flags)
+    config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+    assert config.talker is None
+    module = Qwen25OmniThinkerForConditionalGeneration(config)
+    package = build_from_module(module, config, task=Qwen25OmniTask())
+
+    assert set(package) == {
+        "audio_encoder",
+        "vision_encoder",
+        "embedding",
+        "decoder",
     }

@@ -46,7 +46,7 @@ _SPEECH_MODEL_PARAMS = _make_params(SPEECH_CONFIGS)
 
 
 class TestBuildGraphQwen25Omni:
-    """Verify the Qwen2.5-Omni Thinker four-model split."""
+    """Verify the Qwen2.5-Omni Thinker and Talker six-model split."""
 
     def _omni_config(self):
         overrides = next(
@@ -59,7 +59,7 @@ class TestBuildGraphQwen25Omni:
     @pytest.mark.parametrize(
         "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
     )
-    def test_package_builds_four_models(self, dtype):
+    def test_package_builds_six_models(self, dtype):
         from mobius.models import Qwen25OmniThinkerForConditionalGeneration
         from mobius.tasks import Qwen25OmniTask
 
@@ -73,6 +73,8 @@ class TestBuildGraphQwen25Omni:
             "vision_encoder",
             "embedding",
             "decoder",
+            "talker_embedding",
+            "talker",
         }
         assert {value.name for value in package["audio_encoder"].graph.inputs} == {
             "input_features",
@@ -100,7 +102,14 @@ class TestBuildGraphQwen25Omni:
 
 
 _SPEECH_TASK_KEYS: dict[str, set[str]] = {
-    "qwen25-omni": {"audio_encoder", "vision_encoder", "embedding", "decoder"},
+    "qwen25-omni": {
+        "audio_encoder",
+        "vision_encoder",
+        "embedding",
+        "decoder",
+        "talker_embedding",
+        "talker",
+    },
     "speech-to-text": {"encoder", "decoder"},
     "speech-language": {"audio_encoder", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},
