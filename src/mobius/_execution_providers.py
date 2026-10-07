@@ -60,7 +60,8 @@ class EpCapabilities:
             stage).
         matmul_nbits_qkv_pack_dtypes: dtypes for projection-only INT4 QKV
             packing. Requires ``supports_matmul_nbits`` and is independent
-            of ``qkv_pack_dtypes`` (packed attention inputs).
+            of ``qkv_pack_dtypes`` (packed attention inputs). Experimental:
+            empty for all built-in EPs until numerical acceptance is agreed.
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
@@ -318,7 +319,6 @@ def _register_builtins() -> None:
         ),
         EpCapabilities(
             name="cuda",
-            matmul_nbits_qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
             gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
             qkv_pack_dtypes=frozenset(
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}

@@ -91,6 +91,7 @@ def _random_canonical_weights(package):
 @pytest.mark.parametrize("norm", [False, True])
 @pytest.mark.parametrize("fold", [False, True])
 @pytest.mark.parametrize("zp", [False, True])
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
 def test_cuda_qkv_original_names_binding_and_default_external_roundtrip(
     tmp_path, norm, fold, zp
 ):
@@ -149,6 +150,7 @@ def test_cuda_qkv_original_names_binding_and_default_external_roundtrip(
 
 
 @pytest.mark.parametrize("slot", ["weight", "scales", "zero_points"])
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
 def test_cuda_qkv_missing_concat_hidden_parameter_fails(tmp_path, slot):
     config, package = _cuda_int4_decoder(norm=True, zp=slot == "zero_points")
     weights = _random_canonical_weights(package)
@@ -214,6 +216,7 @@ def test_binding_validation_traverses_only_axis_zero_concat_chains(axis):
 
 @pytest.mark.parametrize("norm", [False, True])
 @pytest.mark.parametrize("zp", [False, True])
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
 def test_cuda_qkv_full_decoder_prefill_and_cached_decode(tmp_path, monkeypatch, norm, zp):
     if "CUDAExecutionProvider" not in ort.get_available_providers():
         pytest.skip("CUDAExecutionProvider is not available")
@@ -291,6 +294,7 @@ def test_cuda_qkv_full_decoder_prefill_and_cached_decode(tmp_path, monkeypatch, 
 
 
 @pytest.mark.parametrize("baseline_cuda", [False, True])
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
 def test_cuda_qkv_full_decoder_runtime_guard(tmp_path, monkeypatch, baseline_cuda):
     provider = "CUDAExecutionProvider"
     monkeypatch.setattr(ort, "get_available_providers", lambda: [provider])

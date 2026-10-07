@@ -52,7 +52,7 @@ pkg = build_from_module(
 |---|---|---|
 | **default** | `"default"` (built-in default) | Portable ONNX. All custom ops with function bodies are kept as-is — function bodies are the executable fallback. No vendor-specific fusions. |
 | **CPU** | `"cpu"` | ORT CPU EP. GQA fusion for FP32. INT4 accuracy level 4. |
-| **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16. Compatible FP16/INT4 QKV projection packing. SkipLayerNorm fusion. |
+| **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16 and SkipLayerNorm fusion. Experimental INT4 QKV projection packing is disabled by default. |
 | **DirectML** | `"dml"` | DirectML (Windows GPU). GQA for FP16. RoPE and packed QKV lowered to separate ops. |
 | **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated. INT4 accuracy level 4. |
 | **MLX** | `"mlx"` | Apple-silicon MLX plugin EP. GQA for FP32/FP16/BF16 with unpacked Q/K/V and shared KV buffers. |
@@ -91,8 +91,10 @@ ops to fused equivalents:
 
 These are applied during **Stage 2: Fusion** of the optimization pipeline.
 
-CUDA also applies `PackMatMulNBitsQKV` at the start of this stage, before
-attention fusion or lowering. For decoder and masked-decoder graphs, three
+Explicitly enabling `matmul_nbits_qkv_pack_dtypes` applies `PackMatMulNBitsQKV`
+at the start of this stage, before attention fusion or lowering. **Every
+built-in EP, including CUDA, leaves this capability empty by default.**
+For decoder and masked-decoder graphs, three
 compatible FP16/INT4 `MatMulNBits` projections feeding standard `Attention`
 or `com.microsoft::GroupQueryAttention` become one `MatMulNBits` followed
 by a `Split` restoring the separate Q, K, and V values. Bias, Q/K RMS
@@ -108,7 +110,7 @@ UINT8 on all three. A power-of-two block size of at least 16 is required.
 Other bit-widths, dtypes, layouts, extra inputs, function overrides, and
 incompatible triples are left unchanged; a mixed 4/4/8 triple is **not**
 partially packed. Standard opset >= 13 is required for the two-input `Split`;
-the pass leaves older opsets unchanged. Other built-in EPs do not enable this pass.
+the pass leaves older opsets unchanged.
 
 Packing concatenates existing parameter storage without precision promotion
 or requantization. Original checkpoint parameter names remain available until
@@ -120,7 +122,32 @@ claimed without workload-specific measurement.
 parameter packing does not imply bit-identical FP16 outputs: the larger output
 width can change CUDA GEMM behavior. Representative large-dimension prefill and
 cached-decode logits exceeded the current `rtol=atol=1e-2` parity criterion.
-The optimization is not yet validated for real-checkpoint generation.
+Bounded real-checkpoint MMLU and generation comparisons do not resolve this
+pointwise parity criterion. Default CUDA builds retain separate quantized
+Q/K/V projections until the numerical acceptance contract and representative
+CUDA regression coverage are agreed.
+
+For experimental evaluation, opt in explicitly through the existing capability
+API before building or optimizing a model:
+
+```python
+import dataclasses
+
+import onnx_ir as ir
+from mobius import get_ep, register_ep
+
+register_ep(
+    dataclasses.replace(
+        get_ep("cuda"),
+        matmul_nbits_qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
+    ),
+    overwrite=True,
+)
+```
+
+This changes the process-local CUDA profile for subsequent builds. It does not
+alter the existing float `PackQKV` capability or promote quantization precision.
+The stock CLI `--ep cuda` does not opt in to INT4 projection packing.
 
 When using `ORT_FPA_INTB_GEMM=1`, keep the default weight folding or enable ORT
 constant folding. With both exporter folding and runtime graph optimizations
