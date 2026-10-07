@@ -233,7 +233,7 @@ class NemotronHMoEGate(nn.Module):
         self.weight = nn.Parameter([num_experts, hidden_size])
         # Correction bias for expert selection (loaded from checkpoint)
         self.e_score_correction_bias = nn.Parameter([num_experts])
-        setattr(self.e_score_correction_bias, "_keep_float32", True)
+        self.e_score_correction_bias._keep_float32 = True  # type: ignore[attr-defined]
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Cast to float32 for numerical stability (eps=1e-20 underflows
