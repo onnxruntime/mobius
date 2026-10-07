@@ -145,7 +145,7 @@ def _write_mixed_checkpoint(tmp_path):
 
 
 def test_public_local_build_reconstructs_all_projection_families(tmp_path, monkeypatch):
-    _raw, expected = _write_mixed_checkpoint(tmp_path)
+    _, expected = _write_mixed_checkpoint(tmp_path)
     monkeypatch.setattr(
         _builder,
         "_download_weights",
@@ -202,7 +202,7 @@ def test_floating_per_expert_checkpoint_uses_exact_streaming_mapping(tmp_path):
 
 
 def test_cli_explicit_dequantize_writes_dense_not_native_format(tmp_path):
-    _raw, _expected = _write_mixed_checkpoint(tmp_path)
+    _write_mixed_checkpoint(tmp_path)
     output = tmp_path / "cli-export"
     main(
         [
@@ -275,7 +275,7 @@ def test_reconstruction_policy_does_not_mutate_source_config():
 
 
 def test_mtp_sources_fail_closed_even_when_config_omits_nextn(tmp_path, monkeypatch):
-    _raw, _expected = _write_mixed_checkpoint(tmp_path)
+    _write_mixed_checkpoint(tmp_path)
     path = tmp_path / "model.safetensors"
     weights = safetensors.torch.load_file(path)
     weights["mtp.layers.0.hnorm.weight"] = torch.ones(32, dtype=torch.bfloat16)
@@ -290,7 +290,7 @@ def test_mtp_sources_fail_closed_even_when_config_omits_nextn(tmp_path, monkeypa
 
 @pytest.mark.parametrize("change", ["missing", "wrong-shape", "nonfinite", "undeclared"])
 def test_cache_scale_contract_fails_before_initializer_binding(tmp_path, change):
-    raw, _expected = _write_mixed_checkpoint(tmp_path)
+    raw, _ = _write_mixed_checkpoint(tmp_path)
     path = tmp_path / "model.safetensors"
     weights = safetensors.torch.load_file(path)
     key = "backbone.layers.2.mixer.k_proj.k_scale"
