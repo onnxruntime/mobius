@@ -1193,6 +1193,9 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     "gemma4_text": "gemma4_text",
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
+    "qwen3_5": "qwen3_5_text",
+    "qwen3_5_vl": "qwen3_5_text",
+    "qwen3_5_text": "qwen3_5_text",
     # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
     # backbone as a standalone decoder-only LLM. The builder overrides
     # ``qwen3_5_moe`` -> ``qwen3_5_moe_vl`` when a ``vision_config`` is present,

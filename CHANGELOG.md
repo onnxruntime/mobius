@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Qwen3.8-27B standard-only text qualification
+
+#### Added
+
+- Dense Qwen3.5-family composites, including Qwen3.8-27B, support text-only
+  export through the public Transformers builder. Offline tests cover the
+  pinned full-size config and reduced random-weight CUDA FP32/FP16
+  prefill/decode parity, not the official 27B checkpoint weights.
+
+#### Fixed
+
+- Explicit `mamba_ssm_dtype` is retained in DeltaNet computation and exported
+  recurrent-state inputs/outputs. Re-exported FP16/BF16 hybrid models whose
+  config requests FP32 state now expose FP32 recurrent slots; callers must
+  allocate state from graph input/output types, not the model weight dtype.
+  Existing saved models are unchanged. Missing or `auto` policies preserve
+  the previous model-dtype state behavior.
+- Shared Qwen3.5 dense/MoE/VL DeltaNet layers use the HF reference's fixed
+  `1e-6` Q/K L2 normalization epsilon. Native GenAI and shared MoE/VL CUDA
+  numerical qualification remain separate from the text-only evidence.
+
 ### GPT-OSS MXFP4 export
 
 #### Added

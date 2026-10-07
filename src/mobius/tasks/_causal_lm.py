@@ -342,8 +342,8 @@ class HybridCausalLMTask(ModelTask):
           - past_key_values.{i}.recurrent_state: [batch, num_v_heads, k_dim, v_dim]
 
     Outputs:
-        - logits: FLOAT
-        - present.{i}.{key|value|conv_state|recurrent_state}: FLOAT
+        - logits and present.{i}.{key|value|conv_state}: model dtype
+        - present.{i}.recurrent_state: configured mamba_ssm_dtype, or model dtype
 
     Args:
         prune_prefill_prefix: If ``True``, insert ``Gather(axis=1, index=-1)``

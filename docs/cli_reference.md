@@ -306,6 +306,14 @@ For a full ORT-GenAI text-only package (with `genai_config.json`), use
 `auto_export(..., text_only=True)` — see
 `examples/gemma4_12b_text_ort_genai.py`.
 
+Dense Qwen3.5-family composites, including `Qwen/Qwen3.8-27B`, also support
+`--features text-only`. Use `--ep onnx-standard` for standard-operator export.
+When the checkpoint declares `mamba_ssm_dtype="float32"`, FP32 recurrent state
+is retained with FP16 weights/activations; without an explicit policy, state
+remains model dtype. Qwen3.8-27B evidence covers graph construction and reduced
+random-weight parity, not official-checkpoint execution. See
+[Qwen3.8-27B qualification](design/qwen38-27b-standard-onnx.md).
+
 ### More Examples
 
 ```bash
