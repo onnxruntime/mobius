@@ -32,9 +32,9 @@ from mobius.models.base import (
 )
 from mobius.models.moe import Qwen2MoELayer
 from mobius.models.qwen_vl import (
-    Qwen25VLEmbeddingModel,
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
+    Qwen25VLEmbeddingModel,
     _QwenVLTextMixin,
     _route_split_embedding_weight,
     split_per_layer_inputs,

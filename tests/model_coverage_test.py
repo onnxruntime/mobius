@@ -146,6 +146,14 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #
 _COVERAGE_SKIP: dict[str, str] = {
     # --- Specialized-test models (covered by a co-located test class) ---
+    "clef_flash": (
+        "Full-record joint schema decisions require four components and span/option "
+        "inputs, not the generic causal-LM contract. Dedicated L1 graph builds, "
+        "pinned published-config L2, and float32/float16 text/image/video L3 parity "
+        "are covered by src/mobius/models/clef_test.py. The HF config identifies "
+        "only the Qwen3.5 backbone; generic L2 cannot load the separate head sidecar. "
+        "Real-checkpoint decision goldens remain unverified."
+    ),
     "neo_chat": "SenseNova U1.5 is a 17.5B (~50 GB) five-component package; "
     "L1-L3 use the tiny config and co-located tests, while pinned L4/L5 text, "
     "image, and edit evidence requires the documented H200 validation.",
