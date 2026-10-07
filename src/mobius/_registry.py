@@ -61,6 +61,7 @@ from mobius.models import (
     BitNetCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
+    ClefFlashModel,
     CodeShellCausalLMModel,
     Cosmos3EdgeTextModel,
     Cosmos3EdgeVLModel,
@@ -881,6 +882,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen2_5_vl_text": ModelRegistration(Qwen25VLTextModel),
     "qwen2_vl": ModelRegistration(Qwen2VLCausalLMModel, task="qwen-vl"),
     "qwen2_vl_text": ModelRegistration(Qwen25VLTextModel),
+    "clef_flash": ModelRegistration(ClefFlashModel, task="clef-decision"),
     "qwen3_5": ModelRegistration(Qwen35VL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     "qwen3_5_moe_vl": ModelRegistration(Qwen35MoEVL3ModelCausalLMModel, task="hybrid-qwen-vl"),
     # Text-only sibling of ``qwen3_5_moe_vl`` (Qwen3.6-35B-A3B). The MoE

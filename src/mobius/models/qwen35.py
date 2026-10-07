@@ -32,6 +32,7 @@ from mobius.models.base import (
 )
 from mobius.models.moe import Qwen2MoELayer
 from mobius.models.qwen_vl import (
+    Qwen25VLEmbeddingModel,
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
     _QwenVLTextMixin,
@@ -670,7 +671,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
         )
         self.decoder = Qwen35VLDecoderModel(decoder_config)
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
-        self.embedding = Qwen3VLEmbeddingModel(config)
+        self.embedding: Qwen25VLEmbeddingModel = Qwen3VLEmbeddingModel(config)
 
     def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(
