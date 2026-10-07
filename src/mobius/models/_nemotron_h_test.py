@@ -213,11 +213,11 @@ def test_expert_routing_relu2_and_sigmoid_matches_independent_reference(tmp_path
     np.testing.assert_allclose(actual, expected.numpy(), atol=1e-6, rtol=1e-5)
 
 
-def test_router_correction_bias_remains_float32():
+def test_router_parameters_remain_float32():
     block = NemotronHMoEBlock(_tiny_config())
     _cast_module_dtype(block, ir.DataType.BFLOAT16)
     assert block.gate.e_score_correction_bias.dtype == ir.DataType.FLOAT
-    assert block.gate.weight.dtype == ir.DataType.BFLOAT16
+    assert block.gate.weight.dtype == ir.DataType.FLOAT
 
 
 def test_mtp_and_duplicate_source_weights_are_not_silently_dropped():
