@@ -231,6 +231,7 @@ class NemotronHMoEGate(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
         self.weight = nn.Parameter([num_experts, hidden_size])
+        self.weight._keep_float32 = True  # type: ignore[attr-defined]
         # Correction bias for expert selection (loaded from checkpoint)
         self.e_score_correction_bias = nn.Parameter([num_experts])
         self.e_score_correction_bias._keep_float32 = True  # type: ignore[attr-defined]

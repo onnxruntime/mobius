@@ -73,7 +73,11 @@ This is **not a working full-Lightning command while the MTP gate remains**.
   report identify the reconstructed representation and lost quantization.
 - `models/nemotron_h.py` casts router weights/bias to FP32 and accumulates routed
   outputs in FP32 before the shared-expert path, retaining sigmoid selection,
-  unbiased routing weights and squared ReLU. All-expert graph unrolling remains;
+  unbiased routing weights and squared ReLU. It also retains FP32 router
+  parameters during dtype conversion: the pinned NVFP4 router weight is FP32,
+  unlike BF16's BF16 router weight; correction biases are FP32 in both.
+  Widening BF16 sources is exact, while rounding NVFP4's FP32 router to BF16
+  would lose unquantized source precision. All-expert graph unrolling remains;
   this is not sparse top-6 performance or native QMoE support.
 - `NemotronHConfig` accepts Transformers' `linear_attention` vocabulary and
   preserves the checkpoint's FP32 SSM-cache dtype. The graph still uses

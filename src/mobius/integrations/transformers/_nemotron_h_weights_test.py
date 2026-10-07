@@ -105,10 +105,10 @@ def _write_mixed_checkpoint(tmp_path):
         else:
             tensors[source] = torch.full(
                 shape,
-                0.125,
-                dtype=torch.float32
-                if initializer.dtype == ir.DataType.FLOAT
-                else torch.bfloat16,
+                0.123456 if source.endswith(".gate.weight") else 0.125,
+                # Pinned NVFP4 keeps both router tensors FP32; this source
+                # contract must not be inferred from the target graph's dtype.
+                dtype=torch.float32 if ".gate." in source else torch.bfloat16,
             )
             expected[name] = tensors[source]
     raw["quantization_config"] = {
@@ -172,8 +172,12 @@ def test_public_local_build_reconstructs_all_projection_families(tmp_path, monke
     assert loaded.metadata_props["mobius.source_weight_format"] == "modelopt-mixed-fp8-nvfp4"
 
 
-def test_floating_per_expert_checkpoint_uses_exact_streaming_mapping(tmp_path):
+@pytest.mark.parametrize("router_dtype", [torch.float32, torch.bfloat16])
+def test_floating_per_expert_checkpoint_uses_exact_streaming_mapping(tmp_path, router_dtype):
     raw, expected = _write_mixed_checkpoint(tmp_path)
+    expected["model.layers.1.moe.gate.weight"] = expected["model.layers.1.moe.gate.weight"].to(
+        router_dtype
+    )
     del raw["quantization_config"]
     (tmp_path / "config.json").write_text(json.dumps(raw), encoding="utf-8")
     safetensors.torch.save_file(
