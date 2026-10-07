@@ -226,6 +226,7 @@ from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
+from mobius.models.qwen25_omni import Qwen25OmniThinkerForConditionalGeneration
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.sensenova_u1 import SenseNovaU1Model
@@ -964,6 +965,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         task="speech-to-text",
         config_class=WhisperConfig,
     ),
+    # --- Omni ---
+    "qwen2_5_omni": ModelRegistration(
+        Qwen25OmniThinkerForConditionalGeneration,
+        task="qwen25-omni",
+    ),
     "moonshine": ModelRegistration(
         MoonshineForConditionalGeneration,
         task="speech-to-text",
@@ -1436,6 +1442,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "moonshine": "moonshine-ai/moonshine-tiny",
     "moonshine_streaming": "moonshine-ai/moonshine-streaming-tiny",
     "whisper": "openai/whisper-tiny",
+    "qwen2_5_omni": "Qwen/Qwen2.5-Omni-7B",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
     "glmasr": "zai-org/GLM-ASR-Nano-2512",
