@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "kind": "development_export_recipe",
+  "checked_on": "2026-10-07",
+  "status": "PREFLIGHT_ONLY",
+  "export_status": "NOT_RUN",
+  "certified": false,
+  "exporter": {
+    "repository": "https://github.com/onnxruntime/mobius",
+    "revision": "dc1798465f77cb2b7070e4d422479c2f890ee24b",
+    "compatibility_rechecked_at": "26a712b210a0a7cd895347f601680e82bbf5e452",
+    "package": "mobius-onnx",
+    "toolchain_validated": false,
+    "source_evidence": [
+      {
+        "path": "src/mobius/__main__.py",
+        "sha256": "dccc246cc17992e810820af7e57572a8f3a73fbefc845d5bfe861e4ce80875f5"
+      },
+      {
+        "path": "src/mobius/_registry.py",
+        "sha256": "ea502bf2fdb7cd4b73ab5c75d4c8769918f312712112fd2f011652277ac45f37"
+      },
+      {
+        "path": "src/mobius/_configs/_base.py",
+        "sha256": "149516ae2be475e3dba51a30a03b16d95d31799391eff2f97ca2666599d209d6"
+      },
+      {
+        "path": "src/mobius/_configs/_quantization.py",
+        "sha256": "d4bc4b0ac10c01d1058fb7d45750a8a5f6ea9b73c30319459f1319838e337d27"
+      },
+      {
+        "path": "src/mobius/models/nemotron_h.py",
+        "sha256": "75b38c8e52bc7a61f0984b134902b6ed7e9cd779879a62bd8f2879db668d31fe"
+      },
+      {
+        "path": "src/mobius/integrations/ort_genai/auto_export.py",
+        "sha256": "f44685481cd6ae3f36a74e62556ca3ab50a3a43f83e6bc8bfc6257a97a44c9c3"
+      }
+    ]
+  },
+  "models": [
+    {
+      "model_id": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+      "revision": "a9904d24bcc1d289a1950fa9d2b978c47cf903b9",
+      "metadata": [
+        {
+          "path": "config.json",
+          "sha256": "a3827a0f5e311547b40943dc081e3ff2f8a277466e8c1a3df2291e8db8a7617c"
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "sha256": "67f21da80ce245a3e24967f54eef3fa10e67a63eba16ef19a2d0569f06103f50"
+        }
+      ],
+      "architecture": "NemotronHForCausalLM",
+      "model_type": "nemotron_h",
+      "layer_counts": {"mamba": 23, "moe": 23, "attention": 6},
+      "num_hidden_layers": 52,
+      "num_routed_experts": 128,
+      "num_experts_per_tok": 6,
+      "num_nextn_predict_layers": 1,
+      "max_position_embeddings": 262144,
+      "checkpoint_tensor_bytes": 65842365568,
+      "checkpoint_shards": 14,
+      "compatibility": "ARCHITECTURE_SOURCE_PRESENT_NOT_VALIDATED",
+      "output_precision": "bf16",
+      "proposed_graph_export_argv": [
+        "mobius", "build", "--config", "<VERIFIED_LOCAL_BF16_SNAPSHOT>",
+        "--output", "<NEW_PRIVATE_OUTPUT_DIRECTORY>",
+        "--ep", "cuda", "--dtype", "bf16", "--external-data", "onnx"
+      ],
+      "command_status": "NOT_RUN",
+      "runtime_packaging_argv": null,
+      "blockers": [
+        "No NVIDIA CUDA GPU or installed exporter on the preflight host.",
+        "A suitable host, dependency lock and resource budget have not been validated.",
+        "Full Lightning checkpoint weight coverage and source/export parity are untested.",
+        "Nemotron-H MTP export is not implemented in the inspected model module.",
+        "Mamba conv_state/ssm_state packaging is not verified against ORT-GenAI."
+      ]
+    },
+    {
+      "model_id": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+      "revision": "bee7596271d1495f6992ae224aefde4410e816b8",
+      "metadata": [
+        {
+          "path": "config.json",
+          "sha256": "f1d98b530846087dc08b574a219713a94f945bf6583dc7230a19ebf1e8c50933"
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "sha256": "3c3bc7efa8d658c2e909a0b9020eb0f72064e6647de348856af4dee9895bead9"
+        }
+      ],
+      "architecture": "NemotronHForCausalLM",
+      "model_type": "nemotron_h",
+      "layer_counts": {"mamba": 23, "moe": 23, "attention": 6},
+      "num_hidden_layers": 52,
+      "num_routed_experts": 128,
+      "num_experts_per_tok": 6,
+      "num_nextn_predict_layers": 1,
+      "max_position_embeddings": 1048576,
+      "checkpoint_tensor_bytes": 21559589596,
+      "checkpoint_shards": 52,
+      "quant_method": "modelopt",
+      "weight_formats": ["FP8", "NVFP4"],
+      "nvfp4_group_size": 16,
+      "compatibility": "UNSUPPORTED_BY_PINNED_EXPORTER",
+      "output_precision": null,
+      "proposed_graph_export_argv": null,
+      "command_status": "NOT_RUN",
+      "runtime_packaging_argv": null,
+      "blockers": [
+        "QuantizationConfig.from_value explicitly raises NotImplementedError for ModelOpt NVFP4/FP8.",
+        "ModelOpt checkpoint loading and native routed-expert NVFP4 emission are not wired.",
+        "ReLU2 expert semantics require separate validation; a generic QMoE is not equivalent.",
+        "BF16 reconstruction or ORT INT4 quantization would be different artifacts, not preserved NVFP4.",
+        "The BF16 host, checkpoint parity, MTP and runtime packaging blockers also apply."
+      ]
+    }
+  ]
+}
