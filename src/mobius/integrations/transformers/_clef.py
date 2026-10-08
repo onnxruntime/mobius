@@ -14,6 +14,7 @@ from collections.abc import Mapping
 import onnx_ir as ir
 import torch
 from huggingface_hub import hf_hub_download
+from onnx_ir import tensor_adapters
 
 from mobius._builder import build_from_module, resolve_dtype
 from mobius.integrations._weight_loading import (
@@ -69,8 +70,10 @@ def _source_name(component: str, name: str) -> tuple[str, int | None]:
     )
 
 
-def _split_qkv(tensor: torch.Tensor, _name: str, *, index: int) -> torch.Tensor:
-    return tensor.chunk(3, dim=0)[index].contiguous()
+def _split_qkv(
+    tensor: torch.Tensor, _name: str, *, index: int, dtype: torch.dtype
+) -> torch.Tensor:
+    return tensor.chunk(3, dim=0)[index].to(dtype=dtype).contiguous()
 
 
 def _plan(
@@ -111,7 +114,11 @@ def _plan(
                 expected_source_dtype=source_dtype,
                 expected_target_shape=target_shape,
                 expected_target_dtype=value.dtype,
-                transform=functools.partial(_split_qkv, index=split),
+                transform=functools.partial(
+                    _split_qkv,
+                    index=split,
+                    dtype=tensor_adapters.to_torch_dtype(value.dtype),
+                ),
             )
     ignored = {}
     for source in index.keys() - used:

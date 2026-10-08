@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import importlib.util
 import json
 import pathlib
@@ -16,7 +17,7 @@ import onnx_ir as ir
 import pytest
 import torch
 
-from mobius import build_from_module
+from mobius import build, build_from_module
 from mobius._configs import VisionConfig
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
@@ -382,6 +383,71 @@ def test_streaming_plan_is_fail_closed_and_supports_tied_embeddings():
         _asset(str(pathlib.Path(__file__).parent), "does_not_exist.safetensors", None)
 
 
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "target_dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+def test_streamed_qkv_dtype_conversion_survives_save_and_reload(
+    tmp_path, source_dtype, target_dtype
+):
+    from onnx_ir import tensor_adapters
+    from safetensors.torch import save_file
+
+    from mobius.integrations._weight_loading import stream_preprocessed_safetensors_to_model
+    from mobius.integrations.transformers._clef import _plan
+
+    sources = {
+        "evidence_layers.0.attention.in_proj_weight": torch.arange(48)
+        .reshape(12, 4)
+        .to(source_dtype),
+        "evidence_layers.0.attention.in_proj_bias": torch.arange(12).to(source_dtype),
+    }
+    checkpoint = tmp_path / "joint_head.safetensors"
+    save_file(sources, str(checkpoint))
+    initializers = [
+        ir.Value(
+            name=f"evidence_layers.0.attention.{projection}.{suffix}",
+            shape=ir.Shape([4, 4] if suffix == "weight" else [4]),
+            type=ir.TensorType(target_dtype),
+        )
+        for projection in ("q_proj", "k_proj", "v_proj")
+        for suffix in ("weight", "bias")
+    ]
+    graph = ir.Graph(
+        [],
+        initializers,
+        nodes=[],
+        initializers=initializers,
+        name="qkv",
+        opset_imports={"": 24},
+    )
+    model = ir.Model(graph, ir_version=11)
+    stream_preprocessed_safetensors_to_model(
+        model,
+        str(tmp_path),
+        functools.partial(
+            _plan, component="decision_head", recognized=set(sources), tied_embeddings=False
+        ),
+        _resolved_paths=[str(checkpoint)],
+    )
+    output = tmp_path / "onnx"
+    ModelPackage({"model": model}).save(str(output), progress_bar=False)
+    reloaded = ModelPackage.load(str(output))["model"]
+    for index, projection in enumerate(("q_proj", "k_proj", "v_proj")):
+        for suffix in ("weight", "bias"):
+            value = reloaded.graph.initializers[
+                f"evidence_layers.0.attention.{projection}.{suffix}"
+            ]
+            assert value.dtype == target_dtype
+            actual = value.const_value.numpy()
+            expected = (
+                sources[f"evidence_layers.0.attention.in_proj_{suffix}"]
+                .chunk(3)[index]
+                .to(tensor_adapters.to_torch_dtype(target_dtype))
+            )
+            np.testing.assert_array_equal(actual.astype(np.float32), expected.float().numpy())
+
+
 @pytest.mark.parametrize("option", ["text_only", "export_paged_attention", "fp8_kv_cache"])
 def test_autoregressive_build_options_are_rejected(option):
     from mobius.integrations.transformers._builder import build_transformers_model
@@ -431,9 +497,7 @@ def test_cli_export_writes_advisory_contract_for_clef(tmp_path):
 
 @pytest.mark.integration
 def test_published_checkpoint_builds_all_decision_components():
-    import mobius
-
-    package = mobius.build(CLEF_FLASH_MODEL_ID, load_weights=False, dtype="f32")
+    package = build(CLEF_FLASH_MODEL_ID, load_weights=False, dtype="f32")
     assert set(package) == {"decoder", "vision_encoder", "embedding", "decision_head"}
     assert package.config.hidden_size == 4096
     assert package.config.head_width == 1024
@@ -630,8 +694,6 @@ def test_streamed_full_pipeline_matches_upstream_for_text_image_and_video(
     from safetensors.torch import save_file
     from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
 
-    import mobius
-
     torch_dtype = torch.float32 if dtype == "f32" else torch.float16
     np_dtype = np.float32 if dtype == "f32" else np.float16
     tolerance = 1e-4 if dtype == "f32" else 1e-2
@@ -689,13 +751,14 @@ def test_streamed_full_pipeline_matches_upstream_for_text_image_and_video(
     save_file(reference.state_dict(), str(tmp_path / "model.safetensors"))
     save_file(head.state_dict(), str(tmp_path / "joint_head.safetensors"))
     (tmp_path / "joint_head_config.json").write_text(json.dumps(head_config))
-    package = mobius.build(str(tmp_path), dtype=dtype)
+    package = build(str(tmp_path), dtype=dtype)
     assert package.config.partial_rotary_factor == pytest.approx(0.5)
     assert package.config.rope_theta == 10000
     assert package.config.mrope_section == [1, 1, 0]
     assert package.weight_loading_report["components"]["decision_head"]["assigned_tensors"] > 0
     # Serialize the lazy bindings, then execute each preceding ONNX stage.
     package.save(str(tmp_path / "onnx"), progress_bar=False, max_workers=1)
+    package = ModelPackage.load(str(tmp_path / "onnx"))
     sessions = {name: OnnxModelSession(model) for name, model in package.items()}
     grid = torch.tensor([[1, 4, 4]])
     for modalities in ((), ("image",), ("video",), ("video", "image")):
