@@ -77,8 +77,17 @@ class _FinalMoELayer(NemotronHMoELayer):
         super().__init__(config)
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        hidden_states, _ = super().forward(op, hidden_states, None, None, None)
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None = None,
+        position_embeddings: tuple | None = None,
+        past_key_value: tuple | None = None,
+    ):
+        hidden_states, _ = super().forward(
+            op, hidden_states, attention_bias, position_embeddings, past_key_value
+        )
         return self.final_layernorm(op, hidden_states)
 
 
