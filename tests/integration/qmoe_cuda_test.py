@@ -1,14 +1,20 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Opt-in synthetic and bounded real-slice CUDA parity for mixed-width Qwen3 MoE."""
+"""Synthetic CUDA parity and path qualification for mixed-width Qwen3 MoE.
+
+Install the pinned CUDA 12 wheel from requirements/ci/qmoe-cuda.txt and set
+MOBIUS_QMOE_CUDA_TEST=1 to run the network-free synthetic tests. INT2 decode
+excludes dense weight scratch; prefill deliberately disables native INT2
+prefill to qualify the bounded dense fallback. Real-slice experiments remain
+separately opt-in and require their original custom wheel and local data.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import tempfile
 import time
 from pathlib import Path
 
@@ -27,21 +33,35 @@ _BLOCK = 32
 _EXPERTS = 4
 _VOCAB = 32
 _ORT_COMMIT = "ee5f6e7"
+_SYNTHETIC_ORT_VERSION = "1.31.0.dev20261008002"
+_SYNTHETIC_ORT_COMMIT = "b131c79"
+_SCRATCH_KEY = "ep.cuda.qmoe_int_dequant_max_scratch_bytes"
+_FALLBACK_SCRATCH_BYTES = 8 * 1024 * 1024
 _DATA_ROOT = Path("/datadisks/disk5/titaiwang")
 
 
 def _packed_weights(
-    rng: np.random.Generator, bits: int, rows: int, k: int
+    rng: np.random.Generator, bits: int, rows: int, k: int, group_size: int = _BLOCK
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Olive K-last format: low nibble precedes high nibble; no zero-point
-    # sidecar means the implicit midpoint (8 for INT4, 128 for INT8).
-    codes = (
-        rng.integers(4, 12, (_EXPERTS, rows, k), dtype=np.uint8)
-        if bits == 4
-        else (rng.integers(120, 136, (_EXPERTS, rows, k), dtype=np.uint8))
-    )
-    packed = codes[..., ::2] | (codes[..., 1::2] << 4) if bits == 4 else codes
-    scales = rng.uniform(0.012, 0.035, (_EXPERTS, rows, k // _BLOCK)).astype(np.float16)
+    # Independent K-last fixture: low-bit codes come first within each byte.
+    if bits == 2:
+        codes = rng.integers(0, 4, (_EXPERTS, rows, k), dtype=np.uint8)
+        packed = (
+            codes[..., 0::4]
+            | (codes[..., 1::4] << 2)
+            | (codes[..., 2::4] << 4)
+            | (codes[..., 3::4] << 6)
+        )
+    elif bits == 4:
+        codes = rng.integers(4, 12, (_EXPERTS, rows, k), dtype=np.uint8)
+        packed = codes[..., ::2] | (codes[..., 1::2] << 4)
+    elif bits == 8:
+        packed = rng.integers(120, 136, (_EXPERTS, rows, k), dtype=np.uint8)
+    else:
+        raise ValueError(f"unsupported synthetic weight width: {bits}")
+    scales = (
+        rng.uniform(0.012, 0.035, (_EXPERTS, rows, k // group_size)) * np.sqrt(_H / k)
+    ).astype(np.float16)
     return torch.from_numpy(packed.copy()), torch.from_numpy(scales)
 
 
@@ -50,8 +70,13 @@ def _dequantize(
 ) -> torch.Tensor:
     """Independent symmetric affine dequantization of Olive's K-last bytes."""
     codes = weight.to(torch.int32)
-    if bits == 4:
+    if bits == 2:
+        codes = torch.stack(tuple((codes >> shift) & 3 for shift in (0, 2, 4, 6)), dim=-1)
+        codes = codes.flatten(-2)
+    elif bits == 4:
         codes = torch.stack((codes & 15, codes >> 4), dim=-1).flatten(-2)
+    elif bits != 8:
+        raise ValueError(f"unsupported synthetic weight width: {bits}")
     return (codes - (1 << (bits - 1))).float() * scale.float().repeat_interleave(
         group_size, dim=-1
     )
@@ -65,6 +90,7 @@ def _reference(
     input_ids: np.ndarray,
     state: dict[str, torch.Tensor],
     layouts: tuple[tuple[int, int], ...],
+    group_size: int = _BLOCK,
 ) -> np.ndarray:
     """Dense Qwen pre-norm residual blocks; attention is explicitly zero.
 
@@ -83,19 +109,22 @@ def _reference(
             state[p + "experts.gate_up_proj_qweight"],
             state[p + "experts.gate_up_proj_scales"],
             fc1_bits,
+            group_size,
         )
         down = _dequantize(
             state[p + "experts.down_proj_qweight"],
             state[p + "experts.down_proj_scales"],
             fc2_bits,
+            group_size,
         )
         routed = torch.zeros_like(x)
         for slot in range(2):
             for expert in range(_EXPERTS):
                 # The unfused dense graph runs all experts then masks their
                 # outputs; doing so here also tests multi-token routing.
-                gate = x @ gate_up[expert, :_INTER].T
-                up = x @ gate_up[expert, _INTER:].T
+                intermediate_size = gate_up.shape[1] // 2
+                gate = x @ gate_up[expert, :intermediate_size].T
+                up = x @ gate_up[expert, intermediate_size:].T
                 value = (functional.silu(gate) * up) @ down[expert].T
                 routed += (
                     value
@@ -107,60 +136,113 @@ def _reference(
     return logits.numpy()
 
 
-def _checkpoint(layouts: tuple[tuple[int, int], ...]) -> dict[str, torch.Tensor]:
+def _checkpoint(
+    layouts: tuple[tuple[int, int], ...],
+    hidden_size: int = _H,
+    intermediate_size: int = _INTER,
+    group_size: int = _BLOCK,
+) -> dict[str, torch.Tensor]:
     rng = np.random.default_rng(744)
     state = {
         "model.embed_tokens.weight": torch.from_numpy(
-            rng.normal(0, 0.65, (_VOCAB, _H)).astype(np.float16)
+            rng.normal(0, 0.65, (_VOCAB, hidden_size)).astype(np.float16)
         ),
-        "model.norm.weight": torch.ones(_H, dtype=torch.float16),
+        "model.norm.weight": torch.ones(hidden_size, dtype=torch.float16),
         "lm_head.weight": torch.from_numpy(
-            rng.normal(0, 0.16, (_VOCAB, _H)).astype(np.float16)
+            rng.normal(0, 0.16, (_VOCAB, hidden_size)).astype(np.float16)
         ),
     }
     for layer, (fc1_bits, fc2_bits) in enumerate(layouts):
         prefix = f"model.layers.{layer}."
         expert_prefix = prefix + "mlp.experts."
         for projection, bits, rows, k in (
-            ("gate_up_proj", fc1_bits, 2 * _INTER, _H),
-            ("down_proj", fc2_bits, _H, _INTER),
+            ("gate_up_proj", fc1_bits, 2 * intermediate_size, hidden_size),
+            ("down_proj", fc2_bits, hidden_size, intermediate_size),
         ):
-            weight, scales = _packed_weights(rng, bits, rows, k)
+            weight, scales = _packed_weights(rng, bits, rows, k, group_size)
             state[expert_prefix + projection + "_qweight"] = weight
             state[expert_prefix + projection + "_scales"] = scales
         # An unquantized router is the Olive Qwen3-MoE convention.
         state[prefix + "mlp.gate.weight"] = torch.from_numpy(
-            rng.normal(0, 0.13, (_EXPERTS, _H)).astype(np.float16)
+            rng.normal(0, 0.13, (_EXPERTS, hidden_size)).astype(np.float16)
         )
         for norm in ("input_layernorm", "post_attention_layernorm"):
-            state[prefix + norm + ".weight"] = torch.ones(_H, dtype=torch.float16)
-        for proj, rows in (("q_proj", _H), ("k_proj", 32), ("v_proj", 32), ("o_proj", _H)):
+            state[prefix + norm + ".weight"] = torch.ones(hidden_size, dtype=torch.float16)
+        for proj, rows in (
+            ("q_proj", hidden_size),
+            ("k_proj", hidden_size // 2),
+            ("v_proj", hidden_size // 2),
+            ("o_proj", hidden_size),
+        ):
             base = prefix + "self_attn." + proj + ".weight_"
             # Symmetric INT4 midpoint: zero attention, without leaving any
             # initializer unset or introducing attention numerical noise.
-            state[base + "qweight"] = torch.full((rows, _H // 2), 0x88, dtype=torch.uint8)
-            state[base + "scales"] = torch.ones(rows, _H // _BLOCK, dtype=torch.float16)
+            state[base + "qweight"] = torch.full(
+                (rows, hidden_size // 2), 0x88, dtype=torch.uint8
+            )
+            state[base + "scales"] = torch.ones(
+                rows, hidden_size // group_size, dtype=torch.float16
+            )
     return state
+
+
+def test_int2_fixture_preserves_lsb_first_codes_and_offset_two():
+    packed = torch.tensor([[[0xE4, 0x1B]]], dtype=torch.uint8)
+    scale = torch.ones(1, 1, 1, dtype=torch.float16)
+    torch.testing.assert_close(
+        _dequantize(packed, scale, bits=2, group_size=8),
+        torch.tensor([[[-2, -1, 0, 1, 1, 0, -1, -2]]], dtype=torch.float32),
+    )
+    rng = np.random.default_rng(744)
+    codes = rng.integers(0, 4, (_EXPERTS, 2, 8), dtype=np.uint8)
+    packed, scales = _packed_weights(np.random.default_rng(744), 2, 2, 8, 8)
+    expected = torch.from_numpy(codes.astype(np.float32) - 2) * scales.float()
+    torch.testing.assert_close(_dequantize(packed, scales, 2, 8), expected)
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    "layouts",
-    [((4, 8), (8, 4)), ((8, 8),)],
-    ids=["adjacent-4x8-8x4", "uniform-8x8"],
+    "layouts,hidden_size,intermediate_size,group_size,tokens,route",
+    [
+        pytest.param(((4, 8), (8, 4)), 64, 64, 32, 3, "dense", id="adjacent-4x8-8x4"),
+        pytest.param(((8, 8),), 64, 64, 32, 3, "dense", id="uniform-8x8"),
+        pytest.param(((2, 4),), 512, 512, 64, 1, "packed", id="int2x4-block64-decode"),
+        pytest.param(((2, 4),), 512, 512, 128, 1, "packed", id="int2x4-block128-decode"),
+        pytest.param(((2, 4),), 512, 512, 64, 257, "dense", id="int2x4-block64-prefill"),
+        pytest.param(((2, 4),), 512, 512, 128, 257, "dense", id="int2x4-block128-prefill"),
+    ],
 )
-def test_olive_qwen3_moe_full_logits_on_cuda(layouts):
+def test_olive_qwen3_moe_full_logits_on_cuda(
+    layouts,
+    hidden_size,
+    intermediate_size,
+    group_size,
+    tokens,
+    route,
+    tmp_path,
+    monkeypatch,
+    record_property,
+):
     """Run the exported model, not a standalone hand-written QMoE node."""
     if os.environ.get("MOBIUS_QMOE_CUDA_TEST") != "1":
-        pytest.skip("set MOBIUS_QMOE_CUDA_TEST=1 with the ee5f6e7c ORT CUDA wheel")
+        pytest.skip("set MOBIUS_QMOE_CUDA_TEST=1 with requirements/ci/qmoe-cuda.txt")
 
     import onnxruntime as ort
 
-    assert f"git-commit-id={_ORT_COMMIT}" in ort.get_build_info(), (
-        f"ORT CUDA wheel from {_ORT_COMMIT} required, got {ort.get_build_info()}"
+    assert ort.__version__ == _SYNTHETIC_ORT_VERSION, ort.__version__
+    assert f"git-commit-id={_SYNTHETIC_ORT_COMMIT}" in ort.get_build_info(), (
+        f"pinned CUDA wheel required, got {ort.get_build_info()}"
     )
     assert "CUDAExecutionProvider" in ort.get_available_providers()
-    assert _DATA_ROOT.is_dir(), f"model/profiling output directory missing: {_DATA_ROOT}"
+    record_property("ort_version", ort.__version__)
+    record_property("ort_build", ort.get_build_info())
+    record_property("qmoe_route", route)
+    # The pin enables native INT2 prefill by default. Keep it off to isolate
+    # packed GEMV from dense fallback, rather than accidentally testing prefill.
+    monkeypatch.setenv("ORT_ENABLE_QMOE_INT2_PREFILL", "0")
+    monkeypatch.setenv("ORT_DISABLE_MOE_GEMV", "0" if route == "packed" else "1")
+    monkeypatch.setenv("ORT_ENABLE_QMOE_KERNEL_DEBUG_INFO", "1")
+    head_dim = hidden_size // 4
 
     overrides = {
         f"model.layers.{layer}.mlp.experts.{projection}": QuantizationOverride(bits=bits)
@@ -170,26 +252,26 @@ def test_olive_qwen3_moe_full_logits_on_cuda(layouts):
     }
     config = make_config(
         dtype=ir.DataType.FLOAT16,
-        hidden_size=_H,
-        intermediate_size=_INTER,
-        moe_intermediate_size=_INTER,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_intermediate_size=intermediate_size,
         num_hidden_layers=len(layouts),
         num_local_experts=_EXPERTS,
         num_experts_per_tok=2,
         norm_topk_prob=True,
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=16,
+        head_dim=head_dim,
         vocab_size=_VOCAB,
         quantization=QuantizationConfig(
             bits=4,
-            group_size=_BLOCK,
+            group_size=group_size,
             quant_method="olive",
             sym=True,
             overrides=overrides,
         ),
     )
-    state = _checkpoint(layouts)
+    state = _checkpoint(layouts, hidden_size, intermediate_size, group_size)
     module = MoECausalLMModel(config)
     assert all(layer.mlp.experts is None for layer in module.model.layers)
     processed = module.preprocess_weights(state.copy())
@@ -203,7 +285,9 @@ def test_olive_qwen3_moe_full_logits_on_cuda(layouts):
         for key in list(processed)
         if ".self_attn." in key and key.endswith(("_qweight", "_scales"))
     }
-    processed.update(preprocess_olive_weights(attention_sidecars, bits=4, group_size=_BLOCK))
+    processed.update(
+        preprocess_olive_weights(attention_sidecars, bits=4, group_size=group_size)
+    )
     from mobius import build_from_module
 
     package = build_from_module(module, config)
@@ -214,14 +298,12 @@ def test_olive_qwen3_moe_full_logits_on_cuda(layouts):
     for layer, (node, (fc1, fc2)) in enumerate(zip(qmoes, layouts)):
         assert node.domain == "com.microsoft"
         assert node.attributes["weights_prepacked"].value == 0
-        assert node.attributes["block_size"].value == _BLOCK
-        assert _BLOCK & (_BLOCK - 1) == 0 and 16 <= _BLOCK <= 256
-        assert _H % _BLOCK == _INTER % _BLOCK == 0
+        assert node.attributes["block_size"].value == group_size
+        assert hidden_size % group_size == intermediate_size % group_size == 0
         assert node.attributes["quant_type"].value == "int"
         assert node.attributes["activation_type"].value == "swiglu"
         assert node.attributes["swiglu_fusion"].value == 1
-        # ee5f6e7c's mixed CUDA fallback requires 3-D scales matching the
-        # FP16/BF16 activation type, and raw uint8-packed FC1/FC2 weights.
+        # Raw packed weights and 3-D scales matching the activation dtype.
         assert node.inputs[0].dtype == ir.DataType.FLOAT16
         assert node.inputs[2].dtype == node.inputs[5].dtype == ir.DataType.UINT8
         assert node.inputs[3].dtype == node.inputs[6].dtype == node.inputs[0].dtype
@@ -229,15 +311,15 @@ def test_olive_qwen3_moe_full_logits_on_cuda(layouts):
             prefix = f"model.layers.{layer}.mlp.{label}_scales"
             assert processed[prefix].ndim == 3
             assert processed[prefix].dtype == torch.float16
-        assert node.attributes["expert_weight_bits"].value == (4 if fc1 != fc2 else 8)
+        assert node.attributes["expert_weight_bits"].value == (4 if fc1 != fc2 else fc1)
         if fc1 != fc2:
             assert tuple(
                 node.attributes[f"fc{i}_expert_weight_bits"].value for i in (1, 2, 3)
             ) == (fc1, fc2, fc1)
     assert all(init.const_value is not None for init in model.graph.initializers.values())
 
-    input_ids = np.array([[1, 9, 3]], dtype=np.int64)
-    expected = _reference(input_ids, state, layouts)
+    input_ids = np.resize(np.array([1, 9, 3], dtype=np.int64), (1, tokens))
+    expected = _reference(input_ids, state, layouts, group_size)
     # Catch accidentally vacuous checkpoints even if the CUDA path regresses
     # to returning only the embedding residual.
     residual_logits = (
@@ -245,51 +327,68 @@ def test_olive_qwen3_moe_full_logits_on_cuda(layouts):
         @ state["lm_head.weight"].float().T
     ).numpy()
     assert np.max(np.abs(expected - residual_logits)) > 0.02
+    assert not np.allclose(expected, residual_logits, rtol=0.01, atol=0.01)
     swapped = state.copy()
     gate_up_key = "model.layers.0.mlp.experts.gate_up_proj_qweight"
-    swapped[gate_up_key] = state[gate_up_key].roll(_INTER, dims=1)
-    assert np.max(np.abs(expected - _reference(input_ids, swapped, layouts))) > 0.02
+    swapped[gate_up_key] = state[gate_up_key].roll(intermediate_size, dims=1)
+    swapped_logits = _reference(input_ids, swapped, layouts, group_size)
+    assert np.max(np.abs(expected - swapped_logits)) > 0.02
+    assert not np.allclose(expected, swapped_logits, rtol=0.01, atol=0.01)
 
-    with tempfile.TemporaryDirectory(prefix="mobius-qmoe-", dir=_DATA_ROOT) as directory:
-        directory = Path(directory)
-        model_path = directory / "model.onnx"
-        ir.save(model, model_path, external_data="model.onnx.data")
-        options = ort.SessionOptions()
-        # The full decoder has CPU shape/control nodes; profile the QMoE nodes
-        # rather than rejecting their legitimate host-side shape work.
-        options.enable_profiling = True
-        options.profile_file_prefix = str(directory / "profile")
-        session = ort.InferenceSession(
-            str(model_path), sess_options=options, providers=["CUDAExecutionProvider"]
-        )
-        assert session.get_providers()[0] == "CUDAExecutionProvider"
-        feeds = {
-            "input_ids": input_ids,
-            "attention_mask": np.ones_like(input_ids),
-            "position_ids": np.arange(input_ids.shape[1], dtype=np.int64)[None, :],
-        }
-        for layer in range(len(layouts)):
-            for cache in ("key", "value"):
-                feeds[f"past_key_values.{layer}.{cache}"] = np.zeros(
-                    (1, 2, 0, 16), dtype=np.float16
-                )
-        actual = session.run(["logits"], feeds)[0]
-        profile = json.loads(Path(session.end_profiling()).read_text(encoding="utf-8"))
-        qmoe_events = [
-            event
-            for event in profile
-            if event.get("cat") == "Node"
-            and (
-                event.get("args", {}).get("op_name") == "QMoE"
-                or "QMoE" in event.get("name", "")
+    model_path = tmp_path / "model.onnx"
+    ir.save(model, model_path, external_data="model.onnx.data")
+    options = ort.SessionOptions()
+    options.add_session_config_entry(
+        _SCRATCH_KEY, str(1 if route == "packed" else _FALLBACK_SCRATCH_BYTES)
+    )
+    # CPU shape/control nodes are legitimate; require CUDA specifically for QMoE.
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "profile")
+    session = ort.InferenceSession(
+        str(model_path), sess_options=options, providers=["CUDAExecutionProvider"]
+    )
+    assert session.get_providers()[0] == "CUDAExecutionProvider"
+    feeds = {
+        "input_ids": input_ids,
+        "attention_mask": np.ones_like(input_ids),
+        "position_ids": np.arange(tokens, dtype=np.int64)[None, :],
+    }
+    for layer in range(len(layouts)):
+        for cache in ("key", "value"):
+            feeds[f"past_key_values.{layer}.{cache}"] = np.zeros(
+                (1, 2, 0, head_dim), dtype=np.float16
             )
-        ]
-        assert len(qmoe_events) >= len(layouts), "QMoE execution missing from ORT profile"
-        assert all(
-            event.get("args", {}).get("provider") == "CUDAExecutionProvider"
-            for event in qmoe_events
-        ), qmoe_events
+    actual = session.run(["logits"], feeds)[0]
+    profile = json.loads(Path(session.end_profiling()).read_text(encoding="utf-8"))
+    qmoe_events = [
+        event
+        for event in profile
+        if event.get("cat") == "Node" and event.get("args", {}).get("op_name") == "QMoE"
+    ]
+    assert len(qmoe_events) >= len(layouts), "QMoE execution missing from ORT profile"
+    assert all(
+        event.get("args", {}).get("provider") == "CUDAExecutionProvider"
+        for event in qmoe_events
+    ), qmoe_events
     np.testing.assert_allclose(actual.astype(np.float32), expected, rtol=0.01, atol=0.01)
+    if layouts[0][0] == 2:
+        # A successful 1-byte-budget decode cannot be dense dequantization.
+        # Verify that the guard really rejects the same model when packing is
+        # disabled, rather than trusting a CUDA provider label as path proof.
+        del session
+        monkeypatch.setenv("ORT_DISABLE_MOE_GEMV", "1")
+        guard_options = ort.SessionOptions()
+        guard_options.add_session_config_entry(_SCRATCH_KEY, "1")
+        fallback = ort.InferenceSession(
+            str(model_path), sess_options=guard_options, providers=["CUDAExecutionProvider"]
+        )
+        assert fallback.get_providers()[0] == "CUDAExecutionProvider"
+        with pytest.raises(
+            ort.capi.onnxruntime_pybind11_state.Fail,
+            match=r"INT2 or mixed-width CUDA QMoE dense fallback requires .*"
+            r"exceeding the configured limit of 1 bytes",
+        ):
+            fallback.run(["logits"], feeds)
 
 
 _REAL_H = 2048
