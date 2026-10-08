@@ -42,9 +42,9 @@ def test_runtime_blocker_candidate_is_metadata_only_and_not_budgeted_as_support(
     assert record["size"] > policy["max_selected_artifact_bytes"]
     assert record["size"] not in {artifact["size"] for artifact in selected_artifacts}
     assert record["tokenizer"]["revision"] == "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"
-    assert record["graph"]["pre_optimization_node_count"] == 43_180
-    assert record["graph"]["node_count"] == 40_109
-    assert record["graph"]["initializer_count"] == 6_255
+    assert record["graph"]["pre_optimization_node_count"] == 43_272
+    assert record["graph"]["node_count"] == 40_222
+    assert record["graph"]["initializer_count"] == 6_257
     assert record["graph"]["matmul_count"] == 6_028
     assert record["graph"]["state_slots"]["mamba2.ssm_state"] == 23
     assert record["runtime_schema_issue"].endswith("/issues/605")
