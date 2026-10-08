@@ -21,14 +21,17 @@ from mobius import build
 from mobius._builder import build_from_module
 from mobius._configs import NemotronHConfig
 from mobius._model_package import ModelPackage
+from mobius._testing import create_test_builder, create_test_input
 from mobius.integrations.transformers._nemotron_h_weights_test import (
     _config,
     _source_name,
     _write_mixed_checkpoint,
 )
+from mobius.models.nemotron_h import NemotronHMoELayer
 from mobius.models.nemotron_h_mtp import (
     NemotronHMtpModel,
     NemotronHSpeculativeModel,
+    _FinalMoELayer,
     mtp_source_name,
 )
 
@@ -52,6 +55,28 @@ def _graph_package(dtype="f32"):
         "bf16": ir.DataType.BFLOAT16,
     }[dtype]
     return build_from_module(NemotronHSpeculativeModel(config), config, task="nemotron-h-mtp")
+
+
+def test_final_moe_layer_accepts_and_forwards_base_positional_contract(monkeypatch):
+    config = NemotronHConfig.from_transformers(SimpleNamespace(**_raw()))
+    layer = _FinalMoELayer(config)
+    builder, op, _graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 2, config.hidden_size])
+    received = []
+
+    def base_forward(
+        self, op, hidden_states, attention_bias, position_embeddings, past_key_value
+    ):
+        received.append((attention_bias, position_embeddings, past_key_value))
+        return hidden_states, (None, None)
+
+    monkeypatch.setattr(NemotronHMoELayer, "forward", base_forward)
+    layer(op, hidden)
+    bias = create_test_input(builder, "bias", [1, 1, 2, 2])
+    positions = (hidden, hidden)
+    cache = (hidden, hidden)
+    layer(op, hidden, bias, positions, cache)
+    assert received == [(None, None, None), (bias, positions, cache)]
 
 
 def _checkpoint(tmp_path, *, dtype=torch.float32):
