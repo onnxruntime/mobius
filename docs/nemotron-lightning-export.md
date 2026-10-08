@@ -119,6 +119,9 @@ implies reconstruction; both remain explicit.
   resolved blob directories. Saving into source checkpoint directories or
   onto source-file aliases is rejected before serialization; use a fresh,
   separate output directory.
+  Local checkpoint paths remain only in transient lazy-source bindings and
+  overlap guards; persisted loading reports and ONNX metadata use
+  `local-safetensors-checkpoint`, including both target/MTP component reports.
 - `models/nemotron_h.py` casts router weights/bias to FP32 and accumulates routed
   outputs in FP32 before the shared-expert path, retaining sigmoid selection,
   unbiased routing weights and squared ReLU. It also retains FP32 router

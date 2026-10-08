@@ -1243,7 +1243,9 @@ def stream_preprocessed_safetensors_to_model(
 
     report = {
         "format": "mobius.weight-loading-report.v1",
-        "source": model_id,
+        "source": (
+            "local-safetensors-checkpoint" if pathlib.Path(model_id).is_dir() else model_id
+        ),
         "revision": revision,
         "output_weight_format": "dense",
         "native_fp8": False,

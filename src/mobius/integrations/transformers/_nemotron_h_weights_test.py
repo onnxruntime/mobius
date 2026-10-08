@@ -153,6 +153,7 @@ def test_public_local_build_reconstructs_all_projection_families(tmp_path, monke
     )
     package = build(str(tmp_path), keep_quantized=False, dtype="bf16")
     report = package.weight_loading_report
+    assert report["source"] == "local-safetensors-checkpoint"
     assert report["storage_policy"] == "explicit-dense-bf16-reconstruction"
     assert report["native_nvfp4"] is False
     assert report["ignored_tensors"] == 0
@@ -169,6 +170,9 @@ def test_public_local_build_reconstructs_all_projection_families(tmp_path, monke
     package.save(output, external_data="onnx")
     assert (output / "model.onnx").is_file()
     loaded = ir.load(output / "model.onnx")
+    assert json.loads(loaded.metadata_props["mobius.weight_loading"])["source"] == (
+        "local-safetensors-checkpoint"
+    )
     assert loaded.metadata_props["mobius.source_weight_format"] == "modelopt-mixed-fp8-nvfp4"
 
 
