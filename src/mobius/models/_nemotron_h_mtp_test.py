@@ -304,6 +304,9 @@ def test_package_accounting_save_and_default_guard(tmp_path):
         build(str(tmp_path), dtype="bf16", load_weights=False)
     package = build(str(tmp_path), task="nemotron-h-mtp", dtype="bf16")
     report = package.weight_loading_report
+    assert report["source"] == "local-safetensors-checkpoint"
+    assert report["decoder_component"]["source"] == "local-safetensors-checkpoint"
+    assert report["mtp_component"]["source"] == "local-safetensors-checkpoint"
     assert report["mtp_preserved"] is True
     assert report["omitted_mtp_tensor_count"] == 0
     assert set(report["mtp_tensors"]) == {n for n in tensors if n.startswith("mtp.")}
@@ -325,9 +328,13 @@ def test_package_accounting_save_and_default_guard(tmp_path):
     restored = ModelPackage.load(output)
     assert set(restored) == {"decoder", "mtp"}
     for model in restored.values():
+        loading = json.loads(model.metadata_props["mobius.weight_loading"])
+        assert loading["source"] == "local-safetensors-checkpoint"
+        assert str(tmp_path) not in json.dumps(loading)
         assert model.metadata_props["mobius.source_num_nextn_predict_layers"] == "1"
         assert model.metadata_props["mobius.mtp_contract"] == "nemotron-h-lightning-nextn@1"
     assert restored.weight_loading_report["mtp_preserved"] is True
+    assert str(tmp_path) not in json.dumps(restored.weight_loading_report)
 
 
 @pytest.mark.parametrize(
