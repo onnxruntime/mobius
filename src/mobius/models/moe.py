@@ -10,6 +10,7 @@ from collections.abc import Callable
 
 import onnx_ir as ir
 import torch
+from onnx_ir import tensor_adapters
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, GrokGGUFConfig, GroveMoEGGUFConfig
@@ -107,6 +108,7 @@ def _preprocess_moe_weights(model: CausalLMModel, state_dict) -> dict:
         qmoe_num_experts=model.config.num_local_experts,
         qmoe_hidden_size=model.config.hidden_size,
         qmoe_intermediate_size=model.config.moe_intermediate_size,
+        qmoe_activation_dtype=tensor_adapters.to_torch_dtype(model.config.dtype),
         qmoe_expected_moe_paths=tuple(
             f"model.layers.{layer_idx}.mlp"
             for layer_idx in range(model.config.num_hidden_layers)

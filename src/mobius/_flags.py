@@ -84,6 +84,10 @@ class _Flags:
          - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
            (ORT <=1.24.x workaround). Disabled by default.
+       * - ``experimental_int3_qmoe_export``
+         - ``MOBIUS_EXPERIMENTAL_INT3_QMOE_EXPORT``
+         - ``False``
+         - Emit draft INT3 QMoE graphs; not released runtime support.
        * - ``tencent_q1_0_use_native_2bit``
          - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
          - ``False``
@@ -106,6 +110,16 @@ class _Flags:
 
     These warnings are expected noise when optimisation passes run before weights
     are loaded. Set ``MOBIUS_SUPPRESS_DEDUP_WARNING=0`` to see all warnings.
+    """
+
+    experimental_int3_qmoe_export: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_EXPERIMENTAL_INT3_QMOE_EXPORT", False)
+    )
+    """Emit draft INT3 QMoE graphs using the proposed raw-bitstream contract.
+
+    This is export-only experimentation, not released ORT schema/kernel support.
+    Set ``MOBIUS_EXPERIMENTAL_INT3_QMOE_EXPORT=1`` before importing mobius, or
+    use ``override_flags(experimental_int3_qmoe_export=True)`` for a scoped export.
     """
 
     ort_cuda_grouped_rmsnorm_workaround: bool = dataclasses.field(
