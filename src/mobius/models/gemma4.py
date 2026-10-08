@@ -13,7 +13,8 @@ Key architectural differences from Gemma3:
 - Dual head_dim: local sliding-window layers use ``config.head_dim``; global
   full-attention layers use ``config.global_head_dim``.
 - Dual RoPE: different ``rope_theta`` and ``partial_rotary_factor`` per layer type.
-- Per-layer input gating (disabled when ``hidden_size_per_layer_input == 0``).
+- Per-layer input gating with decoder-matched quantized projections
+  (disabled when ``hidden_size_per_layer_input == 0``).
 - Vision encoder: pre-patchified input ``[B, N, 3*P^2]`` with 2D position lookup,
   bidirectional attention, 4-norm structure, and scale-then-project pooling.
 - Vision projector: scale-free RMSNorm -> Linear (matches ``embed_vision`` weights).
@@ -1577,10 +1578,11 @@ class Gemma4DecoderLayer(nn.Module):
 
         self._per_layer_dim = config.hidden_size_per_layer_input
         if self._per_layer_dim > 0:
-            self.per_layer_input_gate = Linear(
+            linear_class = _text_linear_class(config) or Linear
+            self.per_layer_input_gate = linear_class(
                 config.hidden_size, self._per_layer_dim, bias=False
             )
-            self.per_layer_projection = Linear(
+            self.per_layer_projection = linear_class(
                 self._per_layer_dim, config.hidden_size, bias=False
             )
             self.post_per_layer_input_norm = RMSNorm(
