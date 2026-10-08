@@ -2842,7 +2842,7 @@
       "architecture": "nemotron_h_moe",
       "blockers": [
         "The smallest model GGUF in the pinned 29-file repository revision is 18,010,755,296 bytes, above the 16 GiB bounded-artifact policy; explicit float16/float32 weights require 63,155,880,576/126,311,761,152 bytes.",
-        "The normal optimized CPU export has 40,109 nodes (43,180 before Mobius optimization) and 6,028 MatMul nodes because its truthful ReLU2 routed experts remain an ONNX loop with FP32 routing/accumulation. This graph-only census was refreshed locally with ORT 1.30.0 installed; the pinned ORT 1.29 runtime inspection below is historical, not a new runtime result. ORT 1.29 MoE/QMoE exposes ReLU but not ReLU2. QMoE has separate router_probs/router_weights for correction-biased selection with unbiased sigmoid mixing, while shared experts and optional latent projections can surround it; those are not fused-op blockers. The pinned 30B has no latent projection. QMoE does not support GGUF IQ2_XXS storage, and Mobius has no proven IQ2_XXS packer/kernel path.",
+        "The normal optimized CPU export has 40,222 nodes (43,272 before Mobius optimization) and 6,028 MatMul nodes because its truthful ReLU2 routed experts remain an ONNX loop with FP32 routing/accumulation. This graph-only census was refreshed locally with ORT 1.30.0 installed; the pinned ORT 1.29 runtime inspection below is historical, not a new runtime result. ORT 1.29 MoE/QMoE exposes ReLU but not ReLU2. QMoE has separate router_probs/router_weights for correction-biased selection with unbiased sigmoid mixing, while shared experts and optional latent projections can surround it; those are not fused-op blockers. The pinned 30B has no latent projection. QMoE does not support GGUF IQ2_XXS storage, and Mobius has no proven IQ2_XXS packer/kernel path.",
         "ORT GenAI 0.15.2 discovers sparse/nonconsecutive KV and conv/recurrent slots, but derives recurrent_state names while this export uses ssm_state, does not beam-reorder recurrent state, and rejects nonzero recurrent-state rewind.",
         "The GGUF tokenizer declares pre=pixtral, whose compiled llama.cpp behavior is not serialized; exact ORT tokenizer materialization is unavailable."
       ],
@@ -2861,10 +2861,10 @@
       "explicit_float32_bytes": 126311761152,
       "filename": "nvidia_Nemotron-3-Nano-30B-A3B-IQ2_XXS.gguf",
       "graph": {
-        "initializer_count": 6255,
+        "initializer_count": 6257,
         "matmul_count": 6028,
-        "node_count": 40109,
-        "pre_optimization_node_count": 43180,
+        "node_count": 40222,
+        "pre_optimization_node_count": 43272,
         "state_slots": {
           "attention.key": 6,
           "attention.value": 6,
