@@ -27,16 +27,24 @@ def build_nemotron_h_streaming_plan(
     initializers: Mapping[str, ir.Value],
     *,
     modelopt: ModelOptConfig | None = None,
+    target_decoder_only: bool = False,
 ) -> StreamingWeightPlan:
     """Map exact per-expert checkpoint keys and account for every source tensor."""
-    if any(name.startswith("mtp.") for name in key_index):
+    mtp_names = sorted(name for name in key_index if name.startswith("mtp."))
+    if (config.num_nextn_predict_layers or mtp_names) and not target_decoder_only:
         raise NotImplementedError(
             "Nemotron-H NextN/MTP tensors require a validated MTP export contract; "
-            "they must not be silently discarded."
+            "they must not be silently discarded. Use explicit target_decoder_only=True "
+            "for the separately labeled target decoder variant."
         )
+    if target_decoder_only and config.num_nextn_predict_layers and not mtp_names:
+        raise ValueError("Source config declares NextN/MTP but no mtp.* tensors were found")
+    omitted = dict.fromkeys(
+        mtp_names, "explicit target-decoder-only variant excludes NextN/MTP"
+    )
     targets: dict[str, StreamingWeightSource] = {}
     constants: dict[str, torch.Tensor] = {}
-    ignored: dict[str, str] = {}
+    ignored = omitted
     quantized_modules: set[str] = set()
     activation_modules = modelopt.activation_modules if modelopt is not None else frozenset()
     cache_scales = set()
@@ -55,6 +63,8 @@ def build_nemotron_h_streaming_plan(
             validate_modelopt_scale(scale, name, scalar=True)
             constants[name] = scale
     for source_name in key_index:
+        if source_name in omitted:
+            continue
         if source_name in cache_scales:
             continue
         if source_name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")):
@@ -102,6 +112,19 @@ def build_nemotron_h_streaming_plan(
         ignored=ignored,
         constants=constants,
         report={
+            "export_variant": "target-decoder-only" if target_decoder_only else "standard",
+            "source_num_nextn_predict_layers": config.num_nextn_predict_layers,
+            "mtp_preserved": False,
+            "mtp_inventory_status": "inspected",
+            "omitted_mtp_tensor_count": len(omitted),
+            "omitted_mtp_tensors": {
+                name: {
+                    "reason": reason,
+                    "shape": key_index[name][1],
+                    "dtype": key_index[name][2],
+                }
+                for name, reason in omitted.items()
+            },
             "source_weight_format": modelopt.source_format if modelopt else "floating",
             "storage_policy": "explicit-dense-bf16-reconstruction" if modelopt else "dense",
             "native_nvfp4": False,

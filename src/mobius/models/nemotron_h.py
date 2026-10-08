@@ -524,13 +524,15 @@ class NemotronHCausalLMModel(nn.Module):
     category: str = "Hybrid SSM+Attention"
     config_class: type = NemotronHConfig
 
-    def __init__(self, config: NemotronHConfig):
+    def __init__(self, config: NemotronHConfig, *, target_decoder_only: bool = False):
         super().__init__()
         self.config = config
-        if config.num_nextn_predict_layers:
+        self.target_decoder_only = target_decoder_only
+        if config.num_nextn_predict_layers and not target_decoder_only:
             raise NotImplementedError(
                 "Nemotron-H NextN/MTP export is not implemented; auxiliary tensors "
-                "must not be silently skipped by a target-only graph."
+                "must not be silently skipped. Explicit target_decoder_only=True "
+                "(--target-decoder-only) exports a separately labeled variant."
             )
         self.model = _NemotronHTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)

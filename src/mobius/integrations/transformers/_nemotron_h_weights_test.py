@@ -310,3 +310,172 @@ def test_cache_scale_contract_fails_before_initializer_binding(tmp_path, change)
     safetensors.torch.save_file(weights, path)
     with pytest.raises(ValueError):
         build(str(tmp_path), keep_quantized=False, dtype="bf16")
+
+
+def _write_mtp_checkpoint(tmp_path, *, mixed):
+    raw, expected = _write_mixed_checkpoint(tmp_path)
+    path = tmp_path / "model.safetensors"
+    weights = safetensors.torch.load_file(path)
+    if not mixed:
+        del raw["quantization_config"]
+        weights = {_source_name(name): tensor for name, tensor in expected.items()}
+    # Omission accounting includes all storage/scale kinds, not only weights.
+    mtp = {
+        "mtp.layers.0.hnorm.weight": torch.ones(32, dtype=torch.bfloat16),
+        "mtp.layers.0.mixer.weight": torch.zeros(4, 16, dtype=torch.uint8),
+        "mtp.layers.0.mixer.weight_scale": torch.ones(4, 2).to(torch.float8_e4m3fn),
+        "mtp.layers.0.mixer.weight_scale_2": torch.tensor(0.25),
+    }
+    weights.update(mtp)
+    raw["num_nextn_predict_layers"] = 1
+    (tmp_path / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+    safetensors.torch.save_file(weights, path)
+    return raw, expected, mtp
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_explicit_target_variant_accounts_for_every_mtp_tensor(tmp_path, mixed, monkeypatch):
+    raw, expected, mtp = _write_mtp_checkpoint(tmp_path, mixed=mixed)
+    source = SimpleNamespace(**raw)
+    monkeypatch.setattr(_builder, "_load_transformers_config", lambda *a, **k: (source, True))
+    monkeypatch.setattr(
+        _builder, "_download_weights", lambda *a, **k: pytest.fail("must use strict streaming")
+    )
+    options = {"dtype": "bf16", "keep_quantized": not mixed}
+    with pytest.raises(NotImplementedError, match="NextN/MTP"):
+        build(str(tmp_path), **options)
+    package = build(str(tmp_path), target_decoder_only=True, **options)
+    assert source.num_nextn_predict_layers == 1
+    assert source.__dict__ == raw
+    report = package.weight_loading_report
+    assert report["export_variant"] == "target-decoder-only"
+    assert report["source_num_nextn_predict_layers"] == 1
+    assert report["mtp_preserved"] is False
+    assert report["omitted_mtp_tensor_count"] == len(mtp)
+    assert report["ignored_tensors"] == len(mtp)
+    assert set(report["omitted_mtp_tensors"]) == set(mtp)
+    for name, tensor in mtp.items():
+        entry = report["omitted_mtp_tensors"][name]
+        assert entry["shape"] == list(tensor.shape)
+        assert "explicit target-decoder-only" in entry["reason"]
+    model = package["model"]
+    assert "/target-decoder-only/" in model.graph.name
+    assert model.metadata_props["mobius.source_num_nextn_predict_layers"] == "1"
+    assert model.metadata_props["mobius.mtp_inventory_status"] == "inspected"
+    assert not any(name.startswith("mtp.") for name in model.graph.initializers)
+    for name, tensor in expected.items():
+        actual = model.graph.initializers[name].const_value.numpy().astype("float32")
+        torch.testing.assert_close(torch.from_numpy(actual), tensor.float(), rtol=0, atol=0)
+    output = tmp_path / "target-decoder-only"
+    package.save(output, external_data="onnx")
+    loaded = ir.load(output / "model.onnx")
+    assert loaded.metadata_props["mobius.export_variant"] == "target-decoder-only"
+    assert set(json.loads(loaded.metadata_props["mobius.omitted_mtp_tensors"])) == set(mtp)
+    saved_report = json.loads((output / "weight-loading-report.json").read_text())
+    assert saved_report["omitted_mtp_tensors"] == report["omitted_mtp_tensors"]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_target_variant_cli_and_graph_only_provenance(tmp_path, mixed):
+    raw, _, mtp = _write_mtp_checkpoint(tmp_path, mixed=mixed)
+    graph_only = build(
+        str(tmp_path),
+        dtype="bf16",
+        keep_quantized=not mixed,
+        target_decoder_only=True,
+        load_weights=False,
+    )["model"]
+    assert graph_only.metadata_props["mobius.mtp_inventory_status"] == "not_inspected"
+    assert "mobius.omitted_mtp_tensors" not in graph_only.metadata_props
+    output = tmp_path / "cli-target"
+    main(
+        [
+            "build",
+            "--config",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--ep",
+            "cpu",
+            "--dtype",
+            "bf16",
+            "--target-decoder-only",
+            "--external-data",
+            "onnx",
+            *(["--dequantize"] if mixed else []),
+        ]
+    )
+    loaded = ir.load(output / "model.onnx")
+    assert loaded.metadata_props["mobius.export_variant"] == "target-decoder-only"
+    report = json.loads((output / "weight-loading-report.json").read_text())
+    assert set(report["omitted_mtp_tensors"]) == set(mtp)
+    assert json.loads((tmp_path / "config.json").read_text()) == raw
+
+
+@pytest.mark.parametrize(
+    "extra", ["unexpected.weight", "unexpected.weight_scale", "mtpx.weight"]
+)
+def test_target_variant_does_not_ignore_non_mtp_extras(tmp_path, extra):
+    _write_mtp_checkpoint(tmp_path, mixed=True)
+    path = tmp_path / "model.safetensors"
+    tensors = safetensors.torch.load_file(path)
+    tensors[extra] = torch.ones(1)
+    safetensors.torch.save_file(tensors, path)
+    with pytest.raises(ValueError, match=r"Unmapped|unclassified"):
+        build(str(tmp_path), dtype="bf16", keep_quantized=False, target_decoder_only=True)
+
+
+def test_target_variant_still_blocks_native_modelopt(tmp_path):
+    _write_mtp_checkpoint(tmp_path, mixed=True)
+    with pytest.raises(NotImplementedError, match="Native"):
+        build(str(tmp_path), dtype="bf16", target_decoder_only=True)
+
+
+def test_target_variant_only_accepts_nemotron(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+    with pytest.raises(ValueError, match="only supported for Nemotron"):
+        build(str(tmp_path), load_weights=False, target_decoder_only=True)
+
+
+def test_declared_nextn_requires_source_inventory_when_loading(tmp_path):
+    raw, _ = _write_mixed_checkpoint(tmp_path)
+    raw["num_nextn_predict_layers"] = 1
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="no mtp"):
+        build(str(tmp_path), dtype="bf16", keep_quantized=False, target_decoder_only=True)
+
+
+def test_target_variant_forwards_cli_model_and_revision(tmp_path, monkeypatch):
+    from mobius import __main__ as cli
+
+    received = {}
+
+    def capture(source, **options):
+        received.update(source=source, **options)
+        return {}
+
+    monkeypatch.setattr(cli, "build", capture)
+    monkeypatch.setattr(cli, "_save_package", lambda *args: None)
+    monkeypatch.setattr(
+        "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+        lambda *args, **kwargs: pytest.fail("target variant cannot bypass build policy"),
+    )
+    main(
+        [
+            "build",
+            "--model",
+            "nvidia/lightning",
+            "--revision",
+            "a" * 40,
+            "--output",
+            str(tmp_path / "target"),
+            "--dtype",
+            "bf16",
+            "--target-decoder-only",
+            "--dequantize",
+        ]
+    )
+    assert received["source"] == "nvidia/lightning"
+    assert received["target_decoder_only"] is True
+    assert received["keep_quantized"] is False
+    assert received["revision"] == "a" * 40
