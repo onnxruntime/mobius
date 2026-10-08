@@ -41,6 +41,7 @@ from mobius.components import (
     FCMLP,
     Attention,
     Embedding,
+    GroupedGatedRMSNorm,
     Linear,
     Mamba2Block,
     RMSNorm,
@@ -84,6 +85,11 @@ class NemotronHMambaLayer(nn.Module):
             # group of heads_per_group * head_dim dimensions.
             norm_group_size=d_inner // config.mamba_n_groups,
             time_step_min=config.mamba_time_step_min,
+        )
+        # HF Zamba2RMSNormGated keeps gating/variance in FP32 and casts before gamma.
+        # Preserve the existing norm.weight namespace without the CUDA 2D-scale op.
+        self.mamba.norm = GroupedGatedRMSNorm(
+            d_inner, d_inner // config.mamba_n_groups, eps=config.rms_norm_eps
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
