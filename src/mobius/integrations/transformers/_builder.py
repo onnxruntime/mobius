@@ -26,6 +26,8 @@ from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import (
     _download_weights,
+    _lazy_safetensors_source_parent_aliases,
+    _resolve_shard_paths,
     stream_preprocessed_safetensors_to_model,
     stream_qdq_safetensors_to_model,
 )
@@ -777,6 +779,7 @@ def build_transformers_model(
 
             if len(package) != 1:
                 raise ValueError("Nemotron-H dense streaming requires one decoder component")
+            paths = _resolve_shard_paths(model_id, revision)
             report = stream_preprocessed_safetensors_to_model(
                 next(iter(package.values())),
                 model_id,
@@ -788,6 +791,21 @@ def build_transformers_model(
                     target_decoder_only=target_decoder_only,
                 ),
                 revision=revision,
+                _resolved_paths=paths,
+            )
+            source_roots = {pathlib.Path(path).parent for path in paths}
+            if pathlib.Path(model_id).is_dir():
+                source_roots.add(pathlib.Path(model_id))
+            control_paths = [
+                str(path)
+                for root in source_roots
+                for name in ("config.json", "model.safetensors.index.json")
+                if (path := root / name).is_file()
+            ]
+            all_source_paths = [*paths, *control_paths]
+            package.register_lazy_source_artifacts(
+                files=all_source_paths,
+                directories=_lazy_safetensors_source_parent_aliases(all_source_paths),
             )
             package.weight_loading_report = report
             for model in package.values():

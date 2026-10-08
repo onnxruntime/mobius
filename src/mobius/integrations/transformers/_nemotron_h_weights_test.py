@@ -479,3 +479,67 @@ def test_target_variant_forwards_cli_model_and_revision(tmp_path, monkeypatch):
     assert received["target_decoder_only"] is True
     assert received["keep_quantized"] is False
     assert received["revision"] == "a" * 40
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("indexed", [False, True])
+def test_lazy_source_guard_prevents_checkpoint_overwrite(
+    tmp_path, monkeypatch, mixed, indexed
+):
+    _write_mtp_checkpoint(tmp_path, mixed=mixed)
+    if indexed:
+        shard = tmp_path / "model-00001-of-00001.safetensors"
+        (tmp_path / "model.safetensors").rename(shard)
+        names = safetensors.torch.load_file(shard)
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": dict.fromkeys(names, shard.name)})
+        )
+    before = {path: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+    resolve = _builder._resolve_shard_paths
+    calls = []
+
+    def resolve_once(*args):
+        calls.append(args)
+        return resolve(*args)
+
+    monkeypatch.setattr(_builder, "_resolve_shard_paths", resolve_once)
+    package = build(
+        str(tmp_path), dtype="bf16", keep_quantized=not mixed, target_decoder_only=True
+    )
+    assert len(calls) == 1
+    assert set(package._native_streaming_source_files) == set(before)
+    assert tmp_path.resolve() in package._native_streaming_source_directories
+    with pytest.raises(ValueError, match="source checkpoint directory"):
+        package.save(tmp_path, external_data="safetensors")
+    assert {path: path.read_bytes() for path in before} == before
+    output = tmp_path / "fresh-output"
+    package.save(output, external_data="safetensors")
+    loaded = ir.load(output / "model.onnx")
+    assert loaded.metadata_props["mobius.export_variant"] == "target-decoder-only"
+
+
+@pytest.mark.parametrize(
+    "source_file", ["model.safetensors", "config.json", "model.safetensors.index.json"]
+)
+def test_lazy_source_guard_rejects_hardlinked_output_before_materializing(
+    tmp_path, monkeypatch, source_file
+):
+    _write_mixed_checkpoint(tmp_path)
+    if source_file.endswith(".index.json"):
+        weights = safetensors.torch.load_file(tmp_path / "model.safetensors")
+        (tmp_path / source_file).write_text(
+            json.dumps({"weight_map": dict.fromkeys(weights, "model.safetensors")})
+        )
+    package = build(str(tmp_path), dtype="bf16", keep_quantized=False)
+    source = tmp_path / source_file
+    before = source.read_bytes()
+    output = tmp_path / "alias-output"
+    output.mkdir()
+    (output / "model.onnx.data").hardlink_to(source)
+    monkeypatch.setattr(
+        "mobius.integrations._weight_loading._materialize_preprocessed_source",
+        lambda *args: pytest.fail("alias rejection must precede lazy reads"),
+    )
+    with pytest.raises(ValueError, match="aliases lazy source file"):
+        package.save(output, external_data="onnx")
+    assert source.read_bytes() == before

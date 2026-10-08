@@ -111,7 +111,7 @@
       "weight_formats": ["FP8", "NVFP4"],
       "nvfp4_group_size": 16,
       "compatibility": "NATIVE_UNSUPPORTED_EXPLICIT_RECONSTRUCTED_BF16_TARGET_ONLY",
-      "output_precision": null,
+      "output_precision": "bf16",
       "export_variant": "target-decoder-only",
       "mtp_preserved": false,
       "proposed_graph_export_argv": [

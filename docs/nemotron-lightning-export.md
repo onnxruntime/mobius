@@ -73,6 +73,10 @@ or `--target-decoder-only`. Neither opt-in implies the other.
   and missing scales. FP8 activation and KV-cache scales are explicitly
   validated/accounted for, **not simulated**. Export metadata and the loading
   report identify the reconstructed representation and lost quantization.
+  The package registers lazy shard/config/index sources and both snapshot and
+  resolved blob directories. Saving into source checkpoint directories or
+  onto source-file aliases is rejected before serialization; use a fresh,
+  separate output directory.
 - `models/nemotron_h.py` casts router weights/bias to FP32 and accumulates routed
   outputs in FP32 before the shared-expert path, retaining sigmoid selection,
   unbiased routing weights and squared ReLU. It also retains FP32 router
