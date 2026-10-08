@@ -35,6 +35,7 @@ __all__ = [
     "DraftTargetCausalLMTask",
     "Eagle3DraftTask",
     "Qwen35MtpTask",
+    "NemotronHMtpTask",
     "Qwen4ExpCausalLMTask",
     "Qwen4ExpVisionLanguageTask",
     "DenoisingTask",
@@ -188,6 +189,7 @@ from mobius.tasks._minimax_music3 import (
 from mobius.tasks._mistral4_gguf import Mistral4GGUFCausalLMTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
+from mobius.tasks._nemotron_h_mtp import NemotronHMtpTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._plamo import PlamoCausalLMTask
@@ -278,6 +280,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "dflash-draft": DFlashDraftTask,
     "eagle3-draft": Eagle3DraftTask,
     "qwen35-mtp": Qwen35MtpTask,
+    "nemotron-h-mtp": NemotronHMtpTask,
     "qwen4-exp-text-generation": Qwen4ExpCausalLMTask,
     "qwen4-exp-vision-language": Qwen4ExpVisionLanguageTask,
     "vae": VAETask,

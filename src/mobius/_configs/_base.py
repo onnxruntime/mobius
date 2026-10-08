@@ -4233,6 +4233,8 @@ class NemotronHConfig(ArchitectureConfig):
     mamba_time_step_min: float = 0.001
     moe_latent_size: int | None = None
     mamba_ssm_dtype: ir.DataType | None = None
+    mtp_layers_block_type: list[str] | None = None
+    residual_in_fp32: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronHConfig:
@@ -4307,7 +4309,7 @@ class NemotronHConfig(ArchitectureConfig):
             **base_fields,
             num_hidden_layers=n,
             layer_types=layers_block_type,
-            hidden_act="relu2",
+            hidden_act=getattr(config, "mlp_hidden_act", "relu2"),
             mamba_n_heads=mamba_n_heads,
             mamba_d_head=mamba_d_head,
             mamba_d_state=getattr(config, "ssm_state_size", 128),
@@ -4320,6 +4322,15 @@ class NemotronHConfig(ArchitectureConfig):
             mamba_ssm_dtype=ssm_dtype,
             moe_latent_size=getattr(config, "moe_latent_size", None),
             shared_expert_intermediate_size=shared_expert_intermediate_size,
+            mtp_layers_block_type=(
+                [
+                    "attention" if kind == "full_attention" else kind
+                    for kind in config.mtp_layers_block_type
+                ]
+                if getattr(config, "mtp_layers_block_type", None) is not None
+                else None
+            ),
+            residual_in_fp32=getattr(config, "residual_in_fp32", False),
         )
 
 

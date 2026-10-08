@@ -134,7 +134,7 @@ class NemotronHAttentionLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
         """Forward pass. Returns (hidden_states, (key, value))."""
@@ -413,8 +413,8 @@ class NemotronHMoELayer(nn.Module):
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
-        position_embeddings: tuple,
+        attention_bias: ir.Value | None,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
         """Forward pass. Returns (hidden_states, (None, None)).
@@ -530,8 +530,9 @@ class NemotronHCausalLMModel(nn.Module):
         self.target_decoder_only = target_decoder_only
         if config.num_nextn_predict_layers and not target_decoder_only:
             raise NotImplementedError(
-                "Nemotron-H NextN/MTP export is not implemented; auxiliary tensors "
-                "must not be silently skipped. Explicit target_decoder_only=True "
+                "Nemotron-H NextN/MTP requires explicit task='nemotron-h-mtp'; "
+                "default export must not silently skip auxiliary tensors. "
+                "Explicit target_decoder_only=True "
                 "(--target-decoder-only) exports a separately labeled variant."
             )
         self.model = _NemotronHTextModel(config)

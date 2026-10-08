@@ -403,6 +403,9 @@ def build_transformers_model(
     ``target_decoder_only`` explicitly exports Nemotron-H without NextN/MTP.
     Source config facts remain unchanged; the strict streaming report names every
     omitted ``mtp.*`` tensor. This is not faithful MTP or a default fallback.
+    ``task='nemotron-h-mtp'`` explicitly exports Lightning target and MTP
+    graphs with a post-final-norm target seed and independently cached draft
+    computation. It does not implement speculative generation orchestration.
     """
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
@@ -564,6 +567,26 @@ def build_transformers_model(
         )
 
     hf_config, parent_config, model_type = _select_primary_config(hf_config)
+    from mobius.tasks import NemotronHMtpTask
+
+    export_lightning_mtp = task == "nemotron-h-mtp" or isinstance(task, NemotronHMtpTask)
+    if export_lightning_mtp:
+        if model_type != "nemotron_h" or target_decoder_only:
+            raise ValueError(
+                "nemotron-h-mtp requires Nemotron-H and excludes target_decoder_only"
+            )
+        if module_class is not None:
+            raise ValueError("nemotron-h-mtp does not support a module_class override")
+        if (
+            text_only
+            or fp8_kv_cache
+            or kv_cache_scales is not None
+            or prune_prefill_prefix
+            or export_paged_attention
+            or glm_full_attention
+            or output_layer_indices is not None
+        ):
+            raise ValueError("nemotron-h-mtp does not support decoder ABI/feature overrides")
     if target_decoder_only and model_type != "nemotron_h":
         raise ValueError("target_decoder_only is only supported for Nemotron-H")
     hf_config, parent_config, modelopt_source = _prepare_nemotron_modelopt_source(
@@ -704,7 +727,11 @@ def build_transformers_model(
         hf_config=parent_config,
     )
     model_module: nn.Module
-    if target_decoder_only:
+    if export_lightning_mtp:
+        from mobius.models.nemotron_h_mtp import NemotronHSpeculativeModel
+
+        model_module = NemotronHSpeculativeModel(config)
+    elif target_decoder_only:
         from mobius.models.nemotron_h import NemotronHCausalLMModel
 
         if module_class is not NemotronHCausalLMModel:
@@ -735,6 +762,11 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{graph_source_name}/{name}"
+        if export_lightning_mtp:
+            model.metadata_props["mobius.source_revision"] = revision or "local-or-unpinned"
+            model.metadata_props["mobius.source_num_nextn_predict_layers"] = str(
+                config.num_nextn_predict_layers
+            )
         if target_decoder_only:
             model.graph.name = f"{graph_source_name}/target-decoder-only/{name}"
             model.metadata_props["mobius.export_variant"] = "target-decoder-only"
@@ -772,16 +804,17 @@ def build_transformers_model(
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
-        if modelopt_source is not None or target_decoder_only:
+        if modelopt_source is not None or target_decoder_only or export_lightning_mtp:
             from mobius.integrations.transformers._nemotron_h_weights import (
+                build_nemotron_h_mtp_streaming_plan,
                 build_nemotron_h_streaming_plan,
             )
 
-            if len(package) != 1:
+            if not export_lightning_mtp and len(package) != 1:
                 raise ValueError("Nemotron-H dense streaming requires one decoder component")
             paths = _resolve_shard_paths(model_id, revision)
             report = stream_preprocessed_safetensors_to_model(
-                next(iter(package.values())),
+                package["decoder"] if export_lightning_mtp else next(iter(package.values())),
                 model_id,
                 lambda index, initializers: build_nemotron_h_streaming_plan(
                     config,
@@ -789,10 +822,51 @@ def build_transformers_model(
                     initializers,
                     modelopt=modelopt_source,
                     target_decoder_only=target_decoder_only,
+                    mtp_companion=export_lightning_mtp,
                 ),
                 revision=revision,
                 _resolved_paths=paths,
             )
+            if export_lightning_mtp:
+                mtp_report = stream_preprocessed_safetensors_to_model(
+                    package["mtp"],
+                    model_id,
+                    lambda index, initializers: build_nemotron_h_mtp_streaming_plan(
+                        config,
+                        index,
+                        initializers,
+                        package["decoder"].graph.initializers,
+                        modelopt=modelopt_source,
+                    ),
+                    revision=revision,
+                    _resolved_paths=paths,
+                )
+                # Partitioning into two graphs is not a target-only omission.
+                decoder_report = dict(report)
+                decoder_report["mtp_preserved"] = True
+                decoder_report["mtp_preservation_component"] = "mtp"
+                report["decoder_component"] = decoder_report
+                report["export_variant"] = "target-with-mtp"
+                report["mtp_preserved"] = True
+                report["mtp_tensor_count"] = mtp_report["mtp_tensor_count"]
+                report["mtp_tensors"] = mtp_report["mtp_tensors"]
+                report["omitted_mtp_tensor_count"] = 0
+                report["omitted_mtp_tensors"] = {}
+                report["decoder_component_mtp_partition_count"] = mtp_report[
+                    "mtp_tensor_count"
+                ]
+                report["mtp_component"] = mtp_report
+                report["generation_runtime_integration"] = False
+                report["ignored_tensors"] = 0
+                decoder_assigned = report["assigned_tensors"]
+                mtp_assigned = mtp_report["assigned_tensors"]
+                if not isinstance(decoder_assigned, int) or not isinstance(mtp_assigned, int):
+                    raise TypeError("Malformed Nemotron-H component tensor accounting")
+                report["assigned_tensors"] = decoder_assigned + mtp_assigned
+                report["shared_table_copies"] = 2
+                package["decoder"].metadata_props["mobius.weight_loading"] = json.dumps(
+                    decoder_report, sort_keys=True
+                )
             source_roots = {pathlib.Path(path).parent for path in paths}
             if pathlib.Path(model_id).is_dir():
                 source_roots.add(pathlib.Path(model_id))
@@ -810,6 +884,9 @@ def build_transformers_model(
             package.weight_loading_report = report
             for model in package.values():
                 model.metadata_props["mobius.weight_loading_status"] = "lazy-bound"
+                if export_lightning_mtp:
+                    model.metadata_props["mobius.mtp_inventory_status"] = "inspected"
+                    model.metadata_props["mobius.mtp_preserved"] = "true"
                 if target_decoder_only:
                     model.metadata_props["mobius.mtp_inventory_status"] = "inspected"
                     model.metadata_props["mobius.omitted_mtp_tensors"] = json.dumps(

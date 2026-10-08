@@ -1,10 +1,42 @@
 {
   "schema_version": 1,
   "kind": "development_export_recipe",
-  "checked_on": "2026-10-07",
-  "status": "CPU_REGRESSION_TESTED_TARGET_DECODER_ONLY_FULL_SIZE_NOT_RUN",
+  "checked_on": "2026-10-08",
+  "status": "CPU_REGRESSION_TESTED_TARGET_AND_MTP_GRAPHS_FULL_WEIGHTED_MTP_NOT_RUN",
   "export_status": "NOT_RUN",
   "certified": false,
+  "mtp_export_contract": {
+    "task": "nemotron-h-mtp",
+    "explicit_opt_in": true,
+    "mutually_exclusive_with": "target_decoder_only",
+    "package_graphs": ["decoder/model.onnx", "mtp/model.onnx"],
+    "source_implementation": "https://github.com/vllm-project/vllm/blob/ef63c23d35acccbba8e014fc88da19d541da38a9/vllm/model_executor/models/nemotron_h_mtp.py",
+    "source_layer_implementation": "https://github.com/vllm-project/vllm/blob/ef63c23d35acccbba8e014fc88da19d541da38a9/vllm/model_executor/models/nemotron_h.py",
+    "physical_mtp_blocks": ["attention", "moe"],
+    "prediction_steps": 1,
+    "target_hidden_output": "mtp_seed",
+    "target_hidden_normalization": "post_final_norm",
+    "token_alignment": "target_h_i_with_token_t_i_plus_1",
+    "draft_prediction": "token_t_i_plus_2",
+    "target_shared_source_tables": ["backbone.embeddings.weight", "lm_head.weight"],
+    "graph_tables": "separate_copies_of_same_source",
+    "draft_cache": "independent_attention_kv_only",
+    "mtp_tensor_count": 270,
+    "mtp_source_dtype": "BF16_except_FP32_correction_bias",
+    "nvfp4_mtp_quantized_modules": 0,
+    "nvfp4_mtp_scale_tensors": 0,
+    "shared_expert_weights": "present_in_both_pinned_indexes_and_independent_headers",
+    "validation": "TINY_INDEPENDENT_CPU_REFERENCE_PREFILL_CACHED_DECODE_REAL_GRAPH_BRIDGE",
+    "full_weighted_mtp_export": "NOT_RUN",
+    "fp16_execution": "TINY_CPU_PREFILL_CACHED_DECODE_REFERENCE_TESTED",
+    "bf16_execution": "NOT_RUN",
+    "h100_cuda": "NOT_RUN",
+    "speculative_generation_runtime": "NOT_IMPLEMENTED",
+    "runtime_metadata_status": "runtime_unvalidated",
+    "native_nvfp4": "UNSUPPORTED",
+    "nvfp4_required_additional_options": ["--dequantize", "--dtype", "bf16"],
+    "default_mtp_guard": "UNCHANGED_FAIL_CLOSED"
+  },
   "exporter": {
     "repository": "https://github.com/onnxruntime/mobius",
     "revision": "dc1798465f77cb2b7070e4d422479c2f890ee24b",
@@ -62,9 +94,17 @@
       "max_position_embeddings": 262144,
       "checkpoint_tensor_bytes": 65842365568,
       "checkpoint_shards": 14,
-      "compatibility": "EXPLICIT_TARGET_DECODER_ONLY_FULL_MTP_UNSUPPORTED",
+      "compatibility": "EXPLICIT_TARGET_ONLY_OR_TARGET_WITH_MTP_FULL_WEIGHTED_MTP_NOT_RUN",
       "output_precision": "bf16",
       "checkpoint_mtp_tensors": 270,
+      "mtp_header_probe": {
+        "shard": "model-00014-of-00014.safetensors",
+        "header_bytes": 33072,
+        "scope": "all_270_mtp_names_shapes_and_dtypes_no_tensor_payloads",
+        "status": "VERIFIED",
+        "shared_expert_projections": "PRESENT",
+        "mtp_scale_tensors": 0
+      },
       "checkpoint_non_mtp_tensors": 6243,
       "export_variant": "target-decoder-only",
       "mtp_preserved": false,
@@ -80,7 +120,7 @@
         "No NVIDIA CUDA GPU; executed validation uses an isolated x64 CPU environment.",
         "A suitable host, dependency lock and resource budget have not been validated.",
         "Full Lightning checkpoint weight coverage and source/export parity are untested.",
-        "Faithful NextN/MTP is unsupported; the explicit target-only variant names all omitted mtp.* tensors. No default fallback.",
+        "The separate explicit MTP task has tiny CPU graph parity, not full weighted MTP or speculative-generation validation. Target-only still names all omitted mtp.* tensors; no default fallback.",
         "Mamba conv_state/ssm_state packaging is not verified against ORT-GenAI."
       ]
     },
@@ -110,7 +150,7 @@
       "quant_method": "modelopt",
       "weight_formats": ["FP8", "NVFP4"],
       "nvfp4_group_size": 16,
-      "compatibility": "NATIVE_UNSUPPORTED_EXPLICIT_RECONSTRUCTED_BF16_TARGET_ONLY",
+      "compatibility": "NATIVE_UNSUPPORTED_EXPLICIT_RECONSTRUCTED_BF16_TARGET_ONLY_OR_MTP_GRAPHS",
       "output_precision": "bf16",
       "export_variant": "target-decoder-only",
       "mtp_preserved": false,
@@ -122,6 +162,15 @@
       ],
       "command_status": "RECONSTRUCTED_BF16_TARGET_DECODER_ONLY_NOT_RUN",
       "checkpoint_mtp_tensors": 270,
+      "mtp_header_probe": {
+        "shard": "model-00052-of-00052.safetensors",
+        "header_bytes": 131824,
+        "scope": "all_270_mtp_names_shapes_and_dtypes_no_tensor_payloads",
+        "status": "VERIFIED_INDEPENDENTLY",
+        "shared_expert_projections": "PRESENT",
+        "mtp_scale_tensors": 0,
+        "mtp_quantized_config_modules": 0
+      },
       "source_format_counts": {"FP8": 46, "NVFP4": 5935},
       "source_fp8_input_scales": 46,
       "source_fp8_kv_cache_scales": 12,
@@ -143,7 +192,7 @@
         "Mixed-format loading/reconstruction is CPU-tested, not native routed-expert NVFP4 emission.",
         "Portable ReLU2/sigmoid routing is CPU-tested; a generic QMoE is not equivalent.",
         "BF16 reconstruction or ORT INT4 quantization would be different artifacts, not preserved NVFP4.",
-        "The BF16 host, checkpoint parity, faithful MTP and runtime packaging blockers also apply."
+        "The BF16 host, full weighted MTP/checkpoint parity and runtime-orchestration blockers also apply."
       ]
     }
   ]

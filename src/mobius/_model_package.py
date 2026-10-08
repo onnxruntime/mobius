@@ -218,6 +218,7 @@ def _validate_streaming_safetensors_destination(
     current_directory = Path(directory)
     current_layout = component_layout
     while True:
+        output_directories.add(current_directory.resolve())
         component_directories = {
             _component_output_directory(
                 current_directory,

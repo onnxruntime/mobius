@@ -6,7 +6,9 @@ records immutable inputs and compatibility limits. Native NVFP4 remains
 unsupported. Explicit dense BF16 reconstruction is implemented and tested
 with miniature mixed-format checkpoints, **not** the complete 30B models.
 An explicitly selected **target-decoder-only** variant can omit NextN/MTP
-with complete named reporting. Faithful MTP export remains unsupported.
+with complete named reporting. A separate explicit `nemotron-h-mtp` task now
+exports target and draft graphs with strict MTP coverage and tiny independent
+CPU parity. This is **graph support**, not a speculative-generation runtime.
 
 The original preflight host was Windows ARM64 with a Qualcomm Adreno X1-85,
 no NVIDIA/CUDA GPU or `nvidia-smi`, Python 3.12.10, 68,171,038,720 bytes RAM
@@ -28,7 +30,7 @@ retrieved from the real checkpoints; no tensor payloads were downloaded.
 | Unique index shards | 14 | 52 |
 | Config context limit | 262,144 | 1,048,576 |
 | Source quantization | Unquantized BF16 | ModelOpt mixed FP8/NVFP4 |
-| Current classification | Explicit target-decoder-only; full MTP unsupported | Explicit reconstructed-BF16 target-decoder-only; native/full MTP unsupported |
+| Current classification | Explicit target-only or target+MTP graphs; full weighted MTP untested | Explicit reconstructed-BF16 target-only or target+MTP graphs; native NVFP4 unsupported |
 
 Both configs declare `NemotronHForCausalLM` / `nemotron_h`, 52 layers
 (23 Mamba, 23 MoE, 6 attention), 128 routed experts, top-6 routing, and one
@@ -56,7 +58,9 @@ The current code adds an explicit Nemotron-H dense reconstruction route:
 `--dequantize --dtype bf16`. Both options are required; implicit dtype,
 FP16, native requests and unsupported layouts fail before weight loading.
 For the pinned Lightning sources, also select `target_decoder_only=True`
-or `--target-decoder-only`. Neither opt-in implies the other.
+/ `--target-decoder-only`, or the separate `task="nemotron-h-mtp"` /
+`--task nemotron-h-mtp` route. Neither MTP selection nor target-only selection
+implies reconstruction; both remain explicit.
 
 - `integrations/modelopt/_config.py` validates exact FP8/NVFP4 module groups,
   static block-16 format, redundant `quantized_layers` declarations and FP8
@@ -102,11 +106,11 @@ quantization and FP8 KV-cache quantization.** It is neither native NVFP4
 preservation nor re-quantized ORT INT4, and does not promise equivalence to
 the original quantized execution.
 
-### NextN/MTP: explicit target-decoder-only, default fail closed
+### NextN/MTP: default fail closed, two explicit export contracts
 
 Model construction rejects nonzero `num_nextn_predict_layers`; eager and
 streaming weight paths also reject `mtp.*` tensors even if a config omits that
-field, **unless the public builder's separate target-only option is explicit**.
+field, **unless the public builder's separate target-only option or MTP task is explicit**.
 The approved `target_decoder_only=True` / `--target-decoder-only` variant
 preserves source `num_nextn_predict_layers`, uses strict streaming for both
 floating per-expert and reconstructed weights, and excludes only `mtp.*` keys.
@@ -122,10 +126,104 @@ and logs warn about omissions. With `--no-weights`, inventory status is
 `not_inspected`: no omitted-tensor coverage is claimed from config alone.
 The [inspected HuggingFace reference](https://github.com/huggingface/transformers/blob/a96730c8c97b8efbf35bbaf7f5da33ec99231a49/src/transformers/models/nemotron_h/modeling_nemotron_h.py)
 ignores MTP; the [inspected vLLM MTP implementation](https://github.com/vllm-project/vllm/blob/ef63c23d35acccbba8e014fc88da19d541da38a9/vllm/model_executor/models/nemotron_h_mtp.py)
-appears to construct shared experts absent from the pinned MTP indexes.
-That discrepancy is not resolved by inventing missing weights.
-The target-only variant is not a resolution of that faithful MTP discrepancy,
-nor a claim to preserve all checkpoint behavior.
+and its [parent layer definitions](https://github.com/vllm-project/vllm/blob/ef63c23d35acccbba8e014fc88da19d541da38a9/vllm/model_executor/models/nemotron_h.py)
+provide the MTP reference. **The earlier shared-expert-absence statement was
+incorrect:** both pinned indexes contain
+`mtp.layers.1.mixer.shared_experts.up_proj.weight` and
+`mtp.layers.1.mixer.shared_experts.down_proj.weight`.
+Independent bounded reads of BF16 shard 14 and NVFP4 shard 52 headers confirm
+their shapes are `[3712,2688]` and `[2688,3712]`. No missing weights or
+architectural substitutions are needed.
+
+### Explicit target + Lightning MTP graph package
+
+`build(..., task="nemotron-h-mtp")` produces `decoder/model.onnx` and
+`mtp/model.onnx`. The default constructor guard and existing target-only
+contract are unchanged. In PowerShell, for the pinned BF16 checkpoint:
+
+```powershell
+mobius build --model nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 `
+    --revision a9904d24bcc1d289a1950fa9d2b978c47cf903b9 `
+    --task nemotron-h-mtp --dtype bf16 --ep cuda `
+    --external-data onnx --output C:\private\lightning-target-and-mtp
+```
+
+For the NVFP4 model, use its pinned revision above and **also** add
+`--dequantize --dtype bf16`; native requests still fail. These full-size
+commands are **NOT_RUN here**. They are not instructions to overwrite the
+checkpoint directory, nor evidence of H100 parity.
+
+The source architecture is one NextN prediction step containing two physical
+blocks, `attention` then `moe`. The first block independently RMS-normalizes
+the next-token embedding and target hidden state, concatenates them in that
+order, projects `2H -> H`, then applies pre-norm GQA and residual addition.
+The second applies pre-norm sigmoid/correction-bias top-6 ReLU2 MoE, including
+its own always-active shared expert, residual addition, and final RMSNorm.
+There is **no RoPE, position-ID input, Mamba block, or SSM state in MTP**.
+Both graphs borrow the same source embedding and LM-head tensors; serialized
+graphs contain separate copies rather than an undocumented runtime-sharing ABI.
+
+| Pinned MTP source | Shape / inventory |
+| --- | --- |
+| `mtp.layers.0.{enorm,hnorm,norm}.weight` | `[2688]` each |
+| `mtp.layers.0.eh_proj.weight` | `[2688,5376]` |
+| `mtp.layers.0.mixer.{q,k,v,o}_proj.weight` | `[4096,2688]`, `[256,2688]`, `[256,2688]`, `[2688,4096]` |
+| `mtp.layers.1.{norm,final_layernorm}.weight` | `[2688]` each |
+| `mtp.layers.1.mixer.gate.{weight,e_score_correction_bias}` | `[128,2688]`, `[128]` |
+| `mtp.layers.1.mixer.experts.0..127.{up,down}_proj.weight` | 256 tensors: `[1856,2688]`, `[2688,1856]` |
+| `mtp.layers.1.mixer.shared_experts.{up,down}_proj.weight` | `[3712,2688]`, `[2688,3712]` |
+
+Both independent headers have exactly **270 MTP tensors**, all BF16 except
+the FP32 correction bias. The pinned NVFP4 config has **zero MTP quantized
+module targets**, and its MTP index/header has **zero MTP scale tensors**.
+The target's reconstructed LM head is reused for the MTP graph; this does not
+simulate the original quantized activations or KV cache.
+
+**Decoder-to-MTP contract:** the explicit decoder emits `mtp_seed`,
+`[batch,sequence,2688]`, **after the target's final `norm_f`**, exactly the
+hidden tensor feeding its LM head. Pair `mtp_seed[:,i]` (target `h_i`) with
+`input_ids[:,i+1]` (`t_(i+1)`) in the draft graph. Draft logits predict
+`t_(i+2)`; the graph does not shift tokens itself. For prompt initialization,
+feed known shifted pairs `ids[:,1:]` and `seed[:,:-1]`. For the next draft
+step, pair the last target seed with the sampled next target token. Further
+recursive drafting may pair `mtp_hidden` with a sampled draft token.
+
+The MTP graph consumes `input_ids` INT64 `[batch,sequence]`, `hidden_states`
+in model dtype `[batch,sequence,2688]`, `attention_mask` INT64
+`[batch,past+sequence]`, and `past_key_values.0.{key,value}` in model dtype
+`[batch,2,past,128]`. It emits `logits` `[batch,sequence,131072]`,
+`mtp_hidden` `[batch,sequence,2688]`, and `present.0.{key,value}` with
+`past+sequence` length. Initialize draft KV with zero sequence length;
+**never borrow target-layer KV**. Target hybrid caches remain in their
+existing sparse layer-index namespaces.
+
+Strict streaming validates the union of both graph source inventories before
+returning the package. Every `mtp.*` source must bind to the draft graph;
+missing, extra, duplicate-mapped and malformed tensors fail. The package
+report records MTP names, shared table copies and per-component partition
+counts, with **zero package-level MTP omissions**. Metadata with `--no-weights`
+marks inventory `not_inspected`; graph construction alone is not tensor coverage.
+Lazy source-file/directory protection applies to both graphs and package roots.
+
+**Validated scope:** tiny FP32 CPU independent-equation parity for prefill,
+cached one-token and multi-token blocks, two rows with different padding,
+FP32 and BF16 source weights, and the actual exported target-to-MTP bridge.
+Tiny FP16 CPU draft prefill and cached decode also pass independent
+FP32-reference comparison at `rtol=atol=1e-2`.
+Tiny tests also cover mixed FP8/NVFP4 reconstruction with floating MTP and a
+shared reconstructed head, exact graph/cache I/O, f32/f16/bf16 graph dtypes,
+CLI serialization, strict source accounting and checkpoint-save protection.
+BF16 execution/parity, full weighted 30B MTP, CUDA/H100,
+performance, Olive requantization and L4/L5 real-weight goldens are **NOT_RUN**;
+no full-model numerical or speedup claim is made.
+
+ORT-GenAI metadata can describe the external coordination contract and marks
+it `runtime_unvalidated`. The exporter does **not** implement speculative
+acceptance/verification. A generation runtime still needs shifted token/hidden
+pairing, independent draft-KV management, target block verification/sampling,
+accepted-prefix commit, and rejected-state restore/replay for **both** draft
+KV and target KV/Mamba conv/SSM states. Existing generic acceptance/rollback
+graphs do not establish Nemotron-H hybrid-state orchestration.
 
 ## Reproduce metadata/source verification
 
