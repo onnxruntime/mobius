@@ -18,6 +18,7 @@ from mobius import build_from_module
 from mobius._builder import _cast_module_dtype
 from mobius._configs import NemotronHConfig
 from mobius._testing import create_test_builder, create_test_input
+from mobius.components import GroupedGatedRMSNorm
 from mobius.integrations._weight_loading import apply_weights
 from mobius.models.nemotron_h import (
     NemotronHCausalLMModel,
@@ -175,6 +176,32 @@ def test_mamba_cache_abi_preserves_configured_float32_ssm(dtype):
         if node.op_type in {"MatMul", "Mul", "Add"}:
             dtypes = {x.dtype for x in node.inputs if x is not None and x.dtype is not None}
             assert len(dtypes) <= 1, (node.name, dtypes)
+
+
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+def test_nemotron_mamba_uses_source_precision_grouped_norm(dtype):
+    config = _tiny_config(dtype=dtype)
+    module = NemotronHCausalLMModel(config)
+    norm = module.model.layers[0].mamba.norm
+    assert isinstance(norm, GroupedGatedRMSNorm)
+    package = build_from_module(module, config, "hybrid-text-generation")
+    graph = package["model"].graph
+    assert "model.layers.0.mamba.norm.weight" in graph.initializers
+    # Other decoder norms may fuse, but none uses a two-dimensional RMS scale.
+    norms = [node for node in graph if node.op_type == "RMSNormalization"]
+    assert norms
+    assert all(node.inputs[1].shape.rank() == 1 for node in norms)
+    gamma_mul = next(
+        node
+        for node in graph
+        if node.op_type == "Mul"
+        and node.inputs[1] is graph.initializers["model.layers.0.mamba.norm.weight"]
+    )
+    assert gamma_mul.inputs[0].dtype == dtype
+    if dtype != ir.DataType.FLOAT:
+        assert gamma_mul.inputs[0].producer().op_type in {"Cast", "CastLike"}
 
 
 def test_expert_routing_relu2_and_sigmoid_matches_independent_reference(tmp_path):

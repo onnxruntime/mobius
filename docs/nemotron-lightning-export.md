@@ -1,6 +1,6 @@
 # Nemotron 3.5 Lightning: reconstruction and compatibility gates
 
-**CPU-tested exporter improvements; both full Lightning exports `NOT_RUN`.**
+**CPU-tested exporter improvements; full-model generation remains blocked.**
 The [machine-readable recipe](../examples/nemotron_lightning/recipe.json)
 records immutable inputs and compatibility limits. Native NVFP4 remains
 unsupported. Explicit dense BF16 reconstruction is implemented and tested
@@ -9,6 +9,44 @@ An explicitly selected **target-decoder-only** variant can omit NextN/MTP
 with complete named reporting. A separate explicit `nemotron-h-mtp` task now
 exports target and draft graphs with strict MTP coverage and tiny independent
 CPU parity. This is **graph support**, not a speculative-generation runtime.
+
+### Grouped Mamba normalization correction and H100 gate
+
+User-supplied H100 evidence for export commit `897a0e05` reports exact source
+weight fidelity passing, but full decoder numerical parity and eight-token
+generation failing. One isolated failure is ORT
+`1.28.0.dev20260722004` CUDA `RMSNormalization` with a two-dimensional grouped
+scale. Scratch decomposition improves the decoder substantially but does not
+clear its numerical or generation gates. Conditional MTP parity under those
+decoder seeds is not end-to-end parity.
+
+Nemotron's Mamba mixer now uses `GroupedGatedRMSNorm`, with explicit FP32
+gating, per-group variance and normalization, followed by a cast to the input
+dtype **before** native-dtype gamma multiplication. This matches the pinned
+HF [`Zamba2RMSNormGated`](https://github.com/huggingface/transformers/blob/a96730c8c97b8efbf35bbaf7f5da33ec99231a49/src/transformers/models/zamba2/modeling_zamba2.py)
+used by `NemotronHMamba2Mixer`. It avoids the faulty two-dimensional-scale
+kernel without changing shared Mamba defaults, weight names, cache contracts
+or task selection. The existing `MOBIUS_ORT_CUDA_GROUPED_RMSNORM_WORKAROUND`
+flag is unchanged for other users; its FP32 gamma-before-cast ordering is
+not the same as this source-faithful variant.
+
+Focused regressions execute FP32/FP16 grouped math on CPU, including
+production normalization dimensions (4096 channels, groups of 512), and
+assert FP32/FP16/BF16 graph cast ordering. The component test also includes a
+BF16 CUDA case, skipped when CUDA is unavailable. Run on the H100:
+
+```bash
+python -m pytest src/mobius/components/_rms_norm_test.py \
+    -k grouped_gated_norm_source_precision_parity -q
+```
+
+The H100 gate is to re-export to a **fresh** directory with this correction,
+verify the optimized graph does not recreate a two-dimensional-scale norm,
+rerun the isolated CUDA norm check and full decoder prefill/cached-state
+comparisons, then require complete generation-token agreement. Original
+exports and checkpoint files must remain unchanged. The remaining decoder
+discrepancy needs a first-divergent-stage comparison and an inspected source
+reference; this correction alone is **not** a claim of resolved full parity.
 
 The original preflight host was Windows ARM64 with a Qualcomm Adreno X1-85,
 no NVIDIA/CUDA GPU or `nvidia-smi`, Python 3.12.10, 68,171,038,720 bytes RAM
