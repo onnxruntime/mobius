@@ -235,6 +235,18 @@ def test_mtp_and_duplicate_source_weights_are_not_silently_dropped():
         _rename_nemotron_h_weight("backbone.layers.3.mixer.q_proj.weight", ["mamba2"])
 
 
+def test_target_decoder_constructor_preserves_source_nextn_contract():
+    config = dataclasses.replace(_tiny_config(), num_nextn_predict_layers=1)
+    with pytest.raises(NotImplementedError, match="NextN/MTP"):
+        NemotronHCausalLMModel(config)
+    module = NemotronHCausalLMModel(config, target_decoder_only=True)
+    assert module.config is config
+    assert config.num_nextn_predict_layers == 1
+    # The public opt-in uses the accounted streaming path, never eager omission.
+    with pytest.raises(NotImplementedError, match="MTP tensors"):
+        module.preprocess_weights({"mtp.layers.0.hnorm.weight": torch.ones(32)})
+
+
 def test_reject_unimplemented_grouped_expert_routing():
     with pytest.raises(NotImplementedError, match="grouped expert"):
         NemotronHConfig.from_transformers(SimpleNamespace(**{**_LIGHTNING, "n_group": 2}))

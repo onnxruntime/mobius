@@ -2,7 +2,7 @@
   "schema_version": 1,
   "kind": "development_export_recipe",
   "checked_on": "2026-10-07",
-  "status": "CPU_REGRESSION_TESTED_FULL_CHECKPOINT_BLOCKED",
+  "status": "CPU_REGRESSION_TESTED_TARGET_DECODER_ONLY_FULL_SIZE_NOT_RUN",
   "export_status": "NOT_RUN",
   "certified": false,
   "exporter": {
@@ -62,18 +62,25 @@
       "max_position_embeddings": 262144,
       "checkpoint_tensor_bytes": 65842365568,
       "checkpoint_shards": 14,
-      "compatibility": "NEXTN_CONTRACT_BLOCKED",
+      "compatibility": "EXPLICIT_TARGET_DECODER_ONLY_FULL_MTP_UNSUPPORTED",
       "output_precision": "bf16",
       "checkpoint_mtp_tensors": 270,
       "checkpoint_non_mtp_tensors": 6243,
-      "proposed_graph_export_argv": null,
-      "command_status": "BLOCKED_MTP",
+      "export_variant": "target-decoder-only",
+      "mtp_preserved": false,
+      "proposed_graph_export_argv": [
+        "mobius", "build", "--config", "C:\\private\\lightning-bf16-pinned",
+        "--output", "C:\\private\\lightning-target-decoder-only-bf16",
+        "--ep", "cuda", "--dtype", "bf16", "--target-decoder-only",
+        "--external-data", "onnx"
+      ],
+      "command_status": "TARGET_DECODER_ONLY_NOT_RUN",
       "runtime_packaging_argv": null,
       "blockers": [
         "No NVIDIA CUDA GPU; executed validation uses an isolated x64 CPU environment.",
         "A suitable host, dependency lock and resource budget have not been validated.",
         "Full Lightning checkpoint weight coverage and source/export parity are untested.",
-        "NextN/MTP construction and mtp.* tensors explicitly fail closed; no target-only fallback.",
+        "Faithful NextN/MTP is unsupported; the explicit target-only variant names all omitted mtp.* tensors. No default fallback.",
         "Mamba conv_state/ssm_state packaging is not verified against ORT-GenAI."
       ]
     },
@@ -103,24 +110,32 @@
       "quant_method": "modelopt",
       "weight_formats": ["FP8", "NVFP4"],
       "nvfp4_group_size": 16,
-      "compatibility": "NATIVE_UNSUPPORTED_DENSE_RECONSTRUCTION_NEXTN_BLOCKED",
+      "compatibility": "NATIVE_UNSUPPORTED_EXPLICIT_RECONSTRUCTED_BF16_TARGET_ONLY",
       "output_precision": null,
-      "proposed_graph_export_argv": null,
-      "command_status": "BLOCKED_MTP_AND_NATIVE_FORMAT",
+      "export_variant": "target-decoder-only",
+      "mtp_preserved": false,
+      "proposed_graph_export_argv": [
+        "mobius", "build", "--config", "C:\\private\\lightning-nvfp4-pinned",
+        "--output", "C:\\private\\lightning-target-decoder-only-reconstructed-bf16",
+        "--ep", "cuda", "--dtype", "bf16", "--target-decoder-only", "--dequantize",
+        "--external-data", "onnx"
+      ],
+      "command_status": "RECONSTRUCTED_BF16_TARGET_DECODER_ONLY_NOT_RUN",
       "checkpoint_mtp_tensors": 270,
       "source_format_counts": {"FP8": 46, "NVFP4": 5935},
       "source_fp8_input_scales": 46,
       "source_fp8_kv_cache_scales": 12,
       "dense_reconstruction": {
         "representation": "dense_bf16",
-        "api_options": {"keep_quantized": false, "dtype": "bf16"},
-        "cli_options": ["--dequantize", "--dtype", "bf16"],
+        "api_options": {"keep_quantized": false, "dtype": "bf16", "target_decoder_only": true},
+        "cli_options": ["--dequantize", "--dtype", "bf16", "--target-decoder-only"],
         "validation": "SYNTHETIC_CPU_BUILDER_CLI_SERIALIZATION_NUMERIC_TESTS",
         "full_checkpoint_export": "NOT_RUN",
         "native_weight_format_preserved": false,
         "activation_quantization_preserved": false,
         "kv_cache_quantization_preserved": false,
-        "requires_validated_nextn_contract": true
+        "mtp_preserved": false,
+        "omission_reporting": "every mtp.* name, source shape/dtype and explicit reason"
       },
       "runtime_packaging_argv": null,
       "blockers": [
@@ -128,7 +143,7 @@
         "Mixed-format loading/reconstruction is CPU-tested, not native routed-expert NVFP4 emission.",
         "Portable ReLU2/sigmoid routing is CPU-tested; a generic QMoE is not equivalent.",
         "BF16 reconstruction or ORT INT4 quantization would be different artifacts, not preserved NVFP4.",
-        "The BF16 host, checkpoint parity, MTP and runtime packaging blockers also apply."
+        "The BF16 host, checkpoint parity, faithful MTP and runtime packaging blockers also apply."
       ]
     }
   ]

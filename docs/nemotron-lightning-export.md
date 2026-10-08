@@ -5,7 +5,8 @@ The [machine-readable recipe](../examples/nemotron_lightning/recipe.json)
 records immutable inputs and compatibility limits. Native NVFP4 remains
 unsupported. Explicit dense BF16 reconstruction is implemented and tested
 with miniature mixed-format checkpoints, **not** the complete 30B models.
-The pinned checkpoints' NextN/MTP contract remains a blocking gate.
+An explicitly selected **target-decoder-only** variant can omit NextN/MTP
+with complete named reporting. Faithful MTP export remains unsupported.
 
 The original preflight host was Windows ARM64 with a Qualcomm Adreno X1-85,
 no NVIDIA/CUDA GPU or `nvidia-smi`, Python 3.12.10, 68,171,038,720 bytes RAM
@@ -27,7 +28,7 @@ retrieved from the real checkpoints; no tensor payloads were downloaded.
 | Unique index shards | 14 | 52 |
 | Config context limit | 262,144 | 1,048,576 |
 | Source quantization | Unquantized BF16 | ModelOpt mixed FP8/NVFP4 |
-| Current full-checkpoint classification | Blocked on NextN/MTP | Native unsupported; dense reconstruction blocked on NextN/MTP |
+| Current classification | Explicit target-decoder-only; full MTP unsupported | Explicit reconstructed-BF16 target-decoder-only; native/full MTP unsupported |
 
 Both configs declare `NemotronHForCausalLM` / `nemotron_h`, 52 layers
 (23 Mamba, 23 MoE, 6 attention), 128 routed experts, top-6 routing, and one
@@ -54,7 +55,8 @@ The current code adds an explicit Nemotron-H dense reconstruction route:
 `build(..., keep_quantized=False, dtype="bf16")`, corresponding to
 `--dequantize --dtype bf16`. Both options are required; implicit dtype,
 FP16, native requests and unsupported layouts fail before weight loading.
-This is **not a working full-Lightning command while the MTP gate remains**.
+For the pinned Lightning sources, also select `target_decoder_only=True`
+or `--target-decoder-only`. Neither opt-in implies the other.
 
 - `integrations/modelopt/_config.py` validates exact FP8/NVFP4 module groups,
   static block-16 format, redundant `quantized_layers` declarations and FP8
@@ -96,17 +98,30 @@ quantization and FP8 KV-cache quantization.** It is neither native NVFP4
 preservation nor re-quantized ORT INT4, and does not promise equivalence to
 the original quantized execution.
 
-### NextN/MTP: fail closed
+### NextN/MTP: explicit target-decoder-only, default fail closed
 
 Model construction rejects nonzero `num_nextn_predict_layers`; eager and
 streaming weight paths also reject `mtp.*` tensors even if a config omits that
-field. No automatic target-only fallback or discarded auxiliary tensors are
-allowed. The [inspected HuggingFace reference](https://github.com/huggingface/transformers/blob/a96730c8c97b8efbf35bbaf7f5da33ec99231a49/src/transformers/models/nemotron_h/modeling_nemotron_h.py)
+field, **unless the public builder's separate target-only option is explicit**.
+The approved `target_decoder_only=True` / `--target-decoder-only` variant
+preserves source `num_nextn_predict_layers`, uses strict streaming for both
+floating per-expert and reconstructed weights, and excludes only `mtp.*` keys.
+Every omitted name, source shape/dtype and reason is persisted in
+`weight-loading-report.json` and ONNX metadata. Unexpected non-MTP tensors,
+missing target weights and scale errors still fail. A source declaring NextN
+but containing no MTP inventory fails when loading. The eager preprocessor
+still rejects MTP; it is not an unreported omission path.
+
+Graph names include `/target-decoder-only/`, metadata records
+`mobius.export_variant=target-decoder-only` and `mobius.mtp_preserved=false`,
+and logs warn about omissions. With `--no-weights`, inventory status is
+`not_inspected`: no omitted-tensor coverage is claimed from config alone.
+The [inspected HuggingFace reference](https://github.com/huggingface/transformers/blob/a96730c8c97b8efbf35bbaf7f5da33ec99231a49/src/transformers/models/nemotron_h/modeling_nemotron_h.py)
 ignores MTP; the [inspected vLLM MTP implementation](https://github.com/vllm-project/vllm/blob/ef63c23d35acccbba8e014fc88da19d541da38a9/vllm/model_executor/models/nemotron_h_mtp.py)
 appears to construct shared experts absent from the pinned MTP indexes.
 That discrepancy is not resolved by inventing missing weights.
-A separately authorized, explicitly named target-only variant or a validated
-faithful MTP graph is required before these complete checkpoints can build.
+The target-only variant is not a resolution of that faithful MTP discrepancy,
+nor a claim to preserve all checkpoint behavior.
 
 ## Reproduce metadata/source verification
 
@@ -181,26 +196,35 @@ does not change the scope of evidence.
 | [`integrations/ort_genai/auto_export.py`](https://github.com/onnxruntime/mobius/blob/dc1798465f77cb2b7070e4d422479c2f890ee24b/src/mobius/integrations/ort_genai/auto_export.py) | Generic recurrent packaging expects paired `conv_state` / `recurrent_state`; Nemotron-H describes `conv_state` / `ssm_state`. Actual graph names/shapes and runtime allocation are unverified, not evidence of a loadable package. |
 | [`__main__.py`](https://github.com/onnxruntime/mobius/blob/dc1798465f77cb2b7070e4d422479c2f890ee24b/src/mobius/__main__.py) | The candidate below uses source-backed CLI syntax. `--revision` is only valid with `--model`, not local `--config`. |
 
-## Full BF16 procedure: blocked, NOT_RUN
+## Target-decoder-only procedures: implemented, full-size NOT_RUN
 
 Before any full export, obtain a suitable development host, explicit resource
 budget, immutable dependency lock and CUDA/ORT version pairing. No package
 installation, model download or GPU allocation is part of this preflight.
 The publisher's 80 GB-class GPU deployment target is not an export-memory
-measurement. Only after the MTP gate is resolved, stage a complete read-only
+measurement. With explicit target-decoder-only scope, stage a complete read-only
 snapshot at the pinned HF revision:
 config, tokenizer and every indexed weight shard. Verify shard identities,
 tokenizer assets, disk capacity and loader peak memory separately. Do not
 enable `trust_remote_code` or fetch mutable `main`.
 
-The earlier graph-only candidate is no longer presented as runnable:
-the pinned config declares one NextN layer, and current construction explicitly
-rejects that unsupported contract before loading shards. The recipe therefore
-contains no approved full-checkpoint build command. Do not edit the config to
-zero NextN or remove MTP tensors to bypass this gate. Any future command must
-use a fresh output directory and retain logs, exit status, exact versions and
-resource measurements; it must omit `--runtime ort-genai` until that separate
-runtime contract is validated.
+The following commands are **unexecuted full-size target-only candidates**,
+not approved GPU work or successful exports. The local snapshot paths must
+contain the verified pinned variants respectively. Do not edit config to zero
+NextN or remove tensors before loading: the opt-in loader reports all omissions.
+
+```powershell
+mobius build --config C:\private\lightning-bf16-pinned `
+    --output C:\private\lightning-target-decoder-only-bf16 `
+    --ep cuda --dtype bf16 --target-decoder-only --external-data onnx
+mobius build --config C:\private\lightning-nvfp4-pinned `
+    --output C:\private\lightning-target-decoder-only-reconstructed-bf16 `
+    --ep cuda --dtype bf16 --target-decoder-only --dequantize --external-data onnx
+```
+
+Use fresh output directories and retain logs, exit status, exact versions and
+resource measurements. Omit `--runtime ort-genai` until that separate runtime
+contract is validated. `--revision` is only valid with `--model`, not `--config`.
 
 Before claiming success, account for every checkpoint tensor, including
 MTP; validate graph/external-data references; compare source/export
@@ -218,10 +242,11 @@ throughput claims.
 The pinned ModelOpt config describes mixed FP8 Mamba projections and FP4
 expert weights with group size 16, plus static FP8 activations and KV cache.
 The generic/native exporter still rejects this method. The opt-in dense
-reconstruction route above handles these physical formats but remains blocked
-on full Lightning MTP accounting. **There is no supported native NVFP4 or
-full-Lightning build command in this recipe.** Do not download 52 shards merely
-to reproduce that known contract blocker.
+reconstruction route handles these physical formats, and the independent
+target-only option accounts for omitted MTP tensors. **There is no native NVFP4
+or faithful full-MTP build command in this recipe.** The candidate above
+produces a differently represented, target-only artifact; do not download 52
+shards merely to reproduce the known native/full-MTP blockers.
 
 Native preservation additionally requires faithful ReLU2/routing kernel
 semantics, runtime capability checks and real-weight parity.
@@ -235,7 +260,8 @@ must not be labeled a preserved NVFP4 export.
 The added suites use reduced configurations, independently specified routing
 and E2M1/E4M3 values, and local synthetic safetensors files. They exercise public
 builder/CLI reconstruction, save/reload, every layer/projection family, source
-accounting, malformed/changing headers, dtype/cache contracts and MTP refusal.
+accounting, malformed/changing headers, dtype/cache contracts, default MTP
+refusal and explicit omission/variant provenance.
 Existing CPU random-weight HuggingFace Nemotron parity tests also run without
 model downloads. These are not full-checkpoint L4/L5 evidence.
 
