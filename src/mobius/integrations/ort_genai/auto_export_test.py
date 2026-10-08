@@ -1003,6 +1003,7 @@ class TestFixChatTemplate:
 
         seq = data["feature_extraction"]["sequence"]
         assert seq[0]["operation"]["type"] == "AudioDecoder"
+        assert seq[0]["operation"]["attrs"] == {"max_samples": 0}
         op = seq[1]["operation"]
         assert op["name"] == "gemma4_audio"
         assert op["type"] == "Gemma4Audio"
@@ -1966,6 +1967,7 @@ class TestExportForOrtGenai:
         # First op: AudioDecoder
         op0 = seq[0]["operation"]
         assert op0["type"] == "AudioDecoder"
+        assert "max_samples" not in op0.get("attrs", {})
 
         # Second op: Gemma4LogMel with expected attrs
         op1 = seq[1]["operation"]
@@ -4196,6 +4198,11 @@ class TestGemma4RealModel:
 
         with open(result["audio_processor"], encoding="utf-8") as f:
             audio_processor = json.load(f)
+        assert audio_processor["feature_extraction"]["sequence"][0]["operation"] == {
+            "name": "audio_decoder",
+            "type": "AudioDecoder",
+            "attrs": {"max_samples": 0},
+        }
         audio_op = audio_processor["feature_extraction"]["sequence"][1]["operation"]
         assert audio_op == {
             "name": "gemma4_audio",
