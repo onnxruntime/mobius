@@ -2266,6 +2266,90 @@ class KimiLinearConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class K2HorizonConfig(CausalLMConfig):
+    """Configuration for K2 Horizon (dense and MoVA variants).
+
+    K2 Horizon (HF class ``K2HorizonForCausalLM``, upstreamed to llama.cpp as
+    "K2 Horizon dense and MoVA support") is a GQA decoder with a dense FFN
+    prefix followed by DeepSeek-V3-style routed+shared-expert MoE layers.
+    Its attention adds three features not covered by the generic
+    :class:`ArchitectureConfig` fields:
+
+    - ``n_norm_groups``: the norm layers (``attn_norm``/``ffn_norm``/final
+      norm) are "group RMS norms" computed over this many equal slices of
+      the hidden dimension (1 degenerates to a standard RMSNorm).
+    - MoVA ("Mixture of Value Attention"): on MoE layers, the usual ``v_proj``
+      is replaced by a router over ``n_value_expert`` single-linear "value
+      experts" (no gate/up/down split), selecting ``n_value_expert_used`` of
+      them per token — see ``K2HorizonValueGate`` in ``models/k2_horizon.py``.
+    - ``has_attn_output_gate``: an optional softplus gate computed from the
+      attention block's pre-QKV normalized input, multiplied into the
+      attention output *before* ``o_proj``.
+
+    Q/K RMSNorm is per-head with a weight distinct per head (not the single
+    weight shared across heads used by the generic ``attn_qk_norm`` path), so
+    it is handled by ``K2HorizonAttention`` directly rather than through
+    ``attn_qk_norm``/``attn_qk_norm_full``.
+    """
+
+    n_norm_groups: int = 1
+    n_value_expert: int = 0
+    n_value_expert_used: int = 0
+    has_attn_output_gate: bool = False
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> K2HorizonConfig:
+        parent = parent_config or config
+        base = ArchitectureConfig.from_transformers(config, parent)
+
+        # num_dense_layers is the direct field name; mlp_only_layers (an
+        # explicit list, as in DeepSeek/Qwen2-MoE) is accepted as a fallback,
+        # read as the length of its consecutive leading-zero prefix.
+        n_dense = getattr(config, "num_dense_layers", None)
+        if n_dense is None:
+            mlp_only_layers = {int(i) for i in getattr(config, "mlp_only_layers", ())}
+            n_dense = 0
+            while n_dense in mlp_only_layers:
+                n_dense += 1
+
+        # rope_head_dim decouples the rotary dimension from head_dim, same
+        # concept as the generic partial_rotary_factor field.
+        rope_head_dim = getattr(config, "rope_head_dim", None)
+        partial_rotary_factor = float(rope_head_dim) / base.head_dim if rope_head_dim else 1.0
+
+        n_value_expert = int(getattr(config, "mova_num_experts", 0) or 0)
+        n_value_expert_used = int(getattr(config, "mova_num_experts_per_tok", 0) or 0)
+        if (n_value_expert > 0) != (n_value_expert_used > 0):
+            raise ValueError(
+                "K2 Horizon requires mova_num_experts and mova_num_experts_per_tok "
+                "to be set together"
+            )
+
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type="k2_horizon",
+            num_local_experts=getattr(config, "num_experts", None),
+            num_experts_per_tok=getattr(config, "num_experts_per_tok", None),
+            moe_intermediate_size=getattr(config, "moe_intermediate_size", None),
+            n_shared_experts=getattr(config, "num_shared_experts", None),
+            first_k_dense_replace=int(n_dense),
+            norm_topk_prob=bool(getattr(config, "norm_topk_prob", False)),
+            routed_scaling_factor=float(getattr(config, "router_scaling_factor", 1.0) or 1.0),
+            # llama.cpp defaults expert_gating_func to sigmoid for this
+            # architecture when the HF config omits it.
+            scoring_func=str(getattr(config, "expert_gating_func", None) or "sigmoid"),
+            topk_method="greedy",
+            use_expert_bias=True,
+            partial_rotary_factor=partial_rotary_factor,
+            n_norm_groups=int(getattr(config, "layernorm_num_groups", 1) or 1),
+            n_value_expert=n_value_expert,
+            n_value_expert_used=n_value_expert_used,
+            has_attn_output_gate=getattr(config, "attention_gate_func", None) == "softplus",
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
 class KimiK3Config(CausalLMConfig):
     """Text-decoder configuration extracted from the composite Kimi-K3 config."""
 

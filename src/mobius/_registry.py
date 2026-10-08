@@ -32,6 +32,7 @@ from mobius._configs import (
     Gemma4Config,
     HyV3Config,
     Jais2Config,
+    K2HorizonConfig,
     KimiK3Config,
     KimiLinearConfig,
     Lfm2Config,
@@ -105,6 +106,7 @@ from mobius.models import (
     HyV3MtpModel,
     InternLM2CausalLMModel,
     Jais2CausalLMModel,
+    K2HorizonCausalLMModel,
     KimiK3CausalLMModel,
     KimiLinearCausalLMModel,
     LayerNormCausalLMModel,
@@ -727,6 +729,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "hunyuan_moe_gguf": ModelRegistration(HunyuanMoEGGUFCausalLMModel),
     "hunyuan_v1_moe": ModelRegistration(HunYuanMoEV1CausalLMModel),
     "jetmoe": ModelRegistration(JetMoeCausalLMModel),
+    "k2_horizon": ModelRegistration(K2HorizonCausalLMModel, config_class=K2HorizonConfig),
     "kimi_linear": ModelRegistration(
         KimiLinearCausalLMModel,
         task="kimi-linear-text-generation",
