@@ -188,10 +188,16 @@ class GroupRMSNorm(nn.Module):
         if flags.ort_cuda_grouped_rmsnorm_workaround:
             # See GatedRMSNorm: ORT <= 1.24.4 CUDA RMSNormalization mishandles
             # a 2D scale, so decompose into basic ops as a workaround.
-            variance = op.ReduceMean(op.Mul(grouped, grouped), axes=[-1], keepdims=True)
+            # Upcast to fp32 before squaring/reducing: at f16 this avoids
+            # overflow in `grouped * grouped` for values above ~256.
+            grouped_f32 = op.Cast(grouped, to=ir.DataType.FLOAT)
+            variance = op.ReduceMean(
+                op.Mul(grouped_f32, grouped_f32), axes=[-1], keepdims=True
+            )
             rnorm = op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon)))
-            normed = op.Mul(grouped, rnorm)
+            normed = op.Mul(grouped_f32, rnorm)
             normed = op.Reshape(normed, orig_shape)
+            normed = op.CastLike(normed, hidden_states)
             return op.Mul(normed, self.weight)
 
         weight_grouped = op.Reshape(
@@ -223,11 +229,13 @@ class PerHeadRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        variance = op.ReduceMean(
-            op.Mul(hidden_states, hidden_states), axes=[-1], keepdims=True
-        )
+        # Upcast to fp32 before squaring/reducing: at f16 this avoids
+        # overflow in `hidden_states * hidden_states` for values above ~256.
+        h_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        variance = op.ReduceMean(op.Mul(h_f32, h_f32), axes=[-1], keepdims=True)
         rnorm = op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon)))
-        normed = op.Mul(hidden_states, rnorm)
+        normed = op.Mul(h_f32, rnorm)
+        normed = op.CastLike(normed, hidden_states)
         return op.Mul(normed, self.weight)
 
 

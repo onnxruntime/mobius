@@ -14,21 +14,29 @@ transformer with:
   independently, then scaled by one full-width learned weight
   (:class:`~mobius.components.GroupRMSNorm`; ``n_norm_groups=1`` degenerates
   to a standard RMSNorm).
-- Per-head Q/K RMSNorm with a weight distinct per head
-  (:class:`~mobius.components.PerHeadRMSNorm`), unlike the single
-  head_dim-only weight shared across all heads used by most QK-norm models.
+- An optional, per-head Q/K RMSNorm with a weight distinct per head
+  (:class:`~mobius.components.PerHeadRMSNorm`; ``config.has_qk_norm``),
+  unlike the single head_dim-only weight shared across all heads used by
+  most QK-norm models. Released checkpoints all disable this
+  (``query_key_norm: false``).
 - MoVA ("mixture of value attention"): on MoE layers, ``v_proj`` is replaced
   by a router over ``n_value_expert`` single-linear "value experts" (no
-  gate/up/down split): ``V = sum_k weight_k * silu(W_k @ x)``. Routing reuses
-  :class:`~mobius.models.deepseek.DeepSeekMoEGate`.
+  gate/up/down split): ``V = sum_k weight_k * silu(W_k @ x)``. Routing and
+  dispatch reuse :class:`~mobius.models.deepseek.DeepSeekMoEGate` and
+  :class:`~mobius.components.MoELayer`.
 - An optional softplus output gate, computed from the attention block's
   pre-QKV normalized input and applied to the attention output *before*
   ``o_proj``.
 
-No real HF checkpoint exists at the time this was added (see
-``K2HorizonConfig`` and the "Caveats" note in this module's PR description);
-``preprocess_weights`` follows the DeepSeek-V3/Qwen2-MoE HF naming
-conventions as the most probable real-world layout.
+Field names and default values (``query_key_norm``/``mlp_only_layers``/
+``rope_head_dim``/``layernorm_num_groups``/``mova_num_experts(_per_tok)``/
+``moe_gate_bias``/``router_scaling_factor``/``router_score_func``/
+``attention_gate_func``) are calibrated against the released
+``IFM/K2-Horizon-0.9B``, ``IFM/K2-Horizon-7B``, and
+``IFM/K2-Horizon-MoVA-36B-A4B`` HuggingFace configs; ``preprocess_weights``
+still follows the DeepSeek-V3/Qwen2-MoE HF weight-naming conventions as the
+most probable real-world layout, since no real checkpoint was downloaded to
+calibrate weight *names* (only the ``config.json`` field names/values).
 """
 
 from __future__ import annotations
@@ -46,6 +54,7 @@ from mobius.components import (
     Embedding,
     GroupRMSNorm,
     Linear,
+    MoELayer,
     PerHeadRMSNorm,
     create_attention_bias,
     initialize_rope,
@@ -56,17 +65,12 @@ from mobius.models.base import CausalLMModel
 from mobius.models.deepseek import DeepSeekMoEGate, _DeepSeekMoEFFN
 
 
-class K2HorizonValueRouter(nn.Module):
-    """MoVA router: replaces ``v_proj`` on MoE layers with a mixture of value experts.
+class _K2HorizonValueExpert(nn.Module):
+    """Single MoVA value expert: ``Linear(hidden_size, n_embd_v_gqa)`` + SiLU.
 
-    Each value expert is a single-linear "value expert" (K2 Horizon).
-
-    Each value expert is ``Linear(hidden_size, n_embd_v_gqa)`` with no
-    gate/up/down split, unlike a regular MoE FFN expert. The routed V is the
-    weighted sum of the selected experts' SiLU-activated outputs:
-    ``V = sum_k weight_k * silu(W_k @ x)``. Routing (sigmoid scoring,
-    optional selection-only bias, optional top-k renormalization/scaling)
-    reuses :class:`DeepSeekMoEGate` against a value-expert-sized config.
+    No gate/up/down split, unlike a regular MoE FFN expert (:class:`~mobius.
+    components.MLP`) — this is the expert shape
+    :class:`~mobius.components.MoELayer` needs an ``expert_factory`` for.
     """
 
     def __init__(
@@ -78,6 +82,32 @@ class K2HorizonValueRouter(nn.Module):
         super().__init__()
         if linear_class is None:
             linear_class = Linear
+        self.proj = linear_class(config.hidden_size, n_embd_v_gqa, bias=False)
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        return op.Swish(self.proj(op, hidden_states))
+
+
+class K2HorizonValueRouter(nn.Module):
+    """MoVA router: replaces ``v_proj`` on MoE layers with a mixture of value experts.
+
+    The routed V is the weighted sum of the selected experts' SiLU-activated
+    outputs: ``V = sum_k weight_k * silu(W_k @ x)``. Both routing (sigmoid
+    scoring, optional selection-only bias, optional top-k
+    renormalization/scaling — via :class:`DeepSeekMoEGate`) and expert
+    dispatch reuse :class:`~mobius.components.MoELayer` against a
+    value-expert-sized config, so MoVA gets the same mask-and-sum dense
+    fallback (and, when applicable, fused QMoE routing) as FFN MoE instead
+    of duplicating that dispatch logic.
+    """
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        n_embd_v_gqa: int,
+        linear_class: type | None = None,
+    ):
+        super().__init__()
         assert config.n_value_expert > 0
         assert config.n_value_expert_used > 0
         value_config = dataclasses.replace(
@@ -87,37 +117,28 @@ class K2HorizonValueRouter(nn.Module):
             n_group=1,
             topk_group=1,
         )
-        self.gate = DeepSeekMoEGate(value_config)
-        self.experts = nn.ModuleList(
-            [
-                linear_class(config.hidden_size, n_embd_v_gqa, bias=False)
-                for _ in range(config.n_value_expert)
-            ]
+        gate = DeepSeekMoEGate(value_config)
+        self.moe = MoELayer(
+            value_config,
+            gate=gate,
+            linear_class=linear_class,
+            expert_factory=lambda cfg, lc: _K2HorizonValueExpert(cfg, n_embd_v_gqa, lc),
         )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        routing_weights, selected_experts = self.gate(op, hidden_states)
-
-        result = None
-        for expert_idx, expert in enumerate(self.experts):
-            expert_output = op.Swish(expert(op, hidden_states))
-            expert_id = op.Constant(value_int=expert_idx)
-            match = op.Equal(selected_experts, expert_id)
-            match_float = op.CastLike(match, routing_weights)
-            weight = op.ReduceSum(op.Mul(routing_weights, match_float), [-1], keepdims=True)
-            contribution = op.Mul(expert_output, weight)
-            result = contribution if result is None else op.Add(result, contribution)
-        return result
+        return self.moe(op, hidden_states)
 
 
 class K2HorizonAttention(nn.Module):
-    """GQA attention with per-head QK-norm, optional MoVA routing, and output gate.
+    """GQA attention with optional per-head QK-norm, MoVA routing, and output gate.
 
     Adds an optional softplus output gate (K2 Horizon).
 
     Differs from the generic :class:`~mobius.components.Attention`:
-    - Q/K RMSNorm uses :class:`PerHeadRMSNorm` (distinct weight per head),
-      not the single weight shared across heads used by ``attn_qk_norm``.
+    - When ``config.has_qk_norm``, Q/K RMSNorm uses :class:`PerHeadRMSNorm`
+      (distinct weight per head), not the single weight shared across heads
+      used by ``attn_qk_norm``. Released checkpoints disable this
+      (``query_key_norm: false``), so it is off by default.
     - MoE layers route V through :class:`K2HorizonValueRouter` instead of a
       plain ``v_proj`` linear.
     - When ``config.has_attn_output_gate``, the attention output is
@@ -157,12 +178,14 @@ class K2HorizonAttention(nn.Module):
             self.v_proj = linear_class(self.hidden_size, kv_dim, bias=config.attn_qkv_bias)
         self.o_proj = linear_class(q_dim, self.hidden_size, bias=config.attn_o_bias)
 
-        self.q_norm = PerHeadRMSNorm(
-            self.num_attention_heads, self.head_dim, eps=config.rms_norm_eps
-        )
-        self.k_norm = PerHeadRMSNorm(
-            self.num_key_value_heads, self.head_dim, eps=config.rms_norm_eps
-        )
+        self._has_qk_norm = config.has_qk_norm
+        if self._has_qk_norm:
+            self.q_norm = PerHeadRMSNorm(
+                self.num_attention_heads, self.head_dim, eps=config.rms_norm_eps
+            )
+            self.k_norm = PerHeadRMSNorm(
+                self.num_key_value_heads, self.head_dim, eps=config.rms_norm_eps
+            )
         if self._has_output_gate:
             self.attn_gate = linear_class(self.hidden_size, q_dim, bias=False)
 
@@ -178,13 +201,15 @@ class K2HorizonAttention(nn.Module):
         query_states = self.q_proj(op, hidden_states)
         key_states = self.k_proj(op, hidden_states)
 
-        # Per-head RMSNorm with a weight distinct per head, on the 4D per-head view.
-        query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
-        key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
-        query_states = self.q_norm(op, query_states)
-        key_states = self.k_norm(op, key_states)
-        query_states = op.Reshape(query_states, [0, 0, -1])
-        key_states = op.Reshape(key_states, [0, 0, -1])
+        if self._has_qk_norm:
+            # Per-head RMSNorm with a weight distinct per head, on the 4D
+            # per-head view.
+            query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
+            key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+            query_states = self.q_norm(op, query_states)
+            key_states = self.k_norm(op, key_states)
+            query_states = op.Reshape(query_states, [0, 0, -1])
+            key_states = op.Reshape(key_states, [0, 0, -1])
 
         query_states = apply_rotary_pos_emb(
             op,
@@ -381,11 +406,13 @@ class K2HorizonCausalLMModel(CausalLMModel):
           ``mlp.moe.gate.e_score_correction_bias``.
         - FFN MoE experts: ``mlp.experts.{i}.*`` -> ``mlp.moe.experts.{i}.*``.
           Shared expert (``mlp.shared_experts.*``) names already align.
-        - MoVA value routing: ``self_attn.v_gate.weight`` ->
-          ``self_attn.v_router.gate.weight``; ``self_attn.v_gate.bias`` ->
-          ``self_attn.v_router.gate.e_score_correction_bias``;
+        - MoVA value routing (:class:`K2HorizonValueRouter` wraps a
+          :class:`~mobius.components.MoELayer`): ``self_attn.v_gate.weight``
+          -> ``self_attn.v_router.moe.gate.weight``;
+          ``self_attn.v_gate.bias`` ->
+          ``self_attn.v_router.moe.gate.e_score_correction_bias``;
           ``self_attn.v_experts.{i}.weight`` ->
-          ``self_attn.v_router.experts.{i}.weight``.
+          ``self_attn.v_router.moe.experts.{i}.proj.weight``.
         - Attention/FFN norms (``attn_norm``/``ffn_norm`` in llama.cpp) and
           Q/K norms already align with standard HF
           ``input_layernorm``/``post_attention_layernorm``/``q_norm``/
@@ -404,17 +431,22 @@ class K2HorizonCausalLMModel(CausalLMModel):
                     new_key = new_key.replace(".mlp.experts.", ".mlp.moe.experts.")
 
             new_key = new_key.replace(
-                ".self_attn.v_gate.weight", ".self_attn.v_router.gate.weight"
+                ".self_attn.v_gate.weight", ".self_attn.v_router.moe.gate.weight"
             )
             new_key = new_key.replace(
                 ".self_attn.v_gate.bias",
-                ".self_attn.v_router.gate.e_score_correction_bias",
+                ".self_attn.v_router.moe.gate.e_score_correction_bias",
             )
             if ".self_attn.v_experts." in new_key:
-                expert_suffix = new_key.split(".self_attn.v_experts.", 1)[1]
-                if expert_suffix.split(".", 1)[0].isdigit():
-                    new_key = new_key.replace(
-                        ".self_attn.v_experts.", ".self_attn.v_router.experts."
+                prefix, expert_suffix = new_key.split(".self_attn.v_experts.", 1)
+                expert_idx, _, rest = expert_suffix.partition(".")
+                if expert_idx.isdigit():
+                    # Each value expert wraps its linear projection in
+                    # `.proj` (see `_K2HorizonValueExpert`), unlike a regular
+                    # MoE FFN expert's bare `gate_proj`/`up_proj`/`down_proj`
+                    # names.
+                    new_key = (
+                        f"{prefix}.self_attn.v_router.moe.experts.{expert_idx}.proj.{rest}"
                     )
 
             renamed[new_key] = value

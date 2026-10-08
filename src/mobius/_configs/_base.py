@@ -2285,17 +2285,22 @@ class K2HorizonConfig(CausalLMConfig):
     - ``has_attn_output_gate``: an optional softplus gate computed from the
       attention block's pre-QKV normalized input, multiplied into the
       attention output *before* ``o_proj``.
+    - ``has_qk_norm``: whether per-head Q/K RMSNorm (``query_key_norm`` in
+      the HF config) is applied at all. Released checkpoints
+      (``IFM/K2-Horizon-0.9B``/``-7B``/``-MoVA-36B-A4B``) all set this
+      ``false``, so it defaults off.
 
-    Q/K RMSNorm is per-head with a weight distinct per head (not the single
-    weight shared across heads used by the generic ``attn_qk_norm`` path), so
-    it is handled by ``K2HorizonAttention`` directly rather than through
-    ``attn_qk_norm``/``attn_qk_norm_full``.
+    Q/K RMSNorm, when enabled, is per-head with a weight distinct per head
+    (not the single weight shared across heads used by the generic
+    ``attn_qk_norm`` path), so it is handled by ``K2HorizonAttention``
+    directly rather than through ``attn_qk_norm``/``attn_qk_norm_full``.
     """
 
     n_norm_groups: int = 1
     n_value_expert: int = 0
     n_value_expert_used: int = 0
     has_attn_output_gate: bool = False
+    has_qk_norm: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> K2HorizonConfig:
@@ -2335,16 +2340,26 @@ class K2HorizonConfig(CausalLMConfig):
             first_k_dense_replace=int(n_dense),
             norm_topk_prob=bool(getattr(config, "norm_topk_prob", False)),
             routed_scaling_factor=float(getattr(config, "router_scaling_factor", 1.0) or 1.0),
-            # llama.cpp defaults expert_gating_func to sigmoid for this
-            # architecture when the HF config omits it.
-            scoring_func=str(getattr(config, "expert_gating_func", None) or "sigmoid"),
+            # router_score_func is the real HF field name (confirmed against
+            # IFM/K2-Horizon-MoVA-36B-A4B's config.json), defaulting to
+            # sigmoid like DeepSeek-V3 when the field is omitted (e.g. on
+            # dense-only checkpoints where no MoE gate exists).
+            scoring_func=str(getattr(config, "router_score_func", None) or "sigmoid"),
             topk_method="greedy",
-            use_expert_bias=True,
+            # moe_gate_bias is the real HF field name for the selection-only
+            # correction bias (confirmed `true` on IFM/K2-Horizon-MoVA-36B-A4B).
+            use_expert_bias=bool(getattr(config, "moe_gate_bias", True)),
+            # llama.cpp clamps the top-k routing-weight normalization
+            # denominator to this floor instead of the generic `+ 1e-20`.
+            routing_weight_normalization_floor=6.103515625e-5,
             partial_rotary_factor=partial_rotary_factor,
             n_norm_groups=int(getattr(config, "layernorm_num_groups", 1) or 1),
             n_value_expert=n_value_expert,
             n_value_expert_used=n_value_expert_used,
             has_attn_output_gate=getattr(config, "attention_gate_func", None) == "softplus",
+            # query_key_norm is the real HF field name; all three released
+            # checkpoints set it false, so default off when absent.
+            has_qk_norm=bool(getattr(config, "query_key_norm", False)),
         )
         return cls(**fields)
 

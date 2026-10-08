@@ -1648,6 +1648,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "n_value_expert": 2,
             "n_value_expert_used": 1,
             "has_attn_output_gate": True,
+            "has_qk_norm": True,
         },
         True,
     ),
