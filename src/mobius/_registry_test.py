@@ -207,6 +207,14 @@ class TestTextOnlyModelTypeOverrides:
     def test_gemma4_resolves_to_text_backbone(self, model_type):
         assert _TEXT_ONLY_MODEL_TYPE[model_type] == "gemma4_text"
 
+    @pytest.mark.parametrize(
+        "model_type", ["qwen3_5", "qwen3_5_vl", "qwen3_5_text", "qwen3_5_vl_text"]
+    )
+    def test_qwen35_resolves_to_text_backbone(self, model_type):
+        target = _TEXT_ONLY_MODEL_TYPE[model_type]
+        assert target == "qwen3_5_text"
+        assert _TEXT_ONLY_MODEL_TYPE[target] == target
+
     def test_nested_text_config_type_is_mapped(self):
         """A VL type and its nested ``text_config`` type must agree.
 

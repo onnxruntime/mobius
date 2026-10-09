@@ -5,6 +5,10 @@
 
 from __future__ import annotations
 
+import onnx_ir as ir
+import pytest
+
+from mobius._builder import _cast_module_dtype
 from mobius._testing import (
     count_op_type,
     create_test_builder,
@@ -12,6 +16,33 @@ from mobius._testing import (
     make_config,
 )
 from mobius.components._gated_deltanet import GatedDeltaNet
+
+
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+@pytest.mark.parametrize("state_dtype", [None, ir.DataType.FLOAT])
+def test_gated_deltanet_propagates_activation_and_state_dtypes(dtype, state_dtype):
+    config = make_config(
+        dtype=dtype,
+        mamba_ssm_dtype=state_dtype,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+    )
+    module = GatedDeltaNet(config)
+    _cast_module_dtype(module, dtype)
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 1, 64], dtype)
+    conv = create_test_input(builder, "conv_state", [1, 128, 3], dtype)
+    recurrent = create_test_input(builder, "rec_state", [1, 4, 16, 16], state_dtype or dtype)
+    output, _, new_recurrent = module(op, hidden, conv, recurrent)
+    attention = next(node for node in graph if node.op_type == "LinearAttention")
+    assert all(value.dtype == (state_dtype or dtype) for value in attention.outputs)
+    assert new_recurrent.dtype == (state_dtype or dtype)
+    assert output.dtype == dtype
 
 
 class TestGatedDeltaNet:

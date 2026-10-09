@@ -17,7 +17,8 @@ from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm, apply_rms_norm
 
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
-def test_offset_rms_norm_learned_scale_precision(tmp_path, dtype):
+@pytest.mark.parametrize("unknown_input_type", [False, True])
+def test_offset_rms_norm_learned_scale_precision(tmp_path, dtype, unknown_input_type):
     """Keep the learned offset and scale multiplication in FP32 until output cast."""
     values = np.asarray([[1.0, 3.0, 6.0, 10.0]], dtype=dtype.numpy())
     weight = np.asarray([0.0004, -0.0004, 0.0003, -0.0003], dtype=dtype.numpy())
@@ -26,7 +27,18 @@ def test_offset_rms_norm_learned_scale_precision(tmp_path, dtype):
     norm.weight = nn.Parameter([4], data=ir.Tensor(weight))
     builder, op, graph = create_test_builder()
     x = create_test_input(builder, "x", [1, 4], dtype)
-    graph.outputs.append(norm(op, x))
+    hidden = op.Identity(x) if unknown_input_type else x
+    if unknown_input_type:
+        hidden.type = None
+    result = norm(op, hidden)
+    result.type = ir.TensorType(dtype)
+    graph.outputs.append(result)
+    if dtype == ir.DataType.FLOAT and not unknown_input_type:
+        assert count_op_type(graph, "Cast") == 0
+        assert count_op_type(graph, "CastLike") == 0
+    else:
+        assert count_op_type(graph, "Cast") >= 1
+        assert count_op_type(graph, "CastLike") == 1
     path = tmp_path / "offset-norm.onnx"
     ir.save(ir.Model(graph, ir_version=11), path)
     actual = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]).run(

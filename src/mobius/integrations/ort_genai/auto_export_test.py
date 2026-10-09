@@ -347,7 +347,37 @@ class TestWriteProcessorConfig:
             for transform in transforms
             if transform["operation"]["type"] == "Normalize"
         )
-        assert normalize["attrs"]["qwen2_5_vl"] == 1
+        assert set(normalize["attrs"]) == {"mean", "std"}
+
+    @pytest.mark.parametrize("model_type", ["qwen2_5_vl_text", "qwen3_vl", "qwen3_5_text"])
+    def test_qwen_rgb_decode_uses_ordinary_normalize(self, tmp_path, model_type):
+        """RGB decoding must not be followed by a BGR-to-RGB Normalize swap."""
+        config = types.SimpleNamespace(
+            model_type=model_type,
+            vision=types.SimpleNamespace(image_size=448, patch_size=16, spatial_merge_size=2),
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        transforms = json.loads(Path(path).read_text())["processor"]["transforms"]
+        assert [item["operation"]["type"] for item in transforms] == [
+            "DecodeImage",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "PatchImage",
+        ]
+        assert transforms[0]["operation"]["attrs"] == {"color_space": "RGB"}
+        assert transforms[3]["operation"]["attrs"] == {
+            "mean": [0.48145466, 0.4578275, 0.40821073],
+            "std": [0.26862954, 0.26130258, 0.27577711],
+        }
+        assert transforms[4]["operation"]["attrs"] == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
 
     def test_mage_vl_writes_packed_patch_processor(self, tmp_path):
         vision = types.SimpleNamespace(
@@ -386,7 +416,7 @@ class TestWriteProcessorConfig:
             for transform in transforms
             if transform["operation"]["type"] == "Normalize"
         )
-        assert normalize["attrs"]["qwen2_5_vl"] == 1
+        assert set(normalize["attrs"]) == {"mean", "std"}
 
     def test_mage_vl_processor_propagates_trust_remote_code(self, tmp_path):
         vision = types.SimpleNamespace(
@@ -490,8 +520,8 @@ class TestWriteProcessorConfig:
         """Muse vision consumes flattened patches and image grid dimensions.
 
         No ``ConvertRGB``: it unconditionally swaps R and B, so pairing it with
-        ``DecodeImage(color_space="RGB")`` would hand the encoder BGR. The
-        ``qwen2_5_vl`` flag therefore lands on ``Normalize`` at index 3.
+        ``DecodeImage(color_space="RGB")`` would hand the encoder BGR. Ordinary
+        normalization preserves RGB; PatchImage owns temporal/spatial packing.
         """
         vision = mock.MagicMock()
         vision.image_size = 448
@@ -520,7 +550,7 @@ class TestWriteProcessorConfig:
             "Normalize",
             "PatchImage",
         ]
-        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert set(transforms[3]["operation"]["attrs"]) == {"mean", "std"}
         assert transforms[4]["operation"]["attrs"] == {
             "patch_size": 14,
             "temporal_patch_size": 2,
@@ -554,7 +584,7 @@ class TestWriteProcessorConfig:
             "Normalize",
             "PatchImage",
         ]
-        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert set(transforms[3]["operation"]["attrs"]) == {"mean", "std"}
         assert transforms[4]["operation"]["attrs"] == {
             "patch_size": 16,
             "temporal_patch_size": 2,

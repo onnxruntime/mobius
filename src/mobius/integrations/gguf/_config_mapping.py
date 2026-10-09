@@ -31,6 +31,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import onnx_ir as ir
 
 from mobius._configs import (
     ArchitectureConfig,
@@ -5308,6 +5309,7 @@ def _qwen4exp_postprocess(
         mrope_section=[int(value) for value in metadata[f"{prefix}rope.dimension_sections"]],
         mrope_interleaved=True,
         norm_topk_prob=True,
+        mamba_ssm_dtype=ir.DataType.FLOAT,
         mtp_num_hidden_layers=0,
         mtp_use_dedicated_embeddings=False,
     )

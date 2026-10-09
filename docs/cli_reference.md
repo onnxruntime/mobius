@@ -91,6 +91,60 @@ mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep webgpu --dtyp
 mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep onnx-standard
 ```
 
+#### Standard Qwen3.8-27B VLM packaging versus runtime selection
+
+The full VLM supports the ordinary build route and the existing ORT-GenAI
+metadata route. Both retain `decoder/model.onnx`, `vision_encoder/model.onnx`,
+and `embedding/model.onnx` when built with `--ep onnx-standard`:
+
+```bash
+mobius build --config /absolute/local-qwen-checkpoint --output /absolute/standard-vlm \
+  --ep onnx-standard --dtype f16
+mobius build --config /absolute/local-qwen-checkpoint --output /absolute/standard-genai \
+  --ep onnx-standard --dtype f16 --runtime ort-genai
+```
+
+`--ep` controls **graph construction**, not independent runtime selection.
+There is no new runtime-EP CLI flag. Prepare CUDA **runtime metadata** for all
+three already-standard graphs using the qualification overlay example (or
+`write_ort_genai_config(pkg, directory, ep="cuda")`, without saving/rebuilding
+graphs). Then select CUDA at execution:
+
+```python
+import onnxruntime_genai as og
+
+config = og.Config("/absolute/cuda-runtime-overlay")
+config.clear_providers()
+config.append_provider("CUDAExecutionProvider")
+model = og.Model(config)
+```
+
+In the qualified GenAI `0.16.0-dev` build, explicit CPU vision/embedding session
+options do not follow the execution provider override. Mixing those CPU sessions
+with CUDA decoder/device buffers segfaulted during native prefill; in-memory
+`Config.overlay()` provider patches did not resolve it. Matching per-component
+CUDA metadata passed. This is why the example prepares CUDA session metadata
+while retaining the exact standard graphs. Do not change build-time `--ep` to
+`cuda` to obtain this runtime-only configuration.
+
+Standard dynamic KV caches require `past_present_share_buffer=false`; CUDA
+graph capture remains off. Hybrid cache slots retain global indices and
+independent FP16 convolution/FP32 recurrent types. Successful packaging does
+not prove a particular native GenAI build can execute those states.
+
+Qwen processor metadata now preserves RGB from `DecodeImage` through ordinary
+`Normalize`; `PatchImage` owns patch packing. Regenerate processor metadata to
+remove the former channel-swap flag from existing configurations, without
+changing graphs or weights. The residual real-image resize difference is not
+qualified as bitwise pixel parity.
+
+For an existing large artifact, do **not** rebuild or save the weights to add
+metadata. Use `examples/qwen38_standard_genai.py` to reconstruct a lazy package
+and create a symlink overlay. See
+[Qwen3.8 qualification](design/qwen38-27b-standard-onnx.md#native-ort-genai-bounded-qualification)
+for the executed bounded evidence and opt-in probe. No CPU/DML, performance,
+numerical-parity, video, serving, or graph-capture guarantee is implied.
+
 ### Optimization Rules (`--optimize`)
 
 ```

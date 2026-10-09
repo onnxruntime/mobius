@@ -290,6 +290,9 @@ class GatedDeltaNet(nn.Module):
             _domain="com.microsoft",
             _outputs=2,
         )
+        # The contrib op lacks a standard schema for builder type propagation.
+        output_3d.type = ir.TensorType(self._stash_type)
+        new_recurrent_state.type = ir.TensorType(self._stash_type)
         # output_3d: (B, T, num_v_heads * d_v) — already 3D
         if self._stash_type != self._dtype:
             output_3d = op.CastLike(output_3d, hidden_states)

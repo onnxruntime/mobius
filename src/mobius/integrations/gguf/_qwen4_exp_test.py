@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import onnx_ir as ir
 import pytest
 
 from mobius._configs import Qwen4ExpConfig
@@ -171,6 +172,7 @@ def test_qwen4exp_config_mapping_is_exact():
     assert config.linear_num_value_heads == 48
     assert config.linear_key_head_dim == 128
     assert config.linear_value_head_dim == 128
+    assert config.mamba_ssm_dtype == ir.DataType.FLOAT
     assert config.mrope_section == [11, 11, 10]
     assert config.mrope_interleaved
 
