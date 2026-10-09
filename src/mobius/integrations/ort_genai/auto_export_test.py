@@ -1003,6 +1003,7 @@ class TestFixChatTemplate:
 
         seq = data["feature_extraction"]["sequence"]
         assert seq[0]["operation"]["type"] == "AudioDecoder"
+        assert seq[0]["operation"]["attrs"] == {"max_samples": 0}
         op = seq[1]["operation"]
         assert op["name"] == "gemma4_audio"
         assert op["type"] == "Gemma4Audio"
@@ -1029,9 +1030,8 @@ class TestFixChatTemplate:
         seq = data["feature_extraction"]["sequence"]
         assert len(seq) == 2
         assert seq[0]["operation"]["type"] == "AudioDecoder"
-        assert seq[1]["operation"]["type"] == "Gemma4Audio"
+        assert seq[1]["operation"]["type"] == "Gemma4LogMel"
         attrs = seq[1]["operation"]["attrs"]
-        assert attrs["type"] == "log_mel"
         assert attrs["feature_size"] == 128
         assert attrs["sampling_rate"] == 16000
         assert attrs["frame_length_ms"] == 20.0  # noqa: RUF069
@@ -1967,11 +1967,11 @@ class TestExportForOrtGenai:
         # First op: AudioDecoder
         op0 = seq[0]["operation"]
         assert op0["type"] == "AudioDecoder"
+        assert "max_samples" not in op0.get("attrs", {})
 
-        # Second op: Gemma4Audio (type=log_mel) with expected attrs
+        # Second op: Gemma4LogMel with expected attrs
         op1 = seq[1]["operation"]
-        assert op1["type"] == "Gemma4Audio"
-        assert op1["attrs"]["type"] == "log_mel"
+        assert op1["type"] == "Gemma4LogMel"
         assert op1["attrs"]["feature_size"] == 128
         assert op1["attrs"]["sampling_rate"] == 16000
         assert op1["attrs"]["mel_floor"] == 0.001  # noqa: RUF069
@@ -4198,6 +4198,11 @@ class TestGemma4RealModel:
 
         with open(result["audio_processor"], encoding="utf-8") as f:
             audio_processor = json.load(f)
+        assert audio_processor["feature_extraction"]["sequence"][0]["operation"] == {
+            "name": "audio_decoder",
+            "type": "AudioDecoder",
+            "attrs": {"max_samples": 0},
+        }
         audio_op = audio_processor["feature_extraction"]["sequence"][1]["operation"]
         assert audio_op == {
             "name": "gemma4_audio",

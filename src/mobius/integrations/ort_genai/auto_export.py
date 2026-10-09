@@ -1356,6 +1356,7 @@ def _write_audio_processor_config(
         # 128-dim log-mel frame. Reproduced natively by the ort-extensions
         # ``Gemma4Audio`` op with ``type="raw_frames"`` (pad to a whole number of
         # frames, reshape to (num_tokens, 640)).
+        # Disable the decoder's Whisper-compatible 30-second truncation.
         samples_per_token = getattr(audio, "hidden_size", None) or 640
         processor = {
             "feature_extraction": {
@@ -1364,6 +1365,7 @@ def _write_audio_processor_config(
                         "operation": {
                             "name": "audio_decoder",
                             "type": "AudioDecoder",
+                            "attrs": {"max_samples": 0},
                         }
                     },
                     {
@@ -1384,7 +1386,7 @@ def _write_audio_processor_config(
         proc_filename = "audio_feature_extraction.json"
     elif model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 USM-style 128-dim log-mel spectrogram via the ort-extensions
-        # ``Gemma4Audio`` op with ``type="log_mel"``.
+        # ``Gemma4LogMel`` op.
         # OrtxCreateSpeechFeatureExtractor requires the feature_extraction.sequence format.
         processor = {
             "feature_extraction": {
@@ -1397,10 +1399,9 @@ def _write_audio_processor_config(
                     },
                     {
                         "operation": {
-                            "name": "gemma4_audio",
-                            "type": "Gemma4Audio",
+                            "name": "gemma4_log_mel",
+                            "type": "Gemma4LogMel",
                             "attrs": {
-                                "type": "log_mel",
                                 "feature_size": 128,
                                 "sampling_rate": 16000,
                                 "frame_length_ms": 20.0,
