@@ -302,8 +302,8 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           pip install -e '.[testing]'
-          # PyPI's ORT 1.27+ wheel requires CUDA 13, while these runners use CUDA 12.
-          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
+          # Pin a CUDA 12 nightly containing the INT2 QMoE kernels.
+          pip install --no-deps --require-hashes -r requirements/ci/qmoe-cuda.txt
           pip install --no-deps onnxruntime-genai-cuda
       - name: Run fast integration tests
         env:
@@ -317,6 +317,16 @@ jobs:
             -k "smollm-135m or smollm2-135m-instruct-f16 or albert-base or t5-small or dinov2-small or wav2vec2-base or whisper-tiny or test_gemma3_multimodal or test_qwen35 or test_qwen3_next or test_deepseek or test_sam_vit or test_ocr2" \
             --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
         timeout-minutes: 15
+      - name: Run synthetic QMoE CUDA qualification
+        env:
+          MOBIUS_QMOE_CUDA_TEST: "1"
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          pytest tests/integration/qmoe_cuda_test.py \
+            -k "not test_real_qwen3_slice" -v --timeout=120 \
+            -o junit_family=xunit1 --junitxml junit-qmoe.xml
+        timeout-minutes: 5
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v7

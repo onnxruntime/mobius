@@ -1,0 +1,6 @@
+# Linux x86_64 / CPython 3.12 CUDA 12 wheel; source commit b131c79b6f03.
+# Keep the synthetic QMoE test's version/build assertions aligned with this pin.
+--index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-12-nightly/pypi/simple/
+--only-binary=:all:
+onnxruntime-gpu==1.31.0.dev20261008002 \
+    --hash=sha256:35bce542024ef63d5f29da214728f1f0504e20d97dd5cbbf0bba5e7fee26ba5a
