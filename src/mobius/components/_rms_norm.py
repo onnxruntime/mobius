@@ -154,6 +154,91 @@ class GatedRMSNorm(nn.Module):
         return op.CastLike(normed, hidden_states)
 
 
+class GroupRMSNorm(nn.Module):
+    """RMSNorm computed independently over equal slices of the hidden dimension.
+
+    Reshapes the hidden dimension into ``(n_groups, hidden_size // n_groups)``,
+    RMS-normalizes each group independently (no per-group scale), reshapes
+    back, then multiplies elementwise by ``weight`` (shape ``(hidden_size,)``,
+    not per-group). ``n_groups=1`` degenerates to standard :class:`RMSNorm`.
+
+    Used by K2 Horizon's ``attn_norm``/``ffn_norm``/final norm, which llama.cpp
+    builds as a "group RMS norm" over ``layernorm_num_groups`` groups.
+    """
+
+    def __init__(self, hidden_size: int, n_groups: int = 1, eps: float = 1e-6):
+        super().__init__()
+        if n_groups < 1 or hidden_size % n_groups:
+            raise ValueError("hidden_size must be evenly divisible by n_groups")
+        self.hidden_size = hidden_size
+        self.n_groups = n_groups
+        self.weight = nn.Parameter([hidden_size])
+        self.variance_epsilon = eps
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        if self.n_groups == 1:
+            return apply_rms_norm(op, hidden_states, self.weight, self.variance_epsilon)
+
+        group_size = self.hidden_size // self.n_groups
+        orig_shape = op.Shape(hidden_states)
+        grouped = op.Reshape(
+            hidden_states,
+            op.Constant(value_ints=[-1, self.n_groups, group_size]),
+        )
+        if flags.ort_cuda_grouped_rmsnorm_workaround:
+            # See GatedRMSNorm: ORT <= 1.24.4 CUDA RMSNormalization mishandles
+            # a 2D scale, so decompose into basic ops as a workaround.
+            # Upcast to fp32 before squaring/reducing: at f16 this avoids
+            # overflow in `grouped * grouped` for values above ~256.
+            grouped_f32 = op.Cast(grouped, to=ir.DataType.FLOAT)
+            variance = op.ReduceMean(
+                op.Mul(grouped_f32, grouped_f32), axes=[-1], keepdims=True
+            )
+            rnorm = op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon)))
+            normed = op.Mul(grouped_f32, rnorm)
+            normed = op.Reshape(normed, orig_shape)
+            normed = op.CastLike(normed, hidden_states)
+            return op.Mul(normed, self.weight)
+
+        weight_grouped = op.Reshape(
+            self.weight, op.Constant(value_ints=[self.n_groups, group_size])
+        )
+        normed = op.RMSNormalization(
+            grouped, weight_grouped, epsilon=self.variance_epsilon, axis=-1
+        )
+        return op.Reshape(normed, orig_shape)
+
+
+class PerHeadRMSNorm(nn.Module):
+    """RMSNorm applied independently per attention head, with a per-head weight.
+
+    Unlike the shared head_dim-only weight used by most QK-norm attention
+    variants (which broadcasts one weight vector identically across every
+    head), this gives each head a distinct learned weight.
+
+    Weight shape is ``(num_heads, head_dim)``. Input is the 4D per-head view
+    ``(batch, seq, num_heads, head_dim)``; each head's ``head_dim`` slice is
+    normalized independently and scaled by its own weight row.
+
+    Used by K2 Horizon's ``attn_q_norm``/``attn_k_norm``.
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter([num_heads, head_dim])
+        self.variance_epsilon = eps
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        # Upcast to fp32 before squaring/reducing: at f16 this avoids
+        # overflow in `hidden_states * hidden_states` for values above ~256.
+        h_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        variance = op.ReduceMean(op.Mul(h_f32, h_f32), axes=[-1], keepdims=True)
+        rnorm = op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon)))
+        normed = op.Mul(h_f32, rnorm)
+        normed = op.CastLike(normed, hidden_states)
+        return op.Mul(normed, self.weight)
+
+
 class ScaleFreeRMSNorm(nn.Module):
     """RMSNorm with a constant all-ones scale (no learnable parameter).
 

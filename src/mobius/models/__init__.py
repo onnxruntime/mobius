@@ -100,6 +100,7 @@ __all__ = [
     "JinaBertV3GGUFModel",
     "Jais2CausalLMModel",
     "JetMoeCausalLMModel",
+    "K2HorizonCausalLMModel",
     "KimiK3CausalLMModel",
     "KimiLinearCausalLMModel",
     "Llama4CausalLMModel",
@@ -314,6 +315,7 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
+from mobius.models.k2_horizon import K2HorizonCausalLMModel
 from mobius.models.kimi_k3 import KimiK3CausalLMModel
 from mobius.models.kimi_linear import KimiLinearCausalLMModel
 from mobius.models.legacy_decoder import (

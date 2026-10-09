@@ -333,6 +333,11 @@ _COVERAGE_SKIP: dict[str, str] = {
     # --- Models requiring trust_remote_code ---
     "chatglm": "Requires trust_remote_code (custom HF modeling code)",
     "dots1": "Requires trust_remote_code (custom HF modeling code)",
+    "k2_horizon": "Requires trust_remote_code (custom HF modeling code; "
+    "IFM/K2-Horizon-0.9B ships config_class/model_class via auto_map). "
+    "L1-L3 graph/config coverage come from the k2_horizon test config in "
+    "tests/_test_configs.py; L4/L5 goldens need a dedicated trust_remote_code "
+    "download workflow.",
     # --- Very large models without small public checkpoints ---
     "arctic": "Very large MoE (480B) — no small public checkpoint",
     "dbrx": "Large MoE (132B) — no small public checkpoint",
