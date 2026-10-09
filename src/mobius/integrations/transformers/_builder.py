@@ -187,6 +187,19 @@ def _load_transformers_config(
 
     from mobius.integrations.transformers._config_resolver import _try_load_config_json
 
+    if trust_remote_code:
+        # Base PretrainedConfig reads JSON only, before any custom AutoConfig code.
+        raw_config, _ = transformers.PretrainedConfig.get_config_dict(
+            model_id, revision=revision
+        )
+        if raw_config.get("model_type") == "clm":
+            raise ValueError("CLM head export does not execute remote model code")
+        if not pathlib.Path(model_id).is_dir():
+            pinned_revision = raw_config.get("_commit_hash")
+            if not isinstance(pinned_revision, str) or len(pinned_revision) != 40:
+                raise ValueError("Cannot pin raw config before executing remote model code")
+            revision = pinned_revision
+
     class _MissingStrictDataclassClassValidationError(Exception):
         """Sentinel that cannot match errors from older Hub installations."""
 
@@ -406,6 +419,12 @@ def build_transformers_model(
     )
 
     detection_revision = revision
+    from mobius.integrations.transformers._clm import CLM_MODEL_ID, CLM_REVISION
+
+    if model_id == CLM_MODEL_ID and revision is None:
+        revision = detection_revision = CLM_REVISION
+    if model_id == CLM_MODEL_ID and trust_remote_code:
+        raise ValueError("CLM head export does not execute remote model code")
     vibevoice_sources = None
     config_model_id = model_id
     if "vibevoice" in model_id.casefold():
@@ -451,6 +470,48 @@ def build_transformers_model(
         revision=detection_revision,
         trust_remote_code=trust_remote_code,
     )
+    if hf_config is not None and getattr(hf_config, "model_type", None) == "clm":
+        from mobius.integrations.transformers._clm import build_clm_heads
+        from mobius.tasks import ContrastiveRankingHeadsTask
+
+        if task not in (None, "contrastive-ranking-heads") and not isinstance(
+            task, ContrastiveRankingHeadsTask
+        ):
+            raise ValueError(
+                "CLM only supports task='contrastive-ranking-heads', not generation"
+            )
+        unsupported = {
+            "module_class": module_class is not None,
+            "output_layer_indices": output_layer_indices is not None,
+            "trace_optimization": trace_optimization,
+            "dequantize": not keep_quantized,
+            "text_only": text_only,
+            "fp8_kv_cache": fp8_kv_cache,
+            "kv_cache_scales": kv_cache_scales is not None,
+            "prune_prefill_prefix": prune_prefill_prefix,
+            "glm_full_attention": glm_full_attention,
+            "export_paged_attention": export_paged_attention,
+            "input_sampling_rate": input_sampling_rate is not None,
+            "bwe_sampling_rate": bwe_sampling_rate is not None,
+        }
+        selected = sorted(name for name, enabled in unsupported.items() if enabled)
+        if selected:
+            raise ValueError(
+                "CLM heads do not support these build options: " + ", ".join(selected)
+            )
+        return build_clm_heads(
+            model_id,
+            hf_config,
+            revision=revision,
+            dtype=dtype,
+            execution_provider=execution_provider,
+            load_weights=load_weights,
+            task=(
+                task
+                if isinstance(task, ContrastiveRankingHeadsTask)
+                else "contrastive-ranking-heads"
+            ),
+        )
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 

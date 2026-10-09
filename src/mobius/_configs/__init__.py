@@ -112,6 +112,7 @@ from mobius._configs._sub_configs import (
     VisionConfig,
 )
 from mobius._configs._world_model import WorldModelConfig
+from mobius._configs.clm import CLMConfig
 from mobius._configs.vibevoice import (
     VibeVoiceASRStreamingConfig,
     VibeVoiceConfig,
@@ -124,6 +125,7 @@ from mobius._configs.vibevoice import (
 from mobius._configs.vibevoice_asr import VibeVoiceASRConfig
 
 __all__ = [
+    "CLMConfig",
     "DEFAULT_INT",
     "ArchitectureConfig",
     "AudioConfig",

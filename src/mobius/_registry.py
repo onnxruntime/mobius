@@ -24,6 +24,7 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    CLMConfig,
     CodeShellConfig,
     Eagle3Config,
     FalconH1Config,
@@ -61,6 +62,7 @@ from mobius.models import (
     BitNetCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
+    CLMRankingModel,
     CodeShellCausalLMModel,
     Cosmos3EdgeTextModel,
     Cosmos3EdgeVLModel,
@@ -477,6 +479,13 @@ def _detect_fallback_registration(hf_config) -> ModelRegistration | None:
 # ``_apply_test_metadata()`` using the dicts below.
 # ---------------------------------------------------------------------------
 _REGISTRATIONS: dict[str, ModelRegistration] = {
+    "clm": ModelRegistration(
+        CLMRankingModel,
+        task="contrastive-ranking-heads",
+        config_class=CLMConfig,
+        test_model_id="Contrastive-LM/CLM-v0.1-8B",
+        test_revision="e939398d4556fcd9400c76fa8c5a513202f42b0a",
+    ),
     # --- Text Generation (Llama-compatible) ---
     "baichuan": ModelRegistration(CausalLMModel),
     "code_llama": ModelRegistration(CausalLMModel),

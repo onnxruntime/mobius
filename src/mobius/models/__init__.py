@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "CLMRankingModel",
     "ApertusCausalLMModel",
     "ArcticGGUFCausalLMModel",
     "ArceeCausalLMModel",
@@ -243,6 +244,7 @@ from mobius.models.bitnet import BitNetCausalLMModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
+from mobius.models.clm import CLMRankingModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
 from mobius.models.cogvideox_vae import (
     AutoencoderKLCogVideoXModel,
