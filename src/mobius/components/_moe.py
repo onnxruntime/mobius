@@ -521,6 +521,11 @@ class MoELayer(nn.Module):
         block_size = quantization.fc1.group_size
         fc1_bits = quantization.fc1.bits
         fc2_bits = quantization.fc2.bits
+        if quantization.has_int3 and expert_config.dtype not in (
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+        ):
+            raise ValueError("Draft INT3 QMoE requires FP16 or BF16 activations.")
         fc1_out = 2 * intermediate_size
         self._fc1_out = fc1_out
         if hidden_size % block_size or intermediate_size % block_size:
@@ -529,12 +534,12 @@ class MoELayer(nn.Module):
             )
 
         self.fc1_experts_weights = nn.Parameter(
-            [self.num_experts, fc1_out, hidden_size * fc1_bits // 8],
+            [self.num_experts, fc1_out, (hidden_size * fc1_bits + 7) // 8],
             dtype=ir.DataType.UINT8,
         )
         self.fc1_scales = nn.Parameter([self.num_experts, fc1_out, hidden_size // block_size])
         self.fc2_experts_weights = nn.Parameter(
-            [self.num_experts, hidden_size, intermediate_size * fc2_bits // 8],
+            [self.num_experts, hidden_size, (intermediate_size * fc2_bits + 7) // 8],
             dtype=ir.DataType.UINT8,
         )
         self.fc2_scales = nn.Parameter(
@@ -574,19 +579,28 @@ class MoELayer(nn.Module):
         if router_weights is not None:
             router_weights = _flatten_to_2d(op, router_weights)
 
-        fc1_experts_weights = _interleave_gate_up_rows(
-            op, self.fc1_experts_weights, self.num_experts, self._fc1_out
-        )
-        fc1_scales = _interleave_gate_up_rows(
-            op, self.fc1_scales, self.num_experts, self._fc1_out
-        )
-        fc1_experts_zero_points = (
-            _interleave_gate_up_rows(
-                op, self.fc1_experts_zero_points, self.num_experts, self._fc1_out
+        fc1_experts_weights: ir.Value
+        fc1_scales: ir.Value
+        fc1_experts_zero_points: ir.Value | None
+        if quantization.has_int3:
+            # The draft checkpoint adapter binds already-interleaved raw tensors.
+            fc1_experts_weights = self.fc1_experts_weights
+            fc1_scales = self.fc1_scales
+            fc1_experts_zero_points = self.fc1_experts_zero_points
+        else:
+            fc1_experts_weights = _interleave_gate_up_rows(
+                op, self.fc1_experts_weights, self.num_experts, self._fc1_out
             )
-            if self.fc1_experts_zero_points is not None
-            else None
-        )
+            fc1_scales = _interleave_gate_up_rows(
+                op, self.fc1_scales, self.num_experts, self._fc1_out
+            )
+            fc1_experts_zero_points = (
+                _interleave_gate_up_rows(
+                    op, self.fc1_experts_zero_points, self.num_experts, self._fc1_out
+                )
+                if self.fc1_experts_zero_points is not None
+                else None
+            )
         # ``activation_alpha``/``activation_beta``/``swiglu_limit`` are only
         # passed when a caller explicitly set them (e.g. DeepSeek-V4's
         # clipped-SwiGLU expert); omitting them for every other existing
@@ -599,7 +613,7 @@ class MoELayer(nn.Module):
         if self.swiglu_limit is not None:
             activation_kwargs["swiglu_limit"] = self.swiglu_limit
         bit_width_kwargs = {}
-        if quantization.is_mixed_width:
+        if quantization.is_mixed_width or quantization.has_int3:
             bit_width_kwargs = {
                 "fc1_expert_weight_bits": quantization.fc1.bits,
                 "fc2_expert_weight_bits": quantization.fc2.bits,
@@ -641,6 +655,15 @@ class MoELayer(nn.Module):
             **activation_kwargs,
             **bit_width_kwargs,
         )
+        if quantization.has_int3:
+            node = result.producer()
+            assert node is not None
+            node.metadata_props["mobius.int3_qmoe.format"] = (
+                "draft-2026-10-08:row-local-lsb-first-uint8"
+            )
+            node.metadata_props["mobius.int3_qmoe.runtime_support"] = (
+                "unqualified; requires reviewed INT3 QMoE schema and kernels"
+            )
         if output_scale != 1.0:  # noqa: RUF069
             result = op.Mul(result, op.CastLike(output_scale, result))
         return result

@@ -47,6 +47,47 @@ across **40+ task types** and **100+ reusable components**.
 
 See the [model documentation](https://onnxruntime.github.io/mobius/models/index.html) for the complete list.
 
+## Experimental INT3 QMoE export
+
+The draft INT3 exporter extends Olive's fused, K-last expert checkpoints using
+the proposed raw QMoE contract from `microsoft/onnxruntime#32657`. It is disabled
+by default. Enable it before importing Mobius with
+`MOBIUS_EXPERIMENTAL_INT3_QMOE_EXPORT=1`, or scope construction, preprocessing,
+and export with:
+
+```python
+from mobius import build
+from mobius._flags import override_flags
+
+with override_flags(experimental_int3_qmoe_export=True):
+    package = build("./local-olive-qwen3-moe", dtype="f16")
+    package.save("./draft-int3-qmoe")
+```
+
+Use an Olive model-wide INT4 configuration with exact source-name overrides for
+`model.layers.<i>.mlp.experts.gate_up_proj` and
+`model.layers.<i>.mlp.experts.down_proj`. Supported draft FC1/FC2 pairs are
+`(3,4)`, `(3,3)`, and `(4,3)`. The generic MoE adapter, including Qwen3-MoE,
+validates fused checkpoint dimensions and binds packed bytes without
+requantization. INT3 is symmetric unsigned offset-4, row-local LSB-first
+`uint8`; FC1 gate/up rows and scales are interleaved together, while FC2
+retains its K-last down-projection layout. Explicit all-4 INT3 zero points are
+validated and omitted in the graph.
+
+The initial draft requires a shared block size of 32/64/128 dividing hidden and
+intermediate sizes. Both FC scale dtypes must match FP16/BF16 activations, and
+scales must be finite and nonnegative. INT4 zero-point semantics stay unchanged.
+Dense INT3 `MatMulNBits`, embeddings, other source layouts, and schema-unapproved
+tails are not enabled. Keep non-expert projections at supported precisions.
+
+This produces **experimental graphs, not models qualified for released ORT**.
+QMoE nodes carry a draft-format/runtime-warning marker; they do not invent an
+approved schema version. Tests cover bytes, interleaving, binding, and external
+data save/reload, not INT3 kernel execution, model quality, or speed. Final
+schema/version review, a complete quantization provenance manifest, and
+checkpoint-to-ORT parity remain necessary before production use. This is not
+completion of the runtime plan's P5 acceptance gate.
+
 ## Installation
 
 ```bash
