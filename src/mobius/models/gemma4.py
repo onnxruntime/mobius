@@ -315,25 +315,58 @@ def _split_per_layer_projection_weight(
     prefix: str,
     config: Gemma4Config,
 ) -> None:
-    """Split the packed PLE projection at the first KV-sharing layer."""
+    """Split the packed PLE projection at the first KV-sharing layer.
+
+    Handles dense ``[N, K]`` weights and Quark-packed ``[K, N/8]`` weights with
+    their scale/zero_point sidecars. Quantized modules reach here still packed
+    by design (see ``_dequantize_float_only_projections``).
+    """
     shared_layers = config.num_kv_shared_layers
     per_layer_dim = config.hidden_size_per_layer_input
     if not shared_layers or not per_layer_dim:
         return
-
-    weight_key = f"{prefix}per_layer_model_projection.weight"
-    weight = state_dict.get(weight_key)
+    base = f"{prefix}per_layer_model_projection"
+    cons = f"{base}_consumer"
+    weight = state_dict.get(f"{base}.weight")
     if weight is None:
         return
+    expected = config.num_hidden_layers * per_layer_dim
+    producer = (config.num_hidden_layers - shared_layers) * per_layer_dim
+    consumer = expected - producer
 
-    expected_rows = config.num_hidden_layers * per_layer_dim
-    if weight.shape[0] != expected_rows:
-        raise ValueError(f"{weight_key} dim 0 expected {expected_rows}, got {weight.shape[0]}")
-    producer_rows = (config.num_hidden_layers - shared_layers) * per_layer_dim
-    producer, consumer = weight.split([producer_rows, expected_rows - producer_rows], dim=0)
-    state_dict[weight_key] = producer.contiguous()
-    state_dict[f"{prefix}per_layer_model_projection_consumer.weight"] = consumer.contiguous()
+    if weight.shape[0] == expected:
+        pw, cw = weight.split([producer, consumer], dim=0)
+        state_dict[f"{base}.weight"] = pw.contiguous()
+        state_dict[f"{cons}.weight"] = cw.contiguous()
+        return
 
+    scale = state_dict.get(f"{base}.weight_scale")
+    if scale is None:
+        raise ValueError(
+            f"{base}.weight dim 0 expected {expected}, got {weight.shape[0]}"
+        )
+    pack = 8
+    if scale.shape[-1] != expected:
+        raise ValueError(
+            f"{base}.weight_scale dim -1 expected {expected}, got {scale.shape[-1]}"
+        )
+    if weight.shape[1] * pack != expected:
+        raise ValueError(
+            f"{base}.weight dim 1 {weight.shape[1]} * {pack} != {expected}"
+        )
+    if producer % pack or consumer % pack:
+        raise ValueError(f"PLE split {producer}/{consumer} not divisible by {pack}")
+    pw, cw = weight.split([producer // pack, consumer // pack], dim=1)
+    state_dict[f"{base}.weight"] = pw.contiguous()
+    state_dict[f"{cons}.weight"] = cw.contiguous()
+    ps, cs = scale.split([producer, consumer], dim=-1)
+    state_dict[f"{base}.weight_scale"] = ps.contiguous()
+    state_dict[f"{cons}.weight_scale"] = cs.contiguous()
+    zp = state_dict.get(f"{base}.weight_zero_point")
+    if zp is not None:
+        pz, cz = zp.split([producer // pack, consumer // pack], dim=-1)
+        state_dict[f"{base}.weight_zero_point"] = pz.contiguous()
+        state_dict[f"{cons}.weight_zero_point"] = cz.contiguous()
 
 def _typed_scalar_constant(op: OpBuilder, value: float, dtype: ir.DataType) -> ir.Value:
     """Create a scalar constant directly in the model compute dtype."""
@@ -2409,13 +2442,14 @@ class Gemma4TextModel(nn.Module):
                     for _ in range(self._num_layers)
                 ]
             )
-            self.per_layer_model_projection = Linear(
+            _ple_linear = _per_layer_model_projection_linear_class(config) or Linear
+            self.per_layer_model_projection = _ple_linear(
                 config.hidden_size,
                 self._first_kv_shared_layer * self._per_layer_dim,
                 bias=False,
             )
             if self._first_kv_shared_layer < self._num_layers:
-                self.per_layer_model_projection_consumer = Linear(
+                self.per_layer_model_projection_consumer = _ple_linear(
                     config.hidden_size,
                     (self._num_layers - self._first_kv_shared_layer) * self._per_layer_dim,
                     bias=False,
