@@ -390,31 +390,14 @@ class TestGemma4ModelPreprocessWeights:
 
         assert result["decoder.lm_head.weight"] is weight
 
-    @pytest.mark.parametrize(
-        ("quantize_embeddings", "quantize_lm_head", "state_dict"),
-        [
-            (
-                True,
-                False,
-                {
-                    "model.language_model.embed_tokens.weight_qweight": torch.zeros(
-                        256, 32, dtype=torch.uint8
-                    )
-                },
-            ),
-            (
-                False,
-                True,
-                {"lm_head.weight_qweight": torch.zeros(256, 32, dtype=torch.uint8)},
-            ),
-        ],
-    )
-    def test_quantized_embedding_or_lm_head_fails_closed(
-        self,
-        quantize_embeddings,
-        quantize_lm_head,
-        state_dict,
-    ):
+    def test_quantized_embedding_fails_closed(self):
+        """A packed embedding table is still rejected: the embedding component
+        would need GatherBlockQuantized to consume it."""
+        state_dict = {
+            "model.language_model.embed_tokens.weight_qweight": torch.zeros(
+                256, 32, dtype=torch.uint8
+            )
+        }
         config = _tiny_gemma4_config(
             tie_word_embeddings=False,
             quantization=QuantizationConfig(
@@ -422,16 +405,57 @@ class TestGemma4ModelPreprocessWeights:
                 group_size=16,
                 quant_method="olive",
                 sym=True,
-                quantize_embeddings=quantize_embeddings,
-                quantize_lm_head=quantize_lm_head,
+                quantize_embeddings=True,
+                quantize_lm_head=False,
             ),
         )
 
         with pytest.raises(
             NotImplementedError,
-            match="Quantized embeddings and LM heads are not yet supported",
+            match="Quantized embeddings are not yet supported",
         ):
             Gemma4Model(config).preprocess_weights(state_dict)
+
+    def test_quantized_lm_head_is_accepted(self):
+        """A packed LM head is kept packed for the decoder's MatMulNBits head.
+
+        Gemma4 opts out of the head guard (reject_quantized_lm_head=False)
+        because the decoder builds a MatMulNBits head exactly as the text-only
+        monolith does. The packed sidecars must survive preprocess_weights
+        rather than raising, and no float head may be synthesized over them.
+        """
+        vocab, bits, group_size = 256, 4, 16
+        # 32 packed bytes == 4 blocks of 16 four-bit codes (8 bytes each).
+        blocks, blob_bytes = 4, group_size * bits // 8
+        state_dict = {
+            "lm_head.weight_qweight": torch.zeros(
+                vocab, blocks * blob_bytes, dtype=torch.uint8
+            ),
+        }
+        config = _tiny_gemma4_config(
+            tie_word_embeddings=False,
+            quantization=QuantizationConfig(
+                bits=bits,
+                group_size=group_size,
+                quant_method="olive",
+                sym=True,
+                quantize_embeddings=False,
+                quantize_lm_head=True,
+            ),
+        )
+
+        result = Gemma4Model(config).preprocess_weights(state_dict)
+
+        head_keys = [key for key in result if "lm_head" in key]
+        assert head_keys == ["decoder.lm_head.weight"], (
+            f"expected exactly one canonical head key, got {head_keys}"
+        )
+        head = result["decoder.lm_head.weight"]
+        # The packed codes must reach the graph in MatMulNBits' B layout
+        # [N, n_blocks_per_col, blob_size], not be dequantized to float and not
+        # be overwritten by a synthesized float head.
+        assert head.dtype is torch.uint8, f"head was dequantized to {head.dtype}"
+        assert tuple(head.shape) == (vocab, blocks, blob_bytes), tuple(head.shape)
 
     def test_gguf_quantized_tables_keep_canonical_weight_path(self):
         config = _tiny_gemma4_config(

@@ -693,7 +693,10 @@ def _preprocess_component_quantized_weights(
         embed_key="embedding.embed_tokens.weight",
         head_key="decoder.lm_head.weight",
         qmoe_target_path=None,
-        reject_quantized_embeddings_lm_head=True,
+        reject_quantized_embeddings=True,
+        # A quantized LM head is supported: the decoder builds a MatMulNBits
+        # head exactly as the text-only monolith does.
+        reject_quantized_lm_head=False,
     )
 
 
@@ -3887,7 +3890,21 @@ class Gemma4Model(nn.Module):
         if self.config.tie_word_embeddings:
             embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
-            if head_key not in state_dict and embed_key in state_dict:
+            # A Quark checkpoint stores the head PACKED under the bare
+            # ``lm_head.*`` stem (no ``language_model.`` prefix) with
+            # ``.weight_scale``/``.weight_zero_point`` sidecars. Testing only
+            # for the float ``head_key`` reports "missing" for such a head and
+            # synthesizes the embed table over it -- the renamer maps both onto
+            # ``decoder.lm_head.weight`` and the float (appended later) wins,
+            # leaving a [vocab, hidden] float beside live packed sidecars.
+            head_present = any(
+                key == head_key
+                or key == "lm_head.weight"
+                or key.startswith("lm_head.weight_")
+                or key.startswith(head_key + "_")
+                for key in state_dict
+            )
+            if not head_present and embed_key in state_dict:
                 state_dict[head_key] = state_dict[embed_key]
 
         renamed: dict[str, torch.Tensor] = {}
@@ -4130,7 +4147,21 @@ class Gemma4UnifiedModel(nn.Module):
         if self.config.tie_word_embeddings:
             embed_key = "language_model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
-            if head_key not in state_dict and embed_key in state_dict:
+            # A Quark checkpoint stores the head PACKED under the bare
+            # ``lm_head.*`` stem (no ``language_model.`` prefix) with
+            # ``.weight_scale``/``.weight_zero_point`` sidecars. Testing only
+            # for the float ``head_key`` reports "missing" for such a head and
+            # synthesizes the embed table over it -- the renamer maps both onto
+            # ``decoder.lm_head.weight`` and the float (appended later) wins,
+            # leaving a [vocab, hidden] float beside live packed sidecars.
+            head_present = any(
+                key == head_key
+                or key == "lm_head.weight"
+                or key.startswith("lm_head.weight_")
+                or key.startswith(head_key + "_")
+                for key in state_dict
+            )
+            if not head_present and embed_key in state_dict:
                 state_dict[head_key] = state_dict[embed_key]
 
         renamed: dict[str, torch.Tensor] = {}

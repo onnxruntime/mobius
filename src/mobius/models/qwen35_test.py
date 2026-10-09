@@ -794,9 +794,21 @@ class TestQwen35MoEVL3ModelQMoEExport:
             raise AssertionError("expected NotImplementedError for GPTQ VL-MoE export")
 
     def test_quantized_embeddings_or_lm_head_raise_clear_error(self):
-        for flag, key in (
-            ("quantize_embeddings", "model.language_model.embed_tokens.weight_qweight"),
-            ("quantize_lm_head", "lm_head.weight_qweight"),
+        # The embedding table and the LM head are guarded independently, so
+        # each error names only the parameter it rejected.
+        for flag, key, expected, owner in (
+            (
+                "quantize_embeddings",
+                "model.language_model.embed_tokens.weight_qweight",
+                "Quantized embeddings are not yet supported",
+                "decoder.model.embed_tokens",
+            ),
+            (
+                "quantize_lm_head",
+                "lm_head.weight_qweight",
+                "Quantized LM heads are not yet supported",
+                "decoder.lm_head",
+            ),
         ):
             config = _moe_vl_config(
                 QuantizationConfig(
@@ -815,8 +827,8 @@ class TestQwen35MoEVL3ModelQMoEExport:
             try:
                 model.preprocess_weights(packed_weight)
             except NotImplementedError as error:
-                assert "Quantized embeddings and LM heads are not yet supported" in str(error)
-                assert "decoder.model.embed_tokens" in str(error)
+                assert expected in str(error)
+                assert owner in str(error)
             else:
                 raise AssertionError(
                     f"expected NotImplementedError when {flag}=True for VL-MoE export"
@@ -873,7 +885,11 @@ class TestQwen35VL3ModelQuantization:
         assert tuple(result[target].shape) == expected_shape
 
     def test_quantized_embeddings_or_lm_head_raise(self):
-        for flag in ("quantize_embeddings", "quantize_lm_head"):
+        # Guarded independently, so each error names only what it rejected.
+        for flag, expected in (
+            ("quantize_embeddings", "Quantized embeddings are not yet supported"),
+            ("quantize_lm_head", "Quantized LM heads are not yet supported"),
+        ):
             config = _moe_vl_config(
                 QuantizationConfig(
                     bits=4,
@@ -888,7 +904,7 @@ class TestQwen35VL3ModelQuantization:
             try:
                 model.preprocess_weights({})
             except NotImplementedError as error:
-                assert "Quantized embeddings and LM heads" in str(error)
+                assert expected in str(error)
             else:
                 raise AssertionError(
                     f"expected NotImplementedError when {flag}=True for dense VL export"

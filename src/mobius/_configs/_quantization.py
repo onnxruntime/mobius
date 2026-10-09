@@ -345,12 +345,23 @@ class QuantizationConfig:
             if pattern.startswith("re:"):
                 _compile_pattern(pattern[3:])
 
+        # Quark signals float modules via ``exclude``; a module absent from
+        # that list is quantized. The AWQ/GPTQ parser reads explicit
+        # ``lm_head``/``embeds`` keys, which Quark never writes -- without this
+        # the flag silently defaults False and the graph builds a dense float
+        # head while the checkpoint supplies packed MatMulNBits weights.
+        # NOTE: quantize_embeddings is deliberately NOT derived the same way --
+        # Quark ships embed_tokens as plain BF16 with no packed sidecars.
+        _lm_head_excluded = any(
+            cls._matches_module(pattern, "lm_head") for pattern in exclusions
+        )
         return cls(
             bits=bits,
             group_size=group_size,
             quant_method="quark",
             sym=bool(weight.get("symmetric", False)),
             modules_to_not_convert=exclusions,
+            quantize_lm_head=not _lm_head_excluded,
         )
 
     @classmethod

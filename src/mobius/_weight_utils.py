@@ -1935,7 +1935,8 @@ def preprocess_quantized_weights(
     qmoe_intermediate_size: int | None = None,
     qmoe_expected_moe_paths: tuple[str, ...] = (),
     qmoe_source_moe_paths: tuple[str, ...] = (),
-    reject_quantized_embeddings_lm_head: bool = False,
+    reject_quantized_embeddings: bool = False,
+    reject_quantized_lm_head: bool = False,
     defer_non_expert_sidecars: bool = False,
     defer_per_channel_sidecars: bool = True,
     qmoe_activation_dtype: torch.dtype | None = None,
@@ -1962,8 +1963,13 @@ def preprocess_quantized_weights(
             When any mixed expert sidecar is present, every path is required.
         qmoe_source_moe_paths: Authoritative Hugging Face module paths aligned
             with ``qmoe_expected_moe_paths`` for override resolution.
-        reject_quantized_embeddings_lm_head: Reject packed embedding/head
-            weights because the caller's graph requires float parameters.
+        reject_quantized_embeddings: Reject a packed embedding table because
+            the caller's graph requires float parameters. Quantized embeddings
+            need ``GatherBlockQuantized`` in the embedding component.
+        reject_quantized_lm_head: Reject a packed LM head for the same reason.
+            Independent of ``reject_quantized_embeddings``: a decoder that can
+            build a ``MatMulNBits`` head may still require a float embedding
+            table.
         defer_non_expert_sidecars: Keep ordinary packed sidecars raw for the
             component loader to resolve per-projection layouts. Expert packing
             and float weight tying still run here.
@@ -2056,35 +2062,35 @@ def preprocess_quantized_weights(
             key == owner + suffix for suffix in DOTTED_PACKED_QUANT_SUFFIXES
         )
 
-    packed_embedding_or_head = (
-        next(
-            (
-                key
-                for key in state_dict
-                if _is_packed_sidecar_of(key, embed_key)
-                or _is_packed_sidecar_of(key, head_key)
-            ),
+    # The embedding table and the LM head are gated independently. A decoder
+    # that builds a MatMulNBits head can accept a packed head while still
+    # requiring a float embedding table, which needs GatherBlockQuantized in
+    # the embedding component to be quantized.
+    def _reject_packed(float_key: str, configured: bool, what: str) -> None:
+        packed = next(
+            (key for key in state_dict if _is_packed_sidecar_of(key, float_key)),
             None,
         )
-        if reject_quantized_embeddings_lm_head
-        else None
-    )
-    configured_quantized_table = quantization is not None and (
-        quantization.quantize_embeddings or quantization.quantize_lm_head
-    )
-    if reject_quantized_embeddings_lm_head and (
-        configured_quantized_table or packed_embedding_or_head is not None
-    ):
-        packed_key_detail = (
-            f" Packed checkpoint key {packed_embedding_or_head!r} was found."
-            if packed_embedding_or_head is not None
-            else ""
-        )
+        if not configured and packed is None:
+            return
+        detail = f" Packed checkpoint key {packed!r} was found." if packed else ""
         raise NotImplementedError(
-            "Quantized embeddings and LM heads are not yet supported by "
-            f"this model: {embed_key.removesuffix('.weight')}, "
-            f"{head_key.removesuffix('.weight')}, and related embedding "
-            f"initializers currently require float weights.{packed_key_detail}"
+            f"Quantized {what} are not yet supported by this model: "
+            f"{float_key.removesuffix('.weight')} and related initializers "
+            f"currently require float weights.{detail}"
+        )
+
+    if reject_quantized_embeddings:
+        _reject_packed(
+            embed_key,
+            quantization is not None and quantization.quantize_embeddings,
+            "embeddings",
+        )
+    if reject_quantized_lm_head:
+        _reject_packed(
+            head_key,
+            quantization is not None and quantization.quantize_lm_head,
+            "LM heads",
         )
 
     deferred = {}

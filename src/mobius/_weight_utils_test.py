@@ -1232,30 +1232,57 @@ class TestPreprocessQuantizedWeights:
         assert not any(".experts." in k and ".gate_proj" in k for k in result)
         assert not any(".experts." in k and ".down_proj" in k for k in result)
 
-    @pytest.mark.parametrize("flag", ["quantize_embeddings", "quantize_lm_head"])
+    @pytest.mark.parametrize(
+        ("flag", "reject_kwarg", "match"),
+        [
+            ("quantize_embeddings", "reject_quantized_embeddings", "Quantized embeddings"),
+            ("quantize_lm_head", "reject_quantized_lm_head", "Quantized LM heads"),
+        ],
+    )
     @pytest.mark.parametrize("defer", [False, True])
-    def test_rejects_quantized_embedding_or_lm_head(self, flag, defer):
+    def test_rejects_quantized_embedding_or_lm_head(self, flag, reject_kwarg, match, defer):
         quantization = QuantizationConfig(
             bits=4,
             group_size=16,
             quant_method="olive",
             **{flag: True},
         )
-        with pytest.raises(NotImplementedError, match="Quantized embeddings and LM heads"):
+        with pytest.raises(NotImplementedError, match=match):
             preprocess_quantized_weights(
                 {},
                 quantization,
-                reject_quantized_embeddings_lm_head=True,
                 defer_non_expert_sidecars=defer,
+                **{reject_kwarg: True},
             )
 
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_accepts_quantized_lm_head_when_only_embeddings_rejected(self, defer):
+        """A caller that builds a MatMulNBits head opts out of the head guard.
+
+        The two guards are independent: a decoder can consume a packed head
+        while still requiring a float embedding table.
+        """
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            quantize_lm_head=True,
+        )
+        preprocess_quantized_weights(
+            {},
+            quantization,
+            reject_quantized_embeddings=True,
+            reject_quantized_lm_head=False,
+            defer_non_expert_sidecars=defer,
+        )
+
     @pytest.mark.parametrize(
-        ("float_key", "suffix"),
+        ("float_key", "reject_kwarg", "suffix"),
         [
-            (float_key, suffix)
-            for float_key in (
-                "decoder.model.embed_tokens.weight",
-                "decoder.lm_head.weight",
+            (float_key, reject_kwarg, suffix)
+            for float_key, reject_kwarg in (
+                ("decoder.model.embed_tokens.weight", "reject_quantized_embeddings"),
+                ("decoder.lm_head.weight", "reject_quantized_lm_head"),
             )
             for suffix in (
                 "_qweight",
@@ -1268,8 +1295,13 @@ class TestPreprocessQuantizedWeights:
         ],
     )
     def test_rejects_packed_embedding_or_head_key_without_config_flags(
-        self, float_key, suffix
+        self, float_key, reject_kwarg, suffix
     ):
+        """Each guard rejects a packed sidecar of its own parameter.
+
+        The placeholder tensor is never unpacked: the guard must fire on the
+        key alone, before any layout work.
+        """
         owner = float_key.removesuffix(".weight")
         packed_key = float_key + suffix if suffix.startswith("_") else owner + suffix
         quantization = QuantizationConfig(bits=4, group_size=16, quant_method="gptq")
@@ -1278,9 +1310,9 @@ class TestPreprocessQuantizedWeights:
             preprocess_quantized_weights(
                 {packed_key: torch.zeros(1)},
                 quantization,
-                reject_quantized_embeddings_lm_head=True,
                 embed_key="decoder.model.embed_tokens.weight",
                 head_key="decoder.lm_head.weight",
+                **{reject_kwarg: True},
             )
 
         assert packed_key in str(error.value)
