@@ -154,6 +154,37 @@ class GatedRMSNorm(nn.Module):
         return op.CastLike(normed, hidden_states)
 
 
+class GroupedGatedRMSNorm(GatedRMSNorm):
+    """Grouped pre-gated RMSNorm with FP32 normalization and native-dtype scale.
+
+    Matches HuggingFace's ``Zamba2RMSNormGated``: gating and variance stay
+    in FP32, then the normalized activation is cast before multiplying
+    the learned scale. Explicit reduction avoids CUDA RMSNormalization
+    kernels that misindex a two-dimensional grouped scale.
+    """
+
+    def __init__(self, hidden_size: int, group_size: int, eps: float = 1e-6):
+        if hidden_size <= 0 or group_size <= 0 or hidden_size % group_size:
+            raise ValueError("group_size must be positive and divide positive hidden_size")
+        super().__init__(hidden_size, eps=eps, group_size=group_size)
+        self.num_groups = hidden_size // group_size
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value) -> ir.Value:
+        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        gate_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
+        gated = op.Mul(hidden_f32, op.Swish(gate_f32))
+        original_shape = op.Shape(hidden_states)
+        grouped = op.Reshape(
+            gated, [-1, self.num_groups, self.group_size]
+        )  # (flattened leading dimensions, groups, group_size)
+        variance = op.ReduceMean(op.Mul(grouped, grouped), axes=[-1], keepdims=True)
+        reciprocal_rms = op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon)))
+        normalized = op.Reshape(op.Mul(grouped, reciprocal_rms), original_shape)
+        # HF casts before gamma, not before variance or after gamma multiplication.
+        normalized = op.CastLike(normalized, hidden_states)
+        return op.Mul(normalized, op.CastLike(self.weight, hidden_states))
+
+
 class ScaleFreeRMSNorm(nn.Module):
     """RMSNorm with a constant all-ones scale (no learnable parameter).
 

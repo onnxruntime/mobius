@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import json
 import logging
 import pathlib
 from typing import Any
@@ -24,6 +26,8 @@ from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import (
     _download_weights,
+    _lazy_safetensors_source_parent_aliases,
+    _resolve_shard_paths,
     stream_preprocessed_safetensors_to_model,
     stream_qdq_safetensors_to_model,
 )
@@ -31,6 +35,7 @@ from mobius.integrations.compressed_tensors import (
     CompressedTensorsConfig,
     stream_compressed_tensors_to_package,
 )
+from mobius.integrations.modelopt._config import ModelOptConfig
 from mobius.tasks import ModelTask
 from mobius.weights import adapt_model_weights
 
@@ -43,6 +48,40 @@ _QWEN4_MODEL_TYPES = frozenset(
         "Qwen4ExpForConditionalGeneration",
     }
 )
+
+
+def _prepare_nemotron_modelopt_source(
+    hf_config,
+    parent_config,
+    *,
+    keep_quantized: bool,
+    dtype: str | ir.DataType | None,
+):
+    """Admit only explicit BF16 weight reconstruction; native ModelOpt stays blocked."""
+    from mobius.integrations.modelopt import is_modelopt_quant_config
+
+    raw = getattr(hf_config, "quantization_config", None)
+    if raw is not None and hasattr(raw, "to_dict"):
+        raw = raw.to_dict()
+    if getattr(hf_config, "model_type", None) != "nemotron_h" or not is_modelopt_quant_config(
+        raw
+    ):
+        return hf_config, parent_config, None
+    if keep_quantized:
+        raise NotImplementedError(
+            "Native Nemotron-H ModelOpt NVFP4/FP8 preservation is unsupported. "
+            "Explicit dense reconstruction requires --dequantize --dtype bf16 "
+            "(keep_quantized=False, dtype='bf16'); no automatic fallback is available."
+        )
+    if dtype is None or resolve_dtype(dtype) != ir.DataType.BFLOAT16:
+        raise ValueError("ModelOpt dense reconstruction requires explicit dtype='bf16'")
+    source = ModelOptConfig.parse(raw)
+    dense_config = copy.copy(hf_config)
+    dense_config.quantization_config = None
+    dense_parent = dense_config if parent_config is hf_config else copy.copy(parent_config)
+    if dense_parent is not dense_config:
+        raise NotImplementedError("ModelOpt Nemotron-H composite configs are unsupported")
+    return dense_config, dense_parent, source
 
 
 def _uses_affine_checkpoint_loader(config: object) -> bool:
@@ -344,6 +383,7 @@ def build_transformers_model(
     export_paged_attention: bool = False,
     input_sampling_rate: int | None = None,
     bwe_sampling_rate: int | None = None,
+    target_decoder_only: bool = False,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
@@ -359,6 +399,13 @@ def build_transformers_model(
     ``keep_quantized`` preserves supported compressed-tensors checkpoints in
     their native block-weight representation. Set it to ``False`` only to
     request explicit dense reconstruction.
+
+    ``target_decoder_only`` explicitly exports Nemotron-H without NextN/MTP.
+    Source config facts remain unchanged; the strict streaming report names every
+    omitted ``mtp.*`` tensor. This is not faithful MTP or a default fallback.
+    ``task='nemotron-h-mtp'`` explicitly exports Lightning target and MTP
+    graphs with a post-final-norm target seed and independently cached draft
+    computation. It does not implement speculative generation orchestration.
     """
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
@@ -384,6 +431,7 @@ def build_transformers_model(
             "export_paged_attention": export_paged_attention,
             "input_sampling_rate": input_sampling_rate is not None,
             "bwe_sampling_rate": bwe_sampling_rate is not None,
+            "target_decoder_only": target_decoder_only,
         }
         selected = sorted(name for name, enabled in unsupported.items() if enabled)
         if selected:
@@ -452,6 +500,8 @@ def build_transformers_model(
         trust_remote_code=trust_remote_code,
     )
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
+        if target_decoder_only:
+            raise ValueError("target_decoder_only is only supported for Nemotron-H")
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
         if module_class is None and _is_reuse_checkpoint(model_id, detection_revision):
@@ -517,6 +567,31 @@ def build_transformers_model(
         )
 
     hf_config, parent_config, model_type = _select_primary_config(hf_config)
+    from mobius.tasks import NemotronHMtpTask
+
+    export_lightning_mtp = task == "nemotron-h-mtp" or isinstance(task, NemotronHMtpTask)
+    if export_lightning_mtp:
+        if model_type != "nemotron_h" or target_decoder_only:
+            raise ValueError(
+                "nemotron-h-mtp requires Nemotron-H and excludes target_decoder_only"
+            )
+        if module_class is not None:
+            raise ValueError("nemotron-h-mtp does not support a module_class override")
+        if (
+            text_only
+            or fp8_kv_cache
+            or kv_cache_scales is not None
+            or prune_prefill_prefix
+            or export_paged_attention
+            or glm_full_attention
+            or output_layer_indices is not None
+        ):
+            raise ValueError("nemotron-h-mtp does not support decoder ABI/feature overrides")
+    if target_decoder_only and model_type != "nemotron_h":
+        raise ValueError("target_decoder_only is only supported for Nemotron-H")
+    hf_config, parent_config, modelopt_source = _prepare_nemotron_modelopt_source(
+        hf_config, parent_config, keep_quantized=keep_quantized, dtype=dtype
+    )
 
     compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
     source_model_type = model_type
@@ -651,7 +726,19 @@ def build_transformers_model(
         model_type=model_type,
         hf_config=parent_config,
     )
-    model_module = module_class(config)
+    model_module: nn.Module
+    if export_lightning_mtp:
+        from mobius.models.nemotron_h_mtp import NemotronHSpeculativeModel
+
+        model_module = NemotronHSpeculativeModel(config)
+    elif target_decoder_only:
+        from mobius.models.nemotron_h import NemotronHCausalLMModel
+
+        if module_class is not NemotronHCausalLMModel:
+            raise ValueError("target_decoder_only requires the Nemotron-H model class")
+        model_module = NemotronHCausalLMModel(config, target_decoder_only=True)
+    else:
+        model_module = module_class(config)
     if dequantize_gptoss_mxfp4:
         model_module._dequantize_mxfp4_checkpoint = True
     attach_hf_component_sources(
@@ -675,6 +762,31 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{graph_source_name}/{name}"
+        if export_lightning_mtp:
+            model.metadata_props["mobius.source_revision"] = revision or "local-or-unpinned"
+            model.metadata_props["mobius.source_num_nextn_predict_layers"] = str(
+                config.num_nextn_predict_layers
+            )
+        if target_decoder_only:
+            model.graph.name = f"{graph_source_name}/target-decoder-only/{name}"
+            model.metadata_props["mobius.export_variant"] = "target-decoder-only"
+            model.metadata_props["mobius.source_num_nextn_predict_layers"] = str(
+                config.num_nextn_predict_layers
+            )
+            model.metadata_props["mobius.mtp_preserved"] = "false"
+            model.metadata_props["mobius.mtp_inventory_status"] = "not_inspected"
+            model.metadata_props["mobius.source_revision"] = revision or "local-or-unpinned"
+        if modelopt_source is not None:
+            model.metadata_props["mobius.storage_policy"] = (
+                "explicit-dense-bf16-reconstruction"
+            )
+            model.metadata_props["mobius.source_weight_format"] = modelopt_source.source_format
+            model.metadata_props["mobius.source_revision"] = revision or "local-or-unpinned"
+            model.metadata_props["mobius.weight_loading_status"] = "not_loaded"
+            model.metadata_props["mobius.source_kv_cache_format"] = (
+                "modelopt-fp8" if modelopt_source.kv_cache_fp8 else "floating"
+            )
+            model.metadata_props["mobius.kv_cache_quantization_preserved"] = "false"
         if model_type in _QWEN4_MODEL_TYPES | {
             "vibevoice",
             "vibevoice_streaming",
@@ -692,7 +804,107 @@ def build_transformers_model(
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
-        if is_gptoss_mxfp4_source and keep_quantized:
+        if modelopt_source is not None or target_decoder_only or export_lightning_mtp:
+            from mobius.integrations.transformers._nemotron_h_weights import (
+                build_nemotron_h_mtp_streaming_plan,
+                build_nemotron_h_streaming_plan,
+            )
+
+            if not export_lightning_mtp and len(package) != 1:
+                raise ValueError("Nemotron-H dense streaming requires one decoder component")
+            paths = _resolve_shard_paths(model_id, revision)
+            report = stream_preprocessed_safetensors_to_model(
+                package["decoder"] if export_lightning_mtp else next(iter(package.values())),
+                model_id,
+                lambda index, initializers: build_nemotron_h_streaming_plan(
+                    config,
+                    index,
+                    initializers,
+                    modelopt=modelopt_source,
+                    target_decoder_only=target_decoder_only,
+                    mtp_companion=export_lightning_mtp,
+                ),
+                revision=revision,
+                _resolved_paths=paths,
+            )
+            if export_lightning_mtp:
+                mtp_report = stream_preprocessed_safetensors_to_model(
+                    package["mtp"],
+                    model_id,
+                    lambda index, initializers: build_nemotron_h_mtp_streaming_plan(
+                        config,
+                        index,
+                        initializers,
+                        package["decoder"].graph.initializers,
+                        modelopt=modelopt_source,
+                    ),
+                    revision=revision,
+                    _resolved_paths=paths,
+                )
+                # Partitioning into two graphs is not a target-only omission.
+                decoder_report = dict(report)
+                decoder_report["mtp_preserved"] = True
+                decoder_report["mtp_preservation_component"] = "mtp"
+                report["decoder_component"] = decoder_report
+                report["export_variant"] = "target-with-mtp"
+                report["mtp_preserved"] = True
+                report["mtp_tensor_count"] = mtp_report["mtp_tensor_count"]
+                report["mtp_tensors"] = mtp_report["mtp_tensors"]
+                report["omitted_mtp_tensor_count"] = 0
+                report["omitted_mtp_tensors"] = {}
+                report["decoder_component_mtp_partition_count"] = mtp_report[
+                    "mtp_tensor_count"
+                ]
+                report["mtp_component"] = mtp_report
+                report["generation_runtime_integration"] = False
+                report["ignored_tensors"] = 0
+                decoder_assigned = report["assigned_tensors"]
+                mtp_assigned = mtp_report["assigned_tensors"]
+                if not isinstance(decoder_assigned, int) or not isinstance(mtp_assigned, int):
+                    raise TypeError("Malformed Nemotron-H component tensor accounting")
+                report["assigned_tensors"] = decoder_assigned + mtp_assigned
+                report["shared_table_copies"] = 2
+                package["decoder"].metadata_props["mobius.weight_loading"] = json.dumps(
+                    decoder_report, sort_keys=True
+                )
+            source_roots = {pathlib.Path(path).parent for path in paths}
+            if pathlib.Path(model_id).is_dir():
+                source_roots.add(pathlib.Path(model_id))
+            control_paths = [
+                str(path)
+                for root in source_roots
+                for name in ("config.json", "model.safetensors.index.json")
+                if (path := root / name).is_file()
+            ]
+            all_source_paths = [*paths, *control_paths]
+            package.register_lazy_source_artifacts(
+                files=all_source_paths,
+                directories=_lazy_safetensors_source_parent_aliases(all_source_paths),
+            )
+            package.weight_loading_report = report
+            for model in package.values():
+                model.metadata_props["mobius.weight_loading_status"] = "lazy-bound"
+                if export_lightning_mtp:
+                    model.metadata_props["mobius.mtp_inventory_status"] = "inspected"
+                    model.metadata_props["mobius.mtp_preserved"] = "true"
+                if target_decoder_only:
+                    model.metadata_props["mobius.mtp_inventory_status"] = "inspected"
+                    model.metadata_props["mobius.omitted_mtp_tensors"] = json.dumps(
+                        report["omitted_mtp_tensors"], sort_keys=True
+                    )
+            if target_decoder_only:
+                logger.warning(
+                    "Explicit target-decoder-only export omits %s named NextN/MTP "
+                    "tensors; see weight-loading-report.json. This is not MTP support.",
+                    report["omitted_mtp_tensor_count"],
+                )
+            if modelopt_source is not None:
+                logger.warning(
+                    "Explicitly reconstructing ModelOpt weights to dense BF16; native "
+                    "NVFP4/FP8 storage, FP8 activations and FP8 KV-cache quantization "
+                    "are not preserved."
+                )
+        elif is_gptoss_mxfp4_source and keep_quantized:
             from mobius.integrations.transformers._gptoss_weights import (
                 stream_gptoss_mxfp4_safetensors_to_package,
             )

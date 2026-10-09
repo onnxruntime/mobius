@@ -41,6 +41,7 @@ from mobius.components import (
     FCMLP,
     Attention,
     Embedding,
+    GroupedGatedRMSNorm,
     Linear,
     Mamba2Block,
     RMSNorm,
@@ -84,6 +85,11 @@ class NemotronHMambaLayer(nn.Module):
             # group of heads_per_group * head_dim dimensions.
             norm_group_size=d_inner // config.mamba_n_groups,
             time_step_min=config.mamba_time_step_min,
+        )
+        # HF Zamba2RMSNormGated keeps gating/variance in FP32 and casts before gamma.
+        # Preserve the existing norm.weight namespace without the CUDA 2D-scale op.
+        self.mamba.norm = GroupedGatedRMSNorm(
+            d_inner, d_inner // config.mamba_n_groups, eps=config.rms_norm_eps
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -134,7 +140,7 @@ class NemotronHAttentionLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        position_embeddings: tuple,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
         """Forward pass. Returns (hidden_states, (key, value))."""
@@ -231,8 +237,10 @@ class NemotronHMoEGate(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
         self.weight = nn.Parameter([num_experts, hidden_size])
+        self.weight._keep_float32 = True  # type: ignore[attr-defined]
         # Correction bias for expert selection (loaded from checkpoint)
         self.e_score_correction_bias = nn.Parameter([num_experts])
+        self.e_score_correction_bias._keep_float32 = True  # type: ignore[attr-defined]
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Cast to float32 for numerical stability (eps=1e-20 underflows
@@ -240,14 +248,14 @@ class NemotronHMoEGate(nn.Module):
         # in NemotronHTopkRouter.forward and never casts back.
         hidden_states = op.Cast(hidden_states, to=1)  # FLOAT32
 
-        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        weight_t = op.Transpose(op.Cast(self.weight, to=1), perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
 
         # Sigmoid probabilities (these become the final routing weights)
         probs = op.Sigmoid(router_logits)
 
         # Add correction bias for expert selection only
-        choice_scores = op.Add(probs, self.e_score_correction_bias)
+        choice_scores = op.Add(probs, op.Cast(self.e_score_correction_bias, to=1))
 
         # Select top-k experts based on biased scores
         k = op.Constant(value_ints=[self.top_k])
@@ -262,9 +270,8 @@ class NemotronHMoEGate(nn.Module):
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
 
-        # Keep routing_weights in float32 (matching HF which never casts back).
-        # The expert dispatch multiplies these with expert outputs, and ONNX
-        # type promotion handles the mixed-dtype matmul naturally.
+        # Keep routing weights in FP32; dispatch explicitly upcasts expert
+        # outputs because ONNX does not implicitly promote mixed input types.
         return routing_weights, selected_experts
 
 
@@ -375,12 +382,15 @@ class NemotronHMoEBlock(nn.Module):
             weighted = op.Mul(routing_weights, match_float)
             # Sum matched routing weights across top_k dim → per-token weight
             weight = op.ReduceSum(weighted, [-1], keepdims=True)
-            contribution = op.Mul(expert_output, weight)
+            # HF accumulates routed contributions in FP32, then rounds once
+            # back to the expert input dtype before the shared-expert addition.
+            contribution = op.Mul(op.Cast(expert_output, to=1), weight)
             if result is None:
                 result = contribution
             else:
                 result = op.Add(result, contribution)
 
+        result = op.CastLike(result, hidden_states)
         # Optional latent projection back to hidden_size
         if self._has_latent:
             result = self.fc2_latent_proj(op, result)
@@ -409,8 +419,8 @@ class NemotronHMoELayer(nn.Module):
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
-        position_embeddings: tuple,
+        attention_bias: ir.Value | None,
+        position_embeddings: tuple | None,
         past_key_value: tuple | None,
     ):
         """Forward pass. Returns (hidden_states, (None, None)).
@@ -520,9 +530,17 @@ class NemotronHCausalLMModel(nn.Module):
     category: str = "Hybrid SSM+Attention"
     config_class: type = NemotronHConfig
 
-    def __init__(self, config: NemotronHConfig):
+    def __init__(self, config: NemotronHConfig, *, target_decoder_only: bool = False):
         super().__init__()
         self.config = config
+        self.target_decoder_only = target_decoder_only
+        if config.num_nextn_predict_layers and not target_decoder_only:
+            raise NotImplementedError(
+                "Nemotron-H NextN/MTP requires explicit task='nemotron-h-mtp'; "
+                "default export must not silently skip auxiliary tensors. "
+                "Explicit target_decoder_only=True "
+                "(--target-decoder-only) exports a separately labeled variant."
+            )
         self.model = _NemotronHTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
@@ -580,6 +598,10 @@ class NemotronHCausalLMModel(nn.Module):
 
         new_state_dict: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
+            if key.startswith("mtp."):
+                raise NotImplementedError(
+                    "Nemotron-H MTP tensors cannot be silently discarded"
+                )
             new_key = _rename_nemotron_h_weight(key, layer_types)
             # Split stacked 3D expert tensors into per-expert 2D weights.
             # HF stores experts.up_proj as (num_experts, inter, input) and
@@ -592,8 +614,12 @@ class NemotronHCausalLMModel(nn.Module):
                     expert_key = (
                         new_key.rsplit("experts.", 1)[0] + f"experts.{i}.{suffix}.weight"
                     )
+                    if expert_key in new_state_dict:
+                        raise ValueError(f"Duplicate Nemotron-H weight target {expert_key!r}")
                     new_state_dict[expert_key] = expert_weight
             else:
+                if new_key in new_state_dict:
+                    raise ValueError(f"Duplicate Nemotron-H weight target {new_key!r}")
                 new_state_dict[new_key] = value
 
         return new_state_dict
@@ -645,7 +671,11 @@ def _rename_nemotron_h_weight(key: str, layer_types: list[str]) -> str:
     if m:
         layer_idx = int(m.group(1))
         rest = m.group(2)
-        ltype = layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
+        if layer_idx >= len(layer_types):
+            raise ValueError(f"Nemotron-H checkpoint layer index out of range: {key!r}")
+        ltype = layer_types[layer_idx]
+        if ltype not in {"mamba2", "full_attention", "moe", "mlp"}:
+            raise ValueError(f"Unknown Nemotron-H layer type {ltype!r} for {key!r}")
 
         if rest.startswith("mixer."):
             mixer_rest = rest[len("mixer.") :]

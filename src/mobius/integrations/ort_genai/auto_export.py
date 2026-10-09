@@ -1943,18 +1943,26 @@ def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
         raise ValueError("MTP runtime metadata requires a target decoder graph")
     dedicated_embeddings = bool(getattr(proposer_config, "use_dedicated_embeddings", False))
     dedicated_lm_head = bool(getattr(proposer_config, "use_dedicated_lm_head", False))
+    conditioning = {
+        "target_hidden_output": "mtp_seed",
+        "target_hidden_input": "hidden_states",
+        "embedding": "dedicated" if dedicated_embeddings else "shared_target",
+        "lm_head": "dedicated" if dedicated_lm_head else "shared_target",
+    }
+    if mtp_model.metadata_props.get("mobius.mtp_contract") == "nemotron-h-lightning-nextn@1":
+        conditioning.update(
+            target_hidden_normalization="post_final_norm",
+            token_alignment="target_h_i_with_token_t_i_plus_1",
+            draft_prediction="token_t_i_plus_2",
+            tables="target_shared_sources_copied_into_draft_graph",
+        )
     payload = {
         "schema_version": 1,
         "status": "runtime_unvalidated",
         "model": {"filename": model_filename},
         "inputs": [value.name for value in mtp_model.graph.inputs if value.name is not None],
         "outputs": [value.name for value in mtp_model.graph.outputs if value.name is not None],
-        "conditioning": {
-            "target_hidden_output": "mtp_seed",
-            "target_hidden_input": "hidden_states",
-            "embedding": "dedicated" if dedicated_embeddings else "shared_target",
-            "lm_head": "dedicated" if dedicated_lm_head else "shared_target",
-        },
+        "conditioning": conditioning,
         "cache_namespaces": {
             "target": {
                 "namespace": "target",

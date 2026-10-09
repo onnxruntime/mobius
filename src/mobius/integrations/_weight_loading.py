@@ -98,9 +98,12 @@ class StreamingWeightSource:
     """One checkpoint tensor bound to one dense ONNX initializer."""
 
     source_name: str
-    mode: Literal["direct", "fp8_scalar", "fp8_block_128"] = "direct"
+    mode: Literal[
+        "direct", "fp8_scalar", "fp8_block_128", "modelopt_fp8", "modelopt_nvfp4"
+    ] = "direct"
     scale_name: str | None = None
     expected_scale: float | None = None
+    global_scale_name: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -473,6 +476,16 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
     return {k: v for k, v in result.items() if not any(k.endswith(s) for s in aux_suffixes)}
 
 
+def _lazy_safetensors_source_parent_aliases(paths: list[str]) -> frozenset[pathlib.Path]:
+    """Return both directory identities from which lazy shards may be read."""
+    # Keep HF snapshot directories as well as the blob directories reached by
+    # shard symlinks so neither can be reused as an external-data destination.
+    return frozenset(
+        {pathlib.Path(path).parent.resolve() for path in paths}
+        | {pathlib.Path(path).resolve().parent for path in paths}
+    )
+
+
 def _resolve_shard_paths(model_id: str, revision: str | None = None) -> list[str]:
     """Resolve local safetensors shard paths for the streaming loader.
 
@@ -690,6 +703,20 @@ def _materialize_preprocessed_source(
     """Read and reconstruct one classified source tensor."""
     source_dtype = key_index[source.source_name][2]
     tensor = _load_indexed_tensor(source.source_name, key_index)
+    if source.mode in {"modelopt_fp8", "modelopt_nvfp4"}:
+        from mobius.integrations.modelopt._weights import reconstruct_modelopt_weight
+
+        assert source.scale_name is not None
+        scale = _load_indexed_tensor(source.scale_name, key_index)
+        global_scale = (
+            _load_indexed_tensor(source.global_scale_name, key_index)
+            if source.global_scale_name is not None
+            else None
+        )
+        tensor = reconstruct_modelopt_weight(
+            tensor, scale, global_scale, name=source.source_name
+        )
+        return tensor if target_dtype == torch.bfloat16 else tensor.to(target_dtype)
     if source.mode == "fp8_block_128":
         assert source.scale_name is not None
         scale = _load_indexed_tensor(source.scale_name, key_index)
@@ -912,6 +939,57 @@ def stream_preprocessed_safetensors_to_model(
         if source.source_name not in key_index:
             raise ValueError(f"Streaming source '{source.source_name}' does not exist")
         _source_path, source_shape, source_dtype = key_index[source.source_name]
+        if source.mode in {"modelopt_fp8", "modelopt_nvfp4"}:
+            from mobius.integrations.modelopt._weights import validate_modelopt_scale
+
+            if source.mode == "modelopt_fp8" and source.global_scale_name is not None:
+                raise ValueError("ModelOpt FP8 must not declare an NVFP4 global scale")
+
+            expected_dtype = "U8" if source.mode == "modelopt_nvfp4" else "F8_E4M3"
+            if len(source_shape) != 2 or source_dtype != expected_dtype:
+                raise ValueError(
+                    f"ModelOpt source '{source.source_name}' requires rank-2 "
+                    f"{expected_dtype}, got {source_dtype}/{source_shape}"
+                )
+            if source.scale_name is None or source.scale_name not in key_index:
+                raise ValueError(f"Missing ModelOpt weight scale for '{source.source_name}'")
+            scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+            if source.mode == "modelopt_nvfp4":
+                logical_width = source_shape[1] * 2
+                if (
+                    logical_width % 16
+                    or scale_shape != [source_shape[0], logical_width // 16]
+                    or scale_dtype != "F8_E4M3"
+                ):
+                    raise ValueError(f"Invalid NVFP4 block scales for '{source.source_name}'")
+                if (
+                    source.global_scale_name is None
+                    or source.global_scale_name not in key_index
+                ):
+                    raise ValueError(f"Missing NVFP4 global scale for '{source.source_name}'")
+                global_path, global_shape, global_dtype = key_index[source.global_scale_name]
+                if global_shape not in ([], [1]) or global_dtype != "F32":
+                    raise ValueError(f"Invalid NVFP4 global scale for '{source.source_name}'")
+                with safe_open(global_path, framework="pt") as handle:
+                    validate_modelopt_scale(
+                        handle.get_tensor(source.global_scale_name),
+                        source.global_scale_name,
+                        scalar=True,
+                    )
+                consumed.add(source.global_scale_name)
+            elif scale_shape not in ([], [1]) or scale_dtype != "F32":
+                raise ValueError(f"Invalid ModelOpt FP8 scale for '{source.source_name}'")
+            elif source.global_scale_name is not None:
+                raise ValueError(
+                    f"FP8 source '{source.source_name}' must not have global scale"
+                )
+            with safe_open(scale_path, framework="pt") as handle:
+                validate_modelopt_scale(
+                    handle.get_tensor(source.scale_name),
+                    source.scale_name,
+                    scalar=source.mode == "modelopt_fp8",
+                )
+            consumed.add(source.scale_name)
         if source.mode in {"fp8_block_128", "fp8_scalar"}:
             if source_dtype not in {"F8_E4M3", "F8_E5M2"}:
                 raise ValueError(
@@ -978,7 +1056,14 @@ def stream_preprocessed_safetensors_to_model(
                 )
             scale_bytes = math.prod(scale_shape) * scale_element_bytes
         consumed.add(source.source_name)
-        return source_shape, source_bytes, scale_bytes
+        if source.global_scale_name is not None:
+            scale_bytes += 4
+        logical_shape = (
+            [source_shape[0], source_shape[1] * 2]
+            if source.mode == "modelopt_nvfp4"
+            else source_shape
+        )
+        return logical_shape, source_bytes, scale_bytes
 
     for target_name, source in plan.targets.items():
         initializer = model.graph.initializers.get(target_name)
@@ -1036,7 +1121,15 @@ def stream_preprocessed_safetensors_to_model(
             largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
             largest_reconstruction_working_set_bytes = max(
                 largest_reconstruction_working_set_bytes,
-                source_bytes + bf16_bytes + cast_bytes + scale_bytes,
+                source_bytes
+                + bf16_bytes
+                + cast_bytes
+                + scale_bytes
+                + (
+                    min(256, source_shape[0]) * source_shape[1] * 40
+                    if source.mode in {"modelopt_fp8", "modelopt_nvfp4"}
+                    else 0
+                ),
             )
         else:
             if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:
@@ -1150,7 +1243,9 @@ def stream_preprocessed_safetensors_to_model(
 
     report = {
         "format": "mobius.weight-loading-report.v1",
-        "source": model_id,
+        "source": (
+            "local-safetensors-checkpoint" if pathlib.Path(model_id).is_dir() else model_id
+        ),
         "revision": revision,
         "output_weight_format": "dense",
         "native_fp8": False,
