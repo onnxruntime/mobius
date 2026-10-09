@@ -19,6 +19,7 @@ __all__ = [
     "SigLIPVisionModel",
     "CTRLCausalLMModel",
     "CausalLMModel",
+    "ClefFlashModel",
     "FusedGateUpCausalLMModel",
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
@@ -242,6 +243,7 @@ from mobius.models.bert import BertModel
 from mobius.models.bitnet import BitNetCausalLMModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
+from mobius.models.clef import ClefFlashModel
 from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
 from mobius.models.cogvideox import CogVideoXTransformer3DModel
 from mobius.models.cogvideox_vae import (

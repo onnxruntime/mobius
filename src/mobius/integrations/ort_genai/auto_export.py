@@ -2038,6 +2038,12 @@ def write_ort_genai_config(
             generation).
     """
     config = getattr(pkg, "config", None)
+    if getattr(config, "model_type", None) == "clef_flash":
+        raise ValueError(
+            "Clef-Flash is a full-record decision model, not an autoregressive "
+            "ORT GenAI pipeline. Save the ONNX components with ModelPackage.save() "
+            "and supply schema spans using mobius.integrations.clef."
+        )
     if config is None:
         raise ValueError(
             "write_ort_genai_config requires ModelPackage.config to be set. "

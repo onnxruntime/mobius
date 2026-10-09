@@ -68,6 +68,16 @@ GPT-2 style models using learned absolute positional embeddings.
 Also registered with `GPT2CausalLMModel`: `biogpt`, `ctrl`, `gpt-sw3`,
 `gpt_bigcode`, `gpt_neo`, `imagegpt`, `openai-gpt`, `xglm`, `xlm`.
 
+## Structured Decisions
+
+| Model Type | Module Class | Example HuggingFace Model |
+|---|---|---|
+| `clef_flash` | `ClefFlashModel` | `Cloudflare/clef-flash` |
+
+The official checkpoint is detected before ordinary Qwen3.5 dispatch so its
+separate joint head is included. See [Clef-Flash](clef-flash.md) for the four-model
+full-record contract, host schema processing, and validation limitations.
+
 ## Mixture-of-Experts (MoE)
 
 Models that route tokens to a subset of expert MLPs.
