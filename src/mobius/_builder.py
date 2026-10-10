@@ -160,6 +160,23 @@ def build_from_module(
     """
     if hasattr(config, "validate"):
         config.validate()
+    from mobius.tasks._causal_lm import DENSE_PAGED_MODEL_TYPES
+
+    if (
+        getattr(config, "export_paged_attention", False)
+        and getattr(config, "model_type", None) in DENSE_PAGED_MODEL_TYPES
+        and (fp8_kv_cache or kv_cache_scales is not None)
+    ):
+        raise ValueError(
+            "Dense PagedAttention requires FP16 page pools; fp8_kv_cache "
+            "and kv_cache_scales are unsupported."
+        )
+    if (
+        prune_prefill_prefix
+        and getattr(config, "export_paged_attention", False)
+        and getattr(config, "model_type", None) in DENSE_PAGED_MODEL_TYPES
+    ):
+        raise ValueError("Dense PagedAttention cannot use prune_prefill_prefix.")
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)

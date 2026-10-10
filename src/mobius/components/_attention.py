@@ -327,6 +327,8 @@ class Attention(nn.Module):
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
     ):
+        from mobius.components._paged_attention import DensePagedState, paged_dense_attention
+
         query_states, key_states, value_states = self._project_qkv(op, hidden_states)
         if not math.isclose(self._key_multiplier, 1.0):
             key_states = op.Mul(key_states, self._key_multiplier)
@@ -344,6 +346,25 @@ class Attention(nn.Module):
                 key_states = self.k_norm(op, key_states)
                 query_states = op.Reshape(query_states, [0, 0, -1])
                 key_states = op.Reshape(key_states, [0, 0, -1])
+
+        if isinstance(past_key_value, DensePagedState):
+            state = past_key_value
+            output, present_key, present_value = paged_dense_attention(
+                op,
+                query_states,
+                key_states,
+                value_states,
+                state,
+                num_heads=self.num_attention_heads,
+                kv_num_heads=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                scale=self.scaling,
+                rotary_interleaved=self._rope_interleave,
+            )
+            hidden_shape = op.Shape(hidden_states)
+            target = op.Concat(op.Slice(hidden_shape, [0], [2], [0]), [-1], axis=0)
+            output = op.Reshape(output, target)
+            return self._project_output(op, output), (present_key, present_value)
 
         # Direct GroupQueryAttention path: skip external RoPE, fuse everything.
         if isinstance(attention_bias, GQAContext):

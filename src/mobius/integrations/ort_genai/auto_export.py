@@ -170,6 +170,10 @@ _DECODER_SEMANTIC_INPUTS = frozenset(
         "input_ids",
         "attention_mask",
         "position_ids",
+        "block_table",
+        "cumulative_sequence_lengths",
+        "past_sequence_lengths",
+        "attention_metadata",
         "past_sequence_length",
         "current_sequence_length",
     }
@@ -450,6 +454,154 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
         cache_slots=max(all_indices) + 1,
         has_recurrent_state=has_recurrent_state,
     )
+
+
+def _is_packed_paged_decoder(model: ir.Model) -> bool:
+    """Recognize the packed-token PagedAttention graph independently of its config."""
+    return any(
+        value.name == "input_ids" and value.shape is not None and value.shape.rank() == 1
+        for value in model.graph.inputs
+    ) and any(
+        node.op_type == "PagedAttention" and node.domain == "com.microsoft"
+        for node in model.graph
+    )
+
+
+def _is_paged_hybrid_decoder(model: ir.Model) -> bool:
+    """Keep recurrent Qwen3.5 paged exports distinct from all-paged dense Qwen."""
+    return any(
+        node.op_type == "LinearAttention" and node.domain == "com.microsoft"
+        for node in model.graph
+    ) and any(
+        value.name is not None
+        and value.name.startswith("past_key_values.")
+        and value.name.endswith((".recurrent_state", ".conv_state"))
+        for value in model.graph.inputs
+    )
+
+
+def _validate_dense_paged_decoder(model: ir.Model, config: Any) -> None:
+    """Reject graph/config mismatches before emitting an Engine page schedule."""
+    import onnx_ir as ir
+
+    from mobius.components._paged_attention import PAGED_BLOCK_SIZE
+
+    inputs = {value.name: value for value in model.graph.inputs}
+    outputs = {value.name: value for value in model.graph.outputs}
+    scheduler_inputs = {
+        "input_ids": (ir.DataType.INT64, 1),
+        "block_table": (ir.DataType.INT32, 2),
+        "cumulative_sequence_lengths": (ir.DataType.INT32, 1),
+        "past_sequence_lengths": (ir.DataType.INT32, 1),
+        "attention_metadata": (ir.DataType.INT32, 1),
+    }
+    cache_inputs = {
+        f"past_key_values.{i}.{kind}"
+        for i in range(config.num_hidden_layers)
+        for kind in ("key", "value")
+    }
+    cache_outputs = {
+        f"present.{i}.{kind}"
+        for i in range(config.num_hidden_layers)
+        for kind in ("key", "value")
+    }
+    if set(inputs) != set(scheduler_inputs) | cache_inputs or set(outputs) != {
+        "logits",
+        *cache_outputs,
+    }:
+        raise ValueError("Dense PagedAttention graph has incompatible scheduler or cache I/O.")
+    for name, (dtype, rank) in scheduler_inputs.items():
+        value = inputs[name]
+        if value.dtype != dtype or value.shape is None or value.shape.rank() != rank:
+            raise ValueError(f"Dense PagedAttention graph has incompatible {name} input.")
+    logits = outputs["logits"]
+    if (
+        logits.dtype != ir.DataType.FLOAT
+        or logits.shape is None
+        or logits.shape.rank() != 2
+        or logits.shape[1] != config.vocab_size
+    ):
+        raise ValueError("Dense PagedAttention graph requires FP32 packed [T,vocab] logits.")
+
+    nodes = [
+        node
+        for node in model.graph
+        if node.op_type == "PagedAttention" and node.domain == "com.microsoft"
+    ]
+    if len(nodes) != config.num_hidden_layers:
+        raise ValueError("Dense PagedAttention graph must have one paged node per layer.")
+    capacity: int | None = None
+    for i, node in enumerate(nodes):
+        if len(node.inputs) != 17 or len(node.outputs) != 3:
+            raise ValueError("Dense PagedAttention graph requires the 17-input operator ABI.")
+        layout = node.attributes.get("kv_cache_layout")
+        rotary = node.attributes.get("do_rotary")
+        num_heads = node.attributes.get("num_heads")
+        kv_num_heads = node.attributes.get("kv_num_heads")
+        if (
+            (layout is not None and layout.value != "SEPARATE")
+            or (rotary is None or rotary.as_int() != 1)
+            or (
+                num_heads is None
+                or num_heads.as_int() != config.num_attention_heads
+                or kv_num_heads is None
+                or kv_num_heads.as_int() != config.num_key_value_heads
+            )
+        ):
+            raise ValueError(
+                "Dense PagedAttention graph requires matching head counts, SEPARATE K/V "
+                "and fused RoPE."
+            )
+        for slot, kind in ((3, "key"), (4, "value")):
+            name = f"past_key_values.{i}.{kind}"
+            cache = inputs[name]
+            if (
+                node.inputs[slot] is not cache
+                or cache.dtype != config.dtype
+                or cache.shape is None
+                or cache.shape.rank() != 4
+                or tuple(cache.shape)[1:]
+                != (PAGED_BLOCK_SIZE, config.num_key_value_heads, config.head_dim)
+                or node.outputs[slot - 2] is not outputs[f"present.{i}.{kind}"]
+            ):
+                raise ValueError(f"Dense PagedAttention graph has incompatible {name} pages.")
+        for slot, name in (
+            (5, "cumulative_sequence_lengths"),
+            (6, "past_sequence_lengths"),
+            (7, "block_table"),
+            (16, "attention_metadata"),
+        ):
+            if node.inputs[slot] is not inputs[name]:
+                raise ValueError(f"Dense PagedAttention graph has incompatible {name} wiring.")
+        if any(node.inputs[slot] is not None for slot in range(10, 16)):
+            raise ValueError(
+                "Dense PagedAttention graph has unsupported optional operator inputs."
+            )
+        for slot in (8, 9):
+            table = node.inputs[slot]
+            initializer = (
+                model.graph.initializers.get(table.name)
+                if table is not None and table.name is not None
+                else None
+            )
+            if (
+                initializer is None
+                or initializer.shape is None
+                or initializer.shape.rank() != 2
+                or not isinstance(initializer.shape[0], int)
+                or initializer.shape[1] != config.head_dim // 2
+            ):
+                raise ValueError("Dense PagedAttention graph requires full-head RoPE tables.")
+            table_length = initializer.shape[0]
+            if capacity is None:
+                capacity = table_length
+            elif capacity != table_length:
+                raise ValueError("Dense PagedAttention graph has inconsistent RoPE tables.")
+    if capacity != config.max_position_embeddings:
+        raise ValueError(
+            "Dense PagedAttention graph RoPE cache length disagrees with "
+            "config.max_position_embeddings."
+        )
 
 
 def _load_generation_config(model_id: str):
@@ -1532,7 +1684,7 @@ def _write_genai_config(
     pkg: ModelPackage,
     ort_model_type: str,
     ep: str,
-    context_length: int,
+    context_length: int | None,
     bos_token_id: int | None,
     eos_token_id: int | list[int] | None,
     pad_token_id: int | None,
@@ -1977,6 +2129,52 @@ def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
     return path
 
 
+def _preflight_dense_paged_decoder(pkg: ModelPackage, ep: str) -> None:
+    """Validate packed Qwen Engine exports before saving models or config."""
+    from mobius.integrations.ort_genai.genai_config import _validate_dense_paged_engine_ep
+    from mobius.tasks._causal_lm import DENSE_PAGED_MODEL_TYPES
+
+    config = getattr(pkg, "config", None)
+    if config is None:
+        return
+    model_type = getattr(config, "model_type", None)
+    packed_models = [model for model in pkg.values() if _is_packed_paged_decoder(model)]
+    if packed_models and model_type not in DENSE_PAGED_MODEL_TYPES:
+        qwen35_hybrid = model_type == "qwen3_5_text" or model_type in _QWEN35_VL_MODEL_TYPES
+        if not qwen35_hybrid or not all(
+            _is_paged_hybrid_decoder(model) for model in packed_models
+        ):
+            raise ValueError(
+                "Packed PagedAttention decoder graph is incompatible with config.model_type."
+            )
+
+    if model_type in DENSE_PAGED_MODEL_TYPES:
+        decoder = pkg.get("model")
+        paged_nodes = (
+            [
+                node
+                for node in decoder.graph
+                if node.op_type == "PagedAttention" and node.domain == "com.microsoft"
+            ]
+            if decoder is not None
+            else []
+        )
+        packed = decoder is not None and any(
+            value.name == "input_ids" and value.shape is not None and value.shape.rank() == 1
+            for value in decoder.graph.inputs
+        )
+        export_paged = getattr(config, "export_paged_attention", False)
+        if not export_paged and (paged_nodes or packed or packed_models):
+            raise ValueError(
+                "Dense PagedAttention graph disagrees with config.export_paged_attention."
+            )
+        if export_paged:
+            _validate_dense_paged_engine_ep(ep, config.dtype)
+            if decoder is None:
+                raise ValueError("ORT GenAI dense paged config requires a decoder graph.")
+            _validate_dense_paged_decoder(decoder, config)
+
+
 def write_ort_genai_config(
     pkg: ModelPackage,
     directory: str,
@@ -1984,7 +2182,7 @@ def write_ort_genai_config(
     hf_model_id: str | None = None,
     revision: str | None = None,
     ep: str = "cpu",
-    context_length: int = 4096,
+    context_length: int | None = None,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
 ) -> dict[str, str]:
@@ -2013,9 +2211,10 @@ def write_ort_genai_config(
         ep: Execution provider for ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"trt-rtx"``). Defaults to ``"cpu"``.
-        context_length: Minimum context length written to
-            ``genai_config.json``. Overridden upward by
-            ``max_position_embeddings`` from ``pkg.config``.
+        context_length: Context length written to ``genai_config.json``.
+            Non-paged exports use at least ``pkg.config.max_position_embeddings``.
+            Dense PagedAttention defaults to that RoPE cache length and rejects
+            a larger explicit value.
         local_config_dir: Path to a local model directory. When provided
             and ``hf_model_id`` is ``None``, tokenizer files are copied from
             this directory instead of downloaded from HuggingFace Hub.
@@ -2044,6 +2243,7 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
+    _preflight_dense_paged_decoder(pkg, ep)
     if getattr(config, "model_type", None) == "vibevoice_streaming":
         raise ValueError(
             "VibeVoice Realtime requires host-owned text windowing, positive/negative "
@@ -2241,7 +2441,7 @@ def export_package(
     hf_model_id: str | None = None,
     revision: str | None = None,
     ep: str = "cpu",
-    context_length: int = 4096,
+    context_length: int | None = None,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
     external_data: str = "onnx",
@@ -2278,9 +2478,10 @@ def export_package(
         ep: Execution provider written to ``session_options`` in
             ``genai_config.json`` (e.g. ``"cpu"``, ``"cuda"``, ``"dml"``,
             ``"webgpu"``, ``"trt-rtx"``).
-        context_length: Minimum context length written to ``genai_config.json``.
-            Overridden upward by ``pkg.config.max_position_embeddings`` when
-            larger.
+        context_length: Context length written to ``genai_config.json``.
+            Non-paged exports use at least ``pkg.config.max_position_embeddings``.
+            Dense PagedAttention defaults to that RoPE cache length and rejects
+            a larger explicit value.
         local_config_dir: Local model directory to copy tokenizer files from
             when ``hf_model_id`` is ``None``.
         trust_remote_code: Allow custom HuggingFace configuration code when
@@ -2323,6 +2524,7 @@ def export_package(
             "Diffusion models (which have no config) are not supported — "
             "use ModelPackage.save() directly for those."
         )
+    _preflight_dense_paged_decoder(pkg, ep)
     # 1. Save ONNX models + weights
     logger.info("Saving ONNX models to %s", output_dir)
     pkg.save(
@@ -2363,7 +2565,7 @@ def auto_export(
     task: str | None = None,
     external_data: str = "onnx",
     trust_remote_code: bool = False,
-    context_length: int = 4096,
+    context_length: int | None = None,
     ep: str = "cpu",
     progress_bar: bool = True,
     text_only: bool = False,
@@ -2390,7 +2592,8 @@ def auto_export(
         trust_remote_code: Trust remote code for HuggingFace config.
         revision: Optional immutable HuggingFace revision used for all Hub
             configuration, weight, tokenizer, and processor requests.
-        context_length: Minimum context length for genai_config.json.
+        context_length: Context length for genai_config.json. Dense PagedAttention
+            cannot exceed the graph's RoPE cache length.
         ep: Execution provider for ``session_options`` in
             ``genai_config.json``. Defaults to ``"cpu"``. For non-CPU providers
             this value also drives build-time ``execution_provider`` so the
