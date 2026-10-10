@@ -28,6 +28,8 @@ Example::
     rewrite(gpt2_model, pattern_rewrite_rules=bias_gelu_rules())
 """
 
+from __future__ import annotations
+
 __all__ = [
     "bias_gelu_rules",
     "clip_to_min_max_rules",
@@ -39,6 +41,7 @@ __all__ = [
     "group_query_attention_rules",
     "htp_rank4_rmsnorm_rules",
     "layer_norm_fusion_rules",
+    "pack_matmul_nbits_qkv_pass",
     "pack_qkv_for_gqa_rules",
     "packed_attention_rules",
     "separate_rope_rules",
@@ -63,6 +66,7 @@ from mobius.rewrite_rules._htp_rank4_rmsnorm import htp_rank4_rmsnorm_rules
 from mobius.rewrite_rules._layer_norm_fusion import (
     layer_norm_fusion_rules,
 )
+from mobius.rewrite_rules._matmul_nbits_qkv import pack_matmul_nbits_qkv_pass
 from mobius.rewrite_rules._packed_attention import packed_attention_rules
 from mobius.rewrite_rules._qmoe_fusion import fuse_dense_moe_to_qmoe
 from mobius.rewrite_rules._scatternd import tensor_scatter_to_scatternd_rules

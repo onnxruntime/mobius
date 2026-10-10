@@ -74,6 +74,7 @@ from mobius.rewrite_rules import (
     gelu_fusion_rules,
     group_query_attention_rules,
     htp_rank4_rmsnorm_rules,
+    pack_matmul_nbits_qkv_pass,
     pack_qkv_for_gqa_rules,
     separate_rope_rules,
     skip_layer_norm_rules,
@@ -351,7 +352,10 @@ def _get_optimization_passes(
     caps: EpCapabilities,
     dtype: ir.DataType,
     model_role: str = "decoder",
-) -> tuple[list[tuple[str, list]], list[tuple[str, list | ir.passes.InPlacePass]]]:
+) -> tuple[
+    list[tuple[str, list | ir.passes.InPlacePass]],
+    list[tuple[str, list | ir.passes.InPlacePass]],
+]:
     """Return ``(fuse_stages, lower_stages)`` for the given capabilities.
 
     Queries the :class:`EpCapabilities` object rather than branching on EP
@@ -360,15 +364,23 @@ def _get_optimization_passes(
 
     Args:
         caps: EP capability descriptor from :data:`~mobius._execution_providers.ep_registry`.
-        dtype: Model dtype for GQA/PackedAttn support checks.
-        model_role: Semantic role. GQA fusion only applies to ``"decoder"``.
+        dtype: Model dtype for GQA/PackedAttn and INT4 projection-packing support checks.
+        model_role: Semantic role. GQA fusion only applies to ``"decoder"``;
+            INT4 projection packing also applies to ``"masked-decoder"``.
 
     Returns:
         ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``
         tuples where payload is a rule list or IR pass.
     """
-    fuse: list[tuple[str, list]] = []
+    fuse: list[tuple[str, list | ir.passes.InPlacePass]] = []
     lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
+
+    if (
+        model_role in ("decoder", "masked-decoder")
+        and caps.supports_matmul_nbits
+        and dtype in caps.matmul_nbits_qkv_pack_dtypes
+    ):
+        fuse.append(("PackMatMulNBitsQKV", pack_matmul_nbits_qkv_pass()))
 
     # --- Attention fusion (decoder only) ---
     if model_role == "decoder" and dtype in caps.gqa_dtypes:
@@ -609,6 +621,9 @@ def optimize_model(
             _log_trace_entry(entry)
     else:
         # Batch all rewrite rules for efficiency; apply IR passes separately.
+        for _, rules_or_pass in fuse_stages:
+            if not isinstance(rules_or_pass, list):
+                rules_or_pass(model)
         all_fuse_rules = [r for _, rp in fuse_stages if isinstance(rp, list) for r in rp]
         all_lower_rules = [r for _, rp in lower_stages if isinstance(rp, list) for r in rp]
         lower_ir_passes = [(n, rp) for n, rp in lower_stages if not isinstance(rp, list)]

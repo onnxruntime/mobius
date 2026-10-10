@@ -100,7 +100,8 @@ print(sorted(ep_registry))
 # Inspect an EP's capabilities
 caps = get_ep("cuda")
 print(caps.gqa_dtypes)          # frozenset({FLOAT16, BFLOAT16})
-print(caps.qkv_pack_dtypes)     # frozenset({FLOAT, FLOAT16, BFLOAT16})
+print(caps.qkv_pack_dtypes)     # frozenset({FLOAT, FLOAT16, BFLOAT16}); float GQA input packing
+print(caps.matmul_nbits_qkv_pack_dtypes)  # frozenset(); experimental INT4 packing is off
 print(caps.supports_fused_rope) # True
 print(caps.enable_graph_capture) # True
 print(caps.provider_options)     # {'enable_skip_layer_norm_strict_mode': '1'}
@@ -132,6 +133,12 @@ pkg = mobius.build("meta-llama/Llama-3.2-1B",
 Unrecognised EP names raise `ValueError` during build-time validation, before
 graph construction or optimization starts — safe-fail by default.
 
+Experimental INT4 QKV projection packing requires an explicit
+`matmul_nbits_qkv_pack_dtypes` override; no built-in EP enables it. See the
+[experimental opt-in example](execution_providers.md#tier-2--ep-specific-fusions-optional-performance)
+and numerical limitations before enabling it. Existing float `PackQKV` is
+unaffected.
+
 ---
 
 ## 5. Common EP configurations at a glance
@@ -141,7 +148,7 @@ graph construction or optimization starts — safe-fail by default.
 | Portable ONNX (maximum compatibility) | `"default"` | any | No EP-specific vendor fusions (e.g. no GQA/PackQKV) |
 | Strict standard ONNX (no custom ops at all) | `"onnx-standard"` | any | All `com.microsoft` ops expanded via InlinePass; safe for non-ORT runtimes |
 | ORT CPU inference | `"cpu"` | `"f32"` | GQA fusion for FP32 |
-| NVIDIA GPU | `"cuda"` | `"f16"` or `"bf16"` | GQA + SkipNorm + PackQKV |
+| NVIDIA GPU | `"cuda"` | `"f16"` or `"bf16"` | GQA + SkipNorm + float PackQKV (GQA input ABI); experimental INT4 projection packing is off unless explicitly enabled |
 | Windows GPU (DirectX) | `"dml"` | `"f16"` | RoPE lowered separately |
 | Browser / WebAssembly | `"webgpu"` | `"f16"` or `"f32"` | Shape ops replaced |
 | NVIDIA TensorRT-RTX | `"trt-rtx"` | `"f16"` or `"bf16"` | SkipLayerNorm expanded |
