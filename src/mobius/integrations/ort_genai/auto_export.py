@@ -1853,6 +1853,46 @@ def _write_genai_config(
     return generator.write(output_dir)
 
 
+def _write_component_genai_config(
+    config: Any,
+    output_dir: str,
+    *,
+    ep: str,
+    context_length: int,
+    bos_token_id: int | None,
+    eos_token_id: int | list[int] | None,
+    pad_token_id: int | None,
+) -> str:
+    """Write the session configuration consumed by non-generative components."""
+    intra_op_threads = 16 if ep == "cpu" else 1
+    model = {
+        "type": "component",
+        "pad_token_id": pad_token_id if pad_token_id is not None else 0,
+        "eos_token_id": eos_token_id if eos_token_id is not None else 0,
+        "vocab_size": max(1, int(getattr(config, "vocab_size", 1))),
+        "context_length": max(
+            context_length,
+            int(getattr(config, "max_position_embeddings", 0)),
+        ),
+        "decoder": {
+            "filename": "backbone/model.onnx",
+            "session_options": {
+                "intra_op_num_threads": intra_op_threads,
+                "inter_op_num_threads": 1,
+                "session.intra_op.allow_spinning": "0",
+                "session.inter_op.allow_spinning": "0",
+            },
+        },
+    }
+    if bos_token_id is not None:
+        model["bos_token_id"] = bos_token_id
+    path = os.path.join(output_dir, "genai_config.json")
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump({"model": model}, file, indent=4)
+        file.write("\n")
+    return path
+
+
 def _mtp_state_ports(model: Any) -> list[dict[str, str]]:
     """Return exact local cache port pairs from one target or MTP graph."""
     output_names = {value.name for value in model.graph.outputs if value.name is not None}
@@ -2185,19 +2225,30 @@ def write_ort_genai_config(
             result[tf] = os.path.join(directory, tf)
 
     logger.info("Generating genai_config.json for %s (ep=%s)", ort_model_type, ep)
-    genai_path = _write_genai_config(
-        config,
-        directory,
-        pkg=pkg,
-        ort_model_type=ort_model_type,
-        ep=ep,
-        context_length=context_length,
-        bos_token_id=bos_token_id,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        is_vlm=is_vlm,
-        has_speech=has_speech,
-    )
+    if set(pkg) == {"backbone", "pointer_head"}:
+        genai_path = _write_component_genai_config(
+            config,
+            directory,
+            ep=ep,
+            context_length=context_length,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+    else:
+        genai_path = _write_genai_config(
+            config,
+            directory,
+            pkg=pkg,
+            ort_model_type=ort_model_type,
+            ep=ep,
+            context_length=context_length,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            is_vlm=is_vlm,
+            has_speech=has_speech,
+        )
     result["genai_config"] = genai_path
 
     # Write processor config for VLMs

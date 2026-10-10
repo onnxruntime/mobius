@@ -87,6 +87,19 @@ class TestGatedDeltaNet:
         assert count_op_type(graph, "Scan") == 0
         assert count_op_type(graph, "Conv") == 0
 
+    def test_forward_initializes_missing_states(self):
+        config = self._make_deltanet_config()
+        dn = GatedDeltaNet(config)
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 4, 64])
+
+        output, new_conv, new_rec = dn(op, hidden, None, None)
+        builder._adapt_outputs([output, new_conv, new_rec], "")
+
+        assert count_op_type(graph, "Expand") >= 2
+        assert count_op_type(graph, "CausalConvWithState") == 1
+        assert count_op_type(graph, "LinearAttention") == 1
+
     def test_forward_has_sigmoid_for_beta(self):
         config = self._make_deltanet_config()
         dn = GatedDeltaNet(config)

@@ -199,7 +199,9 @@ class Qwen35DecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             # DeltaNet states are passed through past_key_value as
             # (conv_state, recurrent_state), same tuple pattern as KV cache
-            conv_state, recurrent_state = past_key_value
+            conv_state, recurrent_state = (
+                past_key_value if past_key_value is not None else (None, None)
+            )
 
             attn_output, new_conv_state, new_recurrent_state = self.linear_attn(
                 op, hidden_states, conv_state, recurrent_state
