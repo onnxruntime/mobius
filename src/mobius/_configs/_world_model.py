@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Configuration for directly declared world models."""
+"""Configuration for directly declared latent-dynamics models."""
 
 from __future__ import annotations
 
@@ -12,12 +12,12 @@ from mobius._configs._base import BaseModelConfig
 
 
 @dataclasses.dataclass
-class WorldModelConfig(BaseModelConfig):
-    """Configuration shared by single-step world-model graphs.
+class LatentDynamicsConfig(BaseModelConfig):
+    """Configuration shared by single-step latent-dynamics graphs.
 
     The three shapes exclude the leading batch dimension. The default
-    :class:`~mobius.models.MLPWorldModel` flattens each value internally, while
-    custom modules may preserve their original ranks.
+    :class:`~mobius.models.MLPLatentDynamicsModel` flattens each value
+    internally, while custom modules may preserve their original ranks.
     """
 
     observation_shape: tuple[int, ...] = (1,)
@@ -44,7 +44,7 @@ class WorldModelConfig(BaseModelConfig):
         return math.prod(self.state_shape)
 
     def validate(self) -> None:
-        """Validate dimensions required by the world-model task and reference model."""
+        """Validate dimensions required by the dynamics task and reference model."""
         for name, shape in (
             ("observation_shape", self.observation_shape),
             ("action_shape", self.action_shape),
@@ -62,3 +62,9 @@ class WorldModelConfig(BaseModelConfig):
             raise ValueError("num_hidden_layers must be positive")
         if self.hidden_act is None:
             raise ValueError("hidden_act must be set")
+
+
+# Backward compatibility for the original, overly broad name. A full world
+# model is a pipeline of heterogeneous components; this config describes only
+# one state-transition component within such a pipeline.
+WorldModelConfig = LatentDynamicsConfig
