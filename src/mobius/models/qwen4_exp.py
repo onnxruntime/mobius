@@ -22,6 +22,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import Qwen4ExpConfig
 from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
@@ -35,6 +36,7 @@ from mobius.components import (
     get_activation,
     initialize_rope,
 )
+from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
 from mobius.models.base import effective_tie_word_embeddings
 from mobius.models.moe import Qwen2MoELayer
 from mobius.models.qwen_vl import Qwen3VLVisionEncoderModel, Qwen25VLEmbeddingModel
@@ -315,7 +317,12 @@ class Qwen4ExpGatedResidual(nn.Module):
         read = op.Sigmoid(self.input_mix_weight_up(op, read))
         read = op.Reshape(read, [0, 0, self._hc_count, self._hidden_size])
         streams = op.Reshape(normalized, [0, 0, self._hc_count, self._hidden_size])
-        mixed = op.ReduceMean(op.Mul(read, streams), [-2], keepdims=False)
+        weighted = op.Mul(read, streams)
+        # Match PyTorch's FP32 reduction accumulator and model-dtype result.
+        mixed = op.CastLike(
+            op.ReduceMean(op.Cast(weighted, to=ir.DataType.FLOAT), [-2], keepdims=False),
+            weighted,
+        )
         if self.block_inject_weight is None:
             return mixed
         inject = self.block_inject_weight(op, normalized)
@@ -759,8 +766,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
         present_index_key = op.Concat(past_index_key, current_key, axis=1)
 
         all_visible = op.Equal(
-            op.Squeeze(attention_bias, [1]),
-            op.CastLike(0.0, attention_bias),
+            op.Squeeze(op.Cast(attention_bias, to=ir.DataType.FLOAT), [1]),
+            op.Constant(value_float=0.0),
         )
         visible_count = op.ReduceSum(
             op.Cast(all_visible, to=ir.DataType.INT64), [2], keepdims=True
@@ -1056,6 +1063,11 @@ class Qwen4ExpExperts(nn.Module):
             router_probabilities,
             [-1, self._num_experts],
         )
+        if not ep_capabilities().supports_fused_moe:
+            output = self._standard_dispatch(op, flat_hidden, router_probs)
+            if self._routing_scale != 1.0:  # noqa: RUF069
+                output = op.Mul(output, op.CastLike(self._routing_scale, output))
+            return op.Reshape(output, original_shape)
         # Qwen computes softmax in float32, then the fused MoE consumes routing
         # probabilities in the same T as hidden/expert weights.
         router_probs = op.Cast(router_probs, to=self._dtype)
@@ -1092,6 +1104,77 @@ class Qwen4ExpExperts(nn.Module):
         if self._routing_scale != 1.0:  # noqa: RUF069
             output = op.Mul(output, op.CastLike(self._routing_scale, output))
         return op.Reshape(output, original_shape)
+
+    def _standard_dispatch(
+        self, op: OpBuilder, hidden: ir.Value, probabilities: ir.Value
+    ) -> ir.Value:
+        assert self._top_k is not None
+        weights, selected = op.TopK(
+            op.Cast(probabilities, to=ir.DataType.FLOAT),
+            op.Constant(value_ints=[self._top_k]),
+            axis=-1,
+            _outputs=2,
+        )
+        if self._normalize:
+            weights = op.Div(weights, op.ReduceSum(weights, [-1], keepdims=1))
+        weights = op.Cast(weights, to=self._dtype)
+        # Resolve parameters in the parent module scope; bodies capture these banks,
+        # rather than carrying or expanding expert weights through Scan.
+        gate_up_bank = op.Identity(self.gate_up_proj)
+        down_bank = op.Identity(self.down_proj)
+        accumulator = ir.Value(name="moe_accumulator", type=ir.TensorType(self._dtype))
+        expert_id = ir.Value(
+            name="moe_expert_id", type=ir.TensorType(ir.DataType.INT64), shape=ir.Shape([])
+        )
+        body, builder = create_body_graph([accumulator], [expert_id], name="moe_dispatch")
+        bop = builder.op
+        pairs = bop.Transpose(bop.NonZero(bop.Equal(selected, expert_id)), perm=[1, 0])
+        nonempty = bop.Greater(bop.Gather(bop.Shape(pairs), 0), 0)
+        active, active_builder = create_body_graph([], [], name="moe_nonempty")
+        aop = active_builder.op
+        tokens = aop.Gather(pairs, 0, axis=1)
+        token_indices = aop.Unsqueeze(tokens, [1])
+        inputs = aop.Gather(hidden, tokens, axis=0)
+        route_weights = aop.Unsqueeze(aop.GatherND(weights, pairs), [1])
+        gate_up = aop.Gather(gate_up_bank, expert_id, axis=0)
+        down = aop.Gather(down_bank, expert_id, axis=0)
+        projected = aop.MatMul(inputs, aop.Transpose(gate_up, perm=[1, 0]))
+        gate, up = aop.Split(
+            projected,
+            [self._intermediate_size, self._intermediate_size],
+            axis=-1,
+            _outputs=2,
+        )
+        activated = aop.Mul(aop.Mul(gate, aop.Sigmoid(gate)), up)
+        contribution = aop.Mul(
+            aop.MatMul(activated, aop.Transpose(down, perm=[1, 0])), route_weights
+        )
+        # TopK selects each expert at most once per token, so replacement scatter
+        # after gathering the old rows is a sum without duplicate-index ambiguity.
+        updated = aop.ScatterND(
+            accumulator,
+            token_indices,
+            aop.Add(aop.Gather(accumulator, tokens, axis=0), contribution),
+        )
+        updated.name = "moe_updated"
+        active.outputs.append(updated)
+        rename_subgraph_values(active, "moe_active_")
+        empty, empty_builder = create_body_graph([], [], name="moe_empty")
+        unchanged = empty_builder.op.Identity(accumulator)
+        unchanged.name = "moe_unchanged"
+        empty.outputs.append(unchanged)
+        rename_subgraph_values(empty, "moe_empty_")
+        result = bop.If(nonempty, then_branch=active, else_branch=empty)
+        result.name = "moe_next_accumulator"
+        body.outputs.append(result)
+        rename_subgraph_values(body, "moe_body_")
+        zero = op.Expand(op.CastLike(0.0, hidden), op.Shape(hidden))
+        return op.Scan(
+            zero,
+            op.Constant(value_ints=list(range(self._num_experts))),
+            body=body,
+            num_scan_inputs=1,
+        )
 
 
 class Qwen4ExpTopKGate(SoftmaxTopKGate):
@@ -1790,9 +1873,16 @@ class Qwen4ExpImageOnlyEmbeddingModel(Qwen25VLEmbeddingModel):
             ),
             input_ids,
         )
-        inputs_embeds = super().forward(
-            op,
-            safe_input_ids,
+        inputs_embeds = self.embed_tokens(op, safe_input_ids)
+        # HF replaces image placeholders only when a new image stream is supplied.
+        # Cached decode may emit an image token without supplying any new features.
+        image_mask = op.And(
+            op.Equal(safe_input_ids, op.Constant(value_int=self.image_token_id)),
+            op.Greater(op.Shape(image_features, start=0, end=1), [0]),
+        )
+        inputs_embeds = op.ScatterND(
+            inputs_embeds,
+            op.Transpose(op.NonZero(image_mask), perm=[1, 0]),
             image_features,
         )
 

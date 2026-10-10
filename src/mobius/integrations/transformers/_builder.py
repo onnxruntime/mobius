@@ -793,6 +793,11 @@ def build_transformers_model(
                 prefix_map=getattr(model_module, "weight_prefix_map", None),
             )
         validate_quantized_component_bindings(package, config)
+    if execution_provider == "onnx-standard":
+        from mobius._optimizations import validate_standard_onnx
+
+        for name, model in package.items():
+            validate_standard_onnx(model, component=name)
     return package
 
 

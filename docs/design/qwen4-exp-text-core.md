@@ -59,9 +59,11 @@ embeddings. Mobius reuses the Qwen3 vision implementation with DeepStack
 disabled and the merger projected to the decoder width of 2560.
 
 The embedding graph scatters `image_features` at token 248056 while preserving
-the original token IDs for PLE. The processor contract follows the evidenced Qwen3
-image processor with vision start/end tokens 248053/248054. This package is
-explicitly image-only: config extraction validates the checkpoint's video token
+the original token IDs for PLE. With an empty image-feature stream, it preserves
+all lexical embeddings, including an image token emitted during cached decode,
+matching the HF forward without new pixels. The processor contract follows the
+evidenced Qwen3 image processor with vision start/end tokens 248053/248054. This
+package is explicitly image-only: config extraction validates the checkpoint's video token
 but removes it from runtime metadata, the embedding graph exposes no video
 feature input, and direct configs that request video support fail closed. The
 embedding graph also publishes `mobius.unsupported_token_ids` and carries a
@@ -75,6 +77,99 @@ QSA uses standard ONNX operators to reproduce the selected-token mask, then
 runs ordinary dense attention under that mask. This is numerically faithful,
 including contiguous left padding, but it does not provide the memory savings
 of a dedicated sparse-attention runtime kernel.
+
+## Standard-ONNX-only export
+
+Select the existing `execution_provider="onnx-standard"` to export the text
+decoder or all three image-text components without custom-domain operators.
+Other EPs retain the existing fused `com.microsoft::MoE` route, parameter
+layouts, tasks, and cache ABI. No additional model alias or configuration flag
+is needed.
+
+The standard expert dispatch selects TopK from float32 router probabilities
+with a one-dimensional INT64 K tensor. When requested, it divides the selected
+probabilities by their float32 sum (not a second softmax), then casts route
+weights to model dtype. A single Scan traverses ascending expert IDs and carries
+only the `[T,H]` output accumulator, with no scan-output history. NonZero finds
+token/route pairs for each expert; an If skips empty experts. The nonempty branch
+scalar-gathers the expert's contiguous `[2I,H]` gate/up and `[H,I]` down matrices
+from lexically captured parent banks, applies SwiGLU, multiplies by route weights,
+and replaces the affected accumulator rows with their old values plus the
+contribution. Expert arithmetic and accumulation stay in model dtype; optional
+routed scaling is applied after accumulation. The shared sigmoid-gated expert
+is unchanged.
+
+The compute graph is independent of expert count: E=2 and E=512 tiny fixtures
+have the same recursive node count and exactly two MatMuls in the expert body.
+Weight storage remains O(EHI); per-expert activation workspace is O(RI+RH),
+where R<=T, plus routing `[T,K]` and accumulator `[T,H]`. There are no
+`[T,K,H,I]` gathered banks or dense `[T,E,I]` activations. Scan still visits all
+E experts and may incur control-flow, NonZero, and scatter overhead; this is
+not a sparse-kernel performance claim. Existing FP8 QDQ bank reconstruction can
+remain O(E) in runtime memory and is not optimized by this dispatch.
+
+Standard-only validation runs after optimization, after package opset lowering,
+and after Transformers dense/streaming/QDQ binding. It recursively checks main
+graphs, GRAPH/GRAPHS attributes, and remaining function signatures and bodies
+against standard domains and applicable ONNX schemas. Unresolved custom ops
+fail with component/path/domain/op diagnostics instead of a warning or EP
+fallback. This global guard may expose previously unresolved exports in other
+architectures; it does not change other EPs.
+
+Local evidence uses tiny synthetic text/image-text graphs, ONNX full checker
+validation in FP32/FP16/BF16, independent FP32 expert parity (K=1/intermediate/E,
+ties, near ties, saturated logits, normalization, scaling, mixed/unused experts,
+batches and single tokens), FP16 routing execution, complete cache/logit
+prefill/decode comparisons across the QSA boundary, left padding, multimodal
+decoder parity, a nonzero vision→embedding→decoder pipeline, and reduced dense
+and storage-preserving FP8 QDQ streaming fixtures. The existing ORT
+`1.30.0.dev20260823001` CPU runtime executes the FP32 tests and the tiny FP16
+expert fixture; its BF16 expert fixture stops at the missing `Expand(13)`
+kernel. Schema validity is not proof of kernel support for every dtype,
+efficient sparse execution, or full-checkpoint generation parity. No full
+checkpoint generation or performance benchmark is claimed.
+
+This change does not enable video, MTP execution, GGUF payload loading, GenAI
+engine integration, or a paged-cache ABI.
+
+### Independent reduced-model parity
+
+The focused integration tests use randomly initialized HF models, not outputs
+from another Mobius graph. The reference source is Transformers commit
+`598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1`; it requires
+`tokenizers>=0.23.1,<0.24.0`. Install or expose that reference in an isolated
+environment before running:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m pytest \
+  src/mobius/models/qwen4_exp_test.py -q -m integration \
+  -k "reduced_random_weight_huggingface or reduced_standard_huggingface"
+```
+
+The standard-ONNX cases run FP32 on CPU/CUDA and BF16 on CUDA. They compare full
+prefill and per-step logits, greedy token choices, linear convolution/recurrent
+state, PLE convolution/context,
+QSA key/value/indexer caches, and position history. Text prefill spans the sparse
+selection boundary and is followed by six cached decode steps. The image-text
+case compares two nonzero, differently shaped image grids through the actual
+ONNX vision-to-embedding-to-decoder pipeline, independently checking vision
+features and HF-fused embeddings, then three decode steps with no new images.
+Shapes and dtypes are checked alongside numerical values; tolerances are
+`rtol=atol=1e-3` for FP32 and `1e-2` for BF16. Recurrent state remains FP32
+even when weights, embeddings, and convolution/KV caches are BF16. The expert
+fixture separately checks FP16/BF16 CUDA dispatch with an empty expert branch
+and near-tie float32 routing probabilities.
+
+The hyper-connection mean retains the rounded model-dtype products, reduces
+them with an FP32 accumulator, then casts the result back to model dtype,
+matching the HF mean without requiring an ORT BF16 ReduceMean kernel. QSA
+compares the mask bias to zero in FP32, avoiding a BF16 Equal kernel without
+changing visibility.
+
+This is independent reduced-model evidence, not official checkpoint parity,
+semantic generation quality, full-size-model reduced-precision parity, or GenAI
+driver compatibility. Tests skip when the experimental HF classes are absent;
+CUDA cases additionally require an available CUDA device and ORT CUDA provider.
 
 ## Guarded features
 
