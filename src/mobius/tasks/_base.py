@@ -236,13 +236,13 @@ def build_decoder_from_embeds(
         decoder: The decoder sub-module to invoke.
         config: Architecture configuration.
         mrope: If ``True``, uses 3D MRoPE position_ids
-            ``[3, batch, seq_len]`` instead of the standard
-            ``[batch, seq_len]``.
+            ``[3, batch_size, sequence_length]`` instead of the standard
+            ``[batch_size, sequence_length]``.
         hybrid: If ``True``, uses hybrid KV + DeltaNet cache inputs/outputs
             (for Qwen3.5-VL and similar).  Requires ``config.layer_types``.
         deepstack: If ``True`` (Qwen3-VL family with
             ``deepstack_visual_indexes``), adds a ``per_layer_inputs`` input
-            ``[batch, seq_len, D * hidden_size]`` that the decoder reshapes and
+            ``[batch_size, sequence_length, D * hidden_size]`` that the decoder reshapes and
             injects into its first ``D`` layers.
 
     Returns:
@@ -259,9 +259,9 @@ def build_decoder_from_embeds(
         _register_linear_attention_functions,
     )
 
-    batch = ir.SymbolicDim("batch")
-    seq_len = ir.SymbolicDim("sequence_len")
-    past_seq_len = ir.SymbolicDim("past_sequence_len")
+    batch = ir.SymbolicDim("batch_size")
+    seq_len = ir.SymbolicDim("sequence_length")
+    past_seq_len = ir.SymbolicDim("past_sequence_length")
 
     graph, builder = _make_graph()
     inputs_embeds = builder.input(
@@ -272,10 +272,9 @@ def build_decoder_from_embeds(
     attention_mask = builder.input(
         "attention_mask",
         dtype=ir.DataType.INT64,
-        shape=[batch, "past_seq_len + seq_len"],
+        shape=[batch, "total_sequence_length"],
     )
-    # MRoPE: 3D position IDs (temporal, height, width) — shape [3, batch, seq_len]
-    # Standard: shape [batch, seq_len]
+    # MRoPE: 3D position IDs (temporal, height, width).
     position_ids = builder.input(
         "position_ids",
         dtype=ir.DataType.INT64,
@@ -283,7 +282,7 @@ def build_decoder_from_embeds(
     )
 
     # DeepStack intermediate vision features, pre-scattered and flattened by
-    # the embedding model. Shape [batch, seq_len, D * hidden_size], matching
+    # the embedding model. Shape [batch_size, sequence_length, D * hidden_size], matching
     # ORT GenAI's generic per_layer_inputs contract.
     per_layer_inputs = None
     num_deepstack = len(getattr(config, "deepstack_visual_indexes", None) or [])
