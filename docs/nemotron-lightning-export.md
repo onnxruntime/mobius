@@ -85,6 +85,19 @@ evidence, not the runnable `run_validation.py`, reference implementation,
 input/cache fixtures, provider profile, or optimized graph; those remote
 `/home/mobius/...` paths are not accessible in the local session.
 
+Local diagnosis reproduces those **source distinctions**, not the full-model
+failure. The pinned native fallback source bytes match the reported native
+module SHA256 `5417d6f8dcbee945d4f1c4ae5327b0d1f443b29cc99098c99ec7befb9c9afcd8`.
+Invoking its original CPU fallback bodies with dispatch decorators removed gives
+synthetic prefill output/state NRMSE 7.13e-8 / 4.61e-8. Native unclamped cached
+updates differ from bounded updates (NRMSE up to 0.00714 in this fixture, below
+the full-model gate). Native BF16 bias/softplus and state-cast-before-readout
+boundaries are independently reproduced, but their synthetic differences do
+not establish the remaining H100 cause or authorize changing export semantics.
+Regression tests cover two-row prefill plus three reused-state calls, grouped
+B/C, active/inactive timestep minimum, output/conv/FP32 SSM and cast boundaries.
+Acceptance thresholds and the production recurrence remain unchanged.
+
 The original preflight host was Windows ARM64 with a Qualcomm Adreno X1-85,
 no NVIDIA/CUDA GPU or `nvidia-smi`, Python 3.12.10, 68,171,038,720 bytes RAM
 and approximately 818 GB free disk. Mobius, PyTorch, Transformers, ORT and
