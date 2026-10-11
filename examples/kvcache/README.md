@@ -53,11 +53,11 @@ serialized graph signatures are:
 | Baseline (Qwen 59 / Gemma 39) | `input_ids`, `attention_mask`, `position_ids`, and `past_key_values.<layer>.key` / `.value` for every layer | `logits`, and `present.<layer>.key` / `.value` for every layer (Qwen 57 / Gemma 37) |
 | Converted (Qwen 31 / Gemma 21) | `input_ids`, `attention_mask`, `position_ids`, and `past_cache_<layer>` for every layer | `logits` and `present_cache_<layer>` for every layer (Qwen 29 / Gemma 19) |
 
-The converter replaces each tensor-cache pair with one opaque cache input and
-output per layer, converts Q/K/V to the operator's BNSD layout, and preserves
-the original mask, absolute positions, projections, Qwen3's Q/K normalization,
-RoPE, grouped-query head mapping, causal semantics, and per-layer attention
-geometry.
+The converter replaces each tensor-cache pair with one abstract,
+runtime-owned cache value input and output per layer, converts Q/K/V to the
+operator's BNSD layout, and preserves the original mask, absolute positions,
+projections, Qwen3's Q/K normalization, RoPE, grouped-query head mapping,
+causal semantics, and per-layer attention geometry.
 The external `attention_mask` is the original INT64 logical token mask with
 shape `[B,past_tokens + query_tokens]`. The graph constructs the rank-4
 Attention mask from it: BOOL for Qwen3 and FLOAT additive bias for Gemma 3;
@@ -90,7 +90,7 @@ Conversion intentionally fails closed if cache tensors are consumed outside
 their layer's Attention node, diagnostic Attention outputs are present, head
 geometry is inconsistent, or an unsupported Attention attribute would be
 lost. The protobuf-level rewrite is isolated in `convert_to_kv_cache.py`
-because the experimental opaque type is not yet representable through the
+because the experimental cache type is not yet representable through the
 stable ONNX IR API.
 
 ## Runtime and comparison
@@ -110,14 +110,17 @@ python -m pip install "C:\Users\grama\.copilot\session-state\51a9868f-d303-40e4-
 ```
 
 It was built in Release with Visual Studio 2022 CMake 3.31.6; plain editable
-installation is not verified on Windows.
+installation is not verified on Windows. The ONNX and ONNX Runtime commits
+used below are currently local and unpublished. The source checkouts shown in
+the commands are local worktrees; remote clones will not contain these pins
+until publication is separately authorized and completed.
 
 To reproduce that Release wheel from the pinned source checkout, ensure CMake
 3.31.6 is on `PATH`, map the checkout to a short drive to avoid MSBuild's
 260-character path limit, then run:
 
 ```powershell
-git clone https://github.com/gramalingam/onnx.git C:\src\onnx-kvcache
+git clone C:\repos\copilot-worktrees\onnx\gramalingam-bookish-broccoli C:\src\onnx-kvcache
 Set-Location C:\src\onnx-kvcache
 git checkout 4443045c53d13a8d3157fcbd2cd5e52450a0784b
 subst K: C:\src\onnx-kvcache
@@ -134,7 +137,7 @@ The native ONNX Runtime fork can be built from its source pin with CPython
 3.13, Visual Studio 2022 C++ tools/Windows SDK, Git, CMake, and Ninja available:
 
 ```powershell
-git clone https://github.com/microsoft/onnxruntime.git C:\src\onnxruntime-kvcache
+git clone C:\repos\copilot-worktrees\onnxruntime\gramalingam-cuddly-adventure C:\src\onnxruntime-kvcache
 Set-Location C:\src\onnxruntime-kvcache
 git checkout 11a522b835ee41b53c6d293a35c7c7135e2dfd5d
 python -m venv .venv
