@@ -123,7 +123,7 @@ class GatedDeltaNet(nn.Module):
             linear_class = Linear
         self.hidden_size = config.hidden_size
         self._dtype = config.dtype
-        self._stash_type = getattr(config, "mamba_ssm_dtype", config.dtype)
+        self._stash_type = getattr(config, "mamba_ssm_dtype", None) or config.dtype
         self._qk_l2norm_eps = getattr(config, "linear_qk_l2norm_eps", 0.0)
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -290,6 +290,9 @@ class GatedDeltaNet(nn.Module):
             _domain="com.microsoft",
             _outputs=2,
         )
+        # The contrib op lacks a standard schema for builder type propagation.
+        output_3d.type = ir.TensorType(self._stash_type)
+        new_recurrent_state.type = ir.TensorType(self._stash_type)
         # output_3d: (B, T, num_v_heads * d_v) — already 3D
         if self._stash_type != self._dtype:
             output_3d = op.CastLike(output_3d, hidden_states)

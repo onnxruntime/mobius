@@ -231,6 +231,7 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "glm_ocr_text",
         "qwen3_vl_text",
         "qwen3_5",
+        "qwen3_5_text",
         "qwen3_5_vl",
         "qwen3_5_vl_text",
         "qwen3_5_moe",
@@ -244,6 +245,7 @@ _QWEN_VL_MODEL_TYPES = frozenset(
 _QWEN35_VL_MODEL_TYPES = frozenset(
     {
         "qwen3_5",
+        "qwen3_5_text",
         "qwen3_5_vl",
         "qwen3_5_vl_text",
         "qwen3_5_moe",
@@ -1290,15 +1292,10 @@ def _write_vision_processor_config(
                 }
             )
         elif model_type in _QWEN_VL_MODEL_TYPES:
-            # Qwen-VL models need the PatchImage transform to extract
-            # temporal+spatial patches, and qwen2_5_vl/qwen3_vl flag
-            # on Normalize for correct interleaving.
+            # DecodeImage(color_space="RGB") already emits RGB. Normalize's
+            # qwen2_5_vl/qwen3_vl flags perform BGR->RGB swaps, not interleaving:
+            # keep ordinary RGB normalization. PatchImage owns patch layout.
             temporal_patch_size = config.temporal_patch_size
-            # Add qwen3_vl flag to the Normalize step
-            for t in transforms:
-                op = t.get("operation", {})
-                if op.get("type") == "Normalize":
-                    op.setdefault("attrs", {})["qwen2_5_vl"] = 1
             transforms.append(
                 {
                     "operation": {
@@ -1581,25 +1578,12 @@ def _write_genai_config(
     # node, the model supports shared-buffer mode; otherwise force it off
     # regardless of the EP capability flag.
     #
-    # ``com.microsoft.LinearAttention`` (linear/recurrent-attention layers,
-    # e.g. Qwen3.5's GatedDeltaNet) is a separate, *mandatory* case: its
-    # recurrent state requires ``past_present_share_buffer=True`` regardless
-    # of whether any other layer uses GQA (ORT GenAI raises "RecurrentState
-    # requires past_present_share_buffer=true" otherwise).
-    #
-    # Hybrid models mix LinearAttention layers with full-attention layers,
-    # which may lower to GQA *or* to the standard (non-GQA) ``Attention`` op
-    # depending on EP/dtype (e.g. the CPU EP only lowers to GQA for fp32;
-    # fp16 falls back to standard Attention -- see ``_execution_providers.py``
-    # ``gqa_dtypes``). If a hybrid graph has LinearAttention but its
-    # full-attention layers are still standard (non-GQA) Attention, forcing
-    # ``past_present_share_buffer=True`` produces an unrunnable config: the
-    # recurrent state requires it, but standard Attention's dynamic-shape KV
-    # concat cannot honor a pre-allocated shared buffer, which fails at
-    # generation time with an ``attn_mask``/``total_sequence_length``
-    # mismatch rather than at load time. Rather than silently emit a broken
-    # config, raise a clear error so the caller picks an EP/dtype combination
-    # (e.g. fp32 on CPU) that lowers full attention to GQA.
+    # Preserve the legacy sharing policy for fused LinearAttention graphs.
+    # This is not a universal recurrent-state requirement: native runtime
+    # versions differ in their support for non-shared recurrent-state swaps.
+    # A standard-only hybrid graph has neither custom op and therefore emits
+    # sharing=False, as its dynamic full-attention KV outputs require. Native
+    # progression/reset must be qualified separately for the installed build.
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
         has_gqa = any(
@@ -2204,7 +2188,9 @@ def write_ort_genai_config(
     processor_path = _write_vision_processor_config(
         config,
         directory,
-        hf_model_id=hf_model_id,
+        # --config uses local HF assets too: otherwise the processor silently
+        # retains CLIP defaults instead of the checkpoint's normalization/bounds.
+        hf_model_id=hf_model_id or local_config_dir,
         trust_remote_code=trust_remote_code,
         revision=revision,
     )
