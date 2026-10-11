@@ -1,6 +1,6 @@
 # Nemotron 3.5 Lightning: reconstruction and compatibility gates
 
-**CPU-tested exporter improvements; full-model generation remains blocked.**
+**CPU-tested exporter improvements; full-model numerical readiness remains blocked.**
 The [machine-readable recipe](../examples/nemotron_lightning/recipe.json)
 records immutable inputs and compatibility limits. Native NVFP4 remains
 unsupported. Explicit dense BF16 reconstruction is implemented and tested
@@ -47,6 +47,43 @@ comparisons, then require complete generation-token agreement. Original
 exports and checkpoint files must remain unchanged. The remaining decoder
 discrepancy needs a first-divergent-stage comparison and an inspected source
 reference; this correction alone is **not** a claim of resolved full parity.
+
+### Updated user-supplied H100 evidence (2026-10-11)
+
+The supplied report at checkout `a72b658f0874c8d8761bc64f5222a27d0e3dc1c7`
+and the original pinned BF16 revision reports **15 normalization cases passing,
+including all five BF16 CUDA cases**, source fidelity passing for 6243 target
+and 270 MTP tensors (6515 comparisons including shared copies), and exact
+eight-token generation passing. This replaces the earlier generation failure
+**for this run only**. Conditional MTP passes 12 comparisons, with maximum
+NRMSE 0.0047783538309905 and minimum cosine 0.9999894304916273.
+
+Full decoder parity still fails **141 of 240 comparisons**, with maximum NRMSE
+0.10049961190760874 and minimum cosine 0.9952473196233278, against unchanged
+NRMSE <= 0.03 / cosine >= 0.999 / finite gates. Short token agreement and
+conditional MTP do not clear this gate; speculative integration is NOT_RUN.
+These are user-provided remote observations, not locally rerun H100 tests.
+
+The report separates precision amplification from identical-input operators:
+prefill first fails the layer-4 convolution-state gate, while the first hidden
+failure is layer 34. Identical-input audits of Mamba layers 0/4/16 show FP32
+recurrence readout NRMSE <= 6.1e-7 with the same timestep, near-exact grouped
+norm, and matching native FP32 router expert sets on the same BF16 inputs.
+Different FP32 upstream inputs change some layer-34 expert selections.
+Layer-4 pre-Mamba norm agrees on the same exposed rounded BF16 residual,
+qualified because fused SkipNorm may normalize before residual-output rounding.
+None of these observations proves full-model parity or justifies a blanket
+recurrence or normalization change.
+
+The native FP32 CPU-fallback reference audit agrees on prefill (112 comparisons,
+maximum NRMSE 1.55e-6), but differs on cached steps. A **reference-only**
+diagnostic omitting the timestep minimum clamp on cached updates matches native
+fallback behavior; the baseline exporter and validation reference were unchanged.
+This establishes a reference-contract question, not fused native BF16 CUDA proof
+or permission to replace the acceptance reference. The report is structured
+evidence, not the runnable `run_validation.py`, reference implementation,
+input/cache fixtures, provider profile, or optimized graph; those remote
+`/home/mobius/...` paths are not accessible in the local session.
 
 The original preflight host was Windows ARM64 with a Qualcomm Adreno X1-85,
 no NVIDIA/CUDA GPU or `nvidia-smi`, Python 3.12.10, 68,171,038,720 bytes RAM
@@ -254,9 +291,16 @@ FP32-reference comparison at `rtol=atol=1e-2`.
 Tiny tests also cover mixed FP8/NVFP4 reconstruction with floating MTP and a
 shared reconstructed head, exact graph/cache I/O, f32/f16/bf16 graph dtypes,
 CLI serialization, strict source accounting and checkpoint-save protection.
-BF16 execution/parity, full weighted 30B MTP, CUDA/H100,
-performance, Olive requantization and L4/L5 real-weight goldens are **NOT_RUN**;
-no full-model numerical or speedup claim is made.
+Local full-weight BF16/CUDA execution, performance, Olive requantization and
+L4/L5 real-weight goldens remain **NOT_RUN**. The separately supplied H100
+conditional MTP/generation results above are not full decoder parity or a
+speedup claim.
+
+`NemotronHSpeculativeModel` is the public paired builder module; the draft
+implementation is private and does not advertise a standalone public task.
+External coordination metadata declares dedicated draft embedding/head tables
+because the graph consumes token IDs and emits logits. Their checkpoint sources
+are shared with the target, but their runtime storage/ABI is not `shared_target`.
 
 ORT-GenAI metadata can describe the external coordination contract and marks
 it `runtime_unvalidated`. The exporter does **not** implement speculative

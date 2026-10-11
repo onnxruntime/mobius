@@ -1943,13 +1943,19 @@ def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
         raise ValueError("MTP runtime metadata requires a target decoder graph")
     dedicated_embeddings = bool(getattr(proposer_config, "use_dedicated_embeddings", False))
     dedicated_lm_head = bool(getattr(proposer_config, "use_dedicated_lm_head", False))
+    lightning_contract = (
+        mtp_model.metadata_props.get("mobius.mtp_contract") == "nemotron-h-lightning-nextn@1"
+    )
+    if lightning_contract:
+        # Shared checkpoint sources are copied into physically dedicated draft tables.
+        dedicated_embeddings = dedicated_lm_head = True
     conditioning = {
         "target_hidden_output": "mtp_seed",
         "target_hidden_input": "hidden_states",
         "embedding": "dedicated" if dedicated_embeddings else "shared_target",
         "lm_head": "dedicated" if dedicated_lm_head else "shared_target",
     }
-    if mtp_model.metadata_props.get("mobius.mtp_contract") == "nemotron-h-lightning-nextn@1":
+    if lightning_contract:
         conditioning.update(
             target_hidden_normalization="post_final_norm",
             token_alignment="target_h_i_with_token_t_i_plus_1",
