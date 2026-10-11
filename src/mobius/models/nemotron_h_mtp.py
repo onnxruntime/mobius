@@ -91,7 +91,7 @@ class _FinalMoELayer(NemotronHMoELayer):
         return self.final_layernorm(op, hidden_states)
 
 
-class NemotronHMtpModel(nn.Module):
+class _NemotronHMtpModel(nn.Module):
     """Standalone draft computation with target-shared embedding and LM head.
 
     Inputs: token IDs for t_(i+1), post-final-norm target h_i, a padding mask,
@@ -101,7 +101,6 @@ class NemotronHMtpModel(nn.Module):
     """
 
     config_class: type = NemotronHConfig
-    default_task: str = "nemotron-h-mtp"
     category: str = "Mixture of Experts"
 
     def __init__(self, config: NemotronHConfig):
@@ -161,7 +160,7 @@ class NemotronHSpeculativeModel(nn.Module):
         self.config = config
         # The explicit package preserves auxiliary tensors in a separate graph.
         self.decoder = _MtpSeedTarget(config, target_decoder_only=True)
-        self.mtp = NemotronHMtpModel(config)
+        self.mtp = _NemotronHMtpModel(config)
         # Each component is its own graph root, not a nested parameter namespace.
         self.decoder._set_name("")
         self.mtp._set_name("")

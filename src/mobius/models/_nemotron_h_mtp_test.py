@@ -29,9 +29,9 @@ from mobius.integrations.transformers._nemotron_h_weights_test import (
 )
 from mobius.models.nemotron_h import NemotronHMoELayer
 from mobius.models.nemotron_h_mtp import (
-    NemotronHMtpModel,
     NemotronHSpeculativeModel,
     _FinalMoELayer,
+    _NemotronHMtpModel,
     mtp_source_name,
 )
 
@@ -55,6 +55,21 @@ def _graph_package(dtype="f32"):
         "bf16": ir.DataType.BFLOAT16,
     }[dtype]
     return build_from_module(NemotronHSpeculativeModel(config), config, task="nemotron-h-mtp")
+
+
+def test_public_speculative_wrapper_builds_with_its_default_task():
+    import mobius.models as models
+
+    config = NemotronHConfig.from_transformers(SimpleNamespace(**_raw()))
+    module = models.NemotronHSpeculativeModel(config)
+    assert module.default_task == "nemotron-h-mtp"
+    assert set(build_from_module(module, config, task=module.default_task)) == {
+        "decoder",
+        "mtp",
+    }
+    assert "NemotronHMtpModel" not in models.__all__
+    assert not hasattr(models, "NemotronHMtpModel")
+    assert not hasattr(module.mtp, "default_task")
 
 
 def test_final_moe_layer_accepts_and_forwards_base_positional_contract(monkeypatch):
@@ -431,6 +446,12 @@ def test_intrinsic_runtime_metadata_has_precise_external_contract(tmp_path):
     assert payload["conditioning"]["token_alignment"] == "target_h_i_with_token_t_i_plus_1"
     assert payload["conditioning"]["draft_prediction"] == "token_t_i_plus_2"
     assert payload["conditioning"]["tables"] == "target_shared_sources_copied_into_draft_graph"
+    assert payload["conditioning"]["embedding"] == "dedicated"
+    assert payload["conditioning"]["lm_head"] == "dedicated"
+    assert payload["shared_embedding"] is None
+    assert payload["shared_lm_head"] is None
+    assert "input_ids" in payload["inputs"]
+    assert "logits" in payload["outputs"]
     assert payload["cache_namespaces"]["target"]["ports"]
     assert payload["cache_namespaces"]["mtp"]["ports"]
     assert payload["num_nextn_predict_layers"] == 1
@@ -452,7 +473,7 @@ def test_pinned_production_mtp_parameter_shapes():
         "moe_shared_expert_intermediate_size": 3712,
     }
     config = NemotronHConfig.from_transformers(SimpleNamespace(**raw))
-    model = NemotronHMtpModel(config)
+    model = _NemotronHMtpModel(config)
     expected = {
         "mtp.layers.0.enorm.weight": [2688],
         "mtp.layers.0.hnorm.weight": [2688],
