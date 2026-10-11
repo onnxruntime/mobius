@@ -337,6 +337,145 @@ The results and rounding diagnosis are retained in
 artifact disk. Prior Torch/raw-ORT results are frozen references, not fresh
 reruns. The existing official FP16 full-logit parity blocker remains open.
 
+### Input-size and repeated-inference memory findings
+
+The native AI2D200 runner used one Python process and one Model for the entire
+ordered subset, creating and deleting a Generator per question. Its preserved
+runner SHA256 is
+`e7f0306d524f04d1a527d9470929a447a54edd626e08c8e8afd56012fe0b5541`.
+Observed native prompt lengths (including image tokens) have median 314.5
+and maximum 1,705; image patch rows have median 1,064 and maximum 6,580.
+Generation was capped at 16 tokens. These are observed subset bounds, not
+dataset-wide maxima or a deployment-safe input limit.
+
+A separate full-resolution large-image diagnostic used 4,875 prompt tokens,
+19,200 patch rows, and a 128-token generation cap. With the same Model kept
+alive and a fresh Generator per call, the first call completed and exactly
+matched the standalone tokens, text, processor tensors, and prompt. The
+second call failed at decoder layer 3's `Attention_node_335`, requesting
+4,563,000,320 bytes. GPU usage rose from 57,947 MiB after Model loading to
+81,133 MiB after the first call, leaving 20 MiB free; deleting the Generator
+and collecting garbage did not reduce that usage while the Model remained
+alive. Process exit restored 81,150 MiB free and 4 MiB used.
+
+This diagnostic used an isolated GenAI build at source commit
+`265917c09ffe68198a026e086d21e694cc938298` with a one-line last-token logits
+allocation correction and package-local `$ORIGIN` RPATH. It retained the
+installed ORT library (SHA256
+`5a2e81ad05259bce596e29d6361fe76750b6c2c9569b8cdddf709ab0d944b0ee`),
+unchanged ONNX graphs, full-resolution images, and generation policy.
+It is not the installed GenAI binary used for AI2D200; that binary's
+originating source commit is unknown. The external GenAI correction is
+not included in this Mobius PR and did not resolve repeated-inference OOM.
+
+The exported decoder contains 16 standard Attention nodes with explicit
+FP16 masks and dynamic past/present KV ports, and no TensorScatter nodes.
+For the failing 4,875-token case, the local ORT unfused workspace formula
+matches the requested bytes exactly:
+`2 * align256(24 * 4875 * 4875 * sizeof(float)) = 4,563,000,320`.
+The inspected CUDA dispatch rejects Flash with an explicit mask and rejects
+MEA when a masked KV row stride is not a multiple of four; `4875 % 4 = 3`.
+This is strong source-and-size evidence for unfused Attention workspace,
+not a captured installed-binary dispatch trace. Exact correspondence of
+the inspected ORT source to the installed binary remains unverified.
+Other large-image attempts also failed in the vision encoder, so decoder
+KV-cache changes alone are not established as a complete remedy.
+
+Repeated-inference failure is confirmed, but live tensor ownership, arena
+retention, and fragmentation have not been distinguished. It is not a proven
+KV-cache leak, graph incompatibility, or numerical-parity fix. TensorScatter
+static-cache A/B testing has not been performed. Deployment needs validated
+post-processor input bounds, generation/concurrency budgets, and repeated
+mixed-size request testing; AI2D200 success alone does not qualify those.
+No MMMU accuracy result is claimed here.
+
+Evidence remains under `genai-runtime-fix-01/probes/candidate-case56-repeat01/`
+(`receipt.json`, `execution.json`) on the qualification artifact disk,
+alongside the immutable AI2D records. No additional benchmark run or graph
+change is part of this documentation update.
+
+### Native numerical diagnostics and reset
+
+Actual native ORT GenAI was compared with the pinned HF FP16 reference using
+native processor snapshots and a native-selected token prefix. HF maintained
+its own cache; no HF tensors or states were injected into GenAI. This isolates
+model numerics from independent preprocessing and generation, and is not a
+replacement for the independently generated AI2D results above.
+
+The completed cases cover text and AI2D indices 0, 124, and 130, plus repeated
+text/image and a fresh-generator text reset. Each completed case compares
+prefill and four cached decode forwards: all 248,320 last-position logits
+and all 128 convolution, recurrent, and KV outputs. Raw graph logits are
+FP16; the GenAI logits API's FP32 promotion was verified separately.
+
+At unchanged `rtol=atol=1e-2`, all 35 paired forward comparisons failed
+full-vocabulary logit tolerance, while all 35 argmax predictions matched.
+These include repeated cases, not 35 independent examples. Of 4,480 state
+comparisons, 2,907 passed and 1,573 failed. Maximum absolute errors were
+0.236328125 for logits and 85.25 for states. There were no shape, dtype, or
+nonfinite failures in those numerical comparisons. The first failing cache
+layer for text was layer 31; image cases could fail at earlier layers.
+Neither this observation nor output-token agreement identifies the root
+cause or clears the numerical gate.
+
+In the repeat run, all 30 directly captured native `position_ids` and
+`attention_mask` comparisons exactly matched HF-derived shapes, int64
+dtypes, and values. Recreating the generator after an intervening image
+case reproduced all five text logits bitwise, all 640 state hashes, and
+the selected tokens. This establishes reset repeatability and input
+agreement only for those tested cases.
+
+The two-image native processor emits two maximum-length patch slots:
+1,064 and 864 valid patches become 2,128 stored rows, including 200 zero
+padding rows, while the grids describe 1,928 valid patches. Native prefill
+executed with finite logits and all expected state schemas, but HF could
+not consume that unchanged padded snapshot. Its paired numerical case
+remains blocked; this is not proof that the native pipeline is incompatible.
+No unpadding, repacking, resizing, or tolerance change was used.
+
+Receipts, full-vocabulary vectors, input captures, and state hashes are in
+`genai-integration/native-numerical-validation-01/attempt-03/`, including
+`final-consolidated-receipt.json` and `reset-receipt.json`. The preceding
+attempt-02 evidence is preserved unchanged. Official FP16 numerical
+qualification remains failed; task-level validation does not waive it.
+
+### CI disposition for the implementation head
+
+At implementation head `9e8d6aa88ee16a8db77df1dbe0b1a1e585d99d61`,
+CI run `37867805012` did not complete its L4/L5 golden suites. Both
+check-run annotations explicitly state that the jobs exceeded the
+one-hour execution limit. Cancellation is not a successful numerical
+or generation test, and the partial logs also contain failed test markers.
+
+The exact base is `26a712b210a0a7cd895347f601680e82bbf5e452`.
+Its main CI run `37681522335` and scheduled L4/L5 runs `37882646916` and
+`37886682810` also ended without completing those suites. All 24 named
+L4 failures observed on the PR head have failed markers on that exact
+base. For L5, 19 of 20 named head failures have corresponding base
+failed markers. This is overlap of observed failures, not proof that
+their root causes or complete test outcomes are identical.
+
+The remaining L5 case is
+`test_generation_matches_golden[text-generation/granitemoe-1b]`.
+It failed on the PR head, but neither inspected base L5 job reached it
+before cancellation. Its baseline disposition is therefore unresolved;
+absence from the base failure list is not a base pass.
+
+The pinned SmolLM FP16 CPU ORT GenAI job was skipped by the PR workflow's
+existing configuration: the caller passes `run_real: false`, and the
+real lane requires that input or a scheduled/manual event. This is not
+evidence that Qwen or the pinned released runtime passed that job.
+
+The filtered logs, annotations, exact-base comparisons, and unresolved
+case coverage are retained in `genai-integration/` as
+`ci-disposition-before-mmmu200.json`,
+`ci-golden-direct-api-log-proof.json`,
+`ci-golden-node-comparison.json`, and
+`ci-granitemoe-l5-disposition.json`. This historical disposition must
+not be presented as the status of a later documentation/publication head.
+Any merge acceptance of incomplete qualification requires an explicit
+maintainer decision; this evidence does not declare the PR merge-ready.
+
 ### Reproducing graph checks
 
 Run from the repository root with Transformers and CUDA ORT available:
@@ -442,3 +581,24 @@ In particular, mixed FP16 convolution/FP32 recurrent state must be qualified
 against the intended GenAI runtime separately. Quantized text-only component
 plans and their module exclusions are outside this unquantized qualification.
 BF16, MTP, and performance qualification are also outside the current evidence.
+
+## Input-size and repeated-inference findings (October 11, 2026)
+
+The completed native AI2D200 result remains **174/200 (87%)**, compared with frozen HF **175/200 (87.5%)** and raw ORT **174/200 (87%)**. Native/HF tokens matched 199/200 and native/raw tokens 198/200. AI2D used **one process and one Model for all 200 questions**, with a fresh Generator per question; it was not a per-question process-isolation run.
+
+| Observed native AI2D200 input | Median | Maximum |
+|---|---:|---:|
+| Prompt tokens, including image tokens | 314.5 | 1,705 |
+| Image patch rows | 1,064 | 6,580 |
+
+Generation was capped at 16 tokens. These are bounds of the tested subset, **not dataset-wide maxima or a validated deployment-safe limit**.
+
+A separate large-image memory diagnostic used 4,875 prompt tokens, 19,200 patch rows, and a 128-token cap. The first call completed; a second identical call on the same Model with a new Generator failed at decoder layer 3 `Attention_node_335`, requesting **4,563,000,320 bytes**. After the first call, GPU usage was 81,133 MiB with only 20 MiB free; deleting the Generator and GC did not reduce usage while the Model stayed alive. Process exit restored 81,150 MiB free / 4 MiB used. The first call exactly matched the standalone tokens, text, processor tensors, and prompt.
+
+This diagnostic used an **isolated GenAI build**, source `265917c09ffe68198a026e086d21e694cc938298`, with a one-line last-token logits allocation correction and package-local `$ORIGIN` RPATH; actual loaded installed ORT SHA256 remained `5a2e81ad05259bce596e29d6361fe76750b6c2c9569b8cdddf709ab0d944b0ee`. Graphs, weights, images, and generation policy were unchanged. It is not the installed GenAI binary used for AI2D200; the installed GenAI source origin is unknown. **The external GenAI correction is not included in this Mobius PR and does not resolve repeated-inference OOM.**
+
+The decoder export has 16 standard Attention nodes, explicit FP16 masks, dynamic KV ports, and no TensorScatter. The inspected ORT unfused workspace formula exactly matches the allocation: `2 * align256(24 * 4875 * 4875 * 4) = 4,563,000,320`. The local dispatch excludes Flash with an explicit mask and excludes MEA for a masked KV stride not divisible by four (`4875 % 4 = 3`). This strongly supports an unfused-workspace attribution, **not a directly captured installed-binary dispatch trace**; the inspected ORT source-to-binary correspondence remains unverified. Other large-image attempts also failed in the vision encoder.
+
+The repeated-inference memory blocker is reproducible, but live tensor ownership, arena retention, and fragmentation are not yet distinguished. **A KV-cache leak is not proven, and static TensorScatter cache has not been A/B tested.** Deployment requires validated processor-output limits, generation/concurrency budgets, and repeated mixed-size request testing, rather than assuming a successful isolated inference or AI2D subset qualifies serving stability.
+
+Per the narrowed publication scope, **no MMMU accuracy result is claimed**. Existing official FP16 numerical parity failures, native/HF resize differences, and incomplete historical L4/L5 CI remain open; this update does not declare merge/deployment readiness. Detailed evidence and historical CI disposition are recorded in `docs/design/qwen38-27b-standard-onnx.md`. Qualification-disk receipts include `genai-runtime-fix-01/probes/candidate-case56-repeat01/{receipt,execution}.json` and the unchanged AI2D200 artifacts.
