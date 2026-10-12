@@ -42,6 +42,7 @@ from mobius.models.qwen4_exp import (
     Qwen4ExpExperts,
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpQSAIndexer,
+    Qwen4ExpVisionEncoderModel,
     Qwen4ExpVLDecoderModel,
 )
 from mobius.tasks._qwen4_exp import Qwen4ExpVisionLanguageTask
@@ -1171,9 +1172,15 @@ def test_standard_moe_independent_reference(top_k, normalize, shape, routes):
     np.testing.assert_allclose(actual, expected.reshape(shape), rtol=2e-5, atol=1e-7)
 
 
-@pytest.mark.parametrize("multimodal", [False, True])
 @pytest.mark.parametrize(
-    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+    "multimodal,dtype",
+    [
+        (False, ir.DataType.FLOAT),
+        (False, ir.DataType.FLOAT16),
+        (False, ir.DataType.BFLOAT16),
+        (True, ir.DataType.FLOAT),
+        (True, ir.DataType.FLOAT16),
+    ],
 )
 def test_standard_all_components_before_after_weights(multimodal, dtype):
     config = (_vl_config if multimodal else _config)(dtype=dtype, num_experts_per_tok=2)
@@ -1205,6 +1212,39 @@ def test_standard_all_components_before_after_weights(multimodal, dtype):
                 )
         validate_standard_onnx(model, component=name)
         onnx.checker.check_model(ir.to_proto(model), full_check=True)
+
+
+def test_standard_bfloat16_multimodal_export_rejects_unqualified_vision():
+    config = _vl_config(dtype=ir.DataType.BFLOAT16)
+    module = Qwen4ExpForConditionalGeneration(config)
+    with pytest.raises(ValueError, match=r"BF16 vision export.*official-weight vision parity"):
+        build_from_module(
+            module,
+            config,
+            task="qwen4-exp-vision-language",
+            execution_provider="onnx-standard",
+        )
+
+
+@pytest.mark.parametrize("config_dtype", [ir.DataType.FLOAT, ir.DataType.BFLOAT16])
+@pytest.mark.parametrize("ep", ["onnx-standard", "default", "cuda"])
+def test_bfloat16_vision_export_guard_uses_cast_weight_dtype(config_dtype, ep):
+    config = _vl_config(dtype=config_dtype)
+    module = Qwen4ExpVisionEncoderModel(config)
+    _cast_module_dtype(module, ir.DataType.BFLOAT16)
+    builder, op, _graph = create_test_builder()
+    pixels = create_test_input(builder, "pixel_values", [4, 1536])
+    grid = create_test_input(builder, "image_grid_thw", [1, 3], ir.DataType.INT64)
+    with build_context(ep_registry.require(ep), ir.DataType.BFLOAT16):
+        if ep == "onnx-standard":
+            with pytest.raises(
+                ValueError, match=r"BF16 vision export.*official-weight vision parity"
+            ):
+                module(op, pixels, grid)
+        else:
+            features = module(op, pixels, grid)
+            assert features.producer() is not None
+            assert module.visual.patch_embed.weight.dtype == ir.DataType.BFLOAT16
 
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
@@ -3154,9 +3194,8 @@ def test_reduced_standard_huggingface_cached_logits_and_states(device, dtype):
     [
         ("cpu", ir.DataType.FLOAT),
         ("cuda", ir.DataType.FLOAT),
-        ("cuda", ir.DataType.BFLOAT16),
     ],
-    ids=["cpu-f32", "cuda-f32", "cuda-bf16"],
+    ids=["cpu-f32", "cuda-f32"],
 )
 def test_reduced_standard_huggingface_image_pipeline_and_decode(device, dtype):
     """Compare nonzero two-image vision, fusion, logits, and cached no-image decode."""
