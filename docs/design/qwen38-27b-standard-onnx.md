@@ -19,8 +19,10 @@ package**, not just its text decoder. Text-only export remains an optional
 subset: removing vision does not remove any hybrid decoder layers.
 The checked-in tests cover full-size graph construction and reduced
 random-weight text/image/video parity. They do not download model weights
-or establish official-checkpoint accuracy. ModelBuilder equivalence and
-GenAI Engine integration are deferred, not acceptance gates for this export.
+or establish official-checkpoint accuracy. Separate bounded native ORT GenAI
+execution and AI2D first-200 evidence are recorded below; they do not establish
+full numerical parity or production readiness. ModelBuilder equivalence
+remains deferred, not an acceptance gate for this export.
 
 ## Operators and state contract
 
@@ -571,11 +573,14 @@ The two additional DeepStack sentinel cases also passed.
 
 Before declaring the official model production-qualified, compare real-weight
 vision/fusion, prefill and multiple reused-state decode steps, full logits
-and state, and multi-token generation. Real processor video/mixed-media and
-AI2D accuracy remain unqualified. Full-size runtime memory and throughput
-must be measured independently of graph build and reduced-model correctness.
-ModelBuilder/native-route comparison and the intended GenAI driver are
-separate, deferred work.
+and state, and multi-token generation. Native ORT GenAI driver execution and
+AI2D first-200 evaluation have completed, as documented above; this bounded
+execution/task evidence does not clear the official FP16 numerical parity
+failures. Full-dataset AI2D accuracy and real-processor video/mixed-media
+remain unqualified. Full-size runtime memory and throughput require
+deployment-scale qualification beyond graph build, reduced-model correctness,
+and the recorded bounded runs. Repeated large-image inference still fails
+with OOM, as documented below. ModelBuilder equivalence remains deferred.
 
 In particular, mixed FP16 convolution/FP32 recurrent state must be qualified
 against the intended GenAI runtime separately. Quantized text-only component
