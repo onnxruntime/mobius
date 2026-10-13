@@ -252,10 +252,12 @@ _STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 
 
 def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None:
-    """Reject unresolved/nonstandard operators, including lexical subgraphs/functions."""
+    """Reject nonstandard operator identifiers, including lexical subgraphs/functions."""
 
-    def check(domain: str, op_type: str, version: int | None, path: str) -> None:
-        if domain in _STANDARD_ONNX_DOMAINS and version is not None:
+    def check(
+        domain: str, op_type: str, version: int | None, path: str, *, overload: str
+    ) -> None:
+        if overload == "" and domain in _STANDARD_ONNX_DOMAINS and version is not None:
             try:
                 onnx.defs.get_schema(op_type, version, "")
             except onnx.defs.SchemaError:
@@ -264,7 +266,8 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
                 return
         raise ValueError(
             f"onnx-standard component {component!r} at {path}: "
-            f"domain={domain!r}, op={op_type!r}, opset={version!r} has no standard "
+            f"domain={domain!r}, op={op_type!r}, overload={overload!r}, "
+            f"opset={version!r} has no standard "
             "ONNX schema. Provide a standard-ONNX decomposition before export."
         )
 
@@ -275,7 +278,7 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
             version = imports.get(node.domain)
             if version is None and node.domain in _STANDARD_ONNX_DOMAINS:
                 version = imports.get("", imports.get("ai.onnx"))
-            check(node.domain, node.op_type, version, node_path)
+            check(node.domain, node.op_type, version, node_path, overload=node.overload)
             for name, attribute in node.attributes.items():
                 if attribute.type == ir.AttributeType.GRAPH:
                     visit(attribute.as_graph(), imports, f"{node_path}/{name}")
@@ -292,6 +295,7 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
             function.name,
             imports.get(function.domain, imports.get("")),
             path,
+            overload=function.overload,
         )
         visit(function.graph, imports, path)
 

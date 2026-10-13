@@ -397,15 +397,26 @@ _STANDARD_ONNX_DOMAINS = frozenset({"", "ai.onnx"})
 
 
 @pytest.mark.parametrize("location", ["main", "If", "Scan", "graphs", "signature", "body"])
-@pytest.mark.parametrize("domain,operator", [("test.custom", "Leak"), ("", "NotAnOnnxOp")])
-def test_onnx_standard_validator_rejects_recursive_leaks(location, domain, operator):
+@pytest.mark.parametrize(
+    "domain,operator,overload",
+    [("test.custom", "Leak", ""), ("", "NotAnOnnxOp", ""), ("", "Identity", "custom")],
+)
+def test_onnx_standard_validator_rejects_recursive_leaks(location, domain, operator, overload):
     builder, op, graph = create_test_builder()
     x = create_test_input(builder, "x", [1])
+
+    def emit(op_builder, op_type, op_domain, op_overload):
+        value = getattr(op_builder, op_type)(x, _domain=op_domain)
+        producer = value.producer()
+        assert producer is not None
+        producer.overload = op_overload
+        return value
+
     if location == "main":
-        graph.outputs.append(getattr(op, operator)(x, _domain=domain))
+        graph.outputs.append(emit(op, operator, domain, overload))
     elif location in {"If", "Scan", "graphs"}:
         body, body_builder = create_body_graph([], [])
-        body.outputs.append(getattr(body_builder.op, operator)(x, _domain=domain))
+        body.outputs.append(emit(body_builder.op, operator, domain, overload))
         if location == "If":
             node = ir.Node(
                 "",
@@ -441,20 +452,61 @@ def test_onnx_standard_validator_rejects_recursive_leaks(location, domain, opera
     if location in {"signature", "body"}:
         body, body_builder = create_body_graph([], [])
         body.outputs.append(
-            getattr(body_builder.op, operator if location == "body" else "Identity")(
-                x,
-                _domain=domain if location == "body" else "",
+            emit(
+                body_builder.op,
+                operator if location == "body" else "Identity",
+                domain if location == "body" else "",
+                overload if location == "body" else "",
             )
         )
         function = ir.Function(
             domain if location == "signature" else "",
             operator if location == "signature" else "Identity",
+            overload=overload if location == "signature" else "",
             graph=body,
             attributes={},
         )
         model.functions[function.identifier()] = function
-    with pytest.raises(ValueError, match=rf"component 'decoder'.*{operator!r}.*decomposition"):
+    with pytest.raises(
+        ValueError,
+        match=rf"component 'decoder'.*{operator!r}.*overload={overload!r}.*decomposition",
+    ):
         validate_standard_onnx(model, component="decoder")
+
+
+@pytest.mark.parametrize("location", ["call", "definition"])
+def test_onnx_standard_validator_rejects_declared_overloads_after_roundtrip(
+    tmp_path: Path, location
+):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    output = op.Identity(x)
+    output.type, output.shape = x.type, x.shape
+    node = output.producer()
+    assert node is not None
+    node.overload = "custom" if location == "call" else ""
+    graph.outputs.append(output)
+    function_builder, function_op, function_graph = create_test_builder()
+    function_x = create_test_input(function_builder, "function_x", [1])
+    function_y = function_op.Neg(function_x)
+    function_y.type, function_y.shape = function_x.type, function_x.shape
+    function_graph.outputs.append(function_y)
+    function = ir.Function(
+        "", "Identity", overload="custom", graph=function_graph, attributes={}
+    )
+    model = ir.Model(graph, ir_version=11)
+    model.functions[function.identifier()] = function
+    path = tmp_path / "overloaded.onnx"
+    expected_path = "graph/" if location == "call" else "function/::Identity"
+    try:
+        ir.save(model, path)
+        for candidate in (model, ir.load(path)):
+            with pytest.raises(
+                ValueError, match=rf"{expected_path}.*overload='custom'.*no standard"
+            ):
+                validate_standard_onnx(candidate)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_onnx_standard_optimizer_rejects_unresolved_custom_node():
