@@ -466,8 +466,6 @@ def test_onnx_standard_optimizer_rejects_unresolved_custom_node():
 
 
 def test_onnx_standard_validates_after_opset_lowering(monkeypatch):
-    import mobius._builder as builder_module
-
     def insert_leak(package, _ep):
         model = package["model"]
         output = model.graph.outputs[0]
@@ -475,7 +473,7 @@ def test_onnx_standard_validates_after_opset_lowering(monkeypatch):
         model.graph.append(node)
         model.graph.outputs[0] = node.outputs[0]
 
-    monkeypatch.setattr(builder_module, "_maybe_apply_opset_lowering", insert_leak)
+    monkeypatch.setattr("mobius._builder._maybe_apply_opset_lowering", insert_leak)
     with pytest.raises(ValueError, match=r"component 'model'.*AfterLowering"):
         _make_llama_pkg("onnx-standard")
 
