@@ -23,7 +23,6 @@ from collections.abc import Collection, Sequence
 import torch
 
 from mobius._configs import QuantizationConfig, QuantizedWeightFormat
-from mobius._flags import flags
 
 logger = logging.getLogger(__name__)
 
@@ -245,10 +244,10 @@ def resolve_qmoe_quantization(
     """Resolve and validate FC1/FC2 layouts for one native QMoE layer.
 
     Legacy uniform INT4 layouts retain the existing predicate and behavior.
-    Projection overrides support Olive integer-affine FC1/FC2 widths (2, 4)
-    and (4, 8), (8, 4), or (8, 8), with a common QMoE block size and the
-    model-wide INT4 layout as the fallback for non-expert projections.
-    Experimental INT3 additionally permits (3, 4), (3, 3), and (4, 3).
+    Olive integer-affine projection overrides independently select INT2, INT3,
+    INT4, or INT8, with a common QMoE block size and the model-wide INT4
+    layout as the fallback for non-expert projections. Export support does
+    not establish execution support in a target ORT runtime.
 
     Explicit per-layer plans must either resolve to a bindable native layout
     or raise; they never silently select an incompatible dense fallback.
@@ -285,13 +284,8 @@ def resolve_qmoe_quantization(
     fallback = supported_qmoe_quantization(quantization)
     has_int3 = 3 in (fc1.bits, fc2.bits)
     if has_int3:
-        if not flags.experimental_int3_qmoe_export:
-            raise NotImplementedError(
-                "INT3 QMoE export requires experimental_int3_qmoe_export=True; "
-                "the proposed INT3 schema and kernels are not released runtime support."
-            )
         if any(projection.bits == 3 and not projection.sym for projection in (fc1, fc2)):
-            raise ValueError("Draft INT3 QMoE requires symmetric INT3 zero point 4.")
+            raise ValueError("INT3 QMoE requires symmetric INT3 zero point 4.")
         if fc1.group_size not in (32, 64, 128):
             raise ValueError("Draft INT3 QMoE requires block_size 32, 64, or 128.")
     fc1_uniform = supported_qmoe_quantization(fc1)
@@ -318,14 +312,20 @@ def resolve_qmoe_quantization(
             )
         return layout
 
-    requested_mixed = (
+    requested_projection_layout = (
         fc1.bits != fc2.bits
         or fc1.group_size != fc2.group_size
         or fc1.sym != fc2.sym
-        or (fallback is not None and fc1.bits == fc2.bits == 8)
+        or (
+            fallback is not None
+            and any(
+                not _same_qmoe_packing_layout(projection, fallback)
+                for projection in (fc1, fc2)
+            )
+        )
         or has_int3
     )
-    if not requested_mixed:
+    if not requested_projection_layout:
         if not (
             _same_qmoe_packing_layout(fc1, quantization)
             and _same_qmoe_packing_layout(fc2, quantization)
@@ -343,16 +343,14 @@ def resolve_qmoe_quantization(
         for layout in layouts
     ):
         raise ValueError(
-            "Mixed native QMoE requires Olive integer-affine weights with packed "
+            "Projection-specific native QMoE requires Olive integer-affine weights with packed "
             "uint8 zero points."
         )
-    allowed_widths = {(2, 4), (4, 8), (8, 4), (8, 8)}
-    if flags.experimental_int3_qmoe_export:
-        allowed_widths.update({(3, 4), (3, 3), (4, 3)})
-    if fallback is None or (fc1.bits, fc2.bits) not in allowed_widths:
+    supported_bits = {2, 3, 4, 8}
+    if fallback is None or any(layout.bits not in supported_bits for layout in layouts):
         raise ValueError(
-            "Unsupported mixed native QMoE expert widths: expected model-wide "
-            f"INT4 with FC1/FC2 in {sorted(allowed_widths)}, "
+            "Unsupported native QMoE expert widths: expected model-wide "
+            f"INT4 with each projection in {sorted(supported_bits)}, "
             f"got fallback={quantization.bits}, "
             f"FC1={fc1.bits}, FC2={fc2.bits}."
         )
@@ -1247,17 +1245,23 @@ def _preprocess_olive_qmoe_weights(
                 raise ValueError(
                     f"Mixed QMoE {label.upper()} qzeros must be uint8, got {qzeros.dtype}."
                 )
-            if layout.has_int3:
-                if scales.dtype != activation_dtype:
-                    raise ValueError(
-                        f"Draft INT3 QMoE {label.upper()} scales must match activation "
-                        f"dtype {activation_dtype}, got {scales.dtype}."
-                    )
-                if not torch.isfinite(scales).all() or torch.any(scales < 0):
-                    raise ValueError(
-                        f"Draft INT3 QMoE {label.upper()} scales must be finite "
-                        "and nonnegative."
-                    )
+            if not torch.isfinite(scales).all() or torch.any(scales < 0):
+                raise ValueError(
+                    f"QMoE {label.upper()} scales must be finite and nonnegative."
+                )
+            if layout.has_int3 and scales.dtype != activation_dtype:
+                raise ValueError(
+                    f"Draft INT3 QMoE {label.upper()} scales must match activation "
+                    f"dtype {activation_dtype}, got {scales.dtype}."
+                )
+            if (
+                activation_dtype is not None
+                and not torch.isfinite(scales.to(activation_dtype)).all()
+            ):
+                raise ValueError(
+                    f"QMoE {label.upper()} scales must remain finite after conversion "
+                    f"to activation dtype {activation_dtype}."
+                )
             if projection_layout.bits == 3 and qzeros is not None:
                 _validate_int3_qmoe_zero_points(qzeros, logical_k // block_size)
                 # Canonical export omits the validated, redundant offset-4 tensor.

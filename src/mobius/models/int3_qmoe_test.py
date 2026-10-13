@@ -1,11 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Offline draft INT3 QMoE export tests; no INT3 runtime execution is claimed."""
+"""Offline QMoE bit-width matrix tests; no INT3 runtime execution is claimed."""
 
 from __future__ import annotations
 
 import dataclasses
+import itertools
 
 import onnx_ir as ir
 import pytest
@@ -14,13 +15,15 @@ from onnx_ir import tensor_adapters
 
 from mobius._builder import build_from_module
 from mobius._configs import QuantizationConfig, QuantizationOverride
-from mobius._flags import override_flags
 from mobius._model_package import ModelPackage
-from mobius._testing import make_config
+from mobius._testing import create_test_builder, create_test_input, make_config
+from mobius.components._moe import _interleave_gate_up_rows
 from mobius.models.moe import MoECausalLMModel
 
 _ROOT = "model.layers.0.mlp"
 _E, _H, _I, _BLOCK = 2, 64, 32, 32
+_PAIRS = tuple(itertools.product((2, 3, 4, 8), repeat=2))
+_INT3_PAIRS = tuple(pair for pair in _PAIRS if 3 in pair)
 
 
 def _pack_oracle(codes: torch.Tensor, bits: int) -> torch.Tensor:
@@ -96,7 +99,7 @@ def _state(fc1: int, fc2: int, dtype: torch.dtype = torch.float16):
     return state
 
 
-@pytest.mark.parametrize("fc1,fc2", [(3, 4), (3, 3), (4, 3)])
+@pytest.mark.parametrize("fc1,fc2", _INT3_PAIRS)
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
 def test_int3_fused_export_preserves_bytes_order_scales_and_external_data(
     tmp_path, fc1, fc2, dtype
@@ -104,18 +107,17 @@ def test_int3_fused_export_preserves_bytes_order_scales_and_external_data(
     torch_dtype = tensor_adapters.to_torch_dtype(dtype)
     config = _config(fc1, fc2, dtype)
     raw = _state(fc1, fc2, torch_dtype)
-    with override_flags(experimental_int3_qmoe_export=True):
-        module = MoECausalLMModel(config)
-        processed = module.preprocess_weights(dict(raw))
-        package = build_from_module(module, config)
-        for name, parameter in module.named_parameters():
-            if name not in processed:
-                processed[name] = torch.zeros(
-                    tuple(parameter.shape),
-                    dtype=tensor_adapters.to_torch_dtype(parameter.dtype),
-                )
-        package.apply_weights(processed)
-        package.save(str(tmp_path), progress_bar=False)
+    module = MoECausalLMModel(config)
+    processed = module.preprocess_weights(dict(raw))
+    package = build_from_module(module, config)
+    for name, parameter in module.named_parameters():
+        if name not in processed:
+            processed[name] = torch.zeros(
+                tuple(parameter.shape),
+                dtype=tensor_adapters.to_torch_dtype(parameter.dtype),
+            )
+    package.apply_weights(processed)
+    package.save(str(tmp_path), progress_bar=False)
 
     graph = ModelPackage.load(str(tmp_path))["model"].graph
     qmoe = next(node for node in graph if node.op_type == "QMoE")
@@ -166,20 +168,9 @@ def test_int3_fused_export_preserves_bytes_order_scales_and_external_data(
     assert list(tmp_path.glob("*.data")), "packed weights must be externally serialized"
 
 
-def test_int3_export_requires_opt_in():
-    with (
-        override_flags(experimental_int3_qmoe_export=False),
-        pytest.raises(NotImplementedError, match="experimental_int3"),
-    ):
-        MoECausalLMModel(_config(3, 4))
-
-
-@pytest.mark.parametrize("fc1,fc2", [(3, 2), (2, 3), (3, 8), (8, 3)])
-def test_int3_export_rejects_unqualified_width_combinations(fc1, fc2):
-    with (
-        override_flags(experimental_int3_qmoe_export=True),
-        pytest.raises(ValueError, match="expert widths"),
-    ):
+@pytest.mark.parametrize("fc1,fc2", [(1, 4), (4, 5), (6, 3)])
+def test_qmoe_export_rejects_unsupported_bit_widths(fc1, fc2):
+    with pytest.raises(ValueError, match="expert widths"):
         MoECausalLMModel(_config(fc1, fc2))
 
 
@@ -187,27 +178,18 @@ def test_int3_export_rejects_unqualified_width_combinations(fc1, fc2):
 def test_int3_export_rejects_unqualified_block_sizes(block):
     config = _config(3, 4)
     config.quantization = dataclasses.replace(config.quantization, group_size=block)
-    with (
-        override_flags(experimental_int3_qmoe_export=True),
-        pytest.raises(ValueError, match="block_size"),
-    ):
+    with pytest.raises(ValueError, match="block_size"):
         MoECausalLMModel(config)
 
 
 def test_int3_export_rejects_unapproved_logical_tails():
     config = dataclasses.replace(_config(3, 4), moe_intermediate_size=33)
-    with (
-        override_flags(experimental_int3_qmoe_export=True),
-        pytest.raises(ValueError, match="divisible"),
-    ):
+    with pytest.raises(ValueError, match="divisible"):
         MoECausalLMModel(config)
 
 
 def test_int3_export_rejects_fp32_activations():
-    with (
-        override_flags(experimental_int3_qmoe_export=True),
-        pytest.raises(ValueError, match="activations"),
-    ):
+    with pytest.raises(ValueError, match="activations"):
         MoECausalLMModel(_config(3, 4, ir.DataType.FLOAT))
 
 
@@ -215,10 +197,7 @@ def test_int3_export_rejects_fp32_activations():
 def test_int3_export_rejects_asymmetric_int3_config(fc1, fc2):
     config = _config(fc1, fc2)
     config.quantization.sym = False
-    with (
-        override_flags(experimental_int3_qmoe_export=True),
-        pytest.raises(ValueError, match="symmetric"),
-    ):
+    with pytest.raises(ValueError, match="symmetric"):
         MoECausalLMModel(config)
 
 
@@ -234,10 +213,9 @@ def test_int3_export_rejects_invalid_projection_payload(mutation, projection):
     else:
         value = {"negative": -1, "nan": float("nan"), "inf": float("inf")}[mutation]
         raw[stem + "_scales"][0, 0, 0] = value
-    with override_flags(experimental_int3_qmoe_export=True):
-        model = MoECausalLMModel(_config(3, 3))
-        with pytest.raises(ValueError, match=r"scales|shape"):
-            model.preprocess_weights(raw)
+    model = MoECausalLMModel(_config(3, 3))
+    with pytest.raises(ValueError, match=r"scales|shape"):
+        model.preprocess_weights(raw)
 
 
 @pytest.mark.parametrize(
@@ -258,14 +236,13 @@ def test_int3_explicit_zero_points_validate_and_export_as_implicit(
     elif invalid == "padding":
         zeros[0, 0, -1] |= 128
     raw[f"{_ROOT}.experts.{projection}_qzeros"] = zeros
-    with override_flags(experimental_int3_qmoe_export=True):
-        module = MoECausalLMModel(_config(3, 3))
-        if invalid:
-            with pytest.raises(ValueError, match=r"zero.point"):
-                module.preprocess_weights(raw)
-        else:
-            processed = module.preprocess_weights(raw)
-            assert not any("zero_points" in key for key in processed)
+    module = MoECausalLMModel(_config(3, 3))
+    if invalid:
+        with pytest.raises(ValueError, match=r"zero.point"):
+            module.preprocess_weights(raw)
+    else:
+        processed = module.preprocess_weights(raw)
+        assert not any("zero_points" in key for key in processed)
 
 
 @pytest.mark.parametrize(
@@ -290,7 +267,7 @@ def test_olive_int3_checkpoint_bytes_match_independent_oracle(k):
     assert torch.equal(olive_quant.pack_to_uint8(logical, 3), _pack_oracle(logical, 3))
 
 
-@pytest.mark.parametrize("fc1,fc2", [(3, 4), (3, 3), (4, 3)])
+@pytest.mark.parametrize("fc1,fc2", _INT3_PAIRS)
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
 def test_public_build_loads_local_olive_int3_checkpoint(tmp_path, fc1, fc2, dtype):
     from safetensors.torch import save_file
@@ -325,25 +302,24 @@ def test_public_build_loads_local_olive_int3_checkpoint(tmp_path, fc1, fc2, dtyp
     )
     hf_config.save_pretrained(tmp_path)
     raw = _state(fc1, fc2, tensor_adapters.to_torch_dtype(dtype))
-    with override_flags(experimental_int3_qmoe_export=True):
-        module = MoECausalLMModel(config)
-        for name, parameter in module.named_parameters():
-            if ".fc1_" in name or ".fc2_" in name or name.startswith("model.rotary_emb."):
-                continue
-            tensor = torch.zeros(
-                tuple(parameter.shape),
-                dtype=tensor_adapters.to_torch_dtype(parameter.dtype),
-            )
-            if tensor.dtype == torch.uint8 and name.endswith(".weight"):
-                raw[name + "_qweight"] = tensor.flatten(-2)
-            elif name.endswith(".scales"):
-                raw[name.removesuffix(".scales") + ".weight_scales"] = tensor
-            else:
-                raw[name] = tensor
-        save_file(raw, str(tmp_path / "model.safetensors"), metadata={"format": "pt"})
-        package = build(str(tmp_path), dtype="f16" if dtype == ir.DataType.FLOAT16 else "bf16")
-        output = tmp_path / "export"
-        package.save(str(output), progress_bar=False)
+    module = MoECausalLMModel(config)
+    for name, parameter in module.named_parameters():
+        if ".fc1_" in name or ".fc2_" in name or name.startswith("model.rotary_emb."):
+            continue
+        tensor = torch.zeros(
+            tuple(parameter.shape),
+            dtype=tensor_adapters.to_torch_dtype(parameter.dtype),
+        )
+        if tensor.dtype == torch.uint8 and name.endswith(".weight"):
+            raw[name + "_qweight"] = tensor.flatten(-2)
+        elif name.endswith(".scales"):
+            raw[name.removesuffix(".scales") + ".weight_scales"] = tensor
+        else:
+            raw[name] = tensor
+    save_file(raw, str(tmp_path / "model.safetensors"), metadata={"format": "pt"})
+    package = build(str(tmp_path), dtype="f16" if dtype == ir.DataType.FLOAT16 else "bf16")
+    output = tmp_path / "export"
+    package.save(str(output), progress_bar=False)
     graph = ModelPackage.load(str(output))["model"].graph
     qmoe = next(node for node in graph if node.op_type == "QMoE")
     assert qmoe.attributes["fc1_expert_weight_bits"].value == fc1
@@ -363,8 +339,7 @@ def test_public_build_loads_local_olive_int3_checkpoint(tmp_path, fc1, fc2, dtyp
 def test_int3_export_accepts_profile_block_sizes(block):
     config = dataclasses.replace(_config(3, 3), hidden_size=128, moe_intermediate_size=128)
     config.quantization = dataclasses.replace(config.quantization, group_size=block)
-    with override_flags(experimental_int3_qmoe_export=True):
-        module = MoECausalLMModel(config)
+    module = MoECausalLMModel(config)
     layer = module.model.layers[0].mlp
     assert tuple(layer.fc1_experts_weights.shape) == (_E, 256, 48)
     assert tuple(layer.fc2_experts_weights.shape) == (_E, 128, 48)
@@ -385,11 +360,145 @@ def test_int3_mixed_export_preserves_asymmetric_int4_zero_points(fc1, fc2):
         torch.arange(_E * rows * (k // _BLOCK)).reshape(_E, rows, k // _BLOCK) % 16, 4
     )
     raw[name + "_qzeros"] = zeros
-    with override_flags(experimental_int3_qmoe_export=True):
-        module = MoECausalLMModel(config)
-        processed = module.preprocess_weights(raw)
+    module = MoECausalLMModel(config)
+    processed = module.preprocess_weights(raw)
     expected = zeros
     if fc1 == 4:
         expected = zeros.reshape(_E, 2, _I, -1).transpose(1, 2).reshape(*zeros.shape)
     assert torch.equal(processed[f"{_ROOT}.{label}_experts_zero_points"], expected)
     assert getattr(module.model.layers[0].mlp, label + "_experts_zero_points") is not None
+
+
+@pytest.mark.parametrize("fc1,fc2", _PAIRS)
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_qmoe_full_width_matrix_binds_and_round_trips(tmp_path, fc1, fc2, dtype):
+    config = _config(fc1, fc2, dtype)
+    raw = _state(fc1, fc2, tensor_adapters.to_torch_dtype(dtype))
+    module = MoECausalLMModel(config)
+    processed = module.preprocess_weights(dict(raw))
+    package = build_from_module(module, config)
+    for name, parameter in module.named_parameters():
+        if name not in processed:
+            processed[name] = torch.zeros(
+                tuple(parameter.shape),
+                dtype=tensor_adapters.to_torch_dtype(parameter.dtype),
+            )
+    package.apply_weights(processed)
+    package.save(str(tmp_path), progress_bar=False)
+    graph = ModelPackage.load(str(tmp_path))["model"].graph
+    qmoe = next(node for node in graph if node.op_type == "QMoE")
+    global_bits = qmoe.attributes["expert_weight_bits"].value
+    for label, bits, projection in (
+        ("fc1", fc1, "gate_up_proj"),
+        ("fc2", fc2, "down_proj"),
+    ):
+        attribute = qmoe.attributes.get(f"{label}_expert_weight_bits")
+        assert (attribute.value if attribute is not None else global_bits) == bits
+        for source_suffix, target_suffix in (
+            ("_qweight", "_experts_weights"),
+            ("_scales", "_scales"),
+        ):
+            expected = raw[f"{_ROOT}.experts.{projection}{source_suffix}"]
+            if 3 in (fc1, fc2) and label == "fc1":
+                expected = (
+                    expected.reshape(_E, 2, _I, -1)
+                    .transpose(1, 2)
+                    .reshape(*expected.shape)
+                    .contiguous()
+                )
+            value = graph.initializers[f"{_ROOT}.{label}{target_suffix}"]
+            assert value.const_value is not None
+            assert (
+                value.const_value.numpy().tobytes()
+                == expected.contiguous().view(torch.uint8).numpy().tobytes()
+            )
+    fc3 = qmoe.attributes.get("fc3_expert_weight_bits")
+    assert (fc3.value if fc3 is not None else global_bits) == fc1
+
+
+@pytest.mark.parametrize("bits", [2, 8])
+@pytest.mark.parametrize("payload", ["weights", "scales", "zero_points"])
+def test_non_int3_graph_interleave_matches_independent_row_order(tmp_path, bits, payload):
+    import onnxruntime as ort
+
+    columns = {
+        "weights": _H * bits // 8,
+        "scales": _H // _BLOCK,
+        "zero_points": (_H // _BLOCK * bits + 7) // 8,
+    }[payload]
+    dtype = ir.DataType.FLOAT if payload == "scales" else ir.DataType.UINT8
+    tensor = torch.arange(_E * 2 * _I * columns).reshape(_E, 2 * _I, columns)
+    tensor = (
+        tensor.float()
+        if payload == "scales"
+        else (tensor // columns * 7 + tensor % columns).to(torch.uint8)
+    )
+    assert torch.all(torch.any(tensor[:, :_I] != tensor[:, _I:], dim=-1))
+    expected = torch.stack([tensor[:, row] for i in range(_I) for row in (i, i + _I)], dim=1)
+    assert not torch.equal(tensor, expected)
+    builder, op, graph = create_test_builder()
+    value = create_test_input(builder, "payload", list(tensor.shape), dtype)
+    result = _interleave_gate_up_rows(op, value, _E, 2 * _I)
+    result.name = "interleaved"
+    result.type = value.type
+    result.shape = value.shape
+    graph.outputs.append(result)
+    path = tmp_path / "interleave.onnx"
+    ir.save(ir.Model(graph, ir_version=10), path)
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    actual = session.run(None, {"payload": tensor.numpy()})[0]
+    assert torch.equal(torch.from_numpy(actual), expected)
+
+
+@pytest.mark.parametrize("fc1,fc2", [(2, 2), (2, 8), (8, 2), (8, 8)])
+@pytest.mark.parametrize("projection", ["gate_up_proj", "down_proj"])
+@pytest.mark.parametrize("invalid", ["negative", "nan", "inf", "cast_overflow"])
+def test_non_int3_export_rejects_invalid_scales(fc1, fc2, projection, invalid):
+    raw = _state(fc1, fc2)
+    key = f"{_ROOT}.experts.{projection}_scales"
+    raw[key] = raw[key].float()
+    raw[key][0, 0, 0] = {
+        "negative": -1,
+        "nan": float("nan"),
+        "inf": float("inf"),
+        "cast_overflow": 65536,
+    }[invalid]
+    module = MoECausalLMModel(_config(fc1, fc2))
+    with pytest.raises(ValueError, match=r"scales.*finite"):
+        module.preprocess_weights(raw)
+
+
+def test_non_int3_export_preserves_weight_loader_scale_conversion(tmp_path):
+    config = _config(2, 8)
+    module = MoECausalLMModel(config)
+    raw = _state(2, 8, torch.float32)
+    processed = module.preprocess_weights(dict(raw))
+    package = build_from_module(module, config)
+    for name, parameter in module.named_parameters():
+        if name not in processed:
+            processed[name] = torch.zeros(
+                tuple(parameter.shape),
+                dtype=tensor_adapters.to_torch_dtype(parameter.dtype),
+            )
+    package.apply_weights(processed)
+    package.save(str(tmp_path), progress_bar=False)
+    graph = ModelPackage.load(str(tmp_path))["model"].graph
+    for label, projection in (("fc1", "gate_up_proj"), ("fc2", "down_proj")):
+        value = graph.initializers[f"{_ROOT}.{label}_scales"]
+        assert value.dtype == ir.DataType.FLOAT16
+        actual = torch.from_numpy(value.const_value.numpy().copy())
+        assert torch.equal(actual, raw[f"{_ROOT}.experts.{projection}_scales"].half())
+
+
+@pytest.mark.parametrize("bits", [2, 8])
+def test_olive_unsigned_symmetric_convention_matches_qmoe(bits):
+    olive_quant = pytest.importorskip("olive.common.quant.utils")
+    quantizer = olive_quant.WeightQuantizer(bits=bits, symmetric=True, group_size=4)
+    scales, zero_points = quantizer.find_qparams(torch.tensor([[-1.0, 0.0, 0.5, 1.0]]))
+    assert torch.all(zero_points == 1 << (bits - 1))
+    codes = torch.tensor([[0, 1 << (bits - 1), (1 << bits) - 1, 1]])
+    packed = olive_quant.pack_to_uint8(codes, bits)
+    decoded = _decode_oracle(packed, bits, codes.shape[-1])
+    actual = quantizer.dequantize(decoded, scales, zero_points)
+    expected = (codes - (1 << (bits - 1))).float() * scales
+    assert torch.equal(actual, expected)
