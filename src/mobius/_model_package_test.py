@@ -1477,6 +1477,26 @@ class TestModelPackageApplyWeights:
         )
         assert model1.graph.initializers[init_name].const_value is not None
 
+    def test_prefix_routes_report_colliding_stripped_names(self):
+        config = make_config()
+        pkg1 = build_from_module(CausalLMModel(config), config)
+        pkg2 = build_from_module(CausalLMModel(config), config)
+        model1 = pkg1["model"]
+        model2 = pkg2["model"]
+        pkg = ModelPackage({"text": model1, "vision": model2})
+
+        init_name = next(iter(model1.graph.initializers.keys()))
+        shape = list(model1.graph.initializers[init_name].shape)
+        applied = pkg.apply_weights(
+            {
+                f"text.{init_name}": torch.ones(shape),
+                f"vision.{init_name}": torch.zeros(shape),
+            },
+            prefix_map={"text.": "text", "vision.": "vision"},
+        )
+
+        assert applied == {f"text.{init_name}", f"vision.{init_name}"}
+
 
 class TestBuildPackageFromModule:
     def test_returns_model_package(self):
