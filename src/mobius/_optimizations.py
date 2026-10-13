@@ -269,7 +269,7 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
         )
 
     def visit(graph: ir.Graph, imports: dict[str, int], path: str) -> None:
-        imports = imports | dict(graph.opset_imports)
+        # Serialized subgraphs inherit imports from their enclosing model/function.
         for index, node in enumerate(graph):
             node_path = f"{path}/{node.name or index}:{node.op_type}"
             version = imports.get(node.domain)
@@ -283,7 +283,7 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
                     for i, subgraph in enumerate(attribute.as_graphs()):
                         visit(subgraph, imports, f"{node_path}/{name}[{i}]")
 
-    visit(model.graph, {}, "graph")
+    visit(model.graph, dict(model.graph.opset_imports), "graph")
     for function in model.functions.values():
         path = f"function/{function.domain}::{function.name}"
         imports = dict(function.opset_imports)

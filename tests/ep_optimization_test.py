@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import onnx_ir as ir
@@ -485,6 +486,122 @@ def test_onnx_standard_validator_rejects_inapplicable_schema_version():
     graph.opset_imports[""] = 0
     with pytest.raises(ValueError, match=r"opset=0.*no standard"):
         validate_standard_onnx(ir.Model(graph, ir_version=11))
+
+
+def _make_nested_swish_model(parent_opset, child_opset, location):
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1]))
+
+    def make_body(name):
+        body_input = (
+            ir.Value(name=f"{name}_x", type=x.type, shape=ir.Shape([]))
+            if location == "Scan"
+            else x
+        )
+        output = ir.Value(name=f"{name}_y", type=x.type, shape=body_input.shape)
+        return ir.Graph(
+            inputs=[body_input] if location == "Scan" else [],
+            outputs=[output],
+            nodes=[ir.Node("", "Swish", [body_input], outputs=[output])],
+            opset_imports={} if child_opset is None else {"": child_opset},
+            name=name,
+        )
+
+    inputs = [x]
+    if location == "If":
+        condition = ir.Value(
+            name="condition", type=ir.TensorType(ir.DataType.BOOL), shape=ir.Shape([])
+        )
+        inputs.append(condition)
+        node_inputs = [condition]
+        attributes = [
+            ir.AttrGraph("then_branch", make_body("then")),
+            ir.AttrGraph("else_branch", make_body("else")),
+        ]
+    elif location == "Scan":
+        node_inputs = [x]
+        attributes = [
+            ir.AttrGraph("body", make_body("scan")),
+            ir.AttrInt64("num_scan_inputs", 1),
+        ]
+    else:
+        node_inputs = [x]
+        # Synthetic GRAPHS attribute exercises the validator's repeated-graph traversal.
+        attributes = [ir.AttrGraphs("nested", [make_body("first"), make_body("second")])]
+    output = ir.Value(name="y", type=x.type, shape=x.shape)
+    node = ir.Node(
+        "",
+        "Identity" if location == "graphs" else location,
+        node_inputs,
+        attributes=attributes,
+        outputs=[output],
+    )
+    return ir.Model(
+        ir.Graph(
+            inputs=inputs,
+            outputs=[output],
+            nodes=[node],
+            opset_imports={"": parent_opset},
+            name="parent",
+        ),
+        ir_version=11,
+    )
+
+
+@pytest.mark.parametrize("location", ["If", "Scan", "graphs"])
+@pytest.mark.parametrize("parent_opset,child_opset", [(23, 24), (24, 23), (24, None)])
+def test_onnx_standard_validator_subgraphs_inherit_parent_opset(
+    location, parent_opset, child_opset
+):
+    model = _make_nested_swish_model(parent_opset, child_opset, location)
+    if parent_opset == 23:
+        with pytest.raises(ValueError, match=r"Swish.*opset=23.*no standard"):
+            validate_standard_onnx(model)
+    else:
+        validate_standard_onnx(model)
+
+
+@pytest.mark.parametrize(
+    "model_opset,function_opset,child_opset",
+    [(23, 24, 23), (24, 23, 24), (23, 24, None)],
+)
+def test_onnx_standard_validator_function_subgraphs_inherit_function_opset(
+    model_opset, function_opset, child_opset
+):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.outputs.append(op.Identity(x))
+    graph.opset_imports[""] = model_opset
+    model = ir.Model(graph, ir_version=11)
+    function = ir.Function(
+        "",
+        "Identity",
+        graph=_make_nested_swish_model(function_opset, child_opset, "Scan").graph,
+        attributes={},
+    )
+    model.functions[function.identifier()] = function
+    if function_opset == 23:
+        with pytest.raises(ValueError, match=r"function/::Identity.*Swish.*opset=23"):
+            validate_standard_onnx(model)
+    else:
+        validate_standard_onnx(model)
+
+
+@pytest.mark.parametrize("parent_opset", [23, 24])
+def test_onnx_standard_validator_subgraph_opset_matches_roundtrip(
+    tmp_path: Path, parent_opset
+):
+    model = _make_nested_swish_model(parent_opset, 24, "If")
+    path = tmp_path / "nested.onnx"
+    try:
+        ir.save(model, path)
+        for candidate in (model, ir.load(path)):
+            if parent_opset == 23:
+                with pytest.raises(ValueError, match=r"Swish.*opset=23.*no standard"):
+                    validate_standard_onnx(candidate)
+            else:
+                validate_standard_onnx(candidate)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_onnx_standard_validates_after_transformers_weight_binding(monkeypatch):
