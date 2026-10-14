@@ -18,13 +18,15 @@ import dataclasses
 import logging
 import math
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 
 import torch
 
 from mobius._configs import QuantizationConfig, QuantizedWeightFormat
 
 logger = logging.getLogger(__name__)
+
+WeightTransform = Callable[[torch.Tensor], torch.Tensor]
 
 # Key suffixes marking a *packed quantized* sidecar tensor rather than a float
 # weight. A "sidecar" here is an auxiliary tensor that rides alongside a
@@ -1086,6 +1088,32 @@ def _resolve_olive_qmoe_layouts(
     }
 
 
+def _validate_qmoe_scales(
+    scales: torch.Tensor,
+    *,
+    label: str,
+    activation_dtype: torch.dtype | None,
+    require_matching_dtype: bool = False,
+) -> None:
+    """Validate numeric scales; INT3 callers also supply a validated activation dtype."""
+    if scales.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError(
+            f"QMoE {label} scales must be float16, bfloat16, or float32, got {scales.dtype}."
+        )
+    if not torch.isfinite(scales).all() or torch.any(scales < 0):
+        raise ValueError(f"QMoE {label} scales must be finite and nonnegative.")
+    if require_matching_dtype and scales.dtype != activation_dtype:
+        raise ValueError(
+            f"Draft INT3 QMoE {label} scales must match activation "
+            f"dtype {activation_dtype}, got {scales.dtype}."
+        )
+    if activation_dtype is not None and not torch.isfinite(scales.to(activation_dtype)).all():
+        raise ValueError(
+            f"QMoE {label} scales must remain finite after conversion "
+            f"to activation dtype {activation_dtype}."
+        )
+
+
 def _preprocess_olive_qmoe_weights(
     state_dict: dict[str, torch.Tensor],
     quantization: QuantizationConfig,
@@ -1099,6 +1127,7 @@ def _preprocess_olive_qmoe_weights(
     embed_key: str,
     head_key: str,
     activation_dtype: torch.dtype | None = None,
+    weight_transforms: dict[str, WeightTransform] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Validate and bind fused K-last Olive sidecars for mixed-width QMoE."""
     expert_keys = {
@@ -1232,42 +1261,25 @@ def _preprocess_olive_qmoe_weights(
                 raise ValueError(
                     f"Mixed QMoE {label.upper()} qweight must be uint8, got {qweight.dtype}."
                 )
-            if scales.dtype not in {
-                torch.float16,
-                torch.bfloat16,
-                torch.float32,
-            }:
-                raise ValueError(
-                    f"Mixed QMoE {label.upper()} scales must be float16, bfloat16, "
-                    f"or float32, got {scales.dtype}."
-                )
             if qzeros is not None and qzeros.dtype != torch.uint8:
                 raise ValueError(
                     f"Mixed QMoE {label.upper()} qzeros must be uint8, got {qzeros.dtype}."
                 )
-            if not torch.isfinite(scales).all() or torch.any(scales < 0):
-                raise ValueError(
-                    f"QMoE {label.upper()} scales must be finite and nonnegative."
-                )
-            if layout.has_int3 and scales.dtype != activation_dtype:
-                raise ValueError(
-                    f"Draft INT3 QMoE {label.upper()} scales must match activation "
-                    f"dtype {activation_dtype}, got {scales.dtype}."
-                )
-            if (
-                activation_dtype is not None
-                and not torch.isfinite(scales.to(activation_dtype)).all()
-            ):
-                raise ValueError(
-                    f"QMoE {label.upper()} scales must remain finite after conversion "
-                    f"to activation dtype {activation_dtype}."
-                )
+            _validate_qmoe_scales(
+                scales,
+                label=label.upper(),
+                activation_dtype=activation_dtype,
+                require_matching_dtype=layout.has_int3,
+            )
             if projection_layout.bits == 3 and qzeros is not None:
                 _validate_int3_qmoe_zero_points(qzeros, logical_k // block_size)
                 # Canonical export omits the validated, redundant offset-4 tensor.
                 qzeros = None
 
             if root in projection_layouts:
+                deferred_interleave = (
+                    layout.has_int3 and label == "fc1" and weight_transforms is not None
+                )
                 # Legacy roots are validated here but renamed by preprocess_olive_weights.
                 if layout.has_int3 and label == "fc1":
                     # Draft raw initializers carry gate/up interleaving, not a
@@ -1280,14 +1292,25 @@ def _preprocess_olive_qmoe_weights(
                             .contiguous()
                         )
 
-                    qweight = interleave(qweight)
-                    scales = interleave(scales)
-                    if qzeros is not None:
-                        qzeros = interleave(qzeros)
-                renamed_experts[f"{stem}.weight"] = qweight.contiguous()
+                    if weight_transforms is None:
+                        qweight = interleave(qweight)
+                        scales = interleave(scales)
+                        if qzeros is not None:
+                            qzeros = interleave(qzeros)
+                    else:
+                        # Keys match the final QMoE names emitted by the packer.
+                        weight_transforms[f"{root}.fc1_experts_weights"] = interleave
+                        weight_transforms[f"{root}.fc1_scales"] = interleave
+                        if qzeros is not None:
+                            weight_transforms[f"{root}.fc1_experts_zero_points"] = interleave
+                renamed_experts[f"{stem}.weight"] = (
+                    qweight if deferred_interleave else qweight.contiguous()
+                )
                 renamed_experts[f"{stem}.scales"] = scales
                 if qzeros is not None:
-                    renamed_experts[f"{stem}.zero_points"] = qzeros.contiguous()
+                    renamed_experts[f"{stem}.zero_points"] = (
+                        qzeros if deferred_interleave else qzeros.contiguous()
+                    )
 
     projection_expert_keys = {
         key
@@ -1634,6 +1657,7 @@ def preprocess_quantized_weights(
     reject_quantized_embeddings_lm_head: bool = False,
     defer_non_expert_sidecars: bool = False,
     qmoe_activation_dtype: torch.dtype | None = None,
+    weight_transforms: dict[str, WeightTransform] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Apply shared quantization conversion, tying, and QMoE packing.
 
@@ -1661,6 +1685,8 @@ def preprocess_quantized_weights(
             component loader to resolve per-projection layouts. Expert packing
             and float weight tying still run here.
         qmoe_activation_dtype: Expected scale dtype for draft INT3 QMoE export.
+        weight_transforms: Optional output mapping for deferred, shape-preserving
+            initializer transforms. Apply it when binding the returned weights.
 
     Returns:
         The preprocessed weight dictionary.
@@ -1831,9 +1857,19 @@ def preprocess_quantized_weights(
                 embed_key=embed_key,
                 head_key=head_key,
                 activation_dtype=qmoe_activation_dtype,
+                weight_transforms=weight_transforms,
             )
             return_state_dict.update(deferred)
             return return_state_dict
+        if use_qmoe:
+            # Legacy layouts retain their shape handling but share the numeric checks.
+            for key, value in state_dict.items():
+                if ".experts." in key and key.endswith("_scales"):
+                    _validate_qmoe_scales(
+                        value,
+                        label=key.removesuffix("_scales"),
+                        activation_dtype=qmoe_activation_dtype,
+                    )
         olive_tie = tie_embeddings or quantization.tie_word_embeddings
         return_state_dict = preprocess_olive_weights(
             state_dict,

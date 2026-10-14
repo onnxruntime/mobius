@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import dataclasses
+import gc
 import itertools
+import weakref
 
 import onnx_ir as ir
 import pytest
@@ -318,6 +320,10 @@ def test_public_build_loads_local_olive_int3_checkpoint(tmp_path, fc1, fc2, dtyp
             raw[name] = tensor
     save_file(raw, str(tmp_path / "model.safetensors"), metadata={"format": "pt"})
     package = build(str(tmp_path), dtype="f16" if dtype == ir.DataType.FLOAT16 else "bf16")
+    for suffix in ("fc1_experts_weights", "fc1_scales"):
+        value = package["model"].graph.initializers[f"{_ROOT}.{suffix}"].const_value
+        assert isinstance(value, ir.LazyTensor)
+        assert not value.cache
     output = tmp_path / "export"
     package.save(str(output), progress_bar=False)
     graph = ModelPackage.load(str(output))["model"].graph
@@ -348,7 +354,8 @@ def test_int3_export_accepts_profile_block_sizes(block):
 
 
 @pytest.mark.parametrize("fc1,fc2", [(3, 4), (4, 3)])
-def test_int3_mixed_export_preserves_asymmetric_int4_zero_points(fc1, fc2):
+@pytest.mark.parametrize("deferred", [False, True])
+def test_int3_mixed_export_preserves_asymmetric_int4_zero_points(tmp_path, fc1, fc2, deferred):
     config = _config(fc1, fc2)
     projection, label, rows, k = (
         ("gate_up_proj", "fc1", 2 * _I, _H) if fc1 == 4 else ("down_proj", "fc2", _H, _I)
@@ -357,16 +364,40 @@ def test_int3_mixed_export_preserves_asymmetric_int4_zero_points(fc1, fc2):
     config.quantization.overrides[name] = QuantizationOverride(bits=4, sym=False)
     raw = _state(fc1, fc2)
     zeros = _pack_oracle(
-        torch.arange(_E * rows * (k // _BLOCK)).reshape(_E, rows, k // _BLOCK) % 16, 4
+        torch.arange(_E * rows * (k // _BLOCK)).reshape(_E, rows, k // _BLOCK) % 7, 4
     )
     raw[name + "_qzeros"] = zeros
     module = MoECausalLMModel(config)
-    processed = module.preprocess_weights(raw)
+    transforms = {} if deferred else None
+    processed = module.preprocess_weights(dict(raw), weight_transforms=transforms)
     expected = zeros
     if fc1 == 4:
-        expected = zeros.reshape(_E, 2, _I, -1).transpose(1, 2).reshape(*zeros.shape)
-    assert torch.equal(processed[f"{_ROOT}.{label}_experts_zero_points"], expected)
+        assert torch.all(torch.any(zeros[:, :_I] != zeros[:, _I:], dim=-1))
+        expected = torch.stack(
+            [zeros[:, row] for i in range(_I) for row in (i, i + _I)], dim=1
+        )
+    key = f"{_ROOT}.{label}_experts_zero_points"
+    if deferred and fc1 == 4:
+        assert processed[key].data_ptr() == zeros.data_ptr()
+        assert torch.equal(transforms[key](processed[key]), expected)
+    else:
+        assert torch.equal(processed[key], expected)
     assert getattr(module.model.layers[0].mlp, label + "_experts_zero_points") is not None
+    package = build_from_module(module, config)
+    for name, parameter in module.named_parameters():
+        if name not in processed:
+            processed[name] = torch.zeros(
+                tuple(parameter.shape),
+                dtype=tensor_adapters.to_torch_dtype(parameter.dtype),
+            )
+    package.apply_weights(processed, weight_transforms=transforms)
+    if deferred and fc1 == 4:
+        value = package["model"].graph.initializers[key].const_value
+        assert isinstance(value, ir.LazyTensor)
+        assert not value.cache
+    package.save(str(tmp_path), progress_bar=False)
+    saved = ModelPackage.load(str(tmp_path))["model"].graph.initializers[key].const_value
+    assert saved.tobytes() == expected.numpy().tobytes()
 
 
 @pytest.mark.parametrize("fc1,fc2", _PAIRS)
@@ -450,7 +481,7 @@ def test_non_int3_graph_interleave_matches_independent_row_order(tmp_path, bits,
     assert torch.equal(torch.from_numpy(actual), expected)
 
 
-@pytest.mark.parametrize("fc1,fc2", [(2, 2), (2, 8), (8, 2), (8, 8)])
+@pytest.mark.parametrize("fc1,fc2", [(2, 2), (2, 8), (4, 4), (8, 2), (8, 8)])
 @pytest.mark.parametrize("projection", ["gate_up_proj", "down_proj"])
 @pytest.mark.parametrize("invalid", ["negative", "nan", "inf", "cast_overflow"])
 def test_non_int3_export_rejects_invalid_scales(fc1, fc2, projection, invalid):
@@ -466,6 +497,82 @@ def test_non_int3_export_rejects_invalid_scales(fc1, fc2, projection, invalid):
     module = MoECausalLMModel(_config(fc1, fc2))
     with pytest.raises(ValueError, match=r"scales.*finite"):
         module.preprocess_weights(raw)
+
+
+@pytest.mark.parametrize("fc1,fc2", _INT3_PAIRS)
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+@pytest.mark.parametrize("layers", [1, 3])
+def test_int3_deferred_interleave_preserves_storage_and_releases_outputs(
+    tmp_path, fc1, fc2, dtype, layers
+):
+    config = _config(fc1, fc2, dtype)
+    config = dataclasses.replace(
+        config,
+        num_hidden_layers=layers,
+        quantization=dataclasses.replace(
+            config.quantization,
+            overrides={
+                key.replace("layers.0.", f"layers.{layer}."): value
+                for layer in range(layers)
+                for key, value in config.quantization.overrides.items()
+            },
+        ),
+    )
+    raw = {
+        key.replace("layers.0.", f"layers.{layer}."): (
+            value.bitwise_xor(layer) if key.endswith("_qweight") else value + layer / 8
+        )
+        for layer in range(layers)
+        for key, value in _state(fc1, fc2, tensor_adapters.to_torch_dtype(dtype)).items()
+    }
+    module = MoECausalLMModel(config)
+    transforms = {}
+    processed = module.preprocess_weights(dict(raw), weight_transforms=transforms)
+    calls = []
+    outputs = []
+    for name, transform in tuple(transforms.items()):
+
+        def recorded(tensor, fn=transform, key=name, source=processed[name]):
+            assert tensor.data_ptr() == source.data_ptr()
+            assert all(reference() is None for reference in outputs)
+            calls.append(key)
+            output = fn(tensor)
+            outputs.append(weakref.ref(output))
+            return output
+
+        transforms[name] = recorded
+    for layer in range(layers):
+        root = _ROOT.replace("layers.0.", f"layers.{layer}.")
+        for suffix, sidecar in (("experts_weights", "_qweight"), ("scales", "_scales")):
+            assert (
+                processed[f"{root}.fc1_{suffix}"].data_ptr()
+                == raw[f"{root}.experts.gate_up_proj{sidecar}"].data_ptr()
+            )
+    package = build_from_module(module, config)
+    for name, parameter in module.named_parameters():
+        if name not in processed:
+            processed[name] = torch.zeros(
+                tuple(parameter.shape),
+                dtype=tensor_adapters.to_torch_dtype(parameter.dtype),
+            )
+    package.apply_weights(processed, weight_transforms=transforms)
+    assert calls == []
+    for directory in ("first", "second"):
+        package.save(str(tmp_path / directory), progress_bar=False)
+        gc.collect()
+        assert outputs
+        assert all(reference() is None for reference in outputs)
+        saved = ModelPackage.load(str(tmp_path / directory))["model"].graph
+        for layer in range(layers):
+            root = _ROOT.replace("layers.0.", f"layers.{layer}.")
+            for suffix, sidecar in (("experts_weights", "_qweight"), ("scales", "_scales")):
+                original = raw[f"{root}.experts.gate_up_proj{sidecar}"]
+                expected = torch.stack(
+                    [original[:, row] for i in range(_I) for row in (i, i + _I)], dim=1
+                )
+                actual = saved.initializers[f"{root}.fc1_{suffix}"].const_value
+                assert actual.tobytes() == tensor_adapters.TorchTensor(expected).tobytes()
+    assert set(calls) == set(transforms)
 
 
 def test_non_int3_export_preserves_weight_loader_scale_conversion(tmp_path):

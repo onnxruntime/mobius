@@ -13,6 +13,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._weight_utils import (
+    WeightTransform,
     preprocess_quantized_weights,
     supported_qmoe_quantization,
 )
@@ -530,7 +531,10 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         self._replace_text_model(Qwen35MoETextModel(config))
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Preprocess HuggingFace state dict for Qwen3.5-MoE.
 
@@ -612,6 +616,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
             qmoe_hidden_size=self.config.hidden_size,
             qmoe_intermediate_size=self.config.moe_intermediate_size,
             qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
+            weight_transforms=weight_transforms,
             qmoe_expected_moe_paths=tuple(
                 f"model.layers.{layer_idx}.mlp"
                 for layer_idx in range(self.config.num_hidden_layers)
@@ -946,7 +951,10 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         )
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Route HF weights to the three sub-model ONNX initializer names.
 
@@ -1042,6 +1050,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 qmoe_hidden_size=self.config.hidden_size,
                 qmoe_intermediate_size=self.config.moe_intermediate_size,
                 qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
+                weight_transforms=weight_transforms,
                 qmoe_expected_moe_paths=tuple(
                     f"decoder.model.layers.{layer_idx}.mlp"
                     for layer_idx in range(self.config.num_hidden_layers)
@@ -1067,6 +1076,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 qmoe_hidden_size=self.config.hidden_size,
                 qmoe_intermediate_size=self.config.moe_intermediate_size,
                 qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
+                weight_transforms=weight_transforms,
                 qmoe_expected_moe_paths=tuple(
                     f"decoder.model.layers.{layer_idx}.mlp"
                     for layer_idx in range(self.config.num_hidden_layers)

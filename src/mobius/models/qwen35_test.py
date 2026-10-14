@@ -461,9 +461,13 @@ def _qwen35_projection_fixture(adapter, fc1, fc2, dtype):
 @pytest.mark.parametrize("adapter", ["text", "vl", "vl_component"])
 @pytest.mark.parametrize("fc1,fc2", [(2, 3), (3, 2), (3, 3), (3, 4), (4, 3), (3, 8), (8, 3)])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
-def test_qwen35_int3_qmoe_preprocess_binds_projection_payloads(adapter, fc1, fc2, dtype):
+@pytest.mark.parametrize("deferred", [False, True])
+def test_qwen35_int3_qmoe_preprocess_binds_projection_payloads(
+    adapter, fc1, fc2, dtype, deferred
+):
     model, state, target = _qwen35_projection_fixture(adapter, fc1, fc2, dtype)
-    result = model.preprocess_weights(dict(state))
+    transforms = {} if deferred else None
+    result = model.preprocess_weights(dict(state), weight_transforms=transforms)
     source = "model.language_model.layers.0.mlp.experts."
     parameters = dict(model.named_parameters())
     for suffix, sidecar in (("experts_weights", "_qweight"), ("scales", "_scales")):
@@ -477,7 +481,12 @@ def test_qwen35_int3_qmoe_preprocess_binds_projection_payloads(adapter, fc1, fc2
             ("fc2", state[source + "down_proj" + sidecar]),
         ):
             name = target + fc + "_" + suffix
-            assert torch.equal(result[name], tensor)
+            if deferred and fc == "fc1":
+                assert result[name].data_ptr() == gate_up.data_ptr()
+                actual = transforms[name](result[name])
+            else:
+                actual = result[name]
+            assert torch.equal(actual, tensor)
             assert tuple(result[name].shape) == tuple(parameters[name].shape)
             assert result[name].dtype == (
                 torch.uint8 if sidecar == "_qweight" else tensor_adapters.to_torch_dtype(dtype)

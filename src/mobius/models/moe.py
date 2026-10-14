@@ -14,7 +14,11 @@ from onnx_ir import tensor_adapters
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, GrokGGUFConfig, GroveMoEGGUFConfig
-from mobius._weight_utils import is_packed_quant_key, preprocess_quantized_weights
+from mobius._weight_utils import (
+    WeightTransform,
+    is_packed_quant_key,
+    preprocess_quantized_weights,
+)
 from mobius.components import (
     FCMLP,
     Attention,
@@ -73,7 +77,12 @@ def _quantized_linear_class(config: ArchitectureConfig) -> type | None:
     )
 
 
-def _preprocess_moe_weights(model: CausalLMModel, state_dict) -> dict:
+def _preprocess_moe_weights(
+    model: CausalLMModel,
+    state_dict,
+    *,
+    weight_transforms: dict[str, WeightTransform] | None = None,
+) -> dict:
     """Shared MoE weight preprocessing that routes routed experts through QMoE.
 
     Applies the standard quantization conversion (GPTQ/AWQ/Olive) and, when the
@@ -85,6 +94,7 @@ def _preprocess_moe_weights(model: CausalLMModel, state_dict) -> dict:
 
     Callers pass a state dict whose HF expert layout has already been
     normalised (see :func:`_rename_moe_expert_weights`).
+    If provided, ``weight_transforms`` is filled in place for deferred binding.
     """
     quantization = model.config.quantization_for("model")
     # The GGUF importer already emits the graph's exact per-expert packed
@@ -109,6 +119,7 @@ def _preprocess_moe_weights(model: CausalLMModel, state_dict) -> dict:
         qmoe_hidden_size=model.config.hidden_size,
         qmoe_intermediate_size=model.config.moe_intermediate_size,
         qmoe_activation_dtype=tensor_adapters.to_torch_dtype(model.config.dtype),
+        weight_transforms=weight_transforms,
         qmoe_expected_moe_paths=tuple(
             f"model.layers.{layer_idx}.mlp"
             for layer_idx in range(model.config.num_hidden_layers)
@@ -402,9 +413,12 @@ class DbrxGGUFCausalLMModel(CausalLMModel):
         )
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class ArcticGGUFDecoderLayer(nn.Module):
@@ -481,9 +495,12 @@ class ArcticGGUFCausalLMModel(CausalLMModel):
         self._replace_text_model(MoETextModel(config, layer_class=ArcticGGUFDecoderLayer))
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class _GrokScaledEmbedding(Embedding):
@@ -637,9 +654,12 @@ class GrokGGUFCausalLMModel(CausalLMModel):
         return (logits, *outputs[1:])
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class GroveMoEBlock(nn.Module):
@@ -799,9 +819,12 @@ class GroveMoEGGUFCausalLMModel(CausalLMModel):
         self._replace_text_model(GroveMoEGGUFTextModel(config))
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class Ernie45MoEGGUFDecoderLayer(MoEDecoderLayer):
@@ -857,9 +880,12 @@ class Ernie45MoEGGUFCausalLMModel(CausalLMModel):
         self._replace_text_model(Ernie45MoEGGUFTextModel(config))
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class Phi3MoECausalLMModel(CausalLMModel):
@@ -938,10 +964,13 @@ class MoECausalLMModel(CausalLMModel):
             self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         state_dict = _rename_moe_expert_weights(state_dict)
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class Qwen2MoELayer(MoELayer):
@@ -1051,10 +1080,13 @@ class Qwen2MoECausalLMModel(CausalLMModel):
             self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         state_dict = _rename_moe_expert_weights(state_dict)
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class UngatedSharedMoELayer(MoELayer):
@@ -1206,9 +1238,12 @@ class HunyuanMoEGGUFCausalLMModel(CausalLMModel):
         self._replace_text_model(HunyuanMoEGGUFTextModel(config))
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 def _preprocess_shared_moe_weights(
@@ -1251,10 +1286,13 @@ class Ernie45MoECausalLMModel(CausalLMModel):
         )
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         state_dict = _preprocess_shared_moe_weights(state_dict)
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class Glm4MoECausalLMModel(CausalLMModel):
@@ -1286,10 +1324,13 @@ class Glm4MoECausalLMModel(CausalLMModel):
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         state_dict = _preprocess_shared_moe_weights(state_dict)
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class HunYuanMoEV1CausalLMModel(CausalLMModel):

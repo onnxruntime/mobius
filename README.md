@@ -78,10 +78,19 @@ FC scale dtypes must match the activations. Every projection's scales must be
 finite and nonnegative. When the adapter supplies the activation dtype,
 scales must remain finite after conversion. Non-INT3 layouts retain the
 standard weight loader's dtype conversion.
+The legacy uniform INT4 path receives the same numeric scale checks.
 INT2, INT4, and INT8 projections retain their existing zero-point
 semantics; asymmetric zero points must be packed `uint8` sidecars.
 Dense INT3 `MatMulNBits`, embeddings, other source layouts, and schema-unapproved
 tails are not enabled. Keep non-expert projections at supported precisions.
+
+`build()` defers INT3-layout FC1 interleaving to initializer serialization,
+using uncached lazy tensors instead of retaining a second complete FC1 payload.
+The original checkpoint is still loaded eagerly; this bounds additional
+interleaving storage, not total checkpoint memory. Direct `preprocess_weights()`
+calls retain eager behavior unless an output `weight_transforms` mapping is
+provided. Pass that mapping to `ModelPackage.apply_weights()` with the returned
+weights to preserve the deferred transformations.
 
 **Export support is not a runtime qualification matrix.** INT3 QMoE nodes
 carry a draft-format/runtime-warning marker; they do not invent an
