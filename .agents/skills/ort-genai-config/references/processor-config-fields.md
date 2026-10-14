@@ -31,12 +31,6 @@ used by ort-extensions image processors. For an overview, see the parent
       },
       {
         "operation": {
-          "name": "convert_to_rgb",
-          "type": "ConvertRGB"
-        }
-      },
-      {
-        "operation": {
           "name": "resize",
           "type": "Resize",
           "attrs": {
@@ -63,8 +57,7 @@ used by ort-extensions image processors. For an overview, see the parent
           "type": "Normalize",
           "attrs": {
             "mean": [0.48145466, 0.4578275, 0.40821073],
-            "std": [0.26862954, 0.26130258, 0.27577711],
-            "qwen2_5_vl": 1
+            "std": [0.26862954, 0.26130258, 0.27577711]
           }
         }
       },
@@ -91,11 +84,21 @@ used by ort-extensions image processors. For an overview, see the parent
 | Type | Purpose | Key attrs |
 |---|---|---|
 | `DecodeImage` | Decode from bytes | `color_space` |
-| `ConvertRGB` | Ensure RGB | — |
+| `ConvertRGB` | Swap BGR to RGB; omit after RGB decode | — |
 | `Resize` | Smart resize | `width`, `height`, `smart_resize`, `min_pixels`, `max_pixels`, `patch_size`, `merge_size` |
 | `Rescale` | Scale pixel values | `rescale_factor` |
 | `Normalize` | Mean/std normalization | `mean`, `std` |
 | `PatchImage` | Extract patches | `patch_size`, `temporal_patch_size`, `merge_size` |
+
+After `DecodeImage(color_space="RGB")`, use ordinary `Normalize`: both
+`ConvertRGB` and the nonzero `qwen2_5_vl`/`qwen3_vl` Normalize flags swap red
+and blue. Neither owns patch interleaving; `PatchImage` owns that layout.
+Do not add either swap to an already-RGB pipeline.
+
+Native smart resize and HF can disagree at half-factor boundaries:
+the inspected ORT-Extensions implementation uses `std::round`, while HF uses
+Python ties-to-even `round`. Grid/token equality must be checked separately
+from RGB correctness and successful generation.
 
 ---
 
@@ -113,7 +116,6 @@ processor_config = {
         "transforms": [
             {"operation": {"name": "decode_image", "type": "DecodeImage",
                            "attrs": {"color_space": "RGB"}}},
-            {"operation": {"name": "convert_to_rgb", "type": "ConvertRGB"}},
             {"operation": {"name": "resize", "type": "Resize",
                            "attrs": {
                                "width": 540, "height": 360, "smart_resize": 1,
@@ -125,7 +127,6 @@ processor_config = {
                            "attrs": {"rescale_factor": ip.rescale_factor}}},
             {"operation": {"name": "normalize", "type": "Normalize", "attrs": {
                 "mean": list(ip.image_mean), "std": list(ip.image_std),
-                "qwen2_5_vl": 1,
             }}},
             {"operation": {"name": "patch_image", "type": "PatchImage", "attrs": {
                 "patch_size": ip.patch_size,
@@ -150,7 +151,6 @@ def _write_processor_config(processor, output_dir):
             "transforms": [
                 {"operation": {"name": "decode_image", "type": "DecodeImage",
                                "attrs": {"color_space": "RGB"}}},
-                {"operation": {"name": "convert_to_rgb", "type": "ConvertRGB"}},
                 {"operation": {"name": "resize", "type": "Resize", "attrs": {
                     "width": 540, "height": 360, "smart_resize": 1,
                     "min_pixels": ip.size.get("shortest_edge", 3136),
@@ -161,7 +161,6 @@ def _write_processor_config(processor, output_dir):
                                "attrs": {"rescale_factor": ip.rescale_factor}}},
                 {"operation": {"name": "normalize", "type": "Normalize", "attrs": {
                     "mean": list(ip.image_mean), "std": list(ip.image_std),
-                    "qwen2_5_vl": 1,
                 }}},
                 {"operation": {"name": "patch_image", "type": "PatchImage", "attrs": {
                     "patch_size": ip.patch_size,
