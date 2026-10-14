@@ -220,6 +220,7 @@ acceptance of a `ModelTask`, rather than changing the defaults:
 ```python
 package = mobius.build(
     model_id,
+    execution_provider="onnx-standard",
     task=Qwen4ExpCausalLMTask(
         split_ngram=True,
         requested_components={"ngram", "main"},
@@ -242,26 +243,41 @@ Qwen4ExpVisionLanguageTask(
 )
 ```
 
-With `split_ngram=False` (the default), `requested_components` is absent or
-rejected; the current text key is `model`, and the current VLM keys remain
+With `split_ngram=False` (the default), `requested_components` must be `None`;
+any non-`None` selection is rejected before graph construction. The current
+text key is `model`, and the current VLM keys remain
 `decoder`, `vision_encoder`, and `embedding`. With `split_ngram=True`, the new
-main key is consistently `main` (role `decoder`) and the lookup key is `ngram`
+proposed main key is `main` (role `decoder`) and the lookup key is `ngram`
 (role `embedding`). Their proposed module attributes are `main` and `ngram`
 for text, and `decoder` and `ngram` for VLM; existing VLM attributes
 `vision_encoder` and `embedding` remain unchanged. The default selected set is
 the complete set for the task: `{ngram, main}` for text, and
 `{ngram, main, vision_encoder, embedding}` for VLM. Unknown keys and empty
-selections fail before graph construction. The option applies only to an
-explicit Qwen4-Exp task instance; other models and non-target EP routes retain
-their existing behavior.
+selections fail before graph construction.
+The opt-in is accepted only with `execution_provider="onnx-standard"`;
+`split_ngram=True` on any other profile is rejected before graph construction,
+with the build entry point validating the combination before `task.build()`.
+The task instance does not override the build entry point's EP default.
+The option is not ignored or silently replaced by an unsplit build. With the opt-in disabled,
+other models and EP profiles retain their existing behavior. This proposal
+adds a Python task-instance interface, not a CLI flag or new task-string alias.
 `requested_components={"main"}` and `{"ngram"}` are valid partial builds;
 neither silently rebuilds the legacy unsplit graph.
+
+| Topology | Package / selector key | Module attribute | Role |
+|---|---|---|---|
+| text | `main` | `main` | `decoder` |
+| VLM | `main` | `decoder` | `decoder` |
+| either | `ngram` | `ngram` | `embedding` |
+| VLM | `vision_encoder` | `vision_encoder` | `encoder` |
+| VLM | `embedding` | `embedding` | `embedding` |
 
 The VLM example opts into the same interface:
 
 ```python
 package = mobius.build(
     model_id,
+    execution_provider="onnx-standard",
     task=Qwen4ExpVisionLanguageTask(
         split_ngram=True,
         requested_components={"ngram", "main", "vision_encoder", "embedding"},
@@ -295,8 +311,7 @@ raw lookup width for each PLE layer.
 
 | Graph | Input | Output | Dtype and shape |
 |---|---|---|---|
-| `ngram` | `input_ids` | — | INT64 `[B,S]` |
-| `ngram` | `attention_mask` (past then current) | — | INT64 `[B,P+S]` |
+| `ngram` | `input_ids` (host substitutes EOS for masked IDs) | — | INT64 `[B,S]` |
 | `ngram` | `past_ngram_context` | — | INT64 `[L,B,N-1]` |
 | `ngram` | — | `ngram_embeddings` | model dtype `[L,B,S,D]` |
 | `ngram` | — | `present_ngram_context` | INT64 `[L,B,N-1]` |
@@ -349,14 +364,16 @@ length. Since the proposed ngram graph has no position input, the host supplies
 the equivalent initialized context; do not add an implicit sentinel or infer
 cold start from token values.
 
-The ngram graph derives current-token validity from the final `S` entries of
-the full `[B,P+S]` mask. Substitute EOS for masked current IDs before hashing
-and when appending to stored history; do not zero the raw lookup result. The
-main graph still gets the original lexical IDs for text embedding, or the
-already fused `inputs_embeds` for VLM, plus the unchanged full attention mask.
-The past part of that mask remains main's attention input; prior ngram history
-must already reflect the per-chunk EOS substitution. Do not reapply the past
-mask to context or confuse it with the current suffix mask.
+Preserve #767's mask-free ngram seam: the host derives current-token validity
+from the final `S` entries of the full `[B,P+S]` mask and substitutes EOS for
+masked current IDs before invoking ngram. The ngram graph receives only those
+prepared IDs and its history, with no mask input or dependency on `P`; do not
+zero the raw lookup result. Keep a separate copy of the original lexical IDs:
+text main receives them for token embedding, and VLM main receives them as
+`ple_input_ids` for query-length/mask bookkeeping alongside image-fused
+`inputs_embeds`. Main retains the unchanged full attention mask. Prior ngram
+history already reflects each chunk's host substitution; do not reapply the
+past mask to it.
 
 For ngram hashing, an EOS in a nearer history position causes farther shifted
 tokens to be treated as EOS. This lookup-only EOS-crossing rule does not rewrite
@@ -364,8 +381,10 @@ the stored context: next context is the final `N-1` entries of the prior
 context concatenated with current IDs after masked-current-ID substitution.
 Distinguish this rule from padding substitution, which does affect stored
 history. The ngram output represents each current token, including masked
-positions using EOS lookup; main's existing token mask suppresses the
-hidden-dependent PLE contribution at those positions.
+positions using EOS lookup. In main, the existing mask zeros the current
+gated value and current convolution input before the PLE convolution.
+Previously stored convolution state can still contribute at a masked
+position; preserve that behavior rather than adding a post-convolution mask.
 
 Every chunk call consumes the last `N-1` context from the preceding chunk and
 returns the next context; it must not restart EOS initialization between chunks.
@@ -394,10 +413,10 @@ package binding rather than retaining a second checkpoint state dict.
 
 | Request / package | Selected graph weights | Runtime dependencies not implicitly built |
 |---|---|---|
-| text `{ngram}` | All configured PLE lookup shards and deterministic hash buffers | Caller supplies IDs, mask, and context; no main graph |
+| text `{ngram}` | All configured PLE lookup shards and deterministic hash buffers | Caller supplies host-prepared IDs and context; no main graph |
 | text `{main}` | Text token table, LM head, decoder and PLE projection/norm/convolution weights; no PLE lookup table | Caller supplies raw ngram embeddings and all main inputs/states |
 | text `{ngram, main}` | Union of the preceding disjoint owners | Complete text split pair |
-| VLM `{ngram}` | PLE lookup shards and deterministic buffers only | Caller supplies IDs/mask/context |
+| VLM `{ngram}` | PLE lookup shards and deterministic buffers only | Caller supplies host-prepared IDs and context |
 | VLM `{main}` | Decoder, LM head, PLE projection/norm/convolution weights; no visual tower, embedding graph, or ngram table | Caller supplies fused embeddings, ngram embeddings, and main states |
 | VLM `{embedding}` | Token-embedding table and image-placeholder mixer/guard | Caller supplies IDs and image features |
 | VLM `{vision_encoder}` | Visual tower | Caller supplies pixels/grid and consumes image features |
@@ -411,10 +430,25 @@ head. Ngram owns neither. Treat the source token-table parameter and
 `lm_head.weight` as distinct identities unless config/source aliases explicitly
 prove they are tied. When that proof exists, declare it through
 `SharedWeightInfo`; do not infer tying from common dimensions, a common external
-data file, or observed equality of values. MTP dependencies and identity
-declarations must agree with M0 (#769). A logical shared-weight declaration
+data file, or observed equality of values. Ordinary token-table/head ownership
+is specified here in N0 (#768); MTP dependencies and identity declarations
+require joint coordination with M0 (#769). A logical shared-weight declaration
 does not guarantee a shared runtime allocation across independently loaded
 ONNX sessions.
+
+The existing manifest and adapter are building blocks, not a claim that they
+already support this split. N1 must define instance-specific descriptors and
+source-name mappings for the keys above, with deterministic-buffer validation
+limited to the selected dependency closure. Supported checkpoint formats must
+be explicit; the proposal does not qualify split FP8 binding.
+The instance-specific manifest must expose those descriptors and roles before
+`task.build()`, not infer them later from unknown package keys. Ngram lookup
+tables must not claim the ordinary token-table alias used for tied-weight
+inference; that alias belongs only to the actual token-table owner above.
+Cross-package shared endpoints between the root and nested MTP sidecar remain
+a joint N0/M0 approval item. Ordinary text/VLM ownership is specified above;
+the endpoint representation and cross-package binding mechanism are not yet
+approved and must not be inferred from same-manifest `SharedWeightInfo`.
 
 ### Build, load, save, and nested MTP behavior
 
@@ -452,7 +486,43 @@ unknown requested name is an error. A selected ONNX graph remains independently
 loadable and carries its ABI version and PLE-layer ordering in metadata; loading
 `main` does not silently load or execute `ngram`. The caller must supply a
 matching ngram ABI at invocation time. Loading an individual component
-subdirectory remains possible with the existing flat-directory load behavior.
+subdirectory remains possible, subject to the split-only identity recovery
+rule below.
+
+**Proposed singleton identity rule:** retain the existing disk layout: one
+selected component is written as root `model.onnx`; multiple components use
+named subdirectories. The pinned loader currently recovers a flat component's
+key from the ONNX filename, so it would return `model` for a singleton split
+graph. N1 therefore needs a narrow metadata-based identity extension, not just
+the existing loader.
+
+Every graph selected by an opt-in split task, including VLM `embedding` and
+`vision_encoder`, carries these proposed ONNX model metadata properties:
+
+- `mobius.qwen4_exp.split_abi`: `qwen4-exp-ngram-main.v1`.
+- `mobius.qwen4_exp.component_key`: its canonical selector key from the table
+  above, not merely its optimization role.
+
+For marked graphs, `ModelPackage.load()` resolves the canonical key from this
+metadata before applying the requested root-key selection. It does not infer
+`main` versus `ngram` from a flat filename. An absent member of this metadata
+pair, an unsupported ABI/key, duplicate recovered keys, or disagreement with a
+component subdirectory name when loading a multi-component package is an
+explicit error. Unmarked legacy graphs retain the existing filename/directory
+key behavior. The graph remains independently loadable by an ONNX runtime;
+the metadata governs its identity in the Mobius package wrapper.
+
+| Saved selection / load entry | Layout | Recovered root key(s) |
+|---|---|---|
+| Singleton `{ngram}` build or full package filtered to `{ngram}` | `model.onnx` | `ngram` |
+| Singleton `{main}` build or full package filtered to `{main}` | `model.onnx` | `main` |
+| Singleton VLM `{embedding}` or `{vision_encoder}` | `model.onnx` | Selected canonical key |
+| Complete text split package | `ngram/model.onnx`, `main/model.onnx` | `ngram`, `main` |
+| Direct load of either marked component subdirectory | Local `model.onnx` | Its metadata key |
+| Unmarked legacy flat package | `model.onnx` | `model`, unchanged |
+
+These rules are a proposal requiring N0 approval and implementation in N1.
+They do not claim that the current loader already recovers split keys.
 
 `ModelPackage.save(components=...)` already filters root package components.
 Retain that existing default and behavior. Make clear that its filter is a
@@ -470,14 +540,16 @@ recursively. MTP remains the existing nested sidecar and is not selected by
 Do not introduce a new persistence scheme or claim that sharing ONNX external
 data shares runtime memory.
 
-Proposed metadata on both split graphs identifies a versioned split ABI
-(`qwen4-exp-ngram-main.v1`), component role, configured `ple_layer_ids`, `N`,
-`D`, and model dtype. Store the main graph's existing state manifest with
+In addition to the package identity metadata above, ngram/main metadata records
+component role, configured `ple_layer_ids`, `N`, `D`, and model dtype.
+Store the main graph's existing state manifest with
 `ple_context` removed only for split mode; ngram metadata documents context
 initialization, order, and state names. Preserve current keys and metadata for
-unsplit graphs. Serialize through ordinary `ModelPackage.save()` subdirectories
-and ONNX external data, then reload through `ModelPackage.load()`; reject a
-pair with mismatched split ABI or layer order at orchestration time.
+unsplit graphs. Use the existing save layout and ONNX external data, then the
+proposed split-aware load rule. Reject a pair with mismatched split ABI or
+layer order at orchestration time. Shape/ABI agreement alone does not prove
+that hash configuration and trained weights belong together; a semantic
+pairing identity/check remains an approval item before qualification.
 
 ### Complete state ownership and restore/replay proposal for S1 (#773)
 
@@ -500,6 +572,11 @@ Specify atomic commit/failure behavior before S1 implementation. Zero proposal
 tokens bypass speculative execution. This is a proposed state contract for
 review, not an approved transaction API or a claim of speculative correctness.
 
+M0 may later add an explicitly requested main pre-final tap; `split_ngram`
+does not request it or an MTP graph. The tap selector, output metadata, and
+text/VLM position mapping remain joint N0/M0 decisions before M1, not implicit
+extensions approved by this document.
+
 ### Alternatives, test targets, and approval gates
 
 Alternatives requiring explicit review include returning per-layer embedding
@@ -515,11 +592,17 @@ Proposed tiny local CPU targets (not run for this documentation-only task):
 
 | Target | Required assertion |
 |---|---|
-| `src/mobius/models/qwen4_exp_test.py::test_split_ngram_main_matches_unsplit` | Tiny random config; compare text logits and every state across prefill, chunked prefill, and multi-token cached decode; exact INT64 histories/positions and dtype-appropriate floats |
-| `src/mobius/tasks/_qwen4_exp_test.py::test_selected_split_weight_mapping_is_transactional` | Missing, malformed, and unselected source tensors; selected dependency success; package unchanged after any selected binding failure |
-| `src/mobius/_model_package_test.py::test_split_components_load_independently` | Save/load `ngram` and `main` separately and verify each declared ABI and independently supplied runtime inputs |
-| `src/mobius/_model_package_test.py::test_split_package_roundtrip_with_mtp_sidecar` | Full and filtered root save/load; all split keys and ABI metadata survive; nested MTP persists/restores in full by default and explicit omission is tested if the proposed option is accepted |
-| `tests/integration/qwen4_exp_generation_test.py::test_split_reduced_cpu_generation` | Later, after graph parity: generated IDs are fed back through ngram and main over multiple decode steps; compare tokens and complete committed state to the unsplit reference |
+| NEW `src/mobius/models/qwen4_exp_split_test.py` (#770) | Tiny random config; compare text/VLM logits and every state across prefill, chunked prefill, and multi-token cached decode; exact INT64 histories/positions and dtype-appropriate floats |
+| Extend `src/mobius/integrations/transformers/_qwen4_exp_weights_test.py` (#770) | Missing/malformed selected sources fail transactionally; same-shape/different-value sentinels prove bound values and unchanged sources; instrument unrelated payloads to prove they are not accessed |
+| `src/mobius/_model_package_test.py::test_split_components_load_independently` | Singleton builds, filtered singleton saves, direct component-directory loads and multi-component packages recover canonical keys; unmarked legacy flat loads remain `model`; missing/invalid/conflicting identity metadata fails explicitly |
+| `src/mobius/_model_package_test.py::test_split_package_roundtrip_with_mtp_sidecar` | Full and filtered root save/load; all selected canonical keys and ABI metadata survive; nested MTP persists/restores in full by default and explicit omission is tested if the proposed option is accepted |
+| NEW `src/mobius/models/qwen4_exp_split_generation_test.py` (#771) | Later, after graph parity: newly generated IDs feed back through host EOS preparation, ngram and main over multiple steps; compare independently generated reference tokens and every state, including image/no-new-image decode |
+
+The NEW files above are required future entry points, not existing or executed
+tests. Their CPU fixtures use local tiny/random tensors with
+`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`; they do not require official model
+downloads. Missing required HF reference capability or skipped mandatory cases
+are blockers, not passes.
 
 Add adversarial padding (left and chunk-boundary), EOS crossing, repeated IDs,
 batching, and multimodal text/image-position cases. Teacher-forced parity alone
@@ -535,9 +618,10 @@ Pinned source cross-checks:
 
 - [Text and VLM task signatures, state construction, and existing package keys](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/tasks/_qwen4_exp.py#L31-L143).
 - [VLM fused embeddings, lexical IDs, and four-axis positions](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/tasks/_qwen4_exp.py#L263-L342).
-- [Ngram hash, flattening, history, lookup, and PLE hidden-dependent operations](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/models/qwen4_exp.py#L410-L505) and [PLE projection/gate/convolution](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/models/qwen4_exp.py#L578-L635).
-- [Main attention masking, current-token EOS substitution, and state flow](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/models/qwen4_exp.py#L1212-L1296).
-- [VLM source component roots and embedding/head routing](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/models/qwen4_exp.py#L1820-L1875).
-- [Component declarations and manifests](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/tasks/_base.py#L23-L103), [shared-weight metadata and endpoint validation](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_component_manifest.py#L41-L103) and [manifest ownership validation](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_component_manifest.py#L161-L205), [tied-weight inference](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_component_manifest.py#L297-L323), and [weight-adapter boundary](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/weights/_adapters.py#L26-L103).
-- [Transactional Qwen4-Exp package streaming](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/integrations/transformers/_qwen4_exp_weights.py#L272-L307), [MTP sidecar save recursion](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_model_package.py#L963-L970) and [load/restore](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_model_package.py#L1304-L1396).
-- [Parent evidence bounds and deferred issues](https://github.com/onnxruntime/mobius/issues/767), [M0 identity contract coordination](https://github.com/onnxruntime/mobius/issues/769), and [S1 complete-state acceptance](https://github.com/onnxruntime/mobius/issues/773).
+- [Ngram hash, flattening, history, lookup, and PLE hidden-dependent operations](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/models/qwen4_exp.py#L410-L511) and [PLE projection/gate/convolution](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/models/qwen4_exp.py#L578-L641).
+- [Main attention masking, current-token EOS substitution, and state flow](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/models/qwen4_exp.py#L1333-L1379).
+- [VLM source component roots and embedding/head routing](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/models/qwen4_exp.py#L1930-L1939).
+- [Component declarations and manifests](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/tasks/_base.py#L23-L103), [shared-weight metadata and endpoint validation](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_component_manifest.py#L41-L103) and [manifest ownership validation](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_component_manifest.py#L161-L205), [tied-weight inference](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_component_manifest.py#L297-L323), and [weight-adapter boundary](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/weights/_adapters.py#L26-L102).
+- [Transactional Qwen4-Exp package streaming](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/integrations/transformers/_qwen4_exp_weights.py#L272-L306), [MTP sidecar save recursion](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_model_package.py#L963-L970) and [load/restore](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_model_package.py#L1304-L1396).
+- [Current selected-component layout](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_model_package.py#L70-L102), [singleton save path](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_model_package.py#L876-L893), and [directory/filename key recovery](https://github.com/onnxruntime/mobius/blob/954e8f1053d64d377d8893e5c700d1b8380d584a/src/mobius/_model_package.py#L1347-L1364).
+- [Parent evidence bounds and deferred issues](https://github.com/onnxruntime/mobius/issues/767), [N0 ordinary ownership contract](https://github.com/onnxruntime/mobius/issues/768), [joint MTP identity coordination with M0](https://github.com/onnxruntime/mobius/issues/769), and [S1 complete-state acceptance](https://github.com/onnxruntime/mobius/issues/773).
