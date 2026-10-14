@@ -24,12 +24,12 @@ The source pins are:
 | Source-grounded observation | What it does not establish |
 |---|---|
 | The GenAI builder enables MTP only when `mtp_num_hidden_layers > 0`, rejects values other than exactly one, and emits a pre-final hyper-stream tap when requested (`qwen.py:2870-2919`). | That the single trained layer can be reused for arbitrary proposal depth. |
-| Its main tap is the last decoder layer's hyper-stream after its residual injections and before the final hyper-connection mixer (`qwen.py:1885-1939`). | A Mobius public output or a reference-validated tensor contract. Mobius #755 returns only final mixed states and logits (`qwen4_exp.py:1212-1296,1299-1330`). |
+| Its main tap is the last decoder layer's hyper-stream after its residual injections and before the final hyper-connection mixer (`qwen.py:1885-1939`). | A Mobius public output or a reference-validated tensor contract. Mobius #755 returns only final mixed states and logits (`qwen4_exp.py:1375-1379,1404-1413`). |
 | The MTP graph accepts `input_ids`, `hidden_states`, attention/position inputs and QSA past state; it emits logits, hidden states, and QSA present state (`qwen.py:3043-3073,3155-3178`). | Which `input_ids` row pairs with which main hidden-state row, nor the host's position advancement rule. |
 | The loader separately constructs token embedding, LM head, two projections, two pre-projection norms, one `mtp.layers.0` decoder layer, and an MTP final mixer (`loaders/qwen.py:154-225`). The builder configures that layer as QSA and disables PLE (`qwen.py:3155-3165`). | Independent numerical parity, cache behavior, or a supported multi-step chain. |
 | HF RMSNorm uses FP32 normalization and `(1 + weight)` scaling before casting back to the input dtype; its hyper-connection mixer normalizes streams, computes a sigmoid mix gate, divides the low-rank input by `hc_count`, and averages across streams (`modeling_qwen4_exp.py:158-178,941-969`). | That the GenAI MTP custom normalization ops round identically, or the exact linear-projection accumulation dtype. |
 | HF's ordinary `Qwen4ExpForCausalLM` defines `model` and `lm_head`, ignores unexpected `mtp.*` keys, and its ordinary forward does not execute an MTP module (`modeling_qwen4_exp.py:1528-1542,1551-1563`). | Any MTP-forward oracle. Calling ordinary HF CausalLM is not an MTP reference. |
-| Mobius #755 deliberately skips `mtp.*` because no authoritative forward/cache ABI exists (`qwen4_exp.py:1360-1367,1511-1528`). | An OOM or other observed runtime failure. Missing MTP is a functional gap. |
+| Mobius #755 deliberately skips `mtp.*` because no authoritative forward/cache ABI exists (`qwen4_exp.py:1443-1449,1603-1607`). | An OOM or other observed runtime failure. Missing MTP is a functional gap. |
 
 The builder and loader describe graph structure and weight ownership, not
 independent numerical proof. The HF model's ordinary CausalLM path is likewise
@@ -130,6 +130,9 @@ hyper-connection mixer. Do not expose the post-mixer `[B,S,H]` as a substitute.
 The ordinary main output remains its current mixed hidden state/logits when
 MTP is not requested. When requested, add the tap without replacing or
 altering those outputs.
+The exact opt-in selector and additive-output metadata must be settled jointly
+with N0 before M1; neither `split_ngram` nor sidecar persistence requests this
+tap implicitly.
 
 The following is a **proposed logical signature**, not an approved ONNX/cache
 ABI. It is non-paged and follows the existing main component's layout where
@@ -140,13 +143,13 @@ possible:
 | Input | `input_ids` | INT64 `[B,S]` | GenAI MTP builder's named input. |
 | Input | `pre_final_hyper_states` | `T` `[B,S,C*H]` | Main-layer tap described above. |
 | Input | `attention_mask` | Existing causal/valid-token mask for `P+S` context | Preserve the ordinary Qwen4-Exp mask semantics; exact ONNX rank/layout follows the approved main ABI. |
-| Input | `position_ids` | INT64 `[4,B,S]` current positions, with channels `[text, temporal, height, width]` | Proposed Mobius representation based on the pinned HF position handling and existing text-core design. Mapping to GenAI's builder input representation is unresolved. |
-| Input | `past_position_ids` | INT64 `[4,B,P]` | Proposed only if the standard QSA/indexer implementation requires full cached positions; otherwise keep the minimum equivalent position state. Must be settled with the MTP cache contract. |
+| Input | `position_ids` | Candidate text INT64 `[B,S]`; candidate VLM INT64 `[4,B,S]`, with channels `[text, temporal, height, width]` | These follow N0's respective main layouts, not a universal four-axis text ABI. The MTP rank, axes and mapping to GenAI remain approval items. |
+| Input | `past_position_ids` | Candidate text INT64 `[B,P]`; candidate VLM INT64 `[4,B,P]` | Proposed only if standard QSA/indexer requires full cached positions; otherwise keep minimum equivalent state. Exact MTP representation remains blocked. |
 | Input | MTP-only QSA `past_key`, `past_value`, `past_indexer_key` | Layer-0 state for this MTP head only | Names/roles are visible in GenAI config; exact layout, dtype, initialization and cache-length representation must be approved. |
 | Output | `logits` | `T` `[B,S,V]` | Builder output. |
 | Output | `hidden_states_out` | `T` `[B,S,C*H]`, pre-final MTP hyper-streams | Builder output; not an approved repeated-step input yet. |
 | Output | MTP-only QSA `present_key`, `present_value`, `present_indexer_key` | Same state ABI as corresponding past values, advanced by the MTP tokens actually processed | Builder output roles; exact ABI unresolved. |
-| Output | `present_position_ids` | INT64 `[4,B,P+S]` if `past_position_ids` is an explicit graph input | Proposed Mobius state pairing, not present in GenAI's MTP config. |
+| Output | `present_position_ids` | Candidate text INT64 `[B,P+S]`; candidate VLM INT64 `[4,B,P+S]`, if position history is an explicit graph input | Proposed pairing following the selected topology; not present in GenAI's MTP config or an approved MTP ABI. |
 
 The GenAI config names `input_ids`, `hidden_states`, `attention_mask`,
 `position_ids`, past/present key/value/indexer state, and
@@ -273,15 +276,23 @@ under `model.embed_tokens.weight` (`qwen.py:2904-2919,3240-3251`).
 These are separate identities and sharing declarations, not permission to
 collapse the token table and vocabulary head into one logical parameter.
 Their physical aliasing and canonical ownership must follow N0 (#768).
+N0 specifies ordinary text/VLM owners, but cross-package endpoints and binding
+between the root and nested MTP sidecar are a joint approval item, not an
+existing capability implied by `SharedWeightInfo`. These example identity
+names are illustrative, not approved serialized keys. Do not interpret the
+cross-reference as resolving the nested sharing mechanism.
 
 ## Independent reference and fixtures
 
 Build the reference independently of the ONNX graph and GenAI builder:
 
-1. Load pinned HF Qwen4-Exp main weights/config and the selected `mtp.*`,
-   embedding and head tensors directly from their source names. The fixture
+1. For tiny forward checks, use a local tiny config and fixed-seed synthetic
+   main, `mtp.*`, embedding and head tensors organized by source names.
+   Separately gated bounded-official checks load the pinned weights/config
+   and selected tensors directly from their source names. The fixture
    reference must not call `Qwen4ExpForCausalLM.forward` for MTP; that forward
-   does not execute the sidecar.
+   does not execute the sidecar. Official assets are not a prerequisite for
+   the tiny reference.
 2. In eager PyTorch, independently implement the approved offset/branchwise
    norms, projections, stream reshape/add, one HF
    `Qwen4ExpTextDecoderLayer` configured as QSA/no-PLE, the MTP-specific
@@ -326,6 +337,21 @@ Qualification levels are separate:
 | Tiny synthetic forward | Standard-op graph construction, every equation/mapping branch, adversarial alignment/state behavior, and parity to the approved independent tiny reference. | Official weight coverage or useful generation quality. |
 | Bounded official forward | Mapping and numerical parity for explicitly listed official tensors/layers/tokens and approved dtypes; record exact scope and tolerances. | Full-checkpoint MTP parity, arbitrary draft depth, or speculative generation. |
 | Speculative generation | Only after forward and transaction semantics are approved: end-to-end output/state behavior against non-speculative generation for explicit acceptance/rejection, EOS, chunking and batching cases. | A consequence of either forward-level qualification; it is a separate gate. |
+
+The required future M1 entry point from #772 is NEW
+`src/mobius/models/qwen4_exp_mtp_test.py`. Once implemented and the reference
+approved, run its tiny CPU cases with:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m pytest \
+  src/mobius/models/qwen4_exp_mtp_test.py -q
+```
+
+This file and command are proposed coverage, not an executed result. Fixtures
+must use local synthetic tensors, not cached official weights or a native
+custom-op build. Missing required pinned HF reference capability or skipped
+mandatory cases remain blockers, not passing skips. Bounded official receipts
+belong to the separately approved #774 campaign.
 
 ## Implementation and approval gates
 
