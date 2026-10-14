@@ -8,6 +8,7 @@ from typing import ClassVar
 
 import onnx_ir as ir
 import torch
+from onnx_ir import tensor_adapters
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, QuantizationConfig
@@ -610,6 +611,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
             qmoe_num_experts=self.config.num_local_experts,
             qmoe_hidden_size=self.config.hidden_size,
             qmoe_intermediate_size=self.config.moe_intermediate_size,
+            qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
             qmoe_expected_moe_paths=tuple(
                 f"model.layers.{layer_idx}.mlp"
                 for layer_idx in range(self.config.num_hidden_layers)
@@ -1039,6 +1041,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 qmoe_num_experts=self.config.num_local_experts,
                 qmoe_hidden_size=self.config.hidden_size,
                 qmoe_intermediate_size=self.config.moe_intermediate_size,
+                qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
                 qmoe_expected_moe_paths=tuple(
                     f"decoder.model.layers.{layer_idx}.mlp"
                     for layer_idx in range(self.config.num_hidden_layers)
@@ -1063,6 +1066,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 qmoe_num_experts=self.config.num_local_experts,
                 qmoe_hidden_size=self.config.hidden_size,
                 qmoe_intermediate_size=self.config.moe_intermediate_size,
+                qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
                 qmoe_expected_moe_paths=tuple(
                     f"decoder.model.layers.{layer_idx}.mlp"
                     for layer_idx in range(self.config.num_hidden_layers)

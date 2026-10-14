@@ -8,7 +8,8 @@ config matches the native QMoE ABI (blk32 int4 Olive/GPTQ/AWQ),
 :meth:`Qwen35MoECausalLMModel.preprocess_weights` keeps the fused expert-major
 tensors and repacks them into ``fc1``/``fc2`` QMoE parameters (mirroring
 DeepSeek-V3), instead of un-fusing into a per-expert dense fallback. All tiny
-random configs -- no checkpoint download.
+random configs -- no checkpoint download. Projection-specific INT3 cases cover
+FP16/BF16 dtype propagation through text, VL, and decoder component-plan adapters.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 import torch
+from onnx_ir import tensor_adapters
 
 from mobius._component_quantization import configure_component_quantization
 from mobius._configs import QuantizationConfig, QuantizationOverride, VisionConfig
@@ -413,6 +415,112 @@ def _moe_vl_config(
         image_token_id=99,
         temporal_patch_size=1,
     )
+
+
+def _qwen35_projection_fixture(adapter, fc1, fc2, dtype):
+    source = "model.language_model.layers.0.mlp.experts."
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=32,
+        quant_method="olive",
+        sym=True,
+        overrides={
+            source + projection: QuantizationOverride(bits=bits)
+            for projection, bits in (("gate_up_proj", fc1), ("down_proj", fc2))
+        },
+    )
+    if adapter == "text":
+        config = _moe_config(quantization)
+        model_class = Qwen35MoECausalLMModel
+        target = "model.layers.0.mlp."
+    else:
+        config = _moe_vl_config(quantization if adapter == "vl" else None)
+        if adapter == "vl_component":
+            config = dataclasses.replace(
+                config, component_quantization={"decoder": quantization}
+            )
+        model_class = Qwen35MoEVL3ModelCausalLMModel
+        target = "decoder.model.layers.0.mlp."
+    config = dataclasses.replace(
+        config, dtype=dtype, moe_intermediate_size=32, shared_expert_intermediate_size=32
+    )
+    state = {}
+    torch_dtype = tensor_adapters.to_torch_dtype(dtype)
+    for projection, bits, rows in (("gate_up_proj", fc1, 64), ("down_proj", fc2, _H)):
+        packed_columns = 32 * bits // 8
+        values = torch.arange(_E * rows * packed_columns).reshape(_E, rows, packed_columns)
+        state[source + projection + "_qweight"] = (
+            values // packed_columns * 7 + values % packed_columns
+        ).to(torch.uint8)
+        state[source + projection + "_scales"] = (
+            torch.arange(_E * rows).reshape(_E, rows, 1) % 7 + 1
+        ).to(torch_dtype) / 8
+    return model_class(config), state, target
+
+
+@pytest.mark.parametrize("adapter", ["text", "vl", "vl_component"])
+@pytest.mark.parametrize("fc1,fc2", [(2, 3), (3, 2), (3, 3), (3, 4), (4, 3), (3, 8), (8, 3)])
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_qwen35_int3_qmoe_preprocess_binds_projection_payloads(adapter, fc1, fc2, dtype):
+    model, state, target = _qwen35_projection_fixture(adapter, fc1, fc2, dtype)
+    result = model.preprocess_weights(dict(state))
+    source = "model.language_model.layers.0.mlp.experts."
+    parameters = dict(model.named_parameters())
+    for suffix, sidecar in (("experts_weights", "_qweight"), ("scales", "_scales")):
+        gate_up = state[source + "gate_up_proj" + sidecar]
+        assert torch.all(torch.any(gate_up[:, :32] != gate_up[:, 32:], dim=-1))
+        expected = torch.stack(
+            [gate_up[:, row] for i in range(32) for row in (i, i + 32)], dim=1
+        )
+        for fc, tensor in (
+            ("fc1", expected),
+            ("fc2", state[source + "down_proj" + sidecar]),
+        ):
+            name = target + fc + "_" + suffix
+            assert torch.equal(result[name], tensor)
+            assert tuple(result[name].shape) == tuple(parameters[name].shape)
+            assert result[name].dtype == (
+                torch.uint8 if sidecar == "_qweight" else tensor_adapters.to_torch_dtype(dtype)
+            )
+    assert not any(".mlp.experts." in name for name in result)
+
+
+@pytest.mark.parametrize("adapter", ["text", "vl", "vl_component"])
+def test_qwen35_int3_qmoe_rejects_float32_activations(adapter):
+    with pytest.raises(ValueError, match="FP16 or BF16 activations"):
+        model, state, _ = _qwen35_projection_fixture(adapter, 3, 4, ir.DataType.FLOAT)
+        model.preprocess_weights(state)
+
+
+@pytest.mark.parametrize("adapter", ["text", "vl", "vl_component"])
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_qwen35_int3_qmoe_preprocess_rejects_mismatched_scale_dtype(adapter, dtype):
+    model, state, _ = _qwen35_projection_fixture(adapter, 3, 4, dtype)
+    key = "model.language_model.layers.0.mlp.experts.down_proj_scales"
+    state[key] = state[key].float()
+    with pytest.raises(ValueError, match="scales must match activation dtype"):
+        model.preprocess_weights(state)
+
+
+@pytest.mark.parametrize("adapter", ["text", "vl", "vl_component"])
+def test_qwen35_non_int3_qmoe_preprocess_allows_float32_scales(adapter):
+    model, state, target = _qwen35_projection_fixture(adapter, 2, 8, ir.DataType.FLOAT16)
+    source = "model.language_model.layers.0.mlp.experts."
+    for projection in ("gate_up_proj", "down_proj"):
+        state[source + projection + "_scales"] = state[source + projection + "_scales"].float()
+    result = model.preprocess_weights(state)
+    assert result[target + "fc1_scales"].dtype == torch.float32
+    assert result[target + "fc2_scales"].dtype == torch.float32
+
+
+@pytest.mark.parametrize("adapter", ["text", "vl", "vl_component"])
+def test_qwen35_non_int3_qmoe_preprocess_rejects_scale_conversion_overflow(adapter):
+    model, state, _ = _qwen35_projection_fixture(adapter, 2, 8, ir.DataType.FLOAT16)
+    key = "model.language_model.layers.0.mlp.experts.down_proj_scales"
+    state[key] = state[key].float()
+    state[key][0, 0, 0] = 65536
+    with pytest.raises(ValueError, match="remain finite"):
+        model.preprocess_weights(state)
 
 
 class TestQwen35MoEQMoEExport:
