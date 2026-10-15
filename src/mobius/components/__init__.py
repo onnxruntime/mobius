@@ -57,6 +57,7 @@ __all__ = [
     "GatedShortConv",
     "ClippableLinear",
     "ClippableQuantizedLinear",
+    "Float32Linear",
     "CogVLMClipSidecar",
     "GroupNorm",
     "GQAContext",
@@ -269,6 +270,7 @@ from mobius.components._fixed_siglip_sidecar import (
     FixedResolutionSiglipMLPSidecar,
     map_fixed_siglip_sidecar_weight,
 )
+from mobius.components._float32_linear import Float32Linear
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._gemma3n_audio import Gemma3nAudioEncoder
 from mobius.components._gemma3n_embedder import Gemma3nMultimodalEmbedder

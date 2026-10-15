@@ -18,10 +18,24 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius.components._common import INT64_MAX, Linear
+from mobius.components._float32_linear import Float32Linear
 from mobius.components._radio_vision import RadioBlock, _RadioClsToken
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+class _RadioV4Block(RadioBlock):
+    def __init__(
+        self, hidden_size: int, intermediate_size: int, num_heads: int, norm_eps: float
+    ):
+        super().__init__(hidden_size, intermediate_size, num_heads, norm_eps)
+        # Pinned HF F.linear adds bias to the float32 accumulator, before the
+        # native BF16 output cast. Keep that boundary without changing RADIOv2.
+        self.attn.qkv = Float32Linear(hidden_size, 3 * hidden_size)
+        self.attn.proj = Float32Linear(hidden_size, hidden_size)
+        self.mlp.fc1 = Float32Linear(hidden_size, intermediate_size)
+        self.mlp.fc2 = Float32Linear(intermediate_size, hidden_size)
 
 
 class _RadioV4PatchGenerator(nn.Module):
@@ -131,6 +145,8 @@ class RadioV4VisionModel(nn.Module):
     is supported; SwiGLU and learned LayerScale variants are not represented.
     Image normalization is deliberately external, matching
     ``RadioModel.make_preprocessor_external()`` in the source wrapper.
+    Biased dense projections retain float32 accumulation through their bias,
+    then cast back before attention, GELU or residual additions.
     """
 
     def __init__(
@@ -172,7 +188,7 @@ class RadioV4VisionModel(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                RadioBlock(hidden_size, intermediate_size, num_heads, norm_eps)
+                _RadioV4Block(hidden_size, intermediate_size, num_heads, norm_eps)
                 for _ in range(num_layers)
             ]
         )
