@@ -91,3 +91,11 @@ every primitive graph output, representative action quality, latency targets,
 GPU providers or the Windows RTX 4090 pilot. Keep numerical qualification and
 release gates closed. Do not apply Olive/quantization rewrites until a baseline
 passes, or infer a runtime-kernel defect from model-level drift alone.
+
+The clean upstream-based contribution was independently re-exported and the same
+full-checkpoint results reproduced. Atlas also compared all four embedding
+nodes (`Gather`, two `Slice`, `Concat`) against a separate original-class
+embedding-subpath producer: 1,294,336 elements match at zero tolerances, with
+every embedding weight byte and instrumentation-control output byte verified.
+Sequential and four-worker reports are identical. That is four of 1,178 nodes
+on one sample, not a claim that the other 1,174 nodes passed qualification.
