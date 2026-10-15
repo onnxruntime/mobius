@@ -113,6 +113,7 @@ __all__ = [
     "QuantizedEmbedding",
     "QuantizedLinear",
     "RadioVisionModel",
+    "RadioV4VisionModel",
     "RMSNorm",
     "RMSNormBias",
     "RmsNorm2d",
@@ -446,6 +447,7 @@ from mobius.components._qwenlike_clip_vision import (
     KimiK25VisionSidecar,
     KimiVLVisionSidecar,
 )
+from mobius.components._radio_v4_vision import RadioV4VisionModel
 from mobius.components._radio_vision import RadioVisionModel
 from mobius.components._rms_norm import (
     Float32GatedRMSNorm,
