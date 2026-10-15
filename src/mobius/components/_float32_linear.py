@@ -18,13 +18,15 @@ class Float32Linear(Linear):
     float32 accumulator through the bias epilogue before rounding to float16 or
     bfloat16. Leading input dimensions and checkpoint parameter names are the
     same as :class:`Linear`. This is a dense floating-point component, not a
-    replacement for a packed/quantized projection.
+    replacement for a packed/quantized projection. Intermediate activation
+    types may remain unresolved until graph-wide inference; CastLike preserves
+    the original activation dtype once it is inferred.
     """
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         supported = (ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16)
         if (
-            x.dtype not in supported
+            (x.dtype is not None and x.dtype not in supported)
             or self.weight.dtype not in supported
             or (self.bias is not None and self.bias.dtype not in supported)
         ):

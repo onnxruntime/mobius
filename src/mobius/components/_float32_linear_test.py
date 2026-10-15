@@ -16,6 +16,7 @@ import torch
 from torch.nn import functional as functional
 
 from mobius._builder import _cast_module_dtype
+from mobius._optimizations import SymbolicShapeInferencePass
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import _numpy_to_ort_value, _ort_value_to_numpy
 from mobius.components import Float32Linear, Linear, RadioV4VisionModel
@@ -118,6 +119,35 @@ def test_dense_epilogue(provider, dtype, torch_dtype, bias, rank):
             else expected.numpy()
         )
         np.testing.assert_array_equal(output, expected_array, strict=True)
+
+
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+def test_deferred_activation_dtype_preserves_cast_like(dtype, bias):
+    component = Float32Linear(2, 3, bias)
+    _cast_module_dtype(component, dtype)
+    builder, op, graph = create_test_builder()
+    value = create_test_input(builder, "x", [1, 2], dtype)
+    intermediate = op.Identity(value)
+    # Custom quantized operators can defer downstream types until graph inference.
+    intermediate.type = None
+
+    result = component(op, intermediate)
+
+    assert intermediate.dtype is None
+    cast = result.producer()
+    assert cast is not None
+    assert cast.op_type == "CastLike"
+    assert cast.inputs[1] is intermediate
+    epilogue = cast.inputs[0]
+    assert epilogue is not None
+    graph.outputs.append(result)
+    SymbolicShapeInferencePass()(ir.Model(graph, ir_version=11))
+    assert intermediate.dtype == dtype
+    assert epilogue.dtype == ir.DataType.FLOAT
+    assert result.dtype == dtype
 
 
 def test_parameter_names_and_dense_only_validation():
