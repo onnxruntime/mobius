@@ -118,6 +118,14 @@ def _keeps_modules_float(config: ArchitectureConfig) -> bool:
     )
 
 
+class Qwen35GatedDeltaNet(GatedDeltaNet):
+    """DeltaNet with the Qwen3.5 reference's per-head L2 normalization epsilon."""
+
+    def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
+        super().__init__(config, linear_class=linear_class)
+        self._qk_l2norm_eps = 1e-6
+
+
 class Qwen35DecoderLayer(nn.Module):
     """Qwen3.5 decoder layer with hybrid attention.
 
@@ -153,7 +161,7 @@ class Qwen35DecoderLayer(nn.Module):
         linear_class = _linear_factory(config)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNet(
+            self.linear_attn = Qwen35GatedDeltaNet(
                 config, linear_class=self._linear_attn_class(config, linear_class)
             )
             self.linear_attn.component_quantization_excluded_methods = (

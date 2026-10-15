@@ -130,6 +130,35 @@ def test_existing_routes_ignore_empty_qmoe_source_paths() -> None:
     assert changed != legacy
 
 
+@pytest.mark.parametrize("architecture", ["llama", "qwen2", "lfm2", "qwen35", "qwen35moe"])
+def test_existing_routes_ignore_inherited_recurrent_dtype(architecture: str) -> None:
+    from mobius._testing import make_config
+    from mobius.integrations.gguf._builder import _serialize_route_graph_config
+
+    payload = _serialize_route_graph_config(make_config(), architecture)
+    assert "mamba_ssm_dtype" not in json.loads(payload)
+
+
+@pytest.mark.parametrize("architecture", ["qwen35", "qwen35moe", "qwen3next", "qwen4exp"])
+def test_routes_retain_explicit_recurrent_dtype(architecture: str) -> None:
+    from mobius._testing import make_config
+    from mobius.integrations.gguf._builder import _serialize_route_graph_config
+
+    inherited = _serialize_route_graph_config(
+        make_config(dtype=ir.DataType.FLOAT16), architecture
+    )
+    half_state = _serialize_route_graph_config(
+        make_config(dtype=ir.DataType.FLOAT16, mamba_ssm_dtype=ir.DataType.FLOAT16),
+        architecture,
+    )
+    float_state = _serialize_route_graph_config(
+        make_config(dtype=ir.DataType.FLOAT16, mamba_ssm_dtype=ir.DataType.FLOAT),
+        architecture,
+    )
+    assert "mamba_ssm_dtype" in json.loads(float_state)
+    assert len({inherited, half_state, float_state}) == 3
+
+
 class TestReuseGgufWeights:
     """Tests for mixed GGUF references plus converted ONNX sidecar weights."""
 

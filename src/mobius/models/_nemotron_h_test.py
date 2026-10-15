@@ -137,6 +137,12 @@ def _tiny_config(**kwargs):
     return dataclasses.replace(config, **kwargs)
 
 
+def test_checkpoint_ssm_cache_dtype_overrides_base_policy():
+    raw = SimpleNamespace(**{**_LIGHTNING, "mamba_ssm_dtype": "float16"})
+    config = NemotronHConfig.from_transformers(raw)
+    assert config.mamba_ssm_dtype == ir.DataType.FLOAT
+
+
 @pytest.mark.parametrize("context", [262144, 1048576])
 def test_pinned_lightning_architecture_fields(context):
     raw = SimpleNamespace(**{**_LIGHTNING, "max_position_embeddings": context})

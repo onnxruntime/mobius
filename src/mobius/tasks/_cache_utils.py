@@ -325,7 +325,7 @@ def _make_hybrid_cache_inputs(
             )
             rec_state = builder.input(
                 f"{prefix}.{i}.recurrent_state",
-                dtype=dtype,
+                dtype=getattr(config, "mamba_ssm_dtype", None) or dtype,
                 shape=[batch, dims.num_v_heads, dims.head_k_dim, dims.head_v_dim],
             )
             pairs.append((conv_state, rec_state))
@@ -480,7 +480,7 @@ def _register_linear_attention_functions(
             kv_num_heads=dims.num_v_heads,
             update_rule="gated_delta",
             scale=1.0 / (dims.head_k_dim**0.5),
-            stash_type=getattr(config, "mamba_ssm_dtype", config.dtype),
+            stash_type=getattr(config, "mamba_ssm_dtype", None) or config.dtype,
         )
         model.functions[conv_func.identifier()] = conv_func
         model.functions[attn_func.identifier()] = attn_func
