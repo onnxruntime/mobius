@@ -605,7 +605,7 @@ def _save_package(
             getattr(args, "config", None) or getattr(args, "model", None),
             getattr(args, "revision", None),
         )
-        if is_native_vlm_package(pkg):
+        if is_native_vlm_package(pkg) and getattr(config, "model_type", None) != "clef_flash":
             try:
                 artifacts = write_native_vlm_package_metadata(
                     pkg,
