@@ -171,6 +171,37 @@ class GatedRMSNorm(nn.Module):
         return op.CastLike(normed, hidden_states)
 
 
+class Float32GatedRMSNorm(GatedRMSNorm):
+    """Gate, normalize and apply gamma in FP32 before a single output cast.
+
+    Matches ``mamba_ssm.ops.triton.layernorm_gated.rmsnorm_fn`` with
+    ``norm_before_gate=False``. Unlike normalized-activation-first rounding,
+    gamma multiplication happens before conversion to the input dtype.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        group_size: int | None = None,
+    ):
+        super().__init__(hidden_size, eps, group_size)
+        if group_size is not None and (group_size <= 0 or hidden_size % group_size):
+            raise ValueError("group_size must be positive and divide hidden_size")
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value):
+        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        gate_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
+        gated = op.Mul(hidden_f32, op.Swish(gate_f32))
+        group_size = self.group_size or self.hidden_size
+        grouped = op.Reshape(gated, [-1, self.hidden_size // group_size, group_size])
+        variance = op.ReduceMean(op.Mul(grouped, grouped), [-1], keepdims=True)
+        normalized = op.Div(grouped, op.Sqrt(op.Add(variance, self.variance_epsilon)))
+        normalized = op.Reshape(normalized, op.Shape(hidden_states))
+        scaled = op.Mul(normalized, op.Cast(self.weight, to=ir.DataType.FLOAT))
+        return op.CastLike(scaled, hidden_states)
+
+
 class ScaleFreeRMSNorm(nn.Module):
     """RMSNorm with a constant all-ones scale (no learnable parameter).
 
