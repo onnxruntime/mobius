@@ -55,6 +55,13 @@ per-group variance, normalization and gamma multiplication in FP32, then
 casts once to model dtype. This differs from the Lightning norm's
 intermediate rounding boundary.
 
+RADIOv4's biased dense projections use `Float32Linear`: MatMul accumulation
+and bias addition complete in FP32 before the output is rounded to model
+dtype. A native-dtype MatMul followed by Add rounds too early; declaring
+BF16 Gemm did not enforce the required boundary on the qualified runtime.
+This dense source contract differs from the packed GGML operators'
+explicit output-before-bias rounding. It does not change their arithmetic.
+
 The upstream b12x A16 backend targets SM120/SM121; it is not executable
 on the H100 validation machine. A source-derived, independently decoded
 BF16 reference is a diagnostic reference, not evidence that b12x ran on
@@ -179,11 +186,30 @@ not newly passing results.
 The embedding graph intentionally differs: absent media now gates placeholder
 replacement off, preserving ordinary token 18 embeddings on cached text-only
 steps. Tested counting-prompt outputs are identical, but the embedding graphs
-are not universally equivalent. Actual v6 GenAI execution is qualified
-separately rather than inferred from standalone ORT.
+are not universally equivalent. Actual v6 C++ GenAI execution independently
+matches all eight tokens and preserves eight finite logit arrays, bitwise
+equal to v5 for this prompt. Its combined three-session residency, without
+a helper vision session, sampled 27,961 MiB; this is still not 24 GB
+qualification.
 
 The coherent clean rebased non-integration regression passes 11,142 tests,
 with 84 skips and 55 deselections using the standard suite selectors and
 four failures reproduced on the exact original base excluded. Subsequent
 test-formatting-only changes do not alter exported arithmetic. This broad
 regression result does not override the model's failed numerical gates.
+
+### Post-v6 vision correction
+
+Identical-input experiments identify premature BF16 rounding between dense
+MatMul and bias as a causal vision discrepancy. The FP32 epilogue reduces
+one production projection's NRMSE from 0.00220645 to 0.00002552. A separately
+labeled actual-checkpoint graph variant then passes image, five-frame and
+seven-frame cases, including exact retention masks and indices. The
+seven-frame compact-feature NRMSE is 0.009237, with cosine 0.999957.
+
+The correction is integrated into source, with 170 focused tests passing
+without skips and clean typing for the changed components. These variant
+results do not relabel the preserved v5/v6 failures: fresh export and
+qualification of the corrected source remain required. FP32 operands can
+increase dense vision weight residency; measure final memory rather than
+reusing the earlier footprint observation.
