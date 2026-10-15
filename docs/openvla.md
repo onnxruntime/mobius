@@ -4,9 +4,10 @@ Mobius can construct, load and save the complete
 `openvla/openvla-7b@47a0ec7fc4ec123775a391911046cf33cf9ed83f` policy as three
 portable ONNX components. This is **experimental conversion support**, not a
 qualified robot policy. Full-weight CPU execution reproduces one frozen source
-sample's preprocessing and seven action tokens/values exactly, but the stricter
-all-element prefill-logit gate still fails. Action agreement must not substitute
-for that numerical gate or representative robot-task evaluation.
+sample's preprocessing and seven action tokens/values exactly. With
+`execution_provider="onnx-standard"`, all captured full-model outputs also pass
+the unchanged all-element numerical gate. This is one CPU fixture, not
+representative robot-task evaluation or GPU qualification.
 
 ## Build
 
@@ -23,7 +24,7 @@ torch.set_num_threads(4)
 package = build(
     "/absolute/pinned/openvla-checkpoint",
     dtype="f32",
-    execution_provider="default",
+    execution_provider="onnx-standard",
     trust_remote_code=False,
 )
 package.save("/absolute/fresh/openvla-onnx", max_workers=4, progress_bar=False)
@@ -32,6 +33,11 @@ package.save("/absolute/fresh/openvla-onnx", max_workers=4, progress_bar=False)
 Allow approximately 15 GB for source tensors and 30 GB for the FP32 package,
 plus temporary files and substantial CPU RAM. The portable graphs use opset 24;
 the demonstrated runtime is ORT 1.31 CPU, not older opset-21 runtimes.
+Use the standard-ONNX profile for this strict CPU baseline. The `default`
+export profile fuses residual normalization into contrib kernels and still
+fails the full-checkpoint logit gate. The `cpu` export profile adds other
+provider-specific rewrites and is not qualified. A profile that loads or matches actions is
+not interchangeable with the qualified graph bytes.
 Other precisions, execution-provider rewrites and quantization are unqualified.
 Non-default/scaled RoPE and quantization requests fail explicitly.
 
@@ -43,8 +49,9 @@ Non-default/scaled RoPE and quantization requests fail explicitly.
 | `embedding` | INT64 text tokens; FP32 image features | embeddings with image patches after BOS |
 | `decoder` | embeddings, INT64 mask/positions, 32 layers of past key/value state | logits and fresh per-layer key/value state |
 
-Each component saves `model.onnx` with its own `model.onnx.data`. The default
-portable package has 714 vision, 4 embedding and 460 decoder nodes. The caller
+Each component saves `model.onnx` with its own `model.onnx.data`. The
+standard-ONNX package has 811 vision, 4 embedding and 524 decoder nodes, with no
+local functions or custom-domain operators. The caller
 owns preprocessing, prompt construction, generation, state and action decoding;
 this package does not claim ORT-GenAI architecture integration.
 
@@ -78,31 +85,52 @@ The pinned `testdata/cases/vision-language/openvla-7b.yaml` records the blocked
 multimodal-decoder golden scope with an explicit `skip_reason`. It does not
 contain a fabricated passing golden or claim that VLA outputs are ordinary text.
 The independent image/source fixtures and action-generation application still
-need integration into the generic golden runner, after the strict baseline gate
-is resolved. Registry/config/CLI coverage passing is not that qualification.
+need integration into the generic golden runner. Registry/config/CLI coverage
+passing is not that qualification.
 
 The full checkpoint reference uses original Torch 2.6 / Transformers 4.40.1 /
 timm 0.9.10, BF16 source tensors upcast to FP32 and eager CPU execution.
 The export environment uses Torch 2.14.1. Original and exported RoPE tables were
 independently checked bit-for-bit across all 2048 positions.
 
-At frozen `atol=rtol=1e-4`, all 128 prefill/decode cache outputs pass and all seven
-greedy action tokens agree. Full prefill logits still have 59 failing elements
-of 8,849,664; feeding original embeddings isolates 31 failures. Decode logits
-pass the combined absolute-plus-relative criterion. Higher-precision MLP
-accumulation was evaluated as a scratch control and **did not fix the gate**;
-no such workaround is included.
+At frozen `atol=rtol=1e-4`, the standard-ONNX profile passes every captured
+boundary, all 8,849,664 prefill logits, decode logits and all 128 prefill/decode
+cache outputs. All seven own-cache greedy action tokens agree. Maximum absolute
+prefill-logit error is 0.00014656782150268555; the gate is the elementwise
+**absolute-plus-relative** criterion, not absolute error alone.
+
+The earlier `default` export has 59 prefill-logit failures, or 31 with original
+embeddings. Independent matched-operand probes found substantially larger
+rounding error in the contrib `SkipSimplifiedLayerNormalization` kernel than in
+standard `Add` plus `RMSNormalization`; residual sums and epsilon were identical.
+Inlining decoder norms eliminates all source-embedding-control failures, but
+leaves five own-embedding failures. Expanding the vision residual norms too
+eliminates those remaining failures. A fresh export through the existing
+`onnx-standard` profile reproduces the complete pass without post-export surgery,
+FP64 arithmetic, changed reference data or relaxed tolerances. A specific ORT
+implementation defect or internal rsqrt mechanism has not been established.
+Higher-precision MLP and variance controls were not incorporated.
 
 This evidence covers one fixed image/instruction and semantic boundaries, not
 every primitive graph output, representative action quality, latency targets,
-GPU providers or the Windows RTX 4090 pilot. Keep numerical qualification and
-release gates closed. Do not apply Olive/quantization rewrites until a baseline
-passes, or infer a runtime-kernel defect from model-level drift alone.
+GPU providers or the Windows RTX 4090 pilot. Keep production and release gates
+closed. Any later Olive/quantization rewrite must preserve this passing baseline
+and earn its own numerical and end-task evidence.
 
 The clean upstream-based contribution was independently re-exported and the same
 full-checkpoint results reproduced. Atlas also compared all four embedding
 nodes (`Gather`, two `Slice`, `Concat`) against a separate original-class
 embedding-subpath producer: 1,294,336 elements match at zero tolerances, with
 every embedding weight byte and instrumentation-control output byte verified.
-Sequential and four-worker reports are identical. That is four of 1,178 nodes
-on one sample, not a claim that the other 1,174 nodes passed qualification.
+Sequential and four-worker reports are identical. That original-class subpath
+scope is four nodes, not independent original-class traces for every primitive.
+
+The standard-profile package additionally passes spec-level matched-operand
+replay for all 1,339 nodes and 1,501 nonempty outputs (1,343,031,391 elements)
+through independent ONNX reference kernels at `atol=rtol=1e-4`. Every original
+component output remains byte-identical under instrumentation, and all 939
+used checkpoint parameters/transposes match an independent original-source
+identity oracle. Atlas's 169 bounded capture shards retain the 256MiB per-NPZ
+limit and produce identical sequential/four-worker reports. This is per-node
+spec evidence on one sample, not universal operator correctness or original-
+class primitive traces. The separate full-model reference remains original code.

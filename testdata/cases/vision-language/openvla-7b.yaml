@@ -11,12 +11,13 @@ inputs:
 level: "L4+L5"
 
 skip_reason: >-
-  Full-policy golden qualification remains blocked: the unchanged original-source
-  FP32 comparison has 59 of 8849664 prefill-logit violations at atol=rtol=1e-4.
+  Generic full-policy golden integration remains blocked. The onnx-standard
+  FP32 profile passes the unchanged frozen full-source gate; the default export
+  profile still has 59 of 8849664 prefill-logit violations at atol=rtol=1e-4.
   The reviewed image/source fixtures and VLA action-generation adapter are not
   integrated into the generic multimodal golden runner. Do not generate a golden
   from candidate outputs or interpret source-exact actions on one sample as
-  passing full-model numerical or robot-task qualification.
+  qualifying every export profile or representative robot-task behavior.
 
 notes: >-
   This is the multimodal decoder golden-coverage entry, not a claim that the

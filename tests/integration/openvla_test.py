@@ -20,7 +20,8 @@ from mobius.models import OpenVLAModel
 
 
 @pytest.mark.integration
-def test_original_class_tiny_reference_through_ort(tmp_path):
+@pytest.mark.parametrize("execution_provider", ["default", "onnx-standard"])
+def test_original_class_tiny_reference_through_ort(tmp_path, execution_provider):
     root_value = os.environ.get("MOBIUS_OPENVLA_REFERENCE")
     if not root_value:
         pytest.skip("set MOBIUS_OPENVLA_REFERENCE to independently captured tiny-fixture")
@@ -61,7 +62,9 @@ def test_original_class_tiny_reference_through_ort(tmp_path):
             ),
         )
     module = OpenVLAModel(config)
-    package = build_from_module(module, config, task="openvla", execution_provider="default")
+    package = build_from_module(
+        module, config, task="openvla", execution_provider=execution_provider
+    )
     package.apply_weights(
         module.preprocess_weights(load_file(str(root / "source-model.safetensors")))
     )

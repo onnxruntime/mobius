@@ -82,12 +82,20 @@ def test_rejects_invalid_vision_geometry(change):
         config.validate()
 
 
-@pytest.mark.parametrize("ep", ["default", "cpu"])
+@pytest.mark.parametrize("ep", ["default", "cpu", "onnx-standard"])
 def test_three_components_and_exact_source_weight_names(ep):
     config = _tiny_config()
     module = OpenVLAModel(config)
     package = build_from_module(module, config, task="openvla", execution_provider=ep)
     assert set(package) == {"decoder", "vision_encoder", "embedding"}
+    if ep == "onnx-standard":
+        for model in package.values():
+            assert not model.functions
+            assert all(node.domain in ("", "ai.onnx") for node in model.graph)
+            assert not any(
+                node.op_type in ("SkipLayerNormalization", "SkipSimplifiedLayerNormalization")
+                for node in model.graph
+            )
     vision = package["vision_encoder"].graph
     assert list(vision.inputs[0].shape) == ["batch", 6, 28, 28]
     parameters = dict(module.named_parameters())
