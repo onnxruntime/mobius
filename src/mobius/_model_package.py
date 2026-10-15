@@ -43,6 +43,7 @@ import tqdm
 
 from mobius._export_report import ComponentExportReport
 from mobius._optimizations import fold_initializers_after_weights
+from mobius._weight_utils import WeightTransform
 from mobius.adapters import (
     AdapterArtifact,
     AdapterServiceOptions,
@@ -1416,6 +1417,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         prefix_map: dict[str, str] | None = None,
         *,
         fold_constants: bool = True,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> None:
         """Apply weights from a state dict across component models.
 
@@ -1433,23 +1435,28 @@ class ModelPackage(UserDict[str, ir.Model]):
                 Weights whose name starts with a prefix are applied to the
                 named component (with the prefix stripped). Unmatched weights
                 are applied to all components.
+            weight_transforms: Shape-preserving transforms keyed by names in
+                ``state_dict`` (the preprocessed names, before prefix routing),
+                evaluated without caching during serialization.
         """
         applied: set[str] = set()
 
         if len(self.data) == 1:
             # Single component — apply all weights directly
             model = next(iter(self.data.values()))
-            applied = _apply_weights_to_model(model, state_dict)
+            applied = _apply_weights_to_model(model, state_dict, weight_transforms)
         elif prefix_map is None:
             # No routing info — try every weight against every model
             for model in self.data.values():
-                applied |= _apply_weights_to_model(model, state_dict)
+                applied |= _apply_weights_to_model(model, state_dict, weight_transforms)
         else:
             # Route by prefix
             routed: dict[str, dict[str, torch.Tensor]] = {name: {} for name in self.data}
+            routed_transforms: dict[str, dict[str, WeightTransform]] = {
+                name: {} for name in self.data
+            }
             unmatched: dict[str, torch.Tensor] = {}
-            # Track original HF names for weights that get stripped
-            stripped_to_original: dict[str, str] = {}
+            stripped_to_original: dict[tuple[str, str], str] = {}
 
             for weight_name, tensor in state_dict.items():
                 matched = False
@@ -1457,7 +1464,11 @@ class ModelPackage(UserDict[str, ir.Model]):
                     if weight_name.startswith(prefix):
                         stripped = weight_name[len(prefix) :].lstrip(".")
                         routed[component][stripped] = tensor
-                        stripped_to_original[stripped] = weight_name
+                        if weight_transforms is not None and weight_name in weight_transforms:
+                            routed_transforms[component][stripped] = weight_transforms[
+                                weight_name
+                            ]
+                        stripped_to_original[(component, stripped)] = weight_name
                         matched = True
                         break
                 if not matched:
@@ -1465,16 +1476,22 @@ class ModelPackage(UserDict[str, ir.Model]):
 
             for component_name, component_weights in routed.items():
                 applied_stripped = _apply_weights_to_model(
-                    self.data[component_name], component_weights
+                    self.data[component_name],
+                    component_weights,
+                    routed_transforms[component_name],
                 )
                 for s in applied_stripped:
-                    applied.add(stripped_to_original.get(s, s))
+                    applied.add(stripped_to_original.get((component_name, s), s))
 
             # Try unmatched weights against all models
             if unmatched:
                 for model in self.data.values():
-                    applied |= _apply_weights_to_model(model, unmatched)
+                    applied |= _apply_weights_to_model(model, unmatched, weight_transforms)
 
+        if weight_transforms is not None:
+            unused = set(weight_transforms) - applied
+            if unused:
+                raise ValueError(f"Weight transforms were not bound: {sorted(unused)!r}.")
         _log_weight_mapping(state_dict, applied)
 
         if not fold_constants:
@@ -1630,7 +1647,11 @@ def _log_weight_mapping(
         )
 
 
-def _apply_weights_to_model(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> set[str]:
+def _apply_weights_to_model(
+    model: ir.Model,
+    state_dict: dict[str, torch.Tensor],
+    weight_transforms: dict[str, WeightTransform] | None = None,
+) -> set[str]:
     """Apply weights to a single model (internal helper).
 
     Uses :func:`_assign_weight` from ``_weight_loading`` for shape
@@ -1644,6 +1665,11 @@ def _apply_weights_to_model(model: ir.Model, state_dict: dict[str, torch.Tensor]
         if name not in model.graph.initializers:
             continue
 
-        _assign_weight(model.graph.initializers[name], tensor, name)
+        _assign_weight(
+            model.graph.initializers[name],
+            tensor,
+            name,
+            transform=weight_transforms.get(name) if weight_transforms is not None else None,
+        )
         applied.add(name)
     return applied
