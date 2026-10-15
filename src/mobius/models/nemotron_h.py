@@ -42,6 +42,7 @@ from mobius.components import (
     INT64_MAX,
     Attention,
     Embedding,
+    Float32AccumulationMamba2Block,
     Float32GatedRMSNorm,
     Linear,
     Mamba2Block,
@@ -119,7 +120,7 @@ class NemotronHMambaLayer(nn.Module):
         return hidden_states, (new_conv_state, new_ssm_state)
 
 
-class _NemotronHPuzzleMamba2Block(Mamba2Block):
+class _NemotronHPuzzleMamba2Block(Float32AccumulationMamba2Block):
     def _apply_conv_padding_mask(
         self, op: OpBuilder, activated: ir.Value, padding_mask: ir.Value
     ) -> ir.Value:
@@ -135,7 +136,11 @@ class _NemotronHPuzzleMamba2Block(Mamba2Block):
 
 
 class NemotronHPuzzleMambaLayer(NemotronHMambaLayer):
-    """Puzzle Mamba block with the source Triton normalization precision."""
+    """Puzzle Mamba with source Conv/bias, readout/D and norm precision.
+
+    Biased convolution and readout-plus-D accumulate in FP32 before their
+    respective model-dtype stores. Activation behavior is not changed here.
+    """
 
     mamba_block_class = _NemotronHPuzzleMamba2Block
 

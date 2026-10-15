@@ -12,6 +12,8 @@ This module provides:
   ``com.microsoft.CausalConvWithState`` for depthwise Conv1D.
   Supports both single-token decode (T=1) and multi-token prefill
   (T>1) in a single code path.
+- **Float32AccumulationMamba2Block**: biased convolution and SSM readout/D
+  epilogues accumulated in FP32 before their model-dtype stores.
 
 HuggingFace reference: ``MambaMixer``, ``BambaMixer``,
 ``NemotronHMamba2Mixer``.
@@ -27,6 +29,7 @@ from onnxscript import OpBuilder, nn
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm, PostGatedRMSNorm
 from mobius.components._ssm import SelectiveScan, SequenceSelectiveScan
+from mobius.functions.causal_conv import prepare_causal_conv_state
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -272,6 +275,7 @@ class _Mamba2DepthwiseConv1d(nn.Module):
         self.weight = nn.Parameter([channels, 1, kernel_size])
         self.bias = nn.Parameter([channels]) if bias else None
         self._channels = channels
+        self._kernel_size = kernel_size
 
     def forward(
         self,
@@ -290,15 +294,26 @@ class _Mamba2DepthwiseConv1d(nn.Module):
             output: (B, D, T) — convolution output with SiLU.
             present_state: (B, D, K-1) — updated carry state.
         """
+        output, present = self._convolve(op, input_val, conv_state)
+        output.dtype = input_val.dtype
+        present.dtype = input_val.dtype
+        return output, present
+
+    def _convolve(
+        self,
+        op: OpBuilder,
+        input_val: ir.Value,
+        conv_state: ir.Value,
+    ) -> tuple[ir.Value, ir.Value]:
         if self.bias is not None:
             conv_bias = self.bias
         else:
-            # Zero bias — the function requires a bias input.
+            # The function requires a bias input, unlike standard Conv.
             conv_bias = op.Expand(
                 op.CastLike(op.Constant(value_float=0.0), self.weight),
                 op.Constant(value_ints=[self._channels]),
             )
-        output, present = op.CausalConvWithState(
+        return op.CausalConvWithState(
             input_val,
             self.weight,
             conv_bias,
@@ -307,9 +322,40 @@ class _Mamba2DepthwiseConv1d(nn.Module):
             _domain="com.microsoft",
             _outputs=2,
         )
-        output.dtype = input_val.dtype
-        present.dtype = input_val.dtype
-        return output, present
+
+
+class _Float32BiasMamba2DepthwiseConv1d(_Mamba2DepthwiseConv1d):
+    """Accumulate convolution and bias in FP32 before the native activation."""
+
+    def _convolve(
+        self,
+        op: OpBuilder,
+        input_val: ir.Value,
+        conv_state: ir.Value,
+    ) -> tuple[ir.Value, ir.Value]:
+        # Cache original model-dtype inputs, independently of accumulation.
+        conv_input, present = prepare_causal_conv_state(
+            op,
+            input_val,
+            conv_state,
+            state_width=self._kernel_size - 1,
+            temporal_axis=2,
+        )
+        # The third Conv input keeps bias inside the FP32 epilogue, before the
+        # source model-dtype store, rather than adding to an already rounded dot.
+        output = op.Conv(
+            op.Cast(conv_input, to=ir.DataType.FLOAT),
+            op.Cast(self.weight, to=ir.DataType.FLOAT),
+            op.Cast(self.bias, to=ir.DataType.FLOAT) if self.bias is not None else None,
+            kernel_shape=[self._kernel_size],
+            dilations=[1],
+            pads=[0, 0],
+            group=self._channels,
+        )
+        output.dtype = ir.DataType.FLOAT
+        # The source stores biased Conv in model dtype before SiLU. Do not
+        # move this cast past activation: it is a separate rounding boundary.
+        return op.Swish(op.CastLike(output, input_val)), present
 
 
 class Mamba2Block(nn.Module):
@@ -361,6 +407,8 @@ class Mamba2Block(nn.Module):
     HuggingFace reference: ``Mamba2Mixer``, ``BambaMixer``,
     ``NemotronHMamba2Mixer``.
     """
+
+    _conv1d_class: type[_Mamba2DepthwiseConv1d] = _Mamba2DepthwiseConv1d
 
     def __init__(
         self,
@@ -416,7 +464,7 @@ class Mamba2Block(nn.Module):
             proj_size,
             bias=proj_bias if in_proj_bias is None else in_proj_bias,
         )
-        self.conv1d = _Mamba2DepthwiseConv1d(
+        self.conv1d = self._conv1d_class(
             self.conv_dim,
             conv_kernel,
             bias=conv_bias,
@@ -583,24 +631,11 @@ class Mamba2Block(nn.Module):
         new_ssm_state.dtype = ir.DataType.FLOAT
         # la_output: (B, T, num_heads * d_head) in f32
         # new_ssm_state: (B, num_heads, d_state, d_head) in f32
-        # Cast back to model dtype for downstream ops and state output
-        la_output = op.CastLike(la_output, hidden_states)
+        # Cache storage precision is independent of the readout epilogue.
         new_ssm_state = op.CastLike(new_ssm_state, ssm_state)
 
         # Step 8: D skip connection — y += D * x (per-head broadcast)
-        # D: (num_heads,) → (1, 1, num_heads, 1) for broadcast
-        # x_4d is still f32; cast D to f32 for the multiply, result cast
-        # back via la_output's dtype.
-        d_f32 = op.Cast(self.D, to=ir.DataType.FLOAT)
-        d_4d = op.Reshape(d_f32, [1, 1, self.num_heads, 1])
-        d_skip = op.CastLike(
-            op.Reshape(
-                op.Mul(d_4d, x_4d),
-                [0, 0, self.num_heads * self.d_head],
-            ),
-            hidden_states,
-        )
-        y = op.Add(la_output, d_skip)
+        y = self._add_ssm_skip(op, la_output, x_4d, hidden_states)
 
         # Step 9: GatedRMSNorm
         y_normed = (
@@ -613,6 +648,28 @@ class Mamba2Block(nn.Module):
             output = op.Mul(output, self.output_multiplier)
 
         return output, new_conv_state, new_ssm_state
+
+    def _ssm_skip(self, op: OpBuilder, x_4d: ir.Value) -> ir.Value:
+        """Compute the FP32 per-head D*x branch, shaped (B, T, d_inner)."""
+        # D: (num_heads,) → (1, 1, num_heads, 1) for broadcast
+        d_f32 = op.Cast(self.D, to=ir.DataType.FLOAT)
+        d_4d = op.Reshape(d_f32, [1, 1, self.num_heads, 1])
+        return op.Reshape(
+            op.Mul(d_4d, x_4d),
+            [0, 0, self.num_heads * self.d_head],
+        )
+
+    def _add_ssm_skip(
+        self,
+        op: OpBuilder,
+        readout: ir.Value,
+        x_4d: ir.Value,
+        hidden_states: ir.Value,
+    ) -> ir.Value:
+        # Preserve the default native-dtype addition for existing architectures.
+        readout = op.CastLike(readout, hidden_states)
+        d_skip = op.CastLike(self._ssm_skip(op, x_4d), hidden_states)
+        return op.Add(readout, d_skip)
 
     def _apply_conv_padding_mask(
         self, op: OpBuilder, activated: ir.Value, padding_mask: ir.Value
@@ -637,3 +694,24 @@ class Mamba2Block(nn.Module):
         x_expanded = op.Expand(x_5d, [1, 1, 1, self.heads_per_group, 1])
         # Flatten → (B, T, num_heads * d_state)
         return op.Reshape(x_expanded, [0, 0, self.num_heads * self.d_state])
+
+
+class Float32AccumulationMamba2Block(Mamba2Block):
+    """Mamba2 with FP32 biased convolution and FP32 readout-plus-D accumulation.
+
+    Preserves model-dtype convolution/cache storage and activation behavior.
+    The SSM readout and D*x are added in FP32 before one model-dtype store,
+    matching source Triton selective-state-update epilogues.
+    """
+
+    _conv1d_class = _Float32BiasMamba2DepthwiseConv1d
+
+    def _add_ssm_skip(
+        self,
+        op: OpBuilder,
+        readout: ir.Value,
+        x_4d: ir.Value,
+        hidden_states: ir.Value,
+    ) -> ir.Value:
+        # Keep both FP32 branches through their sum, then store once before norm.
+        return op.CastLike(op.Add(readout, self._ssm_skip(op, x_4d)), hidden_states)

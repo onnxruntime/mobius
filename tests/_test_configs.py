@@ -1865,9 +1865,15 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         "nemotron_h_puzzle",
         {
             "_config_cls": NemotronHPuzzleConfig,
-            "num_hidden_layers": 3,
-            "layer_types": ["full_attention", "moe", "moe"],
+            "num_hidden_layers": 4,
+            "layer_types": ["mamba2", "full_attention", "moe", "moe"],
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
             "moe_block_configs": (
+                None,
                 None,
                 NemotronHMoEBlockConfig(2, 1, 32),
                 NemotronHMoEBlockConfig(3, 2, 48),
