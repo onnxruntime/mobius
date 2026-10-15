@@ -46,6 +46,7 @@ from onnx_ir import tensor_adapters
 from safetensors import safe_open
 
 from mobius._optimizations import fold_initializers_after_weights
+from mobius._weight_utils import WeightTransform
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,8 @@ def _assign_weight(
     initializer: ir.Value,
     tensor: torch.Tensor,
     name: str,
+    *,
+    transform: WeightTransform | None = None,
 ) -> None:
     """Assign a weight tensor to an initializer with shape/dtype handling.
 
@@ -168,6 +171,8 @@ def _assign_weight(
       initializer's declared ONNX type, wraps the tensor in
       ``ir.LazyTensor`` so the cast happens at serialization time,
       avoiding eager memory allocation.
+    * **Deferred transform** — runs on access or serialization without caching,
+      preserves the source shape, and precedes the target dtype conversion.
     """
     # Raise on shape mismatch (initializers always have concrete int dims).
     init_shape = initializer.shape
@@ -184,16 +189,29 @@ def _assign_weight(
     assert initializer.shape is not None
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
 
-    if tensor.dtype != target_dtype:
+    ir_tensor: ir.TensorProtocol
+    if transform is not None or tensor.dtype != target_dtype:
 
-        def tensor_func(t=tensor, dt=target_dtype, n=name) -> tensor_adapters.TorchTensor:
-            return tensor_adapters.TorchTensor(t.to(dt), name=n)
+        def tensor_func(
+            t: torch.Tensor = tensor,
+            dt: torch.dtype = target_dtype,
+            n: str = name,
+            fn: WeightTransform | None = transform,
+        ) -> tensor_adapters.TorchTensor:
+            value = fn(t) if fn is not None else t
+            if tuple(value.shape) != tuple(t.shape):
+                raise ValueError(
+                    f"Weight transform for '{n}' changed shape from "
+                    f"{tuple(t.shape)} to {tuple(value.shape)}."
+                )
+            return tensor_adapters.TorchTensor(value.to(dt), name=n)
 
         ir_tensor = ir.LazyTensor(
             tensor_func,
             dtype=onnx_dtype,
             shape=ir.Shape(tensor.shape),
             name=name,
+            cache=False,
         )
     else:
         ir_tensor = tensor_adapters.TorchTensor(tensor, name)

@@ -35,6 +35,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, CausalLMConfig
+from mobius._weight_utils import WeightTransform
 from mobius.components import Linear, RMSNorm, initialize_rope
 from mobius.components._attention import Attention, _apply_attention
 from mobius.components._decoder import DecoderLayer
@@ -354,9 +355,12 @@ class DiffusionMoEModel(CausalLMModel):
         return self.lm_head(op, self.model(op, input_ids))
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)
 
 
 class LLaDAMoEModel(DiffusionMoEModel):
