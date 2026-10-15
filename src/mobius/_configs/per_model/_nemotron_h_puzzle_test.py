@@ -100,9 +100,7 @@ def test_puzzle_mixed_mamba_graph_roundtrip(tmp_path, dtype):
         parameter.const_value = ir.tensor(
             np.zeros(list(parameter.shape), dtype=parameter.dtype.numpy())
         )
-    package = build_from_module(
-        module, config, task="hybrid-text-generation"
-    )
+    package = build_from_module(module, config, task="hybrid-text-generation")
     path = tmp_path / "puzzle.onnx"
     ir.save(package["model"], path)
     graph = ir.load(path).graph
