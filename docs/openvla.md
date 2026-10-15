@@ -74,6 +74,13 @@ MOBIUS_OPENVLA_REFERENCE=/absolute/independent/tiny-fixture \
 python -m pytest tests/integration/openvla_test.py -q
 ```
 
+The pinned `testdata/cases/vision-language/openvla-7b.yaml` records the blocked
+multimodal-decoder golden scope with an explicit `skip_reason`. It does not
+contain a fabricated passing golden or claim that VLA outputs are ordinary text.
+The independent image/source fixtures and action-generation application still
+need integration into the generic golden runner, after the strict baseline gate
+is resolved. Registry/config/CLI coverage passing is not that qualification.
+
 The full checkpoint reference uses original Torch 2.6 / Transformers 4.40.1 /
 timm 0.9.10, BF16 source tensors upcast to FP32 and eager CPU execution.
 The export environment uses Torch 2.14.1. Original and exported RoPE tables were

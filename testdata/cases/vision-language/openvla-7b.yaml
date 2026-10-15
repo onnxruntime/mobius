@@ -1,0 +1,26 @@
+model_id: "openvla/openvla-7b"
+model_type: "openvla"
+revision: "47a0ec7fc4ec123775a391911046cf33cf9ed83f"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "In: What action should the robot take to pick up the red cup?\nOut:"
+
+level: "L4+L5"
+
+skip_reason: >-
+  Full-policy golden qualification remains blocked: the unchanged original-source
+  FP32 comparison has 59 of 8849664 prefill-logit violations at atol=rtol=1e-4.
+  The reviewed image/source fixtures and VLA action-generation adapter are not
+  integrated into the generic multimodal golden runner. Do not generate a golden
+  from candidate outputs or interpret source-exact actions on one sample as
+  passing full-model numerical or robot-task qualification.
+
+notes: >-
+  This is the multimodal decoder golden-coverage entry, not a claim that the
+  policy's outputs are ordinary text. Actual action decoding and own-cache
+  execution are exercised in the Atlas development application. The independent
+  original-class tiny replay remains tests/integration/openvla_test.py; full
+  checkpoint observations and limitations are documented in docs/openvla.md.
