@@ -455,6 +455,8 @@ class KimiK3DecoderLayer(nn.Module):
         # float score weight, matching the Kimi-K3 GGUF tensor contract.
         self.attn_res_score = Linear(config.hidden_size, 1, bias=False)
         self.ffn_res_score = Linear(config.hidden_size, 1, bias=False)
+        self.attn_res_score.weight._keep_float32 = True  # type: ignore[attr-defined]
+        self.ffn_res_score.weight._keep_float32 = True  # type: ignore[attr-defined]
 
     @staticmethod
     def _mix(
@@ -532,6 +534,7 @@ class KimiK3TextModel(nn.Module):
         )
         self._residual_eps = config.rms_norm_eps
         self.output_res_score = Linear(config.hidden_size, 1, bias=False)
+        self.output_res_score.weight._keep_float32 = True  # type: ignore[attr-defined]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._dtype = config.dtype
 

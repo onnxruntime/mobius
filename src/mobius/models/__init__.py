@@ -173,6 +173,7 @@ __all__ = [
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
     "NemotronHPuzzleCausalLMModel",
+    "NemotronHOmniModel",
     "NeoBertGGUFModel",
     "NomicBertGGUFModel",
     "NomicBertMoEGGUFModel",
@@ -445,6 +446,7 @@ from mobius.models.nemo_rnnt import EncDecRNNTModel
 from mobius.models.nemotron import NemotronCausalLMModel
 from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel, NemotronHPuzzleCausalLMModel
+from mobius.models.nemotron_h_omni import NemotronHOmniModel
 from mobius.models.nemotron_parse import NemotronParseForConditionalGeneration
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel

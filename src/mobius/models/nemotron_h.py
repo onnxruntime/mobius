@@ -39,6 +39,7 @@ from mobius._configs import NemotronHConfig, NemotronHPuzzleConfig
 from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     FCMLP,
+    INT64_MAX,
     Attention,
     Embedding,
     Float32GatedRMSNorm,
@@ -65,12 +66,14 @@ class NemotronHMambaLayer(nn.Module):
         config: NemotronH architecture config.
     """
 
+    mamba_block_class: type[Mamba2Block] = Mamba2Block
+
     def __init__(self, config: NemotronHConfig):
         super().__init__()
         # d_inner = num_heads * head_dim (not hidden_size * expand)
         d_inner = config.mamba_n_heads * config.mamba_d_head
 
-        self.mamba = Mamba2Block(
+        self.mamba = self.mamba_block_class(
             d_model=config.hidden_size,
             d_inner=d_inner,
             num_heads=config.mamba_n_heads,
@@ -116,8 +119,25 @@ class NemotronHMambaLayer(nn.Module):
         return hidden_states, (new_conv_state, new_ssm_state)
 
 
+class _NemotronHPuzzleMamba2Block(Mamba2Block):
+    def _apply_conv_padding_mask(
+        self, op: OpBuilder, activated: ir.Value, padding_mask: ir.Value
+    ) -> ir.Value:
+        # The pinned CUDA path masks x, not B/C. In particular, padded output
+        # positions may still read a preceding state through their unmasked C.
+        x, bc = op.Split(
+            activated,
+            [self.d_inner, 2 * self.n_groups * self.d_state],
+            axis=-1,
+            _outputs=2,
+        )
+        return op.Concat(op.Mul(x, op.CastLike(padding_mask, x)), bc, axis=-1)
+
+
 class NemotronHPuzzleMambaLayer(NemotronHMambaLayer):
     """Puzzle Mamba block with the source Triton normalization precision."""
+
+    mamba_block_class = _NemotronHPuzzleMamba2Block
 
     def __init__(self, config: NemotronHConfig):
         super().__init__(config)
@@ -127,6 +147,26 @@ class NemotronHPuzzleMambaLayer(NemotronHMambaLayer):
             eps=config.rms_norm_eps,
             group_size=d_inner // config.mamba_n_groups,
         )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value,
+        position_embeddings: tuple,
+        past_key_value: tuple | None,
+        padding_mask: ir.Value | None = None,
+    ):
+        del attention_bias, position_embeddings
+        residual = hidden_states
+        hidden_states = self.norm(op, hidden_states)
+        if padding_mask is not None:
+            hidden_states = op.Mul(hidden_states, op.CastLike(padding_mask, hidden_states))
+        conv_state, ssm_state = past_key_value if past_key_value is not None else (None, None)
+        output, conv_state, ssm_state = self.mamba(
+            op, hidden_states, conv_state, ssm_state, padding_mask=padding_mask
+        )
+        return op.Add(residual, output), (conv_state, ssm_state)
 
 
 class NemotronHAttentionLayer(nn.Module):
@@ -622,6 +662,48 @@ class NemotronHCausalLMModel(nn.Module):
 
 class _NemotronHPuzzleTextModel(_NemotronHTextModel):
     mamba_layer_class = NemotronHPuzzleMambaLayer
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value | None,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+        inputs_embeds: ir.Value | None = None,
+    ):
+        del position_ids  # Puzzle attention has no positional encoding.
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Puzzle requires exactly one of input_ids or inputs_embeds")
+        hidden_states = (
+            self.embed_tokens(op, input_ids) if inputs_embeds is None else inputs_embeds
+        )
+        attention_bias = create_padding_mask(op, hidden_states, attention_mask)
+        query_length = op.Shape(hidden_states, start=1, end=2)
+        total_length = op.Shape(attention_mask, start=1, end=2)
+        current_mask = op.Slice(attention_mask, op.Neg(query_length), [INT64_MAX], axes=[1])
+        # HF drops the Mamba padding mask when reusing state. Attention retains
+        # the complete past+current mask; never reinterpret it as current-only.
+        current_mask = op.Where(
+            op.Greater(total_length, query_length), op.CastLike(1, current_mask), current_mask
+        )
+        mamba_mask = op.Unsqueeze(current_mask, [-1])
+        present_key_values = []
+        past_kvs = past_key_values or [None] * len(self.layers)
+        for layer, past_kv in zip(self.layers, past_kvs):
+            kwargs = {}
+            if isinstance(layer, NemotronHPuzzleMambaLayer):
+                kwargs["padding_mask"] = mamba_mask
+            hidden_states, present_kv = layer(
+                op,
+                hidden_states=hidden_states,
+                attention_bias=attention_bias,
+                position_embeddings=None,
+                past_key_value=past_kv,
+                **kwargs,
+            )
+            present_key_values.append(present_kv)
+        return self.norm(op, hidden_states), present_key_values
 
 
 class NemotronHPuzzleCausalLMModel(NemotronHCausalLMModel):

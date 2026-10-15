@@ -5,10 +5,25 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-from onnxscript import OpBuilder, nn
+from onnxscript import GraphBuilder, OpBuilder, nn
 
 # Used as Slice "end" to mean "all remaining elements along this axis".
 INT64_MAX = 9223372036854775807
+
+
+def realize_parameters(builder: GraphBuilder, module: nn.Module, prefix: str) -> None:
+    """Register captured parameters at root scope before building subgraphs.
+
+    A parameter first realized inside If/Loop otherwise uses the root builder's
+    scope rather than its sub-builder's scope. Precomputed dotted module names
+    keep both lexical captures and checkpoint bindings unambiguous.
+    """
+    for name, parameter in module.named_parameters(prefix=prefix):
+        if parameter._realized:  # pylint: disable=protected-access
+            continue
+        parameter.name = name
+        builder.root.graph.initializers[name] = parameter
+        parameter._realized = True  # pylint: disable=protected-access
 
 
 class Linear(nn.Module):
@@ -35,6 +50,10 @@ class Linear(nn.Module):
         result = op.MatMul(x, w_t)
         if self.bias is not None:
             result = op.Add(result, self.bias)
+        # Native downstream projections need the known MatMul output type
+        # during construction, before the graph-wide inference pass runs.
+        if x.dtype == self.weight.dtype:
+            result.dtype = self.weight.dtype
         return result
 
 

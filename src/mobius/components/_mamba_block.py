@@ -298,7 +298,7 @@ class _Mamba2DepthwiseConv1d(nn.Module):
                 op.CastLike(op.Constant(value_float=0.0), self.weight),
                 op.Constant(value_ints=[self._channels]),
             )
-        return op.CausalConvWithState(
+        output, present = op.CausalConvWithState(
             input_val,
             self.weight,
             conv_bias,
@@ -307,6 +307,9 @@ class _Mamba2DepthwiseConv1d(nn.Module):
             _domain="com.microsoft",
             _outputs=2,
         )
+        output.dtype = input_val.dtype
+        present.dtype = input_val.dtype
+        return output, present
 
 
 class Mamba2Block(nn.Module):
@@ -499,10 +502,7 @@ class Mamba2Block(nn.Module):
         # Transpose back: (B, T, conv_dim)
         x_bc_activated = op.Transpose(conv_out, perm=[0, 2, 1])
         if padding_mask is not None:
-            x_bc_activated = op.Mul(
-                x_bc_activated,
-                op.CastLike(padding_mask, x_bc_activated),
-            )
+            x_bc_activated = self._apply_conv_padding_mask(op, x_bc_activated, padding_mask)
 
         # Step 3: Split xBC → x, B, C
         gs = self.n_groups * self.d_state
@@ -579,6 +579,8 @@ class Mamba2Block(nn.Module):
             _domain="com.microsoft",
             _outputs=2,
         )
+        la_output.dtype = ir.DataType.FLOAT
+        new_ssm_state.dtype = ir.DataType.FLOAT
         # la_output: (B, T, num_heads * d_head) in f32
         # new_ssm_state: (B, num_heads, d_state, d_head) in f32
         # Cast back to model dtype for downstream ops and state output
@@ -611,6 +613,11 @@ class Mamba2Block(nn.Module):
             output = op.Mul(output, self.output_multiplier)
 
         return output, new_conv_state, new_ssm_state
+
+    def _apply_conv_padding_mask(
+        self, op: OpBuilder, activated: ir.Value, padding_mask: ir.Value
+    ) -> ir.Value:
+        return op.Mul(activated, op.CastLike(padding_mask, activated))
 
     def _expand_groups(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         """Expand grouped B or C from n_groups to num_heads.

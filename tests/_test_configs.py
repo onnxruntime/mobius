@@ -53,6 +53,7 @@ from mobius._configs import (
     NanoChatConfig,
     Nemotron3DiarizationConfig,
     NemotronHConfig,
+    NemotronHOmniConfig,
     NemotronHPuzzleConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
@@ -2930,6 +2931,41 @@ _TINY_MUSE_GLIMMER_VISION = VisionConfig(
 # The L1 graph-test parametrization uses specialised test
 # methods that invoke the correct task and assert the right output models.
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "nemotron_h_omni",
+        {
+            "_config_cls": NemotronHOmniConfig,
+            "hidden_act": "relu2",
+            "num_hidden_layers": 4,
+            "layer_types": ["mamba2", "moe", "full_attention", "moe"],
+            "mamba_n_heads": 4,
+            "mamba_d_head": 32,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 2,
+            "mamba_d_conv": 4,
+            "moe_latent_size": 32,
+            "shared_expert_intermediate_size": 48,
+            "moe_block_configs": (
+                None,
+                NemotronHMoEBlockConfig(2, 1, 16),
+                None,
+                NemotronHMoEBlockConfig(3, 2, 24),
+            ),
+            "image_token_id": 18,
+            "radio_max_img_size": 16,
+            "projector_hidden_size": 24,
+            "video_pruning_rate": 0.7,
+            "vision": VisionConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                patch_size=4,
+                image_size=8,
+            ),
+        },
+        True,
+    ),
     (
         "neo_chat",
         {
