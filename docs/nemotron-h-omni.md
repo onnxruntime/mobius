@@ -138,7 +138,15 @@ Decoder comparison covers prefill and seven reused-state steps. All 776
 logit/state arrays are finite. The first state gate failure is layer 36's
 prefill key cache (NRMSE 0.034269, cosine 0.999415); a later convolution
 state reaches NRMSE 0.120708. Exact generated tokens do not override these
-failed internal-state gates. Hidden-stage localization remains required.
+failed internal-state gates.
+
+A separately instrumented trace compares 712 hidden arrays while preserving
+all 776 original logit/state outputs bitwise. Its first hidden gate failures
+are prefill MoE34 and cached step 2 MoE3. At cached MoE3, one selected expert
+changes from 163 to 221; replaying the source on identical native inputs
+reduces output NRMSE from 0.06398 to 0.0000186. This identifies amplification
+of upstream drift, not its primitive cause. Same-input and same-prior-state
+localization in layers 0–2 remains required before changing arithmetic.
 
 Video dense features pass before pruning. Applying EVS to identical feature
 arrays reproduces the source scores, masks and indices exactly: the observed
@@ -152,3 +160,30 @@ Runtime profiles permit host integer shape/count arithmetic. Floating payload
 computation remains CUDA; this is not a strict
 `session.disable_cpu_ep_fallback=1` qualification. Keep this distinction
 explicit when reporting provider placement or CUDA graph eligibility.
+
+### Fresh native-v6 source qualification
+
+Native-v6 was exported from clean Mobius source
+`61d2dff1731e2c312217d891ecd11ba3c3f5a1e2`, rebased onto
+`b1e9c8e9dec1dfa206183f957e77d07cfb734df2`. Independent fidelity again
+validates all 28,885 sources, 28,882 exact bindings and 3 metadata tensors,
+with valid external references and no unexpected FP32 downcasts.
+
+Fresh standalone execution produces the same eight tokens. All 784 saved
+outputs, including 776 decoder logit/state arrays and eight embedding
+outputs, are bitwise identical to the preserved v5 run. Clearing only model
+metadata yields identical decoder and vision graphs; external payload hashes
+also match. Therefore the decoder and vision failures above remain failures,
+not newly passing results.
+
+The embedding graph intentionally differs: absent media now gates placeholder
+replacement off, preserving ordinary token 18 embeddings on cached text-only
+steps. Tested counting-prompt outputs are identical, but the embedding graphs
+are not universally equivalent. Actual v6 GenAI execution is qualified
+separately rather than inferred from standalone ORT.
+
+The coherent clean rebased non-integration regression passes 11,142 tests,
+with 84 skips and 55 deselections using the standard suite selectors and
+four failures reproduced on the exact original base excluded. Subsequent
+test-formatting-only changes do not alter exported arithmetic. This broad
+regression result does not override the model's failed numerical gates.
