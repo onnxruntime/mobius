@@ -53,6 +53,7 @@ from mobius._configs import (
     NanoChatConfig,
     Nemotron3DiarizationConfig,
     NemotronHConfig,
+    NemotronHPuzzleConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
     Plamo2Config,
@@ -73,6 +74,7 @@ from mobius._configs import (
     YolosConfig,
     Zamba2Config,
 )
+from mobius._configs.per_model._nemotron_h_puzzle import NemotronHMoEBlockConfig
 from mobius.models import EsmConfig, ReUseConfig
 
 # ---------------------------------------------------------------------------
@@ -1857,6 +1859,20 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mamba_expand": 2,
         },
         False,
+    ),
+    (
+        "nemotron_h_puzzle",
+        {
+            "_config_cls": NemotronHPuzzleConfig,
+            "num_hidden_layers": 3,
+            "layer_types": ["full_attention", "moe", "moe"],
+            "moe_block_configs": (
+                None,
+                NemotronHMoEBlockConfig(2, 1, 32),
+                NemotronHMoEBlockConfig(3, 2, 48),
+            ),
+        },
+        True,
     ),
     # nemotron_h: hybrid Mamba2+Attention (requires NemotronHConfig)
     (

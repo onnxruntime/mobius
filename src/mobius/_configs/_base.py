@@ -4245,6 +4245,10 @@ class NemotronHConfig(ArchitectureConfig):
     mamba_time_step_min: float = 0.001
     moe_latent_size: int | None = None
 
+    def for_layer(self, layer_index: int) -> NemotronHConfig:
+        """Return the uniform block config; Puzzle overrides per-layer topology."""
+        return self
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronHConfig:
         base = ArchitectureConfig.from_transformers(config, parent_config)

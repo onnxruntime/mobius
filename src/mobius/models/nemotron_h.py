@@ -35,12 +35,13 @@ from typing import TYPE_CHECKING
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import NemotronHConfig
+from mobius._configs import NemotronHConfig, NemotronHPuzzleConfig
 from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     FCMLP,
     Attention,
     Embedding,
+    Float32GatedRMSNorm,
     Linear,
     Mamba2Block,
     RMSNorm,
@@ -113,6 +114,19 @@ class NemotronHMambaLayer(nn.Module):
         hidden_states = op.Add(residual, mamba_out)
 
         return hidden_states, (new_conv_state, new_ssm_state)
+
+
+class NemotronHPuzzleMambaLayer(NemotronHMambaLayer):
+    """Puzzle Mamba block with the source Triton normalization precision."""
+
+    def __init__(self, config: NemotronHConfig):
+        super().__init__(config)
+        d_inner = config.mamba_n_heads * config.mamba_d_head
+        self.mamba.norm = Float32GatedRMSNorm(
+            d_inner,
+            eps=config.rms_norm_eps,
+            group_size=d_inner // config.mamba_n_groups,
+        )
 
 
 class NemotronHAttentionLayer(nn.Module):
@@ -233,6 +247,7 @@ class NemotronHMoEGate(nn.Module):
         self.weight = nn.Parameter([num_experts, hidden_size])
         # Correction bias for expert selection (loaded from checkpoint)
         self.e_score_correction_bias = nn.Parameter([num_experts])
+        self.e_score_correction_bias._keep_float32 = True  # type: ignore[attr-defined]
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Cast to float32 for numerical stability (eps=1e-20 underflows
@@ -240,7 +255,7 @@ class NemotronHMoEGate(nn.Module):
         # in NemotronHTopkRouter.forward and never casts back.
         hidden_states = op.Cast(hidden_states, to=1)  # FLOAT32
 
-        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        weight_t = op.Transpose(op.Cast(self.weight, to=1), perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
 
         # Sigmoid probabilities (these become the final routing weights)
@@ -262,9 +277,8 @@ class NemotronHMoEGate(nn.Module):
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
 
-        # Keep routing_weights in float32 (matching HF which never casts back).
-        # The expert dispatch multiplies these with expert outputs, and ONNX
-        # type promotion handles the mixed-dtype matmul naturally.
+        # Keep routing weights in FP32; expert outputs are explicitly promoted
+        # before multiplication because ONNX does not implicitly promote types.
         return routing_weights, selected_experts
 
 
@@ -375,12 +389,15 @@ class NemotronHMoEBlock(nn.Module):
             weighted = op.Mul(routing_weights, match_float)
             # Sum matched routing weights across top_k dim → per-token weight
             weight = op.ReduceSum(weighted, [-1], keepdims=True)
-            contribution = op.Mul(expert_output, weight)
+            contribution = op.Mul(op.Cast(expert_output, to=1), weight)
             if result is None:
                 result = contribution
             else:
                 result = op.Add(result, contribution)
 
+        # HF accumulates the weighted experts in FP32, then rounds once before
+        # the model-dtype latent output projection and shared-expert addition.
+        result = op.CastLike(result, hidden_states)
         # Optional latent projection back to hidden_size
         if self._has_latent:
             result = self.fc2_latent_proj(op, result)
@@ -443,6 +460,8 @@ class _NemotronHTextModel(nn.Module):
         ``"mlp"`` → NemotronHMLPLayer
     """
 
+    mamba_layer_class: type[NemotronHMambaLayer] = NemotronHMambaLayer
+
     def __init__(self, config: NemotronHConfig):
         super().__init__()
         self._dtype = config.dtype
@@ -460,15 +479,16 @@ class _NemotronHTextModel(nn.Module):
             raise ValueError(f"Unknown Nemotron-H layer type in {layer_types!r}")
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
+            layer_config = config.for_layer(i)
             ltype = layer_types[i]
             if ltype == "mamba2":
-                self.layers.append(NemotronHMambaLayer(config))
+                self.layers.append(self.mamba_layer_class(layer_config))
             elif ltype == "mlp":
-                self.layers.append(NemotronHMLPLayer(config))
+                self.layers.append(NemotronHMLPLayer(layer_config))
             elif ltype == "moe":
-                self.layers.append(NemotronHMoELayer(config))
+                self.layers.append(NemotronHMoELayer(layer_config))
             else:
-                self.layers.append(NemotronHAttentionLayer(config))
+                self.layers.append(NemotronHAttentionLayer(layer_config))
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -519,11 +539,12 @@ class NemotronHCausalLMModel(nn.Module):
     default_task: str = "hybrid-text-generation"
     category: str = "Hybrid SSM+Attention"
     config_class: type = NemotronHConfig
+    text_model_class: type[_NemotronHTextModel] = _NemotronHTextModel
 
     def __init__(self, config: NemotronHConfig):
         super().__init__()
         self.config = config
-        self.model = _NemotronHTextModel(config)
+        self.model = self.text_model_class(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -597,6 +618,22 @@ class NemotronHCausalLMModel(nn.Module):
                 new_state_dict[new_key] = value
 
         return new_state_dict
+
+
+class _NemotronHPuzzleTextModel(_NemotronHTextModel):
+    mamba_layer_class = NemotronHPuzzleMambaLayer
+
+
+class NemotronHPuzzleCausalLMModel(NemotronHCausalLMModel):
+    """Heterogeneous Nemotron-H decoder matching ``NemotronHPuzzleForCausalLM``.
+
+    Accepts token IDs, padding masks and mixed attention/Mamba caches; returns
+    logits and updated caches. This decoder class does not implement the Omni
+    vision wrapper or reinterpret packed IQ2 checkpoint weights as dense weights.
+    """
+
+    config_class = NemotronHPuzzleConfig
+    text_model_class = _NemotronHPuzzleTextModel
 
 
 # Layer index regex: {backbone|model}.layers.<N>.<rest>

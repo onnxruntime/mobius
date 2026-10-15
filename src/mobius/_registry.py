@@ -42,6 +42,7 @@ from mobius._configs import (
     MoonshineConfig,
     MoonshineStreamingConfig,
     MuseGlimmerConfig,
+    NemotronHPuzzleConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
     Plamo2Config,
@@ -220,7 +221,7 @@ from mobius.models.muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
     MuseGlimmerTextCausalLMModel,
 )
-from mobius.models.nemotron_h import NemotronHCausalLMModel
+from mobius.models.nemotron_h import NemotronHCausalLMModel, NemotronHPuzzleCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
@@ -793,6 +794,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "bamba": ModelRegistration(BambaCausalLMModel),
     "jamba": ModelRegistration(JambaCausalLMModel),
     "nemotron_h": ModelRegistration(NemotronHCausalLMModel),
+    "nemotron_h_puzzle": ModelRegistration(
+        NemotronHPuzzleCausalLMModel, config_class=NemotronHPuzzleConfig
+    ),
     "nemotron_parse": ModelRegistration(
         NemotronParseForConditionalGeneration,
         task="vision-encoder-decoder",
