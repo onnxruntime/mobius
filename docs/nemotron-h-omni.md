@@ -55,6 +55,12 @@ per-group variance, normalization and gamma multiplication in FP32, then
 casts once to model dtype. This differs from the Lightning norm's
 intermediate rounding boundary.
 
+Puzzle Mamba convolution completes accumulation and bias addition in FP32,
+then rounds once before Swish. Its state readout and `D*x` skip are also
+combined in FP32 before one native output store. The reusable
+`Float32AccumulationMamba2Block` supplies these boundaries only for Puzzle;
+the default Mamba/Lightning path is unchanged.
+
 RADIOv4's biased dense projections use `Float32Linear`: MatMul accumulation
 and bias addition complete in FP32 before the output is rounded to model
 dtype. A native-dtype MatMul followed by Add rounds too early; declaring
@@ -117,9 +123,12 @@ performance or a 24 GB footprint before ordinary correctness is established.
 
 ### Preserved native-v5 qualification snapshot
 
-The native-v5 package and frozen ORT runtime from commit
-`9c9c43ff4edfe1886ac37a399a75bb1c1e6ea137` have the following
-independent results. These are not full-model shipping claims.
+The native-v5 package and retained runtime-v3 have the following independent
+results. That runtime declared checkout
+`9c9c43ff4edfe1886ac37a399a75bb1c1e6ea137`, but subsequent binary provenance
+investigation found a stale activation object; it was not fully source-matched.
+Both the original binary and failures remain preserved. These are not
+full-model shipping claims.
 
 | Category | Result |
 |---|---|
@@ -209,7 +218,65 @@ seven-frame compact-feature NRMSE is 0.009237, with cosine 0.999957.
 
 The correction is integrated into source, with 170 focused tests passing
 without skips and clean typing for the changed components. These variant
-results do not relabel the preserved v5/v6 failures: fresh export and
-qualification of the corrected source remain required. FP32 operands can
-increase dense vision weight residency; measure final memory rather than
-reusing the earlier footprint observation.
+results do not relabel the preserved v5/v6 failures. The fresh corrected
+source qualification below supersedes the variant for current status.
+FP32 operands can increase dense vision weight residency; measure final
+memory rather than reusing the earlier footprint observation.
+
+### Fresh native-v7 qualification
+
+Native-v7 was exported from clean Mobius source
+`52205332bd4fe488204de0b902b126ba8c188008`, including the dense vision and
+Puzzle Mamba corrections. It uses the separately built, source-matched
+runtime-v4 activation overlay, not the retained runtime-v3 binary.
+The CUDA provider SHA256 is
+`394cc8fadb5006635368e96c8cd0fe124462d1a2a6eb67c3b7fc953f11d19c5d`;
+the unchanged core library SHA256 is
+`62cc0188ef19594c724b3e7f4047b8908fd5852164d56edfd3e08a24734fb4d8`.
+Actual mapped provider hashes are checked in the execution receipts.
+
+| Category | Result |
+|---|---|
+| Source fidelity | PASS: 28,885 sources, 28,882 exact bindings and 3 validated metadata tensors; valid external references and zero unexpected FP32 downcasts |
+| Ordinary greedy generation | PASS: all eight expected tokens in standalone ORT and actual C++ GenAI |
+| Decoder logits | PASS: 8/8 arrays |
+| Decoder hidden states | FAIL: 429/712 arrays pass |
+| Decoder KV cache | FAIL: 106/128 arrays pass |
+| Decoder convolution state | FAIL: 175/320 arrays pass |
+| Decoder SSM state | FAIL: 313/320 arrays pass |
+| Image vision parity | PASS: NRMSE 0.007395104, cosine 0.999973093 |
+| Five-frame compact video features | PASS: NRMSE 0.010337272, cosine 0.999946613 |
+| Seven-frame compact video features | PASS: NRMSE 0.009236995, cosine 0.999957353 |
+| Full multimodal generation | NOT_RUN: held until ordinary decoder numerical gates pass |
+| Speculative integration | NOT_RUN |
+| 24 GB deployment footprint | Not established: actual three-session GenAI execution sampled 30,019 MiB |
+
+All compared arrays are finite. The first failed state is prefill layer 25
+key cache (NRMSE 0.033919); decode step 7 layer 40 convolution state reaches
+NRMSE 0.070001. The first hidden failure is prefill hidden49; decode step 1
+hidden20 reaches NRMSE 0.102489. The separately instrumented hidden graph
+preserves all 776 original logit/state outputs bitwise. No reference,
+backend or numerical gate was changed to obtain these results. Full
+decoder parity therefore remains **FAIL**, despite exact ordinary tokens.
+
+All three vision cases have exact retention masks and indices. These are
+actual exported-v7 executions, not mechanically patched graph variants.
+Video dense diagnostics use auxiliary same-batch tubelet permutations;
+they are not direct unpruned-output fetches. Compact features and retention
+are compared directly. Vision's 7.407 GiB observation is a sampled NVML
+device peak, not an allocator or process-attributed peak.
+
+The ordinary GenAI diagnostic metadata bounds context to 128 tokens; it
+does not establish the source's 262,144-token capability. A prepared
+328-token image handoff is not a generation result and exceeds that
+diagnostic context bound. Any media probe requires a separately labeled
+metadata variant without mutating the qualified package.
+
+The clean corrected-source regression passes 11,208 tests, with 84 skips
+and 63 deselections under the documented standard selectors and four
+exact-base exclusions described above. All 75 targeted Mamba cases pass,
+including eight opt-in actual-checkpoint boundary tests. The L1 failure
+from unresolved activation dtype in component-quantized graph construction
+is fixed with six deferred-type regressions; the exact `52205332` head's
+[remote L1 smoke test passes](https://github.com/onnxruntime/mobius/actions/runs/38819403236/job/116712574716).
+These software checks do not override the failed full-model state gates.
