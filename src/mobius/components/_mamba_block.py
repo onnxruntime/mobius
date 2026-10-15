@@ -356,7 +356,10 @@ class _Float32BiasMamba2DepthwiseConv1d(_Mamba2DepthwiseConv1d):
         output.dtype = ir.DataType.FLOAT
         # The source stores biased Conv in model dtype before SiLU. Do not
         # move this cast past activation: it is a separate rounding boundary.
-        return op.Swish(op.CastLike(output, input_val)), present
+        return self._activate(op, op.CastLike(output, input_val)), present
+
+    def _activate(self, op: OpBuilder, input_val: ir.Value) -> ir.Value:
+        return op.Swish(input_val)
 
 
 class Mamba2Block(nn.Module):
@@ -716,3 +719,22 @@ class Float32AccumulationMamba2Block(Mamba2Block):
     ) -> ir.Value:
         # Keep both FP32 branches through their sum, then store once before norm.
         return op.CastLike(op.Add(readout, self._ssm_skip(op, x_4d)), hidden_states)
+
+
+class _Float32SiLUMamba2DepthwiseConv1d(_Float32BiasMamba2DepthwiseConv1d):
+    def _activate(self, op: OpBuilder, input_val: ir.Value) -> ir.Value:
+        # Preserve the biased Conv model-dtype store before complete FP32 SiLU.
+        input_float = op.Cast(input_val, to=ir.DataType.FLOAT)
+        input_float.dtype = ir.DataType.FLOAT
+        activated = op.Swish(input_float)
+        return op.CastLike(activated, input_val)
+
+
+class Float32SiLUMamba2Block(Float32AccumulationMamba2Block):
+    """Keep complete convolution SiLU in FP32 before a model-dtype output.
+
+    Biased Conv still stores in model dtype before activation; recurrence and
+    readout-plus-D retain the parent block's accumulation boundaries.
+    """
+
+    _conv1d_class = _Float32SiLUMamba2DepthwiseConv1d
