@@ -16,7 +16,30 @@ from mobius._builder import _cast_module_dtype
 from mobius._configs import NemotronHConfig
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import _numpy_to_ort_value, _ort_value_to_numpy
-from mobius.models.nemotron_h import NemotronHMoEBlock
+from mobius.components import Float32AccumulationMamba2Block, Mamba2Block
+from mobius.models.nemotron_h import (
+    NemotronHMambaLayer,
+    NemotronHMoEBlock,
+    NemotronHPuzzleMambaLayer,
+)
+
+
+def test_puzzle_mamba_precision_is_scoped_to_puzzle():
+    config = NemotronHConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        layer_types=["mamba2"],
+        mamba_n_heads=1,
+        mamba_d_head=2,
+        mamba_d_state=1,
+        mamba_n_groups=1,
+        mamba_d_conv=2,
+    )
+    assert type(NemotronHMambaLayer(config).mamba) is Mamba2Block
+    assert isinstance(NemotronHPuzzleMambaLayer(config).mamba, Float32AccumulationMamba2Block)
 
 
 def _reference_moe(x, parameters, config):

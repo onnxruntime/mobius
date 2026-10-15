@@ -45,6 +45,7 @@ __all__ = [
     "GatedDeltaNet",
     "GatedMLP",
     "GatedRMSNorm",
+    "Float32AccumulationMamba2Block",
     "Float32GatedRMSNorm",
     "KimiDeltaAttention",
     "KimiMLAAttention",
@@ -293,6 +294,9 @@ from mobius.components._lightning_attention import (
 )
 from mobius.components._llama4_vision import Llama4VisionTower
 from mobius.components._lora import LoRALinear
+from mobius.components._mamba_block import (
+    Float32AccumulationMamba2Block as Float32AccumulationMamba2Block,
+)
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
 from mobius.components._mamba_block import SequenceMambaBlock
