@@ -2001,10 +2001,15 @@ class TestBuildVLGraph:
             assert pixel_values.dtype == ir.DataType.FLOAT
 
     def test_component_quantization_builds(self, model_type: str, config_overrides: dict):
-        """Every VL task accepts an independent affine layout per component."""
+        """Supported VL tasks accept component layouts; OpenVLA rejects unqualified ones."""
         config = _base_config(**config_overrides)
         task = get_task(_default_task_for_model(model_type))
         config = _with_component_quantization(config, task)
+
+        if model_type == "openvla":
+            with pytest.raises(ValueError, match="separately validated component policy"):
+                build_from_module(registry.get(model_type)(config), config, task=task)
+            return
 
         package = build_from_module(
             registry.get(model_type)(config),
