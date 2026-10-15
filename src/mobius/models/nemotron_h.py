@@ -42,8 +42,9 @@ from mobius.components import (
     INT64_MAX,
     Attention,
     Embedding,
-    Float32AccumulationMamba2Block,
     Float32GatedRMSNorm,
+    Float32RMSNorm,
+    Float32SiLUMamba2Block,
     Linear,
     Mamba2Block,
     RMSNorm,
@@ -120,7 +121,7 @@ class NemotronHMambaLayer(nn.Module):
         return hidden_states, (new_conv_state, new_ssm_state)
 
 
-class _NemotronHPuzzleMamba2Block(Float32AccumulationMamba2Block):
+class _NemotronHPuzzleMamba2Block(Float32SiLUMamba2Block):
     def _apply_conv_padding_mask(
         self, op: OpBuilder, activated: ir.Value, padding_mask: ir.Value
     ) -> ir.Value:
@@ -138,14 +139,16 @@ class _NemotronHPuzzleMamba2Block(Float32AccumulationMamba2Block):
 class NemotronHPuzzleMambaLayer(NemotronHMambaLayer):
     """Puzzle Mamba with source Conv/bias, readout/D and norm precision.
 
-    Biased convolution and readout-plus-D accumulate in FP32 before their
-    respective model-dtype stores. Activation behavior is not changed here.
+    Outer RMSNorm keeps gamma in FP32. Biased convolution stores in model dtype
+    before complete FP32 SiLU and a second native store; readout-plus-D and inner
+    grouped norm retain their separately qualified FP32 accumulation boundaries.
     """
 
     mamba_block_class = _NemotronHPuzzleMamba2Block
 
     def __init__(self, config: NemotronHConfig):
         super().__init__(config)
+        self.norm = Float32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         d_inner = config.mamba_n_heads * config.mamba_d_head
         self.mamba.norm = Float32GatedRMSNorm(
             d_inner,
@@ -667,6 +670,14 @@ class NemotronHCausalLMModel(nn.Module):
 
 class _NemotronHPuzzleTextModel(_NemotronHTextModel):
     mamba_layer_class = NemotronHPuzzleMambaLayer
+
+    def __init__(self, config: NemotronHConfig):
+        super().__init__(config)
+        # The pinned Puzzle HF block uses FP32 gamma for every mixer family,
+        # including the final stateless MoE, and for the final decoder norm.
+        for layer in self.layers:
+            layer.norm = Float32RMSNorm(config.hidden_size, eps=layer.norm.variance_epsilon)
+        self.norm = Float32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,

@@ -16,11 +16,19 @@ from mobius._builder import _cast_module_dtype
 from mobius._configs import NemotronHConfig
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import _numpy_to_ort_value, _ort_value_to_numpy
-from mobius.components import Float32AccumulationMamba2Block, Mamba2Block
+from mobius.components import (
+    Float32GatedRMSNorm,
+    Float32RMSNorm,
+    Float32SiLUMamba2Block,
+    Mamba2Block,
+    RMSNorm,
+)
 from mobius.models.nemotron_h import (
     NemotronHMambaLayer,
     NemotronHMoEBlock,
     NemotronHPuzzleMambaLayer,
+    _NemotronHPuzzleTextModel,
+    _NemotronHTextModel,
 )
 
 
@@ -38,8 +46,47 @@ def test_puzzle_mamba_precision_is_scoped_to_puzzle():
         mamba_n_groups=1,
         mamba_d_conv=2,
     )
-    assert type(NemotronHMambaLayer(config).mamba) is Mamba2Block
-    assert isinstance(NemotronHPuzzleMambaLayer(config).mamba, Float32AccumulationMamba2Block)
+    ordinary, puzzle = NemotronHMambaLayer(config), NemotronHPuzzleMambaLayer(config)
+    assert type(ordinary.mamba) is Mamba2Block
+    assert type(ordinary.norm) is RMSNorm
+    assert isinstance(puzzle.mamba, Float32SiLUMamba2Block)
+    assert type(puzzle.norm) is Float32RMSNorm
+    assert type(puzzle.mamba.norm) is Float32GatedRMSNorm
+    assert [(n, list(p.shape)) for n, p in ordinary.named_parameters()] == [
+        (n, list(p.shape)) for n, p in puzzle.named_parameters()
+    ]
+
+
+def test_puzzle_all88_outer_norms_and_final_norm_keep_parameter_names():
+    config = NemotronHConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        hidden_act="relu2",
+        vocab_size=32,
+        num_hidden_layers=88,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        layer_types=["mamba2", "moe"] * 39 + ["full_attention"] * 8 + ["mamba2", "moe"],
+        mamba_n_heads=1,
+        mamba_d_head=2,
+        mamba_d_state=1,
+        mamba_n_groups=1,
+        mamba_d_conv=2,
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        moe_intermediate_size=4,
+        moe_latent_size=2,
+        shared_expert_intermediate_size=4,
+    )
+    original, puzzle = _NemotronHTextModel(config), _NemotronHPuzzleTextModel(config)
+    assert len(puzzle.layers) == 88
+    assert all(type(layer.norm) is Float32RMSNorm for layer in puzzle.layers)
+    assert type(puzzle.norm) is Float32RMSNorm
+    assert all(type(layer.norm) is RMSNorm for layer in original.layers)
+    assert type(original.norm) is RMSNorm
+    assert [(n, list(p.shape)) for n, p in original.named_parameters()] == [
+        (n, list(p.shape)) for n, p in puzzle.named_parameters()
+    ]
 
 
 def _reference_moe(x, parameters, config):

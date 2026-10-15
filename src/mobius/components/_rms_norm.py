@@ -22,6 +22,28 @@ class RMSNorm(nn.Module):
         return apply_rms_norm(op, hidden_states, self.weight, self.variance_epsilon)
 
 
+class Float32RMSNorm(RMSNorm):
+    """Apply RMS normalization and gamma in FP32 before one model-dtype store.
+
+    Unlike native-dtype RMSNormalization, this preserves the normalized FP32
+    activation through scaling. CastLike also supports deferred activation types.
+    """
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        hidden_float = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        scale_float = op.Cast(self.weight, to=ir.DataType.FLOAT)
+        # Cast determines these types even when upstream metadata is deferred.
+        hidden_float.dtype = scale_float.dtype = ir.DataType.FLOAT
+        normalized = op.RMSNormalization(
+            hidden_float,
+            scale_float,
+            epsilon=self.variance_epsilon,
+            stash_type=1,
+            axis=-1,
+        )
+        return op.CastLike(normalized, hidden_states)
+
+
 class RMSNormBias(nn.Module):
     """RMS normalization with learned scale and bias."""
 

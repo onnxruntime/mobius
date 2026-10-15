@@ -47,6 +47,8 @@ __all__ = [
     "GatedRMSNorm",
     "Float32AccumulationMamba2Block",
     "Float32GatedRMSNorm",
+    "Float32RMSNorm",
+    "Float32SiLUMamba2Block",
     "KimiDeltaAttention",
     "KimiMLAAttention",
     "Gemma3nAudioEncoder",
@@ -297,6 +299,7 @@ from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import (
     Float32AccumulationMamba2Block as Float32AccumulationMamba2Block,
 )
+from mobius.components._mamba_block import Float32SiLUMamba2Block as Float32SiLUMamba2Block
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
 from mobius.components._mamba_block import SequenceMambaBlock
@@ -467,6 +470,7 @@ from mobius.components._radio_v4_vision import RadioV4VisionModel
 from mobius.components._radio_vision import RadioVisionModel
 from mobius.components._rms_norm import (
     Float32GatedRMSNorm,
+    Float32RMSNorm,
     GatedRMSNorm,
     OffsetRMSNorm,
     PostGatedRMSNorm,
