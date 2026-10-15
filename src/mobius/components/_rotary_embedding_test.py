@@ -17,6 +17,7 @@ from mobius.components._rotary_embedding import (
     LinearRope,
     Llama3Rope,
     LongRope,
+    TorchDefaultRope,
     _get_cos_sin_cache,
     _get_default_inv_freq,
     apply_rotary_pos_emb,
@@ -65,6 +66,20 @@ class TestCosSinCache:
 
 
 class TestRopeVariants:
+    def test_torch_default_rope_preserves_source_fp32_rounding(self):
+        import torch
+
+        config = make_config(max_position_embeddings=2048, head_dim=128, rope_theta=10000.0)
+        rope = TorchDefaultRope(config)
+        inv_freq = 1 / (10000.0 ** (torch.arange(0, 128, 2).float() / 128))
+        angles = (inv_freq[:, None] @ torch.arange(2048).float()[None, :]).T
+        np.testing.assert_array_equal(rope.cos_cache.const_value.numpy(), angles.cos().numpy())
+        np.testing.assert_array_equal(rope.sin_cache.const_value.numpy(), angles.sin().numpy())
+        legacy = DefaultRope(config)
+        assert not np.array_equal(
+            legacy.cos_cache.const_value.numpy(), rope.cos_cache.const_value.numpy()
+        )
+
     def test_default_rope_creates_caches(self):
         config = make_config()
         rope = DefaultRope(config)

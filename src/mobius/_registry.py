@@ -221,6 +221,7 @@ from mobius.models.muse_glimmer import (
     MuseGlimmerTextCausalLMModel,
 )
 from mobius.models.nemotron_h import NemotronHCausalLMModel
+from mobius.models.openvla import OpenVLAModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
@@ -850,6 +851,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "mage_vl": ModelRegistration(MageVLForConditionalGeneration, task="mage-vl"),
     "janus": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava": ModelRegistration(LLaVAModel, task="vision-language"),
+    "openvla": ModelRegistration(
+        OpenVLAModel, task="openvla", test_model_id="openvla/openvla-7b",
+        test_revision="47a0ec7fc4ec123775a391911046cf33cf9ed83f",
+    ),
     "llava_next": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava_next_video": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava_onevision": ModelRegistration(LLaVAModel, task="vision-language"),

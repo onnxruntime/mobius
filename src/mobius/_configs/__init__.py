@@ -112,6 +112,7 @@ from mobius._configs._sub_configs import (
     VisionConfig,
 )
 from mobius._configs._world_model import WorldModelConfig
+from mobius._configs.openvla import OpenVLAConfig
 from mobius._configs.vibevoice import (
     VibeVoiceASRStreamingConfig,
     VibeVoiceConfig,
@@ -126,6 +127,7 @@ from mobius._configs.vibevoice_asr import VibeVoiceASRConfig
 __all__ = [
     "DEFAULT_INT",
     "ArchitectureConfig",
+    "OpenVLAConfig",
     "AudioConfig",
     "BambaConfig",
     "BaseModelConfig",

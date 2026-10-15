@@ -160,6 +160,35 @@ class DefaultRope(BaseRope):
         super().__init__(cos_cache, sin_cache, dtype=config.dtype)
 
 
+class TorchDefaultRope(BaseRope):
+    """Default RoPE preserving Hugging Face's FP32 Torch parameter construction."""
+
+    def __init__(self, config: ArchitectureConfig):
+        import torch
+
+        if config.rope_type != "default" or config.rope_scaling:
+            raise ValueError("TorchDefaultRope requires unscaled default RoPE")
+        if config.partial_rotary_factor is None or config.rope_theta is None:
+            raise ValueError("TorchDefaultRope requires explicit rotary factor and theta")
+        head_dim = config.qk_rope_head_dim or config.head_dim
+        dim = int(head_dim * config.partial_rotary_factor)
+        if dim <= 0 or dim % 2:
+            raise ValueError("TorchDefaultRope requires a positive even rotary dimension")
+        indices = torch.arange(0, dim, 2, dtype=torch.int64, device="cpu").float()
+        # NumPy pow differs by an FP32 ulp, which accumulates into RoPE phase drift.
+        inv_freq = 1.0 / (config.rope_theta ** (indices / dim))
+        positions = torch.arange(
+            config.max_position_embeddings, dtype=torch.float32, device="cpu"
+        )
+        angles = (inv_freq[None, :, None] @ positions[None, None, :]).transpose(1, 2)
+        embeddings = torch.cat((angles, angles), dim=-1)
+        super().__init__(
+            embeddings.cos()[0, :, : dim // 2].contiguous().numpy(),
+            embeddings.sin()[0, :, : dim // 2].contiguous().numpy(),
+            dtype=config.dtype,
+        )
+
+
 class ProportionalRope(BaseRope):
     """Proportional RoPE as used in Gemma4 full-attention layers.
 

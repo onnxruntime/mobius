@@ -54,6 +54,7 @@ from mobius._configs import (
     Nemotron3DiarizationConfig,
     NemotronHConfig,
     NemotronParseConfig,
+    OpenVLAConfig,
     ParakeetCTCConfig,
     Plamo2Config,
     Qwen4ExpConfig,
@@ -2914,6 +2915,31 @@ _TINY_MUSE_GLIMMER_VISION = VisionConfig(
 # The L1 graph-test parametrization uses specialised test
 # methods that invoke the correct task and assert the right output models.
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "openvla",
+        {
+            "_config_cls": OpenVLAConfig,
+            "dino": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+            "siglip": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+            ),
+        },
+        True,
+    ),
     (
         "neo_chat",
         {

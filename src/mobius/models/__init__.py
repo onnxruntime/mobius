@@ -108,6 +108,7 @@ __all__ = [
     "LLaDAModel",
     "LLaDAMoEModel",
     "LLaVAModel",
+    "OpenVLAModel",
     "LayerNormCausalLMModel",
     "LegacyLayerNormCausalLMModel",
     "Lfm2CausalLMModel",
@@ -376,6 +377,7 @@ from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.nemotron_parse import NemotronParseForConditionalGeneration
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
+from mobius.models.openvla import OpenVLAModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.parakeet_ctc import ParakeetForCTCModel
 from mobius.models.persimmon import PersimmonCausalLMModel

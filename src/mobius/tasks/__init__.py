@@ -71,6 +71,7 @@ __all__ = [
     "KimiLinearCausalLMTask",
     "Lfm2VlTask",
     "ModelTask",
+    "OpenVLATask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
     "Mistral4GGUFCausalLMTask",
@@ -189,6 +190,7 @@ from mobius.tasks._mistral4_gguf import Mistral4GGUFCausalLMTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
+from mobius.tasks._openvla import OpenVLATask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._plamo import PlamoCausalLMTask
 from mobius.tasks._plamo2 import Plamo2CausalLMTask
@@ -239,6 +241,7 @@ from mobius.tasks._world_model import WorldModelTask
 # ---------------------------------------------------------------------------
 
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
+    "openvla": OpenVLATask,
     "adapter": AdapterTask,
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,
