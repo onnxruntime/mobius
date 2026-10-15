@@ -18,13 +18,15 @@ import dataclasses
 import logging
 import math
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Sequence
 
 import torch
 
 from mobius._configs import QuantizationConfig, QuantizedWeightFormat
 
 logger = logging.getLogger(__name__)
+
+WeightTransform = Callable[[torch.Tensor], torch.Tensor]
 
 # Key suffixes marking a *packed quantized* sidecar tensor rather than a float
 # weight. A "sidecar" here is an auxiliary tensor that rides alongside a
@@ -174,6 +176,10 @@ class QMoEQuantizationLayout:
         return self.fc1.bits != self.fc2.bits
 
     @property
+    def has_int3(self) -> bool:
+        return 3 in (self.fc1.bits, self.fc2.bits)
+
+    @property
     def requires_projection_preprocessing(self) -> bool:
         return any(
             not _same_qmoe_packing_layout(projection, self.fallback)
@@ -240,9 +246,10 @@ def resolve_qmoe_quantization(
     """Resolve and validate FC1/FC2 layouts for one native QMoE layer.
 
     Legacy uniform INT4 layouts retain the existing predicate and behavior.
-    Projection overrides support Olive integer-affine FC1/FC2 widths (2, 4)
-    and (4, 8), (8, 4), or (8, 8), with a common QMoE block size and the
-    model-wide INT4 layout as the fallback for non-expert projections.
+    Olive integer-affine projection overrides independently select INT2, INT3,
+    INT4, or INT8, with a common QMoE block size and the model-wide INT4
+    layout as the fallback for non-expert projections. Export support does
+    not establish execution support in a target ORT runtime.
 
     Explicit per-layer plans must either resolve to a bindable native layout
     or raise; they never silently select an incompatible dense fallback.
@@ -277,6 +284,12 @@ def resolve_qmoe_quantization(
         )
 
     fallback = supported_qmoe_quantization(quantization)
+    has_int3 = 3 in (fc1.bits, fc2.bits)
+    if has_int3:
+        if any(projection.bits == 3 and not projection.sym for projection in (fc1, fc2)):
+            raise ValueError("INT3 QMoE requires symmetric INT3 zero point 4.")
+        if fc1.group_size not in (32, 64, 128):
+            raise ValueError("Draft INT3 QMoE requires block_size 32, 64, or 128.")
     fc1_uniform = supported_qmoe_quantization(fc1)
     fc2_uniform = supported_qmoe_quantization(fc2)
     if fc1_uniform is not None and fc2_uniform is not None:
@@ -301,13 +314,20 @@ def resolve_qmoe_quantization(
             )
         return layout
 
-    requested_mixed = (
+    requested_projection_layout = (
         fc1.bits != fc2.bits
         or fc1.group_size != fc2.group_size
         or fc1.sym != fc2.sym
-        or (fallback is not None and fc1.bits == fc2.bits == 8)
+        or (
+            fallback is not None
+            and any(
+                not _same_qmoe_packing_layout(projection, fallback)
+                for projection in (fc1, fc2)
+            )
+        )
+        or has_int3
     )
-    if not requested_mixed:
+    if not requested_projection_layout:
         if not (
             _same_qmoe_packing_layout(fc1, quantization)
             and _same_qmoe_packing_layout(fc2, quantization)
@@ -325,13 +345,14 @@ def resolve_qmoe_quantization(
         for layout in layouts
     ):
         raise ValueError(
-            "Mixed native QMoE requires Olive integer-affine weights with packed "
+            "Projection-specific native QMoE requires Olive integer-affine weights with packed "
             "uint8 zero points."
         )
-    if fallback is None or (fc1.bits, fc2.bits) not in {(2, 4), (4, 8), (8, 4), (8, 8)}:
+    supported_bits = {2, 3, 4, 8}
+    if fallback is None or any(layout.bits not in supported_bits for layout in layouts):
         raise ValueError(
-            "Unsupported mixed native QMoE expert widths: expected model-wide "
-            "INT4 with FC1/FC2 in {(2, 4), (4, 8), (8, 4), (8, 8)}, "
+            "Unsupported native QMoE expert widths: expected model-wide "
+            f"INT4 with each projection in {sorted(supported_bits)}, "
             f"got fallback={quantization.bits}, "
             f"FC1={fc1.bits}, FC2={fc2.bits}."
         )
@@ -1067,6 +1088,32 @@ def _resolve_olive_qmoe_layouts(
     }
 
 
+def _validate_qmoe_scales(
+    scales: torch.Tensor,
+    *,
+    label: str,
+    activation_dtype: torch.dtype | None,
+    require_matching_dtype: bool = False,
+) -> None:
+    """Validate numeric scales; INT3 callers also supply a validated activation dtype."""
+    if scales.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError(
+            f"QMoE {label} scales must be float16, bfloat16, or float32, got {scales.dtype}."
+        )
+    if not torch.isfinite(scales).all() or torch.any(scales < 0):
+        raise ValueError(f"QMoE {label} scales must be finite and nonnegative.")
+    if require_matching_dtype and scales.dtype != activation_dtype:
+        raise ValueError(
+            f"Draft INT3 QMoE {label} scales must match activation "
+            f"dtype {activation_dtype}, got {scales.dtype}."
+        )
+    if activation_dtype is not None and not torch.isfinite(scales.to(activation_dtype)).all():
+        raise ValueError(
+            f"QMoE {label} scales must remain finite after conversion "
+            f"to activation dtype {activation_dtype}."
+        )
+
+
 def _preprocess_olive_qmoe_weights(
     state_dict: dict[str, torch.Tensor],
     quantization: QuantizationConfig,
@@ -1079,6 +1126,8 @@ def _preprocess_olive_qmoe_weights(
     tie_embeddings: bool,
     embed_key: str,
     head_key: str,
+    activation_dtype: torch.dtype | None = None,
+    weight_transforms: dict[str, WeightTransform] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Validate and bind fused K-last Olive sidecars for mixed-width QMoE."""
     expert_keys = {
@@ -1117,6 +1166,8 @@ def _preprocess_olive_qmoe_weights(
             required_keys = [f"{stem}_qweight", f"{stem}_scales"]
             if not projection_layout.sym:
                 required_keys.append(f"{stem}_qzeros")
+            elif projection_layout.bits == 3 and f"{stem}_qzeros" in state_dict:
+                required_keys.append(f"{stem}_qzeros")
             elif f"{stem}_qzeros" in state_dict:
                 raise ValueError(
                     f"QMoE {projection} is symmetric but checkpoint contains "
@@ -1137,6 +1188,11 @@ def _preprocess_olive_qmoe_weights(
 
     for root, layout in layouts.items():
         block_size = layout.fc1.group_size
+        if layout.has_int3 and activation_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "Draft INT3 QMoE requires an explicit FP16/BF16 activation dtype "
+                "from the model's export adapter."
+            )
         if hidden_size % block_size or intermediate_size % block_size:
             raise ValueError(
                 f"Mixed QMoE dimensions for {root!r} must be divisible by "
@@ -1168,14 +1224,16 @@ def _preprocess_olive_qmoe_weights(
                 "qweight": f"{stem}_qweight",
                 "scales": f"{stem}_scales",
             }
-            if not projection_layout.sym:
+            if not projection_layout.sym or (
+                projection_layout.bits == 3 and f"{stem}_qzeros" in state_dict
+            ):
                 required["qzeros"] = f"{stem}_qzeros"
             qweight = state_dict[required["qweight"]]
             scales = state_dict[required["scales"]]
             qzeros = state_dict[required["qzeros"]] if "qzeros" in required else None
             expected_weight = (
                 *leading_shape,
-                logical_k * projection_layout.bits // 8,
+                (logical_k * projection_layout.bits + 7) // 8,
             )
             expected_scales = (*leading_shape, logical_k // block_size)
             expected_zeros = (
@@ -1203,26 +1261,56 @@ def _preprocess_olive_qmoe_weights(
                 raise ValueError(
                     f"Mixed QMoE {label.upper()} qweight must be uint8, got {qweight.dtype}."
                 )
-            if scales.dtype not in {
-                torch.float16,
-                torch.bfloat16,
-                torch.float32,
-            }:
-                raise ValueError(
-                    f"Mixed QMoE {label.upper()} scales must be float16, bfloat16, "
-                    f"or float32, got {scales.dtype}."
-                )
             if qzeros is not None and qzeros.dtype != torch.uint8:
                 raise ValueError(
                     f"Mixed QMoE {label.upper()} qzeros must be uint8, got {qzeros.dtype}."
                 )
+            _validate_qmoe_scales(
+                scales,
+                label=label.upper(),
+                activation_dtype=activation_dtype,
+                require_matching_dtype=layout.has_int3,
+            )
+            if projection_layout.bits == 3 and qzeros is not None:
+                _validate_int3_qmoe_zero_points(qzeros, logical_k // block_size)
+                # Canonical export omits the validated, redundant offset-4 tensor.
+                qzeros = None
 
             if root in projection_layouts:
+                deferred_interleave = (
+                    layout.has_int3 and label == "fc1" and weight_transforms is not None
+                )
                 # Legacy roots are validated here but renamed by preprocess_olive_weights.
-                renamed_experts[f"{stem}.weight"] = qweight.contiguous()
+                if layout.has_int3 and label == "fc1":
+                    # Draft raw initializers carry gate/up interleaving, not a
+                    # runtime reshape chain or provider-private prepack.
+                    def interleave(tensor: torch.Tensor) -> torch.Tensor:
+                        return (
+                            tensor.reshape(num_experts, 2, intermediate_size, -1)
+                            .transpose(1, 2)
+                            .reshape(*tensor.shape)
+                            .contiguous()
+                        )
+
+                    if weight_transforms is None:
+                        qweight = interleave(qweight)
+                        scales = interleave(scales)
+                        if qzeros is not None:
+                            qzeros = interleave(qzeros)
+                    else:
+                        # Keys match the final QMoE names emitted by the packer.
+                        weight_transforms[f"{root}.fc1_experts_weights"] = interleave
+                        weight_transforms[f"{root}.fc1_scales"] = interleave
+                        if qzeros is not None:
+                            weight_transforms[f"{root}.fc1_experts_zero_points"] = interleave
+                renamed_experts[f"{stem}.weight"] = (
+                    qweight if deferred_interleave else qweight.contiguous()
+                )
                 renamed_experts[f"{stem}.scales"] = scales
                 if qzeros is not None:
-                    renamed_experts[f"{stem}.zero_points"] = qzeros.contiguous()
+                    renamed_experts[f"{stem}.zero_points"] = (
+                        qzeros if deferred_interleave else qzeros.contiguous()
+                    )
 
     projection_expert_keys = {
         key
@@ -1244,6 +1332,20 @@ def _preprocess_olive_qmoe_weights(
     )
     result.update(renamed_experts)
     return pack_qmoe_expert_weights(result, target_moe_path=qmoe_target_path)
+
+
+def _validate_int3_qmoe_zero_points(qzeros: torch.Tensor, num_blocks: int) -> None:
+    """Validate row-local explicit offset-4 codes, including unused tail bits."""
+    offsets = torch.arange(num_blocks, device=qzeros.device) * 3
+    indices = offsets // 8
+    data = torch.nn.functional.pad(qzeros.to(torch.int32), (0, 1))
+    words = data[..., indices] | (data[..., indices + 1] << 8)
+    codes = (words >> (offsets % 8)) & 7
+    if torch.any(codes != 4):
+        raise ValueError("Draft INT3 QMoE explicit zero points must all equal 4.")
+    tail_bits = (num_blocks * 3) % 8
+    if tail_bits and torch.any(qzeros[..., -1].to(torch.int32) >> tail_bits):
+        raise ValueError("Draft INT3 QMoE zero-point tail padding bits must be zero.")
 
 
 def preprocess_gptq_weights(
@@ -1554,6 +1656,8 @@ def preprocess_quantized_weights(
     qmoe_source_moe_paths: tuple[str, ...] = (),
     reject_quantized_embeddings_lm_head: bool = False,
     defer_non_expert_sidecars: bool = False,
+    qmoe_activation_dtype: torch.dtype | None = None,
+    weight_transforms: dict[str, WeightTransform] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Apply shared quantization conversion, tying, and QMoE packing.
 
@@ -1580,6 +1684,9 @@ def preprocess_quantized_weights(
         defer_non_expert_sidecars: Keep ordinary packed sidecars raw for the
             component loader to resolve per-projection layouts. Expert packing
             and float weight tying still run here.
+        qmoe_activation_dtype: Expected scale dtype for draft INT3 QMoE export.
+        weight_transforms: Optional output mapping for deferred, shape-preserving
+            initializer transforms. Apply it when binding the returned weights.
 
     Returns:
         The preprocessed weight dictionary.
@@ -1749,9 +1856,20 @@ def preprocess_quantized_weights(
                 tie_embeddings=tie_embeddings,
                 embed_key=embed_key,
                 head_key=head_key,
+                activation_dtype=qmoe_activation_dtype,
+                weight_transforms=weight_transforms,
             )
             return_state_dict.update(deferred)
             return return_state_dict
+        if use_qmoe:
+            # Legacy layouts retain their shape handling but share the numeric checks.
+            for key, value in state_dict.items():
+                if ".experts." in key and key.endswith("_scales"):
+                    _validate_qmoe_scales(
+                        value,
+                        label=key.removesuffix("_scales"),
+                        activation_dtype=qmoe_activation_dtype,
+                    )
         olive_tie = tie_embeddings or quantization.tie_word_embeddings
         return_state_dict = preprocess_olive_weights(
             state_dict,

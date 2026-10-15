@@ -904,16 +904,16 @@ class TestMixedWidthQMoEExport:
         assert prefix + "fc1_experts_zero_points" in out
         assert prefix + "fc2_experts_zero_points" not in out
 
-    @pytest.mark.parametrize("dense_mode", ["unsupported_uniform", "excluded"])
+    @pytest.mark.parametrize("dense_mode", ["unsupported_width", "excluded"])
     def test_per_layer_expert_plan_rejects_unbindable_dense_fallback(self, dense_mode):
-        if dense_mode == "unsupported_uniform":
+        if dense_mode == "unsupported_width":
             quantization = QuantizationConfig(
                 bits=4,
                 group_size=_BLK,
                 quant_method="olive",
                 overrides={
-                    f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=2),
-                    f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=2),
+                    f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=5),
+                    f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=5),
                 },
             )
         else:
@@ -921,7 +921,7 @@ class TestMixedWidthQMoEExport:
                 _quantization(),
                 modules_to_not_convert=(f"{_LAYER}mlp.experts",),
             )
-        with pytest.raises(ValueError, match="routed expert"):
+        with pytest.raises(ValueError, match=r"routed expert|expert widths"):
             MoECausalLMModel(_moe_config(quantization))
 
     @pytest.mark.parametrize(
@@ -1228,7 +1228,7 @@ class TestMixedWidthQMoEExport:
                     quant_method="olive",
                     overrides={
                         f"{_LAYER}mlp.experts.gate_up_proj": QuantizationOverride(bits=2),
-                        f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=8),
+                        f"{_LAYER}mlp.experts.down_proj": QuantizationOverride(bits=5),
                     },
                 ),
                 "expected model-wide INT4",
