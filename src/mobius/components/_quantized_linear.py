@@ -228,16 +228,11 @@ class NVFP4QuantizedLinear(nn.Module):
             dtype=ir.DataType.UINT8,
         )
         self.weight_scale_2 = nn.Parameter([1], dtype=ir.DataType.FLOAT)
-        self.bias = nn.Parameter([out_features], dtype=ir.DataType.FLOAT16) if bias else None
+        self.weight_scale_2._keep_float32 = True  # type: ignore[attr-defined]
+        self.bias = nn.Parameter([out_features]) if bias else None
 
-    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-        """Compute ``x @ dequant(weight).T`` through the native W4A16 ABI."""
-        if x.dtype != ir.DataType.FLOAT16:
-            raise ValueError(
-                f"MatMulBlockQuantizedFp4Weight requires FLOAT16 activations; got {x.dtype}."
-            )
-        op.builder.graph.opset_imports[_MICROSOFT_DOMAIN] = 1
-        result = getattr(op, _MICROSOFT_NVFP4_OP)(
+    def _project(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        return getattr(op, _MICROSOFT_NVFP4_OP)(
             x,
             self.weight,
             self.weight_scale,
@@ -245,12 +240,102 @@ class NVFP4QuantizedLinear(nn.Module):
             block_size=self._block_size,
             _domain=_MICROSOFT_DOMAIN,
         )
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        """Compute ``x @ dequant(weight).T`` through the native W4A16 ABI."""
+        if x.dtype not in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+            raise ValueError(
+                "MatMulBlockQuantizedFp4Weight requires FLOAT16 or BFLOAT16 "
+                f"activations; got {x.dtype}."
+            )
+        op.builder.graph.opset_imports[_MICROSOFT_DOMAIN] = 1
+        result = self._project(op, x)
         result.dtype = x.dtype
         if x.shape is not None:
             result.shape = ir.Shape([*x.shape[:-1], self._n])
         if self.bias is not None:
-            result = op.Add(result, self.bias)
+            result = op.Add(result, op.CastLike(self.bias, x))
         return result
+
+
+class NVFP4A16Linear(NVFP4QuantizedLinear):
+    """NVFP4 A16 projection with FP32 global scaling after the dot product.
+
+    Local E2M1 * E4M3 weights form native-dtype operands. Accumulation and
+    global scaling remain FP32 until the output cast, followed by native bias
+    addition. Folding the global scale into rounded weights is not equivalent.
+    Requires ``com.microsoft::MatMulNVFP4A16/v1`` for every sequence length.
+    """
+
+    def _project(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        return op.MatMulNVFP4A16(
+            x,
+            self.weight,
+            self.weight_scale,
+            self.weight_scale_2,
+            _domain=_MICROSOFT_DOMAIN,
+        )
+
+
+class _GGMLPackedLinear(nn.Module):
+    _block_size: int
+    _block_bytes: int
+    _op_type: str
+
+    def __init__(self, in_features: int, out_features: int, *, bias: bool = False):
+        super().__init__()
+        if in_features < 0 or in_features % self._block_size or out_features < 0:
+            raise ValueError(
+                f"{self._op_type} requires nonnegative N and K divisible by {self._block_size}"
+            )
+        self._n = out_features
+        self.weight = nn.Parameter(
+            [out_features, in_features // self._block_size, self._block_bytes],
+            dtype=ir.DataType.UINT8,
+        )
+        self.bias = nn.Parameter([out_features]) if bias else None
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        if x.dtype not in {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+            raise ValueError(
+                f"{self._op_type} requires FLOAT, FLOAT16 or BFLOAT16 activations"
+            )
+        op.builder.graph.opset_imports[_MICROSOFT_DOMAIN] = 1
+        inputs = [x, self.weight]
+        if self.bias is not None:
+            inputs.append(op.CastLike(self.bias, x))
+        result = getattr(op, self._op_type)(*inputs, _domain=_MICROSOFT_DOMAIN)
+        result.dtype = x.dtype
+        if x.shape is not None:
+            result.shape = ir.Shape([*x.shape[:-1], self._n])
+        return result
+
+
+class GGMLIQ2XXSLinear(_GGMLPackedLinear):
+    """Packed GGML IQ2_XXS with source-native reconstructed-weight rounding.
+
+    ``[N, K/256, 66]`` bytes remain packed. Each completely decoded FP32
+    weight rounds to activation dtype before FP32 accumulation; matmul output
+    rounds before optional native-dtype bias addition. This is not affine INT2.
+    """
+
+    _block_size = 256
+    _block_bytes = 66
+    _op_type = "MatMulGGMLIQ2XXS"
+
+
+class GGMLQ8Linear(_GGMLPackedLinear):
+    """Packed GGML Q8_0 with exact FP16-scale bits and complete-weight rounding.
+
+    ``[N, K/32, 34]`` stores the FP16 scale and 32 signed payload bytes.
+    Decode in FP32, round the complete reconstructed weight to activation
+    dtype, accumulate in FP32, then round output before native bias addition.
+    Neither early BF16 scale rounding nor FP32-only MatMulNBits is equivalent.
+    """
+
+    _block_size = 32
+    _block_bytes = 34
+    _op_type = "MatMulGGMLQ8_0"
 
 
 class ClippableQuantizedLinear(QuantizedLinear):

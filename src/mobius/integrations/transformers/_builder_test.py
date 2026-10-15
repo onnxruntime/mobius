@@ -50,6 +50,104 @@ def _native_gptoss_config(*, dtype=ir.DataType.FLOAT16):
     )
 
 
+@pytest.mark.parametrize("local_checkpoint", [False, True])
+@pytest.mark.parametrize("revision", [None, "explicit-revision"])
+def test_native_omni_pins_detection_and_streams_before_eager(
+    monkeypatch, tmp_path, local_checkpoint, revision
+) -> None:
+    from mobius._configs import NemotronHOmniConfig
+    from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
+    from mobius.integrations.transformers import _nemotron_h_omni_weights
+    from mobius.models.nemotron_h_omni import BOLT_REVISION
+
+    model_id = (
+        str(tmp_path) if local_checkpoint else "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"
+    )
+    expected_revision = revision
+    if not local_checkpoint and revision is None:
+        expected_revision = BOLT_REVISION
+    config = NemotronHOmniConfig.from_transformers(_omni_config())
+    package = ModelPackage(
+        {
+            name: ir.Model(ir.Graph([], [], nodes=[], name=name), ir_version=11)
+            for name in ("decoder", "vision_encoder", "embedding")
+        },
+        config=config,
+    )
+    probe = mock.Mock(return_value=(SimpleNamespace(model_type="nemotron_h_omni"), False))
+    monkeypatch.setattr(transformers_builder, "_load_transformers_config", probe)
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "nemotron-h-omni", "nemotron_h_omni"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        transformers_builder, "build_from_module", lambda *args, **kwargs: package
+    )
+    eager = mock.Mock(side_effect=AssertionError("Omni must not load the full checkpoint"))
+    stream = mock.Mock(return_value={})
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+    monkeypatch.setattr(
+        _nemotron_h_omni_weights, "stream_nemotron_h_omni_safetensors_to_package", stream
+    )
+    result = transformers_builder.build_transformers_model(
+        model_id, revision=revision, dtype="bf16", execution_provider="cuda"
+    )
+    assert result is package
+    probe.assert_called_once_with(
+        model_id, revision=expected_revision, trust_remote_code=False
+    )
+    eager.assert_not_called()
+    assert stream.call_count == 1
+    args, kwargs = stream.call_args
+    assert args[:2] == (package, model_id)
+    assert isinstance(args[2], NemotronHOmniConfig)
+    assert args[2].dtype == ir.DataType.BFLOAT16
+    assert kwargs == {"revision": expected_revision}
+    assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
+        expected_revision or "unpinned"
+    }
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"keep_quantized": False}, "separate"),
+        ({"execution_provider": "cpu"}, "CUDA"),
+        ({"execution_provider": "default"}, "CUDA"),
+        ({"dtype": "f32"}, "dtype"),
+    ],
+)
+def test_native_omni_rejects_unsupported_modes_before_graph_or_weight_io(
+    monkeypatch, options, message
+) -> None:
+    from mobius._configs import NemotronHOmniConfig
+    from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
+
+    config = NemotronHOmniConfig.from_transformers(_omni_config())
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (SimpleNamespace(model_type="nemotron_h_omni"), False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "nemotron-h-omni", "nemotron_h_omni"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    graph = mock.Mock(side_effect=AssertionError("must reject before graph construction"))
+    eager = mock.Mock(side_effect=AssertionError("must reject before loading weights"))
+    monkeypatch.setattr(transformers_builder, "build_from_module", graph)
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+    kwargs = {"dtype": "bf16", "execution_provider": "cuda", **options}
+    with pytest.raises((ValueError, NotImplementedError), match=message):
+        transformers_builder.build_transformers_model("fake/omni", **kwargs)
+    graph.assert_not_called()
+    eager.assert_not_called()
+
+
 @pytest.mark.parametrize("local_checkpoint", [False, True], ids=["model-id", "local-config"])
 def test_native_gptoss_selects_streaming_before_eager_loader(
     monkeypatch, tmp_path, local_checkpoint

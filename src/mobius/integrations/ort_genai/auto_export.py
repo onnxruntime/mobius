@@ -350,6 +350,41 @@ def _is_single_model_decoder_package(pkg: ModelPackage) -> bool:
     return "input_ids" in input_names and "logits" in output_names
 
 
+def _inspect_hybrid_multimodal_decoder_abi(model: ir.Model) -> _DecoderAbi:
+    """Describe separate KV, convolution and SSM cache families without renaming."""
+    inputs = _graph_input_names(model)
+    outputs = {value.name for value in model.graph.outputs}
+    if "inputs_embeds" not in inputs or "logits" not in outputs:
+        raise ValueError("Hybrid multimodal decoder requires inputs_embeds and logits")
+    past = _cache_names([value.name for value in model.graph.inputs if value.name])
+    present = _cache_names([value.name for value in model.graph.outputs if value.name])
+    semantics = {
+        "key": ("past_key_names", "present_key_names"),
+        "value": ("past_value_names", "present_value_names"),
+        "conv_state": ("past_conv_names", "present_conv_names"),
+        "ssm_state": ("past_recurrent_names", "present_recurrent_names"),
+    }
+    if (past.keys() | present.keys()) - semantics.keys():
+        raise ValueError("Hybrid multimodal decoder has an unclassified cache family")
+    decoder_inputs = {name: name for name in inputs}
+    decoder_outputs = {"logits": "logits"}
+    for kind, (input_key, output_key) in semantics.items():
+        if not past.get(kind) or set(past[kind]) != set(present.get(kind, {})):
+            raise ValueError(f"Hybrid multimodal {kind} inputs/outputs must match")
+        decoder_inputs[input_key] = _name_template(past[kind], label=input_key)
+        decoder_outputs[output_key] = _name_template(present[kind], label=output_key)
+    if set(past["key"]) != set(past["value"]):
+        raise ValueError("Hybrid multimodal key/value cache slots must match")
+    if set(past["conv_state"]) != set(past["ssm_state"]):
+        raise ValueError("Hybrid multimodal conv/SSM cache slots must match")
+    return _DecoderAbi(
+        inputs=decoder_inputs,
+        outputs=decoder_outputs,
+        cache_slots=max(index for family in past.values() for index in family) + 1,
+        has_recurrent_state=True,
+    )
+
+
 def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
     """Validate intrinsic decoder semantics and describe the graph contract."""
     input_names = [value.name for value in model.graph.inputs if value.name is not None]
@@ -454,12 +489,14 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
     )
 
 
-def _load_generation_config(model_id: str):
+def _load_generation_config(model_id: str, *, revision: str | None = None):
     """Load optional Hugging Face generation settings without requiring the file."""
     import transformers
 
     try:
-        return transformers.GenerationConfig.from_pretrained(model_id)
+        if revision is None:
+            return transformers.GenerationConfig.from_pretrained(model_id)
+        return transformers.GenerationConfig.from_pretrained(model_id, revision=revision)
     except OSError:
         logger.debug(
             "No generation_config.json found for %s; using model config token IDs", model_id
@@ -975,6 +1012,12 @@ def _write_vision_processor_config(
         return None
 
     model_type = getattr(config, "model_type", "")
+    if model_type == "nemotron_h_omni":
+        logger.info(
+            "Skipping generated Omni processor: use the pinned source processor, "
+            "run vision explicitly, compact EVS prompts and pass prepared features"
+        )
+        return None
     if model_type in _MINICPM_MODEL_TYPES:
         # MiniCPM needs adaptive slicing and NaViT horizontal patch packing.
         # ort-extensions has no equivalent transform, so preserving the HF
@@ -1550,7 +1593,16 @@ def _write_genai_config(
     decoder_key = "decoder" if "decoder" in pkg else "model"
     decoder_model = pkg.get(decoder_key)
     decoder_abi: _DecoderAbi | None = None
-    if _is_single_model_decoder_package(pkg):
+    is_omni = getattr(config, "model_type", "") == "nemotron_h_omni"
+    if is_omni:
+        if decoder_model is None:
+            raise ValueError("Omni requires a decoder ONNX graph")
+        decoder_abi = _inspect_hybrid_multimodal_decoder_abi(decoder_model)
+        if decoder_abi.cache_slots > config.num_hidden_layers:
+            raise ValueError("Omni cache slots exceed the declared decoder layer count")
+        decoder_inputs = decoder_abi.inputs
+        decoder_outputs = decoder_abi.outputs
+    elif _is_single_model_decoder_package(pkg):
         if decoder_model is None:
             raise ValueError("ORT GenAI text packages require a decoder ONNX graph")
         decoder_abi = _inspect_decoder_abi(decoder_model, model_type=ort_model_type)
@@ -1603,6 +1655,9 @@ def _write_genai_config(
         else:
             supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
+    if is_omni:
+        supports_in_place_kv_cache = False
+
     sliding_window = None
     window_size = getattr(config, "sliding_window", None)
     # ORT GenAI uses this block to allocate a compact present cache. A
@@ -1643,7 +1698,9 @@ def _write_genai_config(
         decoder_filename=decoder_filename,
         supports_in_place_kv_cache=supports_in_place_kv_cache,
         num_cache_layer_slots=(
-            decoder_abi.cache_slots
+            config.num_hidden_layers
+            if is_omni
+            else decoder_abi.cache_slots
             if decoder_abi is not None
             else _count_cache_layer_slots(decoder_model)
         ),
@@ -1669,7 +1726,10 @@ def _write_genai_config(
             # spatial_merge_size and config_filename are config-level
             # properties that cannot be inferred from the graph.
             vision_kwargs: dict[str, Any] = {}
-            if model_type in _GEMMA4_MODEL_TYPES:
+            if is_omni:
+                vision_kwargs["spatial_merge_size"] = None
+                vision_kwargs["config_filename"] = None
+            elif model_type in _GEMMA4_MODEL_TYPES:
                 vision_cfg = getattr(config, "vision", None)
                 vision_kwargs["spatial_merge_size"] = getattr(
                     vision_cfg, "spatial_merge_size", 2
@@ -2034,6 +2094,10 @@ def write_ort_genai_config(
             "KV caches, DPM-Solver sampling, and prefilled voice-prompt caches; it "
             "cannot be represented by an ONNX Runtime GenAI configuration."
         )
+    if hf_model_id == "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB" and revision is None:
+        from mobius.models.nemotron_h_omni import BOLT_REVISION
+
+        revision = BOLT_REVISION
     os.makedirs(directory, exist_ok=True)
     if set(pkg) in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
         pkg, "gguf_projector_type", None
@@ -2060,12 +2124,23 @@ def write_ort_genai_config(
     if hf_model_id is not None:
         import transformers
 
-        hf_config = transformers.AutoConfig.from_pretrained(
-            hf_model_id,
-            trust_remote_code=trust_remote_code,
-            **_revision_kwargs(revision),
-        )
-        model_type = hf_config.model_type
+        if getattr(config, "model_type", None) == "nemotron_h_omni":
+            from mobius.integrations.transformers._builder import _load_transformers_config
+
+            hf_config, _ = _load_transformers_config(
+                hf_model_id, revision=revision, trust_remote_code=trust_remote_code
+            )
+            if hf_config is None:
+                raise ValueError("Cannot resolve the pinned Omni source configuration")
+        else:
+            hf_config = transformers.AutoConfig.from_pretrained(
+                hf_model_id,
+                trust_remote_code=trust_remote_code,
+                **_revision_kwargs(revision),
+            )
+        model_type = getattr(hf_config, "model_type", None)
+        if not isinstance(model_type, str):
+            raise ValueError("Source configuration requires a string model_type")
         cfg_model_type = getattr(config, "model_type", None)
         # See _select_ort_model_type: decoder-only packages prefer the package's
         # own config.model_type; multimodal packages keep the HF parent type.
@@ -2117,7 +2192,9 @@ def write_ort_genai_config(
 
     generation_config_source = hf_model_id or local_config_dir
     if generation_config_source and (
-        generation_config := _load_generation_config(generation_config_source)
+        generation_config := _load_generation_config(
+            generation_config_source, **_revision_kwargs(revision)
+        )
     ):
         generation_bos_token_id = getattr(generation_config, "bos_token_id", None)
         generation_eos_token_id = getattr(generation_config, "eos_token_id", None)

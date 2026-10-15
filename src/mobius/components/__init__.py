@@ -62,7 +62,11 @@ __all__ = [
     "GQAContext",
     "HunyuanVLClipSidecar",
     "INT64_MAX",
+    "realize_parameters",
     "InputMixer",
+    "FlatInputMixer",
+    "GGMLQ8Linear",
+    "GGMLIQ2XXSLinear",
     "Idefics3Projector",
     "InternVLProjector",
     "LayerNorm",
@@ -97,6 +101,7 @@ __all__ = [
     "MobileLDPProjector",
     "MobileLDPV2Projector",
     "MuseGlimmerVisionModel",
+    "NVFP4A16Linear",
     "NVFP4QuantizedLinear",
     "Cosmos3EdgeMultiModalProjector",
     "MobileNetV5Encoder",
@@ -218,6 +223,7 @@ from mobius.components._common import (
     create_padding_mask,
     create_sliding_window_mask,
     create_static_cache_attention_bias,
+    realize_parameters,
 )
 from mobius.components._conv import (
     BatchNorm1d,
@@ -313,9 +319,7 @@ from mobius.components._multimodal import (
     Cosmos3EdgeMultiModalProjector as Cosmos3EdgeMultiModalProjector,
 )
 from mobius.components._multimodal import (
-    Gemma3MultiModalProjector as Gemma3MultiModalProjector,
-)
-from mobius.components._multimodal import (
+    FlatInputMixer,
     GGUFMLPProjector,
     GLMEdgeAdapterProjector,
     InputMixer,
@@ -324,6 +328,9 @@ from mobius.components._multimodal import (
     MLPMultiModalProjector,
     MobileLDPProjector,
     MobileLDPV2Projector,
+)
+from mobius.components._multimodal import (
+    Gemma3MultiModalProjector as Gemma3MultiModalProjector,
 )
 from mobius.components._muse_glimmer_vision import MuseGlimmerVisionModel
 from mobius.components._ocr_encoders import (
@@ -386,6 +393,9 @@ from mobius.components._qformer import (
 from mobius.components._quantized_linear import (
     BlockQuantizedLinear,
     ClippableQuantizedLinear,
+    GGMLIQ2XXSLinear,
+    GGMLQ8Linear,
+    NVFP4A16Linear,
     NVFP4QuantizedLinear,
     QuantizedEmbedding,
     QuantizedLinear,
