@@ -295,8 +295,9 @@ class _Mamba2DepthwiseConv1d(nn.Module):
             present_state: (B, D, K-1) — updated carry state.
         """
         output, present = self._convolve(op, input_val, conv_state)
-        output.dtype = input_val.dtype
-        present.dtype = input_val.dtype
+        if input_val.dtype is not None:
+            output.dtype = input_val.dtype
+            present.dtype = input_val.dtype
         return output, present
 
     def _convolve(
