@@ -103,9 +103,11 @@ token/route pairs for each expert; an If skips empty experts. The nonempty branc
 scalar-gathers the expert's contiguous `[2I,H]` gate/up and `[H,I]` down matrices
 from lexically captured parent banks, applies SwiGLU, multiplies by route weights,
 and replaces the affected accumulator rows with their old values plus the
-contribution. Expert arithmetic and accumulation stay in model dtype; optional
-routed scaling is applied after accumulation. The shared sigmoid-gated expert
-is unchanged.
+contribution. SiLU evaluates `gate / (1 + exp(-gate))` in FP32 and casts its
+result back before multiplying by `up`, preserving HF's activation rounding
+without prematurely materializing a low-precision sigmoid. Expert projections,
+the up product, and accumulation stay in model dtype; optional routed scaling
+is applied after accumulation. The shared sigmoid-gated expert is unchanged.
 
 The compute graph is independent of expert count: E=2 and E=512 tiny fixtures
 have the same recursive node count and exactly two MatMuls in the expert body.
@@ -136,6 +138,13 @@ expert fixture; its BF16 expert fixture stops at the missing `Expand(13)`
 kernel. Schema validity is not proof of kernel support for every dtype,
 efficient sparse execution, or full-checkpoint generation parity. No full
 checkpoint generation or performance benchmark is claimed.
+
+An independent `torch.nn.functional.silu` boundary fixture checks CPU FP32 and
+CUDA FP32/FP16/BF16 with graph optimization both disabled and enabled. It covers
+negative tails amplified by large up values, ordinary values, and large finite
+inputs through the actual Scan/If dispatch, and profiles CUDA expert MatMuls.
+CPU FP16 numerical parity is not an acceptance target; its routing smoke test
+does not establish HF SiLU parity.
 
 This change does not enable video, MTP execution, GGUF payload loading, GenAI
 engine integration, or a paged-cache ABI.

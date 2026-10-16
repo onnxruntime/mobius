@@ -15,6 +15,7 @@ import ml_dtypes
 import numpy as np
 import onnx
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 import safetensors.torch
 import torch
@@ -29,7 +30,11 @@ from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._optimizations import optimize_model, validate_standard_onnx
 from mobius._registry import registry
 from mobius._testing import create_test_builder, create_test_input
-from mobius._testing.ort_inference import OnnxModelSession
+from mobius._testing.ort_inference import (
+    OnnxModelSession,
+    _numpy_to_ort_value,
+    _ort_value_to_numpy,
+)
 from mobius.integrations._block_quant import BlockQuantScheme
 from mobius.integrations._weight_loading import (
     apply_weights,
@@ -1087,7 +1092,13 @@ def test_standard_moe_sparse_structure(experts, dtype):
     assert route_cast.attributes["to"].value == dtype
     assert route_cast.inputs[0].dtype == ir.DataType.FLOAT
     assert route_cast.inputs[0].producer().op_type == "Div"
-    assert not any(n.op_type in {"Cast", "CastLike"} for n in active)
+    activation_casts = [n for n in active if n.op_type == "Cast"]
+    assert len(activation_casts) == 2
+    assert activation_casts[0].attributes["to"].value == ir.DataType.FLOAT
+    assert activation_casts[0].inputs[0].producer().op_type == "Split"
+    assert activation_casts[1].attributes["to"].value == dtype
+    assert activation_casts[1].inputs[0].producer().op_type == "Div"
+    assert activation_casts[1].outputs[0].uses()[0].node.op_type == "Mul"
     assert (
         topk.inputs[1].const_value is not None
         or topk.inputs[1].producer().op_type == "Constant"
@@ -1270,7 +1281,7 @@ def test_standard_moe_low_precision_execution_and_routing(dtype, normalize, devi
     gate_up = torch.full((16, 16), 0.1, dtype=torch_dtype) * 2
     down = torch.full((16, 8), 0.1, dtype=torch_dtype) * 2
     gate, up = (x @ gate_up.T).chunk(2, dim=-1)
-    expected = ((gate * torch.sigmoid(gate) * up) @ down.T) * torch.tensor(
+    expected = ((torch.nn.functional.silu(gate) * up) @ down.T) * torch.tensor(
         1.0 if normalize else 0.50002, dtype=torch_dtype
     )
     try:
@@ -1299,6 +1310,94 @@ def test_standard_moe_low_precision_execution_and_routing(dtype, normalize, devi
         rtol=2e-3,
         atol=1e-5,
     )
+
+
+@pytest.mark.parametrize(
+    "device,dtype,np_dtype,torch_dtype",
+    [
+        ("cpu", ir.DataType.FLOAT, np.float32, torch.float32),
+        ("cuda", ir.DataType.FLOAT, np.float32, torch.float32),
+        ("cuda", ir.DataType.FLOAT16, np.float16, torch.float16),
+        ("cuda", ir.DataType.BFLOAT16, ml_dtypes.bfloat16, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("optimize", [False, True])
+def test_standard_moe_silu_boundary(
+    tmp_path: Path, device, dtype, np_dtype, torch_dtype, optimize
+):
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA PyTorch and ORT are required")
+    config = _config(dtype=dtype, moe_intermediate_size=16, num_experts_per_tok=1)
+    model = _standard_experts(config, [1, 1, 16])
+    # Cover Exp saturation, negative tails, and ordinary BF16 activation rounding.
+    gates = np.array(
+        [-1000, -100, -90, -20, -18, -17, -16, -6, -1, -0.0, 0, 1, 6, 18, 100, 1000],
+        dtype=np_dtype,
+    )
+    ups = np.ones(16, dtype=np_dtype)
+    ups[3:7] = 65504  # Amplify lost tails while keeping the output finite.
+    gate_up = np.zeros((2, 32, 16), dtype=np_dtype)
+    gate_up[0, :16, 0] = gates
+    gate_up[0, 16:, 0] = ups
+    down = np.zeros((2, 16, 16), dtype=np_dtype)
+    down[0] = np.eye(16, dtype=np_dtype)
+    model.graph.initializers["gate_up_proj"].const_value = ir.tensor(gate_up)
+    model.graph.initializers["down_proj"].const_value = ir.tensor(down)
+    hidden = np.zeros((1, 1, 16), dtype=np_dtype)
+    hidden[0, 0, 0] = 1
+    # Expert 0 exercises SiLU tails; expert 1 exercises the empty If branch.
+    probabilities = np.array([[[1.0, 0.0]]], dtype=np.float32)
+    validate_standard_onnx(model)
+
+    x = torch.tensor(hidden.astype(np.float32), dtype=torch_dtype, device=device)
+    w = torch.tensor(gate_up[0].astype(np.float32), dtype=torch_dtype, device=device)
+    d = torch.tensor(down[0].astype(np.float32), dtype=torch_dtype, device=device)
+    gate, up = (x.reshape(1, 16) @ w.T).chunk(2, dim=-1)
+    expected = ((torch.nn.functional.silu(gate) * up) @ d.T).reshape(1, 1, 16)
+
+    path = tmp_path / "moe.onnx"
+    ir.save(model, path)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    options.graph_optimization_level = (
+        ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if optimize
+        else ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    )
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "moe-profile")
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if device == "cuda"
+        else ["CPUExecutionProvider"]
+    )
+    session = ort.InferenceSession(str(path), options, providers=providers)
+    try:
+        outputs = session.run_with_ort_values(
+            ["output"],
+            {
+                "hidden": _numpy_to_ort_value(hidden),
+                "probabilities": _numpy_to_ort_value(probabilities),
+            },
+        )
+        actual = _ort_value_to_numpy(outputs[0])
+    finally:
+        profile = json.loads(Path(session.end_profiling()).read_text())
+    assert actual.dtype == np.dtype(np_dtype)
+    np.testing.assert_allclose(
+        actual.astype(np.float32), expected.float().cpu().numpy(), rtol=2e-3, atol=1e-5
+    )
+    if device == "cuda":
+        matmuls = [
+            event["args"]
+            for event in profile
+            if event.get("args", {}).get("op_name") in {"MatMul", "FusedMatMul", "Gemm"}
+        ]
+        assert len(matmuls) >= 2
+        assert all(event["provider"] == "CUDAExecutionProvider" for event in matmuls)
 
 
 def test_standard_moe_node_count_independent_of_expert_count():

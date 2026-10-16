@@ -1145,7 +1145,14 @@ class Qwen4ExpExperts(nn.Module):
             axis=-1,
             _outputs=2,
         )
-        activated = aop.Mul(aop.Mul(gate, aop.Sigmoid(gate)), up)
+        # Match Torch SiLU's FP32 opmath, rounding before the model-dtype up product.
+        # A separate low-precision Sigmoid loses tails before gate multiplication.
+        gate_f32 = aop.Cast(gate, to=ir.DataType.FLOAT)
+        silu_f32 = aop.Div(
+            gate_f32,
+            aop.Add(aop.Constant(value_float=1.0), aop.Exp(aop.Neg(gate_f32))),
+        )
+        activated = aop.Mul(aop.Cast(silu_f32, to=self._dtype), up)
         contribution = aop.Mul(
             aop.MatMul(activated, aop.Transpose(down, perm=[1, 0])), route_weights
         )
