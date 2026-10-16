@@ -52,7 +52,7 @@ pkg = build_from_module(
 |---|---|---|
 | **default** | `"default"` (built-in default) | Portable ONNX. All custom ops with function bodies are kept as-is — function bodies are the executable fallback. No vendor-specific fusions. |
 | **CPU** | `"cpu"` | ORT CPU EP. GQA fusion for FP32. INT4 accuracy level 4. |
-| **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16. SkipLayerNorm fusion. |
+| **CUDA** | `"cuda"` | ORT CUDA EP. GQA fusion for FP16/BF16 and SkipLayerNorm fusion. Experimental INT4 QKV projection packing is disabled by default. |
 | **DirectML** | `"dml"` | DirectML (Windows GPU). GQA for FP16. RoPE and packed QKV lowered to separate ops. |
 | **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated. INT4 accuracy level 4. |
 | **MLX** | `"mlx"` | Apple-silicon MLX plugin EP. GQA for FP32/FP16/BF16 with unpacked Q/K/V and shared KV buffers. |
@@ -91,6 +91,71 @@ ops to fused equivalents:
 
 These are applied during **Stage 2: Fusion** of the optimization pipeline.
 
+Explicitly enabling `matmul_nbits_qkv_pack_dtypes` applies `PackMatMulNBitsQKV`
+at the start of this stage, before attention fusion or lowering. **Every
+built-in EP, including CUDA, leaves this capability empty by default.**
+For decoder and masked-decoder graphs, three
+compatible FP16/INT4 `MatMulNBits` projections feeding standard `Attention`
+or `com.microsoft::GroupQueryAttention` become one `MatMulNBits` followed
+by a `Split` restoring the separate Q, K, and V values. Bias, Q/K RMS
+normalization (including per-head reshape pairs), rotary embeddings, masks,
+cache outputs, and other projection consumers stay unchanged. This does not
+require GQA fusion and does not pack the attention operator's inputs.
+
+The projections must share the same rank-3 FP16 activation and matching
+attributes (except output width), with `accuracy_level` omitted or zero.
+Weights must have canonical UINT8 blocked INT4 layout, scales must be FP16,
+and zero-points must be absent on all three projections or canonical packed
+UINT8 on all three. A power-of-two block size of at least 16 is required.
+Other bit-widths, dtypes, layouts, extra inputs, function overrides, and
+incompatible triples are left unchanged; a mixed 4/4/8 triple is **not**
+partially packed. Standard opset >= 13 is required for the two-input `Split`;
+the pass leaves older opsets unchanged.
+
+Packing concatenates existing parameter storage without precision promotion
+or requantization. Original checkpoint parameter names remain available until
+weights are applied; the resulting parameter Concats fold after loading unless
+`apply_weights(..., fold_constants=False)` is used. No speed improvement is
+claimed without workload-specific measurement.
+
+**Experimental — larger-model numerical validation is pending.** Byte-exact
+parameter packing does not imply bit-identical FP16 outputs: the larger output
+width can change CUDA GEMM behavior. Representative large-dimension prefill and
+cached-decode logits exceeded the current `rtol=atol=1e-2` parity criterion.
+Bounded real-checkpoint MMLU and generation comparisons do not resolve this
+pointwise parity criterion. Default CUDA builds retain separate quantized
+Q/K/V projections until the numerical acceptance contract and representative
+CUDA regression coverage are agreed.
+
+For experimental evaluation, opt in explicitly through the existing capability
+API before building or optimizing a model:
+
+```python
+import dataclasses
+
+import onnx_ir as ir
+from mobius import get_ep, register_ep
+
+register_ep(
+    dataclasses.replace(
+        get_ep("cuda"),
+        matmul_nbits_qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
+    ),
+    overwrite=True,
+)
+```
+
+This changes the process-local CUDA profile for subsequent builds. It does not
+alter the existing float `PackQKV` capability or promote quantization precision.
+The stock CLI `--ep cuda` does not opt in to INT4 projection packing.
+
+When using `ORT_FPA_INTB_GEMM=1`, keep the default weight folding or enable ORT
+constant folding. With both exporter folding and runtime graph optimizations
+disabled, deferred parameter Concats can prevent the prepacking required by
+that opt-in CUDA path. The tested unfolded graph runs with ORT BASIC or ALL
+optimization, which folds those Concats; this does not establish support for
+every runtime version or configuration.
+
 ### Tier 3 — EP-specific constraints (required, correctness)
 
 Some EPs cannot execute certain ops. These are handled by **lowering rules**
@@ -112,20 +177,28 @@ Every EP is fully described by a single `EpCapabilities` entry in the
 `EpRegistry`. To add a new EP, you add one entry to `_register_builtins()` in
 `src/mobius/_execution_providers.py` — no other code changes.
 
+The following is an abridged field sketch, not a positional constructor
+signature; use keyword arguments when configuring capabilities. The new
+projection-packing field is appended after **all** existing fields and defaults
+to an empty set, preserving existing positional arguments.
+
 ```python
 @dataclasses.dataclass(frozen=True)
 class EpCapabilities:
     name: str
-    gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
-    qkv_pack_dtypes: frozenset[ir.DataType]          # dtypes where PackQKV fusion fires
+    gqa_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
+    qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
     supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
     supports_skip_layer_norm: bool = True            # False → InlinePass expansion
-    supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
     supports_fused_moe: bool = True                  # False → decompose fused MoE ops
     supports_packed_multi_head_attention: bool = False  # True → PackedMultiHeadAttention kernel
     default_int4_accuracy_level: int = 0             # 0 = highest accuracy; 4 = fastest
-    provider_options: dict[str, str]                 # Default ORT GenAI provider options
+    provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False               # GPU graph capture default
+    # Other existing capability fields omitted.
+    matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
+        default_factory=frozenset
+    )  # projection-only INT4 packing; independent of float PackQKV's GQA input ABI
 ```
 
 ### Current registry
@@ -178,7 +251,7 @@ Stage 1:  Cleanup      EP-agnostic. Always applied.
             constant folding, symbolic shape inference, metadata cleanup.
 
 Stage 2:  Fusion       EP-gated. Promotes standard ops to EP-specific fused ops.
-          ↓ GQAFusion, SkipNorm, SkipLayerNorm, GeluFusion
+          ↓ PackMatMulNBitsQKV, GQAFusion, SkipNorm, SkipLayerNorm, GeluFusion
             (each only fires if the EP's capabilities support it)
 
 Stage 2b: InlinePass   EP-gated. Expands custom ops the EP cannot execute

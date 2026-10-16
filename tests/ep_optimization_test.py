@@ -10,6 +10,7 @@ decoder-only fusions from applying to vision or embedding models.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import sys
@@ -20,13 +21,218 @@ import pytest
 from _test_configs import _base_config
 
 from mobius._builder import build_from_module
-from mobius._optimizations import _count_ops, optimize_model
+from mobius._configs import QuantizationConfig, QuantizationOverride
+from mobius._execution_providers import EpCapabilities, ep_registry
+from mobius._optimizations import _count_ops, _get_optimization_passes, optimize_model
 from mobius._pipeline_contract import declare_arbitrary_attention_mask
 from mobius._registry import registry
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.parametrize(
+    "group_size,overrides",
+    [
+        (32, {}),
+        (
+            128,
+            {
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "intermediate_size": 11008,
+                "num_hidden_layers": 1,
+                "vocab_size": 256,
+            },
+        ),
+    ],
+    ids=["tiny", "k4096-block128"],
+)
+def test_cuda_int4_decoder_keeps_projections_by_default(norm, trace, group_size, overrides):
+    assert ep_registry.require("cuda").matmul_nbits_qkv_pack_dtypes == frozenset()
+    config = _base_config(
+        dtype=ir.DataType.FLOAT16,
+        attn_qk_norm=norm,
+        model_type="qwen3" if norm else "llama",
+        quantization=QuantizationConfig(
+            bits=4, group_size=group_size, quant_method="olive", sym=True
+        ),
+        **overrides,
+    )
+    module = registry.get("qwen3" if norm else "llama")(config)
+    package = build_from_module(
+        module, config, execution_provider="cuda", trace_optimization=trace
+    )
+    model = package["model"]
+    names = set(model.graph.initializers)
+    assert _count_ops(model, "GroupQueryAttention") == config.num_hidden_layers
+    assert _count_ops(model, "Split") == 0
+    assert _count_ops(model, "MatMulNBits") == 7 * config.num_hidden_layers
+    optimize_model(model, ep="cuda", dtype=ir.DataType.FLOAT16, trace=trace)
+    assert _count_ops(model, "Split") == 0
+    assert _count_ops(model, "MatMulNBits") == 7 * config.num_hidden_layers
+    assert set(model.graph.initializers) == names
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("trace", [False, True])
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
+def test_cuda_int4_decoder_packs_real_projections_when_enabled(norm, trace):
+    config = _base_config(
+        dtype=ir.DataType.FLOAT16,
+        attn_qk_norm=norm,
+        model_type="qwen3" if norm else "llama",
+        quantization=QuantizationConfig(bits=4, group_size=32, quant_method="olive", sym=True),
+    )
+    module = registry.get("qwen3" if norm else "llama")(config)
+    package = build_from_module(
+        module, config, execution_provider="cuda", trace_optimization=trace
+    )
+    model = package["model"]
+    assert _count_ops(model, "Split") == config.num_hidden_layers
+    assert _count_ops(model, "MatMulNBits") == 5 * config.num_hidden_layers
+    if norm:
+        assert _count_ops(model, "RMSNormalization") >= 2 * config.num_hidden_layers
+    packed = [
+        node
+        for node in model.graph
+        if node.op_type == "MatMulNBits"
+        and node.outputs[0].uses()
+        and any(use.node.op_type == "Split" for use in node.outputs[0].uses())
+    ]
+    assert len(packed) == config.num_hidden_layers
+    assert all(node.attributes.get_int("accuracy_level", 0) == 0 for node in packed)
+    names = set(model.graph.initializers)
+    assert any("q_proj.weight" in name for name in names)
+    optimize_model(model, ep="cuda", dtype=ir.DataType.FLOAT16, trace=trace)
+    assert _count_ops(model, "Split") == config.num_hidden_layers
+    assert set(model.graph.initializers) == names
+
+
+@pytest.mark.parametrize(
+    "role", ["decoder", "masked-decoder", "encoder", "vision", "embedding"]
+)
+@pytest.mark.parametrize("ep", ["cuda", "cpu", "default", "dml", "qnn", "webgpu", "trt-rtx"])
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT16, ir.DataType.FLOAT, ir.DataType.BFLOAT16]
+)
+def test_matmul_nbits_packing_has_independent_capability_gate(role, ep, dtype):
+    caps = ep_registry.require(ep)
+    assert caps.matmul_nbits_qkv_pack_dtypes == frozenset()
+    fuse, _ = _get_optimization_passes(caps, dtype, role)
+    assert all(name != "PackMatMulNBitsQKV" for name, _ in fuse)
+    opted_in = dataclasses.replace(
+        caps, matmul_nbits_qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16})
+    )
+    fuse, _ = _get_optimization_passes(opted_in, dtype, role)
+    enabled = any(name == "PackMatMulNBitsQKV" for name, _ in fuse)
+    assert enabled == (
+        caps.supports_matmul_nbits
+        and dtype == ir.DataType.FLOAT16
+        and role in ("decoder", "masked-decoder")
+    )
+    disabled = dataclasses.replace(opted_in, supports_matmul_nbits=False)
+    fuse, _ = _get_optimization_passes(disabled, dtype, role)
+    assert all(name != "PackMatMulNBitsQKV" for name, _ in fuse)
+
+
+def test_quantized_qkv_capability_preserves_legacy_positional_arguments():
+    caps = EpCapabilities("legacy", frozenset(), frozenset(), False)
+    assert not caps.supports_fused_rope
+    assert caps.matmul_nbits_qkv_pack_dtypes == frozenset()
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
+def test_arbitrary_mask_keeps_attention_and_packs_only_int4_projections(norm):
+    config = _base_config(
+        dtype=ir.DataType.FLOAT16,
+        attn_qk_norm=norm,
+        quantization=QuantizationConfig(bits=4, group_size=32, quant_method="olive", sym=True),
+    )
+    module = registry.get("llama")(config)
+    package = build_from_module(module, config)
+    model = package["model"]
+    declare_arbitrary_attention_mask(model.graph)
+    attentions = [node for node in model.graph if node.op_type == "Attention"]
+    masks = [node.inputs[3] for node in attentions]
+    optimize_model(model, ep="cuda", dtype=ir.DataType.FLOAT16)
+    assert _count_ops(model, "GroupQueryAttention") == 0
+    assert _count_ops(model, "Split") == config.num_hidden_layers
+    assert [node.inputs[3] for node in attentions] == masks
+
+
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
+def test_real_mixed_int4_int8_decoder_does_not_partially_pack():
+    config = _base_config(
+        dtype=ir.DataType.FLOAT16,
+        attn_qk_norm=True,
+        quantization=QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="olive",
+            sym=True,
+            overrides={
+                "model.layers.0.self_attn.v_proj": QuantizationOverride(bits=8),
+                "model.layers.1.self_attn.v_proj": QuantizationOverride(bits=8),
+            },
+        ),
+    )
+    package = build_from_module(
+        registry.get("qwen3")(config), config, execution_provider="cuda"
+    )
+    model = package["model"]
+    assert _count_ops(model, "Split") == 0
+    assert _count_ops(model, "MatMulNBits") == 7 * config.num_hidden_layers
+
+
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
+def test_quantized_qkv_trace_and_nontrace_topologies_agree():
+    config = _base_config(
+        dtype=ir.DataType.FLOAT16,
+        attn_qk_norm=True,
+        quantization=QuantizationConfig(bits=4, group_size=32, quant_method="olive", sym=True),
+    )
+    models = [
+        build_from_module(
+            registry.get("qwen3")(config),
+            config,
+            execution_provider="cuda",
+            trace_optimization=trace,
+        )["model"]
+        for trace in (False, True)
+    ]
+    topology = [
+        [
+            (
+                node.domain,
+                node.op_type,
+                [str(value.shape) if value is not None else None for value in node.inputs],
+            )
+            for node in model.graph
+        ]
+        for model in models
+    ]
+    assert topology[0] == topology[1]
+
+
+@pytest.mark.usefixtures("experimental_cuda_qkv_packing")
+def test_cuda_int4_decoder_packs_full_width_qk_normalization():
+    config = _base_config(
+        dtype=ir.DataType.FLOAT16,
+        attn_qk_norm=True,
+        attn_qk_norm_full=True,
+        quantization=QuantizationConfig(bits=4, group_size=32, quant_method="olive", sym=True),
+    )
+    package = build_from_module(
+        registry.get("qwen3")(config), config, execution_provider="cuda"
+    )
+    assert _count_ops(package["model"], "Split") == config.num_hidden_layers
 
 
 def _make_llama_pkg(ep: str, dtype: ir.DataType = ir.DataType.FLOAT):
