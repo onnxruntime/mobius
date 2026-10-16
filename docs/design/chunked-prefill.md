@@ -1,7 +1,7 @@
-# Standalone chunked prefill candidate
+# Explicit source-chunk prefill numerical candidate
 
 `mobius.components.ChunkedPrefillScan` is a parameter-free `nn.Module`.
-It is **not selected by any model, task, registry, or default export**.
+It is **not selected by any default model, task, registry, or export**.
 It implements explicit prefill, including one-token prefill, not cached decode.
 
 ```python
@@ -92,37 +92,144 @@ python -m pytest src/mobius/components/_chunked_prefill_test.py -q
 The CUDA qualification worker explicitly reserves physical GPU 0. When no
 fixture root is configured, only these opt-in evidence tests are skipped.
 
-## Proposed next-phase adapter (not implemented)
+## Manual-only block/model/task adapter
 
-An opt-in `Float32AccumulationMamba2Block` subclass can preserve all
-projection/conv/norm modules and their parameter names, replacing only its
-prefill SSM evaluation:
+`ChunkedPrefillMamba2Block(Float32SiLUMamba2Block)` replaces the SSM hook,
+not the projection, ConvSiLU, gate/norm, or output-projection modules. Its public
+arguments append `has_previous_state` after the existing optional padding mask.
+It requires native BF16 activations and FP32 SSM state at graph construction;
+dtype is not frozen at module construction. All learned parameter paths,
+including native packed projection paths, are preserved.
 
-1. In `components/_mamba_block.py`, expose an SSM evaluation hook after
-   the existing post-convolution x/B/C split. Proposed inputs are
-   `(op, x_hidden, b_mat, c_mat, dt_raw, ssm_state, has_previous_state)`.
-   Leave existing cached dt preparation/recurrence unchanged; the opt-in
-   prefill branch prepares threshold-20/clamped FP32 dt explicitly.
-   Reshape x/B/C for this component. Reshape FP32 readout back to B,T,d_inner
-   before calling the existing `_add_ssm_skip`.
-2. For source-model prefill, omit `initial_state`: source prefill ignores
-   dirty prior SSM/conv caches. Adapt state orientation explicitly:
-   this component uses head_dim,state_dim; the existing native cache uses
-   state_dim,head_dim. Preserve the independently qualified conv adaptation.
-3. Add explicit phase/cache-validity metadata to the task/block interface,
-   derived from the actual source `cache.has_previous_state` lifecycle.
-   Never infer it from T==1 or a position offset. Propagate it through the
-   model's decoder-layer interface, not an exporter-only heuristic.
-   Concretely, `tasks/_causal_lm.py::HybridCausalLMTask.build` currently
-   provides input IDs/mask/positions and mixed caches, but no phase input.
-   Its opt-in successor should pass a scalar BOOL `has_previous_state`
-   through the model and recurrent decoder layers. Keep
-   `tasks/_cache_utils.py::_make_hybrid_cache_inputs`'s FP32 SSM ABI
-   and sparse mixed-cache slot names intact. A model-specific caller must
-   supply real lifecycle metadata; no task-level substitute is equivalent.
-4. Keep the current FP32 cached recurrence unchanged and reject source
-   cached S>1 until separately qualified.
-5. Replay the checkpoint-backed mask/cache transitions and unchanged frozen
-   full-logit/state/hidden/token gates before any integration or shipping.
+The explicit unregistered model/task pairs are:
 
-No part of this adapter, phase selector, or export wiring is included here.
+| Model | Task | Decoder |
+| --- | --- | --- |
+| `NemotronHPuzzleSourceChunkCausalLMModel` | `SourceChunkHybridCausalLMTask` | `model`, token IDs |
+| `NemotronHOmniSourceChunkModel` | `SourceChunkNemotronHOmniTask` | `decoder`, embeddings |
+
+For example, using an already obtained Omni config:
+
+```python
+import onnx_ir as ir
+from mobius import build_from_module
+from mobius.models import NemotronHOmniSourceChunkModel
+from mobius.tasks import SourceChunkNemotronHOmniTask
+
+config.dtype = ir.DataType.BFLOAT16
+module = NemotronHOmniSourceChunkModel(config)
+package = build_from_module(
+    module, config, task=SourceChunkNemotronHOmniTask(), execution_provider="cuda"
+)
+```
+
+This constructs unweighted IR; it does not authorize a full weighted package.
+Omni's embedding and vision graphs remain unchanged. There is no registry entry,
+CLI flag, default model/task replacement, or new attention implementation.
+
+### Caller-owned phase ABI
+
+The task creates the actual decoder graph input **`has_previous_state: BOOL []`**.
+Graph introspection emits `decoder.inputs.has_previous_state` only when that
+valid scalar input exists. A similarly named config property is not evidence
+that a graph needs the input. Wrong dtype/rank/unknown shape is rejected.
+Existing graphs and metadata without the actual input retain their old ABI.
+GenAI use additionally requires the separately reviewed runtime implementation
+of this optional mapping; released runtime support is not asserted here.
+
+* `False`: prefill, even S1 or offset100. Ignore dirty convolution/SSM history,
+  prepare FP32 threshold-20/clamped dt, and run the chunk scan with **no initial
+  state**. The native cache orientation remains **B,H,state_dim,head_dim**.
+* `True`: consume the FP32 cached state, even offset0. Keep the existing FP32
+  Softplus/LinearAttention cached path, with **no prefill clamp**. An executed
+  cached S>1 branch fails its explicit reshape guard rather than inventing
+  unsupported source semantics.
+
+Neither token count, position IDs, offset, mask values, nor nonzero cache
+contents select phase. FP32 D*x is added before the sole BF16 output store,
+followed by the existing grouped norm/gating order. Convolution keeps the
+native K3 cache ABI.
+
+The source's **mask offset is separate from phase**. The ordinary task uses a
+2D binary total mask: total length minus query length is its physical cache
+position. The direct model interface also appends an explicit INT64
+`cache_position` vector for independent controls; its first element disables
+Mamba mask updates when positive. Only normalized hidden before projection
+and x after ConvSiLU are masked. B/C/dt are not zeroed and real masked tokens
+do not reset state. 3D/4D masks are rejected, not silently ignored. These
+Mamba checks do **not** qualify masked attention/whole-decoder parity:
+attention remains the existing route, including its independent limitations.
+
+`mobius._testing.source_chunk.ExplicitCachePhaseCaller` is a fresh experimental
+validation wrapper, not a change to shared/frozen callers. It owns a stable
+NumPy BOOL scalar: false initially, true only after the synchronous decoder
+callback succeeds. The callback owns atomic cache-output commitment; phase
+does not advance on failure, and any managed failure permanently poisons the
+caller: no retry/reset. Instantiate a new caller for every fresh
+generation. Scheduler/Engine, prompt chunking, rewind, CUDA Graph capture,
+contradictory supplied phases, nonbinary masks, and cached S>1 are rejected.
+
+The fresh qualification evidence also contains runnable
+`bolt_source_chunk_native_run.py` and `bolt_source_chunk_export.py` entrypoints,
+not replacements for the frozen helpers. The ordinary caller validates the
+actual session's canonical BOOL[] input and complete 96-cache/97-output ABI,
+executes the frozen lossless BOOL/BF16 transport, preserves every output and
+hash, handles finite logits and all caches, and only then commits phase.
+It retains the original eight-step/776-decoder-output, embedding, prompt
+provenance, runtime-library, profile, provider and EOS reporting behavior.
+Wrong graphs fail explicitly; no monkeypatch or hidden input fallback is used.
+The ordinary entrypoint pins the sealed qualification contract and exact
+`MAMBA_ONLY`/native-attention variant. At each real execution boundary it
+captures actual embedding input IDs, mask shape/dtype/raw SHA, embedding raw
+SHA, and all 96 actual zero/empty/carried cache SHAs. Its separate
+`phase-execution.json` follows the sealed template, records success-only phase
+transitions, and binds the final ordinary-receipt SHA without a circular hash.
+Failure/early-EOS records remain explicitly incomplete; unexecuted template
+entries are never presented as actual feeds. Candidate declarations remain
+templates until a reviewed actual export/permitted run supplies genuine
+graph, export, inventory, external-reference and runtime identities.
+The export entrypoint defaults to printing a plan without graph/weight/package
+creation. Package writing additionally requires exact independently reviewed
+HEAD/resource-plan hashes and the separately reviewed bounded streaming-save
+API, with one worker and explicit 1-GiB shards. Neither a full export nor
+ordinary full-model run has been performed as part of this adapter task.
+
+### Adapter validation and important numerical limits
+
+Tests cover tiny text/three-component Omni graphs, unchanged ordinary graphs,
+parameter paths including packed projections, deferred dtype, positional API,
+graph-derived metadata, caller success/failure, full tiny-block dirty caches,
+opposite phase/offset controls, and all **70 checkpoint mask/cache pairs**.
+Those checkpoint tests exercise the saved head-zero **post-convolution SSM,
+readout/D and cache-transition boundaries**, not unsaved whole-block outputs.
+Cached results are also bitwise compared against the existing FP32 cached path.
+
+The new H128 production and finite-clamp zero-initial-state controls verify
+**bitwise integration with the accepted standalone primitive on identical
+prepared operands**, exact source CB/padded-cumsum boundaries, FP32 final
+state, and D-before-native-store. They also retain raw and input-conditioned
+Triton comparisons as explicitly labelled diagnostics. They do not weaken the
+sealed standalone `1e-5` gate or turn failed source comparisons into passes.
+
+There are additional qualification limits: native/source FP32 dt preparation
+can differ by about `1.2e-7`, arbitrary synthetic negative A is not recovered
+bitwise through `log(-A)` followed by Exp, and Pow versus source approximate
+exp2 can change BF16 readout operands. With zero incoming state, cancellation
+exposes errors hidden by larger nonzero carry: these additional raw-source
+readout controls exceed `1e-5` (about `4.74e-5` and `3.32e-5` NRMSE).
+Even matched-preparation finite-clamp readout can exceed that gate. Final
+BF16 differences can be magnified near zero by D/readout cancellation and
+source FMA. **This candidate is not an all-state bitwise or full-model pass.**
+The added matched-preparation zero-initial finite-clamp final-state diagnostic
+also exceeds `1e-5` (about `1.88e-5` NRMSE); it remains labelled a failure,
+not a qualification pass. These are additional diagnostic controls, not
+replacements for the sealed primitive fixtures.
+DOUBLE temporaries remain limited to the standalone association/FMA expression;
+stored, incoming, and feedback states remain FP32.
+
+Adapter CUDA tests additionally require `MOBIUS_CHUNK_ADAPTER_EVIDENCE` pointing
+to fresh evidence with the original-source zero-initial/prepared-input diagnostic
+fixtures. Source generation commands/scripts and hashes belong in that evidence,
+not in sealed reference directories. Do not reuse the standalone receipt path.
+No full package, generation, performance, memory-budget, or shipping-readiness
+claim follows from these component/task tests.

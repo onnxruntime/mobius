@@ -144,7 +144,7 @@ class NemotronHPuzzleMambaLayer(NemotronHMambaLayer):
     grouped norm retain their separately qualified FP32 accumulation boundaries.
     """
 
-    mamba_block_class = _NemotronHPuzzleMamba2Block
+    mamba_block_class: type[Mamba2Block] = _NemotronHPuzzleMamba2Block
 
     def __init__(self, config: NemotronHConfig):
         super().__init__(config)

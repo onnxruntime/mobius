@@ -497,6 +497,7 @@ class Mamba2Block(nn.Module):
         conv_state: ir.Value,
         ssm_state: ir.Value,
         padding_mask: ir.Value | None = None,
+        has_previous_state: ir.Value | None = None,
     ):
         """Forward pass for the Mamba2 block.
 
@@ -568,27 +569,62 @@ class Mamba2Block(nn.Module):
         # b_mat: (B, T, n_groups * d_state)
         # c_mat: (B, T, n_groups * d_state)
 
+        la_output, new_ssm_state, x_4d = self._ssm_readout(
+            op, x_hidden, b_mat, c_mat, dt_raw, ssm_state, has_previous_state
+        )
+        # Step 8: D skip connection — y += D * x (per-head broadcast)
+        y = self._add_ssm_skip(op, la_output, x_4d, hidden_states)
+
+        # Step 9: GatedRMSNorm
+        y_normed = (
+            self.norm(op, y, gate) if self.norm is not None else op.Mul(y, op.Swish(gate))
+        )
+
+        # Step 10: Output projection
+        output = self.out_proj(op, y_normed)
+        if not math.isclose(self.output_multiplier, 1.0):
+            output = op.Mul(output, self.output_multiplier)
+
+        return output, new_conv_state, new_ssm_state
+
+    def _ssm_readout(
+        self,
+        op: OpBuilder,
+        x_hidden: ir.Value,
+        b_mat: ir.Value,
+        c_mat: ir.Value,
+        dt_raw: ir.Value,
+        ssm_state: ir.Value,
+        has_previous_state: ir.Value | None = None,
+        prepared_dt: ir.Value | None = None,
+    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+        if has_previous_state is not None:
+            raise ValueError("Explicit cache phase requires a phase-aware Mamba2 subclass")
         # Step 4: Compute dt and decay for LinearAttention.
         # Upcast to fp32 for softplus/exp to match HuggingFace which
         # computes the SSM recurrence in float32.
-        dt_raw_f32 = op.Cast(dt_raw, to=ir.DataType.FLOAT)
-        dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
-        a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
+        if prepared_dt is None:
+            dt_raw_f32 = op.Cast(dt_raw, to=ir.DataType.FLOAT)
+            dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
+            a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
 
-        # dt = softplus(dt_raw + dt_bias): (B, T, num_heads)
-        dt = op.Softplus(op.Add(dt_raw_f32, dt_bias_f32))
-        if self.time_step_min > 0.0 or self.time_step_max is not None:
-            min_value = (
-                op.Constant(value_float=self.time_step_min)
-                if self.time_step_min > 0.0
-                else None
-            )
-            max_value = (
-                op.Constant(value_float=self.time_step_max)
-                if self.time_step_max is not None
-                else None
-            )
-            dt = op.Clip(dt, min_value, max_value)
+            # dt = softplus(dt_raw + dt_bias): (B, T, num_heads)
+            dt = op.Softplus(op.Add(dt_raw_f32, dt_bias_f32))
+            if self.time_step_min > 0.0 or self.time_step_max is not None:
+                min_value = (
+                    op.Constant(value_float=self.time_step_min)
+                    if self.time_step_min > 0.0
+                    else None
+                )
+                max_value = (
+                    op.Constant(value_float=self.time_step_max)
+                    if self.time_step_max is not None
+                    else None
+                )
+                dt = op.Clip(dt, min_value, max_value)
+        else:
+            a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
+            dt = prepared_dt
 
         # decay = A * dt in log-space: g_t where exp(g_t) is the decay
         # A = -exp(A_log), so decay = -exp(A_log) * dt
@@ -638,20 +674,7 @@ class Mamba2Block(nn.Module):
         # Cache storage precision is independent of the readout epilogue.
         new_ssm_state = op.CastLike(new_ssm_state, ssm_state)
 
-        # Step 8: D skip connection — y += D * x (per-head broadcast)
-        y = self._add_ssm_skip(op, la_output, x_4d, hidden_states)
-
-        # Step 9: GatedRMSNorm
-        y_normed = (
-            self.norm(op, y, gate) if self.norm is not None else op.Mul(y, op.Swish(gate))
-        )
-
-        # Step 10: Output projection
-        output = self.out_proj(op, y_normed)
-        if not math.isclose(self.output_multiplier, 1.0):
-            output = op.Mul(output, self.output_multiplier)
-
-        return output, new_conv_state, new_ssm_state
+        return la_output, new_ssm_state, x_4d
 
     def _ssm_skip(self, op: OpBuilder, x_4d: ir.Value) -> ir.Value:
         """Compute the FP32 per-head D*x branch, shaped (B, T, d_inner)."""
