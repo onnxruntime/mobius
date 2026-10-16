@@ -72,6 +72,8 @@ __all__ = [
     "Lfm2VlTask",
     "ModelTask",
     "NemotronHOmniTask",
+    "SourceChunkHybridCausalLMTask",
+    "SourceChunkNemotronHOmniTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
     "Mistral4GGUFCausalLMTask",
@@ -205,6 +207,10 @@ from mobius.tasks._qwen_image_vae import QwenImageEditVAETask, QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
 from mobius.tasks._sensenova_u1 import SenseNovaU1Task
 from mobius.tasks._seq2seq import Seq2SeqTask
+from mobius.tasks._source_chunk import (
+    SourceChunkHybridCausalLMTask,
+    SourceChunkNemotronHOmniTask,
+)
 from mobius.tasks._speech_enhancement import SpeechEnhancementTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask

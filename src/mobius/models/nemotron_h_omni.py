@@ -222,13 +222,14 @@ class NemotronHOmniModel(nn.Module):
     config_class = NemotronHOmniConfig
     default_task = "nemotron-h-omni"
     category = "Multimodal"
+    decoder_class: type[_OmniDecoder] = _OmniDecoder
 
     def __init__(self, config: NemotronHOmniConfig):
         super().__init__()
         if config.tie_word_embeddings:
             raise NotImplementedError("Omni split tied-embedding checkpoints are unsupported")
         self.config = config
-        self.decoder = _OmniDecoder(config)
+        self.decoder = self.decoder_class(config)
         _install_native_projections(self.decoder, config)
         self.embedding = _OmniEmbedding(config)
         self.vision_encoder = _OmniVisionEncoder(config)

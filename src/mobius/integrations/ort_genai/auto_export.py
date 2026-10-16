@@ -172,6 +172,7 @@ _DECODER_SEMANTIC_INPUTS = frozenset(
         "position_ids",
         "past_sequence_length",
         "current_sequence_length",
+        "has_previous_state",
     }
 )
 _CACHE_NAME = re.compile(
@@ -350,12 +351,14 @@ def _is_single_model_decoder_package(pkg: ModelPackage) -> bool:
     return "input_ids" in input_names and "logits" in output_names
 
 
-def _inspect_hybrid_multimodal_decoder_abi(model: ir.Model) -> _DecoderAbi:
+def _inspect_hybrid_multimodal_decoder_abi(
+    model: ir.Model, *, input_name: str = "inputs_embeds"
+) -> _DecoderAbi:
     """Describe separate KV, convolution and SSM cache families without renaming."""
     inputs = _graph_input_names(model)
     outputs = {value.name for value in model.graph.outputs}
-    if "inputs_embeds" not in inputs or "logits" not in outputs:
-        raise ValueError("Hybrid multimodal decoder requires inputs_embeds and logits")
+    if input_name not in inputs or "logits" not in outputs:
+        raise ValueError(f"Hybrid decoder requires {input_name} and logits")
     past = _cache_names([value.name for value in model.graph.inputs if value.name])
     present = _cache_names([value.name for value in model.graph.outputs if value.name])
     semantics = {
@@ -387,8 +390,13 @@ def _inspect_hybrid_multimodal_decoder_abi(model: ir.Model) -> _DecoderAbi:
 
 def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
     """Validate intrinsic decoder semantics and describe the graph contract."""
+    _validate_cache_phase_input(model)
     input_names = [value.name for value in model.graph.inputs if value.name is not None]
     output_names = [value.name for value in model.graph.outputs if value.name is not None]
+    if "has_previous_state" in input_names and any(
+        name.endswith(".ssm_state") for name in input_names
+    ):
+        return _inspect_hybrid_multimodal_decoder_abi(model, input_name="input_ids")
     if "input_ids" not in input_names:
         raise ValueError("Generic ORT GenAI decoder graphs must expose an input_ids input")
     if "logits" not in output_names:
@@ -504,6 +512,15 @@ def _load_generation_config(model_id: str, *, revision: str | None = None):
         return None
 
 
+def _validate_cache_phase_input(model: ir.Model) -> None:
+    import onnx_ir as ir
+
+    for value in model.graph.inputs:
+        if value.name == "has_previous_state":
+            if value.dtype != ir.DataType.BOOL or value.shape is None or len(value.shape) != 0:
+                raise ValueError("Decoder has_previous_state must be a BOOL scalar []")
+
+
 def _graph_input_names(model: ir.Model) -> list[str]:
     """Return non-KV-cache input names from an ONNX model graph.
 
@@ -511,6 +528,7 @@ def _graph_input_names(model: ir.Model) -> list[str]:
     are represented as template patterns in genai_config.json. Semantic state
     such as ``past_position_ids`` remains explicit and graph-derived.
     """
+    _validate_cache_phase_input(model)
     return [
         inp.name
         for inp in model.graph.inputs
