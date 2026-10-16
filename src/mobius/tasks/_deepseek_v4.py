@@ -84,17 +84,19 @@ class DeepSeekV4Task(ModelTask):
 
         When ``config.native_csa`` is off every plan is ``None``, so no inputs
         are created and the returned list is all-``None`` (byte-identical to
-        the pre-CSA graph). The compressed-record axis is a shared dynamic
-        symbolic dim because a layer's attention cache and index cache advance
-        in lockstep, and every CSA layer advances its cache together.
+        the pre-CSA graph). The compressed-record axis is a *per-layer* dynamic
+        symbolic dim: within a layer the attention cache and index cache advance
+        in lockstep (same ratio), but a mixed ratio-4/ratio-128 schedule pools
+        at different rates per layer, so their record counts diverge and cannot
+        share one symbol.
         """
-        records = ir.SymbolicDim("past_compressed_records")
         past_compressed_states: list = []
         for layer in module.model.layers:
             plan = layer.self_attn.csa_plan
             if plan is None:
                 past_compressed_states.append(None)
                 continue
+            records = ir.SymbolicDim(plan.past_records_axis_name)
             past_compressed_kv = builder.input(
                 plan.past_compressed_kv_name,
                 dtype=plan.cache_dtype,
@@ -143,21 +145,22 @@ class DeepSeekV4Task(ModelTask):
         symbolic-shape-inference function (like ``pkg.nxrt::IndexShare`` in the
         GLM DSA task), so each present output is stamped with an explicit type
         or it would export untyped. The compressed-record axis is a distinct
-        dynamic symbolic dim (present record count = past + newly pooled
-        blocks, not a simple ``past + sequence`` sum); the carry tensors are
-        records-independent ``[batch, slots, planes, width]``.
+        *per-layer* dynamic symbolic dim (present record count = past + newly
+        pooled blocks, not a simple ``past + sequence`` sum, and each layer
+        pools at its own ratio); the carry tensors are records-independent
+        ``[batch, slots, planes, width]``.
 
         Ratio-4 additionally emits the packed uint8 ``present_index_key``, the
         f32 ``present_index_carry``, and the transient int32 ``selected_indices``
         top-k result ``[batch, index_num_heads, sequence, min(records, topk)]``
         (inspection-only; not threaded back as state).
         """
-        present_records = ir.SymbolicDim("present_compressed_records")
-        selected_records = ir.SymbolicDim("selected_records")
         for layer, present in zip(module.model.layers, present_compressed_states):
             plan = layer.self_attn.csa_plan
             if plan is None:
                 continue
+            present_records = ir.SymbolicDim(plan.present_records_axis_name)
+            selected_records = ir.SymbolicDim(plan.selected_records_axis_name)
             present_compressed_kv = present[0]
             present_compression_carry = present[1]
             present_compressed_kv.shape = ir.Shape([batch, present_records, plan.stored_width])
