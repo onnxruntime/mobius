@@ -13,16 +13,22 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+import numpy as np
+import onnx
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 from _test_configs import _base_config
 
 from mobius._builder import build_from_module
-from mobius._optimizations import _count_ops, optimize_model
+from mobius._optimizations import _count_ops, optimize_model, validate_standard_onnx
 from mobius._pipeline_contract import declare_arbitrary_attention_mask
 from mobius._registry import registry
+from mobius._testing import create_test_builder, create_test_input
+from mobius.components._scan_utils import create_body_graph
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -390,7 +396,425 @@ def test_unknown_ep_raises():
 # ---------------------------------------------------------------------------
 
 
-_STANDARD_ONNX_DOMAINS = frozenset({"", "ai.onnx"})
+_STANDARD_ONNX_DOMAINS = frozenset({"", "ai.onnx", "ai.onnx.ml"})
+
+
+@pytest.mark.parametrize("location", ["main", "If", "Scan", "graphs", "signature", "body"])
+@pytest.mark.parametrize(
+    "domain,operator,overload,is_standard",
+    [
+        ("test.custom", "Leak", "", False),
+        ("", "NotAnOnnxOp", "", False),
+        ("", "Identity", "custom", False),
+        ("ai.onnx.ml", "Normalizer", "", True),
+        ("ai.onnx.ml", "NotAnOnnxOp", "", False),
+        ("ai.onnx.ml", "Identity", "", False),
+        ("ai.onnx.ml", "Normalizer", "custom", False),
+    ],
+)
+def test_onnx_standard_validator_checks_recursive_identifiers(
+    location, domain, operator, overload, is_standard
+):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.opset_imports["ai.onnx.ml"] = 1
+
+    def emit(op_builder, op_type, op_domain, op_overload):
+        value = getattr(op_builder, op_type)(x, _domain=op_domain)
+        producer = value.producer()
+        assert producer is not None
+        producer.overload = op_overload
+        return value
+
+    if location == "main":
+        graph.outputs.append(emit(op, operator, domain, overload))
+    elif location in {"If", "Scan", "graphs"}:
+        body, body_builder = create_body_graph([], [])
+        body.outputs.append(emit(body_builder.op, operator, domain, overload))
+        if location == "If":
+            node = ir.Node(
+                "",
+                "If",
+                [x],
+                attributes=[
+                    ir.AttrGraph("then_branch", body),
+                    ir.AttrGraph("else_branch", body),
+                ],
+                num_outputs=1,
+            )
+        elif location == "Scan":
+            node = ir.Node(
+                "",
+                "Scan",
+                [x],
+                attributes=[ir.AttrGraph("body", body), ir.AttrInt64("num_scan_inputs", 1)],
+                num_outputs=1,
+            )
+        else:
+            node = ir.Node(
+                "",
+                "Identity",
+                [x],
+                attributes=[ir.AttrGraphs("nested", [body])],
+                num_outputs=1,
+            )
+        graph.append(node)
+        graph.outputs.append(node.outputs[0])
+    else:
+        graph.outputs.append(op.Identity(x))
+    model = ir.Model(graph, ir_version=11)
+    if location in {"signature", "body"}:
+        body, body_builder = create_body_graph([], [])
+        body.opset_imports["ai.onnx.ml"] = 1
+        body.outputs.append(
+            emit(
+                body_builder.op,
+                operator if location == "body" else "Identity",
+                domain if location == "body" else "",
+                overload if location == "body" else "",
+            )
+        )
+        function = ir.Function(
+            domain if location == "signature" else "",
+            operator if location == "signature" else "Identity",
+            overload=overload if location == "signature" else "",
+            graph=body,
+            attributes={},
+        )
+        model.functions[function.identifier()] = function
+    if is_standard:
+        validate_standard_onnx(model, component="decoder")
+        return
+    with pytest.raises(
+        ValueError,
+        match=rf"component 'decoder'.*{operator!r}.*overload={overload!r}.*decomposition",
+    ):
+        validate_standard_onnx(model, component="decoder")
+
+
+def test_onnx_standard_ml_export_roundtrip(tmp_path: Path):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 2])
+    y = op.Normalizer(x, norm="L2", _domain="ai.onnx.ml")
+    y.type, y.shape = x.type, x.shape
+    graph.outputs.append(y)
+    graph.opset_imports["ai.onnx.ml"] = 1
+    model = ir.Model(graph, ir_version=10)
+    optimize_model(model, ep="onnx-standard")
+    assert any(node.domain == "ai.onnx.ml" for node in model.graph)
+
+    path = tmp_path / "normalizer.onnx"
+    try:
+        ir.save(model, path)
+        onnx.checker.check_model(str(path), full_check=True)
+        for candidate in (model, ir.load(path)):
+            validate_standard_onnx(candidate)
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = options.inter_op_num_threads = 1
+        session = ort.InferenceSession(
+            str(path), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        (actual,) = session.run(None, {"x": np.array([[3, 4]], dtype=np.float32)})
+        np.testing.assert_allclose(
+            actual, np.array([[0.6, 0.8]], dtype=np.float32), rtol=1e-6, atol=1e-7
+        )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("include_unused_ml_import", [False, True])
+def test_onnx_standard_retained_ml_function(tmp_path: Path, include_unused_ml_import):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 2])
+    y = op.Binarizer(x, _domain="ai.onnx.ml")
+    y.type, y.shape = x.type, x.shape
+    graph.outputs.append(y)
+    graph.opset_imports["ai.onnx.ml"] = 1
+    model = ir.Model(graph, ir_version=10)
+
+    body_builder, body_op, body = create_test_builder()
+    body_x = create_test_input(body_builder, "body_x", [1, 2])
+    zero = body_op.Constant(value_float=0.0)
+    body_y = body_op.Cast(body_op.Greater(body_x, zero), to=ir.DataType.FLOAT)
+    body_y.type, body_y.shape = body_x.type, body_x.shape
+    body.outputs.append(body_y)
+    if include_unused_ml_import:
+        body.opset_imports["ai.onnx.ml"] = 1
+    function = ir.Function("ai.onnx.ml", "Binarizer", graph=body, attributes={})
+    model.functions[function.identifier()] = function
+
+    validate_standard_onnx(model)
+    optimize_model(model, ep="onnx-standard")
+    assert function.identifier() in model.functions
+    assert "ai.onnx.ml" not in function.opset_imports
+    validate_standard_onnx(model)
+    path = tmp_path / "ml_function.onnx"
+    try:
+        ir.save(model, path)
+        onnx.checker.check_model(str(path), full_check=True)
+        validate_standard_onnx(ir.load(path))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("location", ["main", "signature", "body"])
+@pytest.mark.parametrize("ml_opset", [None, 0])
+def test_onnx_standard_ml_requires_own_opset(location, ml_opset):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 2])
+    graph.outputs.append(
+        op.Normalizer(x, _domain="ai.onnx.ml") if location == "main" else op.Identity(x)
+    )
+    model = ir.Model(graph, ir_version=11)
+    target_graph = graph
+    if location != "main":
+        body_builder, body_op, body = create_test_builder()
+        body_x = create_test_input(body_builder, "body_x", [1, 2])
+        body.outputs.append(
+            body_op.Normalizer(body_x, _domain="ai.onnx.ml")
+            if location == "body"
+            else body_op.Identity(body_x)
+        )
+        function = ir.Function(
+            "ai.onnx.ml" if location == "signature" else "",
+            "Normalizer" if location == "signature" else "Identity",
+            graph=body,
+            attributes={},
+        )
+        model.functions[function.identifier()] = function
+        target_graph = graph if location == "signature" else body
+    target_graph.opset_imports.pop("ai.onnx.ml", None)
+    if ml_opset is not None:
+        target_graph.opset_imports["ai.onnx.ml"] = ml_opset
+    with pytest.raises(ValueError, match=rf"ai.onnx.ml.*opset={ml_opset!r}.*no standard"):
+        validate_standard_onnx(model)
+
+
+@pytest.mark.parametrize("domain,import_domain", [("", "ai.onnx"), ("ai.onnx", "")])
+def test_onnx_standard_core_domain_aliases(domain, import_domain):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.outputs.append(op.Identity(x, _domain=domain))
+    graph.opset_imports.clear()
+    graph.opset_imports[import_domain] = 24
+    validate_standard_onnx(ir.Model(graph, ir_version=11))
+
+
+@pytest.mark.parametrize("location", ["call", "definition"])
+def test_onnx_standard_validator_rejects_declared_overloads_after_roundtrip(
+    tmp_path: Path, location
+):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    output = op.Identity(x)
+    output.type, output.shape = x.type, x.shape
+    node = output.producer()
+    assert node is not None
+    node.overload = "custom" if location == "call" else ""
+    graph.outputs.append(output)
+    function_builder, function_op, function_graph = create_test_builder()
+    function_x = create_test_input(function_builder, "function_x", [1])
+    function_y = function_op.Neg(function_x)
+    function_y.type, function_y.shape = function_x.type, function_x.shape
+    function_graph.outputs.append(function_y)
+    function = ir.Function(
+        "", "Identity", overload="custom", graph=function_graph, attributes={}
+    )
+    model = ir.Model(graph, ir_version=11)
+    model.functions[function.identifier()] = function
+    path = tmp_path / "overloaded.onnx"
+    expected_path = "graph/" if location == "call" else "function/::Identity"
+    try:
+        ir.save(model, path)
+        for candidate in (model, ir.load(path)):
+            with pytest.raises(
+                ValueError, match=rf"{expected_path}.*overload='custom'.*no standard"
+            ):
+                validate_standard_onnx(candidate)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_onnx_standard_optimizer_rejects_unresolved_custom_node():
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.outputs.append(op.Leak(x, _domain="test.custom"))
+    model = ir.Model(graph, ir_version=11)
+    with pytest.raises(ValueError, match=r"test.custom.*Leak"):
+        optimize_model(model, ep="onnx-standard")
+
+
+def test_onnx_standard_validates_after_opset_lowering(monkeypatch):
+    def insert_leak(package, _ep):
+        model = package["model"]
+        output = model.graph.outputs[0]
+        node = ir.Node("test.custom", "AfterLowering", [output], num_outputs=1)
+        model.graph.append(node)
+        model.graph.outputs[0] = node.outputs[0]
+
+    monkeypatch.setattr("mobius._builder._maybe_apply_opset_lowering", insert_leak)
+    with pytest.raises(ValueError, match=r"component 'model'.*AfterLowering"):
+        _make_llama_pkg("onnx-standard")
+
+
+def test_onnx_standard_validator_rejects_inapplicable_schema_version():
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.outputs.append(op.Identity(x))
+    graph.opset_imports[""] = 0
+    with pytest.raises(ValueError, match=r"opset=0.*no standard"):
+        validate_standard_onnx(ir.Model(graph, ir_version=11))
+
+
+def _make_nested_swish_model(parent_opset, child_opset, location):
+    x = ir.Value(name="x", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([1]))
+
+    def make_body(name):
+        body_input = (
+            ir.Value(name=f"{name}_x", type=x.type, shape=ir.Shape([]))
+            if location == "Scan"
+            else x
+        )
+        output = ir.Value(name=f"{name}_y", type=x.type, shape=body_input.shape)
+        return ir.Graph(
+            inputs=[body_input] if location == "Scan" else [],
+            outputs=[output],
+            nodes=[ir.Node("", "Swish", [body_input], outputs=[output])],
+            opset_imports={} if child_opset is None else {"": child_opset},
+            name=name,
+        )
+
+    inputs = [x]
+    if location == "If":
+        condition = ir.Value(
+            name="condition", type=ir.TensorType(ir.DataType.BOOL), shape=ir.Shape([])
+        )
+        inputs.append(condition)
+        node_inputs = [condition]
+        attributes = [
+            ir.AttrGraph("then_branch", make_body("then")),
+            ir.AttrGraph("else_branch", make_body("else")),
+        ]
+    elif location == "Scan":
+        node_inputs = [x]
+        attributes = [
+            ir.AttrGraph("body", make_body("scan")),
+            ir.AttrInt64("num_scan_inputs", 1),
+        ]
+    else:
+        node_inputs = [x]
+        # Synthetic GRAPHS attribute exercises the validator's repeated-graph traversal.
+        attributes = [ir.AttrGraphs("nested", [make_body("first"), make_body("second")])]
+    output = ir.Value(name="y", type=x.type, shape=x.shape)
+    node = ir.Node(
+        "",
+        "Identity" if location == "graphs" else location,
+        node_inputs,
+        attributes=attributes,
+        outputs=[output],
+    )
+    return ir.Model(
+        ir.Graph(
+            inputs=inputs,
+            outputs=[output],
+            nodes=[node],
+            opset_imports={"": parent_opset},
+            name="parent",
+        ),
+        ir_version=11,
+    )
+
+
+@pytest.mark.parametrize("location", ["If", "Scan", "graphs"])
+@pytest.mark.parametrize("parent_opset,child_opset", [(23, 24), (24, 23), (24, None)])
+def test_onnx_standard_validator_subgraphs_inherit_parent_opset(
+    location, parent_opset, child_opset
+):
+    model = _make_nested_swish_model(parent_opset, child_opset, location)
+    if parent_opset == 23:
+        with pytest.raises(ValueError, match=r"Swish.*opset=23.*no standard"):
+            validate_standard_onnx(model)
+    else:
+        validate_standard_onnx(model)
+
+
+@pytest.mark.parametrize(
+    "model_opset,function_opset,child_opset",
+    [(23, 24, 23), (24, 23, 24), (23, 24, None)],
+)
+def test_onnx_standard_validator_function_subgraphs_inherit_function_opset(
+    model_opset, function_opset, child_opset
+):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.outputs.append(op.Identity(x))
+    graph.opset_imports[""] = model_opset
+    model = ir.Model(graph, ir_version=11)
+    function = ir.Function(
+        "",
+        "Identity",
+        graph=_make_nested_swish_model(function_opset, child_opset, "Scan").graph,
+        attributes={},
+    )
+    model.functions[function.identifier()] = function
+    if function_opset == 23:
+        with pytest.raises(ValueError, match=r"function/::Identity.*Swish.*opset=23"):
+            validate_standard_onnx(model)
+    else:
+        validate_standard_onnx(model)
+
+
+@pytest.mark.parametrize("parent_opset", [23, 24])
+def test_onnx_standard_validator_subgraph_opset_matches_roundtrip(
+    tmp_path: Path, parent_opset
+):
+    model = _make_nested_swish_model(parent_opset, 24, "If")
+    path = tmp_path / "nested.onnx"
+    try:
+        ir.save(model, path)
+        for candidate in (model, ir.load(path)):
+            if parent_opset == 23:
+                with pytest.raises(ValueError, match=r"Swish.*opset=23.*no standard"):
+                    validate_standard_onnx(candidate)
+            else:
+                validate_standard_onnx(candidate)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_onnx_standard_validates_after_transformers_weight_binding(monkeypatch):
+    from types import SimpleNamespace
+
+    from mobius.integrations.transformers import _builder as transformers_builder
+    from mobius.integrations.transformers import _config_resolver
+
+    config = _base_config()
+    package = _make_llama_pkg("onnx-standard")
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (SimpleNamespace(model_type="llama"), False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (registry.get("llama"), "text-generation", "llama"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    monkeypatch.setattr(transformers_builder, "build_from_module", lambda *a, **k: package)
+    monkeypatch.setattr(transformers_builder, "_download_weights", lambda *a, **k: {})
+
+    def bind(_self, *args, **kwargs):
+        model = package["model"]
+        node = ir.Node("test.custom", "AfterWeights", [model.graph.outputs[0]], num_outputs=1)
+        model.graph.append(node)
+        model.graph.outputs[0] = node.outputs[0]
+
+    monkeypatch.setattr(type(package), "apply_weights", bind)
+    with pytest.raises(ValueError, match=r"component 'model'.*AfterWeights"):
+        transformers_builder.build_transformers_model(
+            "local-synthetic-llama", execution_provider="onnx-standard"
+        )
 
 
 def _non_standard_nodes(model: ir.Model) -> list[tuple[str, str]]:

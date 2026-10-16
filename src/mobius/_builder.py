@@ -31,7 +31,7 @@ from mobius._configs import BaseModelConfig
 from mobius._execution_providers import ep_registry
 from mobius._flags import flags
 from mobius._model_package import ModelPackage
-from mobius._optimizations import optimize_model
+from mobius._optimizations import optimize_model, validate_standard_onnx
 from mobius.tasks import ModelTask, get_task
 
 logger = logging.getLogger(__name__)
@@ -191,6 +191,9 @@ def build_from_module(
         )
 
     _maybe_apply_opset_lowering(package, execution_provider)
+    if execution_provider == "onnx-standard":
+        for name, model in package.items():
+            validate_standard_onnx(model, component=name)
     return package
 
 
