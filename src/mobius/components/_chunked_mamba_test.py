@@ -8,8 +8,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
@@ -81,6 +83,30 @@ def test_adapter_fixture_inputs_are_protected_before_worker_setup(tmp_path, monk
     with pytest.raises(ValueError, match="must be separate"):
         next(worker.__wrapped__())
     assert not inputs.exists()
+
+
+def test_adapter_fixture_inputs_missing_before_worker_setup(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    output.mkdir()
+    sentinel = output / "runtime.json"
+    sentinel.write_text("must remain untouched")
+    calls = []
+
+    def forbidden_worker(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("Worker must not start without immutable fixture inputs")
+
+    monkeypatch.setenv("MOBIUS_CHUNK_PREFILL_FIXTURES", "configured")
+    monkeypatch.delenv("MOBIUS_CHUNK_ADAPTER_FIXTURES", raising=False)
+    monkeypatch.setenv("MOBIUS_CHUNK_ADAPTER_EVIDENCE", str(output))
+    monkeypatch.setitem(
+        sys.modules, "bolt_ort_worker", SimpleNamespace(RemoteOrt=forbidden_worker)
+    )
+    with pytest.raises(ValueError, match="MOBIUS_CHUNK_ADAPTER_FIXTURES"):
+        next(worker.__wrapped__())
+    assert calls == []
+    assert sentinel.read_text() == "must remain untouched"
+    assert list(output.iterdir()) == [sentinel]
 
 
 def _parameter(parameter, value):
@@ -157,9 +183,8 @@ def worker():
     if not os.environ.get("MOBIUS_CHUNK_PREFILL_FIXTURES"):
         pytest.skip("requires explicitly configured sealed source fixtures")
     directory = Path(os.environ["MOBIUS_CHUNK_ADAPTER_EVIDENCE"])
-    if os.environ.get("MOBIUS_CHUNK_ADAPTER_FIXTURES"):
-        # Reject overlapping roots before creating runtime/evidence files.
-        _adapter_fixture_path("receipt.json", directory)
+    # Require inputs and reject overlaps before creating runtime/evidence files.
+    _adapter_fixture_path("receipt.json", directory)
     from bolt_ort_worker import RemoteOrt
 
     directory.mkdir(parents=True, exist_ok=True)
