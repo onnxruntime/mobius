@@ -227,9 +227,30 @@ replacements for the sealed primitive fixtures.
 DOUBLE temporaries remain limited to the standalone association/FMA expression;
 stored, incoming, and feedback states remain FP32.
 
-Adapter CUDA tests additionally require `MOBIUS_CHUNK_ADAPTER_EVIDENCE` pointing
-to fresh evidence with the original-source zero-initial/prepared-input diagnostic
-fixtures. Source generation commands/scripts and hashes belong in that evidence,
-not in sealed reference directories. Do not reuse the standalone receipt path.
+Adapter CUDA tests additionally require **separate immutable inputs and fresh
+outputs**. Set `MOBIUS_CHUNK_ADAPTER_FIXTURES` to the sealed
+`source-chunk-adapter-v1` directory containing the original-source
+zero-initial/prepared-input diagnostics. Its manifest SHA256 is pinned in the
+tests; every consumed diagnostic JSON/NPZ is hash-verified against it. Set
+`MOBIUS_CHUNK_ADAPTER_EVIDENCE` to a different, fresh output directory.
+Never copy newly generated outputs into the source fixture root or relabel
+them as independent source fixtures. The original receipt/fixtures remain
+read-only. `MOBIUS_CHUNK_ADAPTER_GPU` selects the explicitly allocated physical
+GPU for adapter tests (default 0); recheck availability before running.
+
+For just the two production controls, after setting the common fixture/runtime
+environment above and allocating the requested GPU:
+
+```bash
+export MOBIUS_CHUNK_ADAPTER_FIXTURES=/path/to/sealed/source-chunk-adapter-v1
+export MOBIUS_CHUNK_ADAPTER_EVIDENCE=/path/to/fresh/adapter-evidence
+export MOBIUS_CHUNK_ADAPTER_GPU=1  # Only when physical GPU 1 is allocated/free.
+python -m pytest src/mobius/components/_chunked_mamba_test.py \
+  -k production_prefill_primitive_integration_and_source_diagnostics -q
+```
+
+Source generation commands/scripts and hashes stay in the sealed input evidence;
+new execution profiles/results belong only in the fresh output directory.
+Do not reuse either the standalone or original adapter receipt path.
 No full package, generation, performance, memory-budget, or shipping-readiness
 claim follows from these component/task tests.
