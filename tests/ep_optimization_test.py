@@ -16,7 +16,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+import numpy as np
+import onnx
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 from _test_configs import _base_config
 
@@ -393,17 +396,28 @@ def test_unknown_ep_raises():
 # ---------------------------------------------------------------------------
 
 
-_STANDARD_ONNX_DOMAINS = frozenset({"", "ai.onnx"})
+_STANDARD_ONNX_DOMAINS = frozenset({"", "ai.onnx", "ai.onnx.ml"})
 
 
 @pytest.mark.parametrize("location", ["main", "If", "Scan", "graphs", "signature", "body"])
 @pytest.mark.parametrize(
-    "domain,operator,overload",
-    [("test.custom", "Leak", ""), ("", "NotAnOnnxOp", ""), ("", "Identity", "custom")],
+    "domain,operator,overload,is_standard",
+    [
+        ("test.custom", "Leak", "", False),
+        ("", "NotAnOnnxOp", "", False),
+        ("", "Identity", "custom", False),
+        ("ai.onnx.ml", "Normalizer", "", True),
+        ("ai.onnx.ml", "NotAnOnnxOp", "", False),
+        ("ai.onnx.ml", "Identity", "", False),
+        ("ai.onnx.ml", "Normalizer", "custom", False),
+    ],
 )
-def test_onnx_standard_validator_rejects_recursive_leaks(location, domain, operator, overload):
+def test_onnx_standard_validator_checks_recursive_identifiers(
+    location, domain, operator, overload, is_standard
+):
     builder, op, graph = create_test_builder()
     x = create_test_input(builder, "x", [1])
+    graph.opset_imports["ai.onnx.ml"] = 1
 
     def emit(op_builder, op_type, op_domain, op_overload):
         value = getattr(op_builder, op_type)(x, _domain=op_domain)
@@ -451,6 +465,7 @@ def test_onnx_standard_validator_rejects_recursive_leaks(location, domain, opera
     model = ir.Model(graph, ir_version=11)
     if location in {"signature", "body"}:
         body, body_builder = create_body_graph([], [])
+        body.opset_imports["ai.onnx.ml"] = 1
         body.outputs.append(
             emit(
                 body_builder.op,
@@ -467,11 +482,122 @@ def test_onnx_standard_validator_rejects_recursive_leaks(location, domain, opera
             attributes={},
         )
         model.functions[function.identifier()] = function
+    if is_standard:
+        validate_standard_onnx(model, component="decoder")
+        return
     with pytest.raises(
         ValueError,
         match=rf"component 'decoder'.*{operator!r}.*overload={overload!r}.*decomposition",
     ):
         validate_standard_onnx(model, component="decoder")
+
+
+def test_onnx_standard_ml_export_roundtrip(tmp_path: Path):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 2])
+    y = op.Normalizer(x, norm="L2", _domain="ai.onnx.ml")
+    y.type, y.shape = x.type, x.shape
+    graph.outputs.append(y)
+    graph.opset_imports["ai.onnx.ml"] = 1
+    model = ir.Model(graph, ir_version=10)
+    optimize_model(model, ep="onnx-standard")
+    assert any(node.domain == "ai.onnx.ml" for node in model.graph)
+
+    path = tmp_path / "normalizer.onnx"
+    try:
+        ir.save(model, path)
+        onnx.checker.check_model(str(path), full_check=True)
+        for candidate in (model, ir.load(path)):
+            validate_standard_onnx(candidate)
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = options.inter_op_num_threads = 1
+        session = ort.InferenceSession(
+            str(path), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        (actual,) = session.run(None, {"x": np.array([[3, 4]], dtype=np.float32)})
+        np.testing.assert_allclose(
+            actual, np.array([[0.6, 0.8]], dtype=np.float32), rtol=1e-6, atol=1e-7
+        )
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("include_unused_ml_import", [False, True])
+def test_onnx_standard_retained_ml_function(tmp_path: Path, include_unused_ml_import):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 2])
+    y = op.Binarizer(x, _domain="ai.onnx.ml")
+    y.type, y.shape = x.type, x.shape
+    graph.outputs.append(y)
+    graph.opset_imports["ai.onnx.ml"] = 1
+    model = ir.Model(graph, ir_version=10)
+
+    body_builder, body_op, body = create_test_builder()
+    body_x = create_test_input(body_builder, "body_x", [1, 2])
+    zero = body_op.Constant(value_float=0.0)
+    body_y = body_op.Cast(body_op.Greater(body_x, zero), to=ir.DataType.FLOAT)
+    body_y.type, body_y.shape = body_x.type, body_x.shape
+    body.outputs.append(body_y)
+    if include_unused_ml_import:
+        body.opset_imports["ai.onnx.ml"] = 1
+    function = ir.Function("ai.onnx.ml", "Binarizer", graph=body, attributes={})
+    model.functions[function.identifier()] = function
+
+    validate_standard_onnx(model)
+    optimize_model(model, ep="onnx-standard")
+    assert function.identifier() in model.functions
+    assert "ai.onnx.ml" not in function.opset_imports
+    validate_standard_onnx(model)
+    path = tmp_path / "ml_function.onnx"
+    try:
+        ir.save(model, path)
+        onnx.checker.check_model(str(path), full_check=True)
+        validate_standard_onnx(ir.load(path))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("location", ["main", "signature", "body"])
+@pytest.mark.parametrize("ml_opset", [None, 0])
+def test_onnx_standard_ml_requires_own_opset(location, ml_opset):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 2])
+    graph.outputs.append(
+        op.Normalizer(x, _domain="ai.onnx.ml") if location == "main" else op.Identity(x)
+    )
+    model = ir.Model(graph, ir_version=11)
+    target_graph = graph
+    if location != "main":
+        body_builder, body_op, body = create_test_builder()
+        body_x = create_test_input(body_builder, "body_x", [1, 2])
+        body.outputs.append(
+            body_op.Normalizer(body_x, _domain="ai.onnx.ml")
+            if location == "body"
+            else body_op.Identity(body_x)
+        )
+        function = ir.Function(
+            "ai.onnx.ml" if location == "signature" else "",
+            "Normalizer" if location == "signature" else "Identity",
+            graph=body,
+            attributes={},
+        )
+        model.functions[function.identifier()] = function
+        target_graph = graph if location == "signature" else body
+    target_graph.opset_imports.pop("ai.onnx.ml", None)
+    if ml_opset is not None:
+        target_graph.opset_imports["ai.onnx.ml"] = ml_opset
+    with pytest.raises(ValueError, match=rf"ai.onnx.ml.*opset={ml_opset!r}.*no standard"):
+        validate_standard_onnx(model)
+
+
+@pytest.mark.parametrize("domain,import_domain", [("", "ai.onnx"), ("ai.onnx", "")])
+def test_onnx_standard_core_domain_aliases(domain, import_domain):
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1])
+    graph.outputs.append(op.Identity(x, _domain=domain))
+    graph.opset_imports.clear()
+    graph.opset_imports[import_domain] = 24
+    validate_standard_onnx(ir.Model(graph, ir_version=11))
 
 
 @pytest.mark.parametrize("location", ["call", "definition"])
