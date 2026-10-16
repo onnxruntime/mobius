@@ -173,6 +173,45 @@ def test_zero_new_media_and_cached_decode(cached):
     assert result.image_features.dtype == np.float32
 
 
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("mask_dtype", [np.int64, np.bool_])
+def test_cached_decode_preserves_past_plus_current_mask(batch_size, mask_dtype):
+    ids = np.full((batch_size, 1), 18, dtype=np.int64)
+    attention = np.ones((batch_size, 6), dtype=mask_dtype)
+    attention[:, 1:3] = 0
+    original = attention.copy()
+    result = compact_omni_prompt(ids, attention, [], [], hidden_size=4096, cached_decode=True)
+    np.testing.assert_array_equal(result.input_ids, ids)
+    np.testing.assert_array_equal(result.attention_mask, original)
+    np.testing.assert_array_equal(attention, original)
+    assert result.image_features.shape == (0, 4096)
+    np.testing.assert_array_equal(result.token_retention_mask, np.ones_like(ids, dtype=bool))
+
+
+@pytest.mark.parametrize("shape", [(6,), (2, 6), (1, 0)])
+def test_cached_decode_rejects_misaligned_attention_mask(shape):
+    with pytest.raises(ValueError, match="attention_mask"):
+        compact_omni_prompt(
+            np.array([[7]], dtype=np.int64),
+            np.ones(shape, dtype=np.int64),
+            [],
+            [],
+            hidden_size=4096,
+            cached_decode=True,
+        )
+
+
+def test_prefill_rejects_past_plus_current_mask():
+    with pytest.raises(ValueError, match="attention_mask"):
+        compact_omni_prompt(
+            np.array([[7]], dtype=np.int64),
+            np.ones((1, 6), dtype=np.int64),
+            [],
+            [],
+            hidden_size=4096,
+        )
+
+
 @pytest.mark.parametrize(
     "mutation", ["float64", "rank5", "packed", "zero", "unaligned", "nan"]
 )

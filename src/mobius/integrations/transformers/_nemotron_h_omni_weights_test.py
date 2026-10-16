@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 
 import onnx_ir as ir
 import pytest
@@ -123,6 +124,7 @@ def test_native_omni_all_sources_and_external_bytes_round_trip(tmp_path):
     assert report["ggml_reconstructed_weight_dtype"] == "BFLOAT16"
     assert report["projection_formats"] == {"IQ2_XXS": 1, "Q8_0": 1, "W4A16_NVFP4": 2}
     assert report["native_iq2_storage"] is True
+    assert report["streaming_external_data"] is True
     assert report["full_checkpoint_dequantization"] is False
     output = tmp_path / "output"
     package.save(str(output), progress_bar=False)
@@ -148,6 +150,28 @@ def test_native_omni_all_sources_and_external_bytes_round_trip(tmp_path):
     assert "decoder.lm_head.zero_points" not in decoder.graph.initializers
     assert (output / "vision_encoder/model.onnx").is_file()
     assert (output / "embedding/model.onnx").is_file()
+
+
+def test_native_omni_default_save_bounds_shards_and_materialization(tmp_path, monkeypatch):
+    config, package, state = _fixture()
+    source = tmp_path / "source"
+    _checkpoint(source, state)
+    stream_nemotron_h_omni_safetensors_to_package(package, str(source), config)
+    original_save = ir.save
+    calls = []
+
+    def record_save(model, path, *, max_workers=8, **kwargs):
+        calls.append((max_workers, kwargs["max_shard_size_bytes"]))
+        if "max_workers" in inspect.signature(original_save).parameters:
+            kwargs["max_workers"] = max_workers
+        return original_save(model, path, **kwargs)
+
+    monkeypatch.setattr(ir, "save", record_save)
+    package.save(str(tmp_path / "output"), progress_bar=False)
+    assert len(calls) == 3
+    assert all(workers == 1 and shard_bytes == 1 << 30 for workers, shard_bytes in calls)
+    assert package.weight_loading_report["serializer_max_workers"] == 1
+    assert package.weight_loading_report["external_data_shard_limit_bytes"] == 1 << 30
 
 
 @pytest.mark.parametrize(

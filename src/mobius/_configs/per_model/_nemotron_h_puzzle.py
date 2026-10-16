@@ -74,6 +74,7 @@ class NemotronHPuzzleConfig(NemotronHConfig):
         limits = getattr(config, "time_step_limit", None)
         if limits is not None:
             lower, upper = limits
+            upper = _as_attribute_config(upper)
             if getattr(upper, "__float__", None) == "Infinity":
                 upper = math.inf
             if lower != 0 or upper != math.inf:
@@ -87,7 +88,7 @@ class NemotronHPuzzleConfig(NemotronHConfig):
         if ssm_dtype not in {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
             raise ValueError("Puzzle mamba_ssm_cache_dtype must be a floating-point dtype")
         fields["mamba_ssm_dtype"] = ssm_dtype
-        resolved = []
+        resolved: list[NemotronHMoEBlockConfig | None] = []
         for block, kind in zip(blocks, kinds):
             if kind != "moe":
                 resolved.append(None)

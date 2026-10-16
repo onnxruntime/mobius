@@ -181,9 +181,12 @@ def test_puzzle_block_schedule_overrides_legacy_global_schedule():
 
 
 @pytest.mark.parametrize("upper", [float("inf"), {"__float__": "Infinity"}])
-def test_puzzle_does_not_clamp_to_dt_initialization_bound(upper):
+@pytest.mark.parametrize("attribute_config", [False, True])
+def test_puzzle_does_not_clamp_to_dt_initialization_bound(upper, attribute_config):
     source = _source_config()
     source.update(time_step_min=0.001, time_step_limit=[0.0, upper])
+    if attribute_config:
+        source = types.SimpleNamespace(**source)
     config = NemotronHPuzzleConfig.from_transformers(source)
     assert config.mamba_time_step_min == pytest.approx(0.0)
     assert config.mamba_ssm_dtype == ir.DataType.FLOAT

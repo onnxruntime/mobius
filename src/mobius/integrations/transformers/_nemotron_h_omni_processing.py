@@ -150,18 +150,27 @@ def _validate_prompt(
         raise TypeError("input_ids must be an int64 ndarray")
     if input_ids.ndim != 2 or input_ids.shape[0] <= 0:
         raise ValueError("input_ids must have shape (batch, sequence)")
+    if not isinstance(cached_decode, bool) or not isinstance(allow_provenance_mixed, bool):
+        raise TypeError("cached_decode and allow_provenance_mixed must be bool")
     if attention_mask is not None:
         if (
             not isinstance(attention_mask, np.ndarray)
-            or attention_mask.shape != input_ids.shape
+            or attention_mask.ndim != 2
+            or attention_mask.shape[0] != input_ids.shape[0]
+            or (
+                attention_mask.shape[1] < input_ids.shape[1]
+                if cached_decode
+                else attention_mask.shape[1] != input_ids.shape[1]
+            )
         ):
-            raise ValueError("attention_mask must match input_ids shape")
+            raise ValueError(
+                "attention_mask must match input_ids batch and sequence, "
+                "including past tokens during cached decode"
+            )
         if attention_mask.dtype not in (np.dtype(np.int64), np.dtype(np.bool_)):
             raise TypeError("attention_mask must be int64 or bool")
         if not np.isin(attention_mask, [0, 1]).all():
             raise ValueError("attention_mask must contain only zero or one")
-    if not isinstance(cached_decode, bool) or not isinstance(allow_provenance_mixed, bool):
-        raise TypeError("cached_decode and allow_provenance_mixed must be bool")
     if isinstance(image_token_id, bool) or not isinstance(image_token_id, int):
         raise TypeError("image_token_id must be an integer")
     if cached_decode and calls:
@@ -257,6 +266,8 @@ def compact_omni_prompt(
     represent it correctly. In that extension, per-call provenance defines
     membership, and final features follow surviving prompt order, not call
     order or an assumed images-first layout. No graph output is silently cast.
+    Cached no-media calls preserve a past-plus-current attention mask; prefill
+    masks must match the current prompt shape.
     """
     _positive_integer(hidden_size, "hidden_size")
     dtype = np.dtype(feature_dtype)
