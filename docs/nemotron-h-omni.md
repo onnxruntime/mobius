@@ -50,7 +50,14 @@ the pinned BF16 source. Neither does substituting BF16 scales into
 `MatMulNBits`. The generic `MatMulBlockQuantizedFp4Weight` has different
 global-scale rounding behavior for larger M; it is not the A16 replacement.
 
-The decoder uses FP32 SSM state. Its grouped gated norm computes gating,
+The decoder uses FP32 SSM state. Puzzle's outer block norms and final norm
+use `Float32RMSNorm`: normalization and gamma multiplication complete in
+FP32 before one model-dtype store. Standard native-dtype
+`RMSNormalization` instead rounds the normalized activation before gamma,
+so emitting that operator directly does not match this source contract.
+This is a graph/source mismatch, not evidence of an incorrect ORT kernel.
+
+Its grouped gated norm computes gating,
 per-group variance, normalization and gamma multiplication in FP32, then
 casts once to model dtype. This differs from the Lightning norm's
 intermediate rounding boundary.
@@ -58,8 +65,13 @@ intermediate rounding boundary.
 Puzzle Mamba convolution completes accumulation and bias addition in FP32,
 then rounds once before Swish. Its state readout and `D*x` skip are also
 combined in FP32 before one native output store. The reusable
-`Float32AccumulationMamba2Block` supplies these boundaries only for Puzzle;
-the default Mamba/Lightning path is unchanged.
+`Float32AccumulationMamba2Block` supplies these accumulation boundaries.
+Puzzle selects its `Float32SiLUMamba2Block` subclass; the default
+Mamba/Lightning path is unchanged. Its activation preserves the native
+Conv output store, then computes complete SiLU in FP32 before the native
+activation store.
+Expanding native-dtype Swish into Sigmoid and Mul introduces an additional
+native Sigmoid store and does not match the pinned Torch activation.
 
 RADIOv4's biased dense projections use `Float32Linear`: MatMul accumulation
 and bias addition complete in FP32 before the output is rounded to model
@@ -280,3 +292,36 @@ from unresolved activation dtype in component-quantized graph construction
 is fixed with six deferred-type regressions; the exact `52205332` head's
 [remote L1 smoke test passes](https://github.com/onnxruntime/mobius/actions/runs/38819403236/job/116712574716).
 These software checks do not override the failed full-model state gates.
+
+### Post-v7 primitive corrections
+
+Same-input production-sized replays identify two further source-contract
+mismatches: outer/final RMSNorm's pre-gamma native rounding, and convolution
+SiLU's native Sigmoid intermediate. The Puzzle-only corrections above
+preserve the already qualified Conv output store, grouped norm, FP32
+readout-plus-skip, packed projection boundaries and original reference.
+Default RMSNorm, ordinary Nemotron-H and Lightning wiring are unchanged.
+
+All ten production fixtures, covering fourteen boundary arrays, are bitwise
+source-exact after correction. The focused qualification executes 113 tests
+without skips; the integrated L1/component selection passes 1,898 tests,
+with 52 existing skips and 24 deselections. A fresh native-v8 export from
+clean source `d3ac98d5aa571b0c4c25fd288bd0a36741c342ee` independently passes
+all 28,885 source checks, 28,882 exact bindings and 3 metadata validations,
+with zero unexpected FP32 downcasts.
+
+These are primitive and source-fidelity results, not a passing full-model
+comparison. V8's first ordinary attempt hit the validation client's
+600-second timeout during decoder session creation, before any inference
+steps. Its numerical comparison and hidden/instrumentation-invariance
+checks are therefore **NOT_RUN**, not numerical failures. Session-load
+diagnosis and actual GenAI qualification are separate pending gates.
+The original v7 failures remain preserved; multimodal generation is held
+until ordinary decoder numerical correctness passes.
+
+A subsequent type guard preserves each existing layer's epsilon before norm
+replacement. Full pinned-config builds before and after that guard have
+bitwise-equal complete IR serializations for all three models, including
+attributes, constants, names, dtypes and functions. This is unweighted
+graph-equivalence evidence, not an additional weighted execution. V8's export
+receipt remains labeled with its actual `d3ac98d5` checkout.
