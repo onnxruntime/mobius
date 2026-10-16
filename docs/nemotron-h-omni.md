@@ -123,6 +123,11 @@ embedding graph's INT64 input. The C++/C entry supports actual BF16 feature
 buffers. The current Python NumPy tensor converter does not support BF16;
 casting those features to FP16 is not an equivalent workaround.
 
+The public token-only route in GenAI PR #2741 creates correctly typed empty
+features internally when no media is supplied. Its CPU/CUDA tiny-fixture
+results do not add BF16 NumPy feature conversion or qualify the current full
+Bolt package. Keep token-only, prepared-media and full-package results separate.
+
 ## Readiness gates
 
 Tiny graphs, component parity, source accounting and export success are
@@ -378,3 +383,56 @@ bitwise-equal complete IR serializations for all three models, including
 attributes, constants, names, dtypes and functions. This is unweighted
 graph-equivalence evidence, not an additional weighted execution. V8's export
 receipt remains labeled with its actual `d3ac98d5` checkout.
+
+### Source-chunk baseline and backend diagnostics
+
+The fresh source-chunk package was exported from clean Mobius
+`a8da7270fa2519eec737f103bc1d662b9accc174` at the pinned checkpoint revision
+above. Its frozen Python runtime maps pybind SHA256
+`f1ad43edce7b119d813d659fc39aa3e2beb88542617aad5017854bc051b9ad74`
+and the CUDA provider `394cc8f...` recorded above. The provider is a qualified
+retained-object composition, not a clean build of current ORT main. A sibling
+C++ core library is not the core embedded in that Python extension; do not
+interchange their qualification or GenAI pairing.
+
+| Category | Source-chunk result |
+|---|---|
+| Source fidelity | PASS: 28,885 sources, 28,882 exact bindings and 3 validated metadata tensors; zero unexpected FP32 downcasts |
+| Native packed CUDA execution | PASS for the qualified packed operator route; not a measured 24 GB footprint |
+| Full decoder numerical parity | FAIL: 1,215 PASS / 281 FAIL of 1,496 comparisons, all finite |
+| Ordinary greedy generation | PASS: exact eight-token sequence recorded above |
+| Hidden instrumentation invariance | PASS: all 776 common outputs are typed-byte identical |
+| Image/video parity on this package | NOT_RUN; preserved v8 vision results above are separate |
+| Current full-package GenAI pairing | NOT_RUN; public token-only tiny fixtures are not a substitute |
+| Speculative integration | NOT_RUN |
+
+The 1,496 comparisons include embeddings, logits, hidden states and
+KV/convolution/SSM state across prefill and seven reused-state steps. Logits,
+embeddings, keys and SSM state pass; value caches, convolution caches and hidden
+states contain failures. The unchanged NRMSE/cosine and exact-token gates
+still apply. Exact generated tokens do not override failed internal-state gates.
+
+Same-input grouped-normalization and first-MoE controls pass their component
+gates. All 40 per-layer MoE routing contracts match. Routing-only replay on
+recorded source hidden inputs agrees on 1,079 of 1,080 expert sets; one small
+normalization difference changes a near-boundary selection. Replay on recorded
+native hidden inputs differs on 149 rows. These are replayed decisions, not
+newly observed full-model routes or proof of the cause of every failed array.
+IQ2/Q8 complete-weight rounding is already present in the frozen provider and
+current native operator implementation; no missing-cast workaround is justified.
+
+Two separately labeled projection diagnostics use dequantized BF16 weights
+and standard CUDA Gemm. Both reproduce their frozen source outputs bitwise;
+the original packed Q8 path differs in 38/27,648 values and the IQ2 M1 control
+in 1/2,048. Both packed controls already pass the component gates. This does
+not demonstrate a packed-kernel contract violation, full-model improvement,
+production backend selection or a 24 GB deployment footprint.
+
+An earlier expanded-FP32 NVFP4 diagnostic is a separate negative result:
+over the same 374 observed comparisons, failures increased from 28 to 63.
+That run did not complete eight steps and must not be presented as a full
+qualification or used to replace the native baseline. Preserve all variants
+and failures. Any new backend must first pass focused regressions, then the
+complete unchanged decoder/generation gates before media or speculation.
+See the [retained numerical evidence](https://github.com/onnxruntime/mobius/pull/779#issuecomment-6214929481)
+for report hashes and component-scope limitations.
