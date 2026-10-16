@@ -25,6 +25,7 @@ from mobius.integrations._block_quant import BlockQuantScheme
 from mobius.integrations.diffusers import _builder as diffusers_builder
 from mobius.integrations.transformers import _builder as transformers_builder
 from mobius.integrations.transformers import _config_resolver
+from mobius.tasks import CausalLMTask
 
 
 class _DummyModule(nn.Module):
@@ -775,6 +776,56 @@ def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
 
     assert result is package
     download.assert_called_once_with("fake/model", revision=None)
+
+
+def test_dense_paged_qwen_routes_task_and_rejects_explicit_dynamic_task(monkeypatch) -> None:
+    hf_config = type("HFConfig", (), {"model_type": "qwen3"})()
+    config = make_config(
+        model_type="qwen3",
+        dtype=ir.DataType.FLOAT16,
+        rope_type="default",
+        attn_qk_norm=True,
+        head_dim=16,
+    )
+    package = ModelPackage(
+        {"model": ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)},
+        config=config,
+    )
+    tasks = []
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (value, value, "qwen3"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, args[3], "qwen3"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+
+    def fake_build(_module, _config, task, **kwargs):
+        tasks.append(task)
+        return package
+
+    monkeypatch.setattr(transformers_builder, "build_from_module", fake_build)
+    monkeypatch.setattr(transformers_builder, "_download_weights", lambda *args, **kwargs: {})
+    assert (
+        transformers_builder.build_transformers_model(
+            "fake/model", export_paged_attention=True
+        )
+        is package
+    )
+    assert isinstance(tasks[0], CausalLMTask) and tasks[0]._paged_cache
+    with pytest.raises(ValueError, match="paged_cache=True"):
+        transformers_builder.build_transformers_model(
+            "fake/model", export_paged_attention=True, task=CausalLMTask()
+        )
 
 
 def test_text_only_resolution_ignores_multimodal_parent_architecture() -> None:
