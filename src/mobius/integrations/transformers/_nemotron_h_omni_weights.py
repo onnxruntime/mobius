@@ -184,6 +184,7 @@ def build_nemotron_h_omni_streaming_plan(
         targets=targets,
         constants=constants,
         report={
+            "streaming_external_data": True,
             "output_weight_format": (
                 "native-mixed-precision" if config.quantized_projections else "dense"
             ),
