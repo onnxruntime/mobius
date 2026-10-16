@@ -15,7 +15,9 @@ from pathlib import Path
 import pytest
 
 
-def _run_case(tmp_path: Path, *, ci: bool, phase: str, hard_exit: bool):
+def _run_case(
+    tmp_path: Path, *, ci: bool, phase: str, hard_exit: bool, workers: int | None = None
+):
     shutil.copyfile(Path(__file__).with_name("conftest.py"), tmp_path / "conftest.py")
     (tmp_path / "case_test.py").write_text(
         f"""
@@ -59,6 +61,7 @@ def test_later():
             "--junitxml=results.xml",
             "-p",
             "no:cacheprovider",
+            *(["-p", "xdist.plugin", "-n", str(workers)] if workers is not None else []),
         ],
         cwd=tmp_path,
         env=env,
@@ -115,3 +118,20 @@ def test_passing_run_is_unchanged(tmp_path, ci):
     assert "Immediate CI failure:" not in result.stdout
     assert "PASS_CAPTURE_MUST_STAY_HIDDEN" not in result.stdout
     assert "FAIL_CAPTURE_ONLY_IN_FINAL_SUMMARY" not in result.stdout
+
+
+@pytest.mark.parametrize("ci", [True, False])
+def test_worker_failure_is_reported_once_by_controller(tmp_path, ci):
+    result = _run_case(tmp_path, ci=ci, phase="call", hard_exit=False, workers=2)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[gw" in result.stdout
+    assert result.stdout.count("Immediate CI failure:") == int(ci)
+    assert "short test summary info" in result.stdout
+    assert "PASS_CAPTURE_MUST_STAY_HIDDEN" not in result.stdout
+    assert result.stdout.count("FAIL_CAPTURE_ONLY_IN_FINAL_SUMMARY") == 1
+    suite = ET.parse(tmp_path / "results.xml").getroot().find("testsuite")
+    assert suite is not None
+    assert suite.attrib["failures"] == "1"
+    assert suite.attrib["errors"] == "0"
+    assert suite.attrib["tests"] == "3"
