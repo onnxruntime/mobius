@@ -201,14 +201,17 @@ _ATTENTION_NONPAD_KV_SEQLEN_INPUT_INDEX = 6
 
 def _maybe_apply_opset_lowering(package: ModelPackage, execution_provider: str) -> None:
     """Lower default-domain opset 24 to 23 for sub-models where it is safe."""
-    if not flags.ort_lower_opset_for_ep:
+    if not flags.ort_lower_opset_for_ep and execution_provider != "openvino":
         return
     if execution_provider in ("default", "cpu"):
         return
     for name, model in package.items():
         if "" not in model.graph.opset_imports:
             continue
-        if _graph_requires_opset24(model.graph):
+        functions = list(model.functions.values())
+        if _graph_requires_opset24(model.graph) or any(
+            _graph_requires_opset24(function) for function in functions
+        ):
             logger.info(
                 "Skipped opset→23 lowering for '%s' (EP=%s): graph uses "
                 "opset-24-only ops (TensorScatter / Attention nonpad_kv_seqlen). "
@@ -219,15 +222,27 @@ def _maybe_apply_opset_lowering(package: ModelPackage, execution_provider: str) 
             continue
         original = model.graph.opset_imports[""]
         model.graph.opset_imports[""] = 23
-        logger.warning(
-            "Lowered opset %d→23 for '%s' (EP=%s). "
-            "ORT does not yet register opset %d kernels for this EP. "
-            "Track https://github.com/microsoft/onnxruntime/issues/27729",
-            original,
-            name,
-            execution_provider,
-            original,
-        )
+        for function in functions:
+            if "" in function.opset_imports:
+                function.opset_imports[""] = 23
+        if execution_provider == "openvino":
+            logger.info(
+                "Lowered opset %d→23 for '%s' (EP=%s) to avoid the OpenVINO "
+                "opset-24 Attention mask Pad.",
+                original,
+                name,
+                execution_provider,
+            )
+        else:
+            logger.warning(
+                "Lowered opset %d→23 for '%s' (EP=%s). "
+                "ORT does not yet register opset %d kernels for this EP. "
+                "Track https://github.com/microsoft/onnxruntime/issues/27729",
+                original,
+                name,
+                execution_provider,
+                original,
+            )
 
 
 def _graph_requires_opset24(graph: ir.Graph) -> bool:

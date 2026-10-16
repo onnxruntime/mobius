@@ -183,3 +183,14 @@ def test_maybe_apply_opset_lowering_skipped_when_flag_disabled(
     _maybe_apply_opset_lowering(pkg, execution_provider="cuda")
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
+
+
+def test_maybe_apply_opset_lowering_required_by_openvino(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(flags, "ort_lower_opset_for_ep", False)
+    pkg = ModelPackage({"decoder": _model_with(_standard_nodes())})
+
+    _maybe_apply_opset_lowering(pkg, execution_provider="openvino")
+
+    assert pkg["decoder"].graph.opset_imports[""] == 23

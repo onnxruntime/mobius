@@ -21,10 +21,10 @@ entries for the first ``num_hidden_layers - num_kv_shared_layers`` layers.
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import onnx_ir as ir
-from onnxscript import GraphBuilder, nn
+from onnxscript import GraphBuilder, OpBuilder, nn
 
 from mobius._build_context import ep_capabilities, prefill_prefix_pruning
 from mobius._configs import Gemma4Config
@@ -37,6 +37,7 @@ from mobius._pipeline_contract import (
     declare_component_presence,
     declare_optional_input,
 )
+from mobius.components import StaticCacheState
 from mobius.tasks._base import (
     ModelTask,
     _make_graph,
@@ -60,6 +61,63 @@ def _has_dynamic_cache_layer(config: Gemma4Config) -> bool:
         (layer_types[i] if i < len(layer_types) else "sliding_attention") != "full_attention"
         for i in range(num_kv_layers)
     )
+
+
+def _gemma4_io_dtype(config: Gemma4Config) -> ir.DataType:
+    """Use float32 at OpenVINO graph boundaries while keeping model compute precision."""
+    return ir.DataType.FLOAT if ep_capabilities().name == "openvino" else config.dtype
+
+
+Gemma4CacheState = tuple[ir.Value, ir.Value] | StaticCacheState | None
+
+
+def _cast_tensor(op: OpBuilder, value: ir.Value, dtype: ir.DataType) -> ir.Value:
+    if ep_capabilities().name != "openvino" or value.dtype == dtype:
+        return value
+    cast = op.Cast(value, to=dtype)
+    cast.type = dtype
+    cast.shape = value.shape
+    return cast
+
+
+def _cast_cache_inputs(
+    op: OpBuilder,
+    past_key_values: list[Gemma4CacheState],
+    dtype: ir.DataType,
+) -> list[Gemma4CacheState]:
+    result: list[Gemma4CacheState] = []
+    for cache in past_key_values:
+        if cache is None:
+            result.append(None)
+        elif isinstance(cache, StaticCacheState):
+            result.append(
+                StaticCacheState(
+                    key_cache=_cast_tensor(op, cache.key_cache, dtype),
+                    value_cache=_cast_tensor(op, cache.value_cache, dtype),
+                    write_indices=cache.write_indices,
+                    nonpad_kv_seqlen=cache.nonpad_kv_seqlen,
+                )
+            )
+        else:
+            key, value = cache
+            result.append(
+                (
+                    _cast_tensor(op, key, dtype),
+                    _cast_tensor(op, value, dtype),
+                )
+            )
+    return result
+
+
+def _cast_cache_outputs(
+    op: OpBuilder,
+    present_key_values: list[tuple[ir.Value, ir.Value]],
+    dtype: ir.DataType,
+) -> list[tuple[ir.Value, ir.Value]]:
+    return [
+        (_cast_tensor(op, key, dtype), _cast_tensor(op, value, dtype))
+        for key, value in present_key_values
+    ]
 
 
 def _register_hybrid_cache_outputs(
@@ -90,7 +148,9 @@ def _make_gemma4_static_cache_inputs(
     batch: ir.SymbolicDim,
     max_seq_len: int,
     past_seq_len: ir.SymbolicDim | None = None,
-) -> list:
+    *,
+    dtype: ir.DataType | None = None,
+) -> list[Gemma4CacheState]:
     """Create per-layer hybrid KV cache inputs for Gemma4 static cache mode.
 
     Full-attention layers get :class:`StaticCacheState` (TensorScatter).
@@ -112,16 +172,15 @@ def _make_gemma4_static_cache_inputs(
         past_seq_len: Symbolic dim for dynamic cache sequence length.
             Required when the config has sliding-attention layers.
     """
-    from mobius.components._attention import StaticCacheState
-
     local_head_dim = config.head_dim
     global_head_dim = config.global_head_dim or config.head_dim
+    cache_dtype = config.dtype if dtype is None else dtype
     num_kv_shared = config.num_kv_shared_layers or 0
     num_kv_layers = config.num_hidden_layers - num_kv_shared
     layer_types = config.layer_types or (["sliding_attention"] * config.num_hidden_layers)
 
     # Per non-shared layer: static or dynamic cache
-    layer_entries: list[tuple[str, object]] = []  # ("static"|"dynamic", cache)
+    layer_entries: list[tuple[Literal["static", "dynamic"], tuple[ir.Value, ir.Value]]] = []
     for i in range(num_kv_layers):
         lt = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if lt == "full_attention" else local_head_dim
@@ -135,12 +194,12 @@ def _make_gemma4_static_cache_inputs(
             kv_hidden = kv_heads * hd
             key_cache = builder.input(
                 f"key_cache.{i}",
-                dtype=config.dtype,
+                dtype=cache_dtype,
                 shape=[batch, max_seq_len, kv_hidden],
             )
             value_cache = builder.input(
                 f"value_cache.{i}",
-                dtype=config.dtype,
+                dtype=cache_dtype,
                 shape=[batch, max_seq_len, kv_hidden],
             )
             layer_entries.append(("static", (key_cache, value_cache)))
@@ -150,12 +209,12 @@ def _make_gemma4_static_cache_inputs(
             )
             past_key = builder.input(
                 f"past_key_values.{i}.key",
-                dtype=config.dtype,
+                dtype=cache_dtype,
                 shape=[batch, kv_heads, past_seq_len, hd],
             )
             past_value = builder.input(
                 f"past_key_values.{i}.value",
-                dtype=config.dtype,
+                dtype=cache_dtype,
                 shape=[batch, kv_heads, past_seq_len, hd],
             )
             layer_entries.append(("dynamic", (past_key, past_value)))
@@ -177,13 +236,14 @@ def _make_gemma4_static_cache_inputs(
 
     # Build full per-layer list
     entry_iter = iter(layer_entries)
-    full_list: list = []
+    full_list: list[Gemma4CacheState] = []
     for i in range(config.num_hidden_layers):
         if i >= num_kv_layers:
             full_list.append(None)
         else:
             cache_type, pair = next(entry_iter)
             if cache_type == "static":
+                assert write_indices is not None and nonpad_kv_seqlen is not None
                 k, v = pair
                 full_list.append(
                     StaticCacheState(
@@ -203,7 +263,9 @@ def _make_gemma4_kv_cache_inputs(
     config: Gemma4Config,
     batch: ir.SymbolicDim,
     past_seq_len: ir.SymbolicDim,
-) -> list[tuple[ir.Value, ir.Value]]:
+    *,
+    dtype: ir.DataType | None = None,
+) -> list[Gemma4CacheState]:
     """Create per-layer KV cache inputs accounting for dual head_dim and KV sharing.
 
     Uses ``builder.input()`` to create and register graph inputs directly.
@@ -223,6 +285,7 @@ def _make_gemma4_kv_cache_inputs(
     """
     local_head_dim = config.head_dim
     global_head_dim = config.global_head_dim or config.head_dim
+    cache_dtype = config.dtype if dtype is None else dtype
     # Number of layers with independent KV projections
     num_kv_shared = config.num_kv_shared_layers or 0
     num_kv_layers = config.num_hidden_layers - num_kv_shared
@@ -233,7 +296,7 @@ def _make_gemma4_kv_cache_inputs(
             f"num_hidden_layers ({config.num_hidden_layers})"
         )
 
-    pairs: list[tuple[ir.Value, ir.Value]] = []
+    pairs: list[Gemma4CacheState] = []
     for i in range(num_kv_layers):
         layer_type = layer_types[i] if i < len(layer_types) else "sliding_attention"
         hd = global_head_dim if layer_type == "full_attention" else local_head_dim
@@ -246,12 +309,12 @@ def _make_gemma4_kv_cache_inputs(
             kv_heads = config.num_key_value_heads
         past_key = builder.input(
             f"past_key_values.{i}.key",
-            dtype=config.dtype,
+            dtype=cache_dtype,
             shape=[batch, kv_heads, past_seq_len, hd],
         )
         past_value = builder.input(
             f"past_key_values.{i}.value",
-            dtype=config.dtype,
+            dtype=cache_dtype,
             shape=[batch, kv_heads, past_seq_len, hd],
         )
         pairs.append((past_key, past_value))
@@ -327,6 +390,7 @@ class Gemma4TextCausalLMTask(ModelTask):
 
         graph, builder = _make_graph()
         op = builder.op
+        io_dtype = _gemma4_io_dtype(config)
 
         input_ids = builder.input(
             "input_ids",
@@ -354,6 +418,7 @@ class Gemma4TextCausalLMTask(ModelTask):
                 batch,
                 max_seq_len,
                 past_seq_len,
+                dtype=io_dtype,
             )
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -372,7 +437,9 @@ class Gemma4TextCausalLMTask(ModelTask):
                 config,
                 batch,
                 past_seq_len,
+                dtype=io_dtype,
             )
+        past_key_values = _cast_cache_inputs(op, past_key_values, config.dtype)
 
         with prefill_prefix_pruning(self._prune_prefill_prefix):
             result = module(
@@ -387,7 +454,8 @@ class Gemma4TextCausalLMTask(ModelTask):
         else:
             logits, present_key_values = result
             hidden_outputs = None
-        builder.add_output(logits, "logits")
+        builder.add_output(_cast_tensor(op, logits, io_dtype), "logits")
+        present_key_values = _cast_cache_outputs(op, present_key_values, io_dtype)
 
         if static:
             _register_hybrid_cache_outputs(builder, present_key_values, config)
@@ -407,7 +475,10 @@ class Gemma4TextCausalLMTask(ModelTask):
                     f"but output_layer_indices has {len(output_indices)} entr(y/ies)."
                 )
             for idx, hs in zip(output_indices, hidden_outputs):
-                builder.add_output(hs, f"hidden_states.{idx}")
+                builder.add_output(
+                    _cast_tensor(op, hs, io_dtype),
+                    f"hidden_states.{idx}",
+                )
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
 
@@ -538,12 +609,15 @@ class Gemma4Task(ModelTask):
 
         graph, builder = _make_graph(name="decoder")
         op = builder.op
+        caps = ep_capabilities()
+        decoder_io_dtype = _gemma4_io_dtype(config)
 
-        inputs_embeds = builder.input(
+        inputs_embeds_input = builder.input(
             "inputs_embeds",
-            dtype=config.dtype,
+            dtype=decoder_io_dtype,
             shape=[batch, seq_len, config.hidden_size],
         )
+        inputs_embeds = _cast_tensor(op, inputs_embeds_input, config.dtype)
 
         past_seq_len = ir.SymbolicDim("past_sequence_len")
         # A static-cache layer masks itself from ``write_indices`` and
@@ -569,17 +643,17 @@ class Gemma4Task(ModelTask):
         per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         if per_layer_dim and not config.split_per_layer_embedding:
-            caps = ep_capabilities()
             per_layer_shape = (
                 [batch, seq_len, config.num_hidden_layers, per_layer_dim]
                 if caps.layered_per_layer_inputs
                 else [batch, seq_len, config.num_hidden_layers * per_layer_dim]
             )
-            per_layer_inputs_val = builder.input(
+            per_layer_inputs_input = builder.input(
                 "per_layer_inputs",
-                dtype=config.dtype,
+                dtype=decoder_io_dtype,
                 shape=per_layer_shape,
             )
+            per_layer_inputs_val = _cast_tensor(op, per_layer_inputs_input, config.dtype)
 
         # Vision-block bidirectional attention: the decoder receives the raw
         # ``input_ids`` (alongside ``inputs_embeds``) and derives the block
@@ -607,6 +681,7 @@ class Gemma4Task(ModelTask):
                 batch,
                 max_seq_len,
                 past_seq_len,
+                dtype=decoder_io_dtype,
             )
         else:
             past_key_values = _make_gemma4_kv_cache_inputs(
@@ -614,7 +689,9 @@ class Gemma4Task(ModelTask):
                 config,
                 batch,
                 past_seq_len,
+                dtype=decoder_io_dtype,
             )
+        past_key_values = _cast_cache_inputs(op, past_key_values, config.dtype)
 
         with prefill_prefix_pruning(self._prune_prefill_prefix):
             logits, present_key_values = decoder(
@@ -627,7 +704,12 @@ class Gemma4Task(ModelTask):
                 input_ids=input_ids_val,
             )
 
-        builder.add_output(logits, "logits")
+        builder.add_output(_cast_tensor(op, logits, decoder_io_dtype), "logits")
+        present_key_values = _cast_cache_outputs(
+            op,
+            present_key_values,
+            decoder_io_dtype,
+        )
         if static:
             _register_hybrid_cache_outputs(builder, present_key_values, config)
         else:
@@ -663,12 +745,14 @@ class Gemma4Task(ModelTask):
 
         graph, builder = _make_graph(name="vision_encoder")
         op = builder.op
+        io_dtype = _gemma4_io_dtype(config)
 
-        pixel_values = builder.input(
+        pixel_values_input = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=io_dtype,
             shape=[1, num_patches, pixel_dim],
         )
+        pixel_values = _cast_tensor(op, pixel_values_input, config.dtype)
         pixel_position_ids = builder.input(
             "pixel_position_ids",
             dtype=ir.DataType.INT64,
@@ -681,7 +765,7 @@ class Gemma4Task(ModelTask):
             pixel_position_ids=pixel_position_ids,
         )
 
-        builder.add_output(image_features, "image_features")
+        builder.add_output(_cast_tensor(op, image_features, io_dtype), "image_features")
 
         declare_component_presence(graph, "image")
         return _make_model(graph)
@@ -716,12 +800,14 @@ class Gemma4Task(ModelTask):
 
         graph, builder = _make_graph(name="audio_encoder")
         op = builder.op
+        io_dtype = _gemma4_io_dtype(config)
 
-        input_features = builder.input(
+        input_features_input = builder.input(
             "input_features",
-            dtype=config.dtype,
+            dtype=io_dtype,
             shape=[batch, time, input_size],
         )
+        input_features = _cast_tensor(op, input_features_input, config.dtype)
         input_features_mask = builder.input(
             "input_features_mask",
             dtype=ir.DataType.BOOL,
@@ -748,7 +834,7 @@ class Gemma4Task(ModelTask):
             op.Compress(flattened_features_f32, flattened_mask, axis=0),
             flattened_features,
         )
-        builder.add_output(audio_features, "audio_features")
+        builder.add_output(_cast_tensor(op, audio_features, io_dtype), "audio_features")
         builder.add_output(downsampled_mask, "audio_features_mask")
 
         declare_component_presence(graph, "audio")
@@ -766,37 +852,40 @@ class Gemma4Task(ModelTask):
 
         graph, builder = _make_graph(name="embedding")
         op = builder.op
+        io_dtype = _gemma4_io_dtype(config)
 
         input_ids = builder.input(
             "input_ids",
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
-        image_features = builder.input(
+        image_features_input = builder.input(
             "image_features",
-            dtype=config.dtype,
+            dtype=io_dtype,
             shape=[num_image_tokens, config.hidden_size],
         )
         declare_optional_input(
-            image_features,
+            image_features_input,
             presence="image",
             absent_shape=[0, config.hidden_size],
         )
+        image_features = _cast_tensor(op, image_features_input, config.dtype)
 
         audio_features_val: ir.Value | None = None
 
         if config.audio is not None:
             num_audio_tokens = ir.SymbolicDim("num_audio_tokens")
-            audio_features_val = builder.input(
+            audio_features_input = builder.input(
                 "audio_features",
-                dtype=config.dtype,
+                dtype=io_dtype,
                 shape=[num_audio_tokens, config.hidden_size],
             )
             declare_optional_input(
-                audio_features_val,
+                audio_features_input,
                 presence="audio",
                 absent_shape=[0, config.hidden_size],
             )
+            audio_features_val = _cast_tensor(op, audio_features_input, config.dtype)
 
         result = embedding(
             op,
@@ -807,9 +896,15 @@ class Gemma4Task(ModelTask):
 
         # ``embedding`` returns a dict of named outputs: always
         # ``inputs_embeds``; optionally ``per_layer_inputs`` (per-layer gating).
-        builder.add_output(result["inputs_embeds"], "inputs_embeds")
+        builder.add_output(
+            _cast_tensor(op, result["inputs_embeds"], io_dtype),
+            "inputs_embeds",
+        )
         if "per_layer_inputs" in result:
-            builder.add_output(result["per_layer_inputs"], "per_layer_inputs")
+            builder.add_output(
+                _cast_tensor(op, result["per_layer_inputs"], io_dtype),
+                "per_layer_inputs",
+            )
         return _make_model(graph)
 
 
@@ -856,12 +951,14 @@ class Gemma4UnifiedTask(Gemma4Task):
 
         graph, builder = _make_graph(name="vision_encoder")
         op = builder.op
+        io_dtype = _gemma4_io_dtype(config)
 
-        pixel_values = builder.input(
+        pixel_values_input = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=io_dtype,
             shape=[batch, num_patches, pixel_dim],
         )
+        pixel_values = _cast_tensor(op, pixel_values_input, config.dtype)
         pixel_position_ids = builder.input(
             "pixel_position_ids",
             dtype=ir.DataType.INT64,
@@ -873,7 +970,7 @@ class Gemma4UnifiedTask(Gemma4Task):
             pixel_values=pixel_values,
             pixel_position_ids=pixel_position_ids,
         )
-        builder.add_output(image_features, "image_features")
+        builder.add_output(_cast_tensor(op, image_features, io_dtype), "image_features")
         declare_component_presence(graph, "image")
         return _make_model(graph)
 
@@ -900,12 +997,14 @@ class Gemma4UnifiedTask(Gemma4Task):
 
         graph, builder = _make_graph(name="audio_encoder")
         op = builder.op
+        io_dtype = _gemma4_io_dtype(config)
 
-        input_features = builder.input(
+        input_features_input = builder.input(
             "input_features",
-            dtype=config.dtype,
+            dtype=io_dtype,
             shape=[batch, time, audio_embed_dim],
         )
+        input_features = _cast_tensor(op, input_features_input, config.dtype)
         input_features_mask = builder.input(
             "input_features_mask",
             dtype=ir.DataType.BOOL,
@@ -917,6 +1016,6 @@ class Gemma4UnifiedTask(Gemma4Task):
             input_features,
             input_features_mask=input_features_mask,
         )
-        builder.add_output(audio_features, "audio_features")
+        builder.add_output(_cast_tensor(op, audio_features, io_dtype), "audio_features")
         declare_component_presence(graph, "audio")
         return _make_model(graph)

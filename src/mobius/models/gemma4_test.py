@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import dataclasses
 
+import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 import torch
 
@@ -151,6 +153,37 @@ class TestGemma4ModelPreprocessWeights:
 
         with pytest.raises(NotImplementedError, match="Quantized Gemma4 MoE experts"):
             Gemma4Model(config).preprocess_weights(state_dict)
+
+    def test_shared_kv_layer_drops_redundant_kv_weights(self):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            num_hidden_layers=2,
+            num_kv_shared_layers=1,
+            layer_types=["sliding_attention", "sliding_attention"],
+        )
+        state_dict = {
+            "model.language_model.layers.1.self_attn.k_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.k_proj.weight_scales": torch.ones(64, 4),
+            "model.language_model.layers.1.self_attn.v_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.v_proj.weight_scales": torch.ones(64, 4),
+            "model.language_model.layers.1.self_attn.k_norm.weight": torch.ones(16),
+            "model.language_model.layers.1.self_attn.q_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.1.self_attn.q_proj.weight_scales": torch.ones(64, 4),
+        }
+
+        result = Gemma4Model(config).preprocess_weights(state_dict)
+
+        assert not any(
+            token in key for key in result for token in ("k_proj", "v_proj", "k_norm")
+        )
+        assert "decoder.model.layers.1.self_attn.q_proj.weight_qweight" in result
+        assert "decoder.model.layers.1.self_attn.q_proj.weight_scales" in result
 
     def test_olive_quantized_decoder_sidecars_are_preprocessed(self):
         config = _tiny_gemma4_config(
@@ -384,6 +417,8 @@ class TestGemma4PerLayerInputLayout:
         assert len(decoder_input.shape) == expected_rank
         assert len(embedding_output.shape) == expected_rank
         if expected_rank == 4:
+            assert decoder_input.dtype == ir.DataType.FLOAT
+            assert embedding_output.dtype == ir.DataType.FLOAT
             assert list(decoder_input.shape[-2:]) == [
                 config.num_hidden_layers,
                 config.hidden_size_per_layer_input,
@@ -397,6 +432,14 @@ class TestGemma4PerLayerInputLayout:
                 and any(value is decoder_input for value in node.inputs if value is not None)
                 for node in package["decoder"].graph
             )
+            per_layer_gathers = [
+                node
+                for node in package["decoder"].graph
+                if node.op_type == "Gather"
+                and node.attributes.get("axis") is not None
+                and node.attributes["axis"].value == 2
+            ]
+            assert len(per_layer_gathers) == config.num_hidden_layers
         else:
             assert (
                 decoder_input.shape[-1]
@@ -405,6 +448,224 @@ class TestGemma4PerLayerInputLayout:
             assert (
                 embedding_output.shape[-1]
                 == config.num_hidden_layers * config.hidden_size_per_layer_input
+            )
+
+
+class TestGemma4OpenVINOAttention:
+    @staticmethod
+    def _fill_matching_random_weights(*models: ir.Model) -> None:
+        rng = np.random.default_rng(0)
+        initializer_names = sorted(
+            set().union(*(model.graph.initializers for model in models))
+        )
+        for name in initializer_names:
+            values = [
+                model.graph.initializers.get(name)
+                for model in models
+                if name in model.graph.initializers
+            ]
+            unfilled = [value for value in values if value.const_value is None]
+            if not unfilled:
+                continue
+            shapes = {tuple(int(dim) for dim in value.shape) for value in unfilled}
+            assert len(shapes) == 1, (name, shapes)
+            data = rng.standard_normal(next(iter(shapes))).astype(np.float32) * 0.03
+            for value in unfilled:
+                value.const_value = ir.tensor(data.copy())
+
+    @staticmethod
+    def _run(
+        session: ort.InferenceSession,
+        feeds: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        return dict(
+            zip(
+                (output.name for output in session.get_outputs()),
+                session.run(None, feeds),
+            )
+        )
+
+    def test_openvino_emits_rank4_attention_topology(self):
+        from collections import Counter
+
+        from mobius._builder import build_from_module
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            hidden_size_per_layer_input=8,
+            vocab_size_per_layer_input=256,
+            num_kv_shared_layers=0,
+        )
+        package = build_from_module(
+            Gemma4Model(config),
+            config,
+            task=Gemma4Task(),
+            execution_provider="openvino",
+        )
+        counts = Counter(node.op_type for node in package["decoder"].graph)
+        decoder = package["decoder"].graph
+        inputs_embeds = next(
+            value for value in decoder.inputs if value.name == "inputs_embeds"
+        )
+        logits = next(value for value in decoder.outputs if value.name == "logits")
+
+        assert counts["Attention"] == config.num_hidden_layers
+        assert counts["RotaryEmbedding"] == 0
+        assert counts["Softmax"] == 0
+        assert counts["CumSum"] == 1
+        assert inputs_embeds.dtype == ir.DataType.FLOAT
+        assert logits.dtype == ir.DataType.FLOAT
+
+    def test_openvino_fp16_packages_use_float32_float_boundaries(self):
+        from mobius._builder import build_from_module
+        from mobius.tasks._gemma4 import Gemma4Task, Gemma4TextCausalLMTask
+
+        config = _tiny_gemma4_config(
+            dtype=ir.DataType.FLOAT16,
+            enable_moe_block=False,
+            num_kv_shared_layers=0,
+            audio=Gemma4AudioConfig(
+                input_size=32,
+                num_layers=1,
+                hidden_size=32,
+                output_proj_dims=64,
+                subsampling_conv_channels=[16, 8],
+                audio_token_id=254,
+            ),
+        )
+        package = build_from_module(
+            Gemma4Model(config),
+            config,
+            task=Gemma4Task(),
+            execution_provider="openvino",
+        )
+        text_model = build_from_module(
+            Gemma4CausalLMModel(config),
+            config,
+            task=Gemma4TextCausalLMTask(),
+            execution_provider="openvino",
+        )["model"]
+
+        floating_types = {
+            ir.DataType.FLOAT,
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+        }
+        for model in (*package.values(), text_model):
+            boundary_values = (*model.graph.inputs, *model.graph.outputs)
+            assert all(
+                value.dtype == ir.DataType.FLOAT
+                for value in boundary_values
+                if value.dtype in floating_types
+            )
+
+    def test_openvino_prefill_and_cached_decode_match_standard_attention(self):
+        from mobius._builder import build_from_module
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            num_kv_shared_layers=0,
+            attention_k_eq_v=False,
+            rope_interleave=True,
+            sliding_window=64,
+            max_position_embeddings=32,
+        )
+        models = {
+            execution_provider: build_from_module(
+                Gemma4CausalLMModel(config),
+                config,
+                task=Gemma4TextCausalLMTask(),
+                execution_provider=execution_provider,
+            )["model"]
+            for execution_provider in ("default", "openvino")
+        }
+        self._fill_matching_random_weights(*models.values())
+
+        openvino_available = "OpenVINOExecutionProvider" in ort.get_available_providers()
+        openvino_providers = (
+            ["OpenVINOExecutionProvider"] if openvino_available else ["CPUExecutionProvider"]
+        )
+        sessions = {
+            "default": ort.InferenceSession(
+                ir.serde.serialize_model(models["default"]).SerializeToString(),
+                providers=["CPUExecutionProvider"],
+            ),
+            "openvino": ort.InferenceSession(
+                ir.serde.serialize_model(models["openvino"]).SerializeToString(),
+                providers=openvino_providers,
+            ),
+        }
+        if openvino_available:
+            assert sessions["openvino"].get_providers()[0] == "OpenVINOExecutionProvider"
+
+        empty_cache = {
+            "past_key_values.0.key": np.zeros((1, 2, 0, 16), dtype=np.float32),
+            "past_key_values.0.value": np.zeros((1, 2, 0, 16), dtype=np.float32),
+            "past_key_values.1.key": np.zeros((1, 1, 0, 32), dtype=np.float32),
+            "past_key_values.1.value": np.zeros((1, 1, 0, 32), dtype=np.float32),
+        }
+        prompt = np.array([[1, 2, 3]], dtype=np.int64)
+        prefill_feeds = {
+            "input_ids": prompt,
+            "attention_mask": np.ones((1, 3), dtype=np.int64),
+            "position_ids": np.arange(3, dtype=np.int64)[None, :],
+            **empty_cache,
+        }
+        prefill = {
+            name: self._run(session, prefill_feeds) for name, session in sessions.items()
+        }
+        for output_name, expected in prefill["default"].items():
+            np.testing.assert_allclose(
+                prefill["openvino"][output_name],
+                expected,
+                rtol=1e-4,
+                atol=1e-5,
+                strict=True,
+            )
+
+        next_token = np.array([[4]], dtype=np.int64)
+        decode = {}
+        for name, session in sessions.items():
+            decode_feeds = {
+                "input_ids": next_token,
+                "attention_mask": np.ones((1, 4), dtype=np.int64),
+                "position_ids": np.array([[3]], dtype=np.int64),
+            }
+            for layer in range(config.num_hidden_layers):
+                decode_feeds[f"past_key_values.{layer}.key"] = prefill[name][
+                    f"present.{layer}.key"
+                ]
+                decode_feeds[f"past_key_values.{layer}.value"] = prefill[name][
+                    f"present.{layer}.value"
+                ]
+            decode[name] = self._run(session, decode_feeds)
+
+        for output_name, expected in decode["default"].items():
+            np.testing.assert_allclose(
+                decode["openvino"][output_name],
+                expected,
+                rtol=1e-4,
+                atol=1e-5,
+                strict=True,
+            )
+
+        full_prompt = np.concatenate((prompt, next_token), axis=1)
+        full_feeds = {
+            "input_ids": full_prompt,
+            "attention_mask": np.ones((1, 4), dtype=np.int64),
+            "position_ids": np.arange(4, dtype=np.int64)[None, :],
+            **empty_cache,
+        }
+        for name, session in sessions.items():
+            full = self._run(session, full_feeds)
+            np.testing.assert_allclose(
+                decode[name]["logits"][:, -1],
+                full["logits"][:, -1],
+                rtol=1e-4,
+                atol=1e-5,
+                strict=True,
             )
 
 
