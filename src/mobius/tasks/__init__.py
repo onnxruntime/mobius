@@ -71,6 +71,9 @@ __all__ = [
     "KimiLinearCausalLMTask",
     "Lfm2VlTask",
     "ModelTask",
+    "NemotronHOmniTask",
+    "SourceChunkHybridCausalLMTask",
+    "SourceChunkNemotronHOmniTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
     "Mistral4GGUFCausalLMTask",
@@ -188,6 +191,7 @@ from mobius.tasks._minimax_music3 import (
 from mobius.tasks._mistral4_gguf import Mistral4GGUFCausalLMTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
+from mobius.tasks._nemotron_h_omni import NemotronHOmniTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._plamo import PlamoCausalLMTask
@@ -203,6 +207,10 @@ from mobius.tasks._qwen_image_vae import QwenImageEditVAETask, QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
 from mobius.tasks._sensenova_u1 import SenseNovaU1Task
 from mobius.tasks._seq2seq import Seq2SeqTask
+from mobius.tasks._source_chunk import (
+    SourceChunkHybridCausalLMTask,
+    SourceChunkNemotronHOmniTask,
+)
 from mobius.tasks._speech_enhancement import SpeechEnhancementTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
@@ -269,6 +277,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "t5-text-encoding": T5TextEncoderTask,
     "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
+    "nemotron-h-omni": NemotronHOmniTask,
     "hy-v3-mtp": HyV3MtpTask,
     "kimi-k3-text-generation": KimiK3CausalLMTask,
     "kimi-linear-text-generation": KimiLinearCausalLMTask,

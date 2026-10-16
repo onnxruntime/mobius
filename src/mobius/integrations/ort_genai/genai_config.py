@@ -352,7 +352,7 @@ class GenaiConfigGenerator:
         filename: str = "vision_encoder/model.onnx",
         embedding_filename: str = "embedding/model.onnx",
         spatial_merge_size: int | None = 2,
-        config_filename: str = "image_processor.json",
+        config_filename: str | None = "image_processor.json",
         input_names: dict[str, str] | None = None,
         output_names: dict[str, str] | None = None,
         embedding_input_names: dict[str, str] | None = None,
@@ -375,7 +375,8 @@ class GenaiConfigGenerator:
             spatial_merge_size: Spatial merge size for position ID
                 computation. Set to ``None`` to omit (e.g. for Phi4MM
                 which doesn't use spatial merge).
-            config_filename: Vision processor config filename.
+            config_filename: Vision processor config filename, or ``None`` for
+                externally prepared features without an ORT-extensions processor.
             input_names: Override vision model input name mapping.
                 Defaults to pixel_values + image_grid_thw.
             output_names: Override vision model output name mapping.
@@ -415,7 +416,6 @@ class GenaiConfigGenerator:
 
         self._vision = {
             "filename": filename,
-            "config_filename": config_filename,
             "inputs": input_names,
             "outputs": output_names,
             "session_options": _make_session_options(
@@ -424,6 +424,8 @@ class GenaiConfigGenerator:
                 provider_options=vision_provider_options,
             ),
         }
+        if config_filename is not None:
+            self._vision["config_filename"] = config_filename
         if spatial_merge_size is not None:
             self._vision["spatial_merge_size"] = spatial_merge_size
         if tokens_per_second is not None:
@@ -579,7 +581,7 @@ class GenaiConfigGenerator:
             context_length=self.context_length,
             supports_in_place_kv_cache=self._supports_in_place_kv_cache,
         )
-        if self.model_type in {"lfm2", "lfm2_vl"}:
+        if self.model_type in {"lfm2", "lfm2_vl", "nemotron_h_omni"}:
             # ORT GenAI's LFM2 cache mixes fixed convolution windows with
             # dynamic attention KV; shared in-place KV buffers are unsupported.
             search["past_present_share_buffer"] = False
@@ -618,6 +620,12 @@ class GenaiConfigGenerator:
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,
         }
+        if self.model_type == "nemotron_h_omni":
+            runtime_layer_types = {"mamba2": "mamba", "full_attention": "attention"}
+            decoder["layer_types"] = [
+                runtime_layer_types.get(layer_type, layer_type)
+                for layer_type in self._layer_types or []
+            ]
         if self.model_type in {"lfm2", "lfm2_vl"}:
             decoder["layer_types"] = self._layer_types or []
             decoder["conv_cache_size"] = (

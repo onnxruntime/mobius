@@ -19,7 +19,7 @@ from mobius._component_quantization import (
     normalize_component_quantized_weights,
     validate_quantized_component_bindings,
 )
-from mobius._configs import QuantizedWeightFormat
+from mobius._configs import NemotronHOmniConfig, QuantizedWeightFormat
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius._weight_utils import WeightTransform
@@ -409,6 +409,14 @@ def build_transformers_model(
     detection_revision = revision
     vibevoice_sources = None
     config_model_id = model_id
+    if (
+        model_id == "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"
+        and detection_revision is None
+    ):
+        from mobius.models.nemotron_h_omni import BOLT_REVISION
+
+        revision = BOLT_REVISION
+        detection_revision = BOLT_REVISION
     if "vibevoice" in model_id.casefold():
         from mobius.models.vibevoice import resolve_vibevoice_sources
 
@@ -612,6 +620,20 @@ def build_transformers_model(
             "for the Microsoft W4A16/W8A16 custom-op ABI. Use dtype='f16' or "
             "set keep_quantized=False (--dequantize)."
         )
+    if model_type == "nemotron_h_omni" and getattr(config, "quantized_projections", None):
+        if not isinstance(config, NemotronHOmniConfig):
+            raise TypeError("Native Omni projections require NemotronHOmniConfig")
+        if not keep_quantized:
+            raise NotImplementedError(
+                "Native Omni does not support --dequantize; a BF16 reconstruction "
+                "must be a separate, explicitly labeled diagnostic."
+            )
+        if execution_provider != "cuda":
+            raise ValueError("Native Omni mixed-format weights require explicit CUDA export")
+        if any(
+            item.quant_algo == "W4A16_NVFP4" for item in config.quantized_projections.values()
+        ) and config.dtype not in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+            raise ValueError("Native Omni NVFP4 requires dtype='bf16' or dtype='f16'")
     config, dequantize_gptoss_mxfp4 = _apply_gptoss_mxfp4_source_policy(
         config,
         is_gptoss_mxfp4_source=is_gptoss_mxfp4_source,
@@ -677,6 +699,7 @@ def build_transformers_model(
     for name, model in package.items():
         model.graph.name = f"{graph_source_name}/{name}"
         if model_type in _QWEN4_MODEL_TYPES | {
+            "nemotron_h_omni",
             "vibevoice",
             "vibevoice_streaming",
             "vibevoice_asr",
@@ -693,7 +716,17 @@ def build_transformers_model(
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
-        if is_gptoss_mxfp4_source and keep_quantized:
+        if model_type == "nemotron_h_omni":
+            from mobius.integrations.transformers._nemotron_h_omni_weights import (
+                stream_nemotron_h_omni_safetensors_to_package,
+            )
+
+            if not isinstance(config, NemotronHOmniConfig):
+                raise TypeError("Nemotron-H Omni requires its explicit nested configuration")
+            stream_nemotron_h_omni_safetensors_to_package(
+                package, model_id, config, revision=revision
+            )
+        elif is_gptoss_mxfp4_source and keep_quantized:
             from mobius.integrations.transformers._gptoss_weights import (
                 stream_gptoss_mxfp4_safetensors_to_package,
             )
