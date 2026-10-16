@@ -26,6 +26,61 @@ _PAIRS = [
     for length in (1, 127, 128, 129, 255, 256, 257)
     for mask in ("ones", "left", "right", "holes", "zero_row")
 ]
+_ADAPTER_FIXTURE_MANIFEST_SHA256 = (
+    "8520a2d3cd2085f1307946f8e2b9f13e8165b76285a54d36b5bf58d6b61587ad"
+)
+
+
+def _adapter_fixture_path(name: str, output: Path) -> Path:
+    configured = os.environ.get("MOBIUS_CHUNK_ADAPTER_FIXTURES")
+    if not configured:
+        raise ValueError("Set MOBIUS_CHUNK_ADAPTER_FIXTURES to the sealed adapter inputs")
+    root = Path(configured).resolve()
+    output = output.resolve()
+    if root.is_relative_to(output) or output.is_relative_to(root):
+        raise ValueError("Adapter fixture inputs and evidence output must be separate")
+    manifest_bytes = (root / "artifact-manifest.json").read_bytes()
+    assert hashlib.sha256(manifest_bytes).hexdigest() == _ADAPTER_FIXTURE_MANIFEST_SHA256
+    entry = json.loads(manifest_bytes)["files"][name]
+    path = root / name
+    raw = path.read_bytes()
+    assert len(raw) == entry["bytes"]
+    assert hashlib.sha256(raw).hexdigest() == entry["sha256"]
+    return path
+
+
+@pytest.mark.parametrize("placement", ["same", "nested", "parent"])
+def test_adapter_fixture_inputs_cannot_be_evidence_output(tmp_path, monkeypatch, placement):
+    inputs = tmp_path / "inputs"
+    output = {"same": inputs, "nested": inputs / "outputs", "parent": tmp_path}[placement]
+    monkeypatch.setenv("MOBIUS_CHUNK_ADAPTER_FIXTURES", str(inputs))
+    with pytest.raises(ValueError, match="must be separate"):
+        _adapter_fixture_path("unused.npz", output)
+
+
+def test_adapter_fixture_inputs_do_not_fall_back_to_evidence(tmp_path, monkeypatch):
+    monkeypatch.delenv("MOBIUS_CHUNK_ADAPTER_FIXTURES", raising=False)
+    with pytest.raises(ValueError, match="MOBIUS_CHUNK_ADAPTER_FIXTURES"):
+        _adapter_fixture_path("unused.npz", tmp_path)
+
+
+def test_adapter_fixture_inputs_require_pinned_manifest(tmp_path, monkeypatch):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    (inputs / "artifact-manifest.json").write_text("{}")
+    monkeypatch.setenv("MOBIUS_CHUNK_ADAPTER_FIXTURES", str(inputs))
+    with pytest.raises(AssertionError):
+        _adapter_fixture_path("unused.npz", tmp_path / "output")
+
+
+def test_adapter_fixture_inputs_are_protected_before_worker_setup(tmp_path, monkeypatch):
+    inputs = tmp_path / "inputs"
+    monkeypatch.setenv("MOBIUS_CHUNK_PREFILL_FIXTURES", "configured")
+    monkeypatch.setenv("MOBIUS_CHUNK_ADAPTER_FIXTURES", str(inputs))
+    monkeypatch.setenv("MOBIUS_CHUNK_ADAPTER_EVIDENCE", str(inputs))
+    with pytest.raises(ValueError, match="must be separate"):
+        next(worker.__wrapped__())
+    assert not inputs.exists()
 
 
 def _parameter(parameter, value):
@@ -101,13 +156,16 @@ def _readout_graph(
 def worker():
     if not os.environ.get("MOBIUS_CHUNK_PREFILL_FIXTURES"):
         pytest.skip("requires explicitly configured sealed source fixtures")
+    directory = Path(os.environ["MOBIUS_CHUNK_ADAPTER_EVIDENCE"])
+    if os.environ.get("MOBIUS_CHUNK_ADAPTER_FIXTURES"):
+        # Reject overlapping roots before creating runtime/evidence files.
+        _adapter_fixture_path("receipt.json", directory)
     from bolt_ort_worker import RemoteOrt
 
-    directory = Path(os.environ["MOBIUS_CHUNK_ADAPTER_EVIDENCE"])
     directory.mkdir(parents=True, exist_ok=True)
     remote = RemoteOrt(
         directory / ("worker-" + uuid.uuid4().hex),
-        gpu="0",
+        gpu=os.environ.get("MOBIUS_CHUNK_ADAPTER_GPU", "0"),
         build=os.environ["MOBIUS_CHUNK_PREFILL_ORT_BUILD"],
     )
     (directory / "runtime.json").write_text(json.dumps(remote.info, indent=2) + "\n")
@@ -425,8 +483,14 @@ def test_cuda_source_mask_offset_is_independent_of_successful_cache_phase(worker
 def test_cuda_production_prefill_primitive_integration_and_source_diagnostics(worker, name):
     remote, directory = worker
     values, metadata = _core._load_fixture(name)
-    source_path = directory / (name + "-source-native-prepared-initial-none.npz")
-    source_metadata = json.loads(source_path.with_suffix(".json").read_text())
+    source_path = _adapter_fixture_path(
+        name + "-source-native-prepared-initial-none.npz", directory
+    )
+    source_metadata = json.loads(
+        _adapter_fixture_path(
+            name + "-source-native-prepared-initial-none.json", directory
+        ).read_text()
+    )
     assert (
         hashlib.sha256(source_path.read_bytes()).hexdigest()
         == source_metadata["output_sha256"]
@@ -434,7 +498,7 @@ def test_cuda_production_prefill_primitive_integration_and_source_diagnostics(wo
     assert source_metadata["sealed_input_fixture_sha256"] == metadata["npz_sha256"]
     assert source_metadata["initial_states"] is None
     assert source_metadata["native_preparation_control"]["enabled"]
-    preparation_path = directory / (name + "-native-preparation.npz")
+    preparation_path = _adapter_fixture_path(name + "-native-preparation.npz", directory)
     assert (
         hashlib.sha256(preparation_path.read_bytes()).hexdigest()
         == source_metadata["native_preparation_control"]["preparation_npz_sha256"]
@@ -493,7 +557,7 @@ def test_cuda_production_prefill_primitive_integration_and_source_diagnostics(wo
     np.testing.assert_array_equal(actual[0], primitive[0].reshape(batch, length, heads * p))
     np.testing.assert_array_equal(actual[1], primitive[1].transpose(0, 1, 3, 2))
     with np.load(
-        directory / (name + "-source-native-prepared-intermediates.npz")
+        _adapter_fixture_path(name + "-source-native-prepared-intermediates.npz", directory)
     ) as intermediates:
         source_decay = intermediates["dA"].transpose(2, 0, 1, 3)
         source_cb = intermediates["CB"].transpose(1, 0, 2, 3, 4)
@@ -517,7 +581,9 @@ def test_cuda_production_prefill_primitive_integration_and_source_diagnostics(wo
     )
     for a, b in zip(actual, clean):
         np.testing.assert_array_equal(a, b)
-    with np.load(directory / (name + "-source-model-initial-none.npz")) as raw:
+    with np.load(
+        _adapter_fixture_path(name + "-source-model-initial-none.npz", directory)
+    ) as raw:
         raw_readout = _metrics(actual[0], raw["no_D"].reshape(batch, length, heads * p))
         raw_state = _metrics(actual[1], raw["final_state"].transpose(0, 1, 3, 2))
     (directory / (name + "-adapter-result.json")).write_text(
@@ -535,6 +601,8 @@ def test_cuda_production_prefill_primitive_integration_and_source_diagnostics(wo
                 ),
                 "integration_gate": "BITWISE accepted public primitive on identical native-prepared operands; FP32 D*x + readout then sole native store",
                 "source_zero_initial_sha256": source_metadata["output_sha256"],
+                "source_fixture_root": str(source_path.parent),
+                "source_fixture_manifest_sha256": _ADAPTER_FIXTURE_MANIFEST_SHA256,
                 "raw_source_preparation_comparison": {
                     "readout": raw_readout,
                     "state": raw_state,
