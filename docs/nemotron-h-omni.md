@@ -327,10 +327,33 @@ weight saving. A separately labeled session-only probe with
 with 98 inputs, 97 outputs and zero inference requests. Child logs confirm
 the policy change and otherwise matching options. This isolates a
 reuse-gated allocation-planner problem, not its exact algorithmic cause.
-Numerical qualification of this explicit allocation-policy variant and
-actual GenAI qualification remain separate pending gates; graph
-optimization, arithmetic, providers and acceptance thresholds are unchanged.
-The original v7 failures remain preserved; multimodal generation is held
+Full numerical qualification of this explicit allocation-policy variant
+now fails the unchanged gates. Graph optimization, arithmetic, providers,
+the reference and thresholds were not changed:
+
+| Category | Result |
+|---|---|
+| Ordinary eight-token identity | PASS: exact `[1049,1044,1032,1050,1044,1032,1051,1044]` |
+| Logits | PASS: 8/8 arrays |
+| KV cache | FAIL: 105/128 pass; all 64 keys and 41/64 values |
+| Convolution state | FAIL: 192/320 arrays pass |
+| SSM state | PASS: 320/320 arrays |
+| Hidden states | FAIL: 445/712 arrays pass |
+| Hidden instrumentation invariance | PASS: all 776 common outputs byte-identical |
+| Actual v8 GenAI generation | NOT_RUN: default-policy creation stalled before inference |
+
+All compared outputs are finite. The first state failure is prefill
+layer36's value cache, NRMSE 0.036415. Using the source hidden input for
+that projection reduces NRMSE to 0.00001019, identifying propagated
+upstream drift rather than its original primitive cause. Upstream
+localization remains required; no compensating arithmetic change is
+justified by this downstream failure.
+
+Separately instrumented V8 initialization confirms over 150 million
+allocation-planner free-list candidate visits. A small cast-only
+reproducer demonstrates quadratic scanning; an independent planner fix
+does not establish numerical parity. The default-policy v8 timeout and
+original v7 failures remain preserved. Multimodal generation remains held
 until ordinary decoder numerical correctness passes.
 
 Actual exported-v8 vision independently passes the original image,
