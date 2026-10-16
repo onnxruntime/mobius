@@ -13,6 +13,7 @@ __all__ = [
     "CausalConvNd",
     "CausalDepthwiseConv1d",
     "CausalTransConv1d",
+    "ChunkedPrefillScan",
     "ConformerEncoder",
     "Conv1d",
     "Conv2d",
@@ -187,6 +188,7 @@ from mobius.components._attention import (
     Qwen35Attention as Qwen35Attention,
 )
 from mobius.components._audio import ConformerEncoder
+from mobius.components._chunked_prefill import ChunkedPrefillScan
 from mobius.components._clip_sidecars import (
     MeralionAudioSidecar,
     MeralionProjector,
