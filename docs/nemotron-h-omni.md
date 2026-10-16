@@ -32,6 +32,12 @@ Preserve checkpoint caches and previous evidence. Export size is not a
 measurement of peak runtime VRAM, and the model name is not a measured
 24 GB deployment guarantee.
 
+The draft [Olive native-preservation recipe](https://github.com/microsoft/Olive/pull/2733)
+uses existing model handlers to validate an exported package without
+optimization, requantization or full-model copies. Its 22 focused tests and
+tiny actual CUDA IQ2 execution pass, including rejection of unsupported
+stock runtimes. This is package/operator evidence, not full-model readiness.
+
 ## Required native operator contracts
 
 The mixed-format decoder requires CUDA operators from
@@ -315,9 +321,33 @@ comparison. V8's first ordinary attempt hit the validation client's
 600-second timeout during decoder session creation, before any inference
 steps. Its numerical comparison and hidden/instrumentation-invariance
 checks are therefore **NOT_RUN**, not numerical failures. Session-load
-diagnosis and actual GenAI qualification are separate pending gates.
+diagnosis localizes the delay after OrtValue mapping and before initialized
+weight saving. A separately labeled session-only probe with
+`enable_mem_reuse=False` initializes the same decoder in 102.946448 seconds,
+with 98 inputs, 97 outputs and zero inference requests. Child logs confirm
+the policy change and otherwise matching options. This isolates a
+reuse-gated allocation-planner problem, not its exact algorithmic cause.
+Numerical qualification of this explicit allocation-policy variant and
+actual GenAI qualification remain separate pending gates; graph
+optimization, arithmetic, providers and acceptance thresholds are unchanged.
 The original v7 failures remain preserved; multimodal generation is held
 until ordinary decoder numerical correctness passes.
+
+Actual exported-v8 vision independently passes the original image,
+five-frame and seven-frame cases on H100/runtime-v4. Their respective
+NRMSE values are 0.007395, 0.010337 and 0.009237; cosine similarities are
+0.999973, 0.999947 and 0.999957. Outputs are finite, retention masks and
+indices are exact, and all eight calls match v7 outputs bitwise. Provider
+auditing finds 53 CPU shape/count-only nodes. These are actual v8
+vision-only results, not an embedding, decoder or multimodal-generation
+qualification.
+
+The integrated source head `6bbe4220d51a308fd569e52c137021859e0f95f3` also
+passes the
+[remote L1 smoke test](https://github.com/onnxruntime/mobius/actions/runs/38829579175/job/116745323327)
+and
+[L3 synthetic parity](https://github.com/onnxruntime/mobius/actions/runs/38829579175/job/116745323424).
+Those software checks do not override the outstanding full-model gates.
 
 A subsequent type guard preserves each existing layer's epsilon before norm
 replacement. Full pinned-config builds before and after that guard have
