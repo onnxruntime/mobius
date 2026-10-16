@@ -57,7 +57,19 @@ def test_puzzle_mamba_precision_is_scoped_to_puzzle():
     ]
 
 
-def test_puzzle_all88_outer_norms_and_final_norm_keep_parameter_names():
+@pytest.mark.parametrize("vary_layer_eps", [False, True])
+def test_puzzle_all88_outer_norms_and_final_norm_keep_parameter_names(
+    monkeypatch, vary_layer_eps
+):
+    initialize = _NemotronHTextModel.__init__
+
+    def initialize_with_layer_eps(model, config):
+        initialize(model, config)
+        if vary_layer_eps:
+            for index, layer in enumerate(model.layers):
+                layer.norm.variance_epsilon = (index + 1) * 1e-5
+
+    monkeypatch.setattr(_NemotronHTextModel, "__init__", initialize_with_layer_eps)
     config = NemotronHConfig(
         hidden_size=4,
         intermediate_size=8,
@@ -84,6 +96,9 @@ def test_puzzle_all88_outer_norms_and_final_norm_keep_parameter_names():
     assert type(puzzle.norm) is Float32RMSNorm
     assert all(type(layer.norm) is RMSNorm for layer in original.layers)
     assert type(original.norm) is RMSNorm
+    assert [layer.norm.variance_epsilon for layer in puzzle.layers] == [
+        layer.norm.variance_epsilon for layer in original.layers
+    ]
     assert [(n, list(p.shape)) for n, p in original.named_parameters()] == [
         (n, list(p.shape)) for n, p in puzzle.named_parameters()
     ]
