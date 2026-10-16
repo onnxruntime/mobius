@@ -1262,8 +1262,11 @@ def test_bfloat16_vision_export_guard_uses_cast_weight_dtype(config_dtype, ep):
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_standard_moe_low_precision_execution_and_routing(dtype, normalize, device):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA is unavailable")
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA PyTorch and ORT are required")
     np_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else ml_dtypes.bfloat16
     config = _config(dtype=dtype, num_experts_per_tok=1, norm_topk_prob=normalize)
     model = _standard_experts(config, [1, 1, 16])
@@ -3160,11 +3163,36 @@ def _assert_reduced_float_parity(actual, reference, *, tolerance, err_msg=""):
 
 def _reduced_initial_states(dtype):
     states = _initial_states()
-    if dtype == ir.DataType.BFLOAT16:
+    if dtype != ir.DataType.FLOAT:
+        np_dtype = {
+            ir.DataType.FLOAT16: np.float16,
+            ir.DataType.BFLOAT16: ml_dtypes.bfloat16,
+        }[dtype]
+        # Recurrent accumulators stay FP32 when convolution and KV caches use low precision.
         for name, value in states.items():
             if value.dtype == np.float32 and not name.endswith(".recurrent_state"):
-                states[name] = value.astype(ml_dtypes.bfloat16)
+                states[name] = value.astype(np_dtype)
     return states
+
+
+@pytest.mark.parametrize(
+    "dtype,np_dtype",
+    [
+        (ir.DataType.FLOAT, np.float32),
+        (ir.DataType.FLOAT16, np.float16),
+        (ir.DataType.BFLOAT16, ml_dtypes.bfloat16),
+    ],
+)
+def test_reduced_initial_state_dtypes(dtype, np_dtype):
+    states = _reduced_initial_states(dtype)
+    for name, value in _initial_states().items():
+        expected_dtype = (
+            np_dtype
+            if value.dtype == np.float32 and not name.endswith(".recurrent_state")
+            else value.dtype
+        )
+        assert states[name].dtype == np.dtype(expected_dtype)
+        assert states[name].shape == value.shape
 
 
 def _assert_reduced_huggingface_states(outputs, cache, *, multimodal=False, tolerance=1e-3):
@@ -3204,22 +3232,30 @@ def _assert_reduced_huggingface_states(outputs, cache, *, multimodal=False, tole
     [
         ("cpu", ir.DataType.FLOAT),
         ("cuda", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT16),
         ("cuda", ir.DataType.BFLOAT16),
     ],
-    ids=["cpu-f32", "cuda-f32", "cuda-bf16"],
+    ids=["cpu-f32", "cuda-f32", "cuda-f16", "cuda-bf16"],
 )
 def test_reduced_standard_huggingface_cached_logits_and_states(device, dtype):
     """Check every cache against HF through prefill, sparse selection, and greedy decode."""
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA PyTorch and ORT are required")
     try:
         from transformers import DynamicCache, Qwen4ExpForCausalLM
     except ImportError:
         pytest.skip("Installed transformers does not contain Qwen4-Exp")
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA is unavailable")
 
     torch.manual_seed(17)
-    torch_dtype = torch.bfloat16 if dtype == ir.DataType.BFLOAT16 else torch.float32
-    tolerance = 1e-2 if dtype == ir.DataType.BFLOAT16 else 1e-3
+    torch_dtype = {
+        ir.DataType.FLOAT: torch.float32,
+        ir.DataType.FLOAT16: torch.float16,
+        ir.DataType.BFLOAT16: torch.bfloat16,
+    }[dtype]
+    tolerance = 1e-3 if dtype == ir.DataType.FLOAT else 1e-2
     hf_config = _reduced_huggingface_text_config(num_experts_per_tok=2, dtype=torch_dtype)
     hf_model = Qwen4ExpForCausalLM(hf_config).to(torch_dtype).eval()
     config = Qwen4ExpConfig.from_transformers(hf_config)
@@ -3293,11 +3329,17 @@ def test_reduced_standard_huggingface_cached_logits_and_states(device, dtype):
     [
         ("cpu", ir.DataType.FLOAT),
         ("cuda", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT16),
     ],
-    ids=["cpu-f32", "cuda-f32"],
+    ids=["cpu-f32", "cuda-f32", "cuda-f16"],
 )
 def test_reduced_standard_huggingface_image_pipeline_and_decode(device, dtype):
     """Compare nonzero two-image vision, fusion, logits, and cached no-image decode."""
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA PyTorch and ORT are required")
     try:
         from transformers import (
             DynamicCache,
@@ -3311,13 +3353,11 @@ def test_reduced_standard_huggingface_image_pipeline_and_decode(device, dtype):
         )
     except ImportError:
         pytest.skip("Installed transformers does not contain Qwen4-Exp")
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA is unavailable")
 
     torch.manual_seed(23)
-    torch_dtype = torch.bfloat16 if dtype == ir.DataType.BFLOAT16 else torch.float32
-    np_dtype = ml_dtypes.bfloat16 if dtype == ir.DataType.BFLOAT16 else np.float32
-    tolerance = 1e-2 if dtype == ir.DataType.BFLOAT16 else 1e-3
+    torch_dtype = torch.float16 if dtype == ir.DataType.FLOAT16 else torch.float32
+    np_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
+    tolerance = 1e-3 if dtype == ir.DataType.FLOAT else 1e-2
     text_config = _reduced_huggingface_text_config(
         num_experts_per_tok=2,
         dtype=torch_dtype,
@@ -3492,3 +3532,32 @@ def test_reduced_standard_huggingface_image_pipeline_and_decode(device, dtype):
         vision.close()
         embedding.close()
         decoder.close()
+
+
+@pytest.mark.parametrize(
+    "test,kwargs",
+    [
+        (
+            test_standard_moe_low_precision_execution_and_routing,
+            {"dtype": ir.DataType.FLOAT16, "normalize": True},
+        ),
+        (
+            test_reduced_standard_huggingface_cached_logits_and_states,
+            {"dtype": ir.DataType.FLOAT16},
+        ),
+        (
+            test_reduced_standard_huggingface_image_pipeline_and_decode,
+            {"dtype": ir.DataType.FLOAT16},
+        ),
+    ],
+    ids=["moe", "text", "image-text"],
+)
+@pytest.mark.parametrize("torch_cuda,ort_cuda", [(True, False), (False, True), (False, False)])
+def test_cuda_parity_requires_both_backends(monkeypatch, test, kwargs, torch_cuda, ort_cuda):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: torch_cuda)
+    providers = ["CPUExecutionProvider"]
+    if ort_cuda:
+        providers.append("CUDAExecutionProvider")
+    monkeypatch.setattr(ort, "get_available_providers", lambda: providers)
+    with pytest.raises(pytest.skip.Exception, match="CUDA PyTorch and ORT are required"):
+        test(device="cuda", **kwargs)

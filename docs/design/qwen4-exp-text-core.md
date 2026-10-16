@@ -163,19 +163,21 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m pytest \
   -k "reduced_random_weight_huggingface or reduced_standard_huggingface"
 ```
 
-The standard-ONNX text cases run FP32 on CPU/CUDA and BF16 on CUDA. They compare
+The primary reduced-model acceptance paths are CPU FP32 and CUDA FP16.
+The standard-ONNX text cases also retain CUDA FP32/BF16 coverage. They compare
 full prefill and per-step logits, greedy token choices, linear convolution/recurrent
 state, PLE convolution/context,
 QSA key/value/indexer caches, and position history. Text prefill spans the sparse
 selection boundary and is followed by six cached decode steps. The image-text
-case uses FP32 and compares two nonzero, differently shaped image grids through
-the actual ONNX vision-to-embedding-to-decoder pipeline, independently checking
-vision features and HF-fused embeddings, then three decode steps with no new images.
+cases run CPU FP32 and CUDA FP32/FP16 and compare two nonzero, differently shaped
+image grids through the actual ONNX vision-to-embedding-to-decoder pipeline,
+independently checking vision features and HF-fused embeddings, then three
+decode steps with no new images.
 BF16 image-text regression tests verify export rejection rather than running
 the unqualified pipeline. Shapes and dtypes are checked alongside numerical
-values; tolerances are `rtol=atol=1e-3` for FP32 and `1e-2` for BF16.
+values; tolerances are `rtol=atol=1e-3` for FP32 and `1e-2` for FP16/BF16.
 Recurrent state remains FP32
-even when weights, embeddings, and convolution/KV caches are BF16. The expert
+even when weights, embeddings, and convolution/KV caches are FP16/BF16. The expert
 fixture separately checks FP16/BF16 CUDA dispatch with an empty expert branch
 and near-tie float32 routing probabilities.
 
@@ -189,6 +191,16 @@ This is independent reduced-model evidence, not official checkpoint parity,
 semantic generation quality, full-size-model reduced-precision parity, or GenAI
 driver compatibility. Tests skip when the experimental HF classes are absent;
 CUDA cases additionally require an available CUDA device and ORT CUDA provider.
+Regression tests simulate either backend being unavailable, including CUDA
+PyTorch paired with CPU-only ORT, and verify that all three affected test
+entry points skip before constructing a model or session.
+
+On October 16, 2026, all seven standard reduced-model HF cases passed on ORT
+`1.30.0` (`f1d07f0d1`) and `1.32.0.dev20261016001` (`f33c1744e`).
+CUDA FP16 profiles recorded 370 decoder matrix executions for text, and 6
+vision plus 226 decoder matrix executions for image-text, on each runtime.
+These are actual CUDA execution events; ordinary CPU metadata/control-flow
+handling is allowed. This is not full-checkpoint or performance qualification.
 
 ## Guarded features
 
