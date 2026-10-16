@@ -676,7 +676,10 @@ class _NemotronHPuzzleTextModel(_NemotronHTextModel):
         # The pinned Puzzle HF block uses FP32 gamma for every mixer family,
         # including the final stateless MoE, and for the final decoder norm.
         for layer in self.layers:
-            layer.norm = Float32RMSNorm(config.hidden_size, eps=layer.norm.variance_epsilon)
+            norm = getattr(layer, "norm", None)
+            if not isinstance(norm, RMSNorm):
+                raise TypeError("Puzzle decoder layers require an RMSNorm pre-norm")
+            layer.norm = Float32RMSNorm(config.hidden_size, eps=norm.variance_epsilon)
         self.norm = Float32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
