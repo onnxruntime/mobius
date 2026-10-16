@@ -233,6 +233,8 @@ outputs**. Set `MOBIUS_CHUNK_ADAPTER_FIXTURES` to the sealed
 zero-initial/prepared-input diagnostics. Its manifest SHA256 is pinned in the
 tests; every consumed diagnostic JSON/NPZ is hash-verified against it. Set
 `MOBIUS_CHUNK_ADAPTER_EVIDENCE` to a different, fresh output directory.
+The fixture root is mandatory and validated before worker creation or any
+evidence writes, including when the variable is missing.
 Never copy newly generated outputs into the source fixture root or relabel
 them as independent source fixtures. The original receipt/fixtures remain
 read-only. `MOBIUS_CHUNK_ADAPTER_GPU` selects the explicitly allocated physical
