@@ -2222,6 +2222,8 @@ class Gemma4TextModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(op, input_ids)
 
+        caps = ep_capabilities()
+
         # Unpack flattened per_layer_inputs [B, S, L*D] when required by the EP,
         # or consume the layered [B, S, L, D] representation directly.
         per_layer_list: list[ir.Value] | None = None
@@ -2229,16 +2231,25 @@ class Gemma4TextModel(nn.Module):
             num_layers = len(self.layers)
             per_layer_4d = (
                 per_layer_inputs
-                if ep_capabilities().layered_per_layer_inputs
+                if caps.layered_per_layer_inputs
                 else op.Reshape(
                     per_layer_inputs,
                     op.Constant(value_ints=[0, 0, num_layers, self._per_layer_dim]),
                 )
             )
-            per_layer_list = [
-                op.Squeeze(op.Slice(per_layer_4d, starts=[i], ends=[i + 1], axes=[2]), [2])
-                for i in range(num_layers)
-            ]
+            if caps.name == "openvino":
+                per_layer_list = [
+                    op.Gather(per_layer_4d, op.Constant(value_int=i), axis=2)
+                    for i in range(num_layers)
+                ]
+            else:
+                per_layer_list = [
+                    op.Squeeze(
+                        op.Slice(per_layer_4d, starts=[i], ends=[i + 1], axes=[2]),
+                        [2],
+                    )
+                    for i in range(num_layers)
+                ]
             for layer_idx in range(self._first_kv_shared_layer, num_layers):
                 per_layer_list[layer_idx] = _retain_last_sequence_token(
                     op, per_layer_list[layer_idx]
@@ -2255,7 +2266,6 @@ class Gemma4TextModel(nn.Module):
         from mobius._build_context import get_build_dtype
         from mobius.components._attention import GQAContext, StaticCacheState
 
-        caps = ep_capabilities()
         dtype = get_build_dtype()
         # Bidirectional vision-block overlay (Gemma4 larger models). When
         # active, contiguous vision-token blocks attend bidirectionally on
