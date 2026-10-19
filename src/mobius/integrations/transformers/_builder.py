@@ -647,6 +647,7 @@ def build_transformers_model(
     from mobius.tasks import get_task
 
     resolved_task = get_task(task)
+    resolved_task.validate_build(config, execution_provider=execution_provider)
     component_manifest = resolved_task.component_manifest(
         module_class=module_class,
         model_type=model_type,
@@ -746,6 +747,7 @@ def build_transformers_model(
                 model_id,
                 config,
                 revision=revision,
+                manifest=component_manifest,
             )
         elif compressed_tensors_config is not None:
             stream_compressed_tensors_to_package(

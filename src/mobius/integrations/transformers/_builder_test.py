@@ -935,10 +935,107 @@ def test_qwen4_multimodal_build_streams_entire_package_without_eager_loader(
         "Qwen/Qwen3.8-Flash-Next",
         config,
         revision="immutable",
+        manifest=mock.ANY,
+    )
+    assert stream.call_args.kwargs["manifest"].names == (
+        "decoder",
+        "vision_encoder",
+        "embedding",
     )
     assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
         "immutable"
     }
+
+
+@pytest.mark.parametrize("vlm", [False, True])
+@pytest.mark.parametrize("component", ["main", "ngram"])
+def test_qwen4_split_public_builder_binds_selected_checkpoint(
+    monkeypatch, tmp_path, vlm, component
+):
+    import numpy as np
+    import safetensors.torch
+
+    from mobius._builder import build_from_module
+    from mobius._optimizations import validate_standard_onnx
+    from mobius.integrations.transformers._qwen4_exp_weights_test import (
+        _official_package_state,
+    )
+    from mobius.models.qwen4_exp import (
+        Qwen4ExpCausalLMModel,
+        Qwen4ExpForConditionalGeneration,
+    )
+    from mobius.models.qwen4_exp_test import _config, _vl_config
+    from mobius.tasks._qwen4_exp import Qwen4ExpCausalLMTask, Qwen4ExpVisionLanguageTask
+
+    config = (_vl_config if vlm else _config)()
+    module_class = Qwen4ExpForConditionalGeneration if vlm else Qwen4ExpCausalLMModel
+    task = (Qwen4ExpVisionLanguageTask if vlm else Qwen4ExpCausalLMTask)(
+        split_ngram=True, requested_components={component}
+    )
+    parent = SimpleNamespace(
+        model_type=config.model_type,
+        text_config=config,
+        vision_config=config.vision,
+        quantization_config=None,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (parent, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (config, parent, config.model_type),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        transformers_builder,
+        "_download_weights",
+        mock.Mock(side_effect=AssertionError("eager loader must not run")),
+    )
+    scaffold = build_from_module(
+        module_class(config), config, task, execution_provider="onnx-standard"
+    )
+    manifest = task.component_manifest(hf_config=parent)
+    source = {
+        name: value
+        for name, value in _official_package_state(scaffold, config).items()
+        if manifest[component].owns_source(name)
+    }
+    safetensors.torch.save_file(source, tmp_path / "model.safetensors")
+    package = transformers_builder.build_transformers_model(
+        str(tmp_path), task=task, execution_provider="onnx-standard", revision="immutable"
+    )
+    assert set(package) == {component}
+    model = package[component]
+    validate_standard_onnx(model)
+    assert model.metadata_props["mobius.source_revision"] == "immutable"
+    prefix = "decoder." if vlm else ""
+    if component == "ngram":
+        target = prefix + "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+        source_name = (
+            "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+        )
+    elif vlm:
+        target, source_name = "decoder.lm_head.weight_transposed", "lm_head.weight"
+    else:
+        target, source_name = (
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+        )
+    # Folded linear weights can retain a generated name; select the head by owner.
+    value = model.graph.initializers.get(target)
+    if value is None and vlm and component == "main":
+        value = next(
+            value for name, value in model.graph.initializers.items() if "lm_head" in name
+        )
+    assert value is not None
+    expected = source[source_name].numpy()
+    actual = value.const_value.numpy()
+    if actual.shape != expected.shape:
+        expected = expected.T
+    np.testing.assert_array_equal(actual, expected, strict=True)
 
 
 def test_qwen4_affine_component_plan_fails_before_weight_loading(

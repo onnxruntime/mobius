@@ -164,6 +164,7 @@ def build_from_module(
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)
     resolved_task = get_task(task)
+    resolved_task.validate_build(config, execution_provider=execution_provider)
     component_manifest = configure_component_quantization(
         module,
         config,

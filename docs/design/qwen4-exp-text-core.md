@@ -326,16 +326,20 @@ classified through the same strict streaming contract. The MTP sidecar remains
 excluded for the same authoritative-forward/cache-ABI reason documented above.
 NVFP4 checkpoint lowering remains out of scope.
 
-## Proposed opt-in ngram/main contract (N0; approval required)
+## Opt-in ngram/main contract (N0 and isolated N1 implementation)
 
-This section proposes a new interface; it is not an implemented or approved
-ABI, and it does not qualify split graphs. The source baseline is Mobius at
+This section records the N0 design and its user-authorized N1 (#770)
+implementation on the isolated implementation branch. This does **not** assert
+that N0 is merged or waive its merge gate, and does not qualify official split
+graphs. The historical source baseline is Mobius at
 [#755 head](https://github.com/onnxruntime/mobius/tree/954e8f1053d64d377d8893e5c700d1b8380d584a).
 That PR was unmerged when this proposal was drafted. The bounded official
 evidence above—selected components, four-layer teacher-forced composition, and
 selected PLE rows—does not establish all 48 main layers or all 128 full ngram
-shards. A maintainer must approve the contract before N1 (#770); agent
-completion or PR merge is not semantic approval.
+shards. The implementation base contains #755 squash
+`fd8b2fd4d336ef4a1634ffd58518101927f7f9f4` and N0 design revision
+`059cb8b6b068bbc13571614959311db43ac85e58`. Maintainer review/merge gates remain;
+agent completion is not qualification or semantic approval.
 
 ### Opt-in and package keys
 
@@ -374,8 +378,10 @@ any non-`None` selection is rejected before graph construction. The current
 text key is `model`, and the current VLM keys remain
 `decoder`, `vision_encoder`, and `embedding`. With `split_ngram=True`, the new
 proposed main key is `main` (role `decoder`) and the lookup key is `ngram`
-(role `embedding`). Their proposed module attributes are `main` and `ngram`
-for text, and `decoder` and `ngram` for VLM; existing VLM attributes
+(role `embedding`). Component keys do not create or reparent module attributes.
+Text main and ngram retain the root module (`module_attribute_path=""`);
+VLM main retains `decoder`, while VLM ngram enters at the root and forwards
+through `decoder`. Existing VLM attributes
 `vision_encoder` and `embedding` remain unchanged. The default selected set is
 the complete set for the task: `{ngram, main}` for text, and
 `{ngram, main, vision_encoder, embedding}` for VLM. Unknown keys and empty
@@ -392,9 +398,9 @@ neither silently rebuilds the legacy unsplit graph.
 
 | Topology | Package / selector key | Module attribute | Role |
 |---|---|---|---|
-| text | `main` | `main` | `decoder` |
+| text | `main` | root (`""`) | `decoder` |
 | VLM | `main` | `decoder` | `decoder` |
-| either | `ngram` | `ngram` | `embedding` |
+| either | `ngram` | root (`""`), existing lookup owners below backbone | `embedding` |
 | VLM | `vision_encoder` | `vision_encoder` | `encoder` |
 | VLM | `embedding` | `embedding` | `embedding` |
 
@@ -430,10 +436,13 @@ Let `B` be batch, `S` current chunk length, `P` cached token length, `L` the
 number of configured PLE layers, `N` `ngram_size`, `D` `ple_embed_dim`, `H`
 `hidden_size`, `C` `hc_count`, `K` =
 `linear_num_key_heads * linear_key_head_dim`, and `U` =
-`linear_num_value_heads * linear_value_head_dim`. `L` indexes the configured
-`ple_layer_ids` in their existing order (the values are 1-based decoder layer
-IDs); it is not sorted or inferred from a different layer schedule. `D` is the
-raw lookup width for each PLE layer.
+`linear_num_value_heads * linear_value_head_dim`. `L` indexes the effective
+configuration's `ple_layer_ids` (1-based decoder layer IDs). Existing config
+construction, like the pinned HF reference, sorts and deduplicates these IDs.
+Split graphs preserve the effective order they receive without an additional
+sort; embeddings, context, and metadata must all use that same order. They do
+not recover the caller's pre-normalization list. `D` is the raw lookup width
+for each PLE layer.
 
 | Graph | Input | Output | Dtype and shape |
 |---|---|---|---|
@@ -476,10 +485,9 @@ INT64 or `mamba_ssm_dtype`.
 Flatten the final embedding dimension in the existing order: increasing ngram
 order (2 through `N`), then head order within each ngram order, then each
 head's embedding channels. Preserve the PLE-layer axis rather than concatenating
-it into `D`. This `[L,B,S,D]` layout is a proposal, not an approved ABI; a list
-of `[B,S,D]` outputs or a flattened `[B,S,L*D]` tensor is an alternative, but
-is less explicit about layer-to-table correspondence and must not be mixed
-with this proposal.
+it into `D`. This `[L,B,S,D]` layout is the implemented N1 layout. The earlier alternatives (a list of `[B,S,D]`
+outputs or flattened `[B,S,L*D]`) are not implemented and must not be mixed
+with this ABI.
 
 ### Padding, EOS, chunking, and positions
 
@@ -491,8 +499,9 @@ the equivalent initialized context; do not add an implicit sentinel or infer
 cold start from token values.
 
 Preserve #767's mask-free ngram seam: the host derives current-token validity
-from the final `S` entries of the full `[B,P+S]` mask and substitutes EOS for
-masked current IDs before invoking ngram. The ngram graph receives only those
+from the final `S` entries of the full `[B,P+S]` mask and substitutes EOS
+**only where those entries equal zero** before invoking ngram. Negative and
+other nonzero integers are not padding. The ngram graph receives only those
 prepared IDs and its history, with no mask input or dependency on `P`; do not
 zero the raw lookup result. Keep a separate copy of the original lexical IDs:
 text main receives them for token embedding, and VLM main receives them as
@@ -519,9 +528,17 @@ positions. Text `position_ids` remain `[B,S]`. VLM positions remain
 `[4,B,S]`, ordered text/causal, temporal, height, width; the ngram component
 uses the original lexical token IDs, not image-fused embeddings or positions.
 The VLM image `embedding` component still replaces image placeholders only in
-`inputs_embeds`. Zero-length chunks, EOS-list handling beyond the configured
-first EOS, and non-binary masks need explicit maintainer decisions before
-implementation.
+`inputs_embeds`.
+
+User-settled boundary decisions (October 19, 2026):
+
+- Split mode rejects configurations without PLE layers; unsplit behavior is unchanged.
+- Zero-length split ngram/main calls reject, not no-op. The task uses the
+  existing fail-closed standard-ONNX `Reshape` input-guard convention, not a
+  custom operator.
+- Preserve legacy non-binary masks: host substitution uses `mask == 0`;
+  main receives the original **full integer mask**, never a booleanized copy.
+- A configured EOS list continues to use its first entry only.
 
 ### Component ownership, weights, and selected requests
 
@@ -567,7 +584,7 @@ already support this split. N1 must define instance-specific descriptors and
 source-name mappings for the keys above, with deterministic-buffer validation
 limited to the selected dependency closure. Supported checkpoint formats must
 be explicit; the proposal does not qualify split FP8 binding.
-The instance-specific manifest must expose those descriptors and roles before
+The instance-specific manifest exposes those descriptors and roles before
 `task.build()`, not infer them later from unknown package keys. Ngram lookup
 tables must not claim the ordinary token-table alias used for tied-weight
 inference; that alias belongs only to the actual token-table owner above.
@@ -588,6 +605,9 @@ selected bindings against one source index on cloned models and publish none
 until all selected bindings pass. Preserve exact rollback on a mapping failure.
 This is a narrow selection extension to the existing transactional streaming
 path, not a new loader or a second package format.
+The binding transaction does not make ordinary serialization atomic: lazy
+source payloads must remain available through save, and a later payload I/O
+failure can leave an incomplete destination under the existing save behavior.
 
 Propose these relevant API additions:
 
@@ -647,8 +667,9 @@ the metadata governs its identity in the Mobius package wrapper.
 | Direct load of either marked component subdirectory | Local `model.onnx` | Its metadata key |
 | Unmarked legacy flat package | `model.onnx` | `model`, unchanged |
 
-These rules are a proposal requiring N0 approval and implementation in N1.
-They do not claim that the current loader already recovers split keys.
+These rules are implemented in N1 by the fixed internal
+`mobius._split_identity` schema helper; it imports no model family and adds no
+identity registry. Legacy unmarked singleton identity remains `model`.
 
 `ModelPackage.save(components=...)` already filters root package components.
 Retain that existing default and behavior. Make clear that its filter is a
@@ -672,10 +693,92 @@ Store the main graph's existing state manifest with
 `ple_context` removed only for split mode; ngram metadata documents context
 initialization, order, and state names. Preserve current keys and metadata for
 unsplit graphs. Use the existing save layout and ONNX external data, then the
-proposed split-aware load rule. Reject a pair with mismatched split ABI or
-layer order at orchestration time. Shape/ABI agreement alone does not prove
+split-aware load rule. A host composing independently loaded components must
+reject mismatched split ABI or layer order; N1 does not add an orchestration
+framework. Shape/ABI agreement alone does not prove
 that hash configuration and trained weights belong together; a semantic
 pairing identity/check remains an approval item before qualification.
+
+### N1 implementation boundaries
+
+- `tasks._qwen4_exp` implements the instance options, full pre-build component
+  descriptors, selected graph construction, input guards, and split state
+  metadata. `ModelTask.validate_build(config, execution_provider=...)` is a
+  default-noop hook called by both existing builder entry points. Split
+  validation happens before graph construction and quantization configuration.
+- `models.qwen4_exp` uses build-time forwarding branches along the existing
+  root → backbone → indexed decoder layer → PLE → lookup `__call__` chain.
+  No runtime split selector, copied hash/decoder implementation, new module
+  aliases, graph cutting, or PLE reparenting is involved.
+  `Qwen4ExpPLELayer._apply_embeddings` is the single shared projection,
+  normalization, hidden-gate and convolution tail.
+- `ComponentDescriptor.source_path_exclusions` (default `()`) and
+  `owns_source(name)` partition main's roots from the exact configured
+  `layers.i.ple.ple_embedding` subtrees. Existing manifests without exclusions
+  retain local-name candidate fallback behavior. Shared endpoints are checked
+  against ownership. Only proven ordinary token/head ties use `SharedWeightInfo`;
+  ngram never claims the token-table alias.
+- `stream_qwen4_exp_safetensors_to_package(..., manifest=...)` requires the
+  full manifest for split packages. It reuses `_source_name`,
+  `_plan_model_bindings`, `_stage_model`, one safetensors header index, lazy
+  payload tensors, cloned staging, folding and all-or-nothing publication.
+  Deterministic buffer validation follows selected manifest ownership even
+  when graph optimization has folded away buffer names. An omitted owner's
+  canonical source can satisfy a selected, declared shared endpoint.
+- Initial split binding supports unquantized F32/F16/BF16 safetensors with
+  composite `model.language_model.*`, `model.visual.*`, and `lm_head` paths,
+  including the existing packed expert banks and native PLE shards. Split
+  FP8/block/affine configurations and unsupported selected payload dtypes fail
+  explicitly. Unsplit format support is unchanged; this is not FP8 split
+  qualification.
+- `ModelPackage.load(components=..., include_mtp_head=...)` recovers and
+  validates root identities before filtering. `onnx_ir.load` inspects ONNX
+  graph/metadata with external tensors still lazy; omitted graph objects are
+  discarded and their external payloads are not accessed. Identity errors
+  are not hidden by selection. Selected split graphs receive strict standard
+  validation after build/optimization, binding/folding, and reload.
+- `save(include_mtp_head=False)` and `load(include_mtp_head=False)` omit the
+  nested sidecar. The option is threaded through validation and atomic staging;
+  true retains full recursive persistence, independent of root filters. Legacy
+  flat singleton layout and `save(components=Callable)` are unchanged.
+
+Host preparation example (keep original lexical IDs for main):
+
+```python
+# input_ids: int64[B,S]; full_mask: int64[B,P+S]
+# Cold context is full(first_eos, [L,B,N-1]); subsequent calls reuse present.
+ngram_ids = np.where(full_mask[:, -input_ids.shape[1]:] == 0, first_eos, input_ids)
+lookup = ngram_session.run(
+    None, {"input_ids": ngram_ids, "past_ngram_context": context}
+)
+# Feed raw lookup embeddings to main, alongside the original full_mask and
+# original input_ids (or VLM ple_input_ids + image-fused inputs_embeds).
+```
+
+The caller must reject empty chunks before using the example's trailing-mask
+slice; graph guards also reject them. N1 common-source fixtures demonstrate
+that both components use one synthetic checkpoint. They do not introduce a
+semantic checkpoint-pairing protocol or resolve production pairing.
+
+N1 local verification evidence (synthetic, not official qualification):
+
+- The full split file has 48 passing cases, including CPU FP32/CUDA FP16
+  text/VLM logits and every state, substantive CUDA profiles, and four pinned-HF
+  teacher-forced reference cases (model source SHA-256
+  `77fec77d87f2a0eb23b95fa04276fb5779698a7c7f523cf5061e49c118bcc459`).
+  Separately, the portable CPU subset passes 37 cases without either private
+  reference source/dependency directory on `PYTHONPATH`.
+- Related manifest, package, core/Transformers builder, streaming-weight and
+  existing model regressions: 419 passed, three existing BF16 runtime-capability
+  skips, 12 deselected (`not integration and not arch_validation`). Required
+  split tests have no skips. The unrelated offline VibeVoice architecture
+  config case reproduces the same failure with the exact base builder.
+- Compile and scoped Ruff lint/format checks pass. Package-context mypy
+  comparison against the exact base has no new diagnostics (66 existing
+  diagnostics in each run); this is not a globally clean typing claim.
+
+These results do not satisfy or waive N2's merged-N1 prerequisite, official
+full-checkpoint gates, QSA cutoff-tie qualification, or production pairing.
 
 ### Complete state ownership and restore/replay proposal for S1 (#773)
 
@@ -718,14 +821,15 @@ Proposed tiny local CPU targets (not run for this documentation-only task):
 
 | Target | Required assertion |
 |---|---|
-| NEW `src/mobius/models/qwen4_exp_split_test.py` (#770) | Tiny random config; compare text/VLM logits and every state across prefill, chunked prefill, and multi-token cached decode; exact INT64 histories/positions and dtype-appropriate floats |
+| `src/mobius/models/qwen4_exp_split_test.py` (#770) | Tiny random common-source text/VLM split/unsplit comparisons of full logits and every state across prefill, chunked prefill, and multi-token cached decode; independent pinned-HF teacher-forced fixtures; CPU FP32 and CUDA FP16 with substantive kernel profiles |
 | Extend `src/mobius/integrations/transformers/_qwen4_exp_weights_test.py` (#770) | Missing/malformed selected sources fail transactionally; same-shape/different-value sentinels prove bound values and unchanged sources; instrument unrelated payloads to prove they are not accessed |
 | `src/mobius/_model_package_test.py::test_split_components_load_independently` | Singleton builds, filtered singleton saves, direct component-directory loads and multi-component packages recover canonical keys; unmarked legacy flat loads remain `model`; missing/invalid/conflicting identity metadata fails explicitly |
 | `src/mobius/_model_package_test.py::test_split_package_roundtrip_with_mtp_sidecar` | Full and filtered root save/load; all selected canonical keys and ABI metadata survive; nested MTP persists/restores in full by default and explicit omission is tested if the proposed option is accepted |
 | NEW `src/mobius/models/qwen4_exp_split_generation_test.py` (#771) | Later, after graph parity: newly generated IDs feed back through host EOS preparation, ngram and main over multiple steps; compare independently generated reference tokens and every state, including image/no-new-image decode |
 
-The NEW files above are required future entry points, not existing or executed
-tests. Their CPU fixtures use local tiny/random tensors with
+The N1 split test file and related manifest/weight/package cases are
+implemented. The NEW generation file remains a future N2 entry point and is
+not delivered here: #771 explicitly requires N1 merged. CPU fixtures use local tiny/random tensors with
 `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`; they do not require official model
 downloads. Missing required HF reference capability or skipped mandatory cases
 are blockers, not passes.
@@ -736,9 +840,10 @@ does not qualify closed-loop generation. Require `onnx_ir`/`onnxscript.nn`,
 no explicit protobuf operations, default opset 24, and strict standard ONNX
 validation after binding, optimization, save/reload. Retain the deferred
 QSA exact-cutoff tie discrepancies and the standard BF16 vision rejection;
-neither this proposal nor tiny CPU tests resolve them. No test, build,
-installation, model acquisition, numerical claim, or allocation is part of
-this documentation-only design assignment.
+neither this interface nor tiny synthetic tests resolve them. N0 itself was a
+documentation-only assignment. N1 synthetic evidence is bounded to the tests
+above, not official full-checkpoint, closed-loop N2, MTP, native GenAI, or
+L4/L5 qualification.
 
 Pinned source cross-checks:
 

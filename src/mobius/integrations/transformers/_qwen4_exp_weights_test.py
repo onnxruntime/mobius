@@ -21,6 +21,7 @@ from mobius.models.qwen4_exp import (
     _qwen4_exp_ple_buffer_values,
 )
 from mobius.models.qwen4_exp_test import _config, _vl_config
+from mobius.tasks._qwen4_exp import Qwen4ExpCausalLMTask, Qwen4ExpVisionLanguageTask
 
 
 def _official_state(module: Qwen4ExpCausalLMModel) -> dict[str, torch.Tensor]:
@@ -288,3 +289,319 @@ def test_multimodal_streaming_is_transactional_and_retains_no_source_tensors(
         if initializer.const_value is None
     }
     assert unset_after_fold == unset_before_fold
+
+
+@pytest.mark.parametrize(
+    "vlm,selected",
+    [
+        (False, {"main"}),
+        (False, {"ngram"}),
+        (False, {"main", "ngram"}),
+        (True, {"main"}),
+        (True, {"ngram"}),
+        (True, {"embedding"}),
+        (True, {"vision_encoder"}),
+        (True, {"main", "ngram", "embedding", "vision_encoder"}),
+    ],
+)
+def test_split_selected_payloads_and_source_values(tmp_path, monkeypatch, vlm, selected):
+    config = (_vl_config if vlm else _config)()
+    task = (Qwen4ExpVisionLanguageTask if vlm else Qwen4ExpCausalLMTask)(
+        split_ngram=True, requested_components=selected
+    )
+    module = Qwen4ExpForConditionalGeneration(config) if vlm else Qwen4ExpCausalLMModel(config)
+    package = build_from_module(module, config, task, execution_provider="onnx-standard")
+    manifest = task.component_manifest(hf_config=config)
+    source = _official_package_state(package, config)
+    # Equal shapes must not conceal a swapped source. Each parameter has unique
+    # element values, not merely a different count or dtype.
+    for index, (name, value) in enumerate(source.items()):
+        if value.is_floating_point():
+            source[name] = (
+                torch.arange(value.numel(), dtype=torch.float32).reshape(value.shape) * 0.00001
+                + index * 0.01
+            )
+    needed = {
+        name: value
+        for name, value in source.items()
+        if any(manifest[key].owns_source(name) for key in selected)
+    }
+    # Truly absent unselected dependencies must not prevent a partial build.
+    checkpoint = tmp_path / "model.safetensors"
+    # Header indexing may inspect these, but no payload may be requested.
+    unrelated = {
+        "unselected.component.sentinel": torch.tensor([991.0]),
+    }
+    unrelated.update(
+        {
+            name: torch.zeros_like(value)
+            for name, value in source.items()
+            if name not in needed and not value.is_floating_point()
+        }
+    )
+    safetensors.torch.save_file(needed | unrelated, checkpoint)
+    original_bytes = checkpoint.read_bytes()
+    accessed = set()
+    real_open = qwen4_weights.safe_open
+
+    class SelectedReader:
+        def __init__(self, *args, **kwargs):
+            self.handle = real_open(*args, **kwargs)
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def get_tensor(self, name):
+            assert name in needed, f"Unselected payload {name}"
+            accessed.add(name)
+            return self.handle.get_tensor(name)
+
+        def get_slice(self, name):
+            assert name in needed, f"Unselected payload {name}"
+            accessed.add(name)
+            return self.handle.get_slice(name)
+
+    monkeypatch.setattr(qwen4_weights, "safe_open", SelectedReader)
+    original_index = qwen4_weights._shard_key_index
+    indexed = []
+
+    def count_index(paths):
+        indexed.append(paths)
+        return original_index(paths)
+
+    monkeypatch.setattr(qwen4_weights, "_shard_key_index", count_index)
+    # Test the plan's exact source values before folding rewrites names/shapes.
+    real_fold = qwen4_weights.fold_initializers_after_weights
+    checked = set()
+
+    def check_and_fold(model):
+        for name, value in model.graph.initializers.items():
+            if isinstance(value.const_value, ir.LazyTensor):
+                expected = needed[_source_name(name)]
+                torch.testing.assert_close(
+                    torch.from_numpy(value.const_value.numpy().copy()),
+                    expected,
+                    rtol=0,
+                    atol=0,
+                )
+                checked.add(_source_name(name))
+        real_fold(model)
+
+    monkeypatch.setattr(qwen4_weights, "fold_initializers_after_weights", check_and_fold)
+    report = stream_qwen4_exp_safetensors_to_package(
+        package, str(tmp_path), config, manifest=manifest
+    )
+    assert len(indexed) == 1
+    assert report.retained_source_tensor_count == 0
+    assert report.model_count == len(selected)
+    assert checked
+    assert accessed <= needed.keys()
+    assert checkpoint.read_bytes() == original_bytes
+    assert all(
+        value.const_value is not None
+        for model in package.values()
+        for value in model.graph.initializers.values()
+    )
+    from mobius._model_package import ModelPackage
+
+    package.save(str(tmp_path / "roundtrip"), progress_bar=False)
+    restored = ModelPackage.load(str(tmp_path / "roundtrip"))
+    assert restored.keys() == package.keys()
+    if len(package) > 1:
+        singleton = next(iter(package))
+        package.save(
+            str(tmp_path / "filtered"),
+            components=lambda key: key == singleton,
+            progress_bar=False,
+        )
+        assert set(ModelPackage.load(str(tmp_path / "filtered"))) == {singleton}
+    assert checkpoint.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["missing", "missing_buffer", "shape", "buffer", "buffer_dtype", "fold", "standard"],
+)
+def test_split_binding_rolls_back_all_model_and_source_identities(
+    tmp_path, monkeypatch, failure
+):
+    config = _vl_config()
+    task = Qwen4ExpVisionLanguageTask(split_ngram=True)
+    package = build_from_module(
+        Qwen4ExpForConditionalGeneration(config),
+        config,
+        task,
+        execution_provider="onnx-standard",
+    )
+    source = _official_package_state(package, config)
+    target = "model.visual.patch_embed.proj.weight"
+    if failure == "missing":
+        del source[target]
+    elif failure == "missing_buffer":
+        del source[next(name for name in source if name.endswith("layer_multipliers"))]
+    elif failure == "shape":
+        source[target] = torch.zeros(1)
+    elif failure == "buffer":
+        name = next(name for name in source if name.endswith("layer_multipliers"))
+        source[name] = torch.zeros_like(source[name])
+    elif failure == "buffer_dtype":
+        name = next(name for name in source if name.endswith("layer_multipliers"))
+        source[name] = source[name].to(torch.int32)
+    path = tmp_path / "model.safetensors"
+    safetensors.torch.save_file(source, path)
+    before_bytes = path.read_bytes()
+    before_models = dict(package)
+    before_initializers = {
+        (key, name): (value, value.const_value)
+        for key, model in package.items()
+        for name, value in model.graph.initializers.items()
+    }
+    if failure in {"fold", "standard"}:
+        method = (
+            "fold_initializers_after_weights"
+            if failure == "fold"
+            else "validate_standard_onnx"
+        )
+        original = getattr(qwen4_weights, method)
+        calls = []
+
+        def fail_later(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise ValueError("synthetic later component failure")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(qwen4_weights, method, fail_later)
+    with pytest.raises(ValueError):
+        stream_qwen4_exp_safetensors_to_package(
+            package, str(tmp_path), config, manifest=task.component_manifest(hf_config=config)
+        )
+    assert all(package[key] is model for key, model in before_models.items())
+    for (key, name), (value, tensor) in before_initializers.items():
+        assert package[key].graph.initializers[name] is value
+        assert value.const_value is tensor
+    assert path.read_bytes() == before_bytes
+
+
+def test_split_shared_canonical_source_can_belong_to_omitted_component(tmp_path):
+    config = _vl_config(tie_word_embeddings=True)
+    task = Qwen4ExpVisionLanguageTask(split_ngram=True, requested_components={"main"})
+    package = build_from_module(
+        Qwen4ExpForConditionalGeneration(config),
+        config,
+        task,
+        execution_provider="onnx-standard",
+    )
+    manifest = task.component_manifest(hf_config=config)
+    assert len(manifest.shared_weights) == 1
+    assert manifest.shared_weights[0].canonical.component == "embedding"
+    assert all(
+        endpoint.component != "ngram" for endpoint in manifest.shared_weights[0].endpoints
+    )
+    source = _official_package_state(package, config)
+    source = {
+        name: value for name, value in source.items() if manifest["main"].owns_source(name)
+    }
+    canonical = "model.language_model.embed_tokens.weight"
+    source[canonical] = source.pop("lm_head.weight")
+    safetensors.torch.save_file(source, tmp_path / "model.safetensors")
+    stream_qwen4_exp_safetensors_to_package(package, str(tmp_path), config, manifest=manifest)
+    head = next(
+        value
+        for name, value in package["main"].graph.initializers.items()
+        if "lm_head" in name
+    )
+    actual = torch.from_numpy(head.const_value.numpy().copy())
+    expected = source[canonical]
+    if actual.shape != expected.shape:
+        expected = expected.T
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_split_text_proven_tie_resolves_missing_head_from_main_token_table(tmp_path):
+    config = _config(tie_word_embeddings=True)
+    task = Qwen4ExpCausalLMTask(split_ngram=True, requested_components={"main"})
+    package = build_from_module(
+        Qwen4ExpCausalLMModel(config), config, task, execution_provider="onnx-standard"
+    )
+    manifest = task.component_manifest(hf_config=config)
+    assert manifest.shared_weights[0].canonical.component == "main"
+    source = _official_package_state(package, config)
+    del source["lm_head.weight"]
+    safetensors.torch.save_file(source, tmp_path / "model.safetensors")
+    stream_qwen4_exp_safetensors_to_package(package, str(tmp_path), config, manifest=manifest)
+    head = next(
+        value
+        for name, value in package["main"].graph.initializers.items()
+        if "lm_head" in name
+    )
+    torch.testing.assert_close(
+        torch.from_numpy(head.const_value.numpy().copy()),
+        source["model.language_model.embed_tokens.weight"].T,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("selected", [{"main"}, {"ngram"}])
+def test_split_bfloat16_sources_roundtrip_without_changing_bits(tmp_path, selected):
+    import numpy as np
+
+    config = _config(dtype=ir.DataType.BFLOAT16)
+    task = Qwen4ExpCausalLMTask(split_ngram=True, requested_components=selected)
+    package = build_from_module(
+        Qwen4ExpCausalLMModel(config), config, task, execution_provider="onnx-standard"
+    )
+    source = _official_package_state(package, config)
+    for name, value in source.items():
+        if value.is_floating_point():
+            source[name] = value.to(torch.bfloat16)
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    safetensors.torch.save_file(source, source_dir / "model.safetensors")
+    stream_qwen4_exp_safetensors_to_package(
+        package, str(source_dir), config, manifest=task.component_manifest(hf_config=config)
+    )
+    package.save(str(tmp_path / "saved"), progress_bar=False)
+    from mobius._model_package import ModelPackage
+
+    loaded = ModelPackage.load(str(tmp_path / "saved"))
+    key = next(iter(selected))
+    name = (
+        "model.embed_tokens.weight"
+        if key == "main"
+        else "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    )
+    value = loaded[key].graph.initializers[name].const_value
+    assert value.dtype == ir.DataType.BFLOAT16
+    expected = source[_source_name(name)].view(torch.uint16).numpy()
+    np.testing.assert_array_equal(value.numpy().view(np.uint16), expected, strict=True)
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_split_rejects_unsupported_checkpoint_payload_layout(tmp_path, quantized):
+    config = _config()
+    task = Qwen4ExpCausalLMTask(split_ngram=True, requested_components={"main"})
+    package = build_from_module(
+        Qwen4ExpCausalLMModel(config), config, task, execution_provider="onnx-standard"
+    )
+    source = _official_package_state(package, config)
+    if quantized:
+        source["model.language_model.layers.0.weight_scale"] = torch.ones(1)
+        message = "unquantized"
+    else:
+        source["model.language_model.embed_tokens.weight"] = source[
+            "model.language_model.embed_tokens.weight"
+        ].to(torch.int8)
+        message = "Unsupported split source dtype"
+    safetensors.torch.save_file(source, tmp_path / "model.safetensors")
+    original = dict(package)
+    with pytest.raises(ValueError, match=message):
+        stream_qwen4_exp_safetensors_to_package(
+            package, str(tmp_path), config, manifest=task.component_manifest(hf_config=config)
+        )
+    assert all(package[key] is model for key, model in original.items())

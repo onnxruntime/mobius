@@ -24,6 +24,7 @@ from mobius._model_package import (
     _namespaced_symbolic_dimensions,
     _save_safetensors,
 )
+from mobius._split_identity import COMPONENT_KEY_PROPERTY, SPLIT_ABI, SPLIT_ABI_PROPERTY
 from mobius._testing import make_config
 from mobius.generation import build_greedy_sampler
 from mobius.models.base import CausalLMModel
@@ -35,6 +36,127 @@ def _make_simple_model(name: str = "test") -> ir.Model:
     """Create a minimal ir.Model for testing."""
     graph = ir.Graph([], [], nodes=[], name=name)
     return ir.Model(graph, ir_version=10)
+
+
+def _make_split_model(key):
+    model = _make_simple_model(key)
+    model.graph.opset_imports[""] = 24
+    model.metadata_props.update(
+        {
+            SPLIT_ABI_PROPERTY: SPLIT_ABI,
+            COMPONENT_KEY_PROPERTY: key,
+        }
+    )
+    weight = ir.val("weight")
+    weight.const_value = ir.tensor([1.25, 2.5], dtype=ir.DataType.FLOAT)
+    model.graph.register_initializer(weight)
+    model.graph.outputs.append(weight)
+    return model
+
+
+@pytest.mark.parametrize("key", ["ngram", "main", "embedding", "vision_encoder"])
+@pytest.mark.parametrize("filtered", [False, True], ids=["singleton", "filtered"])
+def test_split_components_load_independently(tmp_path, key, filtered):
+    package = ModelPackage({key: _make_split_model(key)})
+    if filtered:
+        package["other"] = _make_simple_model()
+    package.save(str(tmp_path), components=lambda name: name == key, progress_bar=False)
+    assert (tmp_path / "model.onnx").is_file()
+    assert not (tmp_path / key).exists()
+    loaded = ModelPackage.load(str(tmp_path), components={key})
+    assert set(loaded) == {key}
+    assert loaded[key].metadata_props[COMPONENT_KEY_PROPERTY] == key
+    torch.testing.assert_close(
+        torch.from_numpy(loaded[key].graph.initializers["weight"].const_value.numpy().copy()),
+        torch.tensor([1.25, 2.5]),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_split_selected_load_direct_subdirectory_and_no_omitted_payload(tmp_path, monkeypatch):
+    package = ModelPackage({key: _make_split_model(key) for key in ("main", "ngram")})
+    package.save(str(tmp_path), progress_bar=False)
+    assert set(ModelPackage.load(str(tmp_path / "ngram"))) == {"ngram"}
+    # An omitted component's external payload may be absent. Only graph metadata
+    # is inspected to recover identities and validate the root selection.
+    for path in (tmp_path / "ngram").glob("*.data"):
+        path.unlink()
+    original = ir.ExternalTensor.numpy
+
+    def check_payload(tensor, *args, **kwargs):
+        assert "ngram" not in str(tensor.location)
+        return original(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(ir.ExternalTensor, "numpy", check_payload)
+    loaded = ModelPackage.load(str(tmp_path), components={"main"})
+    assert set(loaded) == {"main"}
+    assert not ModelPackage.load(str(tmp_path), components=set())
+    with pytest.raises(ValueError, match="Unknown requested"):
+        ModelPackage.load(str(tmp_path), components={"absent"})
+
+
+@pytest.mark.parametrize(
+    "metadata,message",
+    [
+        ({SPLIT_ABI_PROPERTY: SPLIT_ABI}, "both"),
+        ({COMPONENT_KEY_PROPERTY: "main"}, "both"),
+        ({SPLIT_ABI_PROPERTY: "future", COMPONENT_KEY_PROPERTY: "main"}, "Unsupported"),
+        ({SPLIT_ABI_PROPERTY: SPLIT_ABI, COMPONENT_KEY_PROPERTY: "other"}, "Unknown split"),
+    ],
+)
+def test_split_load_rejects_invalid_identity_before_selection(tmp_path, metadata, message):
+    model = _make_simple_model()
+    model.metadata_props.update(metadata)
+    ir.save(model, tmp_path / "model.onnx")
+    with pytest.raises(ValueError, match=message):
+        ModelPackage.load(str(tmp_path), components=set())
+
+
+def test_split_load_rejects_duplicate_and_directory_disagreement(tmp_path):
+    model = _make_split_model("main")
+    ir.save(model, tmp_path / "a.onnx")
+    ir.save(model, tmp_path / "b.onnx")
+    with pytest.raises(ValueError, match="Duplicate"):
+        ModelPackage.load(str(tmp_path), components=set())
+    subdir = tmp_path / "ngram"
+    subdir.mkdir()
+    ir.save(model, subdir / "model.onnx")
+    with pytest.raises(ValueError, match="disagrees"):
+        ModelPackage.load(str(tmp_path), components={"main"})
+
+
+@pytest.mark.parametrize("filtered", [False, True])
+@pytest.mark.parametrize("atomic", [False, True])
+def test_split_package_roundtrip_with_mtp_sidecar(tmp_path, filtered, atomic):
+    package = ModelPackage({key: _make_split_model(key) for key in ("main", "ngram")})
+    package.mtp_head = ModelPackage(
+        {"draft": _make_simple_model(), "aux": _make_simple_model()}
+    )
+    package.mtp_head.mtp_head = ModelPackage({"next": _make_simple_model()})
+    if atomic:
+        package.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "streaming_external_data": True,
+        }
+    full = tmp_path / "full"
+    package.save(
+        str(full),
+        progress_bar=False,
+        components=(lambda key: key == "ngram") if filtered else None,
+    )
+    loaded = ModelPackage.load(str(full), components={"ngram"})
+    assert set(loaded) == {"ngram"}
+    assert set(loaded.mtp_head) == {"draft", "aux"}
+    assert set(loaded.mtp_head.mtp_head) == {"model"}  # Legacy flat sidecar identity.
+    assert ModelPackage.load(str(full), include_mtp_head=False).mtp_head is None
+    # Omission must also bypass chain/path/staging validation, not only writing.
+    package.mtp_head.mtp_head = package
+    omitted = tmp_path / "omitted"
+    package.save(str(omitted), progress_bar=False, include_mtp_head=False)
+    assert ModelPackage.load(str(omitted)).mtp_head is None
+    assert not (omitted / ".mobius-package.json").exists()
+    assert not (omitted / ".mobius-mtp").exists()
 
 
 def _make_e8m0_model() -> ir.Model:
