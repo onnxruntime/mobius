@@ -36,6 +36,71 @@ independent numerical proof. The HF model's ordinary CausalLM path is likewise
 not an MTP reference. Any unsupported detail below is an explicit blocker, not
 an assumed fact.
 
+## Existing implementation reuse (M0 / #769)
+
+The engineering comparison uses [#779 at `1782df1`](https://github.com/onnxruntime/mobius/tree/1782df1a4ca4273b90e43b9ce92ee5ed77e721c6).
+The mechanisms listed below are also present, unchanged, in
+[main at `fd8b2fd`](https://github.com/onnxruntime/mobius/tree/fd8b2fd4d336ef4a1634ffd58518101927f7f9f4),
+which includes the squash merge of #755. They are existing building blocks,
+not a new dependency on merging all of #779. The earlier #755 pin above
+remains the historical source for this proposal's Qwen4 observations.
+
+| Existing mechanism | Reuse or narrow extension for Qwen4 |
+|---|---|
+| `_registry.py`, `tasks/_base.py`: model registration, `ModelTask`, `ComponentSpec`, `_make_graph`, `_make_model` | Use the existing model/task and graph-building pipeline; do not add a parallel export registry. |
+| `_component_manifest.py`: `ComponentDescriptor`, `SharedWeightInfo`, `SharedWeightEndpoint`; `weights/_adapters.py` | Express source ownership and proven aliases through existing metadata and adapter boundaries. Root-to-sidecar endpoint addressing remains a joint N0/M0 decision. |
+| `_model_package.py`: `ModelPackage.mtp_head`, `save`, `load` | Keep the nested `mtp_head["model"]` package and existing persistence. Persistence does not establish cross-package shared-weight binding or shared runtime allocations. |
+| `integrations/transformers/_qwen4_exp_weights.py`: `_plan_model_bindings`, `_stage_model`, `stream_qwen4_exp_safetensors_to_package` | Extend N1's selected-dependency transaction narrowly; the current root-component loop does not bind a nested MTP package. Do not create another checkpoint loader. |
+| `tasks/_draft_target.py`: `DraftTargetCausalLMTask`, `bind_shared_initializers` | Reference its separate embedding/head bridges, not its generic decoder ABI or name-matched root binding as an implementation of Qwen4 nested sharing. |
+| `tasks/_qwen4_exp.py`: state helpers and `_finalize_qwen4_decoder` | Reuse Qwen4 state construction and metadata conventions, adapting the dedicated MTP QSA roles and optional main tap explicitly. |
+
+The [existing `Qwen35MtpModel`](https://github.com/onnxruntime/mobius/blob/1782df1a4ca4273b90e43b9ce92ee5ed77e721c6/src/mobius/models/qwen35_mtp.py)
+handles the Qwen3.6 checkpoint family. It consumes post-final-norm `[B,S,H]`
+states, concatenates normalized embedding/hidden branches before a `2H -> H`
+projection, and uses one full-attention GQA layer. These are not Qwen4's
+pre-final hyper-stream tap, separate projections and streamwise addition,
+or QSA/indexer state. Its GGUF mappings and token-pairing convention are
+engineering examples, not authority for Qwen4 equations or alignment.
+
+### Synthetic coordinator evidence and its boundary
+
+The existing
+[`TestMtpAutoDetect.test_direct_ort_target_acceptance_threads_and_rolls_back_both_caches`](https://github.com/onnxruntime/mobius/blob/1782df1a4ca4273b90e43b9ce92ee5ed77e721c6/src/mobius/integrations/gguf/_mtp_test.py)
+constructs tiny synthetic weights and separate target/MTP ORT sessions. Its
+Qwen35-specific prompt initialization pairs token rows `[1:]` with postnorm
+hidden rows `[:-1]`. It asserts 51 proposal steps, one acceptance, 50
+rejections/rollbacks, 102-token target-only equality, cache equality, replay,
+and reorder behavior.
+
+This is a test-local coordinator pattern, not an existing production scheduler
+or an independent Qwen4 MTP-forward reference. S1 (#773) can adapt the pattern
+after the Qwen4 alignment and transaction contract is approved; it must also
+cover ngram history, GDN/PLE convolution and recurrent state, QSA/indexer
+state, position/mask history, and continuation token/tap data. KV cropping
+alone cannot restore all of those states.
+
+The [runtime evidence records](https://github.com/onnxruntime/mobius/blob/1782df1a4ca4273b90e43b9ce92ee5ed77e721c6/src/mobius/integrations/gguf/_mtp_runtime_evidence.py)
+retain `runtime_unvalidated` for real artifacts. Synthetic coordinator
+coverage does not qualify real checkpoint values, independent full-logit
+parity, or native GenAI orchestration. The recorded ORT GenAI 0.15.2
+limitations apply to that pinned version, not every current or future runtime.
+
+### Selected dependencies and staged ownership
+
+MTP selection must require only its own tensors and proven token-table/head
+dependencies, not ngram, vision, or unrelated main-layer payloads. Reuse N1's
+selected-build/load mechanism and validate the entire selected binding
+transaction before publishing it. The additive main-tap selector remains
+separate from component selection and persistence; its public spelling is
+still a joint N0/M0 approval item.
+
+This refinement belongs to M0 (#769) / #777, coordinated with N0 (#768) /
+#776. It does not approve M1 (#772) implementation. M1 requires the approved
+and merged N0/M0 contracts, merged N1 (#770), and the approved base; S1
+(#773) additionally requires merged N2 (#771), M1, and approved transaction
+semantics. Official-weight qualification (#774) and native GenAI assessment
+(#775) retain their separate budget/runtime gates.
+
 ## Candidate equations
 
 Let `B` be batch, `S` current MTP input tokens, `P` cached MTP tokens, `H` the
