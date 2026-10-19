@@ -62,6 +62,15 @@ pkg = build_from_module(
 > **Note:** Passing an unknown EP name raises `ValueError` during
 > optimization. Use `ep_registry` from `mobius` to query registered EPs.
 
+The `onnx-standard` validator accepts official core ONNX operators (`""` /
+`ai.onnx`) and ONNX-ML operators (`ai.onnx.ml`), checking each domain's declared
+opset against its own schemas. ML operators require an explicit `ai.onnx.ml`
+opset import; they do not inherit the core opset. Custom domains, unknown
+operators, and overloaded identifiers remain rejected. Schema validation does
+not guarantee that a particular runtime or EP implements the operator.
+Retained function identifiers use the model's imports for their versions;
+function bodies use their own imports.
+
 ---
 
 ## Three-Tier Support Strategy

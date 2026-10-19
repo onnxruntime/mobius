@@ -51,6 +51,7 @@ import dataclasses
 import logging
 import warnings
 
+import onnx
 import onnx_ir as ir
 import onnx_shape_inference
 import onnxscript.optimizer._constant_folding
@@ -247,7 +248,64 @@ def _suppress_dedup_empty_initializer_warnings():
 
 
 # Standard ONNX domains — functions from these domains are never expanded by InlinePass.
-_STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
+_STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx", "ai.onnx.ml"})
+
+
+def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None:
+    """Reject nonstandard operator identifiers, including lexical subgraphs/functions."""
+
+    def get_version(domain: str, imports: dict[str, int]) -> int | None:
+        version = imports.get(domain)
+        # Only core-domain aliases share an import; ML has its own opset.
+        if version is None and domain in {"", "ai.onnx"}:
+            version = imports.get("", imports.get("ai.onnx"))
+        return version
+
+    def check(
+        domain: str, op_type: str, version: int | None, path: str, *, overload: str
+    ) -> None:
+        if overload == "" and domain in _STANDARD_ONNX_DOMAINS and version is not None:
+            try:
+                onnx.defs.get_schema(op_type, version, "" if domain == "ai.onnx" else domain)
+            except onnx.defs.SchemaError:
+                pass
+            else:
+                return
+        raise ValueError(
+            f"onnx-standard component {component!r} at {path}: "
+            f"domain={domain!r}, op={op_type!r}, overload={overload!r}, "
+            f"opset={version!r} has no standard "
+            "ONNX schema. Provide a standard-ONNX decomposition before export."
+        )
+
+    def visit(graph: ir.Graph, imports: dict[str, int], path: str) -> None:
+        # Serialized subgraphs inherit imports from their enclosing model/function.
+        for index, node in enumerate(graph):
+            node_path = f"{path}/{node.name or index}:{node.op_type}"
+            version = get_version(node.domain, imports)
+            check(node.domain, node.op_type, version, node_path, overload=node.overload)
+            for name, attribute in node.attributes.items():
+                if attribute.type == ir.AttributeType.GRAPH:
+                    visit(attribute.as_graph(), imports, f"{node_path}/{name}")
+                elif attribute.type == ir.AttributeType.GRAPHS:
+                    for i, subgraph in enumerate(attribute.as_graphs()):
+                        visit(subgraph, imports, f"{node_path}/{name}[{i}]")
+
+    model_imports = dict(model.graph.opset_imports)
+    visit(model.graph, model_imports, "graph")
+    for function in model.functions.values():
+        path = f"function/{function.domain}::{function.name}"
+        imports = dict(function.opset_imports)
+        # The model versions the function identifier; its own imports version its body.
+        check(
+            function.domain,
+            function.name,
+            get_version(function.domain, model_imports),
+            path,
+            overload=function.overload,
+        )
+        visit(function.graph, imports, path)
+
 
 # ---------------------------------------------------------------------------
 # Op counting helpers
@@ -717,6 +775,8 @@ def optimize_model(
 
     # Rewrites may insert producers after existing consumers.
     model.graph.sort()
+    if caps.name == "onnx-standard":
+        validate_standard_onnx(model, component=model.graph.name or model_role)
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
