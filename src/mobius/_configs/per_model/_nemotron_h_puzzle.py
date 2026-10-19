@@ -37,6 +37,8 @@ class NemotronHPuzzleConfig(NemotronHConfig):
     as in the pinned HuggingFace ``NemotronHPuzzleConfig``.
     """
 
+    mamba_time_step_min: float = 0.0
+    mamba_ssm_dtype: ir.DataType | None = ir.DataType.FLOAT
     moe_block_configs: tuple[NemotronHMoEBlockConfig | None, ...] = ()
 
     @classmethod

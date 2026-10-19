@@ -111,6 +111,42 @@ def test_rejects_wrong_static_head_dimension():
         ChunkedPrefillScan(2, 1, 4, 8)(op, x, dt, a, b, c)
 
 
+@pytest.mark.parametrize(
+    "index,shape,label",
+    [
+        (1, [1, 256, 1], "batch"),
+        (1, [2, 256, 1], "time"),
+        (3, [1, 128, 1, 1], "batch"),
+        (3, [2, 127, 1, 1], "time"),
+        (4, [1, 128, 1, 1], "batch"),
+        (4, [2, 127, 1, 1], "time"),
+        (5, [1, 1, 1, 1], "batch"),
+    ],
+)
+def test_rejects_conflicting_batch_and_time(index, shape, label):
+    builder, op, _ = create_test_builder()
+    specs = [
+        ([2, 128, 1, 1], ir.DataType.BFLOAT16),
+        ([2, 128, 1], ir.DataType.FLOAT),
+        ([1], ir.DataType.FLOAT),
+        ([2, 128, 1, 1], ir.DataType.BFLOAT16),
+        ([2, 128, 1, 1], ir.DataType.BFLOAT16),
+        ([2, 1, 1, 1], ir.DataType.FLOAT),
+    ]
+    values = [
+        create_test_input(builder, f"input_{i}", shape if i == index else dims, dtype)
+        for i, (dims, dtype) in enumerate(specs)
+    ]
+    with pytest.raises(ValueError, match=f"Conflicting known {label}"):
+        ChunkedPrefillScan(1, 1, 1, 1)(op, *values)
+
+
+def test_symbolic_batch_and_time_are_not_rejected():
+    model = _graph(batch="batch", length="time", heads=1, groups=1, head=1, state=1)
+    SymbolicShapeInferencePass()(model)
+    CheckerPass()(model)
+
+
 def test_padded_lane_tree_and_fma_on_cpu(tmp_path):
     builder, op, graph = create_test_builder()
     dt_input = create_test_input(builder, "dt", [2, 3, 128])

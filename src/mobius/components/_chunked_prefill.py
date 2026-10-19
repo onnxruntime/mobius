@@ -275,6 +275,18 @@ class ChunkedPrefillScan(nn.Module):
                     actual = tensor.shape[axis]
                     if isinstance(actual, int) and actual != size:
                         raise ValueError(f"Dimension {axis} must be {size}, got {actual}")
+        for axis, label in ((0, "batch"), (1, "time")):
+            known = {
+                tensor.shape[axis]
+                for tensor in (x, dt, b, c)
+                if tensor.shape is not None and isinstance(tensor.shape[axis], int)
+            }
+            if axis == 0 and initial_state is not None and initial_state.shape is not None:
+                state_batch = initial_state.shape[0]
+                if isinstance(state_batch, int):
+                    known.add(state_batch)
+            if len(known) > 1:
+                raise ValueError(f"Conflicting known {label} dimensions: {sorted(known)}")
         if x.shape is not None and x.shape[1] == 0:
             raise ValueError("Prefill requires at least one token")
         batch, time = op.Shape(x, start=0, end=1), op.Shape(x, start=1, end=2)

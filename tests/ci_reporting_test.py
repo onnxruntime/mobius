@@ -102,7 +102,17 @@ def test_final_summary_status_and_junit_are_preserved(tmp_path, phase, ci):
     assert suite is not None
     assert suite.attrib["failures"] == ("1" if phase == "call" else "0")
     assert suite.attrib["errors"] == ("0" if phase == "call" else "1")
-    assert suite.attrib["tests"] == "3"
+    cases = suite.findall("testcase")
+    assert len(cases) == 3
+    # Older pytest counts a passing call plus teardown error twice; newer
+    # versions count the single testcase. Both preserve the same error payload.
+    expected_counts = {len(cases)}
+    if phase == "teardown":
+        expected_counts.add(len(cases) + 1)
+    assert int(suite.attrib["tests"]) in expected_counts
+    failed = next(case for case in cases if case.attrib["name"] == "test_failure")
+    assert len(failed.findall("failure")) == int(phase == "call")
+    assert len(failed.findall("error")) == int(phase != "call")
     if ci:
         assert result.stdout.index("Failed: EARLY_FAILURE_TRACE") < result.stdout.index(
             "short test summary info"
