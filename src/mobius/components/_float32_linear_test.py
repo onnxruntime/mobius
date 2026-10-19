@@ -34,7 +34,7 @@ from mobius.components._radio_vision import RadioVisionModel
 )
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("rank", [1, 2, 3])
-def test_dense_epilogue(provider, dtype, torch_dtype, bias, rank):
+def test_dense_epilogue(provider, dtype, torch_dtype, bias, rank, monkeypatch):
     if provider == "CUDAExecutionProvider" and (
         provider not in ort.get_available_providers() or not torch.cuda.is_available()
     ):
@@ -89,7 +89,12 @@ def test_dense_epilogue(provider, dtype, torch_dtype, bias, rank):
     finally:
         path.unlink(missing_ok=True)
     device = "cuda" if provider == "CUDAExecutionProvider" else "cpu"
-    with torch.inference_mode():
+    with monkeypatch.context() as precision, torch.inference_mode():
+        if provider == "CUDAExecutionProvider" and torch_dtype == torch.float16:
+            if hasattr(torch.backends.cuda.matmul, "allow_fp16_accumulation"):
+                # Native FP16 accumulation can erase the cancelling residual;
+                # this component's source comparison requires FP32 accumulation.
+                precision.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
         source = functional.linear(
             x.to(device), weight.to(device), beta.to(device) if beta is not None else None
         ).cpu()
