@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import types
 
 import numpy as np
@@ -13,7 +14,7 @@ import onnx_ir as ir
 import pytest
 
 from mobius._builder import build_from_module
-from mobius._configs import NemotronHPuzzleConfig
+from mobius._configs import NemotronHOmniConfig, NemotronHPuzzleConfig
 from mobius.components import Float32GatedRMSNorm
 from mobius.integrations.transformers._config_resolver import _config_from_hf
 from mobius.models.nemotron_h import NemotronHPuzzleCausalLMModel
@@ -115,6 +116,35 @@ def test_puzzle_mixed_mamba_graph_roundtrip(tmp_path, dtype):
         if node.op_type == "RMSNormalization"
         for value in node.inputs[1:2]
     )
+
+
+@pytest.mark.parametrize("config_class", [NemotronHPuzzleConfig, NemotronHOmniConfig])
+@pytest.mark.parametrize("ssm_dtype", [None, ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_direct_family_defaults_and_explicit_cache_overrides(config_class, ssm_dtype):
+    converted = NemotronHPuzzleConfig.from_transformers(_source_config())
+    fields = {
+        field.name: getattr(converted, field.name)
+        for field in dataclasses.fields(NemotronHPuzzleConfig)
+        if field.init and field.name not in {"mamba_time_step_min", "mamba_ssm_dtype"}
+    }
+    fields["dtype"] = ir.DataType.BFLOAT16
+    direct = config_class(**fields)
+    assert direct.mamba_time_step_min == converted.mamba_time_step_min
+    assert direct.mamba_ssm_dtype == converted.mamba_ssm_dtype
+    module = NemotronHPuzzleCausalLMModel(direct)
+    assert module.model.layers[0].mamba.time_step_min == pytest.approx(0.0, abs=0)
+    package = build_from_module(module, direct, task="hybrid-text-generation")
+    for value in (*package["model"].graph.inputs, *package["model"].graph.outputs):
+        if value.name.endswith(".ssm_state"):
+            assert value.dtype == ir.DataType.FLOAT
+
+    overridden = config_class(**fields, mamba_time_step_min=0.125, mamba_ssm_dtype=ssm_dtype)
+    module = NemotronHPuzzleCausalLMModel(overridden)
+    assert module.model.layers[0].mamba.time_step_min == pytest.approx(0.125, rel=0, abs=0)
+    package = build_from_module(module, overridden, task="hybrid-text-generation")
+    for value in (*package["model"].graph.inputs, *package["model"].graph.outputs):
+        if value.name.endswith(".ssm_state"):
+            assert value.dtype == (ssm_dtype or ir.DataType.BFLOAT16)
 
 
 def test_puzzle_global_moe_fields_apply_when_all_blocks_inherit():

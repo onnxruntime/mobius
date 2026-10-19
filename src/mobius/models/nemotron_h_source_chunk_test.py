@@ -53,6 +53,42 @@ def _parameters(module):
 
 
 @pytest.mark.parametrize("omni", [False, True])
+def test_direct_configuration_uses_fp32_cache_in_both_tasks(omni):
+    converted = _config(omni)
+    cls = type(converted)
+    fields = {
+        field.name: getattr(converted, field.name)
+        for field in dataclasses.fields(converted)
+        if field.init and field.name not in {"mamba_time_step_min", "mamba_ssm_dtype"}
+    }
+    config = cls(**fields)
+    ordinary = NemotronHOmniModel(config) if omni else NemotronHPuzzleCausalLMModel(config)
+    candidate = (
+        NemotronHOmniSourceChunkModel(config)
+        if omni
+        else NemotronHPuzzleSourceChunkCausalLMModel(config)
+    )
+    key = "decoder" if omni else "model"
+    for module, task in (
+        (ordinary, NemotronHOmniTask() if omni else "hybrid-text-generation"),
+        (
+            candidate,
+            SourceChunkNemotronHOmniTask() if omni else SourceChunkHybridCausalLMTask(),
+        ),
+    ):
+        graph = build_from_module(module, config, task=task)[key].graph
+        states = [
+            value
+            for value in (*graph.inputs, *graph.outputs)
+            if value.name.endswith(".ssm_state")
+        ]
+        assert states
+        assert all(value.dtype == ir.DataType.FLOAT for value in states)
+        text = module.decoder.model if omni else module.model
+        assert text.layers[0].mamba.time_step_min == pytest.approx(0.0, abs=0)
+
+
+@pytest.mark.parametrize("omni", [False, True])
 def test_phase_task_input_isolation_and_parameter_paths(omni, tmp_path):
     config = _config(omni)
     ordinary = NemotronHOmniModel(config) if omni else NemotronHPuzzleCausalLMModel(config)
