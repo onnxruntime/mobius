@@ -120,6 +120,51 @@ class TestCreateAttentionBias:
             "Shape(input_ids, 1) must be present to extract query_length correctly"
         )
 
+    def test_openvino_uses_equivalent_numeric_mask(self):
+        from mobius._build_context import build_context
+        from mobius._execution_providers import ep_registry
+
+        def build(execution_provider):
+            builder, op, graph = create_test_builder()
+            input_ids = create_test_input(
+                builder, "input_ids", [1, 4], dtype=ir.DataType.INT64
+            )
+            attention_mask = create_test_input(
+                builder, "attention_mask", [1, 8], dtype=ir.DataType.INT64
+            )
+            block_sequence_ids = create_test_input(
+                builder, "block_sequence_ids", [1, 4], dtype=ir.DataType.INT64
+            )
+            with build_context(ep_registry.require(execution_provider)):
+                bias = create_attention_bias(
+                    op,
+                    input_ids,
+                    attention_mask,
+                    sliding_window=4,
+                    block_sequence_ids=block_sequence_ids,
+                )
+            bias.name = "bias"
+            graph.outputs.append(bias)
+            return ir.Model(graph, ir_version=10)
+
+        openvino_model = build("openvino")
+        qnn_model = build("qnn")
+        assert count_op_type(openvino_model.graph, "Where") == 0
+        assert count_op_type(openvino_model.graph, "And") == 0
+        assert count_op_type(openvino_model.graph, "Or") == 0
+        assert count_op_type(qnn_model.graph, "Where") >= 1
+        assert count_op_type(qnn_model.graph, "And") >= 1
+        assert count_op_type(qnn_model.graph, "Or") >= 1
+
+        feeds = {
+            "input_ids": np.zeros((1, 4), dtype=np.int64),
+            "attention_mask": np.array([[1, 1, 1, 1, 1, 1, 0, 0]], dtype=np.int64),
+            "block_sequence_ids": np.array([[-1, 0, 0, -1]], dtype=np.int64),
+        }
+        openvino_bias = OnnxModelSession(openvino_model, device="cpu").run(feeds)["bias"]
+        qnn_bias = OnnxModelSession(qnn_model, device="cpu").run(feeds)["bias"]
+        np.testing.assert_array_equal(openvino_bias, qnn_bias)
+
 
 class TestBlockwiseAttentionBias:
     """Numerically verify the Gemma4 vision-block bidirectional overlay.
