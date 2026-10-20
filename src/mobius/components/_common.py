@@ -210,6 +210,13 @@ def create_attention_bias(
     Returns:
         Attention bias tensor of shape (batch_size, 1, query_length, total_length).
     """
+    from mobius._build_context import ep_capabilities
+
+    openvino_numeric_mask = ep_capabilities().name == "openvino"
+
+    def as_numeric_mask(value):
+        return op.Cast(value, to=ir.DataType.INT64)
+
     # cumsum on attention_mask gives indices
     all_indices = op.CumSum(attention_mask, 1)  # axis=1
 
@@ -237,12 +244,18 @@ def create_attention_bias(
 
     # Causal mask: q_indices >= kv_indices
     full_mask = op.GreaterOrEqual(q_indices, kv_indices)
+    if openvino_numeric_mask:
+        full_mask = as_numeric_mask(full_mask)
 
     if sliding_window is not None:
         # Also mask out positions too far away
         dist = op.Sub(q_indices, kv_indices)
         within_window = op.Less(dist, sliding_window)
-        full_mask = op.And(full_mask, within_window)
+        full_mask = (
+            op.Mul(full_mask, as_numeric_mask(within_window))
+            if openvino_numeric_mask
+            else op.And(full_mask, within_window)
+        )
 
     if block_sequence_ids is not None:
         # Bidirectional vision-block overlay (OR-ed onto causal/sliding mask,
@@ -266,20 +279,33 @@ def create_attention_bias(
         )  # (B, total_length)
         kv_group = op.Unsqueeze(kv_group_2d, [1])  # (B, 1, total_length)
         # same_block = (q_group == kv_group) AND (q_group >= 0)
-        same_block = op.And(
-            op.Equal(q_group, kv_group),
-            op.GreaterOrEqual(q_group, op.Constant(value_int=0)),
-        )
-        full_mask = op.Or(full_mask, same_block)
+        same_group = op.Equal(q_group, kv_group)
+        valid_group = op.GreaterOrEqual(q_group, op.Constant(value_int=0))
+        if openvino_numeric_mask:
+            same_block = op.Mul(
+                as_numeric_mask(same_group),
+                as_numeric_mask(valid_group),
+            )
+            full_mask = op.Max(full_mask, same_block)
+        else:
+            same_block = op.And(same_group, valid_group)
+            full_mask = op.Or(full_mask, same_block)
 
     # Combine with attention_mask
-    attn_mask_bool = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL)
-    full_mask = op.And(attn_mask_bool, full_mask)
-
-    # Convert to float bias: 0 where attended, dtype.min where masked
     mask_value = float(dtype.min)
-    attention_bias = op.Where(full_mask, 0.0, mask_value)
-    attention_bias = op.Cast(attention_bias, to=dtype)
+    if openvino_numeric_mask:
+        attn_mask_numeric = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.INT64)
+        full_mask = op.Mul(attn_mask_numeric, full_mask)
+        mask = op.Cast(full_mask, to=dtype)
+        attention_bias = op.Mul(
+            op.Sub(op.CastLike(1.0, mask), mask),
+            op.CastLike(mask_value, mask),
+        )
+    else:
+        attn_mask_bool = op.Cast(op.Unsqueeze(attention_mask, [1]), to=ir.DataType.BOOL)
+        full_mask = op.And(attn_mask_bool, full_mask)
+        attention_bias = op.Where(full_mask, 0.0, mask_value)
+        attention_bias = op.Cast(attention_bias, to=dtype)
 
     # Unsqueeze to (batch_size, 1, query_length, total_length)
     return op.Unsqueeze(attention_bias, [1])

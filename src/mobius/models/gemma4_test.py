@@ -352,7 +352,7 @@ class TestGemma4EmbeddingModel:
 class TestGemma4PerLayerInputLayout:
     @pytest.mark.parametrize(
         ("execution_provider", "expected_rank"),
-        [("default", 3), ("onnx-standard", 3), ("openvino", 4)],
+        [("default", 3), ("onnx-standard", 3), ("qnn", 3), ("openvino", 4)],
     )
     def test_layout_matches_execution_provider(self, execution_provider, expected_rank):
         from mobius._builder import build_from_module
@@ -406,6 +406,23 @@ class TestGemma4PerLayerInputLayout:
                 embedding_output.shape[-1]
                 == config.num_hidden_layers * config.hidden_size_per_layer_input
             )
+
+        producer = {
+            id(value): node for node in package["decoder"].graph for value in node.outputs
+        }
+        slice_squeezes = [
+            node
+            for node in package["decoder"].graph
+            if node.op_type == "Squeeze"
+            and node.inputs
+            and node.inputs[0] is not None
+            and (parent := producer.get(id(node.inputs[0]))) is not None
+            and parent.op_type == "Slice"
+        ]
+        if execution_provider == "openvino":
+            assert not slice_squeezes
+        elif execution_provider == "qnn":
+            assert len(slice_squeezes) >= config.num_hidden_layers
 
 
 class TestGemma4VisionQuantization:
