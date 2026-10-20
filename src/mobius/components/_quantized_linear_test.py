@@ -313,12 +313,12 @@ class TestNVFP4QuantizedLinear:
         assert count_op_type(graph, "Add") == 1
         assert graph.opset_imports["com.microsoft"] == 1
 
-    def test_rejects_non_fp16_activation_abi(self):
+    def test_rejects_non_16bit_activation_abi(self):
         linear = NVFP4QuantizedLinear(IN_FEATURES, OUT_FEATURES)
         builder, op, _graph = create_test_builder()
         x = create_test_input(builder, "x", [1, IN_FEATURES])
 
-        with pytest.raises(ValueError, match="requires FLOAT16 activations"):
+        with pytest.raises(ValueError, match="requires FLOAT16 or BFLOAT16 activations"):
             linear(op, x)
 
 

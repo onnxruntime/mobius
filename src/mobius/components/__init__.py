@@ -13,6 +13,9 @@ __all__ = [
     "CausalConvNd",
     "CausalDepthwiseConv1d",
     "CausalTransConv1d",
+    "ChunkedPrefillScan",
+    "ChunkedPrefillMamba2Block",
+    "validate_cache_phase",
     "ConformerEncoder",
     "Conv1d",
     "Conv2d",
@@ -45,6 +48,10 @@ __all__ = [
     "GatedDeltaNet",
     "GatedMLP",
     "GatedRMSNorm",
+    "Float32AccumulationMamba2Block",
+    "Float32GatedRMSNorm",
+    "Float32RMSNorm",
+    "Float32SiLUMamba2Block",
     "KimiDeltaAttention",
     "KimiMLAAttention",
     "Gemma3nAudioEncoder",
@@ -56,12 +63,17 @@ __all__ = [
     "GatedShortConv",
     "ClippableLinear",
     "ClippableQuantizedLinear",
+    "Float32Linear",
     "CogVLMClipSidecar",
     "GroupNorm",
     "GQAContext",
     "HunyuanVLClipSidecar",
     "INT64_MAX",
+    "realize_parameters",
     "InputMixer",
+    "FlatInputMixer",
+    "GGMLQ8Linear",
+    "GGMLIQ2XXSLinear",
     "Idefics3Projector",
     "InternVLProjector",
     "LayerNorm",
@@ -96,6 +108,7 @@ __all__ = [
     "MobileLDPProjector",
     "MobileLDPV2Projector",
     "MuseGlimmerVisionModel",
+    "NVFP4A16Linear",
     "NVFP4QuantizedLinear",
     "Cosmos3EdgeMultiModalProjector",
     "MobileNetV5Encoder",
@@ -112,6 +125,7 @@ __all__ = [
     "QuantizedEmbedding",
     "QuantizedLinear",
     "RadioVisionModel",
+    "RadioV4VisionModel",
     "RMSNorm",
     "RMSNormBias",
     "RmsNorm2d",
@@ -176,6 +190,8 @@ from mobius.components._attention import (
     Qwen35Attention as Qwen35Attention,
 )
 from mobius.components._audio import ConformerEncoder
+from mobius.components._chunked_mamba import ChunkedPrefillMamba2Block, validate_cache_phase
+from mobius.components._chunked_prefill import ChunkedPrefillScan
 from mobius.components._clip_sidecars import (
     MeralionAudioSidecar,
     MeralionProjector,
@@ -216,6 +232,7 @@ from mobius.components._common import (
     create_padding_mask,
     create_sliding_window_mask,
     create_static_cache_attention_bias,
+    realize_parameters,
 )
 from mobius.components._conv import (
     BatchNorm1d,
@@ -261,6 +278,7 @@ from mobius.components._fixed_siglip_sidecar import (
     FixedResolutionSiglipMLPSidecar,
     map_fixed_siglip_sidecar_weight,
 )
+from mobius.components._float32_linear import Float32Linear
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._gemma3n_audio import Gemma3nAudioEncoder
 from mobius.components._gemma3n_embedder import Gemma3nMultimodalEmbedder
@@ -283,6 +301,10 @@ from mobius.components._lightning_attention import (
 )
 from mobius.components._llama4_vision import Llama4VisionTower
 from mobius.components._lora import LoRALinear
+from mobius.components._mamba_block import (
+    Float32AccumulationMamba2Block as Float32AccumulationMamba2Block,
+)
+from mobius.components._mamba_block import Float32SiLUMamba2Block as Float32SiLUMamba2Block
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
 from mobius.components._mamba_block import SequenceMambaBlock
@@ -311,9 +333,7 @@ from mobius.components._multimodal import (
     Cosmos3EdgeMultiModalProjector as Cosmos3EdgeMultiModalProjector,
 )
 from mobius.components._multimodal import (
-    Gemma3MultiModalProjector as Gemma3MultiModalProjector,
-)
-from mobius.components._multimodal import (
+    FlatInputMixer,
     GGUFMLPProjector,
     GLMEdgeAdapterProjector,
     InputMixer,
@@ -322,6 +342,9 @@ from mobius.components._multimodal import (
     MLPMultiModalProjector,
     MobileLDPProjector,
     MobileLDPV2Projector,
+)
+from mobius.components._multimodal import (
+    Gemma3MultiModalProjector as Gemma3MultiModalProjector,
 )
 from mobius.components._muse_glimmer_vision import MuseGlimmerVisionModel
 from mobius.components._ocr_encoders import (
@@ -384,6 +407,9 @@ from mobius.components._qformer import (
 from mobius.components._quantized_linear import (
     BlockQuantizedLinear,
     ClippableQuantizedLinear,
+    GGMLIQ2XXSLinear,
+    GGMLQ8Linear,
+    NVFP4A16Linear,
     NVFP4QuantizedLinear,
     QuantizedEmbedding,
     QuantizedLinear,
@@ -445,8 +471,11 @@ from mobius.components._qwenlike_clip_vision import (
     KimiK25VisionSidecar,
     KimiVLVisionSidecar,
 )
+from mobius.components._radio_v4_vision import RadioV4VisionModel
 from mobius.components._radio_vision import RadioVisionModel
 from mobius.components._rms_norm import (
+    Float32GatedRMSNorm,
+    Float32RMSNorm,
     GatedRMSNorm,
     OffsetRMSNorm,
     PostGatedRMSNorm,

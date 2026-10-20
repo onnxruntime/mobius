@@ -112,6 +112,8 @@ from mobius._configs._sub_configs import (
     VisionConfig,
 )
 from mobius._configs._world_model import WorldModelConfig
+from mobius._configs.per_model._nemotron_h_omni import NemotronHOmniConfig
+from mobius._configs.per_model._nemotron_h_puzzle import NemotronHPuzzleConfig
 from mobius._configs.vibevoice import (
     VibeVoiceASRStreamingConfig,
     VibeVoiceConfig,
@@ -171,6 +173,8 @@ __all__ = [
     "Nemotron3DiarizationConfig",
     "NemotronParseConfig",
     "NemotronHConfig",
+    "NemotronHOmniConfig",
+    "NemotronHPuzzleConfig",
     "ParakeetCTCConfig",
     "Plamo2Config",
     "QuantizationConfig",
