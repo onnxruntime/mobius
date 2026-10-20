@@ -229,6 +229,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     load_weights = not args.no_weights
     keep_quantized = not getattr(args, "dequantize", False)
+    target_decoder_only = getattr(args, "target_decoder_only", False)
+    if target_decoder_only and args.component:
+        raise SystemExit("Error: --target-decoder-only cannot be combined with --component.")
     task: str | ModelTask | None = args.task
 
     # FP8 KV cache: resolve the optional per-layer scale file up front so both
@@ -307,7 +310,13 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # that flag only applies to transformers decoder exports, so we let the
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
-    if args.model and not args.config and not args.text_only and not is_personaplex:
+    if (
+        args.model
+        and not args.config
+        and not args.text_only
+        and not target_decoder_only
+        and not is_personaplex
+    ):
         pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
             if input_sampling_rate is not None or bwe_sampling_rate is not None:
@@ -342,6 +351,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # 'owner/repo:model.nemo'). Routes to the NeMo import path; reuses the
     # standard build args (--dtype, --ep, --external-data) and save logic.
     if args.model and args.model.endswith(".nemo"):
+        if target_decoder_only:
+            raise SystemExit("Error: --target-decoder-only is only supported for Nemotron-H.")
         from mobius.integrations.nemo import build_from_nemo
 
         print(f"Detected NeMo archive: {args.model}")
@@ -381,6 +392,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 keep_quantized=keep_quantized,
                 input_sampling_rate=input_sampling_rate,
                 bwe_sampling_rate=bwe_sampling_rate,
+                target_decoder_only=target_decoder_only,
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
@@ -388,6 +400,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
         if _is_reuse_checkpoint(config_path):
+            if target_decoder_only:
+                raise SystemExit(
+                    "Error: --target-decoder-only is only supported for Nemotron-H."
+                )
             if task not in (None, "speech-enhancement"):
                 from mobius.tasks import SpeechEnhancementTask
 
@@ -447,6 +463,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,
+            target_decoder_only=target_decoder_only,
         )
     else:
         model_id_or_path = args.model
@@ -482,6 +499,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,
+            target_decoder_only=target_decoder_only,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -1435,11 +1453,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build_parser.add_argument(
+        "--target-decoder-only",
+        action="store_true",
+        help=(
+            "Explicit Nemotron-H variant without NextN/MTP. Names every omitted "
+            "mtp.* tensor in the loading report; does not preserve MTP. No default "
+            "fallback and no native NVFP4 support."
+        ),
+    )
+    build_parser.add_argument(
         "--dequantize",
         action="store_true",
         help=(
             "Explicitly reconstruct supported compressed-tensors and GPT-OSS "
-            "MXFP4 weights as dense floating point. Dense GPT-OSS reconstruction "
+            "MXFP4 weights as dense floating point, or Nemotron-H ModelOpt weights "
+            "with explicit --dtype bf16. Dense GPT-OSS reconstruction "
             "is eager and memory-intensive; the default preserves MXFP4 with "
             "bounded native streaming."
         ),
