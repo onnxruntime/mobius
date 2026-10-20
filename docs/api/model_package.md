@@ -53,6 +53,12 @@ def save(
 | `include_policy_components` | `bool` | `True` | Save attached generation-policy models under `policies/`. |
 | `include_adapter_artifacts` | `bool` | `True` | Save attached parameter-adapter bundles under `adapters/`. |
 
+With `onnx-ir >= 1.1`, parallel ONNX writes can materialize multiple deferred
+weight-transform outputs at once. The outputs are not cached, but their lifetimes
+may overlap until their writes finish. Use `max_workers=1` when transformed
+tensors must be materialized one at a time; older `onnx-ir` versions fall back to
+serial writes.
+
 For packages whose weight-loading report sets `streaming_external_data=True`,
 and for qualifying packages with an export report, `save()` publishes
 transactionally to a destination that must not already exist. Models and
