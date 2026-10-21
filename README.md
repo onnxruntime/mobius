@@ -426,6 +426,32 @@ split-chunked engines. These checks are not a model accuracy evaluation: FP16
 state can accumulate error or overflow on other inputs. Long-context accuracy
 evaluation remains outstanding.
 
+### Ornith looped MTP
+
+These benchmarks use the native GenAI `Engine`, not the Generator API. The Engine
+can repeatedly invoke the one-layer FP8 MTP head, feeding each stage's predicted
+token and hidden-state output into the next stage, then verify the proposed block
+with the target. Use `--draft-tokens 2` or `--draft-tokens 4` on
+`ornith_engine_benchmark.py`; the exported rollback capacity of eight permits at
+most seven drafts. The default remains one draft.
+
+A 2K sweep on the fused-gate/FP16-state decoder, with CUDA graphs, low-memory
+settings, 512 output tokens, one warmup and three timed runs, measured:
+
+| Draft width | Decode tokens/s | Target forward passes | MTP forward passes |
+|---|---:|---:|---:|
+| 1 | 167.4 | 302 | 300 |
+| 2 | 164.2 | 228 | 450 |
+| 4 | 152.8 | 175 | 691 |
+
+Forward-pass counts are from each width's first timed turn and include prefill.
+All nine timed outputs matched both their own target-only references and each
+other exactly, using identical runtime fingerprints, with zero MTP failures.
+Width two did not establish a speedup; width four was slower despite fewer target
+passes because it required substantially more MTP work. Retain width one at 2K.
+This does not establish the optimal width at longer contexts, where target
+attention is more expensive; those require a separate parity-qualified sweep.
+
 ### Ornith single-Engine GPU memory
 
 The CUDA runtime supports an opt-in packed-only INT2 expert mode. It releases
