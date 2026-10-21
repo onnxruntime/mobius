@@ -182,7 +182,7 @@ def main():
             for name in (
                 "ORT_DISABLE_MOE_GEMV",
                 "ORT_ENABLE_XQA",
-                "ORT_PAGED_ATTENTION_DISABLE_SPLIT_KV",
+                "ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS",
             )
         },
         "batch_size": 1,

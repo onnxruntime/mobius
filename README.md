@@ -259,7 +259,7 @@ python examples/ornith_engine_export.py \
   --checkpoint /path/to/Ornith-1.5-122B-hf \
   --components /path/to/Ornith-1.5-122B-int2-fp8 \
   --output /path/to/Ornith-1.5-122B-int2-fp8-engine
-ORT_DISABLE_MOE_GEMV=1 ORT_ENABLE_XQA=0 ORT_PAGED_ATTENTION_DISABLE_SPLIT_KV=1 \
+ORT_DISABLE_MOE_GEMV=1 ORT_ENABLE_XQA=0 ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS=8 \
 python examples/ornith_engine_benchmark.py \
   --model /path/to/Ornith-1.5-122B-int2-fp8-engine \
   --report /path/to/engine-benchmark.json
@@ -288,8 +288,8 @@ The Engine runtime must load the same FP8-QMoE-enabled ONNX Runtime used for
 component validation; the benchmark records the loaded native libraries.
 `ornith_engine_export.json` initially marks execution unvalidated.
 The reproducibility settings above select a consistent MoE path and portable
-FP32 paged decode without shape-dependent split-KV reductions for single-token
-and short multi-token verification. They
+FP32 paged decode with a fixed split count instead of shape-dependent split-KV
+reductions for single-token and short multi-token verification. They
 require the ORT portable quantized speculative-attention dispatch extension.
 Default fast kernel selection can amplify shape-dependent rounding into different
 greedy outputs; the benchmark records both environment settings in its report.

@@ -593,7 +593,7 @@ def main():
                 "greedy_parity_runtime_environment": {
                     "ORT_DISABLE_MOE_GEMV": "1",
                     "ORT_ENABLE_XQA": "0",
-                    "ORT_PAGED_ATTENTION_DISABLE_SPLIT_KV": "1",
+                    "ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS": "8",
                 },
                 "vision_engine_ready": False,
                 "kv_cache": "fp8_e4m3fn, unit scales",
