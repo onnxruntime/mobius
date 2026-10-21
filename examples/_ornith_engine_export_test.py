@@ -216,7 +216,9 @@ def test_benchmark_parity_reports_first_mismatch(monkeypatch, mismatch):
     assert calls == [(engine, 128, 64, True), (reference, 128, 64, False)]
 
 
-@pytest.mark.parametrize("status", ["in_progress", "failed_parity", "passed"])
+@pytest.mark.parametrize(
+    "status", ["in_progress", "failed_parity", "failed_repeatability", "passed"]
+)
 def test_benchmark_manifest_requires_parity_and_completed_timings(tmp_path, status):
     from ornith_engine_benchmark import save_report
 

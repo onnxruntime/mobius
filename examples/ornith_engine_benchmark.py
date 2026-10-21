@@ -238,6 +238,10 @@ def main():
     report["parity"]["status"] = "passed"
     del reference_engine, reference_model, reference_config
     save_report(args.model, args.report, report)
+    expected_outputs = {
+        case["context_tokens"]: case["target_only"]["output_ids"]
+        for case in report["parity"]["cases"][1:]
+    }
     for context in args.contexts:
         prompt = make_prompt(unit, context)
         if len(prompt) != context:
@@ -256,6 +260,13 @@ def main():
         runs = []
         for index in range(args.runs):
             result = run_turn(engine, prompt, args.output_tokens)
+            if result["output_ids"] != expected_outputs[context]:
+                report["status"] = "failed_repeatability"
+                report["failure"] = {"context_tokens": context, "run": index, **result}
+                save_report(args.model, args.report, report)
+                raise RuntimeError(
+                    f"Timed output differs from target-only parity at context {context}, run {index}"
+                )
             runs.append(result)
             print(json.dumps({"context": context, "run": index, **result}), flush=True)
         report["contexts"].append(
@@ -278,6 +289,7 @@ def main():
         )
         if len(report["contexts"]) == len(args.contexts):
             report["status"] = "passed"
+            report["timed_outputs_match_target_only"] = True
         save_report(args.model, args.report, report)
     print(f"Saved {args.report}", flush=True)
 

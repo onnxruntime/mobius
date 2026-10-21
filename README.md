@@ -280,6 +280,8 @@ report, leaves `engine_validated` false, and stops
 the benchmark. This is a correctness gate, not an accuracy evaluation or a
 guarantee of equivalence for all prompts. TTFT includes Engine admission,
 prefill, and sampling; it is not an isolated prefill measurement.
+Measured outputs must also match the corresponding target-only reference;
+a repeatability failure stops timing without marking the export validated.
 
 Use a GenAI build with per-verification-row EOS suppression for minimum
 generated token counts. Older builds disable MTP until the minimum is reached,
