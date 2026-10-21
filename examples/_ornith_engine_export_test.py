@@ -4,6 +4,7 @@
 """Packed Ornith ABI and CUDA state/sequence isolation regression tests."""
 
 import dataclasses
+import hashlib
 import json
 import sys
 import weakref
@@ -317,6 +318,82 @@ def test_benchmark_sequential_models_preserve_parity_gate(tmp_path, monkeypatch,
     if not mismatch:
         assert report["timed_outputs_match_target_only"]
     assert not (tmp_path / "ornith_engine_export.json").exists()
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_memory_report_checks_outputs_and_records_allocator_options(
+    tmp_path, monkeypatch, mismatch
+):
+    import ornith_engine_memory as memory
+
+    decoder = tmp_path / "decoder.onnx"
+    decoder.touch()
+    reference_path = tmp_path / "reference.json"
+    reference_path.write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "parity": {"status": "passed"},
+                "decoder_sha256": hashlib.sha256(b"").hexdigest(),
+                "prompt_unit_token_ids": [1, 2],
+                "contexts": [{"context_tokens": 16, "runs": [{"output_ids": [3, 4, 5, 6]}]}],
+            }
+        )
+    )
+    overlays = []
+
+    class Config:
+        def __init__(self, path):
+            pass
+
+        def overlay(self, payload):
+            overlays.append(json.loads(payload))
+
+    monkeypatch.setattr(memory.og, "Config", Config)
+    monkeypatch.setattr(memory.og, "Model", lambda config: object())
+    monkeypatch.setattr(memory.og, "Engine", lambda model: object())
+    monkeypatch.setattr(memory.torch.cuda, "init", lambda: None)
+    monkeypatch.setattr(memory.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(memory.torch.cuda, "mem_get_info", lambda: (100, 1024))
+    monkeypatch.setattr(memory.torch.cuda, "get_device_name", lambda _: "test GPU")
+    monkeypatch.setattr(
+        memory,
+        "run_turn",
+        lambda engine, prompt, output_tokens: {"output_ids": [3, 4, 5, 7 if mismatch else 6]},
+    )
+    report_path = tmp_path / "memory.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "memory",
+            "--model",
+            str(tmp_path),
+            "--reference-report",
+            str(reference_path),
+            "--report",
+            str(report_path),
+            "--decoder-file",
+            "decoder.onnx",
+            "--context",
+            "16",
+            "--device-allocator-for-initializers",
+            "--arena-extend-strategy",
+            "kSameAsRequested",
+        ],
+    )
+    if mismatch:
+        with pytest.raises(RuntimeError, match="Output differs from validated reference"):
+            memory.main()
+    else:
+        memory.main()
+    report = json.loads(report_path.read_text())
+    assert report["status"] == ("failed" if mismatch else "passed")
+    assert report["sampled_peak_device_memory_bytes"] == 924
+    assert len(report["runs"]) == (0 if mismatch else 4)
+    options = overlays[0]["model"]["decoder"]["session_options"]
+    assert options["session.use_device_allocator_for_initializers"] == "1"
+    assert options["provider_options"][0]["cuda"]["arena_extend_strategy"] == "1"
 
 
 @pytest.mark.parametrize(

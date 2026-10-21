@@ -352,6 +352,50 @@ tiling, dense tensor-core dispatch, and attention-reduction experiments did not
 establish a reliable improvement and were not retained. The 200 tokens/s goal
 has not been reached.
 
+### Ornith single-Engine GPU memory
+
+The CUDA runtime supports an opt-in packed-only INT2 expert mode. It releases
+the raw expert initializer after runtime packing, because both Ornith prefill
+and decode already consume the packed copy. No weights are requantized, no
+precision is reduced, and FP8 MTP remains enabled. Direct initializer
+allocations are also required so the freed copies leave the CUDA arena.
+Both settings are opt-in; the original model configuration is unchanged.
+
+```sh
+ORT_QMOE_INT2_PACKED_ONLY=1 ORT_DISABLE_MOE_GEMV=0 \
+ORT_ENABLE_XQA=0 ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS=32 \
+python examples/ornith_engine_memory.py \
+  --model /path/to/Ornith-1.5-122B-int2-fp8-engine \
+  --reference-report /path/to/engine-benchmark-packed-projections.json \
+  --device-allocator-for-initializers \
+  --report /path/to/engine-memory-low-memory-2k.json
+```
+
+The memory tool loads one speculative Engine, enables CUDA graphs, checks every
+output against a previously parity-validated report for the same decoder, and
+samples device-wide used memory every 10 ms through model loading, Engine
+creation, one warmup and three measured 512-token runs. Use an otherwise idle
+GPU. This is a **sampled peak**, including the Torch context, not an exact
+allocator peak or an accuracy test. Add `--context 32768` for the 32K case.
+
+On H200, a fresh default-arena 2K baseline peaked at **73.7 GiB**; packed-only
+experts plus direct initializer allocations peaked at **43.2 GiB** at both
+2K and 32K (about **30.5 GiB / 41% less**). All outputs matched the earlier
+validated references exactly. The identical peaks reflect the unchanged fixed
+KV-pool capacity and bounded prefill chunk size, not zero per-token KV storage.
+Changing only the arena growth strategy did not deliver a comparable saving.
+The low-memory full benchmark measured 141.7/127.8/93.6/56.5 decode tokens/s
+at 2K/8K/16K/32K, with all twelve timed outputs exactly matching both the
+target-only references and the previous packed baseline. Memory optimization
+did not require disabling MTP or changing the output length.
+
+For a fresh full MTP/target-only correctness-gated benchmark in this mode, use
+the alternative-decoder benchmark command below with `ORT_QMOE_INT2_PACKED_ONLY=1`
+and add `--device-allocator-for-initializers`. Keep `--report-only` to preserve the
+original export validation. Unsupported packed-only expert invocations fail
+explicitly rather than attempting to use freed raw weights; reload without
+the option if a raw-weight fallback is needed.
+
 An alternative decoder graph saved alongside an existing export can be tested
 without changing its default configuration:
 

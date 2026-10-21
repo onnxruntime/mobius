@@ -167,6 +167,11 @@ def main():
         "--cuda-graph", action="store_true", help="Enable native Engine CUDA graph capture"
     )
     parser.add_argument(
+        "--device-allocator-for-initializers",
+        action="store_true",
+        help="Allocate initializers outside the arena so consumed raw weights can be freed",
+    )
+    parser.add_argument(
         "--report-only",
         action="store_true",
         help="Save an experimental report without replacing the export's validation record",
@@ -200,6 +205,10 @@ def main():
         decoder_overlay["session_options"] = {
             "provider_options": [{"cuda": {"enable_cuda_graph": "1"}}]
         }
+    if args.device_allocator_for_initializers:
+        decoder_overlay.setdefault("session_options", {})[
+            "session.use_device_allocator_for_initializers"
+        ] = "1"
     if args.decoder_file is not None:
         decoder_overlay["filename"] = str(args.decoder_file)
     config_overlay = {"model": {"decoder": decoder_overlay}} if decoder_overlay else {}
@@ -241,6 +250,7 @@ def main():
                 "ORT_ENABLE_XQA",
                 "ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS",
                 "ORT_FPA_INTB_GEMM",
+                "ORT_QMOE_INT2_PACKED_ONLY",
             )
         },
         "batch_size": 1,
