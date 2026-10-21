@@ -1,0 +1,21 @@
+model_id: "zai-org/GLM-5.3-Flash"
+model_type: "glm5_next"
+revision: "03eb5366286afd40d2221b1d9c63a6dd1ba4832e"
+task_type: "image-text-to-text"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Describe this image in one short sentence."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 24
+  do_sample: false
+  eos_token_id: 154820
+
+ci_skip_reason: "The 321B FP8 checkpoint requires the checked-in reduced production-dimension fixture and targeted CUDA job."
+notes: "Pinned GLM-5.3-Flash image/video package. Reduced real-weight evidence records exact production range bytes and checksums, selects production layers 0 (KDA+dense) and 3 (pooled-DSA+MoE), dequantizes FP8 ranges with their pinned block scales, and takes leading tensor slices into reduced hidden/head/expert/vocabulary dimensions for vision, embedding, prefill, and cached-decode coverage."
