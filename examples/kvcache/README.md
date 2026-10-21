@@ -111,16 +111,17 @@ python -m pip install "C:\Users\grama\.copilot\session-state\51a9868f-d303-40e4-
 
 It was built in Release with Visual Studio 2022 CMake 3.31.6; plain editable
 installation is not verified on Windows. The ONNX and ONNX Runtime commits
-used below are currently local and unpublished. The source checkouts shown in
-the commands are local worktrees; remote clones will not contain these pins
-until publication is separately authorized and completed.
+used below are published on the `gramalingam-kvcache` branches of
+`https://github.com/gramalingam/onnx.git` and
+`https://github.com/microsoft/onnxruntime.git`, respectively. The commands
+clone those branches and check out pinned commits for reproducibility.
 
 To reproduce that Release wheel from the pinned source checkout, ensure CMake
 3.31.6 is on `PATH`, map the checkout to a short drive to avoid MSBuild's
 260-character path limit, then run:
 
 ```powershell
-git clone C:\repos\copilot-worktrees\onnx\gramalingam-bookish-broccoli C:\src\onnx-kvcache
+git clone --branch gramalingam-kvcache https://github.com/gramalingam/onnx.git C:\src\onnx-kvcache
 Set-Location C:\src\onnx-kvcache
 git checkout 4443045c53d13a8d3157fcbd2cd5e52450a0784b
 subst K: C:\src\onnx-kvcache
@@ -137,9 +138,9 @@ The native ONNX Runtime fork can be built from its source pin with CPython
 3.13, Visual Studio 2022 C++ tools/Windows SDK, Git, CMake, and Ninja available:
 
 ```powershell
-git clone C:\repos\copilot-worktrees\onnxruntime\gramalingam-cuddly-adventure C:\src\onnxruntime-kvcache
+git clone --branch gramalingam-kvcache https://github.com/microsoft/onnxruntime.git C:\src\onnxruntime-kvcache
 Set-Location C:\src\onnxruntime-kvcache
-git checkout 11a522b835ee41b53c6d293a35c7c7135e2dfd5d
+git checkout f72121a57a33779cf8ce6161314bb7dd32d90e30
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install cmake ninja
@@ -148,8 +149,10 @@ python tools\kvcache\build.py --onnx-source C:\src\onnx-kvcache
 
 The wrapper checks out the pinned ONNX source into its private build tree,
 builds Release with source Protobuf and contrib kernels enabled, and produces
-the native test executable and Python wheel. To run the cache unit suite from
-the Release output directory:
+the native test executable and Python wheel. The pinned runtime checkout
+`f72121a57a33779cf8ce6161314bb7dd32d90e30` adds documentation only over the
+verified executable source revision recorded below. To run the cache unit
+suite from the Release output directory:
 
 ```powershell
 Set-Location build\kvcache-native\Release\Release
