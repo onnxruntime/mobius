@@ -42,6 +42,95 @@ from mobius.tasks._base import _make_graph, _make_model
 logger = logging.getLogger(__name__)
 
 
+def fuse_shared_expert_gates(model):
+    """Replace scalar gate MatMul/Sigmoid/Mul/Add/Add with one FP16 CUDA op."""
+    graph = model.graph
+
+    def sole_user(value, op_type):
+        uses = tuple(value.uses())
+        if value in graph.outputs or len(uses) != 1:
+            return None
+        user = uses[0].node
+        if user.domain or user.op_type != op_type or user.attributes:
+            return None
+        return user
+
+    fused = 0
+    for matmul in list(graph):
+        if matmul.domain or matmul.op_type != "MatMul" or matmul.attributes:
+            continue
+        x, transposed = matmul.inputs
+        transpose = transposed.producer()
+        if (
+            transpose is None
+            or transpose.domain
+            or transpose.op_type != "Transpose"
+            or set(transpose.attributes) != {"perm"}
+            or tuple(transpose.attributes["perm"].as_ints()) != (1, 0)
+        ):
+            continue
+        weight = transpose.inputs[0]
+        if (
+            x.dtype != ir.DataType.FLOAT16
+            or weight.dtype != ir.DataType.FLOAT16
+            or not weight.is_initializer()
+            or weight.shape is None
+            or weight.shape.rank() != 2
+            or weight.shape[0] != 1
+            or not isinstance(weight.shape[1], int)
+            or weight.shape[1] <= 0
+            or x.shape is None
+            or x.shape.rank() != 2
+            or x.shape[1] != weight.shape[1]
+        ):
+            continue
+        sigmoid = sole_user(matmul.outputs[0], "Sigmoid")
+        mul = sole_user(sigmoid.outputs[0], "Mul") if sigmoid else None
+        add = sole_user(mul.outputs[0], "Add") if mul else None
+        final = sole_user(add.outputs[0], "Add") if add else None
+        if final is None:
+            continue
+        shared = next((value for value in mul.inputs if value is not sigmoid.outputs[0]), None)
+        routed = next((value for value in add.inputs if value is not mul.outputs[0]), None)
+        residual = next((value for value in final.inputs if value is not add.outputs[0]), None)
+        if any(
+            value is None
+            or value.dtype != ir.DataType.FLOAT16
+            or value.shape is None
+            or value.shape.rank() != 2
+            or not isinstance(value.shape[1], int)
+            or value.shape[1] <= 0
+            or value.shape != shared.shape
+            or value.shape[0] != x.shape[0]
+            for value in (shared, routed, residual)
+        ):
+            continue
+        output = ir.Value(
+            name=final.outputs[0].name,
+            shape=final.outputs[0].shape,
+            type=final.outputs[0].type,
+        )
+        node = ir.Node(
+            "com.microsoft",
+            "MatMulSigmoidGatedResidual",
+            [x, weight, shared, routed, residual],
+            outputs=[output],
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph,
+            final,
+            [matmul, sigmoid, mul, add, final],
+            [node],
+            [final.outputs[0]],
+            [output],
+        )
+        fused += 1
+    if fused:
+        graph.opset_imports.setdefault("com.microsoft", 1)
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return fused
+
+
 def pack_int2_projections(model):
     """Pack compatible shared-input projections without requantizing their weights."""
     graph = model.graph
@@ -626,6 +715,11 @@ def main():
     parser.add_argument("--components", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--fuse-shared-expert-gates",
+        action="store_true",
+        help="Fuse FP16 shared gate MatMul, sigmoid, expert sum and residual",
+    )
+    parser.add_argument(
         "--pack-projections",
         action="store_true",
         help="Pack shared-input INT2 projections to reduce decode kernel launches",
@@ -651,6 +745,11 @@ def main():
         )
         packed_projections = (
             pack_int2_projections(package["decoder"]) if args.pack_projections else 0
+        )
+        fused_gates = (
+            fuse_shared_expert_gates(package["decoder"])
+            if args.fuse_shared_expert_gates
+            else 0
         )
         (args.output / "decoder").mkdir(parents=True)
         ir.save(
@@ -691,6 +790,7 @@ def main():
                 "revision": REVISION,
                 "engine_validated": False,
                 "packed_projection_nodes_removed": packed_projections,
+                "shared_expert_gates_fused": fused_gates,
                 "greedy_parity_runtime_environment": {
                     "ORT_DISABLE_MOE_GEMV": "1",
                     "ORT_ENABLE_XQA": "0",

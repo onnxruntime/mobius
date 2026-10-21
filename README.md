@@ -352,6 +352,46 @@ tiling, dense tensor-core dispatch, and attention-reduction experiments did not
 establish a reliable improvement and were not retained. The 200 tokens/s goal
 has not been reached.
 
+### Ornith shared-expert gate fusion
+
+`--fuse-shared-expert-gates` additionally replaces each FP16 shared-expert
+`MatMul -> Sigmoid -> Mul -> Add -> Add` chain with the CUDA contrib operator
+`com.microsoft::MatMulSigmoidGatedResidual`. Its inputs are activation `[M,K]`,
+scalar-gate weight `[1,K]`, and shared/routed/residual tensors `[M,N]`. The
+rewrite only accepts compatible rank-two shapes and single-use intermediate
+values, preserving externally visible or reused values. In this decoder it
+removes 48 of the 96 standard MatMuls, 192 elementwise nodes, and 48 unused
+weight transposes, inserting 48 fused nodes (240 fewer nodes overall).
+The 48 remaining MatMuls are expert-router projections. It does not replace
+the INT2 `MatMulNBits` or FP8 LM-head projections.
+
+This option requires the matching ORT CUDA kernel and is off by default.
+The dot product accumulates in FP32; its result, sigmoid, multiply, and both
+adds each round to FP16 at the original graph boundaries. The reduction order
+can differ from cuBLAS, so output IDs need not match an unfused graph. Validate
+the fused variant against its own target-only reference and keep its benchmark
+report separate from the original export validation.
+
+With packed projections, low-memory settings and CUDA graphs, the fused
+decoder measured **171.4/144.5/114.1/57.2 decode tokens/s** at
+2K/8K/16K/32K on H200. All twelve measured 512-token outputs exactly matched
+the fused decoder's target-only references; MTP reported zero failures.
+The 32K parity-gated memory run retained the **43.2 GiB** sampled peak.
+A separate fresh 2K run measured 161.0 tokens/s with identical IDs, while an
+unfused 2K control on the same runtime measured 132.3 tokens/s and retained
+the old baseline IDs. These are workload-dependent results, not guaranteed
+speedups: the changed sequence increased 2K MTP acceptance from 44.9% to
+73.5%, so the end-to-end gain cannot all be attributed to kernel fusion.
+The 200 tokens/s goal and model accuracy evaluation remain outstanding.
+
+A same-input GPU-only microbenchmark isolated the fusion: for FP16
+`K=N=3072`, unfused/fused latencies were 8.89/4.02 us at one row,
+8.09/4.06 us at two rows, 10.80/4.09 us at eight rows, and 25.20/6.93 us at
+1,024 rows. These are median CUDA-event timings over five samples, each
+replaying a graph of 128 consecutive operator calls twenty times, with
+ORT graph optimization disabled. They exclude Python launch gaps and do
+not imply the same proportional speedup for the whole decoder.
+
 ### Ornith single-Engine GPU memory
 
 The CUDA runtime supports an opt-in packed-only INT2 expert mode. It releases

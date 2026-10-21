@@ -23,6 +23,7 @@ from ornith_engine_export import (
     PackedOrnithTask,
     bind_component_weights,
     engine_config,
+    fuse_shared_expert_gates,
     pack_int2_projections,
 )
 from safetensors.numpy import save_file
@@ -543,6 +544,64 @@ def test_packed_int2_projections_preserve_output_columns(tmp_path, rows, extra_a
 
 def _cuda(array):
     return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(array), "cuda", 0)
+
+
+@pytest.mark.parametrize(
+    "reject", [None, "exposed_gate", "broadcast", "float32", "non_scalar", "extra_user"]
+)
+def test_shared_expert_gate_fusion_is_guarded_and_idempotent(reject):
+    from onnx import TensorProto, helper, numpy_helper
+
+    dtype = TensorProto.FLOAT if reject == "float32" else TensorProto.FLOAT16
+    np_dtype = np.float32 if reject == "float32" else np.float16
+    n, k, rows = 64, 128, 2
+    gate_width = 2 if reject == "non_scalar" else 1
+    shared_shape = [1, n] if reject == "broadcast" else [rows, n]
+    nodes = [
+        helper.make_node("Transpose", ["weight"], ["wt"], perm=[1, 0]),
+        helper.make_node("MatMul", ["x", "wt"], ["dot"]),
+        helper.make_node("Sigmoid", ["dot"], ["gate"]),
+        helper.make_node("Mul", ["gate", "shared"], ["gated"]),
+        helper.make_node("Add", ["gated", "routed"], ["combined"]),
+        helper.make_node("Add", ["combined", "residual"], ["output"]),
+    ]
+    outputs = [helper.make_tensor_value_info("output", dtype, [rows, n])]
+    if reject == "exposed_gate":
+        outputs.append(helper.make_tensor_value_info("gate", dtype, [rows, gate_width]))
+    if reject == "extra_user":
+        nodes.append(helper.make_node("Identity", ["dot"], ["debug"]))
+        outputs.append(helper.make_tensor_value_info("debug", dtype, [rows, gate_width]))
+    proto = helper.make_model(
+        helper.make_graph(
+            nodes,
+            "fusion",
+            [
+                helper.make_tensor_value_info("x", dtype, [rows, k]),
+                helper.make_tensor_value_info("shared", dtype, shared_shape),
+                helper.make_tensor_value_info("routed", dtype, [rows, n]),
+                helper.make_tensor_value_info("residual", dtype, [rows, n]),
+            ],
+            outputs,
+            [numpy_helper.from_array(np.zeros((gate_width, k), np_dtype), "weight")],
+        ),
+        opset_imports=[helper.make_opsetid("", 21)],
+    )
+    model = ir.serde.deserialize_model(onnx.shape_inference.infer_shapes(proto))
+    assert fuse_shared_expert_gates(model) == int(reject is None)
+    assert fuse_shared_expert_gates(model) == 0
+    assert sum(node.op_type == "MatMul" for node in model.graph) == int(reject is not None)
+    if reject is None:
+        assert len(model.graph) == 1
+        node = next(iter(model.graph))
+        assert node.op_type == "MatMulSigmoidGatedResidual"
+        assert [value.name for value in node.inputs] == [
+            "x",
+            "weight",
+            "shared",
+            "routed",
+            "residual",
+        ]
+        assert model.graph.outputs[0].name == "output"
 
 
 def _states(batch, block_count=4):
