@@ -392,6 +392,40 @@ replaying a graph of 128 consecutive operator calls twenty times, with
 ORT graph optimization disabled. They exclude Python launch gaps and do
 not imply the same proportional speedup for the whole decoder.
 
+### Ornith FP16 recurrent-state storage
+
+Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
+state in FP16 instead of the default FP32. This requires matching ORT and GenAI
+builds. Query/key/value activations remain FP16; decay, beta, compact rollback
+capsules, and recurrent update/output arithmetic remain FP32. Recurrent execution
+rounds the state to FP16 after computing each token's output, including during
+multi-token speculative verification. GenAI rollback uses identical per-token
+rounding. Chunked prefill retains its existing internal arithmetic and rounds the
+stored final state. The MTP layer in this export is full attention, so it has no
+GatedDeltaNet recurrent state to convert.
+
+The 36 recurrent tensors shrink from 144 MiB to 72 MiB per batch slot per copy.
+This does **not** guarantee an equivalent decrease in total reserved GPU memory:
+the parity-gated 32K Engine run peaked at **43.194 GiB**, only **6 MiB** below the
+previous FP32-state run. The pool owns multiple copies and allocator reservations
+can mask the reduced tensor storage.
+
+The opt-in fused-gate/FP16-state decoder measured
+**163.4/133.9/111.7/66.1 decode tokens/s** at 2K/8K/16K/32K on H200.
+All twelve measured 512-token outputs exactly matched its own target-only
+references, with zero MTP failures. The 2K individual timings were
+153.7/168.0/168.4 tokens/s. Generated IDs differ from the FP32-state variant at
+every tested context; changed MTP acceptance and runtime variability prevent
+attributing these throughput changes solely to state precision.
+The FP32 decoder and its validation reports remain unchanged.
+
+FP16-state operator tests cover finite outputs through 32K tokens, agreement
+with FP32 within synthetic-test tolerances, exact one-token/multi-token state
+and output parity, compact replay, in-place operation, and recurrent/chunked/
+split-chunked engines. These checks are not a model accuracy evaluation: FP16
+state can accumulate error or overflow on other inputs. Long-context accuracy
+evaluation remains outstanding.
+
 ### Ornith single-Engine GPU memory
 
 The CUDA runtime supports an opt-in packed-only INT2 expert mode. It releases

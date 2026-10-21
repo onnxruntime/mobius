@@ -488,10 +488,13 @@ class PackedMtp(nn.Module):
 
 
 class PackedOrnithTask(ModelTask):
-    def __init__(self, *, mtp=False, block_size=256, capacity=8):
+    def __init__(self, *, mtp=False, block_size=256, capacity=8, recurrent_state_fp16=False):
         self.mtp = mtp
         self.block_size = block_size
         self.capacity = capacity
+        self.recurrent_dtype = (
+            ir.DataType.FLOAT16 if recurrent_state_fp16 else ir.DataType.FLOAT
+        )
 
     def build(self, module, config):
         graph, builder = _make_graph()
@@ -537,7 +540,7 @@ class PackedOrnithTask(ModelTask):
                 state = (
                     builder.input(f"past.{index}.conv", dtype=config.dtype, shape=conv),
                     builder.input(
-                        f"past.{index}.recurrent", dtype=ir.DataType.FLOAT, shape=recurrent
+                        f"past.{index}.recurrent", dtype=self.recurrent_dtype, shape=recurrent
                     ),
                 )
                 shapes.append((conv, recurrent))
@@ -592,7 +595,7 @@ class PackedOrnithTask(ModelTask):
             sides = ("conv", "recurrent") if kind == "linear_attention" else ("key", "value")
             for value, side, shape in zip(state, sides, shapes[index], strict=True):
                 dtype = (
-                    ir.DataType.FLOAT
+                    self.recurrent_dtype
                     if side == "recurrent"
                     else (config.dtype if side == "conv" else ir.DataType.FLOAT8E4M3FN)
                 )
@@ -715,6 +718,11 @@ def main():
     parser.add_argument("--components", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--recurrent-state-fp16",
+        action="store_true",
+        help="Store target/MTP recurrent states in FP16, retaining FP32 updates and capsules",
+    )
+    parser.add_argument(
         "--fuse-shared-expert-gates",
         action="store_true",
         help="Fuse FP16 shared gate MatMul, sigmoid, expert sum and residual",
@@ -738,7 +746,10 @@ def main():
     mtp = PackedMtp(mtp)
     with torch.inference_mode():
         package = build_from_module(
-            target, config, PackedOrnithTask(), execution_provider="cuda"
+            target,
+            config,
+            PackedOrnithTask(recurrent_state_fp16=args.recurrent_state_fp16),
+            execution_provider="cuda",
         )
         bind_component_weights(
             package["decoder"], args.components / "decoder/model.onnx", args.checkpoint
@@ -759,7 +770,10 @@ def main():
             max_workers=1,
         )
         head = build_from_module(
-            mtp, mtp_config, PackedOrnithTask(mtp=True), execution_provider="cuda"
+            mtp,
+            mtp_config,
+            PackedOrnithTask(mtp=True, recurrent_state_fp16=args.recurrent_state_fp16),
+            execution_provider="cuda",
         )
         bind_component_weights(
             head["model"],
@@ -791,6 +805,7 @@ def main():
                 "engine_validated": False,
                 "packed_projection_nodes_removed": packed_projections,
                 "shared_expert_gates_fused": fused_gates,
+                "recurrent_state_dtype": "float16" if args.recurrent_state_fp16 else "float32",
                 "greedy_parity_runtime_environment": {
                     "ORT_DISABLE_MOE_GEMV": "1",
                     "ORT_ENABLE_XQA": "0",

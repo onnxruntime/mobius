@@ -88,14 +88,22 @@ def _initialize(module):
         parameter.const_value = ir.tensor(data.astype(np.float32))
 
 
-def test_packed_target_and_mtp_abi():
+@pytest.mark.parametrize("recurrent_state_fp16", [False, True])
+def test_packed_target_and_mtp_abi(recurrent_state_fp16):
     config = _config()
     package = build_from_module(
-        _module(config), config, PackedOrnithTask(), execution_provider="cuda"
+        _module(config),
+        config,
+        PackedOrnithTask(recurrent_state_fp16=recurrent_state_fp16),
+        execution_provider="cuda",
     )
     graph = package["decoder"].graph
     inputs = {value.name: value for value in graph.inputs}
     outputs = {value.name: value for value in graph.outputs}
+    expected_state_type = ir.DataType.FLOAT16 if recurrent_state_fp16 else ir.DataType.FLOAT
+    assert inputs["past.0.recurrent"].dtype == expected_state_type
+    assert outputs["present.0.recurrent"].dtype == expected_state_type
+    assert outputs["state_update.0.recurrent_capsule"].dtype == ir.DataType.FLOAT
     assert inputs["input_ids"].shape.rank() == 1
     assert inputs["position_ids"].shape[0] == 3
     assert outputs["hidden_states"].shape.rank() == 2
@@ -604,10 +612,10 @@ def test_shared_expert_gate_fusion_is_guarded_and_idempotent(reject):
         assert model.graph.outputs[0].name == "output"
 
 
-def _states(batch, block_count=4):
+def _states(batch, block_count=4, recurrent_dtype=np.float32):
     states = {
         "past.0.conv": _cuda(np.zeros((batch, 512, 3), np.float16)),
-        "past.0.recurrent": _cuda(np.zeros((batch, 2, 128, 128), np.float32)),
+        "past.0.recurrent": _cuda(np.zeros((batch, 2, 128, 128), recurrent_dtype)),
     }
     for side in ("key", "value"):
         # FP8 zero has the same bit pattern as UINT8 zero.
@@ -663,22 +671,32 @@ def _run(session, sequences, states, past=None, capture=0):
 @pytest.mark.skipif(
     "CUDAExecutionProvider" not in ort.get_available_providers(), reason="CUDA required"
 )
-def test_cuda_packed_hybrid_sequence_isolation_and_append(tmp_path):
+@pytest.mark.parametrize("recurrent_state_fp16", [False, True])
+def test_cuda_packed_hybrid_sequence_isolation_and_append(tmp_path, recurrent_state_fp16):
     config = _config()
     module = _module(config)
     _initialize(module)
-    model = build_from_module(module, config, PackedOrnithTask(), execution_provider="cuda")[
-        "decoder"
-    ]
+    model = build_from_module(
+        module,
+        config,
+        PackedOrnithTask(recurrent_state_fp16=recurrent_state_fp16),
+        execution_provider="cuda",
+    )["decoder"]
+
+    def states(batch):
+        return _states(
+            batch, recurrent_dtype=np.float16 if recurrent_state_fp16 else np.float32
+        )
+
     path = tmp_path / "packed.onnx"
     ir.save(model, path)
     options = ort.SessionOptions()
     options.enable_profiling = True
     options.profile_file_prefix = str(tmp_path / "profile")
     session = ort.InferenceSession(str(path), options, providers=["CUDAExecutionProvider"])
-    combined = _run(session, [[3, 5, 7], [11, 13]], _states(2))
-    first = _run(session, [[3, 5, 7]], _states(1))
-    second = _run(session, [[11, 13]], _states(1))
+    combined = _run(session, [[3, 5, 7], [11, 13]], states(2))
+    first = _run(session, [[3, 5, 7]], states(1))
+    second = _run(session, [[11, 13]], states(1))
     for output in ("logits", "hidden_states"):
         actual = combined[output].numpy()
         expected = np.concatenate([first[output].numpy(), second[output].numpy()])
@@ -690,15 +708,15 @@ def test_cuda_packed_hybrid_sequence_isolation_and_append(tmp_path):
             atol=2e-5,
             rtol=1e-2,
         )
-    states = {
+    appended_states = {
         "past.0.conv": combined["present.0.conv"],
         "past.0.recurrent": combined["present.0.recurrent"],
         "past_key_values.1.key": combined["present.1.key"],
         "past_key_values.1.value": combined["present.1.value"],
     }
-    appended = _run(session, [[17], [19]], states, past=[3, 2], capture=1)
-    full_first = _run(session, [[3, 5, 7, 17]], _states(1))
-    full_second = _run(session, [[11, 13, 19]], _states(1))
+    appended = _run(session, [[17], [19]], appended_states, past=[3, 2], capture=1)
+    full_first = _run(session, [[3, 5, 7, 17]], states(1))
+    full_second = _run(session, [[11, 13, 19]], states(1))
     for output in ("logits", "hidden_states"):
         expected = np.concatenate(
             [full_first[output].numpy()[-1:], full_second[output].numpy()[-1:]]
