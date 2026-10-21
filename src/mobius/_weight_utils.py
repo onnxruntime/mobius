@@ -277,6 +277,26 @@ def resolve_qmoe_quantization(
         )
 
     fallback = supported_qmoe_quantization(quantization)
+    if 3 in (fc1.bits, fc2.bits):
+        if (
+            fallback is None
+            or (fc1.bits, fc2.bits) not in {(3, 3), (3, 4), (4, 3)}
+            or any(
+                layout.quant_method != "olive"
+                or layout.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
+                or layout.float_zero_point
+                or not layout.sym
+                for layout in (fc1, fc2)
+            )
+            or fc1.group_size != fc2.group_size
+            or fc1.group_size not in {32, 64, 128}
+        ):
+            raise ValueError(
+                "INT3 native QMoE requires model-wide INT4 fallback and symmetric Olive "
+                "FC1/FC2 in {(3, 3), (3, 4), (4, 3)} with common group_size "
+                "32, 64, or 128."
+            )
+        return QMoEQuantizationLayout(fallback, fc1, fc2)
     fc1_uniform = supported_qmoe_quantization(fc1)
     fc2_uniform = supported_qmoe_quantization(fc2)
     if fc1_uniform is not None and fc2_uniform is not None:
