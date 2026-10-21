@@ -502,6 +502,47 @@ Prioritize INT2 dense/expert work for short-context decode and paged attention
 for long-context decode, rather than more router-wrapper work. The 200 tokens/s
 goal and source-model accuracy evaluation remain outstanding.
 
+### Ornith dense INT2 reduction scheduling
+
+The CUDA FP16 symmetric group-128 INT2 small-row kernel now unrolls its
+reduction loop to overlap loads and dequantization instructions. Two iterations
+are unrolled normally; eight are used for long reductions (`K>=8192`) with
+`N<=4096` and at most four rows. Eight-row tiles retain the smaller unroll factor
+to limit register pressure. This applies only to the two-column warp tile;
+other types, group sizes, explicit zero points, single-row and large-prefill
+dispatches retain their existing paths.
+
+No graph rewrite, weight conversion or precision change is involved.
+FP16 dequantization, half2 fused multiply-add order, FP32 warp reduction and
+output rounding are preserved. Exact tests compare small-batch outputs with the
+separate single-row kernel, including all five Ornith projection shapes, odd
+row counts, partial reduction iterations, dispatch boundaries, other group
+sizes and explicit zero points.
+
+Using the existing fused-gate/FP16-state decoder (without integrated routers),
+the optimized runtime measured **174.1/137.5/112.9/67.1 decode tokens/s** at
+2K/8K/16K/32K. All twelve timed 512-token outputs and MTP counters exactly match
+the prior FP16-state baseline, with zero MTP failures. A separate optimized 2K
+run measured 173.8 tokens/s, versus a fresh original-kernel control at
+158.2 tokens/s on the same H200 and unchanged graph/settings (about 9.8% higher
+throughput). Historical baseline runs vary; this is a measured workload-specific
+gain, not a guarantee for other models or inputs.
+The parity-gated 32K sampled peak remained **43.196 GiB**, effectively unchanged.
+
+Same-input CUDA-event measurements, cycling 128 copies of the weights to exceed
+L2 capacity, reduced the two-row `K=8192,N=3072` projection from **15.85 to
+11.99 us**. The two large `K=3072` packed projections fell from
+**19.57 to 17.59 us** (`N=20608`) and **18.24 to 16.09 us** (`N=17408`).
+Across all five model shapes and 2/4/8 rows, the selected dispatch reduced
+component latency by 5.0–24.3%, with bitwise-identical outputs.
+
+A fresh correctness-qualified 2K CUDA trace confirms unchanged dense INT2 launch
+count (15,360) and reduces summed dense INT2 time from **179.33 to 154.38 ms**
+(13.9%) over the same captured decode workload. Summed total kernel time falls
+from 798.89 to 774.16 ms; trace kernel shares and ordinary Engine throughput
+are different metrics and should not be equated. The 200 tokens/s goal and
+source-model accuracy validation remain outstanding.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
