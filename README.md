@@ -392,6 +392,66 @@ replaying a graph of 128 consecutive operator calls twenty times, with
 ORT graph optimization disabled. They exclude Python launch gaps and do
 not imply the same proportional speedup for the whole decoder.
 
+### Ornith router projection integration
+
+`--fuse-moe-routers` integrates the remaining FP16 router
+`MatMul -> Reshape -> QMoE` chains into `com.microsoft::QMoEWithRouter`.
+Combined with packed projections and shared-expert gate fusion, it removes all
+96 standard MatMuls from the target decoder: 48 shared gates and 48 routers.
+The router rewrite removes another 144 graph nodes, including unused weight
+transposes. INT2 `MatMulNBits` and the FP8 LM-head operator remain.
+
+This is opt-in and requires the matching ORT CUDA build. The guarded rewrite
+requires the same rank-two FP16 activation for projection and expert evaluation,
+constant router weights, compatible expert dimensions, and single-use
+intermediates that are not graph outputs. It accepts only the symmetric,
+group-128 INT2 SwiGLU configuration used here, without expert biases or additional
+optional QMoE inputs.
+
+The operator projects into internal FP16 logits, then reuses QMoE routing and
+expert kernels. **It does not fuse projection and TopK into one CUDA launch.**
+For up to eight rows, a warp per expert accumulates the dot product in FP32 with
+the same reduction order for every row count. Larger prefill batches use CUDA
+MatMul internally. Thus zero standard ONNX MatMul nodes does not mean zero dense
+matrix multiplication or zero cuBLAS calls.
+
+Router reduction order can change logits, selected experts, generated IDs, and
+MTP acceptance. Benchmark the alternate decoder against its own target-only
+reference; do not assume equality with the unfused-router model or promote it
+based only on node count. The original decoder/configuration remain unchanged.
+No GenAI code change is needed for this operator integration.
+The parity-gated 32K sampled peak remained **43.198 GiB**, effectively unchanged
+from the previous 43.194 GiB run.
+
+The experimental fused-gate/FP16-state/router decoder measured:
+
+| Context | Router-integrated decode tokens/s | Prior FP16-state run |
+|---|---:|---:|
+| 2K | 147.1 | 163.4 |
+| 8K | 135.8 | 133.9 |
+| 16K | 104.5 | 111.7 |
+| 32K | 62.9 | 66.1 |
+
+All twelve timed 512-token outputs matched the new variant's target-only
+references exactly, with zero MTP failures. IDs differ from the prior variant at
+every context, so these are not fixed-output performance comparisons.
+At 2K, accepted drafts fell from 211/300 to 176/334 and target forward passes
+rose from 302 to 337. Removing the remaining standard MatMul nodes therefore
+**did not establish an end-to-end speedup**; do not promote this variant over
+the existing decoder. The 200 tokens/s goal and accuracy evaluation remain open.
+A fresh 2K unfused-router control on the exact final runtime and same H200
+measured **157.8 tokens/s**, preserving its prior output IDs. Router integration
+was **6.8% slower** at 147.1 tokens/s; runtime fingerprints match between these
+two reports.
+
+A same-input synthetic component benchmark measured MatMul-plus-QMoE versus
+QMoEWithRouter at **63.77/61.18 us** for one row, **67.49/64.81 us** for two,
+**85.87/84.88 us** for eight, and **147.89/147.82 us** for 32.
+It uses FP16, 256 experts, hidden size 3072, and intermediate size 128
+(smaller than Ornith's 1024). Timings are median CUDA-event samples of twenty
+native CUDA-graph replays, each containing 32 operator calls; graph optimization
+is disabled. These modest local gains do not imply a whole-model speedup.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent

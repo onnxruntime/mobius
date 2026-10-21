@@ -42,6 +42,127 @@ from mobius.tasks._base import _make_graph, _make_model
 logger = logging.getLogger(__name__)
 
 
+def fuse_moe_routers(model):
+    """Integrate FP16 router projections into compatible group-128 INT2 QMoE."""
+    graph = model.graph
+    expected = {
+        "activation_type": "swiglu",
+        "normalize_routing_weights": 1,
+        "k": 8,
+        "expert_weight_bits": 2,
+        "block_size": 128,
+        "swiglu_fusion": 1,
+        "quant_type": "int",
+        "weights_prepacked": 0,
+    }
+
+    def single_use(value):
+        return value not in graph.outputs and len(tuple(value.uses())) == 1
+
+    fused = 0
+    for moe in list(graph):
+        if (
+            moe.domain != "com.microsoft"
+            or moe.op_type != "QMoE"
+            or set(moe.attributes) != set(expected)
+            or any(moe.attributes[name].value != value for name, value in expected.items())
+            or len(moe.inputs) != 7
+            or moe.inputs[4] is not None
+        ):
+            continue
+        activation, scores = moe.inputs[:2]
+        if (
+            activation.dtype != ir.DataType.FLOAT16
+            or activation.shape is None
+            or activation.shape.rank() != 2
+            or (isinstance(activation.shape[0], int) and activation.shape[0] <= 0)
+        ):
+            continue
+        removed = [moe]
+        projection_output = scores
+        reshape = scores.producer()
+        if reshape is not None and not reshape.domain and reshape.op_type == "Reshape":
+            if reshape.attributes or not single_use(scores):
+                continue
+            removed.append(reshape)
+            projection_output = reshape.inputs[0]
+        matmul = projection_output.producer()
+        if (
+            matmul is None
+            or matmul.domain
+            or matmul.op_type != "MatMul"
+            or matmul.attributes
+            or matmul.inputs[0] is not activation
+            or not single_use(projection_output)
+        ):
+            continue
+        transpose = matmul.inputs[1].producer()
+        if (
+            transpose is None
+            or transpose.domain
+            or transpose.op_type != "Transpose"
+            or set(transpose.attributes) != {"perm"}
+            or tuple(transpose.attributes["perm"].as_ints()) != (1, 0)
+        ):
+            continue
+        weight = transpose.inputs[0]
+        if (
+            not weight.is_initializer()
+            or weight.dtype != ir.DataType.FLOAT16
+            or weight.shape is None
+            or weight.shape.rank() != 2
+            or not isinstance(weight.shape[0], int)
+            or weight.shape[0] < 8
+            or not isinstance(weight.shape[1], int)
+            or weight.shape[1] <= 0
+            or activation.shape[1] != weight.shape[1]
+            or any(
+                value.shape != ir.Shape([activation.shape[0], weight.shape[0]])
+                for value in (projection_output, scores)
+            )
+            or any(
+                value is None
+                or value.shape is None
+                or value.shape.rank() != 3
+                or value.shape[0] != weight.shape[0]
+                for value in (moe.inputs[2], moe.inputs[5])
+            )
+        ):
+            continue
+        if reshape is not None and not reshape.domain and reshape.op_type == "Reshape":
+            shape = reshape.inputs[1].const_value
+            if (
+                shape is None
+                or shape.dtype != ir.DataType.INT64
+                or shape.shape != ir.Shape([2])
+                or tuple(shape.numpy().tolist()) != (-1, weight.shape[0])
+            ):
+                continue
+        removed.append(matmul)
+        output = ir.Value(
+            name=moe.outputs[0].name, shape=moe.outputs[0].shape, type=moe.outputs[0].type
+        )
+        node = ir.Node(
+            "com.microsoft",
+            "QMoEWithRouter",
+            [activation, weight, *moe.inputs[2:]],
+            dict(moe.attributes),
+            outputs=[output],
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph,
+            moe,
+            removed,
+            [node],
+            [moe.outputs[0]],
+            [output],
+        )
+        fused += 1
+    if fused:
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return fused
+
+
 def fuse_shared_expert_gates(model):
     """Replace scalar gate MatMul/Sigmoid/Mul/Add/Add with one FP16 CUDA op."""
     graph = model.graph
@@ -718,6 +839,11 @@ def main():
     parser.add_argument("--components", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
+        "--fuse-moe-routers",
+        action="store_true",
+        help="Integrate FP16 router MatMuls into group-128 INT2 QMoE",
+    )
+    parser.add_argument(
         "--recurrent-state-fp16",
         action="store_true",
         help="Store target/MTP recurrent states in FP16, retaining FP32 updates and capsules",
@@ -762,6 +888,7 @@ def main():
             if args.fuse_shared_expert_gates
             else 0
         )
+        fused_routers = fuse_moe_routers(package["decoder"]) if args.fuse_moe_routers else 0
         (args.output / "decoder").mkdir(parents=True)
         ir.save(
             package["decoder"],
@@ -805,6 +932,7 @@ def main():
                 "engine_validated": False,
                 "packed_projection_nodes_removed": packed_projections,
                 "shared_expert_gates_fused": fused_gates,
+                "moe_routers_fused": fused_routers,
                 "recurrent_state_dtype": "float16" if args.recurrent_state_fp16 else "float32",
                 "greedy_parity_runtime_environment": {
                     "ORT_DISABLE_MOE_GEMV": "1",

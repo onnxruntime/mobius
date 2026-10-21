@@ -612,6 +612,115 @@ def test_shared_expert_gate_fusion_is_guarded_and_idempotent(reject):
         assert model.graph.outputs[0].name == "output"
 
 
+@pytest.mark.parametrize(
+    "reject",
+    [
+        None,
+        "direct_router",
+        "exposed_logits",
+        "extra_user",
+        "different_input",
+        "float32",
+        "int4",
+        "bias",
+        "nonidentity_reshape",
+        "dynamic_reshape",
+        "scalar_reshape",
+        "wrong_experts",
+    ],
+)
+def test_moe_router_fusion_is_guarded_and_idempotent(reject):
+    from onnx import TensorProto, helper, numpy_helper
+    from ornith_engine_export import fuse_moe_routers
+
+    dtype = TensorProto.FLOAT if reject == "float32" else TensorProto.FLOAT16
+    inputs = [helper.make_tensor_value_info("x", dtype, [2, 128])]
+    outputs = [helper.make_tensor_value_info("out", dtype, [2, 128])]
+    weights = [
+        numpy_helper.from_array(np.zeros((16, 128), np.float16), "router"),
+        numpy_helper.from_array(np.array([-1, 16], np.int64), "shape"),
+        numpy_helper.from_array(
+            np.zeros((8 if reject == "wrong_experts" else 16, 256, 32), np.uint8), "fc1"
+        ),
+        numpy_helper.from_array(np.ones((16, 256, 1), np.float16), "s1"),
+        numpy_helper.from_array(np.zeros((16, 128, 32), np.uint8), "fc2"),
+        numpy_helper.from_array(np.ones((16, 128, 1), np.float16), "s2"),
+    ]
+    if reject == "nonidentity_reshape":
+        weights[1].CopyFrom(numpy_helper.from_array(np.array([16, 2], np.int64), "shape"))
+    elif reject == "scalar_reshape":
+        weights[1].CopyFrom(numpy_helper.from_array(np.array(-1, np.int64), "shape"))
+    elif reject == "dynamic_reshape":
+        weights.pop(1)
+        inputs.append(helper.make_tensor_value_info("shape", TensorProto.INT64, [2]))
+    if reject == "different_input":
+        inputs.append(helper.make_tensor_value_info("other", dtype, [2, 128]))
+    if reject == "bias":
+        weights.append(numpy_helper.from_array(np.zeros((16, 256), np.float16), "bias"))
+    nodes = [
+        helper.make_node("Transpose", ["router"], ["wt"], perm=[1, 0]),
+        helper.make_node(
+            "MatMul", ["other" if reject == "different_input" else "x", "wt"], ["dot"]
+        ),
+        helper.make_node("Reshape", ["dot", "shape"], ["scores"]),
+        helper.make_node(
+            "QMoE",
+            ["x", "scores", "fc1", "s1", "bias" if reject == "bias" else "", "fc2", "s2"],
+            ["out"],
+            domain="com.microsoft",
+            activation_type="swiglu",
+            normalize_routing_weights=1,
+            k=8,
+            expert_weight_bits=4 if reject == "int4" else 2,
+            block_size=128,
+            swiglu_fusion=1,
+            quant_type="int",
+            weights_prepacked=0,
+        ),
+    ]
+    if reject == "exposed_logits":
+        outputs.append(helper.make_tensor_value_info("scores", dtype, [2, 16]))
+    if reject == "extra_user":
+        nodes.append(helper.make_node("Identity", ["dot"], ["debug"]))
+        outputs.append(helper.make_tensor_value_info("debug", dtype, [2, 16]))
+    if reject == "direct_router":
+        nodes.pop(2)
+        nodes[2].input[1] = "dot"
+    proto = helper.make_model(
+        helper.make_graph(
+            nodes,
+            "routers",
+            inputs,
+            outputs,
+            weights,
+            value_info=[
+                helper.make_tensor_value_info("dot", dtype, [2, 16]),
+                helper.make_tensor_value_info("scores", dtype, [2, 16]),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model = ir.serde.deserialize_model(proto)
+    accepted = reject in (None, "direct_router")
+    assert fuse_moe_routers(model) == int(accepted)
+    assert fuse_moe_routers(model) == 0
+    assert sum(node.op_type == "MatMul" for node in model.graph) == int(not accepted)
+    if accepted:
+        assert len(model.graph) == 1
+        node = next(iter(model.graph))
+        assert node.op_type == "QMoEWithRouter"
+        assert [value.name if value is not None else "" for value in node.inputs] == [
+            "x",
+            "router",
+            "fc1",
+            "s1",
+            "",
+            "fc2",
+            "s2",
+        ]
+        assert model.graph.outputs[0].name == "out"
+
+
 def _states(batch, block_count=4, recurrent_dtype=np.float32):
     states = {
         "past.0.conv": _cuda(np.zeros((batch, 512, 3), np.float16)),
