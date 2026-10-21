@@ -245,6 +245,19 @@ def test_benchmark_manifest_requires_parity_and_completed_timings(tmp_path, stat
         assert "output index 1" in manifest["correctness_blocker"]
 
 
+def test_experimental_benchmark_preserves_export_validation(tmp_path):
+    from ornith_engine_benchmark import save_report
+
+    manifest_path = tmp_path / "ornith_engine_export.json"
+    original = '{"engine_validated": true, "engine_validation_report": "baseline.json"}\n'
+    manifest_path.write_text(original)
+    report = {"status": "in_progress"}
+    report_path = tmp_path / "experimental.json"
+    save_report(tmp_path, report_path, report, update_manifest=False)
+    assert manifest_path.read_text() == original
+    assert json.loads(report_path.read_text()) == report
+
+
 def _cuda(array):
     return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(array), "cuda", 0)
 
@@ -365,7 +378,10 @@ def test_cuda_packed_hybrid_sequence_isolation_and_append(tmp_path):
 @pytest.mark.skipif(
     "CUDAExecutionProvider" not in ort.get_available_providers(), reason="CUDA required"
 )
-def test_native_engine_mtp_rollback_matches_target_only_with_minimum_length(tmp_path):
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_native_engine_mtp_rollback_matches_target_only_with_minimum_length(
+    tmp_path, cuda_graph
+):
     og = pytest.importorskip("onnxruntime_genai")
     from ornith_engine_benchmark import greedy_parity, run_turn
 
@@ -412,12 +428,23 @@ def test_native_engine_mtp_rollback_matches_target_only_with_minimum_length(tmp_
     )
     runtime_config["engine"]["dynamic_batching"]["num_blocks"] = 8
     (tmp_path / "genai_config.json").write_text(json.dumps(runtime_config))
-    model = og.Model(str(tmp_path))
+    config_options = og.Config(str(tmp_path))
+    if cuda_graph:
+        config_options.overlay(
+            '{"model":{"decoder":{"session_options":'
+            '{"provider_options":[{"cuda":{"enable_cuda_graph":"1"}}]}}}}'
+        )
+    model = og.Model(config_options)
     engine = og.Engine(model)
     result = run_turn(engine, [3, 5, 7, 11], 32)
     assert result["speculative"]["zero_accept_rounds"] > 0
 
     reference_config = og.Config(str(tmp_path))
+    if cuda_graph:
+        reference_config.overlay(
+            '{"model":{"decoder":{"session_options":'
+            '{"provider_options":[{"cuda":{"enable_cuda_graph":"1"}}]}}}}'
+        )
     reference_config.overlay('{"model":{"mtp":{"enabled":false}}}')
     reference_model = og.Model(reference_config)
     reference = og.Engine(reference_model)

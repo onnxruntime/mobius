@@ -122,8 +122,10 @@ def greedy_parity(engine, reference_engine, prompt, output_tokens=64):
     }
 
 
-def save_report(model_path, report_path, report):
+def save_report(model_path, report_path, report, *, update_manifest=True):
     report_path.write_text(json.dumps(report, indent=2) + "\n")
+    if not update_manifest:
+        return
     manifest_path = model_path / "ornith_engine_export.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["engine_validated"] = (
@@ -149,6 +151,14 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument(
+        "--cuda-graph", action="store_true", help="Enable native Engine CUDA graph capture"
+    )
+    parser.add_argument(
+        "--report-only",
+        action="store_true",
+        help="Save an experimental report without replacing the export's validation record",
+    )
     args = parser.parse_args()
     if (
         any(n <= 0 for n in args.contexts)
@@ -160,7 +170,17 @@ def main():
             "Require positive contexts/runs, nonnegative warmup, and at least 2 output tokens"
         )
     print("Loading native GenAI Engine", flush=True)
-    model = og.Model(str(args.model))
+    config = og.Config(str(args.model))
+    graph_overlay = {
+        "model": {
+            "decoder": {
+                "session_options": {"provider_options": [{"cuda": {"enable_cuda_graph": "1"}}]}
+            }
+        }
+    }
+    if args.cuda_graph:
+        config.overlay(json.dumps(graph_overlay))
+    model = og.Model(config)
     engine = og.Engine(model)
     tokenizer = og.Tokenizer(model)
     unit = tokenizer.encode(
@@ -174,6 +194,7 @@ def main():
         "config_sha256": hashlib.sha256(
             (args.model / "genai_config.json").read_bytes()
         ).hexdigest(),
+        "config_overlay": graph_overlay if args.cuda_graph else {},
         "gpu": torch.cuda.get_device_name(0),
         "gpu_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
         "cuda_runtime": torch.version.cuda,
@@ -181,6 +202,7 @@ def main():
             name: os.environ.get(name)
             for name in (
                 "ORT_DISABLE_MOE_GEMV",
+                "ORT_MOE_GEMV_FP32_ACCUM",
                 "ORT_ENABLE_XQA",
                 "ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS",
             )
@@ -199,8 +221,10 @@ def main():
         "requested_contexts": args.contexts,
         "status": "in_progress",
     }
-    save_report(args.model, args.report, report)
+    save_report(args.model, args.report, report, update_manifest=not args.report_only)
     reference_config = og.Config(str(args.model))
+    if args.cuda_graph:
+        reference_config.overlay(json.dumps(graph_overlay))
     reference_config.overlay('{"model":{"mtp":{"enabled":false}}}')
     reference_model = og.Model(reference_config)
     reference_engine = og.Engine(reference_model)
@@ -225,19 +249,19 @@ def main():
                 first_mismatch_index=result["first_mismatch_index"],
                 context_tokens=len(prompt),
             )
-            save_report(args.model, args.report, report)
+            save_report(args.model, args.report, report, update_manifest=not args.report_only)
             raise RuntimeError(
                 "MTP and target-only greedy decoding differ at output index "
                 f"{result['first_mismatch_index']} with {len(prompt)} input tokens; "
                 f"see {args.report}. Benchmarking is blocked until correctness is established."
             )
-        save_report(args.model, args.report, report)
+        save_report(args.model, args.report, report, update_manifest=not args.report_only)
         print(
             f"Greedy parity passed: {len(prompt)} input / {output_tokens} output", flush=True
         )
     report["parity"]["status"] = "passed"
     del reference_engine, reference_model, reference_config
-    save_report(args.model, args.report, report)
+    save_report(args.model, args.report, report, update_manifest=not args.report_only)
     expected_outputs = {
         case["context_tokens"]: case["target_only"]["output_ids"]
         for case in report["parity"]["cases"][1:]
@@ -263,7 +287,9 @@ def main():
             if result["output_ids"] != expected_outputs[context]:
                 report["status"] = "failed_repeatability"
                 report["failure"] = {"context_tokens": context, "run": index, **result}
-                save_report(args.model, args.report, report)
+                save_report(
+                    args.model, args.report, report, update_manifest=not args.report_only
+                )
                 raise RuntimeError(
                     f"Timed output differs from target-only parity at context {context}, run {index}"
                 )
@@ -287,10 +313,17 @@ def main():
                 if "libonnxruntime" in line
             }
         )
+        if "runtime_library_sha256" not in report:
+            report["runtime_library_sha256"] = {}
+            for library in report["loaded_runtime_libraries"]:
+                with Path(library).open("rb") as stream:
+                    report["runtime_library_sha256"][library] = hashlib.file_digest(
+                        stream, "sha256"
+                    ).hexdigest()
         if len(report["contexts"]) == len(args.contexts):
             report["status"] = "passed"
             report["timed_outputs_match_target_only"] = True
-        save_report(args.model, args.report, report)
+        save_report(args.model, args.report, report, update_manifest=not args.report_only)
     print(f"Saved {args.report}", flush=True)
 
 

@@ -296,6 +296,32 @@ require the ORT portable quantized speculative-attention dispatch extension.
 Default fast kernel selection can amplify shape-dependent rounding into different
 greedy outputs; the benchmark records both environment settings in its report.
 Engine validation applies only to the recorded runtime and settings.
+
+With the extended INT2 MoE GEMV dispatch (up to 64 expanded token/expert rows),
+single-token decode and top-8 speculative verification can use the same fast
+expert kernels instead of disabling GEMV. The following opt-in settings were
+validated with 512-token greedy MTP/target-only parity at all four contexts:
+
+```sh
+ORT_DISABLE_MOE_GEMV=0 ORT_ENABLE_XQA=0 ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS=32 \
+python examples/ornith_engine_benchmark.py \
+  --model /path/to/Ornith-1.5-122B-int2-fp8-engine \
+  --cuda-graph --report-only \
+  --report /path/to/engine-optimization.json
+```
+
+`--cuda-graph` enables native Engine graph capture for both the speculative
+model and the target-only reference. The report records the applied overlay
+separately from the on-disk configuration hash. `--report-only` preserves the
+export's existing validation record while evaluating alternative settings.
+On one H200, the optimized configuration measured approximately 102/97/57/31
+decode tokens/s at 2K/8K/16K/32K, respectively (batch one, one warmup and three
+measured runs, unchanged INT2/FP8 precision). This does not reach 200 tokens/s.
+The wider GEMV path changes floating-point rounding relative to the
+GEMV-disabled baseline, so its generated sequence can differ; its MTP output
+must still exactly match its own target-only reference. Re-run the parity
+gate after changing kernels, graph settings, or the fixed attention split count.
+
 This package does **not** support Engine image admission or image generation:
 the original export's vision/fusion smoke is still a component-only test.
 Neither benchmark performs an accuracy evaluation.
