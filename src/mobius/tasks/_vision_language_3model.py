@@ -250,9 +250,10 @@ class QwenVLTask(VisionLanguageTask):
             shape=[num_images, 3],
         )
 
+        # Processor pixels are FP32; convolution inputs must match model weights.
         outputs = vision(
             op,
-            pixel_values=pixel_values,
+            pixel_values=op.Cast(pixel_values, to=config.dtype),
             image_grid_thw=image_grid_thw,
         )
 
