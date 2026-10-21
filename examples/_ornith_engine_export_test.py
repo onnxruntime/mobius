@@ -5,6 +5,7 @@
 
 import dataclasses
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,7 @@ from ornith_engine_export import (
     PackedOrnithTask,
     bind_component_weights,
     engine_config,
+    pack_int2_projections,
 )
 from safetensors.numpy import save_file
 
@@ -256,6 +258,109 @@ def test_experimental_benchmark_preserves_export_validation(tmp_path):
     save_report(tmp_path, report_path, report, update_manifest=False)
     assert manifest_path.read_text() == original
     assert json.loads(report_path.read_text()) == report
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--decoder-file", "/outside.onnx"],
+        ["--decoder-file", "../outside.onnx"],
+        ["--decoder-file", "missing.onnx"],
+        ["--draft-tokens", "0"],
+        ["--draft-tokens", "8"],
+    ],
+)
+def test_benchmark_rejects_invalid_tuning_overrides(tmp_path, monkeypatch, arguments):
+    from ornith_engine_benchmark import main
+
+    (tmp_path / "genai_config.json").write_text(
+        json.dumps({"model": {"decoder": {"state_update_capacity": 8}}})
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--model",
+            str(tmp_path),
+            "--report",
+            str(tmp_path / "report.json"),
+            *arguments,
+        ],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        main()
+    assert not (tmp_path / "report.json").exists()
+
+
+@pytest.mark.parametrize("rows", [1, 2, 8])
+@pytest.mark.parametrize("extra_attribute", [False, True])
+@pytest.mark.skipif(
+    "CUDAExecutionProvider" not in ort.get_available_providers(), reason="CUDA required"
+)
+def test_packed_int2_projections_preserve_output_columns(tmp_path, rows, extra_attribute):
+    rng = np.random.default_rng(57)
+    graph, builder = _make_graph()
+    inputs = ir.Value(
+        name="input", shape=ir.Shape([rows, 512]), type=ir.TensorType(ir.DataType.FLOAT16)
+    )
+    graph.inputs.append(inputs)
+    graph.opset_imports["com.microsoft"] = 1
+    for index, width in enumerate((64, 128, 512)):
+        weight = builder.initializer(
+            ir.tensor(rng.integers(0, 256, (width, 4, 32), dtype=np.uint8)),
+            name=f"weight{index}",
+        )
+        scales = builder.initializer(
+            ir.tensor(rng.uniform(0.001, 0.01, (width, 4)).astype(np.float16)),
+            name=f"scale{index}",
+        )
+        value = ir.Value(
+            name=f"output{index}",
+            shape=ir.Shape([rows, width]),
+            type=ir.TensorType(ir.DataType.FLOAT16),
+        )
+        graph.append(
+            ir.Node(
+                "com.microsoft",
+                "MatMulNBits",
+                [inputs, weight, scales],
+                [
+                    ir.AttrInt64(name, number)
+                    for name, number in (
+                        ("K", 512),
+                        ("N", width),
+                        ("bits", 2),
+                        ("block_size", 128),
+                    )
+                ],
+                outputs=[value],
+            )
+        )
+        graph.outputs.append(value)
+    model = _make_model(graph)
+    if extra_attribute:
+        for node in graph:
+            node.attributes["accuracy_level"] = ir.AttrInt64("accuracy_level", 1)
+    before = tmp_path / "before.onnx"
+    ir.save(model, before)
+    feed = {"input": rng.standard_normal((rows, 512)).astype(np.float16)}
+    expected = ort.InferenceSession(str(before), providers=["CUDAExecutionProvider"]).run(
+        None, feed
+    )
+    assert pack_int2_projections(model) == (0 if extra_attribute else 2)
+    assert pack_int2_projections(model) == 0
+    assert sum(node.op_type == "MatMulNBits" for node in graph) == (
+        3 if extra_attribute else 1
+    )
+    assert not any(node.op_type == "Concat" for node in graph)
+    after = tmp_path / "after.onnx"
+    ir.save(model, after)
+    actual = ort.InferenceSession(str(after), providers=["CUDAExecutionProvider"]).run(
+        None, feed
+    )
+    for result, reference in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(result, reference)
 
 
 def _cuda(array):

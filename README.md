@@ -322,6 +322,42 @@ GEMV-disabled baseline, so its generated sequence can differ; its MTP output
 must still exactly match its own target-only reference. Re-run the parity
 gate after changing kernels, graph settings, or the fixed attention split count.
 
+For fewer decode launches, add `--pack-projections` to the Engine export command.
+After binding the existing quantized weights, this opt-in transformation packs
+compatible shared-input INT2 projections along their output-channel dimension
+and splits the results back to their original consumers. It removes 180
+projection nodes from this decoder without requantization, changing FP8
+components, or changing the recurrent-state ABI. Packing is limited to raw
+group-128 INT2 weights without optional inputs or extra attributes; other
+projections are left unchanged.
+
+Combined with the portable attention cache-offset reuse optimization, a packed
+export measured approximately 142/128/93/57 decode tokens/s at
+2K/8K/16K/32K on one H200 with the same benchmark settings and full
+MTP/target-only parity. Wider prefill matrix multiplies change floating-point
+rounding, so the generated sequence and MTP acceptance can differ from the
+unpacked export. These are measurements on the repeated-text benchmark, not
+accuracy results or guaranteed performance on other prompts.
+
+An alternative decoder graph saved alongside an existing export can be tested
+without changing its default configuration:
+
+```sh
+ORT_DISABLE_MOE_GEMV=0 ORT_ENABLE_XQA=0 ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS=32 \
+python examples/ornith_engine_benchmark.py \
+  --model /path/to/Ornith-1.5-122B-int2-fp8-engine \
+  --decoder-file decoder/model-packed.onnx --cuda-graph --report-only \
+  --report /path/to/engine-benchmark-packed-projections.json
+```
+
+The report fingerprints the selected decoder graph and records the filename
+overlay. `--decoder-file` must refer to an existing graph inside the model
+directory. `--draft-tokens` overrides the fixed proposal width for tuning,
+subject to the decoder's rollback capacity; it is applied to the speculative
+model and recorded in the report while the reference still disables MTP.
+Two draft tokens passed 2K parity but were slower than one in this workload,
+so the export retains its default one-token proposal width.
+
 This package does **not** support Engine image admission or image generation:
 the original export's vision/fusion smoke is still a component-only test.
 Neither benchmark performs an accuracy evaluation.

@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import shutil
+from collections import defaultdict
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -33,11 +34,102 @@ from transformers import AutoConfig
 
 from mobius._builder import build_from_module
 from mobius._model_package import ModelPackage
+from mobius._passes._fold_concat import FoldConcatInitializersPass
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.tasks import ModelTask
 from mobius.tasks._base import _make_graph, _make_model
 
 logger = logging.getLogger(__name__)
+
+
+def pack_int2_projections(model):
+    """Pack compatible shared-input projections without requantizing their weights."""
+    graph = model.graph
+    groups = defaultdict(list)
+    for node in graph:
+        if (
+            node.domain != "com.microsoft"
+            or node.op_type != "MatMulNBits"
+            or len(node.inputs) != 3
+            or set(node.attributes) != {"K", "N", "bits", "block_size"}
+            or node.attributes["bits"].as_int() != 2
+            or node.attributes["block_size"].as_int() != 128
+            or any(
+                value is None or not value.is_initializer() or value.const_value is None
+                for value in node.inputs[1:]
+            )
+        ):
+            continue
+        k = node.attributes["K"].as_int()
+        n = node.attributes["N"].as_int()
+        if (
+            k % 128
+            or node.inputs[1].shape != ir.Shape([n, k // 128, 32])
+            or node.inputs[2].shape != ir.Shape([n, k // 128])
+            or node.outputs[0].shape is None
+            or node.outputs[0].shape.rank() != 2
+        ):
+            continue
+        groups[
+            (
+                node.inputs[0],
+                k,
+                tuple(value.dtype for value in node.inputs[1:]),
+            )
+        ].append(node)
+    removed = 0
+    for nodes in groups.values():
+        if len(nodes) < 2:
+            continue
+        widths = [node.attributes["N"].as_int() for node in nodes]
+        # Keep every original column aligned to the same decode-kernel warp tile.
+        if any(width % 16 for width in widths):
+            continue
+        new_nodes = []
+        packed_inputs = [nodes[0].inputs[0]]
+        for index in (1, 2):
+            parts = [node.inputs[index] for node in nodes]
+            shape = list(parts[0].shape)
+            shape[0] = sum(widths)
+            value = ir.Value(shape=ir.Shape(shape), type=parts[0].type)
+            new_nodes.append(
+                ir.Node("", "Concat", parts, [ir.AttrInt64("axis", 0)], outputs=[value])
+            )
+            packed_inputs.append(value)
+        attributes = dict(nodes[0].attributes)
+        attributes["N"] = ir.AttrInt64("N", sum(widths))
+        packed_shape = list(nodes[0].outputs[0].shape)
+        packed_shape[-1] = sum(widths)
+        packed = ir.Value(shape=ir.Shape(packed_shape), type=nodes[0].outputs[0].type)
+        new_nodes.append(
+            ir.Node(
+                "com.microsoft", "MatMulNBits", packed_inputs, attributes, outputs=[packed]
+            )
+        )
+        sizes = ir.Value(
+            name=nodes[0].outputs[0].name + ".packed_split_sizes",
+            const_value=ir.tensor(widths, dtype=ir.DataType.INT64),
+        )
+        graph.register_initializer(sizes)
+        outputs = [
+            ir.Value(
+                name=node.outputs[0].name,
+                shape=node.outputs[0].shape,
+                type=node.outputs[0].type,
+            )
+            for node in nodes
+        ]
+        new_nodes.append(
+            ir.Node("", "Split", [packed, sizes], [ir.AttrInt64("axis", -1)], outputs=outputs)
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph, nodes[0], nodes, new_nodes, [node.outputs[0] for node in nodes], outputs
+        )
+        removed += len(nodes) - 1
+    if removed:
+        FoldConcatInitializersPass()(model)
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return removed
 
 
 def bind_component_weights(model, component, checkpoint, *, mtp=False):
@@ -533,6 +625,11 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--components", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--pack-projections",
+        action="store_true",
+        help="Pack shared-input INT2 projections to reduce decode kernel launches",
+    )
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(f"Refusing to overwrite {args.output}")
@@ -551,6 +648,9 @@ def main():
         )
         bind_component_weights(
             package["decoder"], args.components / "decoder/model.onnx", args.checkpoint
+        )
+        packed_projections = (
+            pack_int2_projections(package["decoder"]) if args.pack_projections else 0
         )
         (args.output / "decoder").mkdir(parents=True)
         ir.save(
@@ -590,6 +690,7 @@ def main():
                 "model_id": MODEL_ID,
                 "revision": REVISION,
                 "engine_validated": False,
+                "packed_projection_nodes_removed": packed_projections,
                 "greedy_parity_runtime_environment": {
                     "ORT_DISABLE_MOE_GEMV": "1",
                     "ORT_ENABLE_XQA": "0",

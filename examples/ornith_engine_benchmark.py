@@ -152,6 +152,14 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument(
+        "--draft-tokens", type=int, help="Override the fixed MTP proposal width"
+    )
+    parser.add_argument(
+        "--decoder-file",
+        type=Path,
+        help="Alternative decoder graph relative to the model directory",
+    )
+    parser.add_argument(
         "--cuda-graph", action="store_true", help="Enable native Engine CUDA graph capture"
     )
     parser.add_argument(
@@ -160,6 +168,18 @@ def main():
         help="Save an experimental report without replacing the export's validation record",
     )
     args = parser.parse_args()
+    disk_config = json.loads((args.model / "genai_config.json").read_text())
+    if args.draft_tokens is not None and not (
+        0 < args.draft_tokens < disk_config["model"]["decoder"]["state_update_capacity"]
+    ):
+        parser.error("--draft-tokens must fit the decoder's speculative state capacity")
+    if args.decoder_file is not None:
+        if args.decoder_file.is_absolute() or not (
+            args.model / args.decoder_file
+        ).resolve().is_relative_to(args.model.resolve()):
+            parser.error("--decoder-file must stay inside the model directory")
+        if not (args.model / args.decoder_file).is_file():
+            parser.error("--decoder-file does not exist")
     if (
         any(n <= 0 for n in args.contexts)
         or args.runs <= 0
@@ -171,15 +191,21 @@ def main():
         )
     print("Loading native GenAI Engine", flush=True)
     config = og.Config(str(args.model))
-    graph_overlay = {
-        "model": {
-            "decoder": {
-                "session_options": {"provider_options": [{"cuda": {"enable_cuda_graph": "1"}}]}
-            }
-        }
-    }
+    decoder_overlay = {}
     if args.cuda_graph:
-        config.overlay(json.dumps(graph_overlay))
+        decoder_overlay["session_options"] = {
+            "provider_options": [{"cuda": {"enable_cuda_graph": "1"}}]
+        }
+    if args.decoder_file is not None:
+        decoder_overlay["filename"] = str(args.decoder_file)
+    config_overlay = {"model": {"decoder": decoder_overlay}} if decoder_overlay else {}
+    if args.draft_tokens is not None:
+        config_overlay["speculative"] = {"max_draft_tokens": args.draft_tokens}
+    if config_overlay:
+        config.overlay(json.dumps(config_overlay))
+    decoder_path = args.model / (
+        args.decoder_file or disk_config["model"]["decoder"]["filename"]
+    )
     model = og.Model(config)
     engine = og.Engine(model)
     tokenizer = og.Tokenizer(model)
@@ -194,7 +220,8 @@ def main():
         "config_sha256": hashlib.sha256(
             (args.model / "genai_config.json").read_bytes()
         ).hexdigest(),
-        "config_overlay": graph_overlay if args.cuda_graph else {},
+        "config_overlay": config_overlay,
+        "decoder_sha256": hashlib.sha256(decoder_path.read_bytes()).hexdigest(),
         "gpu": torch.cuda.get_device_name(0),
         "gpu_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
         "cuda_runtime": torch.version.cuda,
@@ -223,8 +250,8 @@ def main():
     }
     save_report(args.model, args.report, report, update_manifest=not args.report_only)
     reference_config = og.Config(str(args.model))
-    if args.cuda_graph:
-        reference_config.overlay(json.dumps(graph_overlay))
+    if config_overlay:
+        reference_config.overlay(json.dumps(config_overlay))
     reference_config.overlay('{"model":{"mtp":{"enabled":false}}}')
     reference_model = og.Model(reference_config)
     reference_engine = og.Engine(reference_model)
@@ -272,12 +299,7 @@ def main():
             raise RuntimeError(
                 f"Prompt length mismatch: expected {context}, got {len(prompt)}"
             )
-        if (
-            context + args.output_tokens
-            > json.loads((args.model / "genai_config.json").read_text())["model"][
-                "context_length"
-            ]
-        ):
+        if context + args.output_tokens > disk_config["model"]["context_length"]:
             raise ValueError(f"Context {context} plus output exceeds the model context limit")
         for _ in range(args.warmup):
             run_turn(engine, prompt, args.output_tokens)
