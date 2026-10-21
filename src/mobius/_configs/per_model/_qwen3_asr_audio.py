@@ -41,7 +41,9 @@ def _qwen3_asr_audio(config, parent_config, model_type: str, fields: dict):
             n_window_infer=getattr(ac, "n_window_infer", None),
         )
     # Special tokens from thinker config
-    fields["audio_token_id"] = getattr(tc, "audio_token_id", None)
+    fields["audio_token_id"] = getattr(
+        tc, "audio_token_id", getattr(tc, "audio_token_index", None)
+    )
     fields["audio_start_token_id"] = getattr(tc, "audio_start_token_id", None)
     fields["audio_end_token_id"] = getattr(tc, "audio_end_token_id", None)
     fields["classify_num"] = getattr(tc, "classify_num", None)
