@@ -277,7 +277,10 @@ output tokens against an MTP-disabled Engine using the same 128-token prompt.
 A second parity check at each requested context compares the entire requested
 output sequence before any timings are collected. A mismatch is saved in the
 report, leaves `engine_validated` false, and stops
-the benchmark. This is a correctness gate, not an accuracy evaluation or a
+the benchmark. Target-only references are collected first, then that Engine and
+model are released before loading the MTP model; validation does not require
+two simultaneous model copies on the GPU.
+This is a correctness gate, not an accuracy evaluation or a
 guarantee of equivalence for all prompts. TTFT includes Engine admission,
 prefill, and sampling; it is not an isolated prefill measurement.
 Measured outputs must also match the corresponding target-only reference;
@@ -338,6 +341,16 @@ MTP/target-only parity. Wider prefill matrix multiplies change floating-point
 rounding, so the generated sequence and MTP acceptance can differ from the
 unpacked export. These are measurements on the repeated-text benchmark, not
 accuracy results or guaranteed performance on other prompts.
+
+A subsequent run with the same decoder and runtime binary, using sequential
+target-only/MTP model loading, measured 132/120/89/55 decode tokens/s.
+All twelve measured 512-token outputs exactly matched the earlier run.
+The report identifies this validation lifecycle as
+`parity_reference_lifecycle: "sequential"`; the earlier measurements are retained
+as historical results, not a guaranteed current throughput. Further expert
+tiling, dense tensor-core dispatch, and attention-reduction experiments did not
+establish a reliable improvement and were not retained. The 200 tokens/s goal
+has not been reached.
 
 An alternative decoder graph saved alongside an existing export can be tested
 without changing its default configuration:

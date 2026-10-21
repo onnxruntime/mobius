@@ -102,6 +102,10 @@ def run_turn(engine, prompt, output_tokens, *, require_mtp=True):
 def greedy_parity(engine, reference_engine, prompt, output_tokens=64):
     speculative = run_turn(engine, prompt, output_tokens)
     reference = run_turn(reference_engine, prompt, output_tokens, require_mtp=False)
+    return compare_greedy_outputs(speculative, reference)
+
+
+def compare_greedy_outputs(speculative, reference):
     if reference["speculative"]["draft_tokens_proposed"]:
         raise RuntimeError("Parity reference unexpectedly enabled MTP")
     mismatch = next(
@@ -206,9 +210,13 @@ def main():
     decoder_path = args.model / (
         args.decoder_file or disk_config["model"]["decoder"]["filename"]
     )
-    model = og.Model(config)
-    engine = og.Engine(model)
-    tokenizer = og.Tokenizer(model)
+    reference_config = og.Config(str(args.model))
+    if config_overlay:
+        reference_config.overlay(json.dumps(config_overlay))
+    reference_config.overlay('{"model":{"mtp":{"enabled":false}}}')
+    reference_model = og.Model(reference_config)
+    reference_engine = og.Engine(reference_model)
+    tokenizer = og.Tokenizer(reference_model)
     unit = tokenizer.encode(
         "A model processes a long document by keeping track of the preceding information. "
     )
@@ -232,9 +240,11 @@ def main():
                 "ORT_MOE_GEMV_FP32_ACCUM",
                 "ORT_ENABLE_XQA",
                 "ORT_PAGED_ATTENTION_DECODE_NUM_SPLITS",
+                "ORT_FPA_INTB_GEMM",
             )
         },
         "batch_size": 1,
+        "parity_reference_lifecycle": "sequential",
         "greedy": True,
         "mtp_enabled": True,
         "warmup_runs_per_context": args.warmup,
@@ -249,12 +259,6 @@ def main():
         "status": "in_progress",
     }
     save_report(args.model, args.report, report, update_manifest=not args.report_only)
-    reference_config = og.Config(str(args.model))
-    if config_overlay:
-        reference_config.overlay(json.dumps(config_overlay))
-    reference_config.overlay('{"model":{"mtp":{"enabled":false}}}')
-    reference_model = og.Model(reference_config)
-    reference_engine = og.Engine(reference_model)
     print("Checking real-weight MTP versus target-only greedy parity", flush=True)
     report["parity"] = {"status": "in_progress", "cases": []}
     parity_cases = [
@@ -265,8 +269,15 @@ def main():
             64,
         )
     ] + [(make_prompt(unit, context), args.output_tokens) for context in args.contexts]
-    for prompt, output_tokens in parity_cases:
-        result = greedy_parity(engine, reference_engine, prompt, output_tokens)
+    references = [
+        run_turn(reference_engine, prompt, output_tokens, require_mtp=False)
+        for prompt, output_tokens in parity_cases
+    ]
+    del reference_engine, tokenizer, reference_model, reference_config
+    model = og.Model(config)
+    engine = og.Engine(model)
+    for (prompt, output_tokens), reference in zip(parity_cases, references, strict=True):
+        result = compare_greedy_outputs(run_turn(engine, prompt, output_tokens), reference)
         result["context_tokens"] = len(prompt)
         report["parity"]["cases"].append(result)
         if result["status"] != "passed":
@@ -287,7 +298,6 @@ def main():
             f"Greedy parity passed: {len(prompt)} input / {output_tokens} output", flush=True
         )
     report["parity"]["status"] = "passed"
-    del reference_engine, reference_model, reference_config
     save_report(args.model, args.report, report, update_manifest=not args.report_only)
     expected_outputs = {
         case["context_tokens"]: case["target_only"]["output_ids"]

@@ -6,7 +6,9 @@
 import dataclasses
 import json
 import sys
+import weakref
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import onnx
@@ -216,6 +218,105 @@ def test_benchmark_parity_reports_first_mismatch(monkeypatch, mismatch):
     assert result["first_mismatch_index"] == mismatch
     assert result["status"] == ("passed" if mismatch is None else "failed")
     assert calls == [(engine, 128, 64, True), (reference, 128, 64, False)]
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_benchmark_sequential_models_preserve_parity_gate(tmp_path, monkeypatch, mismatch):
+    import ornith_engine_benchmark as benchmark
+
+    models = weakref.WeakSet()
+    calls = []
+
+    class Config:
+        def __init__(self, path):
+            self.reference = False
+
+        def overlay(self, payload):
+            self.reference = (
+                json.loads(payload).get("model", {}).get("mtp", {}).get("enabled") is False
+            )
+
+    class Model:
+        def __init__(self, config):
+            assert not models, "Reference and speculative models must not coexist"
+            models.add(self)
+            self.reference = config.reference
+
+    class Engine:
+        def __init__(self, model):
+            self.model = model
+
+    class Tokenizer:
+        def __init__(self, model):
+            self.model = model
+
+        def encode(self, text):
+            return [1, 2, 3]
+
+    def turn(engine, prompt, output_tokens, *, require_mtp=True):
+        assert engine.model.reference == (not require_mtp)
+        calls.append(require_mtp)
+        tokens = list(range(output_tokens))
+        if mismatch and require_mtp:
+            tokens[0] = -1
+        return {
+            "output_ids": tokens,
+            "speculative": {"draft_tokens_proposed": int(require_mtp)},
+            "ttft_seconds": 0.1,
+            "total_seconds": 1.0,
+            "decode_tokens_per_second": 10.0,
+        }
+
+    (tmp_path / "genai_config.json").write_text(
+        json.dumps(
+            {"model": {"context_length": 1024, "decoder": {"filename": "decoder.onnx"}}}
+        )
+    )
+    (tmp_path / "decoder.onnx").touch()
+    monkeypatch.setattr(benchmark.og, "Config", Config)
+    monkeypatch.setattr(benchmark.og, "Model", Model)
+    monkeypatch.setattr(benchmark.og, "Engine", Engine)
+    monkeypatch.setattr(benchmark.og, "Tokenizer", Tokenizer)
+    monkeypatch.setattr(benchmark, "run_turn", turn)
+    monkeypatch.setattr(benchmark.torch.cuda, "get_device_name", lambda _: "test GPU")
+    monkeypatch.setattr(
+        benchmark.torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(total_memory=1024),
+    )
+    report_path = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark",
+            "--model",
+            str(tmp_path),
+            "--report",
+            str(report_path),
+            "--contexts",
+            "16",
+            "--output-tokens",
+            "8",
+            "--runs",
+            "1",
+            "--warmup",
+            "0",
+            "--report-only",
+        ],
+    )
+    if mismatch:
+        with pytest.raises(RuntimeError, match="differ at output index 0"):
+            benchmark.main()
+    else:
+        benchmark.main()
+    report = json.loads(report_path.read_text())
+    assert calls == ([False, False, True] if mismatch else [False, False, True, True, True])
+    assert report["status"] == ("failed_parity" if mismatch else "passed")
+    assert report["parity_reference_lifecycle"] == "sequential"
+    if not mismatch:
+        assert report["timed_outputs_match_target_only"]
+    assert not (tmp_path / "ornith_engine_export.json").exists()
 
 
 @pytest.mark.parametrize(
