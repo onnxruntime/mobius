@@ -42,7 +42,7 @@ from mobius.tasks._base import _make_graph, _make_model
 logger = logging.getLogger(__name__)
 
 
-def fuse_moe_routers(model):
+def fuse_moe_routers(model, *, use_matmul=False):
     """Integrate FP16 router projections into compatible group-128 INT2 QMoE."""
     graph = model.graph
     expected = {
@@ -142,11 +142,14 @@ def fuse_moe_routers(model):
         output = ir.Value(
             name=moe.outputs[0].name, shape=moe.outputs[0].shape, type=moe.outputs[0].type
         )
+        attributes = dict(moe.attributes)
+        if use_matmul:
+            attributes["router_use_matmul"] = ir.AttrInt64("router_use_matmul", 1)
         node = ir.Node(
             "com.microsoft",
             "QMoEWithRouter",
             [activation, weight, *moe.inputs[2:]],
-            dict(moe.attributes),
+            attributes,
             outputs=[output],
         )
         ir.convenience.replace_nodes_and_values(
@@ -844,6 +847,11 @@ def main():
         help="Integrate FP16 router MatMuls into group-128 INT2 QMoE",
     )
     parser.add_argument(
+        "--moe-router-use-matmul",
+        action="store_true",
+        help="Use CUDA MatMul inside integrated routers at every row count; requires --fuse-moe-routers",
+    )
+    parser.add_argument(
         "--recurrent-state-fp16",
         action="store_true",
         help="Store target/MTP recurrent states in FP16, retaining FP32 updates and capsules",
@@ -859,6 +867,8 @@ def main():
         help="Pack shared-input INT2 projections to reduce decode kernel launches",
     )
     args = parser.parse_args()
+    if args.moe_router_use_matmul and not args.fuse_moe_routers:
+        parser.error("--moe-router-use-matmul requires --fuse-moe-routers")
     if args.output.exists():
         raise FileExistsError(f"Refusing to overwrite {args.output}")
     validate_checkpoint_revision(args.checkpoint)
@@ -888,7 +898,11 @@ def main():
             if args.fuse_shared_expert_gates
             else 0
         )
-        fused_routers = fuse_moe_routers(package["decoder"]) if args.fuse_moe_routers else 0
+        fused_routers = (
+            fuse_moe_routers(package["decoder"], use_matmul=args.moe_router_use_matmul)
+            if args.fuse_moe_routers
+            else 0
+        )
         (args.output / "decoder").mkdir(parents=True)
         ir.save(
             package["decoder"],
@@ -933,6 +947,7 @@ def main():
                 "packed_projection_nodes_removed": packed_projections,
                 "shared_expert_gates_fused": fused_gates,
                 "moe_routers_fused": fused_routers,
+                "moe_router_use_matmul": args.moe_router_use_matmul,
                 "recurrent_state_dtype": "float16" if args.recurrent_state_fp16 else "float32",
                 "greedy_parity_runtime_environment": {
                     "ORT_DISABLE_MOE_GEMV": "1",

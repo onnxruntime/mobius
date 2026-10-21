@@ -629,7 +629,8 @@ def test_shared_expert_gate_fusion_is_guarded_and_idempotent(reject):
         "wrong_experts",
     ],
 )
-def test_moe_router_fusion_is_guarded_and_idempotent(reject):
+@pytest.mark.parametrize("use_matmul", [False, True])
+def test_moe_router_fusion_is_guarded_and_idempotent(reject, use_matmul):
     from onnx import TensorProto, helper, numpy_helper
     from ornith_engine_export import fuse_moe_routers
 
@@ -702,13 +703,16 @@ def test_moe_router_fusion_is_guarded_and_idempotent(reject):
     )
     model = ir.serde.deserialize_model(proto)
     accepted = reject in (None, "direct_router")
-    assert fuse_moe_routers(model) == int(accepted)
-    assert fuse_moe_routers(model) == 0
+    assert fuse_moe_routers(model, use_matmul=use_matmul) == int(accepted)
+    assert fuse_moe_routers(model, use_matmul=use_matmul) == 0
     assert sum(node.op_type == "MatMul" for node in model.graph) == int(not accepted)
     if accepted:
         assert len(model.graph) == 1
         node = next(iter(model.graph))
         assert node.op_type == "QMoEWithRouter"
+        assert ("router_use_matmul" in node.attributes) == use_matmul
+        if use_matmul:
+            assert node.attributes["router_use_matmul"].as_int() == 1
         assert [value.name if value is not None else "" for value in node.inputs] == [
             "x",
             "router",
@@ -719,6 +723,29 @@ def test_moe_router_fusion_is_guarded_and_idempotent(reject):
             "s2",
         ]
         assert model.graph.outputs[0].name == "out"
+
+
+def test_moe_router_matmul_cli_requires_router_fusion(monkeypatch, tmp_path, capsys):
+    from ornith_engine_export import main
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ornith_engine_export",
+            "--checkpoint",
+            str(tmp_path),
+            "--components",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "output"),
+            "--moe-router-use-matmul",
+        ],
+    )
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert "--moe-router-use-matmul requires --fuse-moe-routers" in capsys.readouterr().err
 
 
 def _states(batch, block_count=4, recurrent_dtype=np.float32):

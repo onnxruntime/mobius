@@ -410,7 +410,7 @@ optional QMoE inputs.
 
 The operator projects into internal FP16 logits, then reuses QMoE routing and
 expert kernels. **It does not fuse projection and TopK into one CUDA launch.**
-For up to eight rows, a warp per expert accumulates the dot product in FP32 with
+By default, for up to eight rows, a warp per expert accumulates the dot product in FP32 with
 the same reduction order for every row count. Larger prefill batches use CUDA
 MatMul internally. Thus zero standard ONNX MatMul nodes does not mean zero dense
 matrix multiplication or zero cuBLAS calls.
@@ -451,6 +451,56 @@ It uses FP16, 256 experts, hidden size 3072, and intermediate size 128
 (smaller than Ornith's 1024). Timings are median CUDA-event samples of twenty
 native CUDA-graph replays, each containing 32 operator calls; graph optimization
 is disabled. These modest local gains do not imply a whole-model speedup.
+
+#### Preserving router MatMul numerics
+
+Add `--moe-router-use-matmul` together with `--fuse-moe-routers` to set
+`QMoEWithRouter.router_use_matmul=1`. This uses the existing CUDA MatMul
+implementation inside the operator at every row count rather than the custom
+decode GEMV. The default remains zero, preserving existing experimental graphs.
+This mode still leaves zero standard ONNX MatMul nodes in the target decoder;
+it does not eliminate the projection computation or combine projection and TopK.
+
+The separate MatMul-router/FP16-state decoder measured
+**168.0/133.4/111.6/66.0 decode tokens/s** at 2K/8K/16K/32K.
+All twelve timed 512-token outputs matched both their own target-only references
+and the prior unfused-router FP16-state decoder exactly, with unchanged MTP
+counters and zero failures. Its 32K sampled peak was **43.196 GiB**.
+This restores the original variant's tested numerics, not a source-model accuracy
+guarantee.
+
+A fresh same-runtime 2K control measured 162.5 tokens/s, with individual runs
+157.7/162.2/167.7 versus 168.0/168.1/168.0 for the integrated decoder.
+An earlier integrated run measured 157.7 tokens/s. Given this variability and
+negligible same-input component differences, a reliable end-to-end speedup is
+not established; neither router variant is promoted to the default.
+The same-input synthetic component benchmark described above measured
+baseline/integrated-MatMul latencies of 64.28/63.79, 67.46/67.48,
+85.79/85.92, and 147.98/147.81 us at 1/2/8/32 rows.
+
+#### Current-baseline CUDA profiling
+
+Fresh Nsight Systems node-level traces of the faster unfused-router,
+fused-gate/FP16-state decoder show these steady-decode GPU kernel-time shares:
+
+| Family | 2K | 32K |
+|---|---:|---:|
+| Dense INT2 projections | 22.45% | 10.54% |
+| INT2 expert FC1 + SwiGLU | 12.00% | 5.63% |
+| INT2 expert FC2 | 6.02% | 2.83% |
+| FP8 paged attention, including reduction | 10.79% | 58.18% |
+| Normalization + casts + Split | 13.58% | 6.38% |
+| Expert routing / finalize | 5.16% | 2.46% |
+
+Each trace followed a complete 512-token warmup and captured prefill through at
+least 128 generated tokens. Both full 512-token turns at both contexts exactly
+matched the prior parity-qualified baseline; CUDA graphs, one-draft FP8 MTP,
+packed-only INT2 and direct initializer allocation remained enabled.
+These percentages describe summed kernel duration, not wall time, occupancy,
+or measured hardware bandwidth. Node-level tracing adds overhead.
+Prioritize INT2 dense/expert work for short-context decode and paged attention
+for long-context decode, rather than more router-wrapper work. The 200 tokens/s
+goal and source-model accuracy evaluation remain outstanding.
 
 ### Ornith FP16 recurrent-state storage
 
