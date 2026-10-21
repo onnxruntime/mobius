@@ -95,6 +95,8 @@ class ComponentDescriptor:
             weights belong to this component.
         source_path_aliases: Pairs of ``(local_prefix, source_prefix)`` for
             component paths that cannot be aligned by a shared anchor segment.
+        source_path_exclusions: Source subtrees excluded from this component's
+            roots, including descendants but not similarly named siblings.
     """
 
     name: str
@@ -102,6 +104,7 @@ class ComponentDescriptor:
     role: str
     source_paths: tuple[str, ...] = ()
     source_path_aliases: tuple[tuple[str, str], ...] = ()
+    source_path_exclusions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -117,6 +120,18 @@ class ComponentDescriptor:
                 f"component {self.name!r} source_path_aliases must contain "
                 "non-empty local/source prefixes"
             )
+        if any(not path for path in self.source_path_exclusions):
+            raise ValueError("source_path_exclusions must contain non-empty paths")
+
+    def owns_source(self, name: str) -> bool:
+        """Whether a source is inside a declared root and outside excluded subtrees."""
+
+        def within(path: str) -> bool:
+            return name == path or name.startswith(f"{path}.")
+
+        return (not self.source_paths or any(map(within, self.source_paths))) and not any(
+            map(within, self.source_path_exclusions)
+        )
 
     def source_module_names(self, local_module_path: str) -> tuple[str, ...]:
         """Candidate HuggingFace names for a component-local module path.
@@ -128,7 +143,7 @@ class ComponentDescriptor:
         ``model.language_model.layers.0.self_attn.q_proj``.
         """
         if not local_module_path:
-            return self.source_paths
+            return tuple(path for path in self.source_paths if self.owns_source(path))
 
         local_parts = local_module_path.split(".")
         candidates: list[str] = []
@@ -155,7 +170,13 @@ class ComponentDescriptor:
                     # Use the component root only if no alias or separate
                     # source (such as a top-level output head) already owns it.
                     candidates.append(f"{source_path}.{local_module_path}")
-        return tuple(dict.fromkeys((local_module_path, *candidates)))
+        names = tuple(dict.fromkeys((local_module_path, *candidates)))
+        # Preserve legacy local-name fallbacks unless ownership is explicitly
+        # partitioned. A partition must not reintroduce an excluded source via
+        # either a local spelling or an alias.
+        if not self.source_path_exclusions:
+            return names
+        return tuple(name for name in names if self.owns_source(name))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -191,12 +212,10 @@ class ComponentManifest(Mapping[str, ComponentDescriptor]):
                         f"shared weight {shared_weight.name!r} references unknown "
                         f"component {endpoint.component!r}"
                     )
-                source_paths = by_name[endpoint.component].source_paths
+                descriptor = by_name[endpoint.component]
+                source_paths = descriptor.source_paths
                 module_path = endpoint.parameter.rpartition(".")[0]
-                if source_paths and not any(
-                    module_path == source_path or module_path.startswith(f"{source_path}.")
-                    for source_path in source_paths
-                ):
+                if not descriptor.owns_source(module_path):
                     raise ValueError(
                         f"shared weight {shared_weight.name!r} parameter "
                         f"{endpoint.parameter!r} is outside component "

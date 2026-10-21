@@ -614,13 +614,40 @@ class Qwen4ExpPLELayer(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        hidden_states: ir.Value,
-        input_ids: ir.Value,
-        past_conv_state: ir.Value,
-        past_context: ir.Value,
-        token_mask: ir.Value,
-    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+        hidden_states: ir.Value | None = None,
+        input_ids: ir.Value | None = None,
+        past_conv_state: ir.Value | None = None,
+        past_context: ir.Value | None = None,
+        token_mask: ir.Value | None = None,
+        *,
+        ngram_embeddings: ir.Value | None = None,
+        lookup_context: ir.Value | None = None,
+    ):
+        if lookup_context is not None:
+            assert input_ids is not None
+            return self.ple_embedding(op, input_ids, lookup_context)
+        assert hidden_states is not None and past_conv_state is not None
+        assert token_mask is not None
+        if ngram_embeddings is not None:
+            return self._apply_embeddings(
+                op, hidden_states, ngram_embeddings, past_conv_state, token_mask
+            )
+        assert input_ids is not None and past_context is not None
         embeddings, present_context = self.ple_embedding(op, input_ids, past_context)
+        output, present_conv_state = self._apply_embeddings(
+            op, hidden_states, embeddings, past_conv_state, token_mask
+        )
+        return output, present_conv_state, present_context
+
+    def _apply_embeddings(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        embeddings: ir.Value,
+        past_conv_state: ir.Value,
+        token_mask: ir.Value,
+    ) -> tuple[ir.Value, ir.Value]:
+        """Shared PLE tail; lookup is the only operation outside main."""
         key = self.norm_key(op, self.key_proj(op, embeddings))
         key = op.Reshape(key, [0, 0, self._hc_count, self._hidden_size])
         query = self.norm_query(op, hidden_states)
@@ -638,7 +665,7 @@ class Qwen4ExpPLELayer(nn.Module):
         gated = op.Mul(gated, mask)
         normalized = op.Mul(normalized, mask)
         convolved, present_conv_state = self.conv1d(op, normalized, past_conv_state)
-        return op.Add(gated, convolved), present_conv_state, present_context
+        return op.Add(gated, convolved), present_conv_state
 
 
 class Qwen4ExpQSAIndexer(nn.Module):
@@ -1222,27 +1249,35 @@ class Qwen4ExpDecoderLayer(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        hidden_states: ir.Value,
-        input_ids: ir.Value,
-        attention_bias: ir.Value,
-        position_embeddings: tuple[ir.Value, ir.Value],
-        qsa_current_position_embeddings: tuple[ir.Value, ir.Value],
-        qsa_full_position_embeddings: tuple[ir.Value, ir.Value],
-        past_state: tuple[ir.Value, ...],
-        token_mask: ir.Value,
+        hidden_states: ir.Value | None = None,
+        input_ids: ir.Value | None = None,
+        attention_bias: ir.Value | None = None,
+        position_embeddings: tuple[ir.Value, ir.Value] | None = None,
+        qsa_current_position_embeddings: tuple[ir.Value, ir.Value] | None = None,
+        qsa_full_position_embeddings: tuple[ir.Value, ir.Value] | None = None,
+        past_state: tuple[ir.Value, ...] = (),
+        token_mask: ir.Value | None = None,
+        *,
+        ngram_embeddings: ir.Value | None = None,
+        lookup_context: ir.Value | None = None,
     ):
-        ple_present: tuple[ir.Value, ir.Value] | None = None
+        if lookup_context is not None:
+            assert self.ple is not None
+            return self.ple(op, input_ids=input_ids, lookup_context=lookup_context)
+        assert hidden_states is not None and token_mask is not None
+        ple_present: tuple[ir.Value, ...] | None = None
         if self.ple is not None:
-            ple_output, ple_conv, ple_context = self.ple(
+            ple_output, *ple_states = self.ple(
                 op,
                 hidden_states,
                 input_ids,
                 past_state[2],
-                past_state[3],
+                past_state[3] if ngram_embeddings is None else None,
                 token_mask,
+                ngram_embeddings=ngram_embeddings,
             )
             hidden_states = op.Add(hidden_states, ple_output)
-            ple_present = (ple_conv, ple_context)
+            ple_present = tuple(ple_states)
 
         mixed, residual, inject = self.attn_hyper_connection(op, hidden_states)
         if self.linear_attn is not None:
@@ -1258,6 +1293,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 present_state += ple_present
         else:
             assert self.self_attn is not None
+            assert attention_bias is not None and position_embeddings is not None
+            assert qsa_current_position_embeddings is not None
+            assert qsa_full_position_embeddings is not None
             output, present_state = self.self_attn(
                 op,
                 mixed,
@@ -1282,6 +1320,7 @@ class Qwen4ExpTextModel(nn.Module):
         super().__init__()
         self._dtype = config.dtype
         self._hc_count = config.hc_count
+        self._ple_layer_ids = tuple(config.ple_layer_ids or ())
         self._eos_token_id = (
             config.eos_token_id[0]
             if isinstance(config.eos_token_id, list)
@@ -1303,16 +1342,33 @@ class Qwen4ExpTextModel(nn.Module):
         self,
         op: OpBuilder,
         input_ids: ir.Value | None,
-        attention_mask: ir.Value,
-        position_ids: ir.Value,
-        past_position_ids: ir.Value,
-        past_key_values: list[tuple[ir.Value, ...]],
+        attention_mask: ir.Value | None = None,
+        position_ids: ir.Value | None = None,
+        past_position_ids: ir.Value | None = None,
+        past_key_values: list[tuple[ir.Value, ...]] | None = None,
         *,
         inputs_embeds: ir.Value | None = None,
         ple_input_ids: ir.Value | None = None,
         qsa_position_ids: ir.Value | None = None,
         past_qsa_position_ids: ir.Value | None = None,
+        ngram_embeddings: ir.Value | None = None,
+        past_ngram_context: ir.Value | None = None,
     ):
+        if past_ngram_context is not None:
+            lookup_embeddings, contexts = [], []
+            # Follow the original __call__ scopes, including indexed layers.
+            # Configuration order, not decoder order, defines the external L axis.
+            for index, layer_id in enumerate(self._ple_layer_ids):
+                embedding, context = self.layers[layer_id - 1](
+                    op,
+                    input_ids=input_ids,
+                    lookup_context=op.Gather(past_ngram_context, index, axis=0),
+                )
+                lookup_embeddings.append(op.Unsqueeze(embedding, [0]))
+                contexts.append(op.Unsqueeze(context, [0]))
+            return op.Concat(*lookup_embeddings, axis=0), op.Concat(*contexts, axis=0)
+        assert attention_mask is not None and position_ids is not None
+        assert past_position_ids is not None and past_key_values is not None
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("Qwen4-Exp requires input_ids or inputs_embeds")
@@ -1366,7 +1422,12 @@ class Qwen4ExpTextModel(nn.Module):
             )
 
         presents = []
-        for layer, past_state in zip(self.layers, past_key_values):
+        for layer_index, (layer, past_state) in enumerate(zip(self.layers, past_key_values)):
+            raw_embedding = None
+            if ngram_embeddings is not None and layer_index + 1 in self._ple_layer_ids:
+                raw_embedding = op.Gather(
+                    ngram_embeddings, self._ple_layer_ids.index(layer_index + 1), axis=0
+                )
             hidden_states, present = layer(
                 op,
                 hidden_states,
@@ -1377,6 +1438,7 @@ class Qwen4ExpTextModel(nn.Module):
                 qsa_full_position_embeddings,
                 past_state,
                 current_token_mask,
+                ngram_embeddings=raw_embedding,
             )
             presents.append(present)
         return (
@@ -1403,11 +1465,16 @@ class Qwen4ExpCausalLMModel(nn.Module):
         self,
         op: OpBuilder,
         input_ids: ir.Value,
-        attention_mask: ir.Value,
-        position_ids: ir.Value,
-        past_position_ids: ir.Value,
-        past_key_values: list[tuple[ir.Value, ...]],
+        attention_mask: ir.Value | None = None,
+        position_ids: ir.Value | None = None,
+        past_position_ids: ir.Value | None = None,
+        past_key_values: list[tuple[ir.Value, ...]] | None = None,
+        *,
+        ngram_embeddings: ir.Value | None = None,
+        past_ngram_context: ir.Value | None = None,
     ):
+        if past_ngram_context is not None:
+            return self.model(op, input_ids, past_ngram_context=past_ngram_context)
         hidden_states, presents, present_position_ids = self.model(
             op,
             input_ids,
@@ -1416,6 +1483,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
             past_position_ids,
             past_key_values,
             ple_input_ids=input_ids,
+            ngram_embeddings=ngram_embeddings,
         )
         return self.lm_head(op, hidden_states), presents, present_position_ids
 
@@ -1789,14 +1857,19 @@ class Qwen4ExpVLDecoderModel(Qwen4ExpCausalLMModel):
         self,
         op: OpBuilder,
         input_ids: ir.Value | None,
-        attention_mask: ir.Value,
-        position_ids: ir.Value,
-        past_position_ids: ir.Value,
-        past_key_values: list[tuple[ir.Value, ...]],
+        attention_mask: ir.Value | None = None,
+        position_ids: ir.Value | None = None,
+        past_position_ids: ir.Value | None = None,
+        past_key_values: list[tuple[ir.Value, ...]] | None = None,
         *,
         inputs_embeds: ir.Value | None = None,
         ple_input_ids: ir.Value | None = None,
+        ngram_embeddings: ir.Value | None = None,
+        past_ngram_context: ir.Value | None = None,
     ):
+        if past_ngram_context is not None:
+            return self.model(op, input_ids, past_ngram_context=past_ngram_context)
+        assert position_ids is not None and past_position_ids is not None
         if ple_input_ids is None:
             if input_ids is None:
                 raise ValueError(
@@ -1820,6 +1893,7 @@ class Qwen4ExpVLDecoderModel(Qwen4ExpCausalLMModel):
             # causal sequence axis retained for generation bookkeeping.
             qsa_position_ids=mrope_position_ids,
             past_qsa_position_ids=past_mrope_position_ids,
+            ngram_embeddings=ngram_embeddings,
         )
         present_text_position_ids = op.Concat(
             op.Slice(past_position_ids, [0], [1], [0]),
@@ -1962,6 +2036,8 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self.embedding = Qwen4ExpImageOnlyEmbeddingModel(config)
 
     def forward(self, op: OpBuilder, **kwargs):
+        if "past_ngram_context" in kwargs:
+            return self.decoder(op, **kwargs)
         raise NotImplementedError(
             "Qwen4ExpForConditionalGeneration uses Qwen4ExpVisionLanguageTask, "
             "which builds decoder, vision_encoder, and embedding independently."

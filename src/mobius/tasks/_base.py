@@ -64,6 +64,8 @@ class ComponentSpec:
         """
 
         def _has_nested(obj: object, dotted: str) -> bool:
+            if not dotted:
+                return True
             for part in dotted.split("."):
                 if not hasattr(obj, part):
                     return False
@@ -161,6 +163,10 @@ class ModelTask(ABC):
     #: :meth:`_validate_components` checks that all declared attributes
     #: exist on the module before building begins.
     components: ClassVar[ComponentSpec | None] = None
+
+    def validate_build(self, config: BaseModelConfig, *, execution_provider: str) -> None:
+        """Validate task/profile combinations before constructing any graph."""
+        return None
 
     def component_manifest(
         self,

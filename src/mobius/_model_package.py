@@ -29,7 +29,7 @@ import shutil
 import tempfile
 import threading
 from collections import UserDict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -43,6 +43,7 @@ import tqdm
 
 from mobius._export_report import ComponentExportReport
 from mobius._optimizations import fold_initializers_after_weights
+from mobius._split_identity import split_component_key
 from mobius._weight_utils import WeightTransform
 from mobius.adapters import (
     AdapterArtifact,
@@ -151,7 +152,7 @@ def _mtp_sidecar_name(package: ModelPackage) -> str:
     return name
 
 
-def _validate_mtp_chain(package: ModelPackage) -> None:
+def _validate_mtp_chain(package: ModelPackage, *, include_mtp_head: bool = True) -> None:
     """Reject malformed or cyclic MTP package chains before saving any files."""
     seen: set[int] = set()
     current = package
@@ -188,7 +189,7 @@ def _validate_mtp_chain(package: ModelPackage) -> None:
                 raise ValueError(
                     f"ModelPackage component name {name!r} is reserved for package metadata."
                 )
-        sidecar = current.mtp_head
+        sidecar = current.mtp_head if include_mtp_head else None
         if sidecar is None:
             return
         if not isinstance(sidecar, ModelPackage):
@@ -202,6 +203,7 @@ def _validate_streaming_safetensors_destination(
     *,
     external_data: str,
     component_layout: _ComponentSaveLayout,
+    include_mtp_head: bool = True,
 ) -> None:
     """Defensively reject known aliases to files read by a streaming package.
 
@@ -274,7 +276,7 @@ def _validate_streaming_safetensors_destination(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_files", ())
         )
-        if current_package.mtp_head is None:
+        if not include_mtp_head or current_package.mtp_head is None:
             break
         current_directory /= _mtp_sidecar_name(current_package)
         current_package = current_package.mtp_head
@@ -330,6 +332,7 @@ def _validate_mtp_save_paths(
     external_data: str = "onnx",
     include_policy_components: bool = True,
     include_adapter_artifacts: bool = True,
+    include_mtp_head: bool = True,
 ) -> None:
     """Reject unsafe output paths throughout the package chain before any writes."""
     _validate_output_directory(directory, kind="package", inspect_contents=False)
@@ -441,7 +444,7 @@ def _validate_mtp_save_paths(
         raise ValueError(
             "ModelPackage manifest MTP sidecar collides with an active artifact namespace."
         )
-    if package.mtp_head is None:
+    if not include_mtp_head or package.mtp_head is None:
         return
     sidecar_directory = os.path.join(directory, _mtp_sidecar_name(package))
     _validate_output_directory(sidecar_directory, kind="MTP sidecar")
@@ -452,6 +455,7 @@ def _validate_mtp_save_paths(
         external_data=external_data,
         include_policy_components=include_policy_components,
         include_adapter_artifacts=include_adapter_artifacts,
+        include_mtp_head=include_mtp_head,
     )
 
 
@@ -662,6 +666,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         check_weights: bool = True,
         include_policy_components: bool = True,
         include_adapter_artifacts: bool = True,
+        include_mtp_head: bool = True,
         _atomic_export_report: bool = True,
         _component_layout: _ComponentSaveLayout | None = None,
     ) -> None:
@@ -721,6 +726,8 @@ class ModelPackage(UserDict[str, ir.Model]):
                 components under ``policies/``. Defaults to ``True``.
             include_adapter_artifacts: Save attached parameter-adapter bundles
                 under ``adapters/``. Defaults to ``True``.
+            include_mtp_head: Persist the complete nested MTP sidecar by default.
+                False omits it; the root component predicate is never recursive.
 
         Raises:
             ValueError: If *external_data* is not ``"onnx"`` or
@@ -736,12 +743,13 @@ class ModelPackage(UserDict[str, ir.Model]):
                 f"Unknown external_data format {external_data!r}. "
                 "Expected 'onnx' or 'safetensors'."
             )
-        _validate_mtp_chain(self)
+        _validate_mtp_chain(self, include_mtp_head=include_mtp_head)
         _validate_streaming_safetensors_destination(
             self,
             directory,
             external_data=external_data,
             component_layout=component_layout,
+            include_mtp_head=include_mtp_head,
         )
         _validate_mtp_save_paths(
             self,
@@ -750,6 +758,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             external_data=external_data,
             include_policy_components=include_policy_components,
             include_adapter_artifacts=include_adapter_artifacts,
+            include_mtp_head=include_mtp_head,
         )
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
@@ -761,7 +770,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             if report is not None and report.get("streaming_external_data") is True:
                 streaming_external_data = True
                 break
-            if current_package.mtp_head is None:
+            if not include_mtp_head or current_package.mtp_head is None:
                 break
             current_package = current_package.mtp_head
         if (
@@ -789,6 +798,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                     check_weights=check_weights,
                     include_policy_components=include_policy_components,
                     include_adapter_artifacts=include_adapter_artifacts,
+                    include_mtp_head=include_mtp_head,
                     _atomic_export_report=False,
                     _component_layout=component_layout,
                 )
@@ -956,7 +966,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             self.save_policy_components(directory, check_weights=check_weights)
         if include_adapter_artifacts:
             self.save_adapter_artifacts(directory)
-        if self.mtp_head is not None:
+        if include_mtp_head and self.mtp_head is not None:
             sidecar_name = _mtp_sidecar_name(self)
             sidecar_directory = os.path.join(directory, sidecar_name)
             if os.path.isdir(sidecar_directory):
@@ -970,6 +980,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                 check_weights=check_weights,
                 include_policy_components=include_policy_components,
                 include_adapter_artifacts=include_adapter_artifacts,
+                include_mtp_head=True,
                 _atomic_export_report=False,
             )
             _write_mtp_manifest(directory, sidecar_name)
@@ -1303,7 +1314,13 @@ class ModelPackage(UserDict[str, ir.Model]):
         return artifacts
 
     @classmethod
-    def load(cls, directory: str) -> ModelPackage:
+    def load(
+        cls,
+        directory: str,
+        *,
+        components: Collection[str] | None = None,
+        include_mtp_head: bool = True,
+    ) -> ModelPackage:
         """Load all ``.onnx`` files from a directory into a package.
 
         Supports two layouts:
@@ -1313,27 +1330,49 @@ class ModelPackage(UserDict[str, ir.Model]):
         - **Subfolder**: each subdirectory contains ``model.onnx`` → multi-
           component package keyed by subfolder name.
 
+        Marked split graphs recover their canonical key from fixed-schema
+        identity metadata, including singleton and direct-subdirectory loads.
+        In a multi-component package that key must agree with its directory.
+        Unmarked legacy graphs retain the filename/directory behavior above.
+
         An MTP sidecar named by ``.mobius-package.json`` is restored as
         :attr:`mtp_head`. Unmarked subdirectories, including ``mtp/``, remain
         ordinary model components.
 
         Args:
             directory: Path to the directory containing models.
+            components: Root keys to load, after split identity recovery.
+                None loads all; unknown names raise ValueError. Unselected
+                external tensor payloads are never accessed.
+            include_mtp_head: Restore the entire nested sidecar by default;
+                False omits it without applying the root selection recursively.
 
         Returns:
             A new ``ModelPackage`` with one entry per model found.
         """
-        return cls._load(directory, frozenset())
+        return cls._load(
+            directory,
+            frozenset(),
+            components=frozenset(components) if components is not None else None,
+            include_mtp_head=include_mtp_head,
+        )
 
     @classmethod
-    def _load(cls, directory: str, ancestors: frozenset[str]) -> ModelPackage:
+    def _load(
+        cls,
+        directory: str,
+        ancestors: frozenset[str],
+        *,
+        components: frozenset[str] | None = None,
+        include_mtp_head: bool = True,
+    ) -> ModelPackage:
         resolved_directory = os.path.realpath(directory)
         if resolved_directory in ancestors:
             raise ValueError("ModelPackage MTP sidecar manifests must not contain a cycle.")
         ancestors = ancestors | {resolved_directory}
         sidecar_name = _read_mtp_sidecar_name(directory)
         mtp_dir: str | None = None
-        if sidecar_name is not None:
+        if sidecar_name is not None and include_mtp_head:
             mtp_dir = os.path.join(directory, sidecar_name)
             if not os.path.isdir(mtp_dir):
                 raise ValueError(
@@ -1346,22 +1385,45 @@ class ModelPackage(UserDict[str, ir.Model]):
                 raise ValueError("ModelPackage MTP sidecar must remain inside its package.")
 
         models: dict[str, ir.Model] = {}
+        recovered: set[str] = set()
+
+        def inspect_model(path: str, legacy_key: str, *, subdirectory: bool) -> None:
+            # ir.load parses the graph/metadata but leaves external tensors lazy.
+            # Identity validation must precede filtering, including omitted graphs.
+            model = ir.load(path)
+            key = split_component_key(model.metadata_props)
+            if key is not None and subdirectory and key != legacy_key:
+                raise ValueError(
+                    f"Split component {key!r} disagrees with directory {legacy_key!r}"
+                )
+            key = key or legacy_key
+            if key in recovered:
+                raise ValueError(f"Duplicate recovered component key {key!r}")
+            recovered.add(key)
+            if components is not None and key not in components:
+                return
+            if split_component_key(model.metadata_props) is not None:
+                from mobius._optimizations import validate_standard_onnx
+
+                validate_standard_onnx(model, component=key)
+            models[key] = model
+
+        found_subdirectories = False
         for entry in sorted(os.listdir(directory)):
             subdir = os.path.join(directory, entry)
-            if (
-                mtp_dir is not None
-                and os.path.isdir(subdir)
-                and os.path.samefile(subdir, mtp_dir)
-            ):
+            if sidecar_name is not None and entry == sidecar_name:
                 continue
             model_path = os.path.join(subdir, "model.onnx")
             if os.path.isdir(subdir) and os.path.isfile(model_path):
-                models[entry] = ir.load(model_path)
-        if not models:
+                found_subdirectories = True
+                inspect_model(model_path, entry, subdirectory=True)
+        if not found_subdirectories:
             for filename in sorted(os.listdir(directory)):
                 if filename.endswith(".onnx"):
                     name = filename.removesuffix(".onnx")
-                    models[name] = ir.load(os.path.join(directory, filename))
+                    inspect_model(os.path.join(directory, filename), name, subdirectory=False)
+        if components is not None and not components <= recovered:
+            raise ValueError(f"Unknown requested components: {sorted(components - recovered)}")
         package = cls(models)
         quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
         if os.path.lexists(quantization_report_path):
@@ -1392,8 +1454,8 @@ class ModelPackage(UserDict[str, ir.Model]):
                 raise ValueError("Invalid weight-loading report.")
             package.weight_loading_report = report
         package._load_policy_components(directory)
-        if mtp_dir is not None:
-            package.mtp_head = cls._load(mtp_dir, ancestors)
+        if mtp_dir is not None and include_mtp_head:
+            package.mtp_head = cls._load(mtp_dir, ancestors, include_mtp_head=True)
         return package
 
     def _load_policy_components(self, directory: str) -> None:

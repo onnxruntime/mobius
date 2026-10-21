@@ -6,13 +6,31 @@
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 import onnx_ir as ir
-from onnxscript import nn
+from onnxscript import GraphBuilder, nn
 
-from mobius._configs import Qwen4ExpConfig
+from mobius._build_context import ep_capabilities
+from mobius._component_manifest import (
+    ComponentDescriptor,
+    ComponentManifest,
+    SharedWeightEndpoint,
+    SharedWeightInfo,
+    _config_ties_word_embeddings,
+    _infer_shared_weights,
+)
+from mobius._configs import BaseModelConfig, Qwen4ExpConfig
 from mobius._model_package import ModelPackage
+from mobius._split_identity import (
+    COMPONENT_KEY_PROPERTY,
+    SPLIT_ABI,
+    SPLIT_ABI_PROPERTY,
+    TEXT_COMPONENT_KEYS,
+    VLM_COMPONENT_KEYS,
+)
 from mobius.tasks._base import (
+    ComponentSpec,
     ModelTask,
     _make_graph,
     _make_model,
@@ -34,6 +52,8 @@ def _make_qwen4_state_inputs(
     batch: ir.SymbolicDim,
     past_seq_len: ir.SymbolicDim,
     past_position_ids: ir.Value,
+    *,
+    split_ngram: bool = False,
 ) -> list[tuple[ir.Value, ...]]:
     """Create every Qwen4-Exp recurrent, PLE, QSA, and KV state input."""
     layer_types = _require_layer_types(config)
@@ -88,6 +108,10 @@ def _make_qwen4_state_inputs(
                         ple_state_len,
                     ],
                 )
+                layer_states += (ple_conv_state,)
+                if split_ngram:
+                    states.append(layer_states)
+                    continue
                 ple_context = builder.input(
                     f"past_key_values.{layer_idx}.ple_context",
                     dtype=ir.DataType.INT64,
@@ -111,7 +135,7 @@ def _make_qwen4_state_inputs(
                     ),
                     ple_context,
                 )
-                layer_states += (ple_conv_state, ple_context)
+                layer_states += (ple_context,)
         else:
             key = builder.input(
                 f"past_key_values.{layer_idx}.key",
@@ -158,8 +182,9 @@ def _register_qwen4_outputs(
         if layer_type == "linear_attention":
             builder.add_output(present[0], f"present.{layer_idx}.conv_state")
             builder.add_output(present[1], f"present.{layer_idx}.recurrent_state")
-            if len(present) == 4:
+            if len(present) >= 3:
                 builder.add_output(present[2], f"present.{layer_idx}.ple_conv_state")
+            if len(present) == 4:
                 builder.add_output(present[3], f"present.{layer_idx}.ple_context")
         else:
             builder.add_output(present[0], f"present.{layer_idx}.key")
@@ -172,6 +197,7 @@ def _finalize_qwen4_decoder(
     config: Qwen4ExpConfig,
     *,
     position_axes: list[str],
+    split_ngram: bool = False,
 ) -> ir.Model:
     model = _make_model(graph)
     _register_linear_attention_functions(model, config)
@@ -180,6 +206,10 @@ def _finalize_qwen4_decoder(
         "linear=conv_state,recurrent_state[,ple_conv_state,ple_context];"
         "qsa=key,value,index_key"
     )
+    if split_ngram:
+        model.metadata_props["mobius.cache_abi"] = model.metadata_props[
+            "mobius.cache_abi"
+        ].replace("ple_conv_state,ple_context", "ple_conv_state")
     model.metadata_props["mobius.semantic_reference_revision"] = (
         "Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c;"
         "transformers@598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1"
@@ -190,7 +220,9 @@ def _finalize_qwen4_decoder(
         if layer_type == "linear_attention":
             roles = ["conv_state", "recurrent_state"]
             if layer_index + 1 in (config.ple_layer_ids or []):
-                roles.extend(["ple_conv_state", "ple_context"])
+                roles.append("ple_conv_state")
+                if not split_ngram:
+                    roles.append("ple_context")
         else:
             roles = ["key", "value", "index_key"]
         layers.append(
@@ -219,16 +251,225 @@ def _finalize_qwen4_decoder(
     return model
 
 
-class Qwen4ExpCausalLMTask(ModelTask):
+def _guard_nonempty(builder: GraphBuilder, input_ids: ir.Value) -> ir.Value:
+    """Use the existing fail-closed Reshape input-guard convention on every EP."""
+    op = builder.op
+    empty = op.Equal(op.Shape(input_ids, start=1, end=2), [0])
+    shape = op.Add(op.Cast(empty, to=ir.DataType.INT64), [1])
+    guard = op.Reshape(op.Constant(value_ints=[0]), shape)
+    return op.Add(input_ids, op.ReduceSum(guard, keepdims=False))
+
+
+def _ngram_input(
+    builder: GraphBuilder,
+    config: Qwen4ExpConfig,
+    batch: ir.SymbolicDim,
+    seq_len: ir.SymbolicDim,
+) -> ir.Value:
+    return builder.input(
+        "ngram_embeddings",
+        dtype=config.dtype,
+        shape=[len(config.ple_layer_ids or []), batch, seq_len, config.ple_embed_dim],
+    )
+
+
+class _Qwen4ExpSplitOptions:
+    """Instance-local selection, manifest ownership, and split graph metadata."""
+
+    _is_vlm: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        *,
+        split_ngram: bool = False,
+        requested_components: set[str] | frozenset[str] | None = None,
+    ) -> None:
+        self.split_ngram = split_ngram
+        self.requested_components = (
+            frozenset(requested_components) if requested_components is not None else None
+        )
+        keys = VLM_COMPONENT_KEYS if self._is_vlm else TEXT_COMPONENT_KEYS
+        if not split_ngram and requested_components is not None:
+            raise ValueError("requested_components requires split_ngram=True")
+        if self.requested_components is not None:
+            if not self.requested_components or not self.requested_components <= keys:
+                raise ValueError(f"Expected a nonempty selection from {sorted(keys)}")
+        self._selected = (
+            self.requested_components
+            if self.requested_components is not None
+            else frozenset(keys)
+        )
+
+    def validate_build(self, config: BaseModelConfig, *, execution_provider: str) -> None:
+        if not self.split_ngram:
+            return
+        if execution_provider != "onnx-standard":
+            raise ValueError("split_ngram requires execution_provider='onnx-standard'")
+        if not isinstance(config, Qwen4ExpConfig) or not config.ple_layer_ids:
+            raise ValueError("split_ngram requires at least one configured PLE layer")
+        if config.dtype not in {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+            raise ValueError("split_ngram supports only F32/F16/BF16")
+        if (
+            config.block_quant_scheme is not None
+            or config.quantization is not None
+            or config.component_quantization is not None
+        ):
+            raise ValueError(
+                "split_ngram requires unquantized weights; FP8/block/affine are unsupported"
+            )
+
+    def _split_manifest(self, config: object | None) -> ComponentManifest:
+        text_config = getattr(config, "text_config", config)
+        if isinstance(text_config, dict):
+            layer_ids = text_config.get("ple_layer_ids", [])
+        else:
+            layer_ids = getattr(text_config, "ple_layer_ids", [])
+        lookups = tuple(
+            f"model.language_model.layers.{layer_id - 1}.ple.ple_embedding"
+            for layer_id in layer_ids
+        )
+        main_roots: tuple[str, ...] = (
+            "model.language_model.layers",
+            "model.language_model.rotary_emb",
+            "model.language_model.hyper_connection_mixer",
+            "lm_head",
+        )
+        if not self._is_vlm:
+            main_roots += ("model.language_model.embed_tokens",)
+        specs = ComponentSpec(
+            ngram="",
+            main="decoder" if self._is_vlm else "",
+            **(
+                {"vision_encoder": "vision_encoder", "embedding": "embedding"}
+                if self._is_vlm
+                else {}
+            ),
+        )
+        descriptors = []
+        for name, path in specs.items():
+            if name == "ngram":
+                descriptor = ComponentDescriptor(name, path, "embedding", lookups)
+            elif name == "main":
+                descriptor = ComponentDescriptor(
+                    name,
+                    path,
+                    "decoder",
+                    main_roots,
+                    (
+                        ("lm_head", "lm_head"),
+                        ("model.embed_tokens", "model.language_model.embed_tokens"),
+                    )
+                    if not self._is_vlm
+                    else (("lm_head", "lm_head"),),
+                    source_path_exclusions=lookups,
+                )
+            elif name == "embedding":
+                descriptor = ComponentDescriptor(
+                    name,
+                    path,
+                    "embedding",
+                    ("model.language_model.embed_tokens",),
+                    (("embed_tokens", "model.language_model.embed_tokens"),),
+                )
+            else:
+                descriptor = ComponentDescriptor(name, path, "encoder", ("model.visual",))
+            descriptors.append(descriptor)
+        manifest = ComponentManifest(tuple(descriptors))
+        shared_weights = _infer_shared_weights(config, manifest) if config is not None else ()
+        if not self._is_vlm and config is not None and _config_ties_word_embeddings(config):
+            # Text main owns both ordinary token consumers. A tied checkpoint
+            # may omit the head even though neither consumer belongs to ngram.
+            shared_weights = (
+                SharedWeightInfo(
+                    name="word_embeddings",
+                    canonical=SharedWeightEndpoint(
+                        "main", "model.language_model.embed_tokens.weight"
+                    ),
+                    aliases=(SharedWeightEndpoint("main", "lm_head.weight"),),
+                    kind="tied_word_embeddings",
+                ),
+            )
+        return ComponentManifest(
+            manifest.components,
+            shared_weights,
+        )
+
+    def _mark_split(self, package: ModelPackage, config: Qwen4ExpConfig) -> ModelPackage:
+        roles = self._split_manifest(config)
+        for name, model in package.items():
+            model.metadata_props.update(
+                {
+                    SPLIT_ABI_PROPERTY: SPLIT_ABI,
+                    COMPONENT_KEY_PROPERTY: name,
+                    "mobius.qwen4_exp.role": roles[name].role,
+                    "mobius.qwen4_exp.ple_layer_ids": json.dumps(config.ple_layer_ids),
+                    "mobius.qwen4_exp.ngram_size": str(config.ngram_size),
+                    "mobius.qwen4_exp.ple_embed_dim": str(config.ple_embed_dim),
+                    "mobius.qwen4_exp.dtype": str(config.dtype),
+                }
+            )
+        return package
+
+    def _build_ngram(self, module: nn.Module, config: Qwen4ExpConfig) -> ir.Model:
+        batch, seq_len = ir.SymbolicDim("batch"), ir.SymbolicDim("sequence_len")
+        graph, builder = _make_graph("qwen4_exp_ngram")
+        input_ids = _guard_nonempty(
+            builder,
+            builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]),
+        )
+        context = builder.input(
+            "past_ngram_context",
+            dtype=ir.DataType.INT64,
+            shape=[len(config.ple_layer_ids or []), batch, config.ngram_size - 1],
+        )
+        embeddings, present = module(
+            builder.op, input_ids=input_ids, past_ngram_context=context
+        )
+        builder.add_output(embeddings, "ngram_embeddings")
+        builder.add_output(present, "present_ngram_context")
+        model = _make_model(graph)
+        model.metadata_props["mobius.qwen4_exp.context"] = (
+            "host-first-eos-cold;configured-layer-order;past_ngram_context->present_ngram_context"
+        )
+        return model
+
+
+class Qwen4ExpCausalLMTask(_Qwen4ExpSplitOptions, ModelTask):
     """Build Qwen4-Exp with DeltaNet, PLE, QSA, and position cache states."""
 
+    def component_manifest(
+        self,
+        *,
+        module_class: type | None = None,
+        model_type: str | None = None,
+        hf_config: object | None = None,
+    ) -> ComponentManifest:
+        if self.split_ngram:
+            return self._split_manifest(hf_config)
+        return super().component_manifest(
+            module_class=module_class, model_type=model_type, hf_config=hf_config
+        )
+
     def build(self, module: nn.Module, config: Qwen4ExpConfig) -> ModelPackage:
+        if self.split_ngram:
+            self.validate_build(config, execution_provider=ep_capabilities().name)
+            models = {}
+            if "ngram" in self._selected:
+                models["ngram"] = self._build_ngram(module, config)
+            if "main" in self._selected:
+                models["main"] = self._build_main(module, config)
+            return self._mark_split(ModelPackage(models, config=config), config)
+        return ModelPackage({"model": self._build_main(module, config)}, config=config)
+
+    def _build_main(self, module: nn.Module, config: Qwen4ExpConfig) -> ir.Model:
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
         graph, builder = _make_graph("qwen4_exp")
 
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        if self.split_ngram:
+            input_ids = _guard_nonempty(builder, input_ids)
         attention_mask = builder.input(
             "attention_mask",
             dtype=ir.DataType.INT64,
@@ -244,7 +485,12 @@ class Qwen4ExpCausalLMTask(ModelTask):
         )
 
         states = _make_qwen4_state_inputs(
-            builder, config, batch, past_seq_len, past_position_ids
+            builder,
+            config,
+            batch,
+            past_seq_len,
+            past_position_ids,
+            split_ngram=self.split_ngram,
         )
 
         logits, presents, present_position_ids = module(
@@ -254,21 +500,60 @@ class Qwen4ExpCausalLMTask(ModelTask):
             position_ids,
             past_position_ids,
             states,
+            **(
+                {"ngram_embeddings": _ngram_input(builder, config, batch, seq_len)}
+                if self.split_ngram
+                else {}
+            ),
         )
         _register_qwen4_outputs(builder, config, logits, presents, present_position_ids)
-        model = _finalize_qwen4_decoder(graph, config, position_axes=["text"])
-        return ModelPackage({"model": model}, config=config)
+        return _finalize_qwen4_decoder(
+            graph, config, position_axes=["text"], split_ngram=self.split_ngram
+        )
 
 
-class Qwen4ExpVisionLanguageTask(QwenVLTask):
+class Qwen4ExpVisionLanguageTask(_Qwen4ExpSplitOptions, QwenVLTask):
     """Build the Qwen4-Exp decoder, shared Qwen vision tower, and embedding mixer."""
 
+    _is_vlm = True
+
+    def component_manifest(
+        self,
+        *,
+        module_class: type | None = None,
+        model_type: str | None = None,
+        hf_config: object | None = None,
+    ) -> ComponentManifest:
+        if self.split_ngram:
+            return self._split_manifest(hf_config)
+        return super().component_manifest(
+            module_class=module_class, model_type=model_type, hf_config=hf_config
+        )
+
     def build(self, module: nn.Module, config: Qwen4ExpConfig) -> ModelPackage:
+        if self.split_ngram:
+            self.validate_build(config, execution_provider=ep_capabilities().name)
         self._validate_components(module)
         if config.deepstack_visual_indexes or (
             config.vision is not None and config.vision.deepstack_visual_indexes
         ):
             raise ValueError("Qwen4-Exp multimodal export does not support DeepStack")
+        models = {}
+        if self.split_ngram and "ngram" in self._selected:
+            models["ngram"] = self._build_ngram(module, config)
+        if not self.split_ngram or "main" in self._selected:
+            models["main" if self.split_ngram else "decoder"] = self._build_decoder(
+                module.decoder, config, split_ngram=self.split_ngram
+            )
+        if not self.split_ngram or "vision_encoder" in self._selected:
+            models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        if not self.split_ngram or "embedding" in self._selected:
+            models["embedding"] = self._build_embedding(module, config)
+        package = ModelPackage(models, config=config)
+        return self._mark_split(package, config) if self.split_ngram else package
+
+    @staticmethod
+    def _build_embedding(module: nn.Module, config: Qwen4ExpConfig) -> ir.Model:
         embedding = build_embedding_from_features(
             module.embedding,
             config,
@@ -279,15 +564,12 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
             {"video": config.unsupported_video_token_id},
             separators=(",", ":"),
         )
-        models = {
-            "decoder": self._build_decoder(module.decoder, config),
-            "vision_encoder": self._build_vision(module.vision_encoder, config),
-            "embedding": embedding,
-        }
-        return ModelPackage(models, config=config)
+        return embedding
 
     @staticmethod
-    def _build_decoder(decoder: nn.Module, config: Qwen4ExpConfig) -> ir.Model:
+    def _build_decoder(
+        decoder: nn.Module, config: Qwen4ExpConfig, *, split_ngram: bool = False
+    ) -> ir.Model:
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
         past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -305,6 +587,8 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
             dtype=ir.DataType.INT64,
             shape=[batch, seq_len],
         )
+        if split_ngram:
+            ple_input_ids = _guard_nonempty(builder, ple_input_ids)
         attention_mask = builder.input(
             "attention_mask",
             dtype=ir.DataType.INT64,
@@ -321,7 +605,12 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
             shape=[4, batch, past_seq_len],
         )
         states = _make_qwen4_state_inputs(
-            builder, config, batch, past_seq_len, past_position_ids
+            builder,
+            config,
+            batch,
+            past_seq_len,
+            past_position_ids,
+            split_ngram=split_ngram,
         )
 
         logits, presents, present_position_ids = decoder(
@@ -333,10 +622,16 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
             position_ids=position_ids,
             past_position_ids=past_position_ids,
             past_key_values=states,
+            **(
+                {"ngram_embeddings": _ngram_input(builder, config, batch, seq_len)}
+                if split_ngram
+                else {}
+            ),
         )
         _register_qwen4_outputs(builder, config, logits, presents, present_position_ids)
         return _finalize_qwen4_decoder(
             graph,
             config,
             position_axes=["text", "temporal", "height", "width"],
+            split_ngram=split_ngram,
         )

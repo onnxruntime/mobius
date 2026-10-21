@@ -6,15 +6,18 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 
 import onnx_ir as ir
 import torch
 from onnx_ir import tensor_adapters
 from safetensors import safe_open
 
+from mobius._component_manifest import ComponentDescriptor, ComponentManifest
 from mobius._configs import Qwen4ExpConfig
 from mobius._model_package import ModelPackage
-from mobius._optimizations import fold_initializers_after_weights
+from mobius._optimizations import fold_initializers_after_weights, validate_standard_onnx
+from mobius._split_identity import split_component_key
 from mobius.integrations._weight_loading import _resolve_shard_paths, _shard_key_index
 from mobius.models.qwen4_exp import _qwen4_exp_ple_buffer_values
 
@@ -141,6 +144,8 @@ def _validate_unquantized_checkpoint(key_index) -> None:
 def _validate_deterministic_ple_buffers(
     config: Qwen4ExpConfig,
     key_index,
+    *,
+    selected_sources: set[str] | None = None,
 ) -> int:
     validated_bytes = 0
     for ple_layer_index, layer_id in enumerate(config.ple_layer_ids or []):
@@ -151,12 +156,18 @@ def _validate_deterministic_ple_buffers(
         prefix = f"model.language_model.layers.{layer_id - 1}.ple.ple_embedding."
         for buffer_name, expected_array in expected_values.items():
             source_name = f"{prefix}{buffer_name}"
+            if selected_sources is not None and source_name not in selected_sources:
+                continue
             located = key_index.get(source_name)
             if located is None:
                 raise ValueError(
                     f"Qwen4-Exp checkpoint is missing deterministic buffer '{source_name}'"
                 )
             source_path, source_shape, _dtype = located
+            if selected_sources is not None and _dtype != "I64":
+                raise ValueError(
+                    f"Qwen4-Exp deterministic buffer {source_name} must have INT64 dtype"
+                )
             _validate_shape(source_name, source_shape, list(expected_array.shape))
             with safe_open(source_path, framework="pt") as handle:
                 actual = handle.get_tensor(source_name)
@@ -174,6 +185,9 @@ def _plan_model_bindings(
     model: ir.Model,
     config: Qwen4ExpConfig,
     key_index,
+    *,
+    descriptor: ComponentDescriptor | None = None,
+    aliases: Mapping[str, tuple[str, ...]] | None = None,
 ) -> tuple[list[tuple[ir.Value, ir.TensorProtocol]], int]:
     bindings: list[tuple[ir.Value, ir.TensorProtocol]] = []
     eagerly_validated_bytes = 0
@@ -211,13 +225,24 @@ def _plan_model_bindings(
             continue
 
         source_name = _source_name(target_name)
+        if descriptor is not None and not descriptor.owns_source(source_name):
+            raise ValueError(
+                f"Component {descriptor.name!r} does not own source {source_name!r}"
+            )
         located = key_index.get(source_name)
+        if located is None and aliases is not None:
+            for alias in aliases.get(source_name, ()):
+                if alias in key_index:
+                    source_name, located = alias, key_index[alias]
+                    break
         if located is None:
             raise ValueError(
                 f"Qwen4-Exp checkpoint has no source tensor for initializer "
                 f"'{target_name}' (expected '{source_name}')"
             )
         source_path, source_shape, _dtype = located
+        if descriptor is not None and _dtype not in {"F32", "F16", "BF16"}:
+            raise ValueError(f"Unsupported split source dtype {_dtype!r} for {source_name}")
         _validate_shape(source_name, source_shape, [int(d) for d in initializer.shape])
         bindings.append(
             (initializer, _lazy_source_tensor(initializer, source_path, source_name))
@@ -238,12 +263,19 @@ def _stage_model(
     model: ir.Model,
     config: Qwen4ExpConfig,
     key_index,
+    *,
+    descriptor: ComponentDescriptor | None = None,
+    aliases: Mapping[str, tuple[str, ...]] | None = None,
 ) -> tuple[ir.Model, int, int]:
     staged = model.clone()
-    bindings, validated_bytes = _plan_model_bindings(staged, config, key_index)
+    bindings, validated_bytes = _plan_model_bindings(
+        staged, config, key_index, descriptor=descriptor, aliases=aliases
+    )
     for initializer, value in bindings:
         initializer.const_value = value
     fold_initializers_after_weights(staged)
+    if split_component_key(staged.metadata_props) is not None:
+        validate_standard_onnx(staged, component=descriptor.name if descriptor else "model")
     return staged, len(bindings), validated_bytes
 
 
@@ -275,12 +307,46 @@ def stream_qwen4_exp_safetensors_to_package(
     config: Qwen4ExpConfig,
     *,
     revision: str | None = None,
+    manifest: ComponentManifest | None = None,
 ) -> Qwen4ExpStreamingReport:
     """Transactionally bind every Qwen4-Exp package component from one shard index."""
     paths = _resolve_shard_paths(model_id, revision)
     key_index = _shard_key_index(paths)
     _validate_unquantized_checkpoint(key_index)
-    validated_bytes = _validate_deterministic_ple_buffers(config, key_index)
+    split = any(split_component_key(model.metadata_props) for model in package.values())
+    if split and manifest is None:
+        raise ValueError("Split package binding requires its full component manifest")
+    selected_sources = None
+    if split:
+        assert manifest is not None
+        # Optimization can fold hash-buffer Gather/Slice operations, so the
+        # original buffer names need not survive as graph initializers. Source
+        # ownership, not the optimized initializer inventory, defines this closure.
+        selected_sources = {
+            f"model.language_model.layers.{layer_id - 1}.ple.ple_embedding.{buffer}"
+            for layer_id in config.ple_layer_ids or []
+            for buffer in (
+                "layer_multipliers",
+                "ngram_heads_vocab_sizes",
+                "ngram_heads_offsets",
+            )
+            if any(
+                manifest[key].owns_source(
+                    f"model.language_model.layers.{layer_id - 1}.ple.ple_embedding.{buffer}"
+                )
+                for key in package
+            )
+        }
+    validated_bytes = _validate_deterministic_ple_buffers(
+        config, key_index, selected_sources=selected_sources
+    )
+    aliases: dict[str, tuple[str, ...]] = {}
+    if manifest is not None:
+        for shared in manifest.shared_weights:
+            for endpoint in shared.endpoints:
+                aliases[endpoint.parameter] = tuple(
+                    other.parameter for other in shared.endpoints if other != endpoint
+                )
 
     staged_models: dict[str, ir.Model] = {}
     initializer_count = 0
@@ -290,6 +356,8 @@ def stream_qwen4_exp_safetensors_to_package(
             model,
             config,
             key_index,
+            descriptor=manifest[name] if split and manifest is not None else None,
+            aliases=aliases,
         )
         staged_models[name] = staged
         validated_bytes += model_validated_bytes

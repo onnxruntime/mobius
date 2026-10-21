@@ -13,10 +13,51 @@ import pytest
 from mobius._component_manifest import (
     ComponentDescriptor,
     ComponentManifest,
+    SharedWeightEndpoint,
+    SharedWeightInfo,
     get_hf_component_sources,
     resolve_component_manifest,
 )
 from mobius.tasks import ComponentSpec
+
+
+def test_source_exclusions_apply_to_candidates_and_shared_endpoints():
+    descriptor = ComponentDescriptor(
+        "main",
+        "",
+        "decoder",
+        source_paths=("model.layers",),
+        source_path_aliases=(("lookup", "model.layers.0.lookup"),),
+        source_path_exclusions=("model.layers.0.lookup",),
+    )
+    assert descriptor.owns_source("model.layers.0.proj.weight")
+    assert descriptor.owns_source("model.layers.0.lookup_extra.weight")
+    assert not descriptor.owns_source("model.layers.0.lookup")
+    assert not descriptor.owns_source("model.layers.0.lookup.weight")
+    assert not descriptor.owns_source("other.weight")
+    assert descriptor.source_module_names("lookup") == ()
+    assert descriptor.source_module_names("layers.0.lookup") == ()
+    assert descriptor.source_module_names("layers.0.proj") == ("model.layers.0.proj",)
+    with pytest.raises(ValueError, match="outside component"):
+        ComponentManifest(
+            (descriptor, ComponentDescriptor("other", "", "embedding")),
+            (
+                SharedWeightInfo(
+                    "invalid",
+                    SharedWeightEndpoint("main", "model.layers.0.lookup.weight"),
+                    (SharedWeightEndpoint("other", "table.weight"),),
+                ),
+            ),
+        )
+
+
+def test_component_spec_accepts_empty_root_path():
+    ComponentSpec(main="", ngram="").validate(object(), "RootTask")
+
+
+def test_empty_source_exclusion_rejected():
+    with pytest.raises(ValueError, match="source_path_exclusions"):
+        ComponentDescriptor("main", "", "decoder", source_path_exclusions=("",))
 
 
 class _Task:
