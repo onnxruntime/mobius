@@ -196,6 +196,56 @@ See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html)
 - [`examples/text_generation.py`](examples/text_generation.py) — Greedy text generation with a causal LM
 - [`examples/static_cache_generation.py`](examples/static_cache_generation.py) — Text generation with static KV cache
 - [`examples/multimodal_generation.py`](examples/multimodal_generation.py) — Image captioning with a multimodal model
+- [`examples/ornith_export.py`](examples/ornith_export.py) — Experimental Ornith-1.5-122B
+  INT2 decoder, FP8 LM head/MTP/KV, and FP16 vision export. **Not GenAI Engine-ready.**
+
+#### Experimental Ornith export
+
+Download `ornith-ai/Ornith-1.5-122B` at revision
+`7681ef608624e7532d8164128bcffdbdbaf1b1af` using Hugging Face Hub's
+`snapshot_download(..., local_dir=...)`. Retain its local download metadata:
+the exporter verifies the config, checkpoint index, and every weight shard
+against the pinned revision before quantization. Install Mobius, Olive,
+Transformers' image processing dependencies (Pillow and torchvision), and
+CUDA ONNX Runtime in the same environment.
+
+```sh
+python examples/ornith_export.py \
+  --checkpoint /path/to/Ornith-1.5-122B-hf \
+  --output /path/to/Ornith-1.5-122B-int2-fp8
+python examples/ornith_smoke.py \
+  --checkpoint /path/to/Ornith-1.5-122B-hf \
+  --model /path/to/Ornith-1.5-122B-int2-fp8 \
+  --report /path/to/component-smoke.json
+```
+
+The exporter handles fused decoder expert banks and individual MTP expert
+projections. Decoder expert and dense projections use symmetric INT2 RTN
+with 128-element groups. The LM head and MTP projections use E4M3FN weights
+with floating-point activations; MTP routed expert scales use 128x128 blocks.
+Norms, routing, shared-expert gates, embeddings, convolution caches, and
+recurrent state retain their appropriate floating-point precision.
+FP8 KV caches currently use unit scales, not calibrated scales.
+
+CUDA ONNX Runtime must be built with `onnxruntime_USE_FP8_QMOE=ON`
+and FP8 KV support. A wheel with FP8 KV/linear support does not necessarily
+include FP8 QMoE: inspect `onnxruntime.get_build_info()` for `fp8-qmoe=1`.
+The runtime also needs the non-shared quantized KV-cache preservation fix
+in `DequantizeFlashAttentionFallback`; otherwise prefill can succeed while
+the first decode step reads uninitialized cache history.
+
+The output includes decoder, vision encoder, embedding, and one-layer MoE
+MTP graphs plus an `ornith_export.json` limitations manifest. The MTP sidecar
+uses the existing **external** coordination contract, not native Engine
+speculative decoding. The target exposes its post-final-norm state as
+`mtp_seed`. GenAI Engine still needs packed/paged target and MTP graph I/O,
+hybrid-state rollback wiring, and multimodal image admission/coordinates.
+Do not treat this package or the component smoke check as an Engine
+benchmark, end-to-end image generation, or an accuracy result.
+`--diagnostics` exposes early-layer activations during smoke validation;
+`--skip-mtp` explicitly limits the probe to decoder and vision components.
+A successful full smoke check also records its report in the export manifest's
+`component_validation` field without marking the package Engine-ready.
 
 ## Architecture
 

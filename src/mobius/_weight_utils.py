@@ -142,22 +142,26 @@ def supported_qmoe_quantization(
 ) -> QuantizationConfig | None:
     """Return quantization settings when they match the native QMoE ABI.
 
-    Accepts the integer-affine int4 block schemes whose ``(q - zero_point) *
+    Accepts the integer-affine INT2/INT4 block schemes whose ``(q - zero_point) *
     scale`` dequantization is byte-identical to ``MatMulNBits`` and to the
     ``com.microsoft::QMoE`` kernel: GPTQ, AWQ, and Olive RTN. The CUDA QMoE
-    kernel requires a power-of-two ``block_size >= 16``; unsupported configs
-    fall back to the portable dense representation instead of emitting an
-    unrunnable node.
+    INT4 requires a power-of-two ``block_size >= 16``; INT2 requires Olive
+    packing with block size 64 or 128. Unsupported configs fall back to the
+    portable dense representation instead of emitting an unrunnable node.
     """
     if (
         quantization is None
-        or quantization.bits != 4
+        or quantization.bits not in (2, 4)
         or quantization.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
         or quantization.float_zero_point
         or quantization.quant_method not in {"gptq", "awq", "olive"}
     ):
         return None
     block_size = quantization.group_size
+    if quantization.bits == 2 and (
+        quantization.quant_method != "olive" or block_size not in (64, 128)
+    ):
+        return None
     if block_size < 16 or (block_size & (block_size - 1)) != 0:
         return None
     return quantization

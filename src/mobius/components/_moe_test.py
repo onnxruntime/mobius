@@ -190,6 +190,36 @@ class TestMoELayer:
         assert sum(node.op_type == "MatMul" for node in graph) == 1
         assert sum(node.op_type == "MatMulNBits" for node in graph) == 0
 
+    @pytest.mark.parametrize("block_size", [64, 128])
+    def test_int2_olive_moe_emits_packed_qmoe(self, block_size):
+        quant = QuantizationConfig(bits=2, group_size=block_size, quant_method="olive")
+        config = make_config(
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=128,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            quantization=quant,
+        )
+        layer = MoELayer(config)
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 8, 128])
+        result = layer(op, hidden)
+        builder._adapt_outputs([result], "")
+        qmoe = next(node for node in graph if node.op_type == "QMoE")
+        assert qmoe.attributes["expert_weight_bits"].value == 2
+        assert qmoe.attributes["block_size"].value == block_size
+        assert layer.fc1_experts_weights.shape == ir.Shape([4, 256, 32])
+        assert layer.fc2_experts_weights.shape == ir.Shape([4, 128, 32])
+        assert layer.experts is None
+
+    @pytest.mark.parametrize(
+        "method,block_size", [("olive", 32), ("olive", 256), ("gptq", 64)]
+    )
+    def test_int2_qmoe_rejects_unsupported_layout(self, method, block_size):
+        quant = QuantizationConfig(bits=2, group_size=block_size, quant_method=method)
+        assert supported_qmoe_quantization(quant) is None
+
     def test_olive_group_size_not_power_of_two_falls_back_to_dense(self):
         """Non-pow2 block_size is unrunnable by CUDA QMoE -> dense fallback."""
         quant = QuantizationConfig(bits=4, group_size=48, quant_method="olive", sym=False)

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Qwen3.6 multi-token-prediction (MTP) self-speculative head.
+"""Qwen3.5/3.6 dense or MoE multi-token-prediction (MTP) head.
 
 The dense ``Qwen/Qwen3.6-27B`` checkpoint ships an auxiliary MTP head under
 the ``mtp.*`` weight prefix.  HuggingFace ``transformers`` discards those
@@ -29,9 +29,10 @@ by splitting the target's lm_head off the decoder body).
 The single decoder layer is a ``full_attention`` :class:`Qwen35Attention`
 block (doubled-Q output gating + per-head Q/K :class:`OffsetRMSNorm` +
 partial mRoPE), identical to the target's full-attention layers — so it
-reuses :class:`~mobius.models.qwen35.Qwen35DecoderLayer` unchanged.  The
-three pre/post-fc norms are :class:`OffsetRMSNorm` (the ``1 + weight``
-variant).
+reuses :class:`~mobius.models.qwen35.Qwen35DecoderLayer` or
+:class:`~mobius.models.qwen35.Qwen35MoEDecoderLayer` according to the
+checkpoint's expert configuration. The three pre/post-fc norms are
+:class:`OffsetRMSNorm` (the ``1 + weight`` variant).
 
 References:
 - GenAI builder ``Qwen35MtpHead`` (microsoft/onnxruntime-genai#2218).
@@ -47,16 +48,21 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import Qwen35MtpConfig
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import Embedding, Linear, create_attention_bias, initialize_rope
 from mobius.components._rms_norm import OffsetRMSNorm
-from mobius.models.qwen35 import Qwen35DecoderLayer, _linear_factory
+from mobius.models.qwen35 import (
+    Qwen35DecoderLayer,
+    Qwen35MoEDecoderLayer,
+    _linear_factory,
+)
 
 if TYPE_CHECKING:
     import onnx_ir as ir
 
 
 class Qwen35MtpModel(nn.Module):
-    """Qwen3.6 MTP self-speculative head (a single cross-conditioned full-attention block).
+    """Qwen3.5/3.6 MTP head (one dense or MoE cross-conditioned attention block).
 
     Inputs (graph-level, set up by :class:`~mobius.tasks.Qwen35MtpTask`):
         input_ids or inputs_embeds: Dedicated embeddings consume token IDs;
@@ -96,7 +102,8 @@ class Qwen35MtpModel(nn.Module):
         self.fc = linear_class(2 * config.hidden_size, config.hidden_size, bias=False)
 
         # The single full-attention MTP decoder layer.
-        self.layers = nn.ModuleList([Qwen35DecoderLayer(config, layer_idx=0)])
+        layer_class = Qwen35MoEDecoderLayer if config.num_local_experts else Qwen35DecoderLayer
+        self.layers = nn.ModuleList([layer_class(config, layer_idx=0)])
         self.norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = (
             Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -122,11 +129,32 @@ class Qwen35MtpModel(nn.Module):
             mtp.norm.weight                   -> norm.weight
             mtp.layers.0.*                    -> layers.0.*
         """
-        return {
+        weights = {
             key[len("mtp.") :]: value
             for key, value in state_dict.items()
             if key.startswith("mtp.")
         }
+        if self.config.num_local_experts:
+            for key in list(weights):
+                if key.endswith(".experts.gate_up_proj"):
+                    fused = weights.pop(key)
+                    prefix = key.removesuffix("gate_up_proj")
+                    for index, expert in enumerate(fused):
+                        gate, up = expert.chunk(2, dim=0)
+                        weights[f"{prefix}{index}.gate_proj.weight"] = gate
+                        weights[f"{prefix}{index}.up_proj.weight"] = up
+                elif key.endswith(".experts.down_proj"):
+                    for index, expert in enumerate(weights.pop(key)):
+                        prefix = key.removesuffix("down_proj")
+                        weights[f"{prefix}{index}.down_proj.weight"] = expert
+            return preprocess_quantized_weights(
+                weights,
+                self.config.quantization,
+                tie_embeddings=False,
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive", "gptq", "awq"),
+            )
+        return weights
 
     def forward(
         self,

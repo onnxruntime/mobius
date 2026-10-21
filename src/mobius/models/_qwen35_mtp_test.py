@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from mobius._builder import build_from_module
-from mobius._configs import Qwen35MtpConfig
+from mobius._configs import QuantizationConfig, Qwen35MtpConfig
 from mobius._registry import registry
 from mobius._testing import make_config
 from mobius.models.qwen35_mtp import Qwen35MtpModel
@@ -53,6 +53,21 @@ def _mtp_config(**overrides) -> Qwen35MtpConfig:
 
 
 class TestQwen35MtpModelParams:
+    def test_moe_head_has_routed_and_shared_experts(self):
+        cfg = _mtp_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+        model = Qwen35MtpModel(cfg)
+        names = {name for name, _ in model.named_parameters()}
+        assert "layers.0.mlp.gate.weight" in names
+        assert "layers.0.mlp.experts.0.gate_proj.weight" in names
+        assert "layers.0.mlp.shared_expert.gate_proj.weight" in names
+        assert "layers.0.mlp.shared_expert_gate.weight" in names
+        assert "layers.0.mlp.gate_proj.weight" not in names
+
     def test_head_has_fc_and_norms(self):
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
@@ -106,6 +121,69 @@ class TestQwen35MtpModelParams:
 
 
 class TestQwen35MtpPreprocessWeights:
+    def test_moe_int2_banks_map_without_float_unpacking(self):
+        cfg = _mtp_config(
+            hidden_size=128,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+            quantization=QuantizationConfig(bits=2, group_size=64, quant_method="olive"),
+        )
+        model = Qwen35MtpModel(cfg)
+        source = {
+            "mtp.layers.0.mlp.experts.gate_up_proj_qweight": torch.randint(
+                0, 256, (4, 256, 32), dtype=torch.uint8
+            ),
+            "mtp.layers.0.mlp.experts.gate_up_proj_scales": torch.ones(4, 256, 2),
+            "mtp.layers.0.mlp.experts.down_proj_qweight": torch.randint(
+                0, 256, (4, 128, 32), dtype=torch.uint8
+            ),
+            "mtp.layers.0.mlp.experts.down_proj_scales": torch.ones(4, 128, 2),
+        }
+        weights = model.preprocess_weights(source)
+        for source_stem, target_stem in (
+            ("gate_up_proj", "fc1"),
+            ("down_proj", "fc2"),
+        ):
+            torch.testing.assert_close(
+                weights[f"layers.0.mlp.{target_stem}_experts_weights"],
+                source[f"mtp.layers.0.mlp.experts.{source_stem}_qweight"],
+            )
+            torch.testing.assert_close(
+                weights[f"layers.0.mlp.{target_stem}_scales"],
+                source[f"mtp.layers.0.mlp.experts.{source_stem}_scales"],
+            )
+        assert set(weights) <= {name for name, _ in model.named_parameters()}
+
+    def test_moe_fused_experts_map_to_head_parameters(self):
+        cfg = _mtp_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+        )
+        model = Qwen35MtpModel(cfg)
+        gate_up = torch.randn(4, 256, 64)
+        down = torch.randn(4, 64, 128)
+        weights = model.preprocess_weights(
+            {
+                "mtp.layers.0.mlp.experts.gate_up_proj": gate_up,
+                "mtp.layers.0.mlp.experts.down_proj": down,
+                "mtp.layers.0.mlp.gate.weight": torch.randn(4, 64),
+            }
+        )
+        assert set(weights) <= {name for name, _ in model.named_parameters()}
+        for index in range(4):
+            prefix = f"layers.0.mlp.experts.{index}"
+            torch.testing.assert_close(
+                weights[f"{prefix}.gate_proj.weight"], gate_up[index, :128]
+            )
+            torch.testing.assert_close(
+                weights[f"{prefix}.up_proj.weight"], gate_up[index, 128:]
+            )
+            torch.testing.assert_close(weights[f"{prefix}.down_proj.weight"], down[index])
+
     def test_strips_mtp_prefix_and_drops_rest(self):
         cfg = _mtp_config()
         model = Qwen35MtpModel(cfg)
