@@ -1,0 +1,424 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Packed Ornith ABI and CUDA state/sequence isolation regression tests."""
+
+import dataclasses
+import json
+from pathlib import Path
+
+import numpy as np
+import onnx
+import onnx_ir as ir
+import onnxruntime as ort
+import pytest
+from onnxscript import nn
+from ornith_engine_export import (
+    PackedDecoder,
+    PackedMtp,
+    PackedOrnithTask,
+    bind_component_weights,
+    engine_config,
+)
+from safetensors.numpy import save_file
+
+from mobius._builder import build_from_module
+from mobius._configs import Qwen35MtpConfig
+from mobius._testing import make_config
+from mobius.models.qwen35 import Qwen35VLDecoderModel
+from mobius.models.qwen35_mtp import Qwen35MtpModel
+from mobius.tasks._base import _make_graph, _make_model
+
+
+def _config(**kwargs):
+    values = dict(
+        hidden_size=128,
+        vocab_size=256,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        dtype=ir.DataType.FLOAT16,
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        partial_rotary_factor=0.25,
+        mrope_section=[6, 5, 5],
+        mrope_interleaved=True,
+        max_position_embeddings=128,
+    )
+    values.update(kwargs)
+    return make_config(**values)
+
+
+def _module(config):
+    module = nn.Module()
+    module.decoder = PackedDecoder(Qwen35VLDecoderModel(config))
+    return module
+
+
+def _initialize(module):
+    rng = np.random.default_rng(42)
+    for name, parameter in module.named_parameters():
+        if parameter.const_value is not None:
+            continue
+        shape = tuple(parameter.shape)
+        if "norm" in name:
+            data = (
+                np.ones(shape)
+                if ".norm.weight" in name and "linear_attn" in name
+                else np.zeros(shape)
+            )
+        elif name.endswith("A_log"):
+            data = np.full(shape, -0.5)
+        elif name.endswith("dt_bias"):
+            data = np.full(shape, -0.2)
+        else:
+            data = rng.normal(0, 0.03, shape)
+        parameter.const_value = ir.tensor(data.astype(np.float32))
+
+
+def test_packed_target_and_mtp_abi():
+    config = _config()
+    package = build_from_module(
+        _module(config), config, PackedOrnithTask(), execution_provider="cuda"
+    )
+    graph = package["decoder"].graph
+    inputs = {value.name: value for value in graph.inputs}
+    outputs = {value.name: value for value in graph.outputs}
+    assert inputs["input_ids"].shape.rank() == 1
+    assert inputs["position_ids"].shape[0] == 3
+    assert outputs["hidden_states"].shape.rank() == 2
+    assert inputs["past_key_values.1.key"].dtype == ir.DataType.FLOAT8E4M3FN
+    assert list(inputs["past.0.recurrent"].shape)[1:] == [2, 128, 128]
+    assert outputs["state_update.0.conv_value"].shape[1:] == ir.Shape([8, 512])
+    gdn = next(node for node in graph if node.op_type == "GatedDeltaNet")
+    assert gdn.inputs[4].dtype == gdn.inputs[5].dtype == ir.DataType.FLOAT
+    assert gdn.attributes["state_update_capacity"].as_int() == 8
+    assert not any(
+        node.op_type in {"LinearAttention", "GroupQueryAttention"} for node in graph
+    )
+    mtp_config = Qwen35MtpConfig(
+        **dataclasses.asdict(_config(num_hidden_layers=1, layer_types=["full_attention"])),
+        use_dedicated_embeddings=True,
+        use_dedicated_lm_head=True,
+    )
+    head = build_from_module(
+        PackedMtp(Qwen35MtpModel(mtp_config)),
+        mtp_config,
+        PackedOrnithTask(mtp=True),
+        execution_provider="cuda",
+    )["model"].graph
+    assert head.outputs[1].name == "hidden_states_out"
+    assert head.outputs[1].shape.rank() == 2
+    assert not any("state_update" in value.name for value in head.inputs)
+    assert sum(node.op_type == "PagedAttention" for node in head) == 1
+
+
+def test_component_reuse_and_unfused_checkpoint_fallback(tmp_path):
+    graph, builder = _make_graph()
+    packed = builder.initializer(ir.tensor(np.arange(8, dtype=np.uint8)), name="fc.weight")
+    builder.add_output(packed, "fc.weight")
+    previous = tmp_path / "previous.onnx"
+    ir.save(_make_model(graph), previous, external_data="weights.data")
+    graph, builder = _make_graph()
+    packed = ir.Value(
+        name="fc.weight", shape=ir.Shape([8]), type=ir.TensorType(ir.DataType.UINT8)
+    )
+    norm = ir.Value(
+        name="norm.weight", shape=ir.Shape([4]), type=ir.TensorType(ir.DataType.FLOAT16)
+    )
+    graph.initializers[packed.name] = packed
+    graph.initializers[norm.name] = norm
+    builder.add_output(packed, "fc.weight")
+    builder.add_output(norm, "norm.weight")
+    save_file(
+        {"mtp.norm.weight": np.arange(4, dtype=np.float32)}, tmp_path / "source.safetensors"
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.norm.weight": "source.safetensors"}})
+    )
+    model = _make_model(graph)
+    bind_component_weights(model, previous, tmp_path, mtp=True)
+    np.testing.assert_array_equal(packed.const_value.numpy(), np.arange(8, dtype=np.uint8))
+    np.testing.assert_array_equal(norm.const_value.numpy(), np.arange(4, dtype=np.float16))
+
+
+def test_native_engine_configuration():
+    config = _config()
+    result = engine_config(
+        {
+            "model": {
+                "type": "qwen3_5_moe",
+                "decoder": {"session_options": {}},
+                "vision": {},
+                "embedding": {},
+            },
+            "search": {},
+        },
+        config,
+    )
+    assert "vision" not in result["model"] and "embedding" not in result["model"]
+    assert result["model"]["type"] == "qwen3_5_moe_text"
+    assert result["model"]["mtp"]["main_hidden_states"] == "hidden_states"
+    assert result["model"]["decoder"]["state_groups"] == [
+        {"kind": "paged_kv", "layer_ids": [1]},
+        {"kind": "fixed_conv", "layer_ids": [0], "state_update": {"capacity": 8}},
+        {
+            "kind": "fixed_recurrent",
+            "layer_ids": [0],
+            "state_update": {"capacity": 8, "key_head_count": 1},
+        },
+    ]
+    assert not result["engine"]["dynamic_batching"]["prefix_caching"]
+    assert (
+        result["speculative"]["max_draft_tokens"] + 1
+        <= result["model"]["decoder"]["state_update_capacity"]
+    )
+
+
+@pytest.mark.parametrize("context", [16, 2048, 8192, 16384, 32768])
+def test_benchmark_prompts_have_exact_token_counts(context):
+    from ornith_engine_benchmark import make_prompt
+
+    unit = np.arange(15, dtype=np.int32)
+    prompt = make_prompt(unit, context)
+    assert prompt.shape == (context,)
+    np.testing.assert_array_equal(prompt, np.resize(unit, context))
+
+
+@pytest.mark.parametrize("mismatch", [None, 0, 1, 63])
+def test_benchmark_parity_reports_first_mismatch(monkeypatch, mismatch):
+    import ornith_engine_benchmark as benchmark
+
+    tokens = list(range(64))
+    actual = tokens.copy()
+    if mismatch is not None:
+        actual[mismatch] += 1
+    calls = []
+    engine, reference = object(), object()
+
+    def turn(current, prompt, output_tokens, *, require_mtp=True):
+        calls.append((current, len(prompt), output_tokens, require_mtp))
+        return {
+            "output_ids": actual if require_mtp else tokens,
+            "speculative": {"draft_tokens_proposed": int(require_mtp)},
+        }
+
+    monkeypatch.setattr(benchmark, "run_turn", turn)
+    result = benchmark.greedy_parity(engine, reference, np.arange(128))
+    assert result["first_mismatch_index"] == mismatch
+    assert result["status"] == ("passed" if mismatch is None else "failed")
+    assert calls == [(engine, 128, 64, True), (reference, 128, 64, False)]
+
+
+@pytest.mark.parametrize("status", ["in_progress", "failed_parity", "passed"])
+def test_benchmark_manifest_requires_parity_and_completed_timings(tmp_path, status):
+    from ornith_engine_benchmark import save_report
+
+    manifest_path = tmp_path / "ornith_engine_export.json"
+    manifest_path.write_text(
+        json.dumps({"engine_validated": True, "correctness_blocker": "previous failure"})
+    )
+    report = {
+        "status": status,
+        "parity": {
+            "status": "failed" if status == "failed_parity" else "passed",
+            "first_mismatch_index": 1 if status == "failed_parity" else None,
+        },
+    }
+    report_path = tmp_path / "benchmark.json"
+    save_report(tmp_path, report_path, report)
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["engine_validated"] == (status == "passed")
+    assert manifest["accuracy_test"] is False
+    assert json.loads(report_path.read_text()) == report
+    if status == "passed":
+        assert "correctness_blocker" not in manifest
+    elif status == "failed_parity":
+        assert "output index 1" in manifest["correctness_blocker"]
+
+
+def _cuda(array):
+    return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(array), "cuda", 0)
+
+
+def _states(batch, block_count=4):
+    states = {
+        "past.0.conv": _cuda(np.zeros((batch, 512, 3), np.float16)),
+        "past.0.recurrent": _cuda(np.zeros((batch, 2, 128, 128), np.float32)),
+    }
+    for side in ("key", "value"):
+        # FP8 zero has the same bit pattern as UINT8 zero.
+        cache = ort.OrtValue.ortvalue_from_shape_and_type(
+            [block_count, 256, 1, 128], onnx.TensorProto.FLOAT8E4M3FN, "cuda", 0
+        )
+        cache.update_inplace(np.zeros((block_count, 256, 1, 128), np.uint8))
+        states[f"past_key_values.1.{side}"] = cache
+    return states
+
+
+def _run(session, sequences, states, past=None, capture=0):
+    lengths = [len(sequence) for sequence in sequences]
+    batch = len(sequences)
+    past = [0] * batch if past is None else past
+    positions = np.concatenate(
+        [np.arange(p, p + n) for p, n in zip(past, lengths, strict=True)]
+    )
+    feed = {
+        "input_ids": np.concatenate(sequences).astype(np.int64),
+        "position_ids": np.tile(positions, (3, 1)).astype(np.int64),
+        "cumulative_sequence_lengths": np.array([0, *np.cumsum(lengths)], np.int32),
+        "past_sequence_lengths": np.array(past, np.int32),
+        "block_table": np.arange(batch, dtype=np.int32).reshape(batch, 1),
+        "attention_metadata": np.array(
+            [max(lengths), max(p + n for p, n in zip(past, lengths, strict=True)), 0], np.int32
+        ),
+        "logits_indices": np.arange(sum(lengths), dtype=np.int32),
+        "state_update_capture_count": np.full(batch, capture, np.int32),
+        "state_update_active": np.array([int(capture > 0)], np.int32),
+    }
+    binding = session.io_binding()
+    for name, value in feed.items():
+        binding.bind_cpu_input(name, value)
+    for name, value in states.items():
+        binding.bind_ortvalue_input(name, value)
+    for output in session.get_outputs():
+        if output.name.startswith("present.") and output.name.endswith((".key", ".value")):
+            binding.bind_ortvalue_output(
+                output.name, states[output.name.replace("present.", "past_key_values.", 1)]
+            )
+        else:
+            binding.bind_output(output.name, "cuda", 0)
+    session.run_with_iobinding(binding)
+    binding.synchronize_outputs()
+    return dict(
+        zip(
+            [value.name for value in session.get_outputs()], binding.get_outputs(), strict=True
+        )
+    )
+
+
+@pytest.mark.skipif(
+    "CUDAExecutionProvider" not in ort.get_available_providers(), reason="CUDA required"
+)
+def test_cuda_packed_hybrid_sequence_isolation_and_append(tmp_path):
+    config = _config()
+    module = _module(config)
+    _initialize(module)
+    model = build_from_module(module, config, PackedOrnithTask(), execution_provider="cuda")[
+        "decoder"
+    ]
+    path = tmp_path / "packed.onnx"
+    ir.save(model, path)
+    options = ort.SessionOptions()
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "profile")
+    session = ort.InferenceSession(str(path), options, providers=["CUDAExecutionProvider"])
+    combined = _run(session, [[3, 5, 7], [11, 13]], _states(2))
+    first = _run(session, [[3, 5, 7]], _states(1))
+    second = _run(session, [[11, 13]], _states(1))
+    for output in ("logits", "hidden_states"):
+        actual = combined[output].numpy()
+        expected = np.concatenate([first[output].numpy(), second[output].numpy()])
+        np.testing.assert_allclose(actual, expected, atol=2e-3, rtol=1e-2)
+    for output in ("present.0.conv", "present.0.recurrent"):
+        np.testing.assert_allclose(
+            combined[output].numpy(),
+            np.concatenate([first[output].numpy(), second[output].numpy()]),
+            atol=2e-5,
+            rtol=1e-2,
+        )
+    states = {
+        "past.0.conv": combined["present.0.conv"],
+        "past.0.recurrent": combined["present.0.recurrent"],
+        "past_key_values.1.key": combined["present.1.key"],
+        "past_key_values.1.value": combined["present.1.value"],
+    }
+    appended = _run(session, [[17], [19]], states, past=[3, 2], capture=1)
+    full_first = _run(session, [[3, 5, 7, 17]], _states(1))
+    full_second = _run(session, [[11, 13, 19]], _states(1))
+    for output in ("logits", "hidden_states"):
+        expected = np.concatenate(
+            [full_first[output].numpy()[-1:], full_second[output].numpy()[-1:]]
+        )
+        np.testing.assert_allclose(appended[output].numpy(), expected, atol=2e-3, rtol=2e-2)
+    assert appended["state_update.0.conv_value"].shape() == [2, 8, 512]
+    assert appended["state_update.0.recurrent_capsule"].shape() == [2, 8 * (2 + 128 + 256)]
+    assert np.isfinite(appended["state_update.0.recurrent_capsule"].numpy()).all()
+    events = json.loads(Path(session.end_profiling()).read_text())
+    required = {"VarlenCausalConvWithState", "GatedDeltaNet", "PagedAttention"}
+    executed = {
+        event["args"]["op_name"]
+        for event in events
+        if event.get("args", {}).get("provider") == "CUDAExecutionProvider"
+    }
+    assert required <= executed
+
+
+@pytest.mark.skipif(
+    "CUDAExecutionProvider" not in ort.get_available_providers(), reason="CUDA required"
+)
+def test_native_engine_mtp_rollback_matches_target_only_with_minimum_length(tmp_path):
+    og = pytest.importorskip("onnxruntime_genai")
+    from ornith_engine_benchmark import greedy_parity, run_turn
+
+    config = _config()
+    target = _module(config)
+    mtp_config = Qwen35MtpConfig(
+        **dataclasses.asdict(_config(num_hidden_layers=1, layer_types=["full_attention"])),
+        use_dedicated_embeddings=True,
+        use_dedicated_lm_head=True,
+    )
+    head = PackedMtp(Qwen35MtpModel(mtp_config))
+    for module in (target, head):
+        _initialize(module)
+    target_graph = build_from_module(
+        target, config, PackedOrnithTask(), execution_provider="cuda"
+    )["decoder"]
+    head_graph = build_from_module(
+        head, mtp_config, PackedOrnithTask(mtp=True), execution_provider="cuda"
+    )["model"]
+    (tmp_path / "decoder").mkdir()
+    ir.save(target_graph, tmp_path / "decoder/model.onnx")
+    ir.save(head_graph, tmp_path / "mtp.onnx")
+    runtime_config = engine_config(
+        {
+            "model": {
+                "type": "qwen3_5_moe",
+                "vocab_size": 256,
+                "context_length": 128,
+                "eos_token_id": 2,
+                "pad_token_id": 0,
+                "bos_token_id": 1,
+                "decoder": {
+                    "session_options": {},
+                    "hidden_size": 128,
+                    "head_size": 128,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                },
+            },
+            "search": {"max_length": 128, "past_present_share_buffer": True},
+        },
+        config,
+    )
+    runtime_config["engine"]["dynamic_batching"]["num_blocks"] = 8
+    (tmp_path / "genai_config.json").write_text(json.dumps(runtime_config))
+    model = og.Model(str(tmp_path))
+    engine = og.Engine(model)
+    result = run_turn(engine, [3, 5, 7, 11], 32)
+    assert result["speculative"]["zero_accept_rounds"] > 0
+
+    reference_config = og.Config(str(tmp_path))
+    reference_config.overlay('{"model":{"mtp":{"enabled":false}}}')
+    reference_model = og.Model(reference_config)
+    reference = og.Engine(reference_model)
+    parity = greedy_parity(engine, reference, [3, 5, 7, 11], 32)
+    assert parity["status"] == "passed"
+    assert result["output_ids"] == parity["target_only"]["output_ids"]

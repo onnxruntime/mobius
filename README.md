@@ -247,6 +247,57 @@ benchmark, end-to-end image generation, or an accuracy result.
 A successful full smoke check also records its report in the export manifest's
 `component_validation` field without marking the package Engine-ready.
 
+#### Ornith packed/paged text Engine export
+
+The separate text-only Engine exporter reuses the validated component export's
+INT2 and FP8 initializers, recovering unfused norms, routing weights, and the
+target embedding table from the pinned checkpoint without requantizing the
+122B model. It leaves the component and vision export unchanged.
+
+```sh
+python examples/ornith_engine_export.py \
+  --checkpoint /path/to/Ornith-1.5-122B-hf \
+  --components /path/to/Ornith-1.5-122B-int2-fp8 \
+  --output /path/to/Ornith-1.5-122B-int2-fp8-engine
+ORT_DISABLE_MOE_GEMV=1 ORT_ENABLE_XQA=0 ORT_PAGED_ATTENTION_DISABLE_SPLIT_KV=1 \
+python examples/ornith_engine_benchmark.py \
+  --model /path/to/Ornith-1.5-122B-int2-fp8-engine \
+  --report /path/to/engine-benchmark.json
+```
+
+The packed target and MTP use rank-two hidden states, FP8 paged attention,
+native variable-length convolution/GatedDeltaNet kernels, and native
+`model.mtp` configuration. The hybrid target exposes compact convolution and
+recurrent-state captures for speculative rollback; prefix caching is disabled.
+The default benchmark uses batch one, greedy decoding, exactly
+2048/8192/16384/32768 input tokens and 512 generated tokens, one warmup and
+three measured runs per context. It rejects inactive or failed MTP execution
+rather than reporting target-only timings. Before timing, it compares 64 greedy
+output tokens against an MTP-disabled Engine using the same 128-token prompt.
+A second parity check at each requested context compares the entire requested
+output sequence before any timings are collected. A mismatch is saved in the
+report, leaves `engine_validated` false, and stops
+the benchmark. This is a correctness gate, not an accuracy evaluation or a
+guarantee of equivalence for all prompts. TTFT includes Engine admission,
+prefill, and sampling; it is not an isolated prefill measurement.
+
+Use a GenAI build with per-verification-row EOS suppression for minimum
+generated token counts. Older builds disable MTP until the minimum is reached,
+so setting both output limits to 512 otherwise prevents drafting entirely.
+The Engine runtime must load the same FP8-QMoE-enabled ONNX Runtime used for
+component validation; the benchmark records the loaded native libraries.
+`ornith_engine_export.json` initially marks execution unvalidated.
+The reproducibility settings above select a consistent MoE path and portable
+FP32 paged decode without shape-dependent split-KV reductions for single-token
+and short multi-token verification. They
+require the ORT portable quantized speculative-attention dispatch extension.
+Default fast kernel selection can amplify shape-dependent rounding into different
+greedy outputs; the benchmark records both environment settings in its report.
+Engine validation applies only to the recorded runtime and settings.
+This package does **not** support Engine image admission or image generation:
+the original export's vision/fusion smoke is still a component-only test.
+Neither benchmark performs an accuracy evaluation.
+
 ## Architecture
 
 ```
