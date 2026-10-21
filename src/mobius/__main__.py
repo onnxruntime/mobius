@@ -256,7 +256,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     else:
         static_cache_params = None
 
-    # PagedAttention (LATENT dense-MLA) export uses the paged-cache task with
+    # PagedAttention (LATENT MLA or dense text GQA) uses the paged-cache task with
     # caller-owned page buffers. It is a distinct cache authority, so it cannot
     # be combined with the static-cache task or an explicit --task.
     export_paged_attention = getattr(args, "export_paged_attention", False)
@@ -549,6 +549,15 @@ def _save_package(
             "alignment, which can cause CUBLAS misaligned address errors on "
             "CUDA. Consider using --external-data onnx for CUDA builds."
         )
+
+    if runtime == "ort-genai":
+        from mobius.integrations.ort_genai.auto_export import _preflight_dense_paged_decoder
+
+        _preflight_dense_paged_decoder(pkg, args.execution_provider)
+    elif runtime == "onnx-genai":
+        from mobius.integrations.onnx_genai.auto_export import _reject_packed_paged_decoder
+
+        _reject_packed_paged_decoder(pkg)
 
     pkg.save(
         output_dir,
