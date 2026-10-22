@@ -543,6 +543,52 @@ from 798.89 to 774.16 ms; trace kernel shares and ordinary Engine throughput
 are different metrics and should not be equated. The 200 tokens/s goal and
 source-model accuracy validation remain outstanding.
 
+### Ornith INT2 expert FC1/SwiGLU scheduling
+
+The bias-free FP16 group-128 INT2 FC1/SwiGLU kernel has a targeted scheduling
+path for Ornith's `K=3072`, intermediate size 1024 experts. It unrolls two
+reduction iterations. With more than eight expanded token/expert rows, it also
+issues the four column-weight loads before dequantization to compensate for
+register pressure. Simply unrolling every grid was rejected: it helped one
+token but slowed larger expanded batches in the component sweep.
+Expert layouts, FP32 dot accumulation order, reduction, FP16 rounding, SwiGLU,
+FC2, routing, precision and exported graph are unchanged.
+
+Same-input CUDA-event measurements with sixteen separate 256-expert weight
+banks (exceeding L2 capacity) measured baseline/optimized FC1 latencies of
+**15.98/13.52 us** at eight expanded rows, **24.18/23.11 us** at sixteen,
+**46.06/44.37 us** at 32 and **86.62/83.19 us** at 64.
+Every tested scheduling variant's output was bitwise equal to the original
+arithmetic. These are deterministic synthetic inputs with distinct selected
+experts, not end-to-end model timings.
+
+A parity-qualified 2K CUDA trace, with the previous dense INT2 optimization
+already enabled in both variants, preserves all 3,840 expert FC1 launches and
+reduces summed FC1 time from **96.05 to 89.08 ms** (7.3%). Total summed kernel
+time changes from 774.16 to 767.87 ms. Node-level tracing adds overhead; these
+durations are not normal Engine latency.
+
+The matched Engine comparison uses the same graph, settings and runtime
+libraries except for the CUDA provider, with one warmup and three measured
+512-token runs per context:
+
+| Context | Dense-optimized control (tokens/s) | Expert scheduling (tokens/s) | Change |
+| --- | ---: | ---: | ---: |
+| 2K | 162.700 | 163.986 | +0.79% |
+| 8K | 130.217 | 130.993 | +0.60% |
+| 16K | 109.310 | 109.809 | +0.46% |
+| 32K | 65.019 | 65.287 | +0.41% |
+
+All twelve timed outputs and MTP counters exactly match the control and the
+prior FP16-state decoder, with zero MTP failures. These small whole-model gains
+are sensitive to timing variation. An additional 2K run
+measured 164.4 tokens/s versus a fresh dense-optimized control at 162.9 tokens/s
+(about 0.9% higher). The earlier 174.1 tokens/s dense-only run was measured at a
+different time and is not a contemporaneous control; the expert scheduling
+change does not establish a new best whole-model throughput.
+The parity-gated 32K sampled peak remains **43.196 GiB**.
+The 200 tokens/s goal and source-model accuracy evaluation remain outstanding.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
