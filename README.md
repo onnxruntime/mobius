@@ -744,6 +744,62 @@ queries, fragmented/unmapped pages, per-channel scales, sliding windows,
 softcap and head sinks. The restored runtime passes 100 focused CUDA tests
 plus 20 INT4 subtests. Source-model accuracy remains unevaluated.
 
+### Ornith temporal convolution prefill
+
+The variable-length causal convolution optimization from
+[ORT PR #33381](https://github.com/microsoft/onnxruntime/pull/33381) is selectively
+ported into the Ornith runtime, without the PR's allocator or small-N GEMV
+changes. Eligible single-request prefill uses 32-token temporal tiles instead
+of looping over the entire request in each channel block. A separate final-state
+kernel runs after all tiles have consumed the old state, retaining safe
+initial/final-state aliasing.
+
+The specialization requires at least 256 tokens, kernel size four, dilation
+one or three, a device supporting at least 256 threads per block, and a temporal
+grid within CUDA's grid-Y limit. Other geometries retain the existing dispatch.
+The deployed 1024-token Engine chunks qualify; ordinary one/two-token decode
+does not. No model graph, export option, quantization, or Engine scheduling
+change is required.
+
+Matched H200 Engine measurements use the existing shared-SwiGLU/FP16-state
+decoder, INT2 target weights, FP8 KV/LM head/MTP, width-one MTP, CUDA graphs,
+packed-only experts, and direct initializer allocations. Each context has
+one warmup and three timed 512-token turns:
+
+| Context | Control TTFT (ms) | Temporal convolution TTFT (ms) | TTFT reduction | Control / candidate decode (tokens/s) |
+| --- | ---: | ---: | ---: | ---: |
+| 2K | 278.6 | 223.5 | 19.77% | 168.571 / 168.635 |
+| 8K | 1117.0 | 894.5 | 19.92% | 134.975 / 135.086 |
+| 16K | 2298.4 | 1854.6 | 19.31% | 113.425 / 113.392 |
+| 32K | 4898.5 | 4015.8 | 18.02% | 67.633 / 67.652 |
+
+TTFT includes Engine admission, prompt processing and first-token sampling,
+not isolated convolution latency. Decode changes range from -0.03% to +0.08%;
+this is a prefill optimization, not an established decode throughput gain.
+All twelve timed outputs and MTP counters exactly match the fresh control and
+previous approved decoder, with zero MTP failures. The candidate also passes
+its own target-only greedy checks at every context.
+
+A parity-checked 32K Nsight Systems capture reduces summed prefill convolution
+kernel duration from **962.25 to 77.26 ms** (91.97%), including the separate
+state-update kernel. The synchronized prefill/first-token range decreases from
+4906.65 to 4031.47 ms. Node tracing adds overhead, and these kernel sums are not
+measurements of bandwidth or occupancy.
+
+The added Python regression suite passes two tests with 102 subcases:
+bitwise equality to the general kernel for FP32/FP16/BF16, dispatch boundaries,
+capture-count clamping, optional bias/capture, aliased state and subsequent
+continuation. Sixteen existing parity tests plus eight subcases also pass.
+Three native regression tests are ported from the PR but were not executed
+because native test targets are disabled in this runtime build.
+
+The exact tested provider is installed, staged and packaged in the matching
+CUDA wheel; binary hashes are verified against the saved runtime.
+`engine-conv-temporal-summary.json` records benchmark, profile and package
+provenance alongside the export artifacts. The previously approved wheel is
+retained for rollback. Source-model accuracy remains unevaluated, and portable
+paged attention remains the main long-context decode bottleneck.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
