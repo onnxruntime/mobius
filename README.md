@@ -706,6 +706,44 @@ unchanged from 43.194 GiB. The exact tested runtime is packaged in the matching
 CUDA wheel. Attention remains the largest measured long-context bottleneck;
 the 200 tokens/s goal and source-model accuracy evaluation remain outstanding.
 
+#### Rejected grouped-query KV-read reuse experiment
+
+A later experiment shared each FP8 K/V read and conversion across two query
+heads within a CTA, retaining the original per-head FP32 arithmetic and fixed
+split count 32. A second version also shared the block barriers between the
+two heads' softmax reductions. Neither improved native Engine throughput:
+
+| Context | Fresh control (tokens/s) | Paired heads (tokens/s) | Paired heads, batched reductions (tokens/s) |
+| --- | ---: | ---: | ---: |
+| 2K | 168.196 | 168.248 | 165.879 |
+| 8K | 134.736 | 133.923 | 128.735 |
+| 16K | 113.221 | 111.985 | 105.178 |
+| 32K | 67.548 | 66.363 | 60.631 |
+
+These are sequential same-settings H200 runs with one warmup and three timed
+512-token turns per context, one-draft MTP, FP8 KV/LM head/MTP, INT2 target,
+FP16 state, CUDA graphs, packed-only experts and direct initializer allocations.
+All 24 timed prototype outputs and MTP counters match the control and prior
+decoder exactly, with zero MTP failures. Four-head and 128-thread variants
+were evaluated only as synthetic components, not full-model benchmarks.
+Fewer redundant KV loads therefore did not establish a speedup; neither
+prototype is enabled or retained in the runtime. The previously validated
+ordered-reduction runtime and matching wheel are restored.
+
+The paired-head 32K profile confirms grid-X halves from 32 to 16 while the
+number of attention kernel launches is unchanged. It does not establish
+reduced physical HBM traffic, improved occupancy or memory-bandwidth
+saturation. Original component timings included per-run provider
+synchronization and possible host submission gaps; they are not evidence
+of isolated GPU latency gains. Subsequent component checks disable that
+synchronization and use explicit stream/event completion.
+
+Additional regression tests remain for FP8 head-256 grouped attention,
+including bitwise equality to an equivalent expanded-MHA cache with ragged
+queries, fragmented/unmapped pages, per-channel scales, sliding windows,
+softcap and head sinks. The restored runtime passes 100 focused CUDA tests
+plus 20 INT4 subtests. Source-model accuracy remains unevaluated.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
