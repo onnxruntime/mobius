@@ -1113,11 +1113,52 @@ leaving the default path untouched. It uses distinct `-fp32conv` filenames.
 However, this change **does not fix acceptance** in the 2K test (one accepted
 draft in 128 target passes, 46.86 tokens/s); it is not promoted.
 
-These results establish the cost mechanism but do not yet explain why this
-trained draft has so little agreement with the deployed INT2 target.
-Potential target-feature/quantization compatibility and remaining numerical
-differences require a real-feature reference-drafter replay before attributing
-the problem to a specific cause. No task/source accuracy evaluation was run.
+Follow-up replay captured 2K real target features and sixteen committed tokens,
+checking the tokens against the saved target-only baseline. The public
+`z-lab/dflash` reference drafter loads the checkpoint strictly and uses the same
+features, positions, anchor, mask embedding and exported FP8 head as ONNX.
+Across five decode positions, final-hidden cosine similarity is
+**0.999888--0.999912** for the BF16 body and approximately **0.9984--0.9985**
+for the FP8 body. The reference itself proposes the wrong first token at all
+five positions. Original BF16 target embedding/head controls do not change
+those first proposals. Incremental cache replay also remains close to the
+full-context reference; exact proposal paths are not universally identical
+because small numerical differences can change selector decisions.
+
+A separate source-target numerical control loads one original layer at a time,
+with a fixed teacher-forced input, rather than running a task evaluation.
+The deployed target's post-layer-45 features have cosine **-0.0171** to the
+original BF16 source features on the 2K prompt. An independent PyTorch control
+applies the exporter's symmetric group-128 INT2 RTN code/FP16-scale rule, then
+runs ordinary reference operators on dequantized weights:
+
+| Source-only arithmetic control | Post-layer-45 cosine to original BF16 |
+| --- | ---: |
+| Original weights, FP16 activations | 0.98273 |
+| INT2 RTN/dequantized weights, FP16 activations | 0.04362 |
+
+These aggregate cosines use FP64 reductions. The quantized-reference control
+reproduces the large feature drift without ORT's INT2 kernels, establishing
+that weight quantization is a major compatibility problem, not merely drafter
+FP8 precision. It is not exact end-to-end parity: the quantized PyTorch and
+deployed target still differ in late-layer features, so additional target
+numerical differences are not ruled out.
+
+With the original BF16 target's features, its actual anchor and its original
+embedding/head, the reference drafter produces a block whose **first six of
+fifteen proposals are accepted consecutively** by an original-target numerical
+verification pass. This is one block, not an acceptance average or a BF16
+throughput benchmark. Substituting source features into the INT2 deployment
+would not be a valid fix: the verifier and features must describe the same
+target.
+
+The evidence now points strongly to compatibility with the current
+uncalibrated INT2 RTN target. Improving/calibrating that INT2 quantization, or
+adapting the drafter to the exact deployed target, is more promising than
+drafter-kernel tuning alone. No 350 tokens/s reproduction is established;
+the colleague's hardware/runtime/precision/workload are unavailable.
+The accepted target/runtime/default configuration and saved MTP results remain
+unchanged. No task/source-model accuracy benchmark was run.
 
 ### Ornith FP16 recurrent-state storage
 
