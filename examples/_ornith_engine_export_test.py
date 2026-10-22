@@ -331,8 +331,9 @@ def test_benchmark_sequential_models_preserve_parity_gate(tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize("mismatch", [False, True])
+@pytest.mark.parametrize("draft_tokens", [None, 1, 2, 4])
 def test_memory_report_checks_outputs_and_records_allocator_options(
-    tmp_path, monkeypatch, mismatch
+    tmp_path, monkeypatch, mismatch, draft_tokens
 ):
     import ornith_engine_memory as memory
 
@@ -346,6 +347,11 @@ def test_memory_report_checks_outputs_and_records_allocator_options(
                 "parity": {"status": "passed"},
                 "decoder_sha256": hashlib.sha256(b"").hexdigest(),
                 "prompt_unit_token_ids": [1, 2],
+                "config_overlay": (
+                    {"speculative": {"max_draft_tokens": draft_tokens}}
+                    if draft_tokens is not None
+                    else {}
+                ),
                 "contexts": [{"context_tokens": 16, "runs": [{"output_ids": [3, 4, 5, 6]}]}],
             }
         )
@@ -404,6 +410,11 @@ def test_memory_report_checks_outputs_and_records_allocator_options(
     options = overlays[0]["model"]["decoder"]["session_options"]
     assert options["session.use_device_allocator_for_initializers"] == "1"
     assert options["provider_options"][0]["cuda"]["arena_extend_strategy"] == "1"
+    if draft_tokens is not None:
+        assert overlays[0]["speculative"] == {"max_draft_tokens": draft_tokens}
+        assert report["config_overlay"]["speculative"] == {"max_draft_tokens": draft_tokens}
+    else:
+        assert "speculative" not in overlays[0]
 
 
 @pytest.mark.parametrize(

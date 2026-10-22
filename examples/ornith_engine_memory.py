@@ -68,6 +68,9 @@ def main():
         overlay["model"]["decoder"]["session_options"][
             "session.use_device_allocator_for_initializers"
         ] = "1"
+    speculative = reference.get("config_overlay", {}).get("speculative")
+    if speculative is not None:
+        overlay["speculative"] = speculative
     torch.cuda.init()
     stage, peaks, snapshots = "initial", {}, {}
     lock = threading.Lock()

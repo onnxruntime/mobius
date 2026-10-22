@@ -713,10 +713,75 @@ All nine timed outputs matched both their own target-only references and each
 other exactly, using identical runtime fingerprints, with zero MTP failures.
 Width two did not establish a speedup; width four was slower despite fewer target
 passes because it required substantially more MTP work. Retain width one at 2K.
-This does not establish the optimal width at longer contexts, where target
-attention is more expensive; those require a separate parity-qualified sweep.
+This historical 2K sweep predates dense/expert scheduling and shared-expert
+projection/SwiGLU fusion; its absolute rates are not a matched comparison
+against the current decoder.
+
+A separate long-context sweep on the current shared-expert projection/SwiGLU
+decoder uses the same INT2/FP8 precision and FP16 recurrent state, one H200,
+batch one, CUDA graphs, packed-only experts, 512 output tokens, one warmup and
+three timed runs per case. Widths run sequentially on GPU0 with identical
+runtime fingerprints and fixed attention split count 32:
+
+| Context | Width 1 (tokens/s) | Width 2 (tokens/s) | Width 4 (tokens/s) |
+| --- | ---: | ---: | ---: |
+| 8K | 133.689 | 131.007 | 117.542 |
+| 16K | 111.585 | 111.204 | 101.365 |
+| 32K | 65.664 | 56.416 | 42.269 |
+
+A reverse-order 16K confirmation (width two, then width one; again one warmup
+and three timed turns) measured 111.134 and 111.483 tokens/s respectively.
+Width two was 0.31% slower, versus 0.34% in the initial sweep: there is no
+repeatable benefit from widening at 16K. All repeat outputs and MTP counters
+match their respective initial cases.
+
+All 27 timed output sequences match their own target-only reference, each
+other and the prior fused decoder exactly, with zero MTP failures. Wider
+drafting reduces target passes but increases draft work:
+
+| Context | Draft width | Accepted/evaluated drafts | Target passes | MTP passes |
+| --- | ---: | ---: | ---: | ---: |
+| 8K | 1 | 65.91% | 316 | 308 |
+| 8K | 2 | 69.49% | 248 | 478 |
+| 8K | 4 | 70.95% | 199 | 760 |
+| 16K | 1 | 72.30% | 313 | 296 |
+| 16K | 2 | 76.33% | 240 | 447 |
+| 16K | 4 | 77.93% | 188 | 688 |
+| 32K | 1 | 41.55% | 393 | 361 |
+| 32K | 2 | 42.79% | 353 | 641 |
+| 32K | 4 | 45.68% | 321 | 1154 |
+
+Counts include prefill and are identical across the three timed turns of a
+case; they measure work, not isolated draft/verification GPU latency. At 32K,
+width four only reduces target passes by 18.3% while requiring 3.2 times as
+many MTP passes. Wider verification also executes more target rows per pass.
+Higher accepted/evaluated draft fraction therefore does not imply better
+whole-model throughput. Keep the exported default of one draft; this
+repeated-text workload does not establish an optimum for other prompts.
+The 200 tokens/s goal and source-model accuracy evaluation remain outstanding.
 
 ### Ornith single-Engine GPU memory
+
+`ornith_engine_memory.py` inherits any `speculative` configuration overlay from
+its parity-qualified reference benchmark. In particular, a reference measured
+with `--draft-tokens 2` or `--draft-tokens 4` is sampled at that same width,
+instead of silently reverting to the exported one-draft default. The effective
+overlay is recorded in the memory report.
+
+On the shared-expert projection/SwiGLU decoder, fresh 32K processes using the
+long-context sweep references measured:
+
+| Draft width | Sampled peak device memory (GiB) |
+| --- | ---: |
+| 1 | 43.194 |
+| 2 | 43.208 |
+| 4 | 43.229 |
+
+Each process includes one warmup and three measured 512-token turns. All
+outputs and MTP counters match the corresponding width's reference. Wider
+drafting adds little sampled peak memory here (about 14 MiB at width two and
+36 MiB at width four), but does not improve throughput on these prompts.
+These are 10 ms device-wide samples, not exact allocator peaks.
 
 The CUDA runtime supports an opt-in packed-only INT2 expert mode. It releases
 the raw expert initializer after runtime packing, because both Ornith prefill
