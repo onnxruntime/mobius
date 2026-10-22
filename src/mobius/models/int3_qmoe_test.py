@@ -558,7 +558,7 @@ def test_int3_deferred_interleave_preserves_storage_and_releases_outputs(
     package.apply_weights(processed, weight_transforms=transforms)
     assert calls == []
     for directory in ("first", "second"):
-        package.save(str(tmp_path / directory), progress_bar=False)
+        package.save(str(tmp_path / directory), progress_bar=False, max_workers=1)
         gc.collect()
         assert outputs
         assert all(reference() is None for reference in outputs)

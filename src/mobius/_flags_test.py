@@ -18,6 +18,12 @@ class TestDefaultValues:
         f = _flags._Flags()
         assert f.suppress_dedup_warning is True
 
+    def test_sparse_iq2_moe_requires_explicit_opt_in(self, monkeypatch):
+        monkeypatch.delenv("MOBIUS_SPARSE_IQ2_MOE", raising=False)
+        assert _flags._Flags().sparse_iq2_moe is False
+        monkeypatch.setenv("MOBIUS_SPARSE_IQ2_MOE", "1")
+        assert _flags._Flags().sparse_iq2_moe is True
+
 
 class TestEnvVarOverride:
     """Flags are read from environment variables at construction time."""

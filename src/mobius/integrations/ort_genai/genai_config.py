@@ -283,6 +283,7 @@ class GenaiConfigGenerator:
         num_cache_layer_slots: int | None = None,
         sliding_window: dict[str, Any] | None = None,
         has_specialized_topology: bool = False,
+        decoder_graph_capture: bool | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -343,6 +344,7 @@ class GenaiConfigGenerator:
                 and getattr(config, "rope_type", None) == "longrope"
             ),
             has_specialized_topology=has_specialized_topology,
+            decoder_graph_capture=decoder_graph_capture,
         )
 
     def with_vision(

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 __all__ = [
     "StreamingExpertBankSource",
+    "StreamingPackedExpertBankSource",
     "StreamingTransformedWeightSource",
     "StreamingWeightPlan",
     "StreamingWeightSource",
@@ -116,6 +117,21 @@ class StreamingExpertBankSource:
 
 
 @dataclasses.dataclass(frozen=True)
+class StreamingPackedExpertBankSource:
+    """Byte-preserving stack of rank-3 UINT8 native-block expert projections.
+
+    The destination is one rank-4 bank. Each source is validated at preflight
+    and again at serialization, then copied without dtype conversion. Only one
+    destination bank, one source and declared validation scratch are live.
+    """
+
+    source_names: tuple[str, ...]
+    expected_source_shape: tuple[int, int, int]
+    validate_tensor: Callable[[torch.Tensor, str], None] | None = None
+    validation_scratch_bytes: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
 class StreamingTransformedWeightSource:
     """One source tensor transformed lazily into a differently laid-out target.
 
@@ -150,7 +166,10 @@ class StreamingWeightPlan:
 
     targets: Mapping[
         str,
-        StreamingWeightSource | StreamingExpertBankSource | StreamingTransformedWeightSource,
+        StreamingWeightSource
+        | StreamingExpertBankSource
+        | StreamingPackedExpertBankSource
+        | StreamingTransformedWeightSource,
     ]
     ignored: Mapping[str, str] = dataclasses.field(default_factory=dict)
     constants: Mapping[str, torch.Tensor] = dataclasses.field(default_factory=dict)
@@ -845,6 +864,55 @@ def _validate_transformed_target(
     return target_shape
 
 
+def _validate_packed_bank_target(
+    initializer: ir.Value,
+    source: StreamingPackedExpertBankSource,
+    target_name: str,
+) -> tuple[int, ...]:
+    shape = (len(source.source_names), *source.expected_source_shape)
+    if (
+        not source.source_names
+        or len(set(source.source_names)) != len(source.source_names)
+        or len(source.expected_source_shape) != 3
+        or any(dim <= 0 for dim in source.expected_source_shape)
+        or source.validation_scratch_bytes < 0
+    ):
+        raise ValueError(f"Invalid packed expert bank source contract for {target_name!r}")
+    if initializer.dtype != ir.DataType.UINT8 or initializer.shape != ir.Shape(shape):
+        raise ValueError(
+            f"Packed expert bank {target_name!r} requires UINT8/{shape}, "
+            f"got {initializer.dtype}/{initializer.shape}"
+        )
+    return shape
+
+
+def _assign_lazy_packed_expert_bank(
+    initializer: ir.Value,
+    source: StreamingPackedExpertBankSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    target_name: str,
+) -> None:
+    target_shape = _validate_packed_bank_target(initializer, source, target_name)
+
+    def tensor_func() -> tensor_adapters.TorchTensor:
+        output = torch.empty(target_shape, dtype=torch.uint8)
+        for expert_index, source_name in enumerate(source.source_names):
+            tensor = _load_indexed_tensor(source_name, key_index)
+            if source.validate_tensor is not None:
+                source.validate_tensor(tensor, source_name)
+            output[expert_index].copy_(tensor)
+            del tensor
+        return tensor_adapters.TorchTensor(output, name=target_name)
+
+    initializer.const_value = ir.LazyTensor(
+        tensor_func,
+        dtype=ir.DataType.UINT8,
+        shape=ir.Shape(target_shape),
+        name=target_name,
+        cache=False,
+    )
+
+
 def _assign_lazy_expert_bank(
     initializer: ir.Value,
     source: StreamingExpertBankSource,
@@ -989,6 +1057,7 @@ def _stream_preprocessed_safetensors(
             ir.Value,
             StreamingWeightSource
             | StreamingExpertBankSource
+            | StreamingPackedExpertBankSource
             | StreamingTransformedWeightSource,
             str,
         ]
@@ -1129,6 +1198,29 @@ def _stream_preprocessed_safetensors(
                 largest_reconstruction_working_set_bytes,
                 source_bytes + bf16_bytes + cast_bytes + scale_bytes,
             )
+        elif isinstance(source, StreamingPackedExpertBankSource):
+            _validate_packed_bank_target(initializer, source, target_name)
+            max_source_bytes = 0
+            for source_name in source.source_names:
+                if source_name not in key_index:
+                    raise ValueError(f"Streaming source '{source_name}' does not exist")
+                _path, source_shape, source_dtype = key_index[source_name]
+                if tuple(source_shape) != source.expected_source_shape or source_dtype != "U8":
+                    raise ValueError(
+                        f"Packed expert source {source_name!r} requires "
+                        f"U8/{source.expected_source_shape}, got {source_dtype}/{source_shape}"
+                    )
+                tensor = _load_indexed_tensor(source_name, key_index)
+                if source.validate_tensor is not None:
+                    source.validate_tensor(tensor, source_name)
+                del tensor
+                consumed.add(source_name)
+                max_source_bytes = max(max_source_bytes, math.prod(source_shape))
+            largest_source_tensor_bytes = max(largest_source_tensor_bytes, max_source_bytes)
+            largest_reconstruction_working_set_bytes = max(
+                largest_reconstruction_working_set_bytes,
+                target_bytes + max_source_bytes + source.validation_scratch_bytes,
+            )
         else:
             if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:
                 raise ValueError(
@@ -1236,6 +1328,8 @@ def _stream_preprocessed_safetensors(
             _assign_lazy_transformed(initializer, source, key_index, target_name)
         elif isinstance(source, StreamingWeightSource):
             _assign_lazy_preprocessed(initializer, source, key_index, target_name)
+        elif isinstance(source, StreamingPackedExpertBankSource):
+            _assign_lazy_packed_expert_bank(initializer, source, key_index, target_name)
         else:
             _assign_lazy_expert_bank(initializer, source, key_index, target_name)
 
@@ -1684,6 +1778,14 @@ def stream_qdq_safetensors_to_model(
     paths = _resolve_shard_paths(model_id, revision)
     key_index = _shard_key_index(paths)
     plan = planner(key_index, model.graph.initializers)
+    qdq_sources: dict[str, StreamingWeightSource | StreamingExpertBankSource] = {}
+    for name, planned_source in plan.targets.items():
+        if not isinstance(planned_source, (StreamingWeightSource, StreamingExpertBankSource)):
+            raise TypeError(
+                f"QDQ does not support transformed or native packed sources: {name!r}; "
+                "use the native streaming loader"
+            )
+        qdq_sources[name] = planned_source
     graph = model.graph
     consumed = set(plan.ignored) | set(plan.constants)
     assigned: set[str] = set()
@@ -1752,7 +1854,7 @@ def stream_qdq_safetensors_to_model(
     # appending any QDQ node. A malformed late target must not leave a partially
     # mutated graph.
     ple_dependencies: dict[str, ir.Value] = {}
-    for target_name, source in plan.targets.items():
+    for target_name, source in qdq_sources.items():
         target = graph.initializers.get(target_name)
         if target is None:
             raise ValueError(f"QDQ plan targets unknown initializer '{target_name}'")
@@ -1875,7 +1977,7 @@ def stream_qdq_safetensors_to_model(
             f"QDQ plan (e.g. {unclassified[:5]})"
         )
 
-    for target_name, source in plan.targets.items():
+    for target_name, source in qdq_sources.items():
         target = graph.initializers.get(target_name)
         if target is None:
             raise ValueError(f"QDQ plan targets unknown initializer '{target_name}'")

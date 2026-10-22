@@ -4009,6 +4009,22 @@ def test_cuda_decoder_capture_tracks_graph_kv_cache_contract(
     assert cuda_options["enable_cuda_graph"] == enable_cuda_graph
 
 
+def test_sparse_iq2_disables_capture_even_with_shared_gqa_cache(tmp_path):
+    pkg = _make_fake_llm_pkg("gpt_oss")
+    for op_type, attrs in (
+        ("GroupQueryAttention", []),
+        ("QMoE", [ir.AttrString("quant_type", "iq2_xxs")]),
+    ):
+        pkg["model"].graph.append(
+            ir.Node("com.microsoft", op_type, [], attributes=attrs, num_outputs=1)
+        )
+    result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
+    config = json.loads(Path(result["genai_config"]).read_text())
+    options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+    assert config["search"]["past_present_share_buffer"] is True
+    assert options["enable_cuda_graph"] == "0"
+
+
 def test_gpt2_separate_cache_graph_uses_generic_decoder(tmp_path):
     write_ort_genai_config(_make_fake_llm_pkg("gpt2"), str(tmp_path))
     generated = json.loads((tmp_path / "genai_config.json").read_text())

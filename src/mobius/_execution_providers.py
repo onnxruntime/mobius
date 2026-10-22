@@ -147,6 +147,10 @@ class EpCapabilities:
             graph-capture-safe.  Set ``True`` only for EPs that cannot execute
             ``Shape`` / ``ConstantOfShape`` under graph capture (currently
             WebGPU).
+        iq2_moe_dtypes: Target dtypes for the optional companion-runtime CUDA
+            QMoE IQ2_XXS extension, not stock QMoE support. Emission additionally
+            requires an explicit model opt-in. This kernel cannot be captured
+            in a CUDA graph; it does not inherit ``enable_graph_capture``.
     """
 
     name: str
@@ -171,6 +175,7 @@ class EpCapabilities:
     max_buffer_size: int | None = None
     layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
+    iq2_moe_dtypes: frozenset[ir.DataType] = dataclasses.field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -312,6 +317,9 @@ def _register_builtins() -> None:
         ),
         EpCapabilities(
             name="cuda",
+            iq2_moe_dtypes=frozenset(
+                {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
+            ),
             gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
             qkv_pack_dtypes=frozenset(
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}

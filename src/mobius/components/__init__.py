@@ -74,6 +74,7 @@ __all__ = [
     "FlatInputMixer",
     "GGMLQ8Linear",
     "GGMLIQ2XXSLinear",
+    "GGMLIQ2XXSMoE",
     "Idefics3Projector",
     "InternVLProjector",
     "LayerNorm",
@@ -295,6 +296,7 @@ from mobius.components._hunyuan_step_vision import (
     HunyuanVLClipSidecar,
     Step3VLClipSidecar,
 )
+from mobius.components._iq2_moe import GGMLIQ2XXSMoE
 from mobius.components._kimi_linear import KimiDeltaAttention, KimiMLAAttention
 from mobius.components._lightning_attention import (
     LightningAttention as LightningAttention,

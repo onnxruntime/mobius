@@ -345,12 +345,11 @@ class NemotronHMoEBlock(nn.Module):
         [optional] expert_output → fc2_latent_proj → hidden
         output = expert_output + shared_experts(original_hidden)
 
-    ORT 1.29 ``com.microsoft.MoE``/``QMoE`` cannot implement the routed
-    experts faithfully because their exposed activation set has ReLU but no
-    ReLU2. ``QMoE`` does have separate selection and mixing inputs, so the
-    correction-biased selection and unbiased sigmoid weights are representable.
-    Shared experts and optional latent projections can remain as surrounding
-    graph operations. We use loop-over-experts dispatch.
+    Default dispatch is a dense diagnostic loop, not sparse execution.
+    Stock affine ``QMoE`` is not a substitute for native IQ2_XXS blocks with
+    independent FP32 mixing weights. Omni's opt-in subclass emits the companion
+    CUDA IQ2 QMoE extension directly; routing, shared experts and latent
+    projections remain outside that operator.
 
     HuggingFace reference: ``NemotronHMoE``.
     """
@@ -425,8 +424,25 @@ class NemotronHMoEBlock(nn.Module):
         if self._has_latent:
             hidden_states = self.fc1_latent_proj(op, hidden_states)
 
-        # Loop-over-experts dispatch: each expert processes all tokens,
-        # then results are masked and weighted by routing weights
+        result = self._dispatch_experts(op, hidden_states, routing_weights, selected_experts)
+
+        # HF accumulates the weighted experts in FP32, then rounds once before
+        # the model-dtype latent output projection and shared-expert addition.
+        result = op.CastLike(result, hidden_states)
+        if self._has_latent:
+            result = self.fc2_latent_proj(op, result)
+
+        shared_output = self.shared_experts(op, residual)
+        return op.Add(result, shared_output)
+
+    def _dispatch_experts(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        routing_weights: ir.Value,
+        selected_experts: ir.Value,
+    ) -> ir.Value:
+        # Diagnostic dense fallback: all experts process all tokens before masking.
         result = None
         for expert_idx, expert in enumerate(self.experts):
             expert_output = expert(op, hidden_states)
@@ -443,16 +459,7 @@ class NemotronHMoEBlock(nn.Module):
             else:
                 result = op.Add(result, contribution)
 
-        # HF accumulates the weighted experts in FP32, then rounds once before
-        # the model-dtype latent output projection and shared-expert addition.
-        result = op.CastLike(result, hidden_states)
-        # Optional latent projection back to hidden_size
-        if self._has_latent:
-            result = self.fc2_latent_proj(op, result)
-
-        # Add shared expert output (operates on original hidden states)
-        shared_output = self.shared_experts(op, residual)
-        result = op.Add(result, shared_output)
+        assert result is not None
         return result
 
 
