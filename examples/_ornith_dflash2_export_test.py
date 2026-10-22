@@ -88,6 +88,49 @@ def test_fp8_body_reuses_weight_and_keeps_sensitive_projections_dense():
     assert nodes[2].inputs[1].dtype == ir.DataType.BFLOAT16
 
 
+@pytest.mark.parametrize("width", [1, 7, 15])
+@pytest.mark.parametrize("fp32_conv", [False, True])
+def test_draft_geometry_has_distinct_files_and_preserves_runtime_cap(
+    tmp_path, width, fp32_conv
+):
+    import json
+
+    config = {
+        "hidden_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "intermediate_size": 64,
+        "vocab_size": 64,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 128,
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000},
+        "dflash_config": {
+            "conv_kernel_size": 2,
+            "conv_group_size": 4,
+            "selector_rank": 4,
+            "selector_top_k": 2,
+            "mask_token_id": 63,
+            "target_layer_ids": [1],
+            "block_size": 16,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    builder = OrnithDFlash2Builder(
+        tmp_path,
+        target_model(),
+        num_draft_tokens=width,
+        fp32_conv=fp32_conv,
+    )
+    assert builder.block_size == width + 1
+    assert builder.num_draft_tokens == width
+    assert builder.conv_fp32_accumulation is fp32_conv
+    suffix = f"-block{width + 1}" if width != 7 else ""
+    suffix += "-fp32conv" if fp32_conv else ""
+    assert builder.filename == f"dflash2-fp8{suffix}.onnx"
+
+
 def test_experiment_overlay_preserves_drafter_and_does_not_mutate_default():
     base = {
         "model": {

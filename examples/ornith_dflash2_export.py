@@ -72,7 +72,9 @@ def add_target_taps(model, layer_ids, hidden_size):
 class OrnithDFlash2Builder(DFlash2Builder):
     """Reuse GenAI's architecture with Mobius block-FP8 projection quantization."""
 
-    def __init__(self, draft_dir, target_model, *, fp8=True, num_draft_tokens=7):
+    def __init__(
+        self, draft_dir, target_model, *, fp8=True, num_draft_tokens=7, fp32_conv=False
+    ):
         self.target_model = target_model
         self.fp8 = fp8
         super().__init__(
@@ -86,7 +88,12 @@ class OrnithDFlash2Builder(DFlash2Builder):
             compute_dtype=ir.DataType.BFLOAT16,
             fuse_gate_up=True,
             fuse_qkv=True,
+            conv_fp32_accumulation=fp32_conv,
         )
+        if self.block_size != 8:
+            self.filename = self.filename.replace(".onnx", f"-block{self.block_size}.onnx")
+        if fp32_conv:
+            self.filename = self.filename.replace(".onnx", "-fp32conv.onnx")
 
     def load_weights(self):
         weights = {}
@@ -209,7 +216,12 @@ class OrnithDFlash2Builder(DFlash2Builder):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--num-draft-tokens", type=int, default=7, choices=range(1, 8))
+    parser.add_argument("--num-draft-tokens", type=int, default=7, choices=range(1, 16))
+    parser.add_argument(
+        "--fp32-conv",
+        action="store_true",
+        help="Match compiled reference convolution accumulation",
+    )
     parser.add_argument(
         "--bf16", action="store_true", help="Export a nonquantized draft control"
     )
@@ -225,12 +237,17 @@ def main():
     target_path = args.model / TARGET_DECODER
     target = ir.load(target_path)
     builder = OrnithDFlash2Builder(
-        draft_dir, target, fp8=not args.bf16, num_draft_tokens=args.num_draft_tokens
+        draft_dir,
+        target,
+        fp8=not args.bf16,
+        num_draft_tokens=args.num_draft_tokens,
+        fp32_conv=args.fp32_conv,
     )
     config = json.loads((args.model / "genai_config.json").read_text())
     capacity = config["model"]["decoder"]["state_update_capacity"]
-    if builder.num_draft_tokens + 1 > capacity:
-        raise ValueError("Draft block exceeds the target's recurrent rollback capacity")
+    if capacity < 2:
+        raise ValueError("Target recurrent rollback capacity must allow at least one draft")
+    verification_width = min(builder.num_draft_tokens, capacity - 1)
     output_dir = args.model / "dflash2"
     output_dir.mkdir(exist_ok=True)
     target_variant = target_path.with_name("model-gated-rms-dflash2.onnx")
@@ -262,9 +279,13 @@ def main():
             "mtp": {"enabled": False},
             "dflash2": section,
         },
-        "speculative": {"max_draft_tokens": builder.num_draft_tokens},
+        "speculative": {"max_draft_tokens": verification_width},
     }
     name = "bf16" if args.bf16 else "fp8"
+    if builder.block_size != 8:
+        name += f"-block{builder.block_size}"
+    if args.fp32_conv:
+        name += "-fp32conv"
     (args.model / f"dflash2-{name}-config.json").write_text(
         json.dumps(overlay, indent=2) + "\n"
     )
@@ -274,6 +295,8 @@ def main():
         "target_decoder": TARGET_DECODER,
         "target_decoder_sha256": hashlib.sha256(target_path.read_bytes()).hexdigest(),
         "draft_block_size": builder.block_size,
+        "verification_draft_tokens": verification_width,
+        "conv_fp32_accumulation": args.fp32_conv,
         "target_capture_capacity": capacity,
         "precision": {
             "projections": "BF16" if args.bf16 else "FP8 E4M3FN, row-block 128, FP32 scales",

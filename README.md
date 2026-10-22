@@ -1033,7 +1033,11 @@ This is weight-only FP8, not FP8 activations or an FP8 draft cache.
 The checkpoint uses 16 query rows, but the current target has an eight-token
 recurrent rollback capacity. This initial experiment explicitly uses eight
 query rows (anchor + seven drafts); it is **not** a benchmark of the published
-16-row configuration. `--num-draft-tokens` can select 1–7. The draft's eight
+16-row configuration. `--num-draft-tokens` can select 1–15 for the draft graph.
+Verification is separately capped at `state_update_capacity - 1`, so a
+16-row draft can be tested without increasing the target's rollback capacity:
+the Engine only verifies its first seven proposals. Non-default block sizes
+use distinct graph/config filenames. The draft's eight
 post-residual target taps are layers 1/7/14/20/26/32/39/45 (zero-based).
 No target weights or arithmetic are changed by exporting these taps.
 
@@ -1070,6 +1074,50 @@ control yet, so the low acceptance is not attributed specifically to FP8.
 `engine-dflash2-fp8-summary.json` preserves package hashes, the fresh control,
 per-context sampled peak memory and the benchmark-only decision. The accepted
 gated-RMS plus FP8 MTP deployment remains the recommendation.
+
+#### DFlash2 slowdown diagnostics
+
+No additional MTP run is needed when only the draft changes; reuse its saved
+control. Short, 2K-context, 128-output diagnostic runs found:
+
+| DFlash2-only configuration | Decode tokens/s | Accepted drafts / target passes |
+| --- | ---: | ---: |
+| FP8 body, eight-row draft, seven verified drafts | 48.28 | 2 / 127 |
+| BF16 body, otherwise unchanged | 48.38 | 2 / 127 |
+| FP8 body, trained 16-row draft, seven verified drafts | 47.49 | 1 / 128 |
+| FP8 eight-row draft, only one verified draft | 95.62 | 2 / 127 |
+
+The one-draft result averages three measured runs; the other diagnostics
+use one measured run after warmup. These are not replacements for the longer
+four-context benchmark. BF16 alone and restoring 16-row drafting do not
+resolve the low acceptance. Native chat formatting improves short-prompt
+acceptance somewhat, but the tested long chat prompt still accepts only
+three drafts in 126 target passes.
+
+A warmed 2K Nsight trace through 128 outputs attributes **2351.20 ms** of
+summed steady-decode GPU kernel time to target verification, **206.20 ms**
+to the drafter and **18.94 ms** to other kernels. Target work is about **91.3%**
+of this sum. The phase wall time is 3057.61 ms; summed kernel durations are
+not wall-time shares. Almost all proposed rows are rejected after paying for
+their target execution, which explains the large cost of seven-draft
+verification. The FP8 draft uses the direct small-row FP8 kernels here, not
+full-weight dequantization for every projection.
+
+`--fp32-conv` is a separate arithmetic diagnostic: the compiled public
+dynamic-convolution reference accumulates in FP32 and rounds once, whereas
+the decomposed BF16 graph rounds each operation. An isolated learned-weight
+test exactly matches compiled output with FP32 accumulation; the old
+decomposition matches only 61.2% of elements. The opt-in graph performs
+coefficient construction and accumulation in FP32, then casts once, while
+leaving the default path untouched. It uses distinct `-fp32conv` filenames.
+However, this change **does not fix acceptance** in the 2K test (one accepted
+draft in 128 target passes, 46.86 tokens/s); it is not promoted.
+
+These results establish the cost mechanism but do not yet explain why this
+trained draft has so little agreement with the deployed INT2 target.
+Potential target-feature/quantization compatibility and remaining numerical
+differences require a real-feature reference-drafter replay before attributing
+the problem to a specific cause. No task/source accuracy evaluation was run.
 
 ### Ornith FP16 recurrent-state storage
 
