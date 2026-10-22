@@ -23,6 +23,7 @@ from ornith_engine_export import (
     PackedOrnithTask,
     bind_component_weights,
     engine_config,
+    fuse_int2_swiglu,
     fuse_shared_expert_gates,
     pack_int2_projections,
 )
@@ -550,6 +551,180 @@ def test_packed_int2_projections_preserve_output_columns(tmp_path, rows, extra_a
         np.testing.assert_array_equal(result, reference)
 
 
+def _packed_swiglu_model():
+    rng = np.random.default_rng(47)
+    graph, builder = _make_graph()
+    graph.opset_imports[""] = 24
+    graph.opset_imports["com.microsoft"] = 1
+
+    def value(name, width):
+        return ir.Value(
+            name=name,
+            shape=ir.Shape(["rows", width]),
+            type=ir.TensorType(ir.DataType.FLOAT16),
+        )
+
+    x, projected = value("x", 128), value("projected", 32)
+    gate, up, swish, result = (value(name, 16) for name in ("gate", "up", "swish", "y"))
+    graph.inputs.append(x)
+    weight = builder.initializer(
+        ir.tensor(rng.integers(0, 256, (32, 1, 32), dtype=np.uint8)), name="weight"
+    )
+    scales = builder.initializer(
+        ir.tensor(rng.uniform(0.001, 0.01, (32, 1)).astype(np.float16)), name="scales"
+    )
+    sizes = builder.initializer(ir.tensor([16, 16], dtype=ir.DataType.INT64), name="sizes")
+    graph.extend(
+        [
+            ir.Node(
+                "com.microsoft",
+                "MatMulNBits",
+                [x, weight, scales],
+                [
+                    ir.AttrInt64(key, number)
+                    for key, number in (
+                        ("K", 128),
+                        ("N", 32),
+                        ("bits", 2),
+                        ("block_size", 128),
+                    )
+                ],
+                outputs=[projected],
+            ),
+            ir.Node(
+                "", "Split", [projected, sizes], [ir.AttrInt64("axis", -1)], outputs=[gate, up]
+            ),
+            ir.Node("", "Swish", [gate], outputs=[swish]),
+            ir.Node("", "Mul", [swish, up], outputs=[result]),
+        ]
+    )
+    graph.outputs.append(result)
+    return _make_model(graph)
+
+
+@pytest.mark.parametrize(
+    "reject",
+    [
+        None,
+        "quick_gelu",
+        "quick_gelu_missing_alpha",
+        "alpha",
+        "bits",
+        "block_size",
+        "attribute",
+        "axis",
+        "sizes",
+        "dynamic_sizes",
+        "extra_output",
+        "reused_gate",
+        "reused_up",
+        "reused_swish",
+        "dtype",
+        "shape",
+        "swapped_gate",
+        "dynamic_weight",
+    ],
+)
+def test_int2_swiglu_fusion_guards(reject):
+    model = _packed_swiglu_model()
+    graph = model.graph
+    projection, split, swish, mul = list(graph)
+    if reject in ("quick_gelu", "quick_gelu_missing_alpha"):
+        swish.domain = "com.microsoft"
+        swish.op_type = "QuickGelu"
+        if reject == "quick_gelu":
+            swish.attributes["alpha"] = ir.AttrFloat32("alpha", 1.0)
+    elif reject == "alpha":
+        swish.attributes["alpha"] = ir.AttrFloat32("alpha", 0.5)
+    elif reject in ("bits", "block_size", "attribute"):
+        name, number = {
+            "bits": ("bits", 4),
+            "block_size": ("block_size", 64),
+            "attribute": ("accuracy_level", 1),
+        }[reject]
+        projection.attributes[name] = ir.AttrInt64(name, number)
+    elif reject == "axis":
+        split.attributes["axis"] = ir.AttrInt64("axis", 0)
+    elif reject == "sizes":
+        split.inputs[1].const_value = ir.tensor([8, 24], dtype=ir.DataType.INT64)
+    elif reject == "dynamic_sizes":
+        sizes = split.inputs[1]
+        del graph.initializers[sizes.name]
+        sizes.const_value = None
+        graph.inputs.append(sizes)
+    elif reject == "extra_output":
+        graph.outputs.append(projection.outputs[0])
+    elif reject in ("reused_gate", "reused_up", "reused_swish"):
+        source = {
+            "reused_gate": split.outputs[0],
+            "reused_up": split.outputs[1],
+            "reused_swish": swish.outputs[0],
+        }[reject]
+        graph.outputs.append(source)
+    elif reject == "dtype":
+        projection.inputs[2].type = ir.TensorType(ir.DataType.FLOAT)
+    elif reject == "shape":
+        mul.outputs[0].shape = ir.Shape(["rows", 32])
+    elif reject == "swapped_gate":
+        swish.replace_input_with(0, split.outputs[1])
+        mul.replace_input_with(1, split.outputs[0])
+    elif reject == "dynamic_weight":
+        weight = projection.inputs[1]
+        del graph.initializers[weight.name]
+        graph.inputs.append(weight)
+    accepted = reject in (None, "quick_gelu")
+    assert fuse_int2_swiglu(model) == int(accepted)
+    assert fuse_int2_swiglu(model) == 0
+    if accepted:
+        assert [node.op_type for node in graph] == ["MatMulNBitsSwiGLU"]
+        assert graph.outputs[0].name == "y"
+        assert graph.outputs[0].shape == ir.Shape(["rows", 16])
+        assert "sizes" not in graph.initializers
+
+
+def test_int2_swiglu_fusion_after_projection_packing():
+    model = _packed_swiglu_model()
+    graph = model.graph
+    projection, split, _, _ = list(graph)
+    nodes, outputs = [], []
+    for index in range(2):
+        parameters = []
+        for value in projection.inputs[1:]:
+            parameter = ir.Value(
+                name=f"{value.name}_{index}",
+                shape=ir.Shape([16, *value.shape[1:]]),
+                type=value.type,
+                const_value=ir.tensor(
+                    value.const_value.numpy()[index * 16 : (index + 1) * 16]
+                ),
+            )
+            graph.register_initializer(parameter)
+            parameters.append(parameter)
+        output = ir.Value(
+            name=split.outputs[index].name,
+            shape=split.outputs[index].shape,
+            type=split.outputs[index].type,
+        )
+        attributes = dict(projection.attributes)
+        attributes["N"] = ir.AttrInt64("N", 16)
+        nodes.append(
+            ir.Node(
+                "com.microsoft",
+                "MatMulNBits",
+                [projection.inputs[0], *parameters],
+                attributes,
+                outputs=[output],
+            )
+        )
+        outputs.append(output)
+    ir.convenience.replace_nodes_and_values(
+        graph, split, [projection, split], nodes, list(split.outputs), outputs
+    )
+    assert pack_int2_projections(model) == 1
+    assert fuse_int2_swiglu(model) == 1
+    assert [node.op_type for node in graph] == ["MatMulNBitsSwiGLU"]
+
+
 def _cuda(array):
     return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(array), "cuda", 0)
 
@@ -725,7 +900,16 @@ def test_moe_router_fusion_is_guarded_and_idempotent(reject, use_matmul):
         assert model.graph.outputs[0].name == "out"
 
 
-def test_moe_router_matmul_cli_requires_router_fusion(monkeypatch, tmp_path, capsys):
+@pytest.mark.parametrize(
+    "flag,required",
+    [
+        ("--moe-router-use-matmul", "--fuse-moe-routers"),
+        ("--fuse-shared-expert-swiglu", "--pack-projections"),
+    ],
+)
+def test_export_cli_requires_prerequisite_fusion(
+    monkeypatch, tmp_path, capsys, flag, required
+):
     from ornith_engine_export import main
 
     monkeypatch.setattr(
@@ -739,13 +923,13 @@ def test_moe_router_matmul_cli_requires_router_fusion(monkeypatch, tmp_path, cap
             str(tmp_path),
             "--output",
             str(tmp_path / "output"),
-            "--moe-router-use-matmul",
+            flag,
         ],
     )
     with pytest.raises(SystemExit) as error:
         main()
     assert error.value.code == 2
-    assert "--moe-router-use-matmul requires --fuse-moe-routers" in capsys.readouterr().err
+    assert f"{flag} requires {required}" in capsys.readouterr().err
 
 
 def _states(batch, block_count=4, recurrent_dtype=np.float32):

@@ -255,6 +255,114 @@ def fuse_shared_expert_gates(model):
     return fused
 
 
+def fuse_int2_swiglu(model):
+    """Fuse INT2 gate/up projections using ORT's optimized QuickGelu SiLU arithmetic."""
+    graph = model.graph
+
+    def sole_user(value, op_type, domain=""):
+        uses = tuple(value.uses())
+        if value in graph.outputs or len(uses) != 1:
+            return None
+        node = uses[0].node
+        return node if node.domain == domain and node.op_type == op_type else None
+
+    fused = 0
+    for projection in list(graph):
+        if (
+            projection.domain != "com.microsoft"
+            or projection.op_type != "MatMulNBits"
+            or len(projection.inputs) != 3
+            or set(projection.attributes) != {"K", "N", "bits", "block_size"}
+            or projection.attributes["bits"].as_int() != 2
+            or projection.attributes["block_size"].as_int() != 128
+        ):
+            continue
+        x, weight, scales = projection.inputs
+        k = projection.attributes["K"].as_int()
+        n = projection.attributes["N"].as_int()
+        if (
+            k <= 0
+            or k % 128
+            or k > 2**31 - 1
+            or n <= 0
+            or n % 16
+            or n > 2**31 - 1
+            or x is None
+            or x.dtype != ir.DataType.FLOAT16
+            or x.shape is None
+            or x.shape.rank() != 2
+            or x.shape[1] != k
+            or weight is None
+            or not weight.is_initializer()
+            or weight.dtype != ir.DataType.UINT8
+            or weight.shape != ir.Shape([n, k // 128, 32])
+            or scales is None
+            or not scales.is_initializer()
+            or scales.dtype != ir.DataType.FLOAT16
+            or scales.shape != ir.Shape([n, k // 128])
+        ):
+            continue
+        split = sole_user(projection.outputs[0], "Split")
+        if (
+            split is None
+            or len(split.inputs) != 2
+            or len(split.outputs) != 2
+            or set(split.attributes) != {"axis"}
+            or split.attributes["axis"].as_int() not in (-1, 1)
+            or split.inputs[1] is None
+            or not split.inputs[1].is_initializer()
+            or split.inputs[1].dtype != ir.DataType.INT64
+            or split.inputs[1].const_value is None
+            or split.inputs[1].shape != ir.Shape([2])
+            or tuple(split.inputs[1].const_value.numpy()) != (n // 2, n // 2)
+        ):
+            continue
+        gate, up = split.outputs
+        swish = sole_user(gate, "Swish")
+        if swish is None:
+            swish = sole_user(gate, "QuickGelu", "com.microsoft")
+        mul = sole_user(up, "Mul")
+        if (
+            swish is None
+            or mul is None
+            or set(swish.attributes) - {"alpha"}
+            or (swish.op_type == "QuickGelu" and "alpha" not in swish.attributes)
+            or (
+                "alpha" in swish.attributes and swish.attributes["alpha"].as_float() != 1.0  # noqa: RUF069 - exact activation semantics
+            )
+            or mul.attributes
+            or sole_user(swish.outputs[0], "Mul") is not mul
+            or set(mul.inputs) != {swish.outputs[0], up}
+            or any(
+                value.dtype != ir.DataType.FLOAT16
+                or value.shape != ir.Shape([x.shape[0], n // 2])
+                for value in (gate, up, swish.outputs[0], mul.outputs[0])
+            )
+            or projection.outputs[0].dtype != ir.DataType.FLOAT16
+            or projection.outputs[0].shape != ir.Shape([x.shape[0], n])
+        ):
+            continue
+        output = ir.Value(
+            name=mul.outputs[0].name,
+            shape=mul.outputs[0].shape,
+            type=mul.outputs[0].type,
+        )
+        node = ir.Node(
+            "com.microsoft",
+            "MatMulNBitsSwiGLU",
+            [x, weight, scales],
+            [ir.AttrInt64("K", k), ir.AttrInt64("N", n)],
+            outputs=[output],
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph, mul, [projection, split, swish, mul], [node], [mul.outputs[0]], [output]
+        )
+        fused += 1
+    if fused:
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return fused
+
+
 def pack_int2_projections(model):
     """Pack compatible shared-input projections without requantizing their weights."""
     graph = model.graph
@@ -321,6 +429,8 @@ def pack_int2_projections(model):
         )
         sizes = ir.Value(
             name=nodes[0].outputs[0].name + ".packed_split_sizes",
+            shape=ir.Shape([len(widths)]),
+            type=ir.TensorType(ir.DataType.INT64),
             const_value=ir.tensor(widths, dtype=ir.DataType.INT64),
         )
         graph.register_initializer(sizes)
@@ -862,6 +972,11 @@ def main():
         help="Fuse FP16 shared gate MatMul, sigmoid, expert sum and residual",
     )
     parser.add_argument(
+        "--fuse-shared-expert-swiglu",
+        action="store_true",
+        help="Fuse packed FP16 INT2 gate/up projection and SwiGLU; requires --pack-projections",
+    )
+    parser.add_argument(
         "--pack-projections",
         action="store_true",
         help="Pack shared-input INT2 projections to reduce decode kernel launches",
@@ -869,6 +984,8 @@ def main():
     args = parser.parse_args()
     if args.moe_router_use_matmul and not args.fuse_moe_routers:
         parser.error("--moe-router-use-matmul requires --fuse-moe-routers")
+    if args.fuse_shared_expert_swiglu and not args.pack_projections:
+        parser.error("--fuse-shared-expert-swiglu requires --pack-projections")
     if args.output.exists():
         raise FileExistsError(f"Refusing to overwrite {args.output}")
     validate_checkpoint_revision(args.checkpoint)
@@ -892,6 +1009,9 @@ def main():
         )
         packed_projections = (
             pack_int2_projections(package["decoder"]) if args.pack_projections else 0
+        )
+        fused_swiglu = (
+            fuse_int2_swiglu(package["decoder"]) if args.fuse_shared_expert_swiglu else 0
         )
         fused_gates = (
             fuse_shared_expert_gates(package["decoder"])
@@ -946,6 +1066,7 @@ def main():
                 "engine_validated": False,
                 "packed_projection_nodes_removed": packed_projections,
                 "shared_expert_gates_fused": fused_gates,
+                "shared_expert_swiglu_fused": fused_swiglu,
                 "moe_routers_fused": fused_routers,
                 "moe_router_use_matmul": args.moe_router_use_matmul,
                 "recurrent_state_dtype": "float16" if args.recurrent_state_fp16 else "float32",

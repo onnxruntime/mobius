@@ -589,6 +589,73 @@ change does not establish a new best whole-model throughput.
 The parity-gated 32K sampled peak remains **43.196 GiB**.
 The 200 tokens/s goal and source-model accuracy evaluation remain outstanding.
 
+### Ornith shared-expert INT2 projection/SwiGLU fusion
+
+`--pack-projections --fuse-shared-expert-swiglu` replaces compatible packed
+`MatMulNBits -> Split -> Swish -> Mul` chains (or explicit
+`QuickGelu(alpha=1)` instead of Swish) with
+`com.microsoft::MatMulNBitsSwiGLU`. This is separate from the existing scalar
+gate/residual fusion: it computes the shared expert's gate/up projection and
+activation, leaving the down projection and residual path unchanged.
+
+The opt-in rewrite accepts only rank-two FP16 activations, raw symmetric INT2
+weights with group size 128, equal gate/up halves and Swish alpha exactly one.
+It rejects optional projection inputs/attributes, dynamic weights, incompatible
+shapes, and intermediate values exposed as graph outputs or used elsewhere.
+For Ornith it replaces 48 four-node chains with 48 fused nodes (144 fewer
+graph nodes), without changing weight bytes or the recurrent-state ABI.
+
+For one through eight rows, the CUDA kernel pairs corresponding gate/up
+columns, reuses activation loads, and writes the 1024-wide activated result
+directly instead of materializing the 2048-wide projection and elementwise
+intermediates. FP16 dequantization, half2 dot accumulation order, FP32 warp
+reduction and projection rounding are retained. The activation matches ORT's
+optimized `QuickGelu(alpha=1)` path: sigmoid/product arithmetic is FP32, the
+activated gate rounds to FP16, and the final up multiply rounds to FP16.
+This intentionally matches the deployed optimized decoder, not an unoptimized
+Swish expansion that rounds sigmoid separately. The flag therefore requires
+validation against the optimized unfused graph, not just an isolated Swish.
+Larger prefill batches retain dequantize/GEMM and use a fused activation
+epilogue. The matching ORT CUDA runtime is required; this option is off by
+default and does not change MTP weights or GenAI Engine scheduling.
+
+The same-runtime comparison on one H200, with native Engine CUDA graphs,
+packed-only INT2 experts, FP16 recurrent state, one warmup and three measured
+512-token runs per context, measured:
+
+| Context | Unfused control (tokens/s) | Projection/SwiGLU fusion (tokens/s) | Change |
+| --- | ---: | ---: | ---: |
+| 2K | 164.185 | 167.915 | +2.27% |
+| 8K | 131.153 | 133.532 | +1.81% |
+| 16K | 109.894 | 111.513 | +1.47% |
+| 32K | 65.323 | 66.008 | +1.05% |
+
+All twelve timed output sequences and MTP counters exactly match the unfused
+control and the prior FP16-state decoder, with zero MTP failures. This is a
+modest matched improvement, not a new best throughput across historical runs.
+The initial implementation's separately rounded sigmoid passed isolated Swish
+tests but changed full-model IDs; that arithmetic was rejected. Connected
+SiLU/QuickGelu optimization, bitwise FP16 results, empty inputs, small-M row
+invariance, large-M GEMM prefill and CUDA-graph replay now have regression
+coverage. The 200 tokens/s goal and source-model accuracy evaluation remain
+outstanding.
+
+In same-input ORT CUDA graphs with 64 independent INT2 weight banks exceeding
+L2 capacity, baseline/fused median CUDA-event times were **8.77/5.22 us** at
+one row, **11.76/6.82 us** at two rows, **15.94/10.34 us** at four rows and
+**22.55/17.31 us** at eight rows. These use the correct QuickGelu baseline and
+bitwise-equal deterministic synthetic inputs, not whole-model timings.
+
+A same-runtime 2K Nsight Systems comparison preserves all 3,840 shared
+projection launches, replacing them with fused projection/activation kernels.
+It removes 3,840 Split, 3,840 FP16 QuickGelu and 3,840 multiply launches:
+**155,747 -> 144,227** total kernels in the synchronized steady-decode window.
+Summed kernel time falls from **768.01 to 751.55 ms** (2.14%). Both complete
+512-token profiled outputs match the prior baseline. Node-level tracing adds
+overhead; these are summed GPU durations, not normal Engine wall latency.
+The parity-gated 32K sampled device-memory peak is **43.194 GiB**, essentially
+unchanged. The exact tested runtime is packaged in the matching CUDA wheel.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
