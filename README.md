@@ -800,6 +800,65 @@ provenance alongside the export artifacts. The previously approved wheel is
 retained for rollback. Source-model accuracy remains unevaluated, and portable
 paged attention remains the main long-context decode bottleneck.
 
+### Ornith small-row MoE finalization decode
+
+The staged finalization optimization from
+[ORT PR #33473](https://github.com/microsoft/onnxruntime/pull/33473) is selectively
+adapted to the Ornith branch's existing launch-capability and programmatic
+dependent-launch handling. For one/two-row staged finalization, one warp owns
+each column tile instead of assigning all output columns to one CTA per row.
+For hidden size 3072 and FP16 output, the main grid changes from `[2,1,1]`
+with 384 threads per block to `[2,12,1]` with 32 threads per block.
+
+Expert selection, routing weights, per-output top-k accumulation order,
+quantization, shared-expert fusion, and Engine scheduling remain unchanged.
+Larger-row and other finalization modes retain existing dispatch. The routing
+fusion, FP8 projection, BF16 shared-expert and NVFP4 changes from the PR are
+not included.
+
+Matched H200 native Engine measurements use the approved temporal-convolution
+runtime as control, the same model graph, width-one FP8 MTP, INT2 target,
+FP8 KV/LM head, FP16 state, CUDA graphs, packed-only experts and direct
+initializer allocations. Each context has one warmup and three timed
+512-token turns; the candidate is followed by a fresh control:
+
+| Context | Control decode (tokens/s) | Tiled finalization decode (tokens/s) | Change |
+| --- | ---: | ---: | ---: |
+| 2K | 168.736 | 180.744 | +7.12% |
+| 8K | 135.110 | 142.810 | +5.70% |
+| 16K | 113.484 | 118.642 | +4.55% |
+| 32K | 67.677 | 69.911 | +3.30% |
+
+All twelve timed outputs and MTP counters exactly match both the fresh
+control and previous approved runtime. The candidate passes its own
+target-only greedy checks, with zero MTP failures. Thirty-seven focused
+CUDA tests plus 36 subcases pass, including top-eight INT2 at one/two/three/eight
+rows, hidden sizes 512/3072, group sizes 64/128, packed-only expert storage,
+FP8 FP16/BF16 paths, biases, all-expert selection and CUDA graph replay.
+
+The parity-checked 32K node-level CUDA profile retains 173121 steady-decode
+kernel launches. Summed finalization-kernel duration falls from 20.07 to
+16.09 ms, and the observed grids match the intended specialization.
+The change in summed GPU kernel time is much smaller than the unprofiled
+throughput gain: tracing overhead and graph scheduling prevent attributing
+the end-to-end gain solely to this sum. Hardware-counter access remains
+unavailable, so no bandwidth, achieved-occupancy or stall diagnosis is claimed.
+Portable paged attention still accounts for about 59% of summed decode GPU
+kernel time at 32K.
+
+A preceding head-256 register-accumulator attention experiment passed all
+sixteen bitwise component cases but regressed long-context asynchronous
+warm-cache timings by about 0.2-0.8%. It was rejected before full-model
+benchmarking; no attention-kernel changes from it remain. The accepted
+runtime retains the temporal-convolution prefill optimization.
+
+The installed provider, staged binaries, saved runtime and wheel are
+hash-verified. `engine-decode-priorities-summary.json` alongside the export
+artifacts records the accepted/rejected evidence and package provenance.
+The previous temporal-convolution runtime remains available for rollback.
+Source-model accuracy is still unevaluated, and 200 decode tokens/s has not
+been reached.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
