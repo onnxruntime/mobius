@@ -198,6 +198,19 @@ class _Flags:
     is **not** a performance path and makes no throughput claim.
     """
 
+    sparse_iq2_moe: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_SPARSE_IQ2_MOE", False)
+    )
+    """Emit routed Omni IQ2_XXS experts directly as sparse CUDA QMoE nodes.
+
+    Requires the companion runtime's ``QMoE quant_type='iq2_xxs'`` extension,
+    SM80+ CUDA, external INT64 selected experts and final FP32 routing weights.
+    Stock QMoE does not implement this ABI. CUDA graph capture is unsupported.
+    All routed projections must be bias-free IQ2_XXS with ReLU2 activation.
+    Default ``False`` preserves the existing dense-all-expert diagnostic graph;
+    enabling the flag fails explicitly on unsupported providers or topology.
+    """
+
 
 # Global singleton — import and use this directly.
 flags = _Flags()

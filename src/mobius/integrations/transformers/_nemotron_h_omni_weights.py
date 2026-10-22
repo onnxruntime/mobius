@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections import Counter
 from collections.abc import Callable, Mapping
 from functools import partial
@@ -15,6 +17,7 @@ import torch
 from mobius._configs import NemotronHOmniConfig
 from mobius._model_package import ModelPackage
 from mobius.integrations._weight_loading import (
+    StreamingPackedExpertBankSource,
     StreamingTransformedWeightSource,
     StreamingWeightPlan,
     StreamingWeightSource,
@@ -81,7 +84,13 @@ def build_nemotron_h_omni_streaming_plan(
     initializers: Mapping[str, ir.Value],
 ) -> StreamingWeightPlan:
     """Classify every source from authoritative per-projection storage metadata."""
-    targets: dict[str, StreamingWeightSource | StreamingTransformedWeightSource] = {}
+    targets: dict[
+        str,
+        StreamingWeightSource
+        | StreamingTransformedWeightSource
+        | StreamingPackedExpertBankSource,
+    ] = {}
+    packed_banks: dict[str, dict[int, str]] = {}
 
     def transformed(
         target_name: str,
@@ -113,6 +122,25 @@ def build_nemotron_h_omni_streaming_plan(
         target_root = _target_name(source_root, config)
         if target_root is None:
             raise ValueError(f"Unsupported Omni source projection {source_root}")
+        expert = re.fullmatch(r"(.+\.moe)\.experts\.(\d+)\.(up_proj|down_proj)", target_root)
+        if expert is not None:
+            prefix, index_text, projection = expert.groups()
+            bank_name = f"{prefix}.packed_experts.{projection}"
+            if bank_name in initializers:
+                if (
+                    specification.quant_algo != "IQ2_XXS"
+                    or specification.group_size != 256
+                    or specification.block_payload_bytes != 66
+                ):
+                    raise ValueError(
+                        f"Sparse IQ2 bank requires GGML IQ2_XXS/256/66: {source_root}"
+                    )
+                bank = packed_banks.setdefault(bank_name, {})
+                index = int(index_text)
+                if index in bank:
+                    raise ValueError(f"Duplicate sparse IQ2 expert binding: {source_root}")
+                bank[index] = source_root + ".weight"
+                continue
         weight_name = target_root + ".weight"
         weight = initializers.get(weight_name)
         if weight is None or weight.shape is None or weight.dtype != ir.DataType.UINT8:
@@ -155,6 +183,20 @@ def build_nemotron_h_omni_streaming_plan(
         else:
             raise ValueError(f"Unsupported Omni format {specification.quant_algo}")
 
+    for bank_name, experts in packed_banks.items():
+        value = initializers[bank_name]
+        if value.dtype != ir.DataType.UINT8 or value.shape is None or len(value.shape) != 4:
+            raise ValueError(f"Invalid sparse IQ2 graph bank {bank_name}")
+        count, rows, blocks, payload = _fixed_shape(value.shape)
+        if payload != 66 or set(experts) != set(range(count)):
+            raise ValueError(f"Incomplete or malformed sparse IQ2 expert bank {bank_name}")
+        targets[bank_name] = StreamingPackedExpertBankSource(
+            source_names=tuple(experts[index] for index in range(count)),
+            expected_source_shape=(rows, blocks, payload),
+            validate_tensor=_validate_ggml_scale,
+            validation_scratch_bytes=math.prod((rows, blocks)) * 4,
+        )
+
     for source_name, (_path, _shape, dtype) in key_index.items():
         target_name = _target_name(source_name, config)
         if target_name is None or target_name not in initializers:
@@ -192,6 +234,8 @@ def build_nemotron_h_omni_streaming_plan(
                 item.quant_algo == "IQ2_XXS" for item in config.quantized_projections.values()
             ),
             "full_checkpoint_dequantization": False,
+            "routed_moe_execution": "sparse-iq2" if packed_banks else "dense-diagnostic",
+            "sparse_iq2_moe_layers": len(packed_banks) // 2,
             "projection_formats": dict(
                 Counter(item.quant_algo for item in config.quantized_projections.values())
             ),

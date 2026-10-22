@@ -38,6 +38,92 @@ optimization, requantization or full-model copies. Its 22 focused tests and
 tiny actual CUDA IQ2 execution pass, including rejection of unsupported
 stock runtimes. This is package/operator evidence, not full-model readiness.
 
+## Opt-in sparse IQ2 routed experts
+
+`MOBIUS_SPARSE_IQ2_MOE=1` replaces the routed-expert loop with **one sparse
+`com.microsoft::QMoE` per MoE layer**, emitted directly during construction.
+It does not first build or wrap the unconditional per-expert graph. In
+PowerShell, set the flag before running the pinned export command above:
+
+```powershell
+$env:MOBIUS_SPARSE_IQ2_MOE = "1"
+```
+
+This requires the **companion CUDA QMoE IQ2_XXS runtime extension** in
+addition to the native projection operators below. Stock QMoE and the
+parent native-matmul runtime alone do not implement this contract. The
+export flag is an explicit selection of that target ABI, not runtime
+discovery or proof that a compatible binary is installed.
+
+Only CUDA FLOAT/FLOAT16/BFLOAT16 targets are accepted; the runtime requires
+SM80+. Every routed up/down projection must be bias-free IQ2_XXS, with
+ReLU2 activation, positive latent/intermediate dimensions divisible by 256,
+and `1 <= k <= min(num_experts,32)`. Unsupported providers, incomplete or
+mixed-format routed experts and unsupported topology fail explicitly.
+Heterogeneous expert counts, intermediate sizes and top-k remain per layer.
+
+The default `MOBIUS_SPARSE_IQ2_MOE=0` preserves the existing **dense
+diagnostic** path: every routed expert evaluates every token before masking.
+It remains useful for numerical comparison but is not sparse execution.
+Shared experts, latent projections, Q8_0/NVFP4 projections, embedding,
+vision, and the global KV/convolution/SSM cache descriptors are unchanged.
+
+The version-1 `QMoE` IQ2 extension uses the following exact operands.
+All unspecified optional inputs, including `router_probs` at index 1,
+are omitted:
+
+| Input index | Meaning | Type and shape |
+|---|---|---|
+| 0 | Native expert activations | FLOAT/FLOAT16/BFLOAT16 `[T,L]` or `[B,S,L]` |
+| 2 | Up projection bank | UINT8 `[E,I,L/256,66]` |
+| 5 | Down projection bank | UINT8 `[E,L,I/256,66]` |
+| 21 | Selected expert IDs | INT64 `[T,k]`, distinct and in `[0,E)` per token |
+| 22 | Final mixing weights | FLOAT `[T,k]`, finite |
+
+Attributes are `quant_type="iq2_xxs"`, `expert_weight_bits=2`,
+`block_size=256`, `activation_type="relu2"`, the layer's `k`,
+`normalize_routing_weights=0`, `use_sparse_mixer=0`, `swiglu_fusion=0`,
+and `weights_prepacked=0`. Output has the native activation type and shape;
+dynamic and empty token dimensions are supported.
+
+Routing stays outside QMoE: original-width FP32 gate, sigmoid, selection
+using correction-biased scores, gathering **unbiased** probabilities,
+optional normalization with `sum + 1e-20`, and routed scaling. The kernel
+does not reselect experts or renormalize those weights. Complete decoded
+weights round to native dtype before FP32 dot accumulation. Up output,
+ReLU2 square, and down output have native stores. Final weighted aggregation
+uses separate FP32 multiply/add in ascending expert-ID order, then rounds
+once before the latent output projection. This matches the exporter's
+diagnostic reduction order, not a claim of upstream CUDA bitwise identity.
+
+Packed banks are streamed byte-for-byte, including embedded FP16 scales,
+with a working set bounded by one packed bank, one expert source and
+declared scale-validation scratch. All sources/targets are accounted for
+before transactional package binding; source metadata and scales are
+revalidated at serialization. No affine INT2 conversion, full-checkpoint
+dequantization or early BF16 scale rounding is performed.
+
+The runtime's scalar validation synchronization **excludes CUDA graph
+capture**. GenAI metadata disables decoder capture whenever an IQ2 QMoE
+node is present, even if GQA otherwise supports shared KV buffers.
+Omni continues to disable shared buffers as before. Do not manually enable
+capture for this kernel.
+
+Focused tests cover the ABI, graph shape, heterogeneous topology, CPU
+router/dense diagnostic numerics, packed-byte round trips, bounded loading,
+atomic failure and multimodal/cache metadata. Actual CUDA comparison of the
+sparse op against the native dense diagnostic is separately opt-in:
+
+```powershell
+$env:MOBIUS_TEST_SPARSE_IQ2_CUDA = "1"
+python -m pytest src\mobius\components\_iq2_moe_test.py -k real_cuda -q
+```
+
+Once opted in, missing CUDA or missing companion operators fail rather than
+being treated as passing/skipped execution. Structural/streaming tests do
+not qualify CUDA execution, throughput, full-model numerical parity, or a
+24 GB footprint. The preserved full-model failures below remain unresolved.
+
 ## Required native operator contracts
 
 The mixed-format decoder requires CUDA operators from

@@ -1676,6 +1676,15 @@ def _write_genai_config(
     if is_omni:
         supports_in_place_kv_cache = False
 
+    # IQ2 validation synchronizes a scalar status flag; the kernel cannot be captured.
+    has_sparse_iq2_moe = decoder_model is not None and any(
+        node.domain == "com.microsoft"
+        and node.op_type == "QMoE"
+        and (quant_type := node.attributes.get("quant_type")) is not None
+        and quant_type.as_string() == "iq2_xxs"
+        for node in decoder_model.graph.all_nodes()
+    )
+
     sliding_window = None
     window_size = getattr(config, "sliding_window", None)
     # ORT GenAI uses this block to allocate a compact present cache. A
@@ -1724,6 +1733,7 @@ def _write_genai_config(
         ),
         sliding_window=sliding_window,
         has_specialized_topology=not _is_single_model_decoder_package(pkg),
+        decoder_graph_capture=False if has_sparse_iq2_moe else None,
     )
     generator.with_special_tokens(
         **_special_token_ids_from_tokenizer_config(output_dir, config.vocab_size)

@@ -16,11 +16,14 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._component_quantization import _replace_child, _resolve_module
-from mobius._configs import NemotronHOmniConfig
+from mobius._configs import NemotronHConfig, NemotronHOmniConfig
+from mobius._flags import flags
 from mobius.components import (
+    FCMLP,
     Embedding,
     FlatInputMixer,
     GGMLIQ2XXSLinear,
+    GGMLIQ2XXSMoE,
     GGMLQ8Linear,
     Linear,
     NVFP4A16Linear,
@@ -33,6 +36,8 @@ from mobius.models._nemotron_h_omni_vision import (
     build_omni_video_features,
 )
 from mobius.models.nemotron_h import (
+    NemotronHMoEBlock,
+    NemotronHMoELayer,
     NemotronHPuzzleCausalLMModel,
     _rename_nemotron_h_weight,
 )
@@ -41,6 +46,47 @@ if TYPE_CHECKING:
     import torch
 
 BOLT_REVISION = "c6cc2e8ffa353403213d6b9b18aaf8eb684d705a"
+
+
+class _SparseIQ2MoEBlock(NemotronHMoEBlock):
+    """Keep the source router/shared/latent paths; never build dense routed experts."""
+
+    def __init__(self, original: NemotronHMoEBlock, config: NemotronHConfig):
+        nn.Module.__init__(self)
+        if config.hidden_act != "relu2" or config.mlp_bias:
+            raise ValueError("Sparse IQ2 MoE requires bias-free ReLU2 routed experts")
+        for expert in original.experts:
+            if not isinstance(expert, FCMLP):
+                raise TypeError("Sparse IQ2 MoE requires non-gated FCMLP experts")
+            for projection in (expert.up_proj, expert.down_proj):
+                if not isinstance(projection, GGMLIQ2XXSLinear):
+                    raise TypeError(
+                        "Sparse IQ2 MoE requires all routed expert projections to be IQ2_XXS"
+                    )
+        assert config.num_local_experts is not None
+        assert config.num_experts_per_tok is not None
+        assert config.moe_intermediate_size is not None
+        self.gate = original.gate
+        self.shared_experts = original.shared_experts
+        self._has_latent = original._has_latent
+        if self._has_latent:
+            self.fc1_latent_proj = original.fc1_latent_proj
+            self.fc2_latent_proj = original.fc2_latent_proj
+        self.packed_experts = GGMLIQ2XXSMoE(
+            config.moe_latent_size or config.hidden_size,
+            config.moe_intermediate_size,
+            config.num_local_experts,
+            config.num_experts_per_tok,
+        )
+
+    def _dispatch_experts(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        routing_weights: ir.Value,
+        selected_experts: ir.Value,
+    ) -> ir.Value:
+        return self.packed_experts(op, hidden_states, routing_weights, selected_experts)
 
 
 def _install_native_projections(decoder: nn.Module, config: NemotronHOmniConfig) -> None:
@@ -231,6 +277,13 @@ class NemotronHOmniModel(nn.Module):
         self.config = config
         self.decoder = self.decoder_class(config)
         _install_native_projections(self.decoder, config)
+        if flags.sparse_iq2_moe:
+            for index, kind in enumerate(config.layer_types or []):
+                if kind == "moe":
+                    layer = self.decoder.model.layers[index]
+                    if not isinstance(layer, NemotronHMoELayer):
+                        raise TypeError("Sparse IQ2 MoE requires a Nemotron-H MoE layer")
+                    layer.moe = _SparseIQ2MoEBlock(layer.moe, config.for_layer(index))
         self.embedding = _OmniEmbedding(config)
         self.vision_encoder = _OmniVisionEncoder(config)
 
