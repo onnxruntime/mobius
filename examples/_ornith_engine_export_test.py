@@ -23,8 +23,12 @@ from ornith_engine_export import (
     PackedOrnithTask,
     bind_component_weights,
     engine_config,
+    fuse_attention_output_gates,
+    fuse_block_rmsnorm,
     fuse_gated_rmsnorm,
+    fuse_gdn_inputs,
     fuse_int2_swiglu,
+    fuse_qk_norm_rotary,
     fuse_shared_expert_gates,
     pack_int2_projections,
 )
@@ -99,6 +103,253 @@ def test_gated_rmsnorm_rewrite(activation, reject):
         assert [v.name for v in node.inputs] == ["x", "gate", "scale"]
         assert [v.name for v in node.outputs] == ["y"]
         assert fuse_gated_rmsnorm(model) == 0
+
+
+@pytest.mark.parametrize(
+    "reject", [None, "axis", "shared", "width", "dtype", "epsilon", "stash"]
+)
+@pytest.mark.parametrize("residual", [False, True])
+def test_block_rmsnorm_rewrite(reject, residual):
+    from onnx import TensorProto, helper
+
+    width = 256 if reject == "width" else 3072
+    shape = [2, width]
+    nodes = []
+    inputs = [helper.make_tensor_value_info("x", TensorProto.FLOAT16, shape)]
+    if residual:
+        inputs.append(helper.make_tensor_value_info("skip", TensorProto.FLOAT16, shape))
+        nodes.append(helper.make_node("Add", ["x", "skip"], ["residual"]))
+    nodes.extend(
+        [
+            helper.make_node(
+                "Cast", ["residual" if residual else "x"], ["xf"], to=TensorProto.FLOAT
+            ),
+            helper.make_node(
+                "RMSNormalization",
+                ["xf", "scale"],
+                ["norm"],
+                axis=0 if reject == "axis" else -1,
+                epsilon=-1.0 if reject == "epsilon" else 1e-6,
+                stash_type=10 if reject == "stash" else 1,
+            ),
+            helper.make_node("Cast", ["norm"], ["y"], to=TensorProto.FLOAT16),
+        ]
+    )
+    if reject == "dtype":
+        inputs[0].type.tensor_type.elem_type = TensorProto.FLOAT
+        if residual:
+            inputs[1].type.tensor_type.elem_type = TensorProto.FLOAT
+    inputs.append(helper.make_tensor_value_info("scale", TensorProto.FLOAT, [width]))
+    outputs = [helper.make_tensor_value_info("y", TensorProto.FLOAT16, shape)]
+    if reject == "shared":
+        outputs.append(helper.make_tensor_value_info("xf", TensorProto.FLOAT, shape))
+    proto = helper.make_model(
+        helper.make_graph(
+            nodes,
+            "norm",
+            inputs,
+            outputs,
+            value_info=[
+                helper.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+                for name in ("xf", "norm")
+            ]
+            + (
+                [
+                    helper.make_tensor_value_info(
+                        "residual",
+                        TensorProto.FLOAT if reject == "dtype" else TensorProto.FLOAT16,
+                        shape,
+                    )
+                ]
+                if residual
+                else []
+            ),
+        ),
+        opset_imports=[helper.make_opsetid("", 23)],
+        ir_version=10,
+    )
+    model = ir.serde.deserialize_model(proto)
+    should_fuse = reject is None
+    assert fuse_block_rmsnorm(model) == int(should_fuse)
+    if should_fuse:
+        assert [n.op_type for n in model.graph] == (
+            ["Add", "RMSNormFp32"] if residual else ["RMSNormFp32"]
+        )
+        assert fuse_block_rmsnorm(model) == 0
+
+
+@pytest.mark.parametrize("reject", [None, "interleaved", "rotary_dim", "shared", "scale"])
+def test_qk_norm_rotary_rewrite(reject):
+    h, tp = onnx.helper, onnx.TensorProto
+    shape = [2, 32, 256]
+    nodes = [
+        h.make_node("Cast", ["x"], ["xf"], to=tp.FLOAT),
+        h.make_node("RMSNormalization", ["xf", "scale"], ["norm"], axis=-1, epsilon=1e-6),
+        h.make_node("Cast", ["norm"], ["half"], to=tp.FLOAT16),
+        h.make_node("Reshape", ["half", "shape"], ["packed"]),
+        h.make_node(
+            "RotaryEmbedding",
+            ["packed", "cos", "sin"],
+            ["y"],
+            num_heads=32,
+            rotary_embedding_dim=32 if reject == "rotary_dim" else 64,
+            interleaved=int(reject == "interleaved"),
+        ),
+    ]
+    outputs = [h.make_tensor_value_info("y", tp.FLOAT16, [1, 2, 8192])]
+    if reject == "shared":
+        outputs.append(h.make_tensor_value_info("norm", tp.FLOAT, shape))
+    proto = h.make_model(
+        h.make_graph(
+            nodes,
+            "qk",
+            [
+                h.make_tensor_value_info("x", tp.FLOAT16, shape),
+                h.make_tensor_value_info(
+                    "scale", tp.FLOAT16 if reject == "scale" else tp.FLOAT, [256]
+                ),
+                h.make_tensor_value_info("cos", tp.FLOAT16, [1, 2, 32]),
+                h.make_tensor_value_info("sin", tp.FLOAT16, [1, 2, 32]),
+            ],
+            outputs,
+            initializer=[
+                onnx.numpy_helper.from_array(np.array([1, 2, 8192], np.int64), "shape")
+            ],
+            value_info=[
+                h.make_tensor_value_info("xf", tp.FLOAT, shape),
+                h.make_tensor_value_info("norm", tp.FLOAT, shape),
+                h.make_tensor_value_info("half", tp.FLOAT16, shape),
+                h.make_tensor_value_info("packed", tp.FLOAT16, [1, 2, 8192]),
+            ],
+        ),
+        opset_imports=[h.make_opsetid("", 23)],
+        ir_version=10,
+    )
+    model = ir.serde.deserialize_model(proto)
+    assert fuse_qk_norm_rotary(model) == int(reject is None)
+    if reject is None:
+        assert [n.op_type for n in model.graph] == ["RMSNormRotaryFp32"]
+        assert fuse_qk_norm_rotary(model) == 0
+
+
+@pytest.mark.parametrize("reject", [None, "shared", "broadcast", "dtype"])
+def test_attention_output_gate_rewrite(reject):
+    h, tp = onnx.helper, onnx.TensorProto
+    dtype = tp.FLOAT if reject == "dtype" else tp.FLOAT16
+    shape = [2, 8192]
+    gate_shape = [1, 8192] if reject == "broadcast" else shape
+    outputs = [h.make_tensor_value_info("y", dtype, shape)]
+    if reject == "shared":
+        outputs.append(h.make_tensor_value_info("sigmoid", dtype, gate_shape))
+    proto = h.make_model(
+        h.make_graph(
+            [
+                h.make_node("PagedAttention", ["x"], ["attention"], domain="com.microsoft"),
+                h.make_node("Sigmoid", ["gate"], ["sigmoid"]),
+                h.make_node("Mul", ["attention", "sigmoid"], ["y"]),
+            ],
+            "gate",
+            [
+                h.make_tensor_value_info("x", dtype, shape),
+                h.make_tensor_value_info("gate", dtype, gate_shape),
+            ],
+            outputs,
+            value_info=[
+                h.make_tensor_value_info("attention", dtype, shape),
+                h.make_tensor_value_info("sigmoid", dtype, gate_shape),
+            ],
+        ),
+        opset_imports=[h.make_opsetid("", 23), h.make_opsetid("com.microsoft", 1)],
+        ir_version=10,
+    )
+    model = ir.serde.deserialize_model(proto)
+    assert fuse_attention_output_gates(model) == int(reject is None)
+    if reject is None:
+        assert [n.op_type for n in model.graph] == ["PagedAttention", "SigmoidMul"]
+        assert fuse_attention_output_gates(model) == 0
+
+
+@pytest.mark.parametrize("reject", [None, "sizes", "shared", "gate_dtype", "state_shape"])
+def test_gdn_packed_inputs_rewrite(reject):
+    h, tp = onnx.helper, onnx.TensorProto
+    nodes = [h.make_node("Split", ["packed", "sizes"], ["qs", "ks", "vs"], axis=-1)]
+    inputs = [
+        h.make_tensor_value_info("packed", tp.FLOAT16, [2, 12288]),
+        h.make_tensor_value_info(
+            "decay", tp.FLOAT if reject == "gate_dtype" else tp.FLOAT16, [2, 64]
+        ),
+        h.make_tensor_value_info("beta", tp.FLOAT16, [2, 64]),
+        h.make_tensor_value_info(
+            "state", tp.FLOAT16, [1, 32 if reject == "state_shape" else 64, 128, 128]
+        ),
+    ]
+    metadata = []
+    for n, heads, width in (("q", 16, 2048), ("k", 16, 2048), ("v", 64, 8192)):
+        nodes.append(h.make_node("Reshape", [n + "s", n + "_shape"], [n]))
+        metadata.extend(
+            [
+                h.make_tensor_value_info(n + "s", tp.FLOAT16, [2, width]),
+                h.make_tensor_value_info(n, tp.FLOAT16, [2, heads, 128]),
+            ]
+        )
+    nodes.extend(
+        [
+            h.make_node("Cast", ["decay"], ["df"], to=tp.FLOAT),
+            h.make_node("Cast", ["beta"], ["bf"], to=tp.FLOAT),
+            h.make_node(
+                "GatedDeltaNet",
+                ["q", "k", "v", "", "df", "bf", "state", "", "", "", ""],
+                ["y", "final", "capsule"],
+                domain="com.microsoft",
+            ),
+        ]
+    )
+    outputs = [
+        h.make_tensor_value_info("y", tp.FLOAT16, [2, 64, 128]),
+        h.make_tensor_value_info("final", tp.FLOAT16, [1, 64, 128, 128]),
+        h.make_tensor_value_info("capsule", tp.FLOAT, [1, 0]),
+    ]
+    if reject == "shared":
+        outputs.append(h.make_tensor_value_info("q", tp.FLOAT16, [2, 16, 128]))
+    metadata.extend(h.make_tensor_value_info(n, tp.FLOAT, [2, 64]) for n in ("df", "bf"))
+    initializers = [
+        onnx.numpy_helper.from_array(
+            np.array(
+                [2048, 8192, 2048] if reject == "sizes" else [2048, 2048, 8192], np.int64
+            ),
+            "sizes",
+        ),
+    ] + [
+        onnx.numpy_helper.from_array(np.array([-1, heads, 128], np.int64), n + "_shape")
+        for n, heads in (("q", 16), ("k", 16), ("v", 64))
+    ]
+    proto = h.make_model(
+        h.make_graph(
+            nodes,
+            "packed",
+            inputs,
+            outputs,
+            initializer=initializers,
+            value_info=metadata,
+        ),
+        opset_imports=[h.make_opsetid("", 23), h.make_opsetid("com.microsoft", 1)],
+        ir_version=10,
+    )
+    model = ir.serde.deserialize_model(proto)
+    assert fuse_gdn_inputs(model) == int(reject is None)
+    if reject is None:
+        node = next(iter(model.graph))
+        assert node.op_type == "GatedDeltaNet"
+        assert [v.name if v is not None else None for v in node.inputs[:7]] == [
+            "packed",
+            None,
+            None,
+            None,
+            "decay",
+            "beta",
+            "state",
+        ]
+        assert fuse_gdn_inputs(model) == 0
 
 
 def _config(**kwargs):

@@ -921,6 +921,87 @@ staged, saved and wheel binaries are hash-verified; `engine-gated-rms-summary.js
 records the benchmark, test, trace and package provenance. The previous runtime
 is retained for rollback.
 
+### Ornith remaining exact graph fusions
+
+The following additional Engine export flags can be combined with
+`--fuse-gated-rmsnorm`. Each is opt-in and requires the matching ORT branch:
+
+| Flag | Target chains | Implementation |
+| --- | ---: | --- |
+| `--fuse-block-rmsnorm` | 97 | `RMSNormFp32`: FP16 storage, FP32 RMSNorm/scale arithmetic, one final FP16 conversion |
+| `--fuse-gdn-inputs` | 36 | Pass packed convolution QKV and FP16 decay/beta directly to GatedDeltaNet |
+| `--fuse-qk-norm-rotary` | 24 | `RMSNormRotaryFp32`: FP32 norm, FP16 norm output rounding, then partial FP16 rotary |
+| `--fuse-attention-output-gates` | 12 | `SigmoidMul`: sigmoid rounded to FP16 before the FP16 multiply |
+
+Block and Q/K norm fusions reuse the core CUDA RMSNormalization reduction and
+launch heuristic rather than substituting a different reduction. Block norm
+is deliberately limited to `[tokens,3072]`; Q/K norm+rotary accepts
+`[tokens,2|32,256]`, FP32 scale `[256]`, pre-gathered FP16 cos/sin
+`[1,tokens,32]`, and noninterleaved rotary dimension 64.
+
+Packed GDN input executes directly from the token-major Q/K/V layout with
+explicit input row strides. It avoids the old internal unpack copies as well
+as exported Split/Reshape and gate Cast nodes. Decay/beta can now be FP16 or
+FP32; activation, normalization, recurrent arithmetic, FP16 state rounding,
+capture factors and rollback semantics are unchanged. All recurrent,
+chunked and chunked-split input paths use the same strided loads.
+
+The attention gate fusion combines sigmoid/multiply in one epilogue kernel;
+it does not fuse the gate into attention softmax or value accumulation, and
+does not change any attention backend or FP8 cache setting. Residual Add
+nodes are intentionally retained. No residual-add/RMSNorm fusion is enabled
+by these flags.
+
+Rewrites require compatible types, shapes, attributes and exclusive
+intermediate users, preserve external initializer bytes, and are idempotent.
+The export manifest records `block_rmsnorms_fused`, `gdn_inputs_fused`,
+`qk_norm_rotary_fused` and `attention_output_gates_fused`. Combining all four
+with the previously accepted gated-RMS graph removes another 518 graph
+nodes, from 2145 to 1627, without changing the model ABI or weight precision.
+
+The combined graph passes 116 CUDA component tests (one empty-graph capture
+case is skipped), 136 exporter/ABI tests, and all four-context target-only
+and MTP greedy checks. All twelve timed 512-output-token sequences and MTP
+counters exactly match both the approved gated-RMS model and the fresh
+same-runtime control. The component suite includes FP16 state, capture factors,
+recurrent/chunked/chunked-split paths, graph replay, finite extremes and strict
+rewrite rejection cases.
+
+However, fewer nodes did **not** establish a general decode speedup. A final
+reverse-order control, with no concurrent GPU tests, gives:
+
+| Context | Approved graph on new runtime (tokens/s) | Combined graph (tokens/s) | Change | Combined sampled peak (GiB) |
+| --- | ---: | ---: | ---: | ---: |
+| 2K | 174.470 | 174.883 | +0.24% | 43.265 |
+| 8K | 140.380 | 139.124 | -0.90% | 43.265 |
+| 16K | 117.049 | 116.157 | -0.76% | 43.265 |
+| 32K | 69.121 | 70.187 | +1.54% | 43.265 |
+
+These are three timed turns after one warmup, with width-one FP8 MTP,
+CUDA graphs, packed-only INT2 experts and direct initializer allocations.
+TTFT improves about 1.2-1.5%. Memory is sampled every 10 ms in separate
+processes through loading, warmup and generation; it includes CUDA context
+allocations and is not an exact allocator peak. Shared-host timing drift is
+visible relative to historical tables, so only the fresh matched controls
+support the comparisons above.
+
+Parity-checked 2K node-level CUDA traces confirm that steady-decode launches
+fall from 129827 to 98947 (-30880), and summed GPU kernel time falls from
+759.89 to 734.81 ms. However, summed normalization-kernel time rises from
+45.39 to 57.24 ms, offsetting part of the cast/elementwise savings. These
+trace sums are not wall-time or hardware-counter measurements, and fewer
+launches alone do not establish end-to-end throughput gains. Separate
+component microtimings were rejected because host submission gaps or stream
+capture limitations made them unsuitable for performance claims.
+
+**The combined graph/runtime is experimental and is not promoted as the
+recommended deployment.** The previously accepted gated-RMS decoder/runtime
+remain the recommendation. `decoder/model-fused-all-exact.onnx` and a
+separately saved matching wheel preserve the experiment for further tuning;
+older runtimes cannot load the new contrib operators. Default Engine config
+is unchanged. `engine-all-fusions-summary.json` records exact parity,
+benchmarks, memory, package identity and the non-promotion decision.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent

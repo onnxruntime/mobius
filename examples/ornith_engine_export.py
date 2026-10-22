@@ -256,6 +256,340 @@ def fuse_shared_expert_gates(model):
     return fused
 
 
+def fuse_gdn_inputs(model):
+    """Feed packed QKV and FP16 gates directly to the existing recurrent kernels."""
+    graph = model.graph
+
+    def exclusive(value):
+        return value not in graph.outputs and len(tuple(value.uses())) == 1
+
+    fused = 0
+    for gdn in list(graph):
+        if (
+            gdn.domain != "com.microsoft"
+            or gdn.op_type != "GatedDeltaNet"
+            or len(gdn.inputs) != 11
+        ):
+            continue
+        if any(v is None for v in gdn.inputs[:3]) or gdn.inputs[6] is None:
+            continue
+        reshapes = [v.producer() for v in gdn.inputs[:3]]
+        if any(
+            n is None
+            or n.domain != ""
+            or n.op_type != "Reshape"
+            or n.attributes
+            or not exclusive(n.outputs[0])
+            for n in reshapes
+        ):
+            continue
+        split = reshapes[0].inputs[0].producer()
+        if (
+            split is None
+            or split.domain != ""
+            or split.op_type != "Split"
+            or len(split.inputs) != 2
+            or len(split.outputs) != 3
+            or set(split.attributes) != {"axis"}
+            or split.attributes["axis"].as_int() != -1
+            or any(
+                n.inputs[0] is not v or not exclusive(v)
+                for n, v in zip(reshapes, split.outputs, strict=True)
+            )
+        ):
+            continue
+        packed, sizes = split.inputs
+        if (
+            packed is None
+            or packed.dtype != ir.DataType.FLOAT16
+            or packed.shape is None
+            or packed.shape.rank() != 2
+            or packed.shape[1] != 12288
+            or sizes is None
+            or sizes.const_value is None
+            or sizes.dtype != ir.DataType.INT64
+            or tuple(sizes.const_value.numpy()) != (2048, 2048, 8192)
+            or any(
+                v.shape != ir.Shape([packed.shape[0], heads, 128])
+                for v, heads in zip(gdn.inputs[:3], (16, 16, 64), strict=True)
+            )
+            or gdn.inputs[6].shape is None
+            or gdn.inputs[6].shape.rank() != 4
+            or list(gdn.inputs[6].shape)[1:] != [64, 128, 128]
+        ):
+            continue
+        casts = [v.producer() if v is not None else None for v in gdn.inputs[4:6]]
+        if any(
+            n is None
+            or n.domain != ""
+            or n.op_type != "Cast"
+            or set(n.attributes) != {"to"}
+            or n.attributes["to"].as_int() != int(ir.DataType.FLOAT)
+            or n.inputs[0].dtype != ir.DataType.FLOAT16
+            or n.inputs[0].shape != ir.Shape([packed.shape[0], 64])
+            or not exclusive(n.outputs[0])
+            for n in casts
+        ):
+            continue
+        outputs = [ir.Value(name=v.name, shape=v.shape, type=v.type) for v in gdn.outputs]
+        inputs = list(gdn.inputs)
+        inputs[:3] = [packed, None, None]
+        inputs[4:6] = [n.inputs[0] for n in casts]
+        node = ir.Node(
+            gdn.domain, gdn.op_type, inputs, list(gdn.attributes.values()), outputs=outputs
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph, gdn, [split, *reshapes, *casts, gdn], [node], list(gdn.outputs), outputs
+        )
+        fused += 1
+    if fused:
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return fused
+
+
+def fuse_qk_norm_rotary(model):
+    """Fuse exact FP32 Q/K RMSNorm and the deployed partial rotary contract."""
+    graph = model.graph
+
+    def previous(value, op_type):
+        node = value.producer()
+        return (
+            node
+            if (
+                node is not None
+                and node.domain == ""
+                and node.op_type == op_type
+                and value not in graph.outputs
+                and len(tuple(value.uses())) == 1
+            )
+            else None
+        )
+
+    fused = 0
+    for rotary in list(graph):
+        if (
+            rotary.domain != ""
+            or rotary.op_type != "RotaryEmbedding"
+            or len(rotary.inputs) != 3
+            or set(rotary.attributes) != {"num_heads", "rotary_embedding_dim", "interleaved"}
+            or rotary.attributes["num_heads"].as_int() not in (2, 32)
+            or rotary.attributes["rotary_embedding_dim"].as_int() != 64
+            or rotary.attributes["interleaved"].as_int() != 0
+        ):
+            continue
+        reshape = previous(rotary.inputs[0], "Reshape")
+        if reshape is None or reshape.attributes:
+            continue
+        final = previous(reshape.inputs[0], "Cast")
+        if (
+            final is None
+            or set(final.attributes) != {"to"}
+            or final.attributes["to"].as_int() != int(ir.DataType.FLOAT16)
+        ):
+            continue
+        norm = previous(final.inputs[0], "RMSNormalization")
+        if (
+            norm is None
+            or len(norm.inputs) != 2
+            or set(norm.attributes) - {"axis", "epsilon", "stash_type"}
+            or ("axis" in norm.attributes and norm.attributes["axis"].as_int() != -1)
+            or (
+                "stash_type" in norm.attributes and norm.attributes["stash_type"].as_int() != 1
+            )
+        ):
+            continue
+        cast = previous(norm.inputs[0], "Cast")
+        if (
+            cast is None
+            or set(cast.attributes) != {"to"}
+            or cast.attributes["to"].as_int() != int(ir.DataType.FLOAT)
+        ):
+            continue
+        x, scale = cast.inputs[0], norm.inputs[1]
+        heads = rotary.attributes["num_heads"].as_int()
+        epsilon = (
+            norm.attributes["epsilon"].as_float() if "epsilon" in norm.attributes else 1e-5
+        )
+        if (
+            not math.isfinite(epsilon)
+            or epsilon < 0
+            or x.dtype != ir.DataType.FLOAT16
+            or x.shape is None
+            or x.shape.rank() != 3
+            or list(x.shape)[1:] != [heads, 256]
+            or scale.dtype != ir.DataType.FLOAT
+            or scale.shape != ir.Shape([256])
+            or any(
+                v.dtype != ir.DataType.FLOAT or v.shape != x.shape
+                for v in (cast.outputs[0], norm.outputs[0])
+            )
+            or final.outputs[0].shape != x.shape
+            or rotary.inputs[0].shape != ir.Shape([1, x.shape[0], heads * 256])
+            or rotary.outputs[0].shape != rotary.inputs[0].shape
+            or any(
+                v.dtype != ir.DataType.FLOAT16 or v.shape != ir.Shape([1, x.shape[0], 32])
+                for v in rotary.inputs[1:]
+            )
+        ):
+            continue
+        output = ir.Value(
+            name=rotary.outputs[0].name,
+            shape=rotary.outputs[0].shape,
+            type=rotary.outputs[0].type,
+        )
+        node = ir.Node(
+            "com.microsoft",
+            "RMSNormRotaryFp32",
+            [x, scale, *rotary.inputs[1:]],
+            [ir.AttrFloat32("epsilon", epsilon)],
+            outputs=[output],
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph,
+            rotary,
+            [cast, norm, final, reshape, rotary],
+            [node],
+            [rotary.outputs[0]],
+            [output],
+        )
+        fused += 1
+    if fused:
+        graph.opset_imports.setdefault("com.microsoft", 1)
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return fused
+
+
+def fuse_attention_output_gates(model):
+    """Fuse FP16 sigmoid/multiply, retaining sigmoid's FP16 rounding."""
+    graph = model.graph
+    fused = 0
+    for attention in list(graph):
+        if attention.domain != "com.microsoft" or attention.op_type != "PagedAttention":
+            continue
+        value = attention.outputs[0]
+        uses = tuple(value.uses())
+        if value in graph.outputs or len(uses) != 1:
+            continue
+        mul = uses[0].node
+        if mul.domain != "" or mul.op_type != "Mul" or mul.attributes:
+            continue
+        other = next((v for v in mul.inputs if v is not value), None)
+        sigmoid = other.producer() if other is not None else None
+        if (
+            sigmoid is None
+            or sigmoid.domain != ""
+            or sigmoid.op_type != "Sigmoid"
+            or sigmoid.attributes
+            or other in graph.outputs
+            or len(tuple(other.uses())) != 1
+            or value.shape is None
+            or value.shape.rank() != 2
+            or value.shape[1] != 8192
+            or any(
+                v.dtype != ir.DataType.FLOAT16 or v.shape != value.shape
+                for v in (value, sigmoid.inputs[0], other, mul.outputs[0])
+            )
+        ):
+            continue
+        output = ir.Value(
+            name=mul.outputs[0].name, shape=mul.outputs[0].shape, type=mul.outputs[0].type
+        )
+        node = ir.Node(
+            "com.microsoft", "SigmoidMul", [value, sigmoid.inputs[0]], outputs=[output]
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph, mul, [sigmoid, mul], [node], [mul.outputs[0]], [output]
+        )
+        fused += 1
+    if fused:
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return fused
+
+
+def fuse_block_rmsnorm(model):
+    """Remove casts around width-3072 FP32 block norms without fusing residuals."""
+    graph = model.graph
+    fused = 0
+    for norm in list(graph):
+        if (
+            norm.domain != ""
+            or norm.op_type != "RMSNormalization"
+            or len(norm.inputs) != 2
+            or len(norm.outputs) != 1
+            or set(norm.attributes) - {"axis", "epsilon", "stash_type"}
+            or ("axis" in norm.attributes and norm.attributes["axis"].as_int() != -1)
+            or (
+                "stash_type" in norm.attributes and norm.attributes["stash_type"].as_int() != 1
+            )
+        ):
+            continue
+        epsilon = (
+            norm.attributes["epsilon"].as_float() if "epsilon" in norm.attributes else 1e-5
+        )
+        if not math.isfinite(epsilon) or epsilon < 0:
+            continue
+        x_float, scale = norm.inputs
+        if x_float is None or scale is None:
+            continue
+        cast = x_float.producer()
+        uses = tuple(norm.outputs[0].uses())
+        if (
+            cast is None
+            or cast.domain != ""
+            or cast.op_type != "Cast"
+            or len(cast.inputs) != 1
+            or set(cast.attributes) != {"to"}
+            or cast.attributes["to"].as_int() != int(ir.DataType.FLOAT)
+            or x_float in graph.outputs
+            or len(tuple(x_float.uses())) != 1
+            or norm.outputs[0] in graph.outputs
+            or len(uses) != 1
+        ):
+            continue
+        final = uses[0].node
+        x = cast.inputs[0]
+        if (
+            final.domain != ""
+            or final.op_type != "Cast"
+            or set(final.attributes) != {"to"}
+            or final.attributes["to"].as_int() != int(ir.DataType.FLOAT16)
+            or x is None
+            or x.dtype != ir.DataType.FLOAT16
+            or x.shape is None
+            or x.shape.rank() != 2
+            or x.shape[1] != 3072
+            or scale.dtype != ir.DataType.FLOAT
+            or scale.shape != ir.Shape([3072])
+            or any(
+                v.dtype != ir.DataType.FLOAT or v.shape != x.shape
+                for v in (x_float, norm.outputs[0])
+            )
+            or final.outputs[0].dtype != ir.DataType.FLOAT16
+            or final.outputs[0].shape != x.shape
+        ):
+            continue
+        output = ir.Value(
+            name=final.outputs[0].name,
+            shape=final.outputs[0].shape,
+            type=final.outputs[0].type,
+        )
+        node = ir.Node(
+            "com.microsoft",
+            "RMSNormFp32",
+            [x, scale],
+            [ir.AttrFloat32("epsilon", epsilon)],
+            outputs=[output],
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph, final, [cast, norm, final], [node], [final.outputs[0]], [output]
+        )
+        fused += 1
+    if fused:
+        graph.opset_imports.setdefault("com.microsoft", 1)
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return fused
+
+
 def fuse_gated_rmsnorm(model):
     """Fuse width-128 FP32 gated norms without changing reduction or rounding order."""
     graph = model.graph
@@ -1096,6 +1430,26 @@ def main():
         help="Fuse FP16 shared gate MatMul, sigmoid, expert sum and residual",
     )
     parser.add_argument(
+        "--fuse-gdn-inputs",
+        action="store_true",
+        help="Consume packed GDN QKV and FP16 decay/beta gates without split/cast kernels",
+    )
+    parser.add_argument(
+        "--fuse-qk-norm-rotary",
+        action="store_true",
+        help="Fuse FP32 Q/K RMSNorm and partial FP16 rotary with exact rounding",
+    )
+    parser.add_argument(
+        "--fuse-attention-output-gates",
+        action="store_true",
+        help="Fuse FP16 attention sigmoid/multiply while retaining sigmoid rounding",
+    )
+    parser.add_argument(
+        "--fuse-block-rmsnorm",
+        action="store_true",
+        help="Fuse width-3072 block RMSNorm/cast chains with exact FP32 arithmetic",
+    )
+    parser.add_argument(
         "--fuse-gated-rmsnorm",
         action="store_true",
         help="Fuse width-128 FP32 gated RMS norms into an exact-order FP16 CUDA operator",
@@ -1148,6 +1502,18 @@ def main():
             else 0
         )
         fused_norms = fuse_gated_rmsnorm(package["decoder"]) if args.fuse_gated_rmsnorm else 0
+        fused_block_norms = (
+            fuse_block_rmsnorm(package["decoder"]) if args.fuse_block_rmsnorm else 0
+        )
+        fused_gdn_inputs = fuse_gdn_inputs(package["decoder"]) if args.fuse_gdn_inputs else 0
+        fused_qk_rotary = (
+            fuse_qk_norm_rotary(package["decoder"]) if args.fuse_qk_norm_rotary else 0
+        )
+        fused_attention_gates = (
+            fuse_attention_output_gates(package["decoder"])
+            if args.fuse_attention_output_gates
+            else 0
+        )
         fused_routers = (
             fuse_moe_routers(package["decoder"], use_matmul=args.moe_router_use_matmul)
             if args.fuse_moe_routers
@@ -1198,6 +1564,10 @@ def main():
                 "shared_expert_gates_fused": fused_gates,
                 "shared_expert_swiglu_fused": fused_swiglu,
                 "gated_rmsnorms_fused": fused_norms,
+                "block_rmsnorms_fused": fused_block_norms,
+                "gdn_inputs_fused": fused_gdn_inputs,
+                "qk_norm_rotary_fused": fused_qk_rotary,
+                "attention_output_gates_fused": fused_attention_gates,
                 "moe_routers_fused": fused_routers,
                 "moe_router_use_matmul": args.moe_router_use_matmul,
                 "recurrent_state_dtype": "float16" if args.recurrent_state_fp16 else "float32",
