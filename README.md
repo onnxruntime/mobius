@@ -656,6 +656,56 @@ overhead; these are summed GPU durations, not normal Engine wall latency.
 The parity-gated 32K sampled device-memory peak is **43.194 GiB**, essentially
 unchanged. The exact tested runtime is packaged in the matching CUDA wheel.
 
+### Ornith portable paged-attention reduction scheduling
+
+A refreshed 32K Nsight Systems capture on the shared-expert projection/SwiGLU
+decoder attributes **59.88%** of summed steady-decode GPU kernel time to portable
+paged attention. This is a kernel-duration share, not measured memory bandwidth
+or an unprofiled wall-time fraction.
+
+The CUDA paged-decode kernel now performs each tile's softmax maximum and sum
+with three block barriers instead of ten. The first warp combines shared
+values using the original 128/64/32 pairing, then finishes the 16/8/4/2/1
+stages with shuffle operations. Unlike a differently ordered warp reduction,
+this retains the original FP32 addition tree. It removes fourteen block
+barriers per nonempty KV tile without changing QK/PV arithmetic, cache format,
+split count, model graph, precision, or Engine scheduling. No new flag is
+required; the benchmark still uses fixed split count 32 and one-draft FP8 MTP.
+
+Regression coverage includes partial/full tiles, long-context speculative
+queries, per-tensor/per-channel FP8 scales, sliding windows, softcap, head
+sinks, query-shape invariance, and existing FP16/INT8/INT4 decode behavior.
+An earlier four-value FP8 cache-load scheduling experiment preserved bits but
+generally regressed component timings and was discarded.
+
+Matched H200 native Engine measurements, with one warmup and three timed
+512-token turns per context, measured:
+
+| Context | Control (tokens/s) | Ordered reduction (tokens/s) | Change |
+| --- | ---: | ---: | ---: |
+| 2K | 167.950 | 168.455 | +0.30% |
+| 8K | 133.496 | 135.000 | +1.13% |
+| 16K | 111.522 | 113.467 | +1.74% |
+| 32K | 66.016 | 67.590 | +2.38% |
+
+All twelve timed outputs and MTP counters match the control and prior fused
+decoder exactly, with zero MTP failures. A candidate run before the control
+also measured 67.557 tokens/s at 32K, versus 67.590 in the final candidate
+run after the control. Sixteen synthetic FP8 component cases (1/2/4/8 query
+rows at 2K/8K/16K/32K past lengths) are bitwise equal to the original kernel.
+Component timings use warm-cache ORT CUDA graphs, not a cold-cache bandwidth
+measurement.
+
+The matched 32K profiles retain **173,121** kernel launches in the synchronized
+steady-decode window. Summed attention-kernel time falls from **1188.09 to
+1139.66 ms** (4.08%); total summed kernel time falls from **1984.17 to
+1935.91 ms** (2.43%). Complete warmup/profiled outputs and MTP counters are
+unchanged. Node-level tracing adds overhead; these sums are not ordinary
+Engine wall latency. The sampled 32K memory peak is **43.196 GiB**, essentially
+unchanged from 43.194 GiB. The exact tested runtime is packaged in the matching
+CUDA wheel. Attention remains the largest measured long-context bottleneck;
+the 200 tokens/s goal and source-model accuracy evaluation remain outstanding.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
