@@ -1058,7 +1058,7 @@ context, CUDA graphs, same accepted runtime) produced:
 | 2K | 184.13 | 50.01 |
 | 8K | 145.05 | 37.04 |
 | 16K | 120.11 | 27.44 |
-| 32K | 70.51 | 19.60 |
+| 32K | 70.51 | 19.61 |
 
 All twelve measured outputs match the target-only references, with zero draft
 failures or disables, but only 3.73%/3.33%/2.75%/9.80% of evaluated proposals
