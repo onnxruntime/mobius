@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -24,6 +25,16 @@ def make_prompt(unit, context):
     if not unit or context <= 0:
         raise ValueError("Require nonempty prompt tokens and a positive context length")
     return np.asarray((unit * ((context + len(unit) - 1) // len(unit)))[:context], np.int32)
+
+
+def merge_overlay(base, changes):
+    result = copy.deepcopy(base)
+    for key, value in changes.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_overlay(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
 
 
 def run_turn(engine, prompt, output_tokens, *, require_mtp=True):
@@ -72,6 +83,8 @@ def run_turn(engine, prompt, output_tokens, *, require_mtp=True):
                 "draft_tokens_evaluated",
                 "draft_tokens_accepted",
                 "mtp_failures",
+                "dflash2_failures",
+                "dflash2_disables",
                 "draft_forward_passes",
                 "target_forward_passes",
                 "zero_accept_rounds",
@@ -82,9 +95,11 @@ def run_turn(engine, prompt, output_tokens, *, require_mtp=True):
         if require_mtp and (
             counters["draft_tokens_proposed"] <= 0 or counters["draft_tokens_evaluated"] <= 0
         ):
-            raise RuntimeError(f"MTP did not execute: {counters}")
-        if counters["mtp_failures"]:
-            raise RuntimeError(f"MTP reported failures: {counters}")
+            raise RuntimeError(f"Speculative drafting did not execute: {counters}")
+        if any(
+            counters[name] for name in ("mtp_failures", "dflash2_failures", "dflash2_disables")
+        ):
+            raise RuntimeError(f"Speculative drafting reported failures: {counters}")
         return {
             "context_tokens": len(prompt),
             "generated_tokens": len(tokens),
@@ -107,7 +122,7 @@ def greedy_parity(engine, reference_engine, prompt, output_tokens=64):
 
 def compare_greedy_outputs(speculative, reference):
     if reference["speculative"]["draft_tokens_proposed"]:
-        raise RuntimeError("Parity reference unexpectedly enabled MTP")
+        raise RuntimeError("Parity reference unexpectedly enabled speculative drafting")
     mismatch = next(
         (
             index
@@ -156,8 +171,11 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument(
-        "--draft-tokens", type=int, help="Override the fixed MTP proposal width"
+        "--config-overlay",
+        type=Path,
+        help="Opt-in experiment config overlay; requires --report-only",
     )
+    parser.add_argument("--draft-tokens", type=int, help="Override the fixed proposal width")
     parser.add_argument(
         "--decoder-file",
         type=Path,
@@ -178,6 +196,11 @@ def main():
     )
     args = parser.parse_args()
     disk_config = json.loads((args.model / "genai_config.json").read_text())
+    experiment = json.loads(args.config_overlay.read_text()) if args.config_overlay else {}
+    if args.config_overlay and not args.report_only:
+        parser.error("--config-overlay requires --report-only")
+    if not isinstance(experiment, dict):
+        parser.error("--config-overlay must contain a JSON object")
     if args.draft_tokens is not None and not (
         0 < args.draft_tokens < disk_config["model"]["decoder"]["state_update_capacity"]
     ):
@@ -211,18 +234,25 @@ def main():
         ] = "1"
     if args.decoder_file is not None:
         decoder_overlay["filename"] = str(args.decoder_file)
-    config_overlay = {"model": {"decoder": decoder_overlay}} if decoder_overlay else {}
+    config_overlay = merge_overlay(
+        experiment, {"model": {"decoder": decoder_overlay}} if decoder_overlay else {}
+    )
     if args.draft_tokens is not None:
-        config_overlay["speculative"] = {"max_draft_tokens": args.draft_tokens}
+        config_overlay.setdefault("speculative", {})["max_draft_tokens"] = args.draft_tokens
     if config_overlay:
         config.overlay(json.dumps(config_overlay))
-    decoder_path = args.model / (
-        args.decoder_file or disk_config["model"]["decoder"]["filename"]
-    )
+    effective = merge_overlay(disk_config, config_overlay)
+    decoder_path = args.model / effective["model"]["decoder"]["filename"]
+    if (
+        not decoder_path.resolve().is_relative_to(args.model.resolve())
+        or not decoder_path.is_file()
+    ):
+        parser.error("Effective decoder must identify a graph inside the model directory")
+    dflash2_enabled = bool(effective["model"].get("dflash2", {}).get("filename"))
     reference_config = og.Config(str(args.model))
     if config_overlay:
         reference_config.overlay(json.dumps(config_overlay))
-    reference_config.overlay('{"model":{"mtp":{"enabled":false}}}')
+    reference_config.overlay('{"model":{"mtp":{"enabled":false},"dflash2":{"filename":""}}}')
     reference_model = og.Model(reference_config)
     reference_engine = og.Engine(reference_model)
     tokenizer = og.Tokenizer(reference_model)
@@ -256,7 +286,8 @@ def main():
         "batch_size": 1,
         "parity_reference_lifecycle": "sequential",
         "greedy": True,
-        "mtp_enabled": True,
+        "mtp_enabled": bool(effective["model"].get("mtp", {}).get("enabled")),
+        "dflash2_enabled": dflash2_enabled,
         "warmup_runs_per_context": args.warmup,
         "measured_runs_per_context": args.runs,
         "accuracy_test": False,
@@ -269,7 +300,7 @@ def main():
         "status": "in_progress",
     }
     save_report(args.model, args.report, report, update_manifest=not args.report_only)
-    print("Checking real-weight MTP versus target-only greedy parity", flush=True)
+    print("Checking speculative versus target-only greedy output", flush=True)
     report["parity"] = {"status": "in_progress", "cases": []}
     parity_cases = [
         (
@@ -299,7 +330,7 @@ def main():
             )
             save_report(args.model, args.report, report, update_manifest=not args.report_only)
             raise RuntimeError(
-                "MTP and target-only greedy decoding differ at output index "
+                "Speculative and target-only greedy decoding differ at output index "
                 f"{result['first_mismatch_index']} with {len(prompt)} input tokens; "
                 f"see {args.report}. Benchmarking is blocked until correctness is established."
             )

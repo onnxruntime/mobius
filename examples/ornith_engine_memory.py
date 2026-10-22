@@ -15,7 +15,7 @@ from pathlib import Path
 
 import onnxruntime_genai as og
 import torch
-from ornith_engine_benchmark import make_prompt, run_turn
+from ornith_engine_benchmark import make_prompt, merge_overlay, run_turn
 
 
 def require_reference_output(result, expected, index):
@@ -71,6 +71,7 @@ def main():
     speculative = reference.get("config_overlay", {}).get("speculative")
     if speculative is not None:
         overlay["speculative"] = speculative
+    overlay = merge_overlay(reference.get("config_overlay", {}), overlay)
     torch.cuda.init()
     stage, peaks, snapshots = "initial", {}, {}
     lock = threading.Lock()

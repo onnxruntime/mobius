@@ -1002,6 +1002,75 @@ older runtimes cannot load the new contrib operators. Default Engine config
 is unchanged. `engine-all-fusions-summary.json` records exact parity,
 benchmarks, memory, package identity and the non-promotion decision.
 
+### Ornith FP8 DFlash2 experiment
+
+[`incoai/Ornith-1.5-122B-DFlash2`](https://huggingface.co/incoai/Ornith-1.5-122B-DFlash2)
+is an Ornith-trained block drafter, separate from the model's built-in MTP.
+`examples/ornith_dflash2_export.py` reuses the native GenAI DFlash2 graph builder
+and Engine scheduler. Add the matching GenAI checkout's `src/python/py` to
+`PYTHONPATH`; no SGLang installation is needed.
+
+```bash
+export PYTHONPATH=/path/to/onnxruntime-genai/src/python/py
+python examples/ornith_dflash2_export.py --model /path/to/engine-export
+python examples/ornith_engine_benchmark.py --model /path/to/engine-export \
+  --config-overlay /path/to/engine-export/dflash2-fp8-config.json \
+  --contexts 2048 8192 16384 32768 --output-tokens 512 --warmup 1 --runs 3 \
+  --cuda-graph --device-allocator-for-initializers --report-only \
+  --report /path/to/engine-export/engine-benchmark-dflash2-fp8.json
+```
+
+The export pins draft revision `9baefc1bec85c08193ab442e0ca5f7057669b61d`.
+Body projections use E4M3FN FP8 weights with FP32 row-block-128 scales
+(`MatMulBlockQuantizedFp8Weight`), while activations and the drafter's own KV
+cache stay BF16. Dynamic-convolution coefficients, norms and candidate-selector
+parameters remain unquantized. The LM head uses the exact already-exported target
+FP8 weights/scales, not a separately quantized approximation. The supplied
+`mask_embedding.safetensors` row is restored **after** casting the target's FP16
+embedding lookup to BF16, so tiny mask values are not lost to FP16 underflow.
+This is weight-only FP8, not FP8 activations or an FP8 draft cache.
+
+The checkpoint uses 16 query rows, but the current target has an eight-token
+recurrent rollback capacity. This initial experiment explicitly uses eight
+query rows (anchor + seven drafts); it is **not** a benchmark of the published
+16-row configuration. `--num-draft-tokens` can select 1–7. The draft's eight
+post-residual target taps are layers 1/7/14/20/26/32/39/45 (zero-based).
+No target weights or arithmetic are changed by exporting these taps.
+
+The exporter writes a separate decoder graph, drafter and config overlay.
+It refuses to overwrite an existing draft; `--bf16` exports a separate dense
+control using the same architecture. The default `genai_config.json`, accepted
+gated-RMS graph/runtime and previous benchmark reports remain unchanged.
+The overlay disables built-in MTP and enables DFlash2 instead. Memory sampling
+can reuse `ornith_engine_memory.py` with the DFlash2 reference report and
+`--decoder-file decoder/model-gated-rms-dflash2.onnx`.
+
+The benchmark performs execution, zero-failure and target-only greedy-output
+checks before recording timings. These are benchmark-integrity checks, not a
+task-accuracy evaluation or comparison against the source BF16 target.
+Source-model and task accuracy remain deferred.
+
+The first single-H200 run (one warmup, three measured 512-output turns per
+context, CUDA graphs, same accepted runtime) produced:
+
+| Context | Fresh accepted MTP control (tokens/s) | FP8 DFlash2 (tokens/s) |
+| --- | ---: | ---: |
+| 2K | 184.13 | 50.01 |
+| 8K | 145.05 | 37.04 |
+| 16K | 120.11 | 27.44 |
+| 32K | 70.51 | 19.60 |
+
+All twelve measured outputs match the target-only references, with zero draft
+failures or disables, but only 3.73%/3.33%/2.75%/9.80% of evaluated proposals
+were accepted at 2K/8K/16K/32K. Evaluated proposals stop at rejection, so those
+percentages are not acceptance length or accepted/proposed ratios.
+**This experiment is not promoted:** drafting/verification costs outweigh the
+benefit at this acceptance level. There is no BF16 draft
+control yet, so the low acceptance is not attributed specifically to FP8.
+`engine-dflash2-fp8-summary.json` preserves package hashes, the fresh control,
+per-context sampled peak memory and the benchmark-only decision. The accepted
+gated-RMS plus FP8 MTP deployment remains the recommendation.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
