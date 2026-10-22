@@ -859,6 +859,68 @@ The previous temporal-convolution runtime remains available for rollback.
 Source-model accuracy is still unevaluated, and 200 decode tokens/s has not
 been reached.
 
+### Ornith exact gated RMS normalization fusion
+
+The Engine exporter accepts opt-in `--fuse-gated-rmsnorm` to fuse the 36
+GatedDeltaNet output norms. Each compatible FP16-to-FP32 cast, FP32
+RMSNormalization, FP32 gate cast/SiLU, multiply and FP16 output cast becomes
+one `com.microsoft.GatedRMSNormExact` node. The existing surrounding reshapes
+and scale tensor are retained, and no weights are requantized.
+
+This CUDA-only operator deliberately has a narrow contract: FP16 input and
+gate of shape `[rows,128]`, FP32 scale `[128]`, and finite nonnegative epsilon.
+It reproduces the width-128 single-warp FP32 RMSNormalization reduction,
+separately rounded FP32 standardization and scaling, and optimized
+QuickGelu(alpha=1) arithmetic including its negative tail. There is only one
+FP16 conversion at the output. The pre-existing generic `GatedRMSNorm` uses
+a different reduction order and is not silently substituted.
+
+The rewrite checks types, shapes, normalization/activation attributes and
+exclusive intermediate users; incompatible or shared chains are left intact.
+It supports exported Swish and already optimized QuickGelu, is idempotent,
+and records the number fused as `gated_rmsnorms_fused` in export provenance.
+It requires the matching ORT branch; older runtimes cannot load this operator.
+FP8 KV cache, INT2 projections, FP8 LM head/MTP, recurrent state and attention
+behavior are unchanged.
+
+Fresh matched H200 Engine measurements use the same rebuilt runtime for both
+the original and fused decoder graphs, width-one FP8 MTP, CUDA graphs,
+packed-only INT2 experts and direct initializer allocations. Each context has
+one warmup and three timed 512-token turns:
+
+| Context | Original graph decode (tokens/s) | Fused graph decode (tokens/s) | Change |
+| --- | ---: | ---: | ---: |
+| 2K | 169.330 | 184.193 | +8.78% |
+| 8K | 135.373 | 145.049 | +7.15% |
+| 16K | 113.571 | 120.032 | +5.69% |
+| 32K | 67.756 | 70.503 | +4.05% |
+
+TTFT improves by about 2.8-3.2%. All twelve output-token sequences and MTP
+counters match both the matched control and previous approved model, with zero
+MTP failures. The fused graph also passes its own target-only greedy checks.
+Thirty-one CUDA tests cover bitwise FP16 outputs against the actual unfused
+FP32 RMSNormalization/QuickGelu graph, zero rows, extreme finite inputs,
+zero epsilon, prefill up to 65536 rows, CUDA graph replay with changing inputs,
+and invalid contracts. All 108 exporter/ABI tests pass, including positive,
+negative and idempotent rewrite cases.
+
+The isolated decoder variant is
+`decoder/model-fused-shared-swiglu-fp16-state-gated-rms.onnx`; select it with
+the benchmark's `--decoder-file` option. It removes 180 graph nodes
+(2325 to 2145), preserving every remaining initializer byte and external-data
+reference. The previous approved decoder remains unchanged. These gains use
+fresh matched controls and must not be added cumulatively to older benchmark
+tables. Source-model accuracy remains unevaluated.
+
+Matched, parity-checked 32K CUDA node traces confirm exactly five launches
+removed for every fused norm. Prefill launches fall from 68739 to 62979
+(-5760); captured steady-decode launches fall from 173121 to 155841 (-17280).
+Summed steady-decode GPU kernel time falls from 1932.67 to 1916.66 ms.
+These sums are not wall-time or hardware-counter measurements. The installed,
+staged, saved and wheel binaries are hash-verified; `engine-gated-rms-summary.json`
+records the benchmark, test, trace and package provenance. The previous runtime
+is retained for rollback.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent

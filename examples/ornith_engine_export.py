@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import shutil
 from collections import defaultdict
 from contextlib import ExitStack
@@ -244,6 +245,129 @@ def fuse_shared_expert_gates(model):
             graph,
             final,
             [matmul, sigmoid, mul, add, final],
+            [node],
+            [final.outputs[0]],
+            [output],
+        )
+        fused += 1
+    if fused:
+        graph.opset_imports.setdefault("com.microsoft", 1)
+        ir.passes.common.RemoveUnusedNodesPass()(model)
+    return fused
+
+
+def fuse_gated_rmsnorm(model):
+    """Fuse width-128 FP32 gated norms without changing reduction or rounding order."""
+    graph = model.graph
+
+    def sole_user(value, op_type):
+        uses = tuple(value.uses())
+        if value in graph.outputs or len(uses) != 1:
+            return None
+        node = uses[0].node
+        return node if node.domain == "" and node.op_type == op_type else None
+
+    def fp32_cast(value):
+        node = value.producer()
+        if (
+            node is None
+            or node.domain != ""
+            or node.op_type != "Cast"
+            or set(node.attributes) != {"to"}
+            or node.attributes["to"].as_int() != int(ir.DataType.FLOAT)
+            or node.inputs[0].dtype != ir.DataType.FLOAT16
+            or value.dtype != ir.DataType.FLOAT
+            or value in graph.outputs
+            or len(tuple(value.uses())) != 1
+        ):
+            return None
+        return node
+
+    fused = 0
+    for norm in list(graph):
+        if (
+            norm.domain != ""
+            or norm.op_type != "RMSNormalization"
+            or len(norm.inputs) != 2
+            or len(norm.outputs) != 1
+            or set(norm.attributes) != {"axis", "stash_type", "epsilon"}
+            or norm.attributes["axis"].as_int() != -1
+            or norm.attributes["stash_type"].as_int() != 1
+            or not math.isfinite(norm.attributes["epsilon"].as_float())
+            or norm.attributes["epsilon"].as_float() < 0
+        ):
+            continue
+        x_float, scale = norm.inputs
+        cast_x = fp32_cast(x_float)
+        mul = sole_user(norm.outputs[0], "Mul")
+        if cast_x is None or mul is None or len(mul.inputs) != 2 or mul.attributes:
+            continue
+        gate_value = next((v for v in mul.inputs if v is not norm.outputs[0]), None)
+        if gate_value is None:
+            continue
+        activation = gate_value.producer()
+        if (
+            activation is None
+            or not (
+                (activation.domain == "" and activation.op_type == "Swish")
+                or (activation.domain == "com.microsoft" and activation.op_type == "QuickGelu")
+            )
+            or set(activation.attributes) - {"alpha"}
+            or (activation.op_type == "QuickGelu" and "alpha" not in activation.attributes)
+            or (
+                "alpha" in activation.attributes
+                and activation.attributes["alpha"].as_float() != 1.0  # noqa: RUF069
+            )
+            or sole_user(gate_value, "Mul") is not mul
+        ):
+            continue
+        cast_gate = fp32_cast(activation.inputs[0])
+        final = sole_user(mul.outputs[0], "Cast")
+        if (
+            cast_gate is None
+            or final is None
+            or set(final.attributes) != {"to"}
+            or final.attributes["to"].as_int() != int(ir.DataType.FLOAT16)
+        ):
+            continue
+        x, gate = cast_x.inputs[0], cast_gate.inputs[0]
+        if (
+            x.shape is None
+            or x.shape.rank() != 2
+            or x.shape[1] != 128
+            or gate.shape != x.shape
+            or scale.dtype != ir.DataType.FLOAT
+            or scale.shape != ir.Shape([128])
+            or any(
+                v.dtype != ir.DataType.FLOAT or v.shape != x.shape
+                for v in (
+                    x_float,
+                    norm.outputs[0],
+                    activation.inputs[0],
+                    gate_value,
+                    mul.outputs[0],
+                )
+            )
+            or final.outputs[0].dtype != ir.DataType.FLOAT16
+            or final.outputs[0].shape != x.shape
+        ):
+            continue
+        output = ir.Value(
+            name=final.outputs[0].name,
+            shape=final.outputs[0].shape,
+            type=final.outputs[0].type,
+        )
+        node = ir.Node(
+            "com.microsoft",
+            "GatedRMSNormExact",
+            [x, gate, scale],
+            [ir.AttrFloat32("epsilon", norm.attributes["epsilon"].as_float())],
+            outputs=[output],
+        )
+        ir.convenience.replace_nodes_and_values(
+            graph,
+            final,
+            [cast_x, norm, cast_gate, activation, mul, final],
             [node],
             [final.outputs[0]],
             [output],
@@ -972,6 +1096,11 @@ def main():
         help="Fuse FP16 shared gate MatMul, sigmoid, expert sum and residual",
     )
     parser.add_argument(
+        "--fuse-gated-rmsnorm",
+        action="store_true",
+        help="Fuse width-128 FP32 gated RMS norms into an exact-order FP16 CUDA operator",
+    )
+    parser.add_argument(
         "--fuse-shared-expert-swiglu",
         action="store_true",
         help="Fuse packed FP16 INT2 gate/up projection and SwiGLU; requires --pack-projections",
@@ -1018,6 +1147,7 @@ def main():
             if args.fuse_shared_expert_gates
             else 0
         )
+        fused_norms = fuse_gated_rmsnorm(package["decoder"]) if args.fuse_gated_rmsnorm else 0
         fused_routers = (
             fuse_moe_routers(package["decoder"], use_matmul=args.moe_router_use_matmul)
             if args.fuse_moe_routers
@@ -1067,6 +1197,7 @@ def main():
                 "packed_projection_nodes_removed": packed_projections,
                 "shared_expert_gates_fused": fused_gates,
                 "shared_expert_swiglu_fused": fused_swiglu,
+                "gated_rmsnorms_fused": fused_norms,
                 "moe_routers_fused": fused_routers,
                 "moe_router_use_matmul": args.moe_router_use_matmul,
                 "recurrent_state_dtype": "float16" if args.recurrent_state_fp16 else "float32",

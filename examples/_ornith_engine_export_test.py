@@ -23,6 +23,7 @@ from ornith_engine_export import (
     PackedOrnithTask,
     bind_component_weights,
     engine_config,
+    fuse_gated_rmsnorm,
     fuse_int2_swiglu,
     fuse_shared_expert_gates,
     pack_int2_projections,
@@ -35,6 +36,69 @@ from mobius._testing import make_config
 from mobius.models.qwen35 import Qwen35VLDecoderModel
 from mobius.models.qwen35_mtp import Qwen35MtpModel
 from mobius.tasks._base import _make_graph, _make_model
+
+
+@pytest.mark.parametrize("activation", ["Swish", "QuickGelu"])
+@pytest.mark.parametrize(
+    "reject", [None, "axis", "alpha", "shared", "width", "dtype", "epsilon"]
+)
+def test_gated_rmsnorm_rewrite(activation, reject):
+    from onnx import TensorProto
+    from onnx import helper as h
+
+    width = 64 if reject == "width" else 128
+    shape = [2, width]
+    half = TensorProto.FLOAT if reject == "dtype" else TensorProto.FLOAT16
+    nodes = [
+        h.make_node("Cast", ["x"], ["xf"], to=TensorProto.FLOAT),
+        h.make_node("Cast", ["gate"], ["gf"], to=TensorProto.FLOAT),
+        h.make_node(
+            "RMSNormalization",
+            ["xf", "scale"],
+            ["norm"],
+            axis=0 if reject == "axis" else -1,
+            stash_type=1,
+            epsilon=-1.0 if reject == "epsilon" else 1e-6,
+        ),
+        h.make_node(
+            activation,
+            ["gf"],
+            ["activated"],
+            domain="com.microsoft" if activation == "QuickGelu" else "",
+            alpha=0.5 if reject == "alpha" else 1.0,
+        ),
+        h.make_node("Mul", ["norm", "activated"], ["product"]),
+        h.make_node("Cast", ["product"], ["y"], to=TensorProto.FLOAT16),
+    ]
+    outputs = [h.make_tensor_value_info("y", TensorProto.FLOAT16, shape)]
+    if reject == "shared":
+        outputs.append(h.make_tensor_value_info("xf", TensorProto.FLOAT, shape))
+    proto = h.make_model(
+        h.make_graph(
+            nodes,
+            "norm",
+            [
+                h.make_tensor_value_info("x", half, shape),
+                h.make_tensor_value_info("gate", TensorProto.FLOAT16, shape),
+                h.make_tensor_value_info("scale", TensorProto.FLOAT, [width]),
+            ],
+            outputs,
+            value_info=[
+                h.make_tensor_value_info(name, TensorProto.FLOAT, shape)
+                for name in ("xf", "gf", "norm", "activated", "product")
+            ],
+        ),
+        opset_imports=[h.make_opsetid("", 24), h.make_opsetid("com.microsoft", 1)],
+        ir_version=10,
+    )
+    model = ir.serde.deserialize_model(proto)
+    assert fuse_gated_rmsnorm(model) == (0 if reject else 1)
+    if not reject:
+        node = next(iter(model.graph))
+        assert node.op_type == "GatedRMSNormExact"
+        assert [v.name for v in node.inputs] == ["x", "gate", "scale"]
+        assert [v.name for v in node.outputs] == ["y"]
+        assert fuse_gated_rmsnorm(model) == 0
 
 
 def _config(**kwargs):
