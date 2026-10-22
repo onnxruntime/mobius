@@ -1160,6 +1160,73 @@ the colleague's hardware/runtime/precision/workload are unavailable.
 The accepted target/runtime/default configuration and saved MTP results remain
 unchanged. No task/source-model accuracy benchmark was run.
 
+#### Experimental calibrated INT2 target
+
+A bounded calibration experiment uses eight distinct text topics, each expanded
+to 768 tokens (6,144 calibration tokens), and evaluates reconstruction on four
+held-out topics. These small, repetitive samples are diagnostic data, not a
+production calibration corpus or a task-accuracy evaluation.
+Olive's existing `gptq_quantize_weight` improves held-out reconstruction of the
+tested dense projections. Routed experts have insufficient per-expert Hessian
+coverage at this budget and remain at their original RTN weights.
+
+The full 48-layer sequential dense-GPTQ control retains symmetric INT2,
+group size 128, zero point 2, FP16 scales, and disables activation ordering.
+It improves post-layer-45 feature cosine to the original BF16 target from
+**0.04362 to 0.48204** in the independent PyTorch quantized-reference control.
+This is feature reconstruction, not evidence of task accuracy.
+
+`examples/ornith_int2_overlay.py` applies the resulting packed dense weights
+to an isolated copy of an existing packed/fused target. Its manifest requires
+the pinned checkpoint revision, source-graph SHA256, quantization ABI, and
+SHA256-verified safetensors shards mapping every original dense weight name
+to its `codes`/`scales` tensors. Coverage, dtype, shape, scale finiteness, and
+packed concatenation order are checked before replacing initializers.
+Output must share the source graph's directory: unchanged expert/head/embedding
+external-data descriptors are reused verbatim, and only calibrated dense
+weights are written to the new external-data file. Existing graph/data/report
+files are never overwritten. The default decoder/config is not modified.
+
+```bash
+python examples/ornith_int2_overlay.py \
+  --model /path/to/decoder/model-gated-rms-dflash2.onnx \
+  --calibration /path/to/verified-dense-gptq-tensors \
+  --output /path/to/decoder/model-gated-rms-dflash2-dense-gptq.onnx
+```
+
+The experimental overlay changes 384 dense weight/scale initializers without
+changing graph nodes or other initializers. Its FP8 DFlash2 run passes
+target-only greedy integrity checks at 128-input/64-output and
+2K-input/128-output sizes. Short 2K diagnostics measured:
+
+| Target / verified drafts | Decode tokens/s | Accepted drafts / target passes |
+| --- | ---: | ---: |
+| Original RTN target / 7 | 48.28 | 2 / 127 |
+| Dense-GPTQ target / 7 | 61.02 | 27 / 102 |
+| Dense-GPTQ target / 3 | 88.08 | 26 / 103 |
+| Dense-GPTQ target / 1 | 113.90 | 22 / 107 |
+
+Widths one and three average three measured runs after warmup; width seven
+uses one measured run after warmup. All measured calibrated-target outputs
+match that target's own reference, with zero DFlash2 failures/disables.
+The calibrated target emits different tokens from the accepted RTN target,
+so these are separate workloads, not a same-output kernel-speed comparison.
+The saved MTP baseline applies only to the unchanged accepted target; it was
+not rerun or claimed to predict calibrated-target MTP throughput.
+
+The diagonal-only scale-fitting helper in `examples/ornith_int2_quantization.py`
+is retained for diagnostics, not enabled by the exporter. It improves many
+isolated projection reconstruction errors but severely worsens full-model
+feature agreement by layer 14. That experiment was stopped and is **rejected**.
+Minimizing a diagonal calibration objective does not guarantee held-out
+projection or end-to-end improvement.
+
+The dense-GPTQ target is also **not promoted**: 350 tokens/s is not reached,
+acceptance remains low, and task accuracy is still deferred. Broader,
+nonrepetitive calibration and sufficient expert-specific coverage are needed
+before treating this as a production quantization recipe. No final
+four-context benchmark or memory sweep is claimed for this diagnostic model.
+
 ### Ornith FP16 recurrent-state storage
 
 Add `--recurrent-state-fp16` to the Engine export to store GatedDeltaNet recurrent
