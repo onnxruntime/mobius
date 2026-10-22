@@ -1127,7 +1127,7 @@ because small numerical differences can change selector decisions.
 
 A separate source-target numerical control loads one original layer at a time,
 with a fixed teacher-forced input, rather than running a task evaluation.
-The deployed target's post-layer-45 features have cosine **-0.0171** to the
+The deployed target's post-layer-45 features have cosine **-0.01766** to the
 original BF16 source features on the 2K prompt. An independent PyTorch control
 applies the exporter's symmetric group-128 INT2 RTN code/FP16-scale rule, then
 runs ordinary reference operators on dequantized weights:
