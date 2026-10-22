@@ -136,6 +136,44 @@ Also registered with `LLaVAModel` (task: `vision-language`):
 `molmo`, `ovis2`, `paligemma`, `pixtral`, `smolvlm`, `video_llava`,
 `vipllava`.
 
+### Ornith-1.5
+
+The [Ornith-1.5 collection](https://huggingface.co/collections/ornith-ai/ornith-15)
+uses the existing Qwen3.5 architectures; no Ornith-specific registry alias or
+custom modeling code is needed. The original, unquantized HuggingFace checkpoints
+resolve automatically:
+
+| Checkpoint | Architecture | Decoder layers | Routed experts / active |
+|---|---|---|---|
+| `ornith-ai/Ornith-1.5-9B` | Qwen3.5 dense | 32 | — |
+| `ornith-ai/Ornith-1.5-35B-A3B` | Qwen3.5 MoE | 40 | 256 / 8 |
+| `ornith-ai/Ornith-1.5-122B` | Qwen3.5 MoE | 48 | 256 / 8 |
+| `ornith-ai/Ornith-1.5-397B` | Qwen3.5 MoE | 60 | 512 / 10 |
+
+By default, export includes the text decoder, vision encoder, and embedding
+graphs. Use `--features text-only` to export only the decoder:
+
+```powershell
+mobius build --model ornith-ai/Ornith-1.5-9B --revision 489cb97981b8654bcfcf30ce1f94ed1b62e07b53 --dtype bf16 .\ornith-9b
+mobius build --model ornith-ai/Ornith-1.5-9B --revision 489cb97981b8654bcfcf30ce1f94ed1b62e07b53 --dtype bf16 --features text-only .\ornith-9b-text
+```
+
+Weight-loading memory scales with **total** parameters, not active experts.
+BF16 weights alone require roughly 19 GB for 9B and 807 GB for 397B, before
+loading/export overhead. Add `--no-weights` for a configuration-only graph build.
+Pinned revisions for all four sizes are recorded in
+`testdata/cases/vision-language/ornith-1_5-*.yaml`; the corresponding L2 tests
+exercise public dispatch, nested config fields, and recurrent/KV cache wiring.
+These are not full-checkpoint numerical or generation results: Ornith-specific
+L4/L5 goldens have not yet been collected.
+
+The collection also contains FP8, NVFP4, GGUF, and MLX conversions. Architecture
+compatibility does **not** establish support for those storage formats or their
+runtime kernels. They are not covered by the Ornith compatibility cases above;
+do not treat NVFP4 as affine INT4 or pass MLX-packed weights to the ordinary
+HuggingFace loader. See the [GGUF capability catalog](gguf-capability-catalog.md)
+for format-specific import and runtime evidence.
+
 ## Encoder-Only (BERT Family)
 
 Models for text embeddings, classification, and feature extraction.

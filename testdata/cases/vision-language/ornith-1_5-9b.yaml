@@ -1,0 +1,24 @@
+model_id: "ornith-ai/Ornith-1.5-9B"
+model_type: "qwen3_5"
+revision: "489cb97981b8654bcfcf30ce1f94ed1b62e07b53"
+task_type: "image-text-to-text"
+dtype: "bfloat16"
+reference_loader: "multimodal"
+
+inputs:
+  prompts:
+    - "Describe this image in one short sentence."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+generation:
+  max_new_tokens: 24
+  do_sample: false
+  eos_token_id: 248046
+
+ci_skip_reason: "9B checkpoint requires substantial memory; full-weight goldens are not yet collected."
+notes: |
+  Ornith-1.5 dense Qwen3.5 vision-language checkpoint. Pinned L2 config
+  and graph coverage is in tests/ornith_test.py, including text-only export.
+  L4/L5 enrollment is not evidence of real-weight parity until goldens exist.

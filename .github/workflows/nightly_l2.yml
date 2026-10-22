@@ -41,7 +41,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: hf-l2-configs-${{ hashFiles('tests/arch_validation_test.py') }}
+          key: hf-l2-configs-${{ hashFiles('tests/arch_validation_test.py', 'tests/ornith_test.py', 'testdata/cases/vision-language/ornith-*.yaml') }}
           restore-keys: |
             hf-l2-configs-
 
@@ -57,7 +57,7 @@ jobs:
       # Run sequentially (-p no:xdist) to stay under 2GB RAM
       - name: Run L2 architecture validation tests
         run: |
-          pytest tests/arch_validation_test.py \
+          pytest tests/arch_validation_test.py tests/ornith_test.py \
             -m arch_validation \
             -v \
             -p no:xdist \
