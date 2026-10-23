@@ -62,7 +62,11 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
         modified = False
 
         for node in list(model.graph.all_nodes()):
-            if node.op_type != "Transpose":
+            if (
+                node.domain not in ("", "ai.onnx")
+                or node.overload
+                or node.op_type != "Transpose"
+            ):
                 continue
 
             if len(node.inputs) != 1:
@@ -73,7 +77,15 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
                 continue
 
             # Only fold initializer inputs (not graph inputs or computed values).
-            if not inp.is_initializer():
+            if (
+                not inp.is_initializer()
+                or inp.is_graph_input()
+                or inp.is_graph_output()
+                # Preserve legacy root ownership/naming even when the
+                # consumer is in a Loop/If body. Only child-local initializers
+                # need the scoped FoldWeightLayoutPass.
+                or model.graph.initializers.get(inp.name) is not inp
+            ):
                 continue
 
             # Only fold when the initializer's sole consumer is this Transpose node.

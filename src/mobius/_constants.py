@@ -9,6 +9,11 @@ from __future__ import annotations
 # Separated into its own module to avoid circular imports between
 # tasks, components, and the top-level package.
 OPSET_VERSION = 24
+QKV_PROJECTION_SOURCES_METADATA_KEY = "mobius.qkv_projection_sources"
+"""Versioned source names and widths retained on projection-packing Split nodes."""
+
+# Transient tensor.meta ownership, never serialized as ONNX metadata.
+LAZY_SOURCE_FILES_META_KEY = "mobius.lazy_source_files"
 
 # ---------------------------------------------------------------------------
 # Static KV cache ABI

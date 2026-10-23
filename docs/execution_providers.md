@@ -100,6 +100,80 @@ ops to fused equivalents:
 
 These are applied during **Stage 2: Fusion** of the optimization pipeline.
 
+#### Projection packing and numerical limitations
+
+The existing float `PackQKV` GQA-input fusion is unchanged. A generic
+projection-only pass also handles compatible float projections that remain
+separate after that fusion, including masked decoders and raw K reused for V.
+It splits the packed result **before** normalization, RoPE, attention, or cache
+consumers. Sources must be static, non-overridable initializer parameters with
+compatible shapes and dtypes; ambiguous repeated sources, shared weights with
+outside consumers, and overlapping groups are declined before graph mutation.
+No attention-mask contract is relaxed to make packing possible.
+
+**INT4 projection packing is experimental and default-disabled on every
+built-in EP, including CUDA, for FP16 and BF16 alike.** Opt in only through
+the existing capability API:
+
+```python
+import dataclasses
+
+import onnx_ir as ir
+from mobius import get_ep, register_ep
+
+register_ep(
+    dataclasses.replace(
+        get_ep("cuda"),
+        matmul_nbits_qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
+    ),
+    overwrite=True,
+)
+```
+
+This overrides the process-local profile for subsequent builds. Stock
+`--ep cuda` does not opt in. The capability is independent of float
+`qkv_pack_dtypes`; activation dtype (`--dtype`), weight quantization/storage,
+component precision overrides, and FP8 KV-cache flags remain independent
+choices. Packing does not promote precision, dequantize, or requantize weights.
+
+Compatible INT4 groups share a rank-3 floating-point activation, attributes
+other than output width, and canonical UINT8 blocked weights. Scales match the
+activation dtype; zero points must be absent throughout or uniformly packed
+UINT8. Flat and row-major scale/zero-point storage are supported. Block size
+must be a power of two of at least 16; `accuracy_level` must be omitted or zero.
+Caller-owned function bodies, mixed bit widths, extra nonempty inputs, and
+incompatible layouts are not packed. Standard opset >= 13 is required.
+The canonical implementation is `_qkv_projection_packing.py` for both float
+and INT4, including the supported Q/K pair with K reused for V.
+
+Parameter Concats retain checkpoint names until binding. Missing parameter
+leaves are validated even with `apply_weights(..., fold_constants=False)`.
+Normally the post-weight pipeline folds Concats and static Reshape/Transpose
+chains lazily, including layouts exposed by small integer shape-expression
+folding. That generic folding is always independent of experimental packing;
+it preserves dtype and does not eagerly load large weight tensors.
+
+**The PR754 numerical gate remains failed and unwaived.** Byte-exact packing
+does not imply identical floating-point outputs: changing GEMM output width can
+change CUDA kernel behavior. Representative large-dimension prefill and
+cached-decode logits exceeded the existing `rtol=atol=1e-2` criterion. Bounded
+MMLU/generation evidence does not resolve pointwise parity; neither tolerances
+nor automatic BF16/FP16 enablement have changed. No production numerical
+accuracy or speed improvement is claimed.
+
+For `ORT_FPA_INTB_GEMM=1`, keep exporter folding or ORT constant folding enabled:
+unfolded parameter Concats can prevent runtime prepacking when both are off.
+This is not a guarantee for every runtime version/configuration.
+
+Packed float sources retain adapter restoration metadata. Lazy restored/folded
+weights keep their backing-file ownership after source initializers are pruned.
+`ModelPackage.save()` checks model/shard, policy, adapter, package metadata, and
+MTP destinations before writing, rejecting known same-path, hardlink, or symlink
+aliases to lazy sources. Adapter files use `adapters/<alias>/adapter.json`,
+`adapter.onnx_adapter`, or `adapter_model.safetensors` plus `adapter_config.json`
+according to persistence options. These checks are **not** full TOCTOU
+protection for non-transactional saves; use a separate output directory.
+
 ### Tier 3 — EP-specific constraints (required, correctness)
 
 Some EPs cannot execute certain ops. These are handled by **lowering rules**
