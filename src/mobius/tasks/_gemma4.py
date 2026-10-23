@@ -34,6 +34,7 @@ from mobius._constants import (
 )
 from mobius._model_package import ModelPackage
 from mobius._pipeline_contract import (
+    declare_arbitrary_attention_mask,
     declare_component_presence,
     declare_optional_input,
 )
@@ -537,6 +538,13 @@ class Gemma4Task(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
 
         graph, builder = _make_graph(name="decoder")
+        if (
+            config.use_bidirectional_attention == "vision"
+            and config.image_token_id is not None
+        ):
+            # A causal global bias still carries arbitrary padding positions.
+            # Prefix-length GQA fusion cannot preserve internal mask holes.
+            declare_arbitrary_attention_mask(graph)
         op = builder.op
 
         inputs_embeds = builder.input(
@@ -643,7 +651,7 @@ class Gemma4Task(ModelTask):
         """Build vision encoder: pixel_values + pixel_position_ids -> image_features.
 
         Inputs:
-        - ``pixel_values [1, N, 3*P^2]``: one pre-patchified image with ``N``
+        - ``pixel_values [1, N, 3*P^2]``: FP32 patches in ``[0, 1]``, with ``N``
           patches (padded to ``max_soft_tokens``, typically 280).
         - ``pixel_position_ids [1, N, 2]``: (x, y) patch coordinates.
           Unused patch slots (from images smaller than the maximum) use
@@ -666,7 +674,7 @@ class Gemma4Task(ModelTask):
 
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[1, num_patches, pixel_dim],
         )
         pixel_position_ids = builder.input(

@@ -558,47 +558,68 @@ def test_gemma4_unified_12b_multimodal_prefill():
 
 
 @pytest.mark.integration
-def test_gemma4_bidirectional_mask_parity():
+@pytest.mark.parametrize(
+    ("static", "case"),
+    [
+        (static, case)
+        for static in (False, True)
+        for case in ("text", "image", "two_images", "long_image", "padding")
+    ]
+    + [(False, "internal_hole")],
+)
+def test_gemma4_bidirectional_mask_parity(static, case):
     """Mobius's vision-block attention bias matches HuggingFace exactly.
 
-    Larger Gemma 4 models use ``use_bidirectional_attention="vision"``: a
-    contiguous run of image/audio placeholder tokens attends bidirectionally
-    within its block (on BOTH full and sliding layers), while text stays
-    causal.  This test compares mobius's ``create_attention_bias`` output
-    (with ``block_sequence_ids`` from ``_compute_block_sequence_ids``) against
-    HuggingFace's real ``create_causal_mask`` / ``create_sliding_window_causal_mask``
-    for the actual ``gemma-4-26b-a4b-it`` config.  It needs only the config
-    (no weights), so it is cheap and deterministic.
+    Global layers remain causal; local layers use
+    ``(causal OR same-image) AND left-window AND padding``. Compare the actual
+    HF Gemma4 entry point with a local config, without downloads or weights.
     """
     import onnx_ir as ir
     import torch
-    from transformers.masking_utils import (
-        create_causal_mask,
-        create_sliding_window_causal_mask,
+    from transformers import Gemma4TextConfig
+    from transformers.models.gemma4.modeling_gemma4 import (
+        create_masks_for_vision_model,
+        get_block_sequence_ids_for_mask,
     )
 
     from mobius._testing import create_test_builder, create_test_input
-    from mobius.components._common import create_attention_bias
+    from mobius.components import create_attention_bias, create_static_cache_attention_bias
     from mobius.models.gemma4 import _compute_block_sequence_ids
     from mobius.tasks._base import _make_graph, _make_model
 
-    model_id = "google/gemma-4-26b-a4b-it"
-    if not _model_accessible(model_id):
-        pytest.skip(f"{model_id} not accessible (requires HuggingFace authentication)")
-
-    hf_config = transformers.AutoConfig.from_pretrained(model_id)
-    text_cfg = hf_config.text_config
+    text_cfg = Gemma4TextConfig(
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        sliding_window=1024,
+        layer_types=["sliding_attention", "full_attention"],
+        use_bidirectional_attention="vision",
+    )
     text_cfg._attn_implementation = "eager"  # always returns a dense float mask
     assert text_cfg.use_bidirectional_attention == "vision"
-    image_token_id = hf_config.image_token_id
-
-    # Synthetic layout: text, image block, text, image block, text.
-    seq_len = 12
-    input_ids = np.full((1, seq_len), 5, dtype=np.int64)
-    input_ids[0, 2:7] = image_token_id
-    input_ids[0, 9:11] = image_token_id
+    image_token_id = 255
+    types = {
+        "text": [0] * 7,
+        "image": [0, 1, 1, 1, 0],
+        "two_images": [0, 1, 1, 0, 1, 1, 0],
+        "long_image": [0] + [1] * 1120 + [0],
+        "padding": [0, 1, 1, 1, 0, 0],
+        "internal_hole": [1] * 1025,
+    }[case]
+    token_types = torch.tensor([types])
+    seq_len = len(types)
+    input_ids = np.where(token_types.numpy() == 1, image_token_id, 5).astype(np.int64)
     attention_mask = np.ones((1, seq_len), dtype=np.int64)
     position_ids = np.arange(seq_len, dtype=np.int64)[None, :]
+    if case == "padding":
+        attention_mask[0, -2:] = 0
+    elif case == "internal_hole":
+        # Physical q=1024,k=0 is outside W=1024 despite an invalid slot at k=1.
+        # The static primitive has prefix validity, not arbitrary hole validity;
+        # retain its ten existing comparisons and test this case dynamically.
+        attention_mask[0, 1] = 0
 
     # Mobius block_sequence_ids from input_ids.
     graph, builder = _make_graph()
@@ -609,10 +630,9 @@ def test_gemma4_bidirectional_mask_parity():
     block_ids = OnnxModelSession(_make_model(graph), device="cpu").run(
         {"input_ids": input_ids}
     )["bsid"]
-    # Two contiguous image runs separated by text -> groups 0 and 1.
     np.testing.assert_array_equal(
-        block_ids[0],
-        np.array([-1, -1, 0, 0, 0, 0, 0, -1, -1, 1, 1, -1], dtype=np.int64),
+        block_ids,
+        get_block_sequence_ids_for_mask(token_types, torch.device("cpu")).numpy(),
     )
 
     def mobius_attended(sliding_window):
@@ -620,14 +640,22 @@ def test_gemma4_bidirectional_mask_parity():
         ii = create_test_input(b, "input_ids", [1, seq_len], dtype=ir.DataType.INT64)
         am = create_test_input(b, "attention_mask", [1, seq_len], dtype=ir.DataType.INT64)
         bk = create_test_input(b, "block_sequence_ids", [1, seq_len], dtype=ir.DataType.INT64)
-        bias = create_attention_bias(
-            bop,
-            ii,
-            am,
+        arguments = dict(
             sliding_window=sliding_window,
             dtype=ir.DataType.FLOAT,
-            block_sequence_ids=bk,
+            block_sequence_ids=bk if sliding_window is not None else None,
         )
+        if static:
+            bias = create_static_cache_attention_bias(
+                bop,
+                write_indices=bop.Constant(value_ints=[0]),
+                seq_len=bop.Shape(ii, start=1, end=2),
+                nonpad_kv_seqlen=bop.ReduceSum(am, [1], keepdims=0),
+                max_seq_len=seq_len,
+                **arguments,
+            )
+        else:
+            bias = create_attention_bias(bop, ii, am, **arguments)
         bias.name = "bias"
         g.outputs.append(bias)
         out = OnnxModelSession(ir.Model(g, ir_version=10), device="cpu").run(
@@ -641,30 +669,26 @@ def test_gemma4_bidirectional_mask_parity():
 
     inputs_embeds = torch.zeros(1, seq_len, 8)
     blk = torch.from_numpy(block_ids)
-    hf_full = create_causal_mask(
+    hf_masks = create_masks_for_vision_model(
         text_cfg,
         inputs_embeds,
         torch.from_numpy(attention_mask),
         None,
         torch.from_numpy(position_ids),
-        block_sequence_ids=blk,
-    )
-    hf_sliding = create_sliding_window_causal_mask(
-        text_cfg,
-        inputs_embeds,
-        torch.from_numpy(attention_mask),
-        None,
-        torch.from_numpy(position_ids),
-        block_sequence_ids=blk,
+        blk,
     )
 
     def hf_attended(mask):
         m = mask[0, 0].numpy()
         return m if m.dtype == bool else (m > -1e30)
 
-    # Full-attention layers: causal OR same-block, AND padding.
-    np.testing.assert_array_equal(mobius_attended(None), hf_attended(hf_full))
-    # Sliding layers: (causal AND window) OR same-block, AND padding.
     np.testing.assert_array_equal(
-        mobius_attended(text_cfg.sliding_window), hf_attended(hf_sliding)
+        mobius_attended(None), hf_attended(hf_masks["full_attention"])
     )
+    actual_local = mobius_attended(text_cfg.sliding_window)
+    hf_local = hf_attended(hf_masks["sliding_attention"])
+    np.testing.assert_array_equal(actual_local, hf_local)
+    if case == "internal_hole":
+        assert not hf_local[1024, 0]
+        assert not actual_local[1024, 0]
+        assert actual_local[1024, 2]

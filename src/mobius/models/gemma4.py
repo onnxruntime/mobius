@@ -35,9 +35,13 @@ from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
 from mobius._configs import ArchitectureConfig, Gemma4Config, QuantizationConfig
+from mobius._constants import GEMMA4_CUSTOM_GEGLU_METADATA_KEY
+from mobius._flags import flags
 from mobius._weight_utils import (
+    QMoEQuantizationLayout,
     is_packed_quant_key,
     preprocess_quantized_weights,
+    resolve_qmoe_quantization,
     vlm_decoder_weights,
     vlm_embedding_weights,
 )
@@ -47,6 +51,7 @@ from mobius.components import (
     Embedding,
     LayerNorm,
     Linear,
+    MoELayer,
     RMSNorm,
     ScaledQuantizedEmbedding,
     ScaleFreeRMSNorm,
@@ -90,6 +95,146 @@ _GEMMA4_COMPONENT_SOURCES: dict[str, tuple[str, ...]] = {
         "model.language_model.per_layer_projection_norm",
     ),
 }
+
+_TANH_GELU_ACTIVATIONS = frozenset({"gelu_pytorch_tanh", "gelu_new", "gelu_fast"})
+
+
+def _mark_custom_geglu_runtime(result: ir.Value) -> ir.Value:
+    """Persist the experimental operator ABI requirement, not a release claim."""
+    node = result.producer()
+    assert node is not None
+    node.metadata_props[GEMMA4_CUSTOM_GEGLU_METADATA_KEY] = "custom-cuda-geglu-v1"
+    return result
+
+
+def _expert_source_paths(layer_idx: int) -> tuple[str, ...]:
+    return (
+        f"model.language_model.layers.{layer_idx}",
+        f"model.layers.{layer_idx}",
+    )
+
+
+def _expert_quantization(
+    config: Gemma4Config, layer_idx: int
+) -> QMoEQuantizationLayout | None:
+    """Resolve native experts without bypassing main's per-projection module plan."""
+    if not config.enable_moe_block:
+        return None
+    quantization = _active_quantization(config.quantization_for("decoder"))
+    if quantization is None or not quantization.quantize_moe:
+        return None
+    if not flags.gemma4_custom_geglu:
+        raise NotImplementedError(
+            "Quantized Gemma4 GEGLU experts require explicit custom-runtime opt-in: "
+            "MOBIUS_GEMMA4_CUSTOM_GEGLU=1 (or override_flags(gemma4_custom_geglu=True)). "
+            "Unmodified released ORT support is unverified."
+        )
+    if config.dtype not in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+        raise NotImplementedError("Quantized Gemma4 MoE requires FLOAT16 or BFLOAT16.")
+    layout = resolve_qmoe_quantization(quantization, _expert_source_paths(layer_idx))
+    if (
+        config.disable_qmoe
+        or config.hidden_act not in _TANH_GELU_ACTIVATIONS
+        or layout is None
+        or any(
+            projection.bits != 4 or projection.quant_method != "olive"
+            for projection in (layout.fc1, layout.fc2)
+        )
+    ):
+        raise NotImplementedError(
+            "Quantized Gemma4 MoE experts require Olive integer-affine INT4, "
+            "tanh-GELU, and native QMoE enabled."
+        )
+    return layout
+
+
+def _extract_native_expert_weights(
+    state_dict: dict[str, torch.Tensor], config: Gemma4Config, *, prefix: str
+) -> dict[str, torch.Tensor]:
+    """Consume only Gemma4 expert sidecars, leaving ordinary module plans untouched.
+
+    Return canonical QMoE groups separately so the legacy/root Olive converter
+    cannot interpret ``fc1_scales`` as another raw ``*_scales`` sidecar. The shared
+    component loader already recognizes complete canonical MoELayer groups.
+    """
+    result: dict[str, torch.Tensor] = {}
+    for index in range(config.num_hidden_layers):
+        layout = _expert_quantization(config, index)
+        if layout is None:
+            continue
+        assert config.moe_intermediate_size is not None
+        assert config.num_local_experts is not None
+        root = f"{prefix}layers.{index}"
+        for projection, quantization, output_size, input_size, target in (
+            (
+                "gate_up_proj",
+                layout.fc1,
+                2 * config.moe_intermediate_size,
+                config.hidden_size,
+                "fc1",
+            ),
+            ("down_proj", layout.fc2, config.hidden_size, config.moe_intermediate_size, "fc2"),
+        ):
+            stem = f"{root}.experts.{projection}"
+            keys = [key for key in state_dict if key.startswith(stem)]
+            if not keys:
+                continue
+            group = quantization.group_size
+            if input_size % group:
+                raise ValueError(f"Gemma4 QMoE {stem}: input size must divide group_size.")
+            blocks = input_size // group
+            shapes = {
+                "_qweight": (config.num_local_experts, output_size, input_size // 2),
+                "_scales": (config.num_local_experts, output_size, blocks),
+            }
+            if not quantization.sym:
+                shapes["_qzeros"] = (config.num_local_experts, output_size, (blocks + 1) // 2)
+            expected = {stem + suffix for suffix in shapes}
+            if set(keys) != expected:
+                raise ValueError(
+                    f"Gemma4 QMoE {stem}: expected sidecars {sorted(expected)}, "
+                    f"got {sorted(keys)}."
+                )
+            suffixes = {
+                "_qweight": "experts_weights",
+                "_scales": "scales",
+                "_qzeros": "experts_zero_points",
+            }
+            for suffix, shape in shapes.items():
+                value = state_dict[stem + suffix]
+                if tuple(value.shape) != shape:
+                    raise ValueError(
+                        f"Gemma4 QMoE {stem + suffix}: expected shape {shape}, "
+                        f"got {tuple(value.shape)}."
+                    )
+                if suffix == "_scales":
+                    if (
+                        not value.is_floating_point()
+                        or not torch.isfinite(value).all()
+                        or torch.any(value < 0)
+                    ):
+                        raise ValueError(f"Gemma4 QMoE {stem}: invalid quantization scales.")
+                elif value.dtype != torch.uint8:
+                    raise ValueError(f"Gemma4 QMoE {stem + suffix} must be uint8.")
+                result[f"{root}.moe.{target}_{suffixes[suffix]}"] = state_dict.pop(
+                    stem + suffix
+                )
+        # Fold expert output scales into block scales, never the packed INT4 codes.
+        scale_key = f"{root}.router.per_expert_scale"
+        fc2_key = f"{root}.moe.fc2_scales"
+        if fc2_key in result and scale_key in state_dict:
+            scale = state_dict[scale_key]
+            if (
+                tuple(scale.shape) != (config.num_local_experts,)
+                or not torch.isfinite(scale).all()
+            ):
+                raise ValueError(f"Gemma4 QMoE {scale_key}: invalid expert output scales.")
+            result[fc2_key] = result[fc2_key] * scale.to(result[fc2_key].dtype)[:, None, None]
+            state_dict[scale_key] = torch.ones_like(scale)
+        for key in list(state_dict):
+            if key.startswith(f"{root}.router."):
+                result[key.replace(".router.", ".moe.gate.")] = state_dict.pop(key)
+    return result
 
 
 def _split_per_layer_projection_weight(
@@ -440,7 +585,7 @@ def _remap_moe_expert_weights(
     state_dict: dict[str, torch.Tensor],
     config: Gemma4Config,
 ) -> None:
-    """Rename HF MoE expert weights and fold router scale in-place.
+    """Rename HF MoE expert weights and fold expert output scales in-place.
 
     Shared by ``Gemma4CausalLMModel`` and ``Gemma4Model`` to avoid
     duplicating the rename/fold logic.
@@ -479,13 +624,9 @@ def _remap_moe_expert_weights(
             new_key = key.replace(".experts.down_proj", ".fc2_experts_weights")
             state_dict[new_key] = state_dict.pop(key)
 
-    # Fold hidden_size^-0.5 into router.scale
     if config.enable_moe_block:
-        scale_factor = float(config.hidden_size**-0.5)
         pes_by_prefix: dict[str, torch.Tensor] = {}
         for key in list(state_dict.keys()):
-            if ".router.scale" in key and ".per_expert_scale" not in key:
-                state_dict[key] = state_dict[key] * scale_factor
             if key.endswith(".router.per_expert_scale"):
                 pes_by_prefix[key[: -len(".router.per_expert_scale")]] = state_dict[key]
         # Fold per_expert_scale into the expert down projection (fc2). HF's router
@@ -807,12 +948,14 @@ class Gemma4VisionPooler(nn.Module):
         y_pos = op.Gather(pixel_position_ids, op.Constant(value_int=1), axis=2)  # [B, T]
         is_padding = op.And(op.Equal(x_pos, neg_one), op.Equal(y_pos, neg_one))  # [B, T] bool
 
-        # zero out padding hidden states: features * (1 - is_padding)
-        not_padding_f = op.CastLike(
-            op.Cast(op.Not(is_padding), to=ir.DataType.FLOAT), vision_features
-        )
-        not_padding_f = op.Unsqueeze(not_padding_f, [2])  # [B, T, 1]
-        vision_features = op.Mul(vision_features, not_padding_f)  # [B, T, D]
+        # Match HF masked_fill, including padded NaN/Inf, in the FP32 pooling
+        # path. Keep the original features as the mean-rounding dtype reference.
+        features_f32 = op.Cast(vision_features, to=ir.DataType.FLOAT)
+        masked_features_f32 = op.Where(
+            op.Unsqueeze(is_padding, [2]),
+            op.Constant(value_float=0.0),
+            features_f32,
+        )  # [B, T, D]
 
         # --- 2. Clamp positions to [0, ∞) so padding doesn't break Div ------
         clamped_x = op.Max(x_pos, op.Constant(value_int=0))  # [B, T]
@@ -854,23 +997,25 @@ class Gemma4VisionPooler(nn.Module):
         on_val = 1.0 / float(k2)
         one_hot_vals = op.Constant(value_floats=[0.0, on_val])
         weights = op.OneHot(kernel_idxs, valid_depth, one_hot_vals)  # [B, T, valid_depth] f32
-        # Cast to model dtype for the subsequent MatMul
-        weights = op.CastLike(weights, vision_features)
-
         # --- 6. Weighted sum: [B, valid_depth, T] @ [B, T, D] ---------------
+        # HF accumulates FP32 coefficients and FP32 features, then rounds the
+        # pooled mean once to working dtype. BF16 coefficients (notably 1/9)
+        # change that mean even if the MatMul itself uses FP32 accumulation.
         weights_t = op.Transpose(weights, perm=[0, 2, 1])  # [B, valid_depth, T]
-        output = op.MatMul(weights_t, vision_features)  # [B, valid_depth, D]
+        output = op.MatMul(weights_t, masked_features_f32)  # [B, valid_depth, D]
+        output = op.CastLike(output, vision_features)
 
         # --- 7. Scale by sqrt(hidden_size) matching HF VisionPooler ----------
-        scale = op.CastLike(op.Constant(value_float=self._pooler_scale), output)
-        return op.Mul(output, scale)
+        # HF rounds the pooled mean to working dtype before FP32 scaling/standardization.
+        output = op.Cast(output, to=ir.DataType.FLOAT)
+        return op.Mul(output, op.Constant(value_float=self._pooler_scale))
 
 
 class _Gemma4VisionPatchEmbedder(nn.Module):
     """Gemma4 patch embedder: linear projection + 2D position lookup.
 
     Inputs:
-    - ``pixel_values [B, N, 3*patch_size^2]``: pre-patchified, normalized to ``[-1, 1]``
+    - ``pixel_values [B, N, 3*patch_size^2]``: FP32 processor patches in ``[0, 1]``
     - ``pixel_position_ids [B, N, 2]``: (x, y) coordinates for each patch
 
     Output: ``[B, N, hidden_size]``
@@ -905,10 +1050,11 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
         position embeddings are zeroed exactly as HF does in
         ``Gemma4VisionPatchEmbedder._position_embeddings``.
         """
-        # pixel_values in [0,1] -> normalize to [-1, 1]: 2*(v - 0.5) = 2v - 1
-        two = op.CastLike(op.Constant(value_float=2.0), pixel_values)
-        one = op.CastLike(op.Constant(value_float=1.0), pixel_values)
-        pixel_values = op.Sub(op.Mul(pixel_values, two), one)
+        # HF normalizes processor pixels in FP32, then rounds to the projection dtype.
+        # Casting processor pixels first loses information, especially for BF16.
+        pixel_values = op.Cast(pixel_values, to=ir.DataType.FLOAT)
+        pixel_values = op.Mul(op.Sub(pixel_values, 0.5), 2.0)
+        pixel_values = op.CastLike(pixel_values, self.position_embedding_table)
         hidden_states = self.input_proj(op, pixel_values)  # [B, N, hidden]
 
         # Detect padding patches: x-coord == -1 means the patch is padding.
@@ -949,6 +1095,7 @@ class _Gemma4VisionEncoderCore(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         vc = config.vision  # VisionConfig for the SigLIP encoder
+
         linear_class, clippable_linear_class = _vision_linear_classes(config)
         self.patch_embedder = _Gemma4VisionPatchEmbedder(
             patch_size=vc.patch_size or 16,
@@ -1326,7 +1473,7 @@ class Gemma4TextAttention(nn.Module):
             past_key = past_key_value[0] if past_key_value is not None else None
             past_value = past_key_value[1] if past_key_value is not None else None
 
-            gqa_attrs: dict = {
+            gqa_attrs = {
                 "num_heads": self.num_attention_heads,
                 "kv_num_heads": self.num_key_value_heads,
                 "scale": self.scaling,
@@ -1442,20 +1589,16 @@ class Gemma4TextAttention(nn.Module):
 
 
 class _Gemma4MoeRouter(nn.Module):
-    """Gemma4 MoE router: scale-free RMSNorm → learned scale → linear → softmax.
+    """Gemma4 MoE router: scale-free RMSNorm → learned scale → raw logits.
 
     Matches ``Gemma4TextRouter`` in HuggingFace.
 
-    Parameters (aligned with HF state_dict, with one weight-fold):
-    - ``scale`` [hidden_size]: ``router.scale * hidden_size^-0.5`` (folded during
-      ``preprocess_weights`` — see ``Gemma4CausalLMModel.preprocess_weights``)
+    Parameters (aligned with HF state_dict):
+    - ``scale`` [hidden_size]: unmodified learned router scale
     - ``proj.weight`` [num_experts, hidden_size]: router logits (no bias)
     - ``per_expert_scale`` [num_experts]: per-expert output weight scaling
 
     ``router.norm`` is scale-free (no learnable parameter, omitted from state_dict).
-
-    The ``hidden_size^-0.5`` scale factor is absorbed into ``self.scale`` at weight-load
-    time to avoid graph-level float-constant collisions across multiple decoder layers.
 
     Args:
         hidden_size: Model hidden dimension.
@@ -1463,23 +1606,28 @@ class _Gemma4MoeRouter(nn.Module):
         rms_norm_eps: Epsilon for the scale-free RMSNorm.
     """
 
+    # Olive expert quantization leaves the learned router projection floating point.
+    # Use the shared component loader's exclusion hook rather than rewriting its plan.
+    component_quantization_excluded_methods: ClassVar[frozenset[str]] = frozenset(
+        {"olive", "gptq", "awq"}
+    )
+
     def __init__(self, hidden_size: int, num_experts: int, rms_norm_eps: float = 1e-6):
         super().__init__()
         self._eps = rms_norm_eps
         self._hidden_size = hidden_size
-        # ``scale`` stores router.scale * hidden_size^-0.5 (folded in preprocess_weights)
         self.scale = nn.Parameter([hidden_size])
         self.proj = Linear(hidden_size, num_experts, bias=False)
         self.per_expert_scale = nn.Parameter([num_experts])
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        """Compute router probabilities over all experts.
+        """Compute raw logits; native MoE/QMoE performs softmax internally.
 
         Args:
             hidden_states: [num_tokens, hidden_size] (batch-sequence flattened)
 
         Returns:
-            router_probs: [num_tokens, num_experts] full softmax probabilities
+            Router logits: [num_tokens, num_experts].
         """
         # Scale-free RMSNorm using RMSNormalization op (epsilon as attribute avoids
         # graph-level float constant name collisions across multiple decoder layers).
@@ -1489,11 +1637,29 @@ class _Gemma4MoeRouter(nn.Module):
             hidden_states,
         )
         x_normed = op.RMSNormalization(hidden_states, ones, epsilon=self._eps, axis=-1)
-        # Scale: x_normed * self.scale  (hidden_size^-0.5 already folded into scale)
         x_scaled = op.Mul(x_normed, self.scale)
+        # Keep the learned-scale rounding, then use FP32 opmath for HF's Python scalar.
+        x_scaled = op.CastLike(
+            op.Mul(
+                op.Cast(x_scaled, to=ir.DataType.FLOAT),
+                op.Constant(value_float=float(self._hidden_size**-0.5)),
+            ),
+            x_scaled,
+        )
         # Linear projection then softmax -> router_probs [num_tokens, num_experts]
-        expert_scores = self.proj(op, x_scaled)
-        return op.Softmax(expert_scores, axis=-1)
+        return self.proj(op, x_scaled)
+
+    def qmoe_routing(
+        self, op: OpBuilder, hidden_states: ir.Value, router_input: ir.Value
+    ) -> tuple[ir.Value, None, bool, float]:
+        # Router sees the residual; experts see a separately normalized activation.
+        return self.forward(op, router_input), None, True, 1.0
+
+
+class _Gemma4QMoELayer(MoELayer):
+    """Native INT4 experts with exact tanh-GEGLU instead of approximate SwiGLU."""
+
+    _qmoe_activation_type = "geglu"
 
 
 class Gemma4DecoderLayer(nn.Module):
@@ -1591,6 +1757,7 @@ class Gemma4DecoderLayer(nn.Module):
             self.act_fn = get_activation(config.hidden_act)
 
         self._enable_moe_block = config.enable_moe_block
+        self.moe: MoELayer | None = None
         if config.enable_moe_block:
             assert config.num_local_experts is not None, "num_local_experts required for MoE"
             assert config.num_experts_per_tok is not None, (
@@ -1604,18 +1771,17 @@ class Gemma4DecoderLayer(nn.Module):
             self._num_experts = config.num_local_experts
             self._moe_intermediate_size = config.moe_intermediate_size
             self._hidden_size = config.hidden_size
-            # The fused com.microsoft::MoE op's only GATED activation is
-            # ``swiglu`` = ``x * sigmoid(activation_alpha * x) * up``. Gemma 4
-            # experts use ``act_fn(gate) * up`` where ``act_fn`` is the config's
-            # ``hidden_act`` (``gelu_pytorch_tanh`` for the 26B-A4B / 31B MoE
-            # checkpoints), NOT silu. Since ``x * sigmoid(1.702 * x)`` closely
-            # approximates gelu, gelu-family activations map to
-            # ``activation_alpha=1.702``; a genuine silu expert maps to 1.0.
             _moe_act = (config.hidden_act or "").lower()
-            self._moe_swiglu_alpha = 1.702 if "gelu" in _moe_act else 1.0
+            self._fused_moe_activation = (
+                "geglu"
+                if _moe_act in _TANH_GELU_ACTIVATIONS
+                else "swiglu"
+                if _moe_act in {"silu", "swish"}
+                else None
+            )
             # The unfused fallback (EPs without a fused MoE op) uses explicit
             # ONNX ops, so it applies the EXACT expert activation via the shared
-            # ACT2FN mapping instead of the swiglu approximation. This keeps
+            # ACT2FN mapping. This keeps
             # ``gelu`` (erf) distinct from the tanh-approx variants
             # (``gelu_pytorch_tanh``/``gelu_new``/``gelu_fast``) and ``silu`` ->
             # Swish, faithfully matching HuggingFace's ``act_fn(gate) * up`` for
@@ -1623,19 +1789,32 @@ class Gemma4DecoderLayer(nn.Module):
             self._moe_act_fn = get_activation(config.hidden_act)
             moe_inter = config.moe_intermediate_size
 
-            self.router = _Gemma4MoeRouter(
+            router = _Gemma4MoeRouter(
                 config.hidden_size, config.num_local_experts, config.rms_norm_eps
             )
+            if _expert_quantization(config, layer_idx) is not None:
+                self.moe = _Gemma4QMoELayer(
+                    dataclasses.replace(
+                        config,
+                        quantization=config.quantization_for("decoder"),
+                        component_quantization=None,
+                        qmoe_source_paths=_expert_source_paths(layer_idx),
+                    ),
+                    gate=router,
+                )
+            else:
+                self.router = router
             # Expert weights stored as 3D tensors (all experts stacked).
             # fc1_experts_weights: gate+up combined [E, 2*moe_inter, hidden].
             # fc2_experts_weights: down projection [E, hidden, moe_inter].
             # These map to HF experts.gate_up_proj and experts.down_proj.
-            self.fc1_experts_weights = nn.Parameter(
-                [config.num_local_experts, 2 * moe_inter, config.hidden_size]
-            )
-            self.fc2_experts_weights = nn.Parameter(
-                [config.num_local_experts, config.hidden_size, moe_inter]
-            )
+            if self.moe is None:
+                self.fc1_experts_weights = nn.Parameter(
+                    [config.num_local_experts, 2 * moe_inter, config.hidden_size]
+                )
+                self.fc2_experts_weights = nn.Parameter(
+                    [config.num_local_experts, config.hidden_size, moe_inter]
+                )
             # MoE-specific norms (in addition to the shared pre/post_feedforward norms)
             self.pre_feedforward_layernorm_2 = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -1699,7 +1878,7 @@ class Gemma4DecoderLayer(nn.Module):
             #   combined: post_ff_norm(dense + moe) + residual
             dense_out = self.post_feedforward_layernorm_1(op, hidden_states)
 
-            # MoE input is the pre-attention residual (flattened to 2D for routing).
+            # Route the feed-forward residual, flattened to [B*S, H].
             batch_size = op.Shape(residual, start=0, end=1)  # [1] scalar
             seq_len = op.Shape(residual, start=1, end=2)  # [1] scalar
             hidden_size = op.Shape(residual, start=2, end=3)  # [1] scalar
@@ -1707,25 +1886,33 @@ class Gemma4DecoderLayer(nn.Module):
             flat_shape = op.Concat(num_tokens, hidden_size, axis=0)  # [2]
             residual_flat = op.Reshape(residual, flat_shape)  # [B*S, H]
 
-            # router_probs: [B*S, E] full softmax over all experts
-            router_probs = self.router(op, residual_flat)  # [B*S, E]
-
             # Norm residual before experts
             normed_flat = self.pre_feedforward_layernorm_2(op, residual_flat)  # [B*S, H]
 
             caps = ep_capabilities()
-            if caps.supports_fused_moe:
+            custom_geglu = caps.name == "cuda" and flags.gemma4_custom_geglu
+            if self.moe is not None:
+                if not (caps.supports_fused_moe and custom_geglu):
+                    raise NotImplementedError(
+                        "Quantized Gemma4 MoE requires a GEGLU-capable custom CUDA runtime "
+                        "and MOBIUS_GEMMA4_CUSTOM_GEGLU=1."
+                    )
+                moe_out_flat = op.CastLike(
+                    _mark_custom_geglu_runtime(self.moe(op, normed_flat, residual_flat)),
+                    normed_flat,
+                )
+            elif (
+                caps.supports_fused_moe
+                and self._fused_moe_activation is not None
+                and (self._fused_moe_activation != "geglu" or custom_geglu)
+            ):
                 # Fused com.microsoft::MoE op handles top-k selection +
                 # expert dispatch internally. Requires ORT main (post
                 # microsoft/onnxruntime#28467, MoE GEMM Refactor) which
                 # plumbs the SwiGLU schema attributes to the kernel.
                 #
-                # Gemma 4 gated-FFN semantics via the fused SwiGLU schema:
-                #   activation_type=swiglu   — x * sigmoid(activation_alpha*x) * up
-                #   activation_alpha=1.702   — approximates gelu_pytorch_tanh, the
-                #                              activation Gemma 4 experts actually
-                #                              use (act_fn(gate)*up); a silu expert
-                #                              would use 1.0. (See _moe_swiglu_alpha.)
+                # GEGLU is tanh-GELU(gate)*up, not sigmoid(1.702*gate)*gate*up.
+                # SwiGLU uses alpha=1 for genuine SiLU; GEGLU ignores alpha.
                 #   activation_beta=0.0      — linear * gate (no GPT-OSS "+1" bias)
                 #   swiglu_limit=inf         — no clipping (≤0 disables the clamp)
                 #   swiglu_fusion=1          — interleaved layout
@@ -1763,28 +1950,33 @@ class Gemma4DecoderLayer(nn.Module):
                     ),
                     op.Constant(value_ints=[e_dim, 2 * inter, hidden]),
                 )  # [E, 2*inter, H] interleaved
-                moe_out_flat = op.CastLike(
-                    op.MoE(  # type: ignore[attr-defined]
-                        normed_flat,
-                        router_probs,
-                        fc1_interleaved,
-                        None,  # fc1_experts_bias (slot 3, optional)
-                        self.fc2_experts_weights,
-                        activation_type="swiglu",
-                        k=self._top_k,
-                        normalize_routing_weights=1,
-                        activation_alpha=self._moe_swiglu_alpha,
-                        activation_beta=0.0,
-                        swiglu_limit=float("inf"),
-                        swiglu_fusion=1,
-                        _domain="com.microsoft",
-                    ),
-                    normed_flat,  # match input dtype (bf16/fp16/fp32)
-                )  # [B*S, H]
+                moe_result = op.MoE(  # type: ignore[attr-defined]
+                    normed_flat,
+                    self.router(op, residual_flat),
+                    fc1_interleaved,
+                    None,  # fc1_experts_bias (slot 3, optional)
+                    self.fc2_experts_weights,
+                    activation_type=self._fused_moe_activation,
+                    k=self._top_k,
+                    normalize_routing_weights=1,
+                    activation_alpha=1.0,
+                    activation_beta=0.0,
+                    swiglu_limit=float("inf"),
+                    swiglu_fusion=1,
+                    _domain="com.microsoft",
+                )
+                if self._fused_moe_activation == "geglu":
+                    moe_result = _mark_custom_geglu_runtime(moe_result)
+                moe_out_flat = op.CastLike(moe_result, normed_flat)  # [B*S, H]
             else:
                 # EPs without fused MoE support fall back to a static
                 # per-expert unroll.
-                moe_out_flat = self._dispatch_moe_fallback(op, normed_flat, router_probs)
+                router_logits = self.router(op, residual_flat)
+                moe_out_flat = self._dispatch_moe_fallback(
+                    op,
+                    normed_flat,
+                    op.Softmax(op.Cast(router_logits, to=ir.DataType.FLOAT), axis=-1),
+                )
 
             moe_out = op.Reshape(moe_out_flat, op.Shape(residual))  # [B, S, H]
             moe_out = self.post_feedforward_layernorm_2(op, moe_out)
@@ -1874,7 +2066,7 @@ class Gemma4DecoderLayer(nn.Module):
         up = op.Einsum(normed_flat, up_w, equation="th,eih->tei")
         # Exact expert activation via ACT2FN: ``gelu_pytorch_tanh`` -> tanh-approx
         # GELU, bare ``gelu`` -> erf GELU, ``silu``/``swish`` -> Swish, etc. This
-        # avoids the swiglu approximation used on the fused path.
+        # preserves the distinction between erf GELU and tanh-GEGLU.
         activated = self._moe_act_fn(op, gate)
         inter = op.Mul(activated, up)  # [T, E, moe_inter]
 
@@ -1882,7 +2074,11 @@ class Gemma4DecoderLayer(nn.Module):
         expert_out = op.Einsum(inter, self.fc2_experts_weights, equation="tei,ehi->teh")
 
         # Weight by the dense routing vector and sum over experts.
-        weighted = op.Mul(expert_out, op.Unsqueeze(dense_w, [2]))  # [T, E, H] * [T, E, 1]
+        # HF rounds each FP32-weighted contribution back to the expert dtype.
+        weighted = op.CastLike(
+            op.Mul(op.Cast(expert_out, to=ir.DataType.FLOAT), op.Unsqueeze(dense_w, [2])),
+            expert_out,
+        )  # [T, E, H] * [T, E, 1]
         return op.ReduceSum(weighted, [1], keepdims=0)  # [T, H]
 
 
@@ -1984,9 +2180,9 @@ class Gemma4TextModel(nn.Module):
         self.layer_types = layer_types
         self.sliding_window = config.sliding_window
         # Bidirectional attention mode (None | "vision"). When "vision",
-        # contiguous image-token blocks attend bidirectionally; the overlay is
-        # derived from input_ids at runtime via ``block_sequence_ids`` and forces
-        # the float-bias attention path (``is_causal=0``). HF also defines an
+        # contiguous image-token blocks attend bidirectionally in local layers.
+        # The overlay is derived from input_ids via ``block_sequence_ids`` and
+        # uses the float-bias attention path (``is_causal=0``) locally. HF defines an
         # "all" mode (every token bidirectional, no causal mask); it is not used
         # by any supported Gemma4 checkpoint and not implemented here, so reject
         # it explicitly rather than silently falling back to causal attention.
@@ -2267,12 +2463,10 @@ class Gemma4TextModel(nn.Module):
         from mobius.components._attention import GQAContext, StaticCacheState
 
         dtype = get_build_dtype()
-        # Bidirectional vision-block overlay (Gemma4 larger models). When
-        # active, contiguous vision-token blocks attend bidirectionally on
-        # BOTH full and sliding layers. This cannot be expressed by the
-        # GroupQueryAttention op (causal / local-window only), so we force
-        # the float-bias Attention path with ``is_causal=0`` and bake the
-        # full mask (causal + sliding + padding + blockwise OR) into the bias.
+        # HF applies the image overlay only to local layers:
+        # valid_key AND (causal OR same-image) AND (key > query - window).
+        # Global layers stay causal. Retain the conservative all-Attention
+        # construction here; the normal optimizer can fuse causal globals to GQA.
         #
         # ``block_sequence_ids`` [B, S] identifies contiguous image token
         # blocks. It is derived from ``input_ids`` (image token spans only;
@@ -2283,16 +2477,8 @@ class Gemma4TextModel(nn.Module):
         # to the decoder but cannot forward an arbitrary int tensor). When a
         # caller supplies ``block_sequence_ids`` directly it is used as-is.
         #
-        # Trade-off: the overlay is a *static* graph choice — once a model is
-        # built with ``use_bidirectional_attention == "vision"`` the decoder
-        # always takes the float-bias (``is_causal=0``) path and forgoes GQA,
-        # for text-only prompts and every decode step too. This is unavoidable
-        # in a single static graph: image-token presence is data-dependent at
-        # runtime, and the same graph serves both image prefill and text decode.
-        # It stays numerically correct everywhere — when there are no image
-        # tokens the block ids are all ``-1`` and the ``q_group >= 0`` guard in
-        # ``create_attention_bias`` makes the overlay a pure no-op (plain causal,
-        # matching HuggingFace). Only the fused/GQA fast path is given up.
+        # The overlay is a static graph choice even for text-only decode.
+        # All -1 block IDs make it a no-op at runtime.
         bidirectional = self._use_bidirectional_attention == "vision" and self._has_image_token
         if bidirectional and block_sequence_ids is None and input_ids is not None:
             block_sequence_ids = _compute_block_sequence_ids(
@@ -2311,11 +2497,6 @@ class Gemma4TextModel(nn.Module):
             and caps.supports_fused_rope
             and not use_block_overlay
         )
-        # When the blockwise overlay is active the Attention op must NOT
-        # re-apply its built-in causal mask (it would cancel the
-        # future-position unmasking baked into the float bias).
-        attn_is_causal = 0 if use_block_overlay else 1
-
         if use_gqa:
             # Calling forward() on the RoPE modules materializes their
             # cos_cache / sin_cache nn.Parameters as ONNX graph initializers.
@@ -2447,7 +2628,6 @@ class Gemma4TextModel(nn.Module):
                     input_ids=query_input,
                     attention_mask=attention_mask,
                     dtype=self._dtype,
-                    block_sequence_ids=block_sequence_ids if use_block_overlay else None,
                 ),
             }
             fallback_pos_dict = position_embeddings_dict
@@ -2529,7 +2709,8 @@ class Gemma4TextModel(nn.Module):
                 shared_kv_states=shared_kv_states,
                 per_layer_input=per_layer_input,
                 past_key_value=past_kv,
-                is_causal=attn_is_causal,
+                # Only local layers may unmask future keys within an image block.
+                is_causal=0 if use_block_overlay and layer_type == "sliding_attention" else 1,
                 static_kv_seqlen=static_kv_seqlen,
             )
             # KV-shared layers borrow K,V from source layers — exclude from
@@ -2684,10 +2865,14 @@ class Gemma4CausalLMModel(CausalLMModel):
         # HF's model.embed_tokens_per_layer.weight [V, L*D] maps directly
         # to our fused embedding table — no splitting needed.
         # (For WebGPU, splitting is handled by _Gemma4DecoderModel.preprocess_weights.)
-        # Map HF expert weight names and fold router scale
+        config = self.config
+        if not isinstance(config, Gemma4Config):
+            raise TypeError("Gemma4 expert preprocessing requires a Gemma4Config.")
+        native = _extract_native_expert_weights(state_dict, config, prefix="model.")
+        # Map HF expert weight names and fold expert output scales.
         _remap_moe_expert_weights(state_dict, self.config)
         _split_per_layer_projection_weight(state_dict, "model.", self.config)
-        return super().preprocess_weights(state_dict)
+        return super().preprocess_weights(state_dict) | native
 
     def static_kv_cache_specs(self) -> list[tuple[int, int]]:
         """Per-cache-layer ``(num_kv_heads, head_dim)`` for static-cache mode."""
@@ -2793,11 +2978,16 @@ class _Gemma4VisionEncoderModel(nn.Module):
     def __init__(self, config: Gemma4Config):
         super().__init__()
         vc = config.vision  # VisionConfig for the SigLIP encoder
+        if vc is None or vc.hidden_size is None:
+            raise ValueError("Gemma4 vision encoder requires vision.hidden_size.")
         self._text_hidden_size = config.hidden_size
+        self._dtype = config.dtype
         self.encoder = _Gemma4VisionEncoderCore(config)
         # Gemma4VisionPooler: 3x3 spatial average pooling + sqrt(hidden) scaling.
         # Reduces N patches to N/9 before projection.
         self.pooler = Gemma4VisionPooler(vc.hidden_size, vc.pooling_kernel_size or 3)
+        self.std_bias = nn.Parameter([vc.hidden_size]) if vc.standardize else None
+        self.std_scale = nn.Parameter([vc.hidden_size]) if vc.standardize else None
         self.projector_norm = ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
         linear_class, _ = _vision_linear_classes(config)
         self.projector = linear_class(vc.hidden_size, config.hidden_size, bias=False)
@@ -2814,6 +3004,13 @@ class _Gemma4VisionEncoderModel(nn.Module):
         # Position-based pooling: [B, N, D] -> [B, N/9, D], scales by sqrt(D).
         # Passes pixel_position_ids so the pooler can assign patches to spatial buckets.
         vision_features = self.pooler(op, vision_features, pixel_position_ids)
+
+        if self.std_bias is not None and self.std_scale is not None:
+            vision_features = op.Mul(
+                op.Sub(vision_features, op.Cast(self.std_bias, to=ir.DataType.FLOAT)),
+                op.Cast(self.std_scale, to=ir.DataType.FLOAT),
+            )
+        vision_features = op.Cast(vision_features, to=self._dtype)
 
         # Scale-free norm + linear projection -> [B, N/9, text_hidden]
         vision_features = self.projector_norm(op, vision_features)
@@ -2832,7 +3029,9 @@ class _Gemma4VisionEncoderModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
-            if key.startswith("vision_tower."):
+            if key in ("vision_tower.std_bias", "vision_tower.std_scale"):
+                renamed[key.removeprefix("vision_tower.")] = value
+            elif key.startswith("vision_tower."):
                 new_key = "encoder." + key[len("vision_tower.") :]
                 # HF Gemma4VisionModel wraps its layer list in a Gemma4VisionEncoder
                 # submodule, adding an extra "encoder." level. Our _Gemma4VisionEncoderCore
@@ -3543,6 +3742,8 @@ class Gemma4Model(nn.Module):
             elif key.startswith("lm_head."):
                 renamed["decoder." + key] = value
 
+            elif key in ("vision_tower.std_bias", "vision_tower.std_scale"):
+                renamed["vision_encoder." + key.removeprefix("vision_tower.")] = value
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
                 # HF wraps encoder layers under an extra "encoder." sub-module; strip it
@@ -3599,10 +3800,12 @@ class Gemma4Model(nn.Module):
             else:
                 renamed[key] = value
 
-        # Map HF expert weight names and fold router scale
+        native = _extract_native_expert_weights(renamed, self.config, prefix="decoder.model.")
+        # Map HF expert weight names and fold expert output scales.
         _remap_moe_expert_weights(renamed, self.config)
 
         renamed = _preprocess_component_quantized_weights(renamed, self.config)
+        renamed.update(native)
 
         # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 256 MiB
         # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.
