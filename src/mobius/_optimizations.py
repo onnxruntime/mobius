@@ -21,10 +21,11 @@ support requires only a new registry entry — no changes to this module.
 Post-weight passes
 ------------------
 :func:`fold_initializers_after_weights` should be called after weights are loaded.
-It runs :class:`~mobius._passes.FoldTransposedInitializerPass` and
-:class:`~mobius._passes.FoldConcatInitializersPass` to fold runtime Transpose and
-Concat nodes over initializers into pre-computed weights, then removes unused
-nodes.
+It runs :class:`~mobius._passes.FoldTransposedInitializerPass`,
+:class:`~mobius._passes.FoldConcatInitializersPass`, and
+:class:`~mobius._passes.FoldWeightLayoutPass` to fold runtime Transpose, Concat,
+and static layout chains over initializers into pre-computed weights, then
+removes unused nodes.
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ from mobius._flags import flags
 from mobius._passes import (
     FoldConcatInitializersPass,
     FoldTransposedInitializerPass,
+    FoldWeightLayoutPass,
     Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
 )
@@ -780,11 +782,12 @@ def optimize_model(
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
-    """Fold weight ``Transpose`` and ``Concat`` nodes after weights are loaded.
+    """Fold weight Transpose, Concat, and static layout chains after weights load.
 
     Runs :class:`~onnx_ir.passes.common.LiftConstantsToInitializersPass`,
     :class:`~mobius._passes.FoldConcatInitializersPass`,
-    :class:`~mobius._passes.FoldTransposedInitializerPass`, and
+    :class:`~mobius._passes.FoldTransposedInitializerPass`,
+    :class:`~mobius._passes.FoldWeightLayoutPass`, and
     :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` in order.
     FoldConcat must precede FoldTranspose so that packed QKV initializers are
     visible before the Transpose fold runs.
@@ -794,6 +797,7 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
             common_passes.LiftConstantsToInitializersPass(),
             FoldConcatInitializersPass(),
             FoldTransposedInitializerPass(),
+            FoldWeightLayoutPass(),
             common_passes.RemoveUnusedNodesPass(),
         ]
     )(model)
