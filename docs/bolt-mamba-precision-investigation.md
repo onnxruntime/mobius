@@ -9,6 +9,14 @@ convolution backend is the intended contract for this binary.
 The external package and its CUDA implementation are not part of Mobius.
 No model weights, extracted kernels, or third-party binaries are included here.
 
+**Source follow-up:** the owning public repository was subsequently located.
+[nemotron_ops PR #1](https://github.com/tianleiwu/nemotron_ops/pull/1) now
+contains the actual CUDA changes and weight-free executable regressions.
+Both precision boundaries are independently opt-in; existing defaults remain
+unchanged. All four CUDA policy regressions executed and passed, and all four
+rebuilt libraries were replayed through the package's ORT runtime.
+This does not establish full decoder parity or generation correctness.
+
 ## Identical-input findings
 
 The original compiled operator was invoked using its original layer-zero
@@ -164,19 +172,76 @@ record of local package-specific evidence, not a self-contained public
 reproducer: the external package, retained inputs and isolated runtime
 must be supplied separately.
 
-## Remaining work before a fix can be claimed
+## Source-owned intervention
 
-The binary embeds a `nemotron_ops` CUDA source path, but that source and
-its owning repository are unavailable in the supplied package. A
-Mobius-side change cannot correct an independently supplied compiled
-custom operator. No production precision change is proposed here.
+The source changes are based on upstream
+`e4f63ffdcb830e2faf5ddb149047953d922a6afb` in
+[`tianleiwu/nemotron_ops`](https://github.com/tianleiwu/nemotron_ops).
+The public source includes optimizations beyond the supplied binary's
+inspected kernel template signatures. Nevertheless, the rebuilt default
+matches the supplied binary **bitwise for all five stage outputs in both
+retained blocks**. This is fixture-level equivalence, not proof that every
+input or full-model execution is unchanged.
 
-After obtaining that source and agreeing on the intended contract:
+The source PR adds two independent CMake options, both defaulting to `OFF`:
 
-1. Add an isolated cast-only kernel variant at each boundary, separately
-   and together. Preserve the baseline, original weights and cache semantics.
-2. Repeat the same-operand stage comparisons, including a true single-token
-   reused-state case and the full captured execution path.
+- `BOLT_MAMBA_ROUND_CONV_BEFORE_SILU`
+- `BOLT_MAMBA_ROUND_READOUT_BEFORE_NORM`
+
+They apply to both `MambaStep` and `MambaVerify`, including the specialized
+eight-row convolution and group-size 1,024 normalization paths. They do
+not change gamma arithmetic or the FP32 recurrent-state layout. The
+readout-only variant preserves convolution activations, convolution
+states, SSM states and the diagnostic readout bitwise in both blocks.
+
+Four focused CUDA executable tests cover all option combinations on
+discriminating inputs, generic and specialized convolution, raw state
+history, and group-size 1,024 and 512 normalization. All four executed and
+passed on H100. They require no model weights, Python ORT or protobuf
+construction.
+
+All four shared-library variants were additionally rebuilt with CUDA 12.6
+and ORT 1.31/API-31 headers and exercised through the original isolated
+ORT 1.31 runtime on the retained real operands. Each output is closer to
+its declared cast-policy control than to the opposite policy, with
+remaining CPU/GPU differences at most one adjacent BF16 value.
+
+The combined variant's cached normalization has two CPU-control
+differences, NRMSE `0.000011093073433104719`. The CPU pre-cast values are
+zero and one FP32 ulp from their BF16 rounding midpoints. An initial
+arbitrary `1e-5` CPU-control NRMSE proxy failed and was preserved; the
+follow-up instead reports exact BF16-step distances and discrimination
+between the two policies. NumPy reduction/transcendental calculations
+are not a bitwise CUDA FP32 oracle. **No full-model gate was changed.**
+
+Additional evidence, including all four library builds, executed CUDA
+regressions, raw five-output ORT replays, profiles, unchanged-state
+comparisons, midpoint diagnosis and preserved failures, is retained in:
+
+```text
+/home/mobius/bolt-coworker-source-rounding-20261022/
+```
+
+The initial runtime launch rejected a library built with the unrelated
+checkout's newer API-32 headers. The successful libraries use public
+ORT v1.31.0 headers pinned to
+`402979ac1bef89dcd55add41eaa7277c407599eb`. The original package and its
+bundled runtime were not modified.
+
+## Remaining work before a full-model fix can be claimed
+
+The binary did not bundle its CUDA source. Its owning repository has now
+been located and the source-owned controls are implemented in PR #1;
+a Mobius-side change is not needed to patch this external custom operator.
+Neither PR claims that changing these boundaries corrects full-model output.
+
+After agreeing on the intended reference contract:
+
+1. Use the independent source controls in separately labeled full-model
+   packages. Preserve the baseline, original weights and cache semantics.
+2. Extend the same-operand comparisons with a true single-token
+   reused-state case and the full captured execution path. The current
+   real-operand ORT replay covers two eight-row blocks only.
 3. Compare full prefill and every cached-step logit, hybrid states and exact
    ordinary greedy token sequences against a matching pinned reference.
    Retain the original gates: finite outputs, NRMSE at most 0.03,
@@ -186,5 +251,6 @@ After obtaining that source and agreeing on the intended contract:
    integration or performance.
 
 **Current disposition:** both boundary differences confirmed; contribution
-to full decoder failure unproven; corrected-kernel decoder parity and
-generation not run; production kernel fix blocked on source availability.
+to full decoder failure unproven; opt-in source-owned precision controls
+implemented with executed CUDA regressions and ORT replays; full-model
+decoder parity and generation for these variants not run.
