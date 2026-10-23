@@ -17,6 +17,74 @@ unchanged. All four CUDA policy regressions executed and passed, and all four
 rebuilt libraries were replayed through the package's ORT runtime.
 This does not establish full decoder parity or generation correctness.
 
+## Full-decoder follow-up: candidate does not resolve the mismatch
+
+The October 23 follow-up ran the **complete target decoder** with each of
+the four compiled policies on GPUs 4 through 7. It used the unchanged
+external model graph and packed payload, the same pinned 27-token prompt
+and independent diagnostic archives, four discarded CUDA-graph capture
+runs followed by complete cache reset, and eight ordinary greedy tokens.
+No drafter was invoked.
+
+The full rebuilt default reproduces **all 320 retained numerical
+artifacts bitwise**, not just the earlier layer-zero fixture. This rules
+out a new rebuilt-default change as the explanation for this experiment's
+baseline differences.
+
+The fixed full-logit gate remains finite outputs, NRMSE at most `0.03`
+and cosine at least `0.999`; all generated token IDs must match exactly.
+
+| Full-decoder policy | Prefill NRMSE | Worst cached-step NRMSE | Cached logit gates passed | Greedy tokens |
+| --- | --- | --- | --- | --- |
+| Existing default | 0.03119024 | 0.10973963 | 1 / 7 | 8 / 8 identical |
+| BF16 before SiLU only | 0.03230441 | 0.11508622 | 1 / 7 | 8 / 8 identical |
+| BF16 readout before norm only | 0.03773379 | 0.10616561 | 2 / 7 | 8 / 8 identical |
+| Both BF16 boundaries | 0.03178134 | 0.10854810 | 1 / 7 | 8 / 8 identical |
+
+**All four policies fail full-logit parity against the existing
+diagnostic.** In particular, enabling both boundaries does not resolve
+the issue and slightly worsens prefill NRMSE. Token identity was already
+present in the baseline and must not be presented as a newly fixed result.
+All four runs produce this exact sequence:
+
+```text
+1049, 1044, 1032, 1050, 1044, 1032, 1051, 1044
+```
+
+Block-versus-token prefill/cached logits, six auxiliary hidden taps and
+all 192 hybrid-state comparisons remain bitwise identical within each
+policy. This establishes internal consistency, **not** source equivalence.
+Additional comparisons to the existing diagnostic cover 192 states and
+48 hidden-tap outputs per policy. Only 39 of 192 state comparisons and
+11 of 48 hidden-tap comparisons pass for the both-boundaries policy.
+These are explicitly cross-weight comparisons, not same-weight fidelity
+claims.
+
+The additional state comparisons map source convolution history to its
+last three raw samples and transpose source SSM state `[B,H,P,N]` to target
+`[B,H,N,P]`. Auxiliary taps are verified as the raw residual output before
+layers `1,18,35,51,68,85`; no normalized activation is substituted.
+
+The complete fresh evidence directory is:
+
+```text
+/home/mobius/bolt-full-decoder-bf16-20261023/
+```
+
+It retains the full controller and command lines, actual library/model/
+reference pins, raw logits and auxiliary states, raw committed hybrid
+states, exact tokens, provider profiles, reference comparisons and resource
+receipts. Each native worker completed and was reaped; the original package
+and all previous evidence remain untouched.
+
+The existing reference's packed-weight differences and deliberately
+selected convolution backend still prevent attribution of the remaining
+gap to a particular custom kernel. **This negative experiment rejects
+the claim that these two cast changes alone fix the observed decoder
+mismatch.** Matching-weight independent parity and speculative integration
+remain unqualified; the controls must not be merged or deployed as a
+demonstrated full-model numerical fix.
+
 ## Identical-input findings
 
 The original compiled operator was invoked using its original layer-zero
@@ -237,20 +305,20 @@ Neither PR claims that changing these boundaries corrects full-model output.
 
 After agreeing on the intended reference contract:
 
-1. Use the independent source controls in separately labeled full-model
-   packages. Preserve the baseline, original weights and cache semantics.
-2. Extend the same-operand comparisons with a true single-token
-   reused-state case and the full captured execution path. The current
-   real-operand ORT replay covers two eight-row blocks only.
-3. Compare full prefill and every cached-step logit, hybrid states and exact
-   ordinary greedy token sequences against a matching pinned reference.
-   Retain the original gates: finite outputs, NRMSE at most 0.03,
-   cosine at least 0.999, and complete token identity.
-4. Only attribute the full-model failure to these boundaries if the controlled
-   full-model experiment demonstrates it. Only then evaluate speculative
-   integration or performance.
+1. Obtain an independent reference with the same packed weights and
+   explicitly pinned arithmetic/backend contract. The current reference
+   is useful diagnostically but not a same-weight source oracle.
+2. Locate the earliest failing stage against that reference before
+   proposing another precision change. The full captured four-policy
+   experiment above did not establish these boundaries as the root cause.
+3. Preserve the original full-model gates: finite outputs, NRMSE at most
+   0.03, cosine at least 0.999, and complete token identity. Only evaluate
+   speculative integration or performance after ordinary decoder
+   correctness is established.
 
 **Current disposition:** both boundary differences confirmed; contribution
 to full decoder failure unproven; opt-in source-owned precision controls
 implemented with executed CUDA regressions and ORT replays; full-model
-decoder parity and generation for these variants not run.
+prefill/cached comparisons and ordinary generation now executed for all
+four policies; full-logit diagnostic parity fails for every policy;
+both-boundaries candidate does not resolve the observed issue.
