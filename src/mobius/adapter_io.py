@@ -21,8 +21,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import onnx_ir as ir
+from onnx_ir.passes import common as common_passes
 from safetensors.numpy import load_file
 
+from mobius._constants import LAZY_SOURCE_FILES_META_KEY, QKV_PROJECTION_SOURCES_METADATA_KEY
 from mobius.adapters import (
     AdapterArtifact,
     AdapterServiceOptions,
@@ -166,11 +168,180 @@ def _peft_module_keys(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     )
 
 
+def _packed_projection_sources(node: ir.Node, metadata: str) -> list[tuple[str, int]]:
+    record: object = json.loads(metadata)
+    if (
+        not isinstance(record, dict)
+        or type(record.get("version")) is not int
+        or record["version"] != 1
+    ):
+        raise ValueError(f"unsupported packed-projection metadata on {node.name!r}")
+    names, widths = record.get("weights"), record.get("widths")
+    if (
+        not isinstance(names, list)
+        or not isinstance(widths, list)
+        or len(names) != len(widths)
+        or len(names) not in (2, 3)
+    ):
+        raise ValueError(f"invalid packed-projection source list on {node.name!r}")
+    sources = []
+    for name, width in zip(names, widths, strict=True):
+        if not isinstance(name, str) or not name or type(width) is not int or width <= 0:
+            raise ValueError(f"invalid packed-projection source on {node.name!r}")
+        original = name.removesuffix("_t") if name.endswith(".weight_t") else name
+        sources.append((original, width))
+    return sources
+
+
+def _restore_packed_peft_projections(
+    model: ir.Model, module_key: str, candidates: list[str]
+) -> None:
+    """Restore independent float projections before attaching a PEFT adapter."""
+    suffixes = tuple(
+        suffix
+        for candidate in candidates
+        for suffix in (f"{candidate}.weight", f"{candidate}.weight_t")
+    )
+    groups = []
+    for node in model.graph:
+        metadata = node.metadata_props.get(QKV_PROJECTION_SOURCES_METADATA_KEY)
+        if metadata is None:
+            continue
+        sources = _packed_projection_sources(node, metadata)
+        if any(name.endswith(suffixes) for name, _ in sources):
+            groups.append((node, sources))
+    if not groups:
+        return
+    if (
+        len(groups) != 1
+        or sum(name.endswith(suffixes) for name, _ in groups[0][1]) != 1
+        or any(name.endswith(suffixes) for name in model.graph.initializers)
+    ):
+        raise ValueError(f"PEFT module {module_key!r} has ambiguous packed projection targets")
+    split, sources = groups[0]
+    packed = split.inputs[0] if split.inputs else None
+    projection = packed.producer() if packed is not None else None
+    if (
+        split.domain not in ("", "ai.onnx")
+        or split.op_type != "Split"
+        or split.overload
+        or split.attributes.get_int("axis", 0) not in (-1, 2)
+        or len(split.outputs) != len(sources)
+        or packed is None
+        or projection is None
+        or projection.domain not in ("", "ai.onnx")
+        or projection.op_type != "MatMul"
+        or projection.overload
+        or projection.attributes
+        or len(projection.inputs) != 2
+        or len(projection.outputs) != 1
+        or packed in model.graph.outputs
+        or len(packed.uses()) != 1
+    ):
+        raise ValueError(f"PEFT module {module_key!r} has an unsupported packed projection")
+    x, weight = projection.inputs
+    if (
+        x is None
+        or weight is None
+        or not weight.is_initializer()
+        or weight in model.graph.inputs
+        or weight.const_value is None
+        or weight.shape is None
+        or len(weight.shape) != 2
+        or weight.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16)
+        or not all(isinstance(dim, int) and dim > 0 for dim in weight.shape)
+        or weight.shape[1] != sum(width for _, width in sources)
+    ):
+        raise ValueError(
+            f"PEFT module {module_key!r} requires a loaded, folded packed projection weight"
+        )
+    names = [name for name, _ in sources]
+    if len(set(names)) != len(names) or any(
+        name in model.graph.initializers for name in names
+    ):
+        raise ValueError(f"PEFT module {module_key!r} has conflicting source weights")
+    if any(
+        output.shape is None
+        or len(output.shape) != 3
+        or output.shape[-1] != width
+        or output.dtype != weight.dtype
+        for output, (_, width) in zip(split.outputs, sources, strict=True)
+    ):
+        raise ValueError(f"PEFT module {module_key!r} has inconsistent packed output metadata")
+    nodes: list[ir.Node] = []
+    outputs = []
+    initializers = []
+    start = 0
+    tensor = weight.const_value
+    assert weight.dtype is not None
+    for original, (name, width) in zip(split.outputs, sources, strict=True):
+        end = start + width
+        parameter_shape = ir.Shape([width, weight.shape[0]])
+        parameter = ir.Value(name=name, type=weight.type, shape=parameter_shape)
+
+        def load_projection(
+            source: ir.TensorProtocol = tensor, lo: int = start, hi: int = end
+        ) -> ir.TensorProtocol:
+            return ir.tensor(np.ascontiguousarray(source.numpy()[:, lo:hi].T))
+
+        parameter.const_value = ir.LazyTensor(
+            load_projection, dtype=weight.dtype, shape=parameter_shape, name=name
+        )
+        # RemoveUnusedNodes drops the packed ExternalTensor from the graph.
+        # Keep its file ownership visible to ModelPackage's existing pre-write
+        # alias guard without materializing the full packed checkpoint.
+        source_files = (
+            (tensor.path,)
+            if isinstance(tensor, ir.ExternalTensor)
+            else tensor.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+        )
+        if source_files:
+            parameter.const_value.meta[LAZY_SOURCE_FILES_META_KEY] = tuple(source_files)
+            # Folding may replace this tensor; ownership belongs to the model too.
+            model.meta[LAZY_SOURCE_FILES_META_KEY] = frozenset(
+                (*model.meta.get(LAZY_SOURCE_FILES_META_KEY, ()), *source_files)
+            )
+        initializers.append(parameter)
+        transposed = ir.Value(type=weight.type, shape=ir.Shape([weight.shape[0], width]))
+        nodes.append(
+            ir.Node(
+                "",
+                "Transpose",
+                [parameter],
+                {"perm": ir.AttrInt64s("perm", [1, 0])},
+                outputs=[transposed],
+            )
+        )
+        output = ir.Value(
+            name=original.name,
+            shape=original.shape,
+            type=original.type,
+            doc_string=original.doc_string,
+        )
+        output.metadata_props.update(original.metadata_props)
+        output.meta.update(original.meta)
+        outputs.append(output)
+        nodes.append(ir.Node("", "MatMul", [x, transposed], outputs=[output]))
+        start = end
+    for initializer in initializers:
+        model.graph.initializers.add(initializer)
+    ir.convenience.replace_nodes_and_values(
+        model.graph,
+        insertion_point=projection,
+        old_nodes=[projection, split],
+        new_nodes=nodes,
+        old_values=list(split.outputs),
+        new_values=outputs,
+    )
+    common_passes.RemoveUnusedNodesPass()(model)
+
+
 def _resolve_initializer_name(model: ir.Model, module_key: str) -> str:
     candidates = [module_key]
     for prefix in ("base_model.model.", "base_model.", "model."):
         if module_key.startswith(prefix):
             candidates.append(module_key[len(prefix) :])
+    _restore_packed_peft_projections(model, module_key, candidates)
     matches = [
         name
         for name in model.graph.initializers
