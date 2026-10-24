@@ -68,6 +68,47 @@ def _reshape_shape(node: ir.Node, source_shape: tuple[int, ...]) -> tuple[int, .
     return tuple(resolved)
 
 
+def _storage_layout_values(model: ir.Model) -> set[ir.Value]:
+    """Find parameter views whose checkpoint storage ABI must remain explicit."""
+    pending: list[ir.Value] = []
+    for node in model.graph.all_nodes():
+        if node.domain in ("", "ai.onnx") and node.op_type == "DequantizeLinear":
+            parameters = node.inputs[:3]
+        elif node.domain == "com.microsoft" and node.op_type in ("MoE", "QMoE"):
+            # Skip activations/routing. Expert weights, biases, scales, and
+            # zero points retain their checkpoint-format names and row order;
+            # the explicit layout views adapt that storage to the runtime ABI.
+            parameters = node.inputs[2 : 14 if node.op_type == "QMoE" else 8]
+        else:
+            continue
+        pending.extend(value for value in parameters if value is not None)
+    protected: set[ir.Value] = set()
+    while pending:
+        value = pending.pop()
+        if value in protected:
+            continue
+        protected.add(value)
+        producer = value.producer()
+        if producer is None or producer.domain not in ("", "ai.onnx") or producer.overload:
+            continue
+        if producer.op_type in (
+            "Identity",
+            "Reshape",
+            "Transpose",
+            "Cast",
+            "CastLike",
+            "Pad",
+            "Slice",
+            "Expand",
+        ):
+            pending.extend(item for item in producer.inputs[:1] if item is not None)
+        elif producer.op_type in ("Add", "Sub", "Mul", "Div", "Concat"):
+            # FP8 scales can carry an exact-zero execution dependency before
+            # DQ. Follow the scale path without evaluating its arithmetic.
+            pending.extend(item for item in producer.inputs if item is not None)
+    return protected
+
+
 class FoldWeightLayoutPass(ir.passes.InPlacePass):
     """Fold named static Reshape/Transpose outputs into lazy initializers.
 
@@ -75,6 +116,8 @@ class FoldWeightLayoutPass(ir.passes.InPlacePass):
     without reading weight payloads: only constant Reshape shape vectors are read.
     Materialization preserves the source dtype and uses no arithmetic or casts.
     Overridable initializers, shared sources, and dynamic shapes remain untouched.
+    MoE/QMoE and QDQ parameter-layout paths retain checkpoint storage names and
+    byte layouts; their explicit runtime format conversions are not folded.
     Dead folded inputs are removed in their owning graph; run dead-code elimination
     afterward to remove unused Constant shape nodes.
     Malformed static layout nodes raise ValueError rather than being skipped.
@@ -83,6 +126,7 @@ class FoldWeightLayoutPass(ir.passes.InPlacePass):
     def call(self, model: ir.Model) -> ir.passes.PassResult:
         folded = 0
         graphs = tuple(model.graphs())
+        storage_layouts = _storage_layout_values(model)
 
         # Registry identity is authoritative, including parent-owned captures.
         # Do not infer ownership from the graph containing the consumer node.
@@ -108,6 +152,8 @@ class FoldWeightLayoutPass(ir.passes.InPlacePass):
                 expected_inputs = 2 if node.op_type == "Reshape" else 1
                 if len(node.inputs) != expected_inputs or len(node.outputs) != 1:
                     raise ValueError(f"Malformed weight layout node {node.name!r}")
+                if node.outputs[0] in storage_layouts:
+                    continue
                 source = node.inputs[0]
                 if source is None or not source.is_initializer() or source.is_graph_input():
                     continue

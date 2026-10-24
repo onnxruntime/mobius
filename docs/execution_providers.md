@@ -102,9 +102,14 @@ These are applied during **Stage 2: Fusion** of the optimization pipeline.
 
 #### Projection packing and numerical limitations
 
-The existing float `PackQKV` GQA-input fusion is unchanged. A generic
-projection-only pass also handles compatible float projections that remain
-separate after that fusion, including masked decoders and raw K reused for V.
+The existing float `PackQKV` GQA-input fusion stage is unchanged, but
+**`PackQKVProjections` is a new, additional float projection-packing stage**.
+It runs by default for both `decoder` and `masked-decoder` roles whenever the
+activation dtype is in the EP's existing `qkv_pack_dtypes` capability. Thus
+nonempty built-in float profiles, including CUDA's FLOAT/FP16/BF16 profile,
+enable this new behavior without a new opt-in. It handles compatible float
+projections that remain separate after GQA-input packing, including masked
+decoders and raw K reused for V. Only INT4 projection packing is default-off.
 It splits the packed result **before** normalization, RoPE, attention, or cache
 consumers. Sources must be static, non-overridable initializer parameters with
 compatible shapes and dtypes; ambiguous repeated sources, shared weights with
@@ -152,14 +157,21 @@ Normally the post-weight pipeline folds Concats and static Reshape/Transpose
 chains lazily, including layouts exposed by small integer shape-expression
 folding. That generic folding is always independent of experimental packing;
 it preserves dtype and does not eagerly load large weight tensors.
+Checkpoint-storage layout paths feeding MoE/QMoE parameters or
+`DequantizeLinear` are conservatively retained: their named expert/code/scale
+initializers and original byte layouts remain available to loaders and
+serialized-storage contracts. Ordinary layout folding and the existing
+2-D transpose optimization remain enabled.
 
-**The PR754 numerical gate remains failed and unwaived.** Byte-exact packing
+**The PR754 INT4-packing numerical gate remains failed and unwaived.** Byte-exact packing
 does not imply identical floating-point outputs: changing GEMM output width can
 change CUDA kernel behavior. Representative large-dimension prefill and
 cached-decode logits exceeded the existing `rtol=atol=1e-2` criterion. Bounded
 MMLU/generation evidence does not resolve pointwise parity; neither tolerances
-nor automatic BF16/FP16 enablement have changed. No production numerical
-accuracy or speed improvement is claimed.
+nor automatic BF16/FP16 INT4-packing enablement have changed. This branch does
+not separately qualify numerical accuracy for the new float projection stage;
+do not infer a float numerical pass from the INT4 gate's scope. No production
+numerical accuracy or speed improvement is claimed.
 
 For `ORT_FPA_INTB_GEMM=1`, keep exporter folding or ORT constant folding enabled:
 unfolded parameter Concats can prevent runtime prepacking when both are off.
@@ -200,7 +212,7 @@ Every EP is fully described by a single `EpCapabilities` entry in the
 class EpCapabilities:
     name: str
     gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
-    qkv_pack_dtypes: frozenset[ir.DataType]          # dtypes where PackQKV fusion fires
+    qkv_pack_dtypes: frozenset[ir.DataType]          # both float packing stages
     supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
     supports_skip_layer_norm: bool = True            # False → InlinePass expansion
     supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
