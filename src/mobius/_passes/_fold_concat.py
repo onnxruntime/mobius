@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 class FoldConcatInitializersPass(ir.passes.InPlacePass):
     """Fold ``Concat(init_0, init_1, ...)`` into a single packed initializer.
 
-    For each ``Concat`` node whose **every** input is a graph initializer:
+    For each ``Concat`` node whose **every** input is a non-overridable initializer:
 
     1. A new initializer ``{name_0}__{name_1}__axis_{axis}__concat`` is registered whose
        :class:`~onnx_ir.LazyTensor` value lazily concatenates the inputs along
@@ -111,6 +111,11 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
 
             # Only fold when ALL inputs are graph initializers.
             if not all(v is not None and v.is_initializer() for v in inputs):
+                continue
+
+            # Initializers declared as graph inputs are runtime-overridable,
+            # including when captured by a lexical child graph.
+            if any(value in scope.inputs for scope in graphs for value in inputs):
                 continue
 
             # All inputs must have loaded weights. Folding before weights are

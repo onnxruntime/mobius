@@ -505,6 +505,95 @@ def test_nested_graph_initializers_are_registered_in_their_scope():
         assert set(branch.initializers) == {"layout"}
 
 
+@pytest.mark.parametrize("parent_capture", [False, True])
+def test_post_weight_pipeline_preserves_overridable_concat_input(tmp_path, parent_capture):
+    import onnxruntime as ort
+
+    data = np.arange(8, dtype=np.float32)
+    weight = _initializer("W", data)
+    shape = _initializer("shape", np.array([2, 4], dtype=np.int64))
+    bias = _initializer("B", np.zeros((1, 4), dtype=np.float32))
+    reshape = ir.Node("", "Reshape", [weight, shape], num_outputs=1)
+    reshape.outputs[0].name = "layout"
+    reshape.outputs[0].shape = ir.Shape([2, 4])
+    reshape.outputs[0].dtype = ir.DataType.FLOAT
+    concat = ir.Node(
+        "",
+        "Concat",
+        [reshape.outputs[0], bias],
+        [ir.AttrInt64("axis", 0)],
+        num_outputs=1,
+    )
+    concat.outputs[0].name = "output"
+    concat.outputs[0].shape = ir.Shape([3, 4])
+    concat.outputs[0].dtype = ir.DataType.FLOAT
+    graph = ir.Graph(
+        [bias],
+        concat.outputs,
+        nodes=[reshape, concat],
+        initializers=[weight, shape, bias],
+        name="overridable_concat",
+        opset_imports={"": 24},
+    )
+    if parent_capture:
+        graph.inputs.clear()
+        del graph.initializers["B"]
+        condition = ir.Value(
+            name="condition", shape=ir.Shape([]), type=ir.TensorType(ir.DataType.BOOL)
+        )
+        fallback = ir.Node("", "Identity", [bias], num_outputs=1)
+        fallback.outputs[0].name = "fallback"
+        fallback.outputs[0].shape = bias.shape
+        fallback.outputs[0].dtype = bias.dtype
+        other = ir.Graph([], fallback.outputs, nodes=[fallback], name="other_branch")
+        select = ir.Node(
+            "",
+            "If",
+            [condition],
+            [ir.AttrGraph("then_branch", graph), ir.AttrGraph("else_branch", other)],
+            num_outputs=1,
+        )
+        select.outputs[0].name = "result"
+        select.outputs[0].shape = ir.Shape([None, 4])
+        select.outputs[0].dtype = ir.DataType.FLOAT
+        graph = ir.Graph(
+            [condition, bias],
+            select.outputs,
+            nodes=[select],
+            initializers=[bias],
+            name="captured_overridable_concat",
+            opset_imports={"": 24},
+        )
+    model = ir.Model(graph, ir_version=10)
+    fold_initializers_after_weights(model)
+    assert all(node.op_type != "Reshape" for node in model.graph.all_nodes())
+    assert sum(node.op_type == "Concat" for node in model.graph.all_nodes()) == 1
+    assert model.graph.initializers["B"] is bias
+    assert bias in model.graph.inputs
+
+    ModelPackage({"model": model}).save(tmp_path, progress_bar=False, max_workers=1)
+    restored = ModelPackage.load(tmp_path)["model"]
+    for index, candidate in enumerate((model, restored)):
+        model_path = tmp_path / f"runtime_{index}.onnx"
+        ir.save(candidate, model_path)
+        # The test wrapper filters out overridable initializers via get_inputs();
+        # use ORT directly so B is actually supplied to the runtime.
+        session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        assert [value.name for value in session.get_overridable_initializers()] == ["B"]
+        for override in (None, np.full((1, 4), 17, dtype=np.float32)):
+            feeds = {"condition": np.asarray(True)} if parent_capture else {}
+            if override is not None:
+                feeds["B"] = override
+            actual = session.run(None, feeds)[0]
+            expected = np.concatenate(
+                [
+                    data.reshape(2, 4),
+                    np.zeros((1, 4), dtype=np.float32) if override is None else override,
+                ]
+            )
+            np.testing.assert_array_equal(actual, expected)
+
+
 def test_post_weight_pipeline_concat_layouts_are_isolated_in_if_branches(tmp_path):
     branches = []
     expected_outputs = []
