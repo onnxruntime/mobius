@@ -2033,9 +2033,20 @@ class TestGemma4MoeFallbackActivation:
         from mobius.models.gemma4 import Gemma4DecoderLayer
 
         class FallbackOnly(Gemma4DecoderLayer):
-            def forward(self, op, normed_flat, router_probs):
-                self.router(op, normed_flat)
-                return self._dispatch_moe_fallback(op, normed_flat, router_probs)
+            def forward(
+                self,
+                op,
+                hidden_states,
+                attention_bias,
+                position_embeddings=None,
+                shared_kv_states=None,
+                per_layer_input=None,
+                past_key_value=None,
+                is_causal=1,
+                static_kv_seqlen=None,
+            ):
+                self.router(op, hidden_states)
+                return self._dispatch_moe_fallback(op, hidden_states, attention_bias)
 
         config = _tiny_gemma4_text_moe_config(
             dtype=ir.DataType.FLOAT,

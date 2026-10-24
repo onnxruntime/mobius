@@ -93,15 +93,17 @@ class TestOverrideFlagsContextManager:
 
     def test_custom_geglu_override_is_scoped_even_on_exception(self):
         original = _flags.flags.gemma4_custom_geglu
-        with _flags.override_flags(gemma4_custom_geglu=False):
-            assert not _flags.flags.gemma4_custom_geglu
-            with pytest.raises(RuntimeError, match="test restoration"):
+        try:
+            with _flags.override_flags(gemma4_custom_geglu=False):
                 assert not _flags.flags.gemma4_custom_geglu
-                with _flags.override_flags(gemma4_custom_geglu=True):
-                    assert _flags.flags.gemma4_custom_geglu
-                    raise RuntimeError("test restoration")
-            assert not _flags.flags.gemma4_custom_geglu
-        assert _flags.flags.gemma4_custom_geglu is original
+                with pytest.raises(RuntimeError, match="test restoration"):
+                    assert not _flags.flags.gemma4_custom_geglu
+                    with _flags.override_flags(gemma4_custom_geglu=True):
+                        assert _flags.flags.gemma4_custom_geglu
+                        raise RuntimeError("test restoration")
+                assert not _flags.flags.gemma4_custom_geglu
+        finally:
+            assert _flags.flags.gemma4_custom_geglu is original
 
     def test_unknown_flag_raises_value_error(self):
         with (
