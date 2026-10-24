@@ -157,6 +157,8 @@ Normally the post-weight pipeline folds Concats and static Reshape/Transpose
 chains lazily, including layouts exposed by small integer shape-expression
 folding. That generic folding is always independent of experimental packing;
 it preserves dtype and does not eagerly load large weight tensors.
+Concats with runtime-overridable initializer inputs remain unfused, including
+initializers captured from a parent graph's inputs.
 Checkpoint-storage layout paths feeding MoE/QMoE parameters or
 `DequantizeLinear` are conservatively retained: their named expert/code/scale
 initializers and original byte layouts remain available to loaders and

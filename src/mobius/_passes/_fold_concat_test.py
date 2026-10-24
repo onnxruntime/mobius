@@ -168,14 +168,14 @@ def test_nested_concat_prunes_only_dead_owned_sources(parent_owned, retained):
     assert len(reads) == 2
 
 
-def test_concat_cleanup_retains_graph_input_initializer():
+def test_concat_preserves_overridable_graph_input_initializer():
     model, sources = _make_concat_model([np.ones((4, 8), dtype=np.float32)] * 2)
     model.graph.inputs.append(sources[0])
-    assert FoldConcatInitializersPass()(model).modified
-    assert model.graph.initializers["init_1"] is sources[1]
+    assert not FoldConcatInitializersPass()(model).modified
+    assert [node.op_type for node in model.graph] == ["Concat"]
     common.RemoveUnusedNodesPass()(model)
     assert model.graph.initializers["init_0"] is sources[0]
-    assert "init_1" not in model.graph.initializers
+    assert model.graph.initializers["init_1"] is sources[1]
 
 
 def test_concat_cleanup_preserves_external_source_ownership(tmp_path, monkeypatch):
