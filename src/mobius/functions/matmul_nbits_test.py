@@ -29,6 +29,10 @@ import pytest
 from onnx_ir.passes.common import InlinePass
 
 from mobius.functions import get_function, matmul_nbits, register_function_bodies
+from mobius.functions.matmul_nbits import (
+    FUNCTION_BODY_METADATA_KEY,
+    FUNCTION_BODY_METADATA_VALUE,
+)
 
 
 def _run(model: ir.Model, feeds: dict) -> np.ndarray:
@@ -143,6 +147,37 @@ class TestMatMulNBitsFunctionSignature:
 
         assert node.overload == "default_zero_points"
         assert node.op_identifier() in model.functions
+
+    @pytest.mark.parametrize("has_zero_points", [False, True])
+    def test_direct_factory_does_not_claim_registry_ownership(self, has_zero_points):
+        function = matmul_nbits(has_zero_points=has_zero_points)
+        assert FUNCTION_BODY_METADATA_KEY not in function.metadata_props
+        automatic = get_function(function.identifier())
+        assert automatic is not None
+        assert automatic.metadata_props[FUNCTION_BODY_METADATA_KEY] == (
+            FUNCTION_BODY_METADATA_VALUE
+        )
+        assert FUNCTION_BODY_METADATA_KEY not in function.metadata_props
+
+    @pytest.mark.parametrize("has_zero_points", [False, True])
+    def test_automatic_registration_retains_provenance_and_specialization(
+        self, has_zero_points
+    ):
+        model, *_ = _build_matmulnbits_model(
+            n_out=8, k_in=64, block=32, has_zero_points=has_zero_points
+        )
+        register_function_bodies(model)
+        node = next(iter(model.graph))
+        assert node.overload == ("" if has_zero_points else "default_zero_points")
+        function = model.functions[node.op_identifier()]
+        assert function.metadata_props[FUNCTION_BODY_METADATA_KEY] == (
+            FUNCTION_BODY_METADATA_VALUE
+        )
+        register_function_bodies(model)
+        assert model.functions[node.op_identifier()] is function
+        assert function.metadata_props[FUNCTION_BODY_METADATA_KEY] == (
+            FUNCTION_BODY_METADATA_VALUE
+        )
 
 
 class TestMatMulNBitsInlineParity:

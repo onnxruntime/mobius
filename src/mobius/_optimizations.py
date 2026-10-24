@@ -21,10 +21,8 @@ support requires only a new registry entry — no changes to this module.
 Post-weight passes
 ------------------
 :func:`fold_initializers_after_weights` should be called after weights are loaded.
-It runs :class:`~mobius._passes.FoldTransposedInitializerPass` and
-:class:`~mobius._passes.FoldConcatInitializersPass` to fold runtime Transpose and
-Concat nodes over initializers into pre-computed weights, then removes unused
-nodes.
+It lazily folds initializer Transpose, Concat, and static Reshape/Transpose
+chains, independently of experimental projection packing.
 """
 
 from __future__ import annotations
@@ -49,6 +47,7 @@ __all__ = [
 import contextlib
 import dataclasses
 import logging
+import math
 import warnings
 
 import onnx
@@ -58,11 +57,13 @@ import onnxscript.optimizer._constant_folding
 from onnx_ir.passes import common as common_passes
 from onnxscript.rewriter import rewrite
 
+from mobius._constants import LAZY_SOURCE_FILES_META_KEY
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
 from mobius._passes import (
     FoldConcatInitializersPass,
     FoldTransposedInitializerPass,
+    FoldWeightLayoutPass,
     Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
 )
@@ -75,7 +76,9 @@ from mobius.rewrite_rules import (
     gelu_fusion_rules,
     group_query_attention_rules,
     htp_rank4_rmsnorm_rules,
+    pack_matmul_nbits_qkv_pass,
     pack_qkv_for_gqa_rules,
+    pack_qkv_projections_pass,
     separate_rope_rules,
     skip_layer_norm_rules,
     skip_norm_rules,
@@ -375,6 +378,21 @@ def _apply_stage(model: ir.Model, rules_or_pass: list | ir.passes.InPlacePass) -
         rewrite(model, pattern_rewrite_rules=rules_or_pass)
 
 
+def _apply_stages(
+    model: ir.Model, stages: list[tuple[str, list | ir.passes.InPlacePass]]
+) -> None:
+    """Batch adjacent rule groups without dropping or reordering IR passes."""
+    pending: list = []
+    for _, rules_or_pass in stages:
+        if isinstance(rules_or_pass, list):
+            pending.extend(rules_or_pass)
+        else:
+            _apply_stage(model, pending)
+            pending = []
+            _apply_stage(model, rules_or_pass)
+    _apply_stage(model, pending)
+
+
 def _log_trace_entry(entry: _TraceEntry) -> None:
     if not entry.added and not entry.removed:
         logger.info("[EP Trace]   %-25s: no matches (0 nodes affected)", entry.name)
@@ -409,7 +427,10 @@ def _get_optimization_passes(
     caps: EpCapabilities,
     dtype: ir.DataType,
     model_role: str = "decoder",
-) -> tuple[list[tuple[str, list]], list[tuple[str, list | ir.passes.InPlacePass]]]:
+) -> tuple[
+    list[tuple[str, list | ir.passes.InPlacePass]],
+    list[tuple[str, list | ir.passes.InPlacePass]],
+]:
     """Return ``(fuse_stages, lower_stages)`` for the given capabilities.
 
     Queries the :class:`EpCapabilities` object rather than branching on EP
@@ -425,7 +446,7 @@ def _get_optimization_passes(
         ``(fuse_stages, lower_stages)`` — each a list of ``(name, payload)``
         tuples where payload is a rule list or IR pass.
     """
-    fuse: list[tuple[str, list]] = []
+    fuse: list[tuple[str, list | ir.passes.InPlacePass]] = []
     lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
 
     # --- Attention fusion (decoder only) ---
@@ -440,6 +461,12 @@ def _get_optimization_passes(
     # --- QKV packing (decoder only, gated by qkv_pack_dtypes) ---
     if model_role == "decoder" and dtype in caps.qkv_pack_dtypes:
         fuse.append(("PackQKV", list(pack_qkv_for_gqa_rules())))
+
+    if model_role in {"decoder", "masked-decoder"}:
+        if dtype in caps.qkv_pack_dtypes:
+            fuse.append(("PackQKVProjections", pack_qkv_projections_pass()))
+        if dtype in caps.matmul_nbits_qkv_pack_dtypes:
+            fuse.append(("PackMatMulNBitsQKV", pack_matmul_nbits_qkv_pass()))
 
     # --- Normalization fusions (all roles, all dtypes) ---
     # When supports_skip_layer_norm=False (e.g. trt-rtx), fusion is skipped;
@@ -666,22 +693,12 @@ def optimize_model(
             trace_entries.append(entry)
             _log_trace_entry(entry)
     else:
-        # Batch all rewrite rules for efficiency; apply IR passes separately.
-        all_fuse_rules = [r for _, rp in fuse_stages if isinstance(rp, list) for r in rp]
-        all_lower_rules = [r for _, rp in lower_stages if isinstance(rp, list) for r in rp]
-        lower_ir_passes = [(n, rp) for n, rp in lower_stages if not isinstance(rp, list)]
-
-        if all_fuse_rules:
-            rewrite(model, pattern_rewrite_rules=all_fuse_rules)
+        _apply_stages(model, fuse_stages)
 
         # Expand unsupported custom ops via registered ir.Function bodies.
         inline_pass(model)
 
-        if all_lower_rules:
-            rewrite(model, pattern_rewrite_rules=all_lower_rules)
-
-        for _, ir_pass in lower_ir_passes:
-            ir_pass(model)
+        _apply_stages(model, lower_stages)
 
     # Stage 4: Final dead-node removal, constant folding, and dead input
     # cleanup after rewrites.
@@ -780,20 +797,56 @@ def optimize_model(
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
-    """Fold weight ``Transpose`` and ``Concat`` nodes after weights are loaded.
+    """Lazily fold weight Transpose, Concat, and static layout chains.
 
-    Runs :class:`~onnx_ir.passes.common.LiftConstantsToInitializersPass`,
-    :class:`~mobius._passes.FoldConcatInitializersPass`,
-    :class:`~mobius._passes.FoldTransposedInitializerPass`, and
-    :class:`~onnx_ir.passes.common.RemoveUnusedNodesPass` in order.
-    FoldConcat must precede FoldTranspose so that packed QKV initializers are
-    visible before the Transpose fold runs.
+    Fold small integer shape expressions first without exposing weight payloads
+    to the general constant folder. Preserve the shipped root Transpose naming
+    convention, then fold layouts and packing to a fixed point.
     """
-    ir.passes.PassManager(
-        [
-            common_passes.LiftConstantsToInitializersPass(),
-            FoldConcatInitializersPass(),
-            FoldTransposedInitializerPass(),
-            common_passes.RemoveUnusedNodesPass(),
-        ]
-    )(model)
+    common_passes.LiftConstantsToInitializersPass()(model)
+    hidden: dict[ir.Value, ir.TensorProtocol] = {}
+    for graph in model.graphs():
+        for value in graph.initializers.values():
+            tensor = value.const_value
+            if tensor is not None:
+                source_files = (
+                    (tensor.path,)
+                    if isinstance(tensor, ir.ExternalTensor)
+                    else tensor.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+                )
+                if source_files:
+                    model.meta[LAZY_SOURCE_FILES_META_KEY] = frozenset(
+                        (*model.meta.get(LAZY_SOURCE_FILES_META_KEY, ()), *source_files)
+                    )
+            if tensor is not None and not (
+                tensor.dtype == ir.DataType.INT64
+                and all(isinstance(dim, int) for dim in tensor.shape)
+                and math.prod(tensor.shape.numpy()) <= 8192
+            ):
+                hidden[value] = tensor
+                value.const_value = None
+    try:
+        # Partial evaluators also simplify Identity without reading its input.
+        # In particular, an output Identity transfers its public output name
+        # to the producer value before lazy layout folding. Size limits and
+        # should_fold do not gate those upstream symbolic simplifications.
+        onnxscript.optimizer._constant_folding.FoldConstantsPass(
+            shape_inference=False, input_size_limit=8192, output_size_limit=8192
+        )(model)
+    finally:
+        for value, tensor in hidden.items():
+            value.const_value = tensor
+    common_passes.LiftConstantsToInitializersPass()(model)
+    common_passes.RemoveUnusedNodesPass()(model)
+    lazy_passes = (
+        FoldTransposedInitializerPass(),
+        FoldWeightLayoutPass(),
+        FoldConcatInitializersPass(),
+    )
+    while True:
+        modified = False
+        for lazy_pass in lazy_passes:
+            modified = lazy_pass(model).modified or modified
+        common_passes.RemoveUnusedNodesPass()(model)
+        if not modified:
+            break

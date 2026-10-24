@@ -48,6 +48,8 @@ from onnxscript._internal.builder import build_function
 from mobius._constants import OPSET_VERSION
 
 DOMAIN = "com.microsoft"
+FUNCTION_BODY_METADATA_KEY = "mobius.function_body"
+FUNCTION_BODY_METADATA_VALUE = "1"
 
 
 def matmul_nbits(*, has_zero_points: bool = True) -> ir.Function:
@@ -152,4 +154,7 @@ def matmul_nbits(*, has_zero_points: bool = True) -> ir.Function:
     )
     if not has_zero_points:
         function.overload = "default_zero_points"
+    # get_function() attaches automatic-fallback ownership metadata. A direct
+    # factory result is caller-owned: do not authorize call specialization or
+    # projection packing merely because the caller used this factory.
     return function
