@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,11 +16,43 @@ from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.gguf._builder import (
     _config_tensor_name_mapper,
     _detect_quant_params,
+    _load_quantized_state_dict,
+    _normalize_gguf_weights,
     _preflight_quantization_report,
 )
+from mobius.integrations.gguf._config_mapping import gguf_to_config
+from mobius.integrations.gguf._reader import GGUFModel
 from mobius.integrations.gguf._reader_test import _write_gemma4_test_gguf
 from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 from mobius.models.gemma4 import Gemma4CausalLMModel
+
+
+def _write_quantized_gemma4(
+    path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    shared_layers: int = 3,
+    tied_embedding: bool = False,
+) -> None:
+    from gguf import GGMLQuantizationType, GGUFWriter, quantize
+
+    add_tensor = GGUFWriter.add_tensor
+
+    def add_quantized_tensor(self, name, tensor, **kwargs):
+        if tied_embedding and name == "output.weight":
+            return
+        if tensor.ndim == 2 and (tied_embedding or name != "token_embd.weight"):
+            qtype = (
+                GGMLQuantizationType.Q8_0
+                if name == "token_embd.weight"
+                else GGMLQuantizationType.Q4_0
+            )
+            tensor = quantize(tensor, qtype)
+            kwargs["raw_dtype"] = qtype
+        return add_tensor(self, name, tensor, **kwargs)
+
+    monkeypatch.setattr(GGUFWriter, "add_tensor", add_quantized_tensor)
+    _write_gemma4_test_gguf(path, num_kv_shared_layers=shared_layers)
 
 
 @pytest.mark.parametrize("shared_layers", [0, 3])
@@ -30,20 +63,8 @@ def test_shared_kv_import(
     shared_layers: int,
     keep_quantized: bool,
 ) -> None:
-    from gguf import GGMLQuantizationType, GGUFWriter, quantize
-
-    add_tensor = GGUFWriter.add_tensor
-
-    def add_quantized_tensor(self, name, tensor, **kwargs):
-        if tensor.ndim == 2 and name != "token_embd.weight":
-            tensor = quantize(tensor, GGMLQuantizationType.Q4_0)
-            kwargs["raw_dtype"] = GGMLQuantizationType.Q4_0
-        return add_tensor(self, name, tensor, **kwargs)
-
-    monkeypatch.setattr(GGUFWriter, "add_tensor", add_quantized_tensor)
     path = tmp_path / "gemma4.gguf"
-    _write_gemma4_test_gguf(path, num_kv_shared_layers=shared_layers)
-
+    _write_quantized_gemma4(path, monkeypatch, shared_layers=shared_layers)
     package = build_from_gguf(path, keep_quantized=keep_quantized)
     initializers = package["model"].graph.initializers
     assert package.config.num_kv_shared_layers == shared_layers
@@ -68,6 +89,66 @@ def test_shared_kv_import(
                 assert initializers[name].const_value is not None
         query = f"model.layers.{layer}.self_attn.q_proj.weight"
         assert query in initializers or f"{query}_t" in initializers
+
+
+def test_tied_quantized_head_loads_and_saves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise GGUF binding and persistence without source-identity lifecycle checks."""
+    import numpy as np
+
+    from mobius import ModelPackage, build_from_module
+    from mobius.components import TiedQuantizedLMHead
+
+    path = tmp_path / "tied-gemma4.gguf"
+    _write_quantized_gemma4(path, monkeypatch, tied_embedding=True)
+    source = GGUFModel(path)
+    try:
+        config = gguf_to_config(source)
+        assert config.tie_word_embeddings
+        assert "output.weight" not in source.tensor_names
+        bits, block_size, sym = _detect_quant_params(source, "gemma4")
+        config = dataclasses.replace(
+            config,
+            quantization=QuantizationConfig(
+                bits=bits,
+                group_size=block_size,
+                quant_method="gguf",
+                sym=sym,
+                quantize_embeddings=True,
+                quantize_lm_head=True,
+                tie_word_embeddings=True,
+            ),
+        )
+        module = Gemma4CausalLMModel(config)
+        package = build_from_module(module, config)
+        weights = _load_quantized_state_dict(
+            source,
+            "gemma4",
+            module,
+            config,
+            name_mapper=_config_tensor_name_mapper("gemma4", config),
+        )
+        weights = _normalize_gguf_weights(weights, "gemma4", config)
+        package.apply_weights(module.preprocess_weights(weights))
+    finally:
+        source.close()
+
+    output = tmp_path / "package"
+    package.save(output, progress_bar=False)
+    loaded = ModelPackage.load(output)
+    assert isinstance(module.lm_head, TiedQuantizedLMHead)
+    assert module.lm_head.qweight is module.model.embed_tokens.qweight
+    assert module.lm_head.scales is module.model.embed_tokens.scales
+    assert module.lm_head.zero_points is module.model.embed_tokens.zero_points
+    assert not any(name.startswith("lm_head.") for name in package["model"].graph.initializers)
+    for name, initializer in package["model"].graph.initializers.items():
+        assert initializer.const_value is not None
+        restored = loaded["model"].graph.initializers[name]
+        assert restored.const_value is not None
+        np.testing.assert_array_equal(
+            restored.const_value.numpy(), initializer.const_value.numpy()
+        )
 
 
 @pytest.mark.parametrize("shared_layers", [0, 18])

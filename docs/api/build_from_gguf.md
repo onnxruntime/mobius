@@ -29,6 +29,10 @@ They remain in the source qtype census but not the mapped-tensor fidelity record
 Projection weights in cache-owning layers and tensors outside the configured layer
 range are not covered by this exclusion.
 
+For text-only Gemma4 checkpoints with tied quantized embeddings and no
+`output.weight`, the LM head shares the embedding's packed table, scales, and
+zero points. No independent output weights are required or synthesized.
+
 ## Signature
 
 ```python
