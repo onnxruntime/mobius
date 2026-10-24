@@ -15,6 +15,8 @@ QKV_PROJECTION_SOURCES_METADATA_KEY = "mobius.qkv_projection_sources"
 # Transient tensor.meta ownership, never serialized as ONNX metadata.
 LAZY_SOURCE_FILES_META_KEY = "mobius.lazy_source_files"
 
+GEMMA4_CUSTOM_GEGLU_METADATA_KEY = "mobius.gemma4.required_runtime_feature"
+
 # ---------------------------------------------------------------------------
 # Static KV cache ABI
 # ---------------------------------------------------------------------------

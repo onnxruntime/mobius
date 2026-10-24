@@ -132,7 +132,7 @@ def prepare_vision_feeds(
     Args:
         processor: ``AutoProcessor`` loaded for the Gemma 4 model.
         image_path: Path to a local image file (JPEG, PNG, etc.).
-        np_dtype: Numpy dtype for pixel values (default float32).
+        np_dtype: Retained for caller compatibility; pixels always use float32.
 
     Returns:
         ``{"pixel_values": [B, N, 3*P^2], "pixel_position_ids": int64[B, N, 2]}``
@@ -143,7 +143,8 @@ def prepare_vision_feeds(
     # Gemma 4 processor requires a text argument alongside images.
     # Use a placeholder image token so the processor computes correct dims.
     processed = processor(images=img, text="<image>", return_tensors="np")
-    pixel_values = processed["pixel_values"].astype(np_dtype)
+    # The vision ABI is FLOAT even when decoder/projection weights use BF16.
+    pixel_values = processed["pixel_values"].astype(np.float32)
     # The HF processor returns "image_position_ids"; our ONNX vision model input is "pixel_position_ids"
     pixel_position_ids = processed["image_position_ids"].astype(np.int64)
     return {"pixel_values": pixel_values, "pixel_position_ids": pixel_position_ids}
