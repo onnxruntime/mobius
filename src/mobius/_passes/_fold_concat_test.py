@@ -5,9 +5,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import onnx_ir as ir
+import pytest
+from onnx_ir.passes import common
 
+from mobius import ModelPackage
+from mobius._constants import LAZY_SOURCE_FILES_META_KEY
 from mobius._passes._fold_concat import FoldConcatInitializersPass
 
 
@@ -63,6 +69,164 @@ def _make_concat_model(
 
     model = ir.Model(graph, ir_version=10)
     return model, init_vals
+
+
+@pytest.mark.parametrize("parent_owned", [False, True])
+@pytest.mark.parametrize("retained", [None, "consumer", "output"])
+def test_nested_concat_prunes_only_dead_owned_sources(parent_owned, retained):
+    arrays = [
+        np.arange(32, dtype=np.float32).reshape(4, 8),
+        np.full((4, 8), 100, dtype=np.float32),
+    ]
+    original, sources = _make_concat_model(arrays)
+    branch = original.graph
+    branch.inputs.clear()
+    branch.outputs[0].name = "packed_output"
+    if retained == "consumer" or (retained == "output" and parent_owned):
+        identity = ir.Node("", "Identity", [sources[0]], num_outputs=1)
+        identity.outputs[0].name = "retained_output"
+        identity.outputs[0].shape = sources[0].shape
+        identity.outputs[0].dtype = sources[0].dtype
+        branch.append(identity)
+        branch.outputs.append(identity.outputs[0])
+    elif retained == "output":
+        branch.outputs.append(sources[0])
+    other_outputs = []
+    for index, output in enumerate(branch.outputs):
+        assert output.shape is not None
+        other_outputs.append(
+            ir.Value(
+                name=f"other_{index}",
+                shape=output.shape,
+                type=output.type,
+                const_value=ir.tensor(np.zeros(output.shape.numpy(), dtype=np.float32)),
+            )
+        )
+    other_branch = ir.Graph(
+        [], other_outputs, nodes=[], initializers=other_outputs, name="other_branch"
+    )
+    condition = ir.Value(
+        name="condition", shape=ir.Shape([]), type=ir.TensorType(ir.DataType.BOOL)
+    )
+    select = ir.Node(
+        "",
+        "If",
+        [condition],
+        [ir.AttrGraph("then_branch", branch), ir.AttrGraph("else_branch", other_branch)],
+        num_outputs=len(branch.outputs),
+    )
+    for index, output in enumerate(select.outputs):
+        output.name = f"result_{index}"
+        output.shape = branch.outputs[index].shape
+        output.type = branch.outputs[index].type
+    root = ir.Graph(
+        [condition],
+        select.outputs,
+        nodes=[select],
+        opset_imports={"": 20},
+        name="nested_concat_ownership",
+    )
+    model = ir.Model(root, ir_version=10)
+    if parent_owned:
+        for source in sources:
+            assert source.name is not None
+            del branch.initializers[source.name]
+            root.register_initializer(source)
+        if retained == "output":
+            root.outputs.append(sources[0])
+    owner = root if parent_owned else branch
+    reads = []
+    tensors = []
+    for source, array in zip(sources, arrays, strict=True):
+
+        def read(data=array):
+            reads.append(True)
+            return ir.tensor(data)
+
+        tensor = ir.LazyTensor(read, dtype=source.dtype, shape=source.shape)
+        tensor.meta[LAZY_SOURCE_FILES_META_KEY] = ("checkpoint.bin",)
+        source.const_value = tensor
+        tensors.append(tensor)
+
+    assert FoldConcatInitializersPass()(model).modified
+    packed_name = "init_0__init_1__axis_0__concat"
+    packed = branch.initializers[packed_name]
+    expected_keys = {sources[0].name} if retained is not None else set()
+    if not parent_owned:
+        expected_keys.add(packed_name)
+    assert set(owner.initializers) == expected_keys
+    if parent_owned:
+        assert set(branch.initializers) == {packed_name}
+    assert all(
+        source.const_value is tensor for source, tensor in zip(sources, tensors, strict=True)
+    )
+    assert not reads
+    assert set(packed.const_value.meta[LAZY_SOURCE_FILES_META_KEY]) == {"checkpoint.bin"}
+    assert set(model.meta[LAZY_SOURCE_FILES_META_KEY]) == {"checkpoint.bin"}
+    assert not FoldConcatInitializersPass()(model).modified
+    np.testing.assert_array_equal(packed.const_value.numpy(), np.concatenate(arrays, axis=0))
+    assert len(reads) == 2
+
+
+def test_concat_cleanup_retains_graph_input_initializer():
+    model, sources = _make_concat_model([np.ones((4, 8), dtype=np.float32)] * 2)
+    model.graph.inputs.append(sources[0])
+    assert FoldConcatInitializersPass()(model).modified
+    assert model.graph.initializers["init_1"] is sources[1]
+    common.RemoveUnusedNodesPass()(model)
+    assert model.graph.initializers["init_0"] is sources[0]
+    assert "init_1" not in model.graph.initializers
+
+
+def test_concat_cleanup_preserves_external_source_ownership(tmp_path, monkeypatch):
+    arrays = [
+        np.arange(512, dtype=np.float32).reshape(32, 16),
+        np.full((32, 16), 3, dtype=np.float32),
+    ]
+    model, _ = _make_concat_model(arrays)
+    model.graph.inputs.clear()
+    model.graph.outputs[0].name = "output"
+    base = tmp_path / "base"
+    ModelPackage({"model": model}).save(base, max_workers=1, progress_bar=False)
+    before = {path.name: path.read_bytes() for path in base.iterdir()}
+    model = ModelPackage.load(base)["model"]
+    sources = list(model.graph.initializers.values())
+    assert all(isinstance(value.const_value, ir.ExternalTensor) for value in sources)
+    source_path = (base / "model.onnx.data").resolve()
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("folding and alias refusal must not read external payloads")
+
+    packed_name = "init_0__init_1__axis_0__concat"
+    with monkeypatch.context() as patch:
+        patch.setattr(ir.ExternalTensor, "numpy", unexpected_read)
+        assert FoldConcatInitializersPass()(model).modified
+        assert set(model.graph.initializers) == {"init_0", "init_1", packed_name}
+        common.RemoveUnusedNodesPass()(model)
+        assert set(model.graph.initializers) == {packed_name}
+        packed = model.graph.initializers[packed_name]
+        assert model.graph.outputs[0] is packed
+        assert source_path in {
+            Path(path).resolve()
+            for path in packed.const_value.meta[LAZY_SOURCE_FILES_META_KEY]
+        }
+        assert source_path in {
+            Path(path).resolve() for path in model.meta[LAZY_SOURCE_FILES_META_KEY]
+        }
+        assert all(value.const_value is not None for value in sources)
+        # A fresh package cannot rely on source-file registration performed
+        # before pruning: the packed lazy tensor must carry its own backing.
+        package = ModelPackage({"model": model})
+        with pytest.raises(ValueError, match="aliases lazy source file"):
+            package.save(base, max_workers=1, progress_bar=False)
+    assert before == {path.name: path.read_bytes() for path in base.iterdir()}
+    safe = tmp_path / "safe"
+    package.save(safe, max_workers=1, progress_bar=False)
+    restored = ModelPackage.load(safe)["model"].graph
+    assert set(restored.initializers) == {packed_name}
+    np.testing.assert_array_equal(
+        restored.initializers[packed_name].const_value.numpy(), np.concatenate(arrays, axis=0)
+    )
 
 
 class TestFoldConcatInitializersPass:
@@ -336,6 +500,13 @@ class TestFoldConcatInitializersPass:
         # Only one packed initializer should be registered.
         packed_keys = [k for k in model.graph.initializers if "__concat" in k]
         assert len(packed_keys) == 1
+        assert {"init_0", "init_1"} <= model.graph.initializers.keys()
+        common.RemoveUnusedNodesPass()(model)
+        assert set(model.graph.initializers) == set(packed_keys)
+        np.testing.assert_array_equal(
+            model.graph.initializers[packed_keys[0]].const_value.numpy(),
+            np.concatenate([a, b], axis=0),
+        )
         node_types = [n.op_type for n in model.graph.all_nodes()]
         assert "Concat" not in node_types
 

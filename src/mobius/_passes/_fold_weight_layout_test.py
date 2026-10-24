@@ -17,6 +17,7 @@ from mobius import ModelPackage
 from mobius._constants import LAZY_SOURCE_FILES_META_KEY
 from mobius._optimizations import fold_initializers_after_weights
 from mobius._passes import FoldWeightLayoutPass
+from mobius._testing.ort_inference import OnnxModelSession
 
 
 def _initializer(name, data):
@@ -166,6 +167,139 @@ def test_shared_sources_are_not_duplicated():
     assert model.graph.outputs[2] is layout.outputs[0]
     assert set(model.graph.initializers) == {"weight", "shape1", "shape2"}
     assert source.const_value.numpy().tobytes() == data.tobytes()
+
+
+@pytest.mark.parametrize(
+    ("domain", "op_type", "parameter_slot", "protected"),
+    [
+        ("com.microsoft", "MoE", 2, True),
+        ("com.microsoft", "QMoE", 2, True),
+        ("com.microsoft", "QMoE", 3, True),
+        ("", "DequantizeLinear", 0, True),
+        ("", "DequantizeLinear", 1, True),
+        ("com.microsoft", "MatMulNBits", 1, False),
+        ("", "MatMul", 1, False),
+    ],
+)
+def test_post_weight_storage_layout_paths_preserve_named_sources(
+    domain, op_type, parameter_slot, protected
+):
+    model = _model(np.arange(48, dtype=np.float32).reshape(2, 8, 3))
+    source = model.graph.initializers["weight"]
+
+    def unexpected_read():
+        raise AssertionError("eligibility and layout folding must not read weight payloads")
+
+    tensor = ir.LazyTensor(unexpected_read, dtype=source.dtype, shape=source.shape)
+    source.const_value = tensor
+    # Only the consumer's parameter position matters to this structural test;
+    # complete model/schema and public save/load contracts are covered by the
+    # existing QMoE/FP8/streaming model tests, unchanged by this regression fix.
+    inputs = []
+    for index in range(parameter_slot):
+        argument = ir.Value(
+            name=f"argument_{index}",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([1]),
+        )
+        model.graph.inputs.append(argument)
+        inputs.append(argument)
+    inputs.append(model.graph.outputs[0])
+    consumer = ir.Node(domain, op_type, inputs, num_outputs=1)
+    consumer.outputs[0].name = "consumer_output"
+    model.graph.append(consumer)
+    model.graph.outputs.append(consumer.outputs[0])
+    fold_initializers_after_weights(model)
+    if protected:
+        assert model.graph.initializers["weight"] is source
+        assert source.const_value is tensor
+        assert sum(node.op_type == "Reshape" for node in model.graph) == 2
+        assert sum(node.op_type == "Transpose" for node in model.graph) == 1
+    else:
+        assert "weight" not in model.graph.initializers
+        assert not any(node.op_type in ("Reshape", "Transpose") for node in model.graph)
+
+
+@pytest.mark.parametrize("with_dependency", [False, True])
+def test_qdq_scalar_scale_storage_survives_pipeline_and_package_roundtrip(
+    tmp_path, with_dependency
+):
+    data = np.array([[0.5]], dtype=np.float32)
+    scale = _initializer("checkpoint_scale", data)
+    reads = []
+
+    def read_scale():
+        reads.append(True)
+        return ir.tensor(data)
+
+    tensor = ir.LazyTensor(read_scale, dtype=scale.dtype, shape=scale.shape)
+    scale.const_value = tensor
+    scalar_shape = _initializer("scalar_shape", np.array([], dtype=np.int64))
+    reshape = ir.Node("", "Reshape", [scale, scalar_shape], num_outputs=1)
+    reshape.outputs[0].name = "runtime_scalar_scale"
+    reshape.outputs[0].dtype = ir.DataType.FLOAT
+    reshape.outputs[0].shape = ir.Shape([])
+    codes = ir.Value(name="codes", type=ir.TensorType(ir.DataType.UINT8), shape=ir.Shape([4]))
+    inputs = [codes]
+    nodes = [reshape]
+    runtime_scale = reshape.outputs[0]
+    if with_dependency:
+        dependency = ir.Value(
+            name="dependency", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([])
+        )
+        inputs.append(dependency)
+        add = ir.Node("", "Add", [runtime_scale, dependency], num_outputs=1)
+        add.outputs[0].name = "dependent_scale"
+        add.outputs[0].dtype = ir.DataType.FLOAT
+        add.outputs[0].shape = ir.Shape([])
+        nodes.append(add)
+        runtime_scale = add.outputs[0]
+    dequantize = ir.Node("", "DequantizeLinear", [codes, runtime_scale], num_outputs=1)
+    dequantize.outputs[0].name = "output"
+    dequantize.outputs[0].dtype = ir.DataType.FLOAT
+    dequantize.outputs[0].shape = ir.Shape([4])
+    nodes.append(dequantize)
+    model = ir.Model(
+        ir.Graph(
+            inputs,
+            [dequantize.outputs[0]],
+            nodes=nodes,
+            initializers=[scale, scalar_shape],
+            opset_imports={"": 21},
+        ),
+        ir_version=10,
+    )
+    fold_initializers_after_weights(model)
+    assert model.graph.initializers["checkpoint_scale"] is scale
+    assert scale.const_value is tensor
+    assert not reads
+    assert reshape.graph is model.graph
+    assert reshape.inputs[0] is scale
+    # The protected source stays in checkpoint orientation, not the scalar
+    # runtime format. This is a storage contract, not just numerical parity.
+    assert scale.shape == ir.Shape([1, 1])
+    assert scale.dtype == ir.DataType.FLOAT
+    fold_initializers_after_weights(model)
+    assert model.graph.initializers["checkpoint_scale"] is scale
+    assert not reads
+
+    ModelPackage({"model": model}).save(tmp_path, progress_bar=False)
+    restored = ModelPackage.load(tmp_path)["model"]
+    restored_scale = restored.graph.initializers["checkpoint_scale"]
+    assert restored_scale.shape == scale.shape
+    assert restored_scale.dtype == scale.dtype
+    assert restored_scale.const_value.numpy().tobytes() == data.tobytes()
+    for candidate in (model, restored):
+        session = OnnxModelSession(candidate, device="cpu")
+        for dependency_value in (0.0, 0.25) if with_dependency else (0.0,):
+            code_data = np.array([0, 1, 127, 255], dtype=np.uint8)
+            feeds: dict[str, np.ndarray] = {"codes": code_data}
+            if with_dependency:
+                feeds["dependency"] = np.asarray(dependency_value, dtype=np.float32)
+            actual = session.run(feeds)["output"]
+            np.testing.assert_array_equal(
+                actual, code_data.astype(np.float32) * (0.5 + dependency_value)
+            )
 
 
 def test_unshared_graph_output_layout_name_survives():
@@ -369,6 +503,116 @@ def test_nested_graph_initializers_are_registered_in_their_scope():
     for branch in (first, second):
         assert [item.op_type for item in branch] == ["Identity"]
         assert set(branch.initializers) == {"layout"}
+
+
+def test_post_weight_pipeline_concat_layouts_are_isolated_in_if_branches(tmp_path):
+    branches = []
+    expected_outputs = []
+    for offset in (0, 100):
+        data = np.arange(24, dtype=np.float32).reshape(2, 3, 4) + offset
+        zeros = np.zeros((1, 4, 3), dtype=np.float32)
+        # Each lexical scope deliberately uses the same names for different
+        # payloads. The rank-3 Transpose is folded by FoldWeightLayoutPass,
+        # which exposes an all-initializer Concat in each branch.
+        weight = _initializer("W", data)
+        padding = _initializer("Z", zeros)
+        transpose = ir.Node(
+            "", "Transpose", [weight], [ir.AttrInt64s("perm", [0, 2, 1])], num_outputs=1
+        )
+        transpose.outputs[0].name = "layout"
+        transpose.outputs[0].shape = ir.Shape([2, 4, 3])
+        transpose.outputs[0].dtype = ir.DataType.FLOAT
+        concat = ir.Node(
+            "",
+            "Concat",
+            [transpose.outputs[0], padding],
+            [ir.AttrInt64("axis", 0)],
+            num_outputs=1,
+        )
+        concat.outputs[0].name = "branch_output"
+        concat.outputs[0].shape = ir.Shape([3, 4, 3])
+        concat.outputs[0].dtype = ir.DataType.FLOAT
+        branches.append(
+            ir.Graph(
+                [],
+                [concat.outputs[0]],
+                nodes=[transpose, concat],
+                initializers=[weight, padding],
+                name=f"branch_{offset}",
+            )
+        )
+        expected_outputs.append(np.concatenate([data.transpose(0, 2, 1), zeros], axis=0))
+    condition = ir.Value(
+        name="condition", shape=ir.Shape([]), type=ir.TensorType(ir.DataType.BOOL)
+    )
+    select = ir.Node(
+        "",
+        "If",
+        [condition],
+        [
+            ir.AttrGraph("then_branch", branches[0]),
+            ir.AttrGraph("else_branch", branches[1]),
+        ],
+        num_outputs=1,
+    )
+    select.outputs[0].name = "result"
+    select.outputs[0].shape = ir.Shape([3, 4, 3])
+    select.outputs[0].dtype = ir.DataType.FLOAT
+    model = ir.Model(
+        ir.Graph(
+            [condition],
+            [select.outputs[0]],
+            nodes=[select],
+            opset_imports={"": 24},
+            name="layout_concat_if",
+        ),
+        ir_version=10,
+    )
+
+    fold_initializers_after_weights(model)
+    assert not model.graph.initializers
+    packed_name = "layout__Z__axis_0__concat"
+    packed_values = []
+    for branch, expected in zip(branches, expected_outputs, strict=True):
+        assert not list(branch)
+        assert set(branch.initializers) == {packed_name}
+        packed = branch.initializers[packed_name]
+        assert branch.outputs[0] is packed
+        assert isinstance(packed.const_value, ir.LazyTensor)
+        np.testing.assert_array_equal(packed.const_value.numpy(), expected)
+        packed_values.append(packed)
+    assert packed_values[0] is not packed_values[1]
+    fold_initializers_after_weights(model)
+    assert not model.graph.initializers
+    assert all(
+        branch.initializers[packed_name] is packed
+        for branch, packed in zip(branches, packed_values, strict=True)
+    )
+
+    output_directory = tmp_path / "package"
+    ModelPackage({"model": model}).save(
+        str(output_directory), max_workers=1, progress_bar=False
+    )
+    restored = ModelPackage.load(str(output_directory))["model"]
+    assert not restored.graph.initializers
+    restored_select = next(iter(restored.graph))
+    for attribute, expected in zip(
+        ("then_branch", "else_branch"), expected_outputs, strict=True
+    ):
+        branch = restored_select.attributes[attribute].as_graph()
+        assert not list(branch)
+        assert set(branch.initializers) == {packed_name}
+        packed = branch.initializers[packed_name]
+        assert branch.outputs[0] is packed
+        np.testing.assert_array_equal(packed.const_value.numpy(), expected)
+
+    # Both branches must execute their own payload, before and after the public
+    # package roundtrip, rather than reusing a same-named sibling initializer.
+    for candidate in (model, restored):
+        session = OnnxModelSession(candidate, device="cpu")
+        for take_then, expected in zip((True, False), expected_outputs, strict=True):
+            result = session.run({"condition": np.asarray(take_then, dtype=np.bool_)})
+            np.testing.assert_array_equal(result["result"], expected)
 
 
 @pytest.mark.parametrize("retained", [None, "shared", "graph_output"])
