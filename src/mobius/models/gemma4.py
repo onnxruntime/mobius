@@ -2016,10 +2016,8 @@ class Gemma4DecoderLayer(nn.Module):
         count), unlike a per-expert static unroll which produces O(E x K) nodes
         (~6k per layer at E=128/K=8 — impractical for large MoE checkpoints).
 
-        Standard ``MatMul``/``Einsum`` accumulate in fp32 on CUDA even for fp16
-        inputs, so this path is numerically faithful to HuggingFace — unlike the
-        released-ORT fused ``com.microsoft::MoE`` kernel, which fp16-accumulates
-        the expert GEMMs and loses accuracy at large hidden size.
+        This preserves the reference activation and routing boundaries, but
+        kernel-dependent accumulation still requires numerical qualification.
 
         Args:
             normed_flat: [T, H] — pre-normed input for the experts (T = B*S).
@@ -2053,6 +2051,14 @@ class Gemma4DecoderLayer(nn.Module):
             op.ConstantOfShape(dense_shape, value=ir.tensor(np.zeros(1, dtype=np.float32))),
             top_weights,
         )
+        selected = op.ScatterElements(
+            op.Cast(dense_w, to=ir.DataType.BOOL),
+            top_indices,
+            op.ConstantOfShape(
+                op.Shape(top_indices), value=ir.tensor(np.ones(1, dtype=np.bool_))
+            ),
+            axis=1,
+        )  # [T, E], independent of routing weights or learned expert scales
         dense_w = op.ScatterElements(dense_w, top_indices, top_weights, axis=1)  # [T, E]
 
         # fc1_experts_weights [E, 2*moe_inter, H] stores gate rows then up rows.
@@ -2073,6 +2079,11 @@ class Gemma4DecoderLayer(nn.Module):
         # Down projection: [T, E, moe_inter] x [E, H, moe_inter] -> [T, E, H]
         expert_out = op.Einsum(inter, self.fc2_experts_weights, equation="tei,ehi->teh")
 
+        # Sparse HF dispatch never evaluates unselected experts. Multiplying
+        # their nonfinite outputs by zero would contaminate selected results.
+        expert_out = op.Where(
+            op.Unsqueeze(selected, [2]), expert_out, op.CastLike(0.0, expert_out)
+        )
         # Weight by the dense routing vector and sum over experts.
         # HF rounds each FP32-weighted contribution back to the expert dtype.
         weighted = op.CastLike(

@@ -46,6 +46,12 @@ exact-activation fallback; quantized GEGLU experts fail at construction with an
 explicit requirement message. Opt-in does not enable native GEGLU on non-CUDA
 providers. Tanh-GELU must not be replaced by a sigmoid-based SwiGLU approximation.
 
+The portable fallback evaluates experts densely, but selects out unchosen expert
+outputs before weighting. This prevents an overflowing unselected expert from
+contaminating the result through `0 * Inf` or `0 * NaN`; nonfinite selected
+experts still propagate. This safeguard is not full-checkpoint numerical or
+performance qualification.
+
 Each emitted native `MoE`/`QMoE` operator persists
 `mobius.gemma4.required_runtime_feature="custom-cuda-geglu-v1"` in its ONNX
 metadata. This declares the experimental CUDA `activation_type="geglu"`,

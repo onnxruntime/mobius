@@ -2021,6 +2021,65 @@ class TestGemma4MoeFallbackActivation:
         assert acts, "MoE fallback must emit an activation op"
         assert all(op == "Gelu" and approx == "tanh" for op, approx in acts), acts
 
+    @pytest.mark.parametrize("selected_expert", [0, 1])
+    @pytest.mark.parametrize("expert_scale", [0.0, 1.0])
+    def test_nonfinite_expert_is_masked_by_selection_not_weight(
+        self, selected_expert, expert_scale
+    ):
+        import numpy as np
+
+        from mobius._testing import create_test_builder, create_test_input
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import Gemma4DecoderLayer
+
+        class FallbackOnly(Gemma4DecoderLayer):
+            def forward(self, op, normed_flat, router_probs):
+                self.router(op, normed_flat)
+                return self._dispatch_moe_fallback(op, normed_flat, router_probs)
+
+        config = _tiny_gemma4_text_moe_config(
+            dtype=ir.DataType.FLOAT,
+            num_local_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+        )
+        module = FallbackOnly(config, 0)
+        fc1 = np.zeros((2, 32, 64), dtype=np.float32)
+        fc1[1] = np.finfo(np.float32).max
+        fc2 = np.zeros((2, 64, 16), dtype=np.float32)
+        fc2[1] = 1
+        module.fc1_experts_weights.const_value = ir.tensor(fc1)
+        module.fc2_experts_weights.const_value = ir.tensor(fc2)
+        module.router.per_expert_scale.const_value = ir.tensor(
+            np.full(2, expert_scale, dtype=np.float32)
+        )
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "normed_flat", [1, 64])
+        probs = create_test_input(builder, "router_probs", [1, 2])
+        output = module(op, x, probs)
+        output.name = "fallback"
+        output.shape = ir.Shape([1, 64])
+        output.dtype = ir.DataType.FLOAT
+        graph.outputs.append(output)
+        graph = ir.convenience.extract(graph, [x, probs], [output])
+        session = OnnxModelSession(ir.Model(graph, ir_version=10), device="cpu")
+        try:
+            actual = session.run(
+                {
+                    "normed_flat": np.ones((1, 64), dtype=np.float32),
+                    "router_probs": np.eye(2, dtype=np.float32)[
+                        selected_expert : selected_expert + 1
+                    ],
+                }
+            )["fallback"]
+        finally:
+            session.close()
+        if selected_expert == 0:
+            np.testing.assert_array_equal(actual, np.zeros((1, 64), dtype=np.float32))
+        else:
+            # Even a zero learned scale must not hide a selected expert's NaNs.
+            assert not np.isfinite(actual).any()
+
 
 class TestGemma4OutputLayerIndices:
     """``output_layer_indices`` taps the post-final-norm hidden as ``hidden_states.{idx}``.
