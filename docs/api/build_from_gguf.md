@@ -22,6 +22,13 @@ package.save("output")
 Quantized target storage is requested by default. Use
 `keep_quantized=False` when the output must use float storage.
 
+Gemma4 imports honor `gemma4.attention.shared_kv_layers`: K/V projection and
+K-norm weights stored in the configured shared-KV layers are unused, matching
+Transformers, and are excluded before quantization selection and weight loading.
+They remain in the source qtype census but not the mapped-tensor fidelity records.
+Projection weights in cache-owning layers and tensors outside the configured layer
+range are not covered by this exclusion.
+
 ## Signature
 
 ```python
