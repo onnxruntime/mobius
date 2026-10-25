@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import math
+import tracemalloc
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,7 @@ import onnxruntime as ort
 import pytest
 from gguf import quants
 
+from mobius.integrations.gguf import _repacker
 from mobius.integrations.gguf._repacker import (
     RepackedTensor,
     _unpack_q4_k_scales,
@@ -969,6 +972,55 @@ class TestRepackQ6K:
         assert _GGUF_BLOCK_ELEMENTS[_GGUF_Q6_K] == 256
 
 
+def _reference_repack_dequantized(values: np.ndarray, *, symmetric: bool) -> RepackedTensor:
+    """Snapshot of the unchunked algorithm, including its float32 rounding."""
+    n_out, k_in = values.shape
+    n_blocks = math.ceil(k_in / _BLOCK_SIZE)
+    padded = np.zeros((n_out, n_blocks * _BLOCK_SIZE), dtype=np.float32)
+    padded[:, :k_in] = values.astype(np.float32, copy=False)
+    blocks = padded.reshape(n_out, n_blocks, _BLOCK_SIZE)
+    if symmetric:
+        block_min = blocks.min(axis=-1)
+        block_max = blocks.max(axis=-1)
+        scales = np.maximum(-block_min / 8.0, block_max / 7.0)
+        zero_points = np.full_like(scales, 8, dtype=np.uint8)
+    else:
+        block_min = np.minimum(blocks.min(axis=-1), 0.0)
+        block_max = np.maximum(blocks.max(axis=-1), 0.0)
+        scales = (block_max - block_min) / 15.0
+        safe_scales = np.where(scales != 0, scales, 1.0)
+        zero_points = np.clip(np.rint(-block_min / safe_scales), 0, 15).astype(np.uint8)
+    safe_scales = np.where(scales != 0, scales, 1.0)
+    quants = np.rint(blocks / safe_scales[:, :, None])
+    quants += zero_points[:, :, None]
+    quants = np.clip(quants, 0, 15).astype(np.uint8)
+    quants = np.where(scales[:, :, None] != 0, quants, 0).astype(np.uint8)
+    pairs = quants.reshape(n_out, n_blocks, _BLOCK_SIZE // 2, 2)
+    weight = (pairs[..., 1] << 4) | pairs[..., 0]
+    packed_zero_points = None
+    if not symmetric:
+        zp_cols = math.ceil(n_blocks / 2)
+        zp_padded = np.zeros((n_out, zp_cols * 2), dtype=np.uint8)
+        zp_padded[:, :n_blocks] = zero_points
+        zp_pairs = zp_padded.reshape(n_out, zp_cols, 2)
+        packed_zero_points = zp_pairs[:, :, 0] | (zp_pairs[:, :, 1] << 4)
+    return RepackedTensor(
+        weight, scales.astype(np.float32), packed_zero_points, _BLOCK_SIZE, 4
+    )
+
+
+def _assert_repacked_bytes_equal(actual: RepackedTensor, expected: RepackedTensor) -> None:
+    assert (actual.bits, actual.block_size) == (expected.bits, expected.block_size)
+    for name in ("weight", "scales", "zero_points"):
+        got, want = getattr(actual, name), getattr(expected, name)
+        if want is None:
+            assert got is None
+        else:
+            assert got.shape == want.shape
+            assert got.dtype == want.dtype
+            assert got.tobytes() == want.tobytes(), name
+
+
 class TestRepackDequantizedTensor:
     def test_asymmetric_q4_round_trip_bound(self):
         rng = np.random.default_rng(0)
@@ -980,6 +1032,126 @@ class TestRepackDequantizedTensor:
         assert max_abs_diff <= float(result.scales.max()) * 0.51 + 1e-6
         assert result.weight.shape == (3, 3, 16)
         assert result.zero_points.shape == (3, 2)
+
+    @pytest.mark.parametrize("symmetric", [False, True])
+    @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64, np.int16])
+    @pytest.mark.parametrize("layout", ["C", "F", "strided", "reversed"])
+    @pytest.mark.parametrize(
+        "shape",
+        [(0, 70), (3, 0), (0, 0), (1, 1), (1, 32), (3, 64), (5, 70), (7, 192), (2, 449)],
+    )
+    def test_chunked_bytes_match_original(self, monkeypatch, symmetric, dtype, layout, shape):
+        monkeypatch.setattr(_repacker, "_REPACK_CHUNK_BLOCKS", 6)
+        rng = np.random.default_rng(2026)
+        values = (rng.normal(size=shape) * 10).astype(dtype)
+        if layout == "F":
+            values = np.asfortranarray(values)
+        elif layout == "strided":
+            backing = np.empty((shape[0] * 2, shape[1] * 2), dtype=dtype)
+            backing[::2, ::2] = values
+            values = backing[::2, ::2]
+        elif layout == "reversed":
+            values = values[::-1, ::-1]
+        values.flags.writeable = False
+        original = values.tobytes()
+        expected = _reference_repack_dequantized(values, symmetric=symmetric)
+        actual = repack_dequantized_tensor(values, symmetric=symmetric)
+        _assert_repacked_bytes_equal(actual, expected)
+        assert values.tobytes() == original
+
+    @pytest.mark.parametrize("symmetric", [False, True])
+    def test_zero_constant_and_rounding_blocks_match_original(self, monkeypatch, symmetric):
+        monkeypatch.setattr(_repacker, "_REPACK_CHUNK_BLOCKS", 6)
+        # Unit scales give exact half-way ties; include both signs and signed zero.
+        patterns = np.array(
+            [
+                [0.0] * 32,
+                [-0.0] * 32,
+                [3.0] * 32,
+                [-3.0] * 32,
+                [0.0, 15.0, 0.5, 1.5, 2.5, 3.5, 14.5, 7.5] * 4,
+                [-8.0, 7.0, -0.5, -1.5, -2.5, -3.5, 0.5, 1.5] * 4,
+                [0.0, 0.0, 1e-30, -1e-30] * 8,
+            ],
+            dtype=np.float32,
+        )
+        values = np.tile(patterns.reshape(1, -1), (5, 1))
+        _assert_repacked_bytes_equal(
+            repack_dequantized_tensor(values, symmetric=symmetric),
+            _reference_repack_dequantized(values, symmetric=symmetric),
+        )
+
+    @pytest.mark.parametrize("symmetric", [False, True])
+    @pytest.mark.parametrize("shape", [(99, 10752), (1, 1048609)])
+    def test_default_chunk_boundary_matches_original(self, symmetric, shape):
+        values = np.random.default_rng(2).normal(size=shape).astype(np.float32)
+        _assert_repacked_bytes_equal(
+            repack_dequantized_tensor(values, symmetric=symmetric),
+            _reference_repack_dequantized(values, symmetric=symmetric),
+        )
+
+    @pytest.mark.parametrize("symmetric", [False, True])
+    @pytest.mark.parametrize("shape", [(31, 97), (1, 1025), (5, 449)])
+    def test_each_scratch_tile_is_bounded(self, monkeypatch, symmetric, shape):
+        limit = 6
+        monkeypatch.setattr(_repacker, "_REPACK_CHUNK_BLOCKS", limit)
+        original = _repacker._repack_dequantized_chunk
+        block_counts = []
+
+        def checked_chunk(values, *, symmetric):
+            blocks = values.shape[0] * math.ceil(values.shape[1] / _BLOCK_SIZE)
+            assert 0 < blocks <= limit
+            block_counts.append(blocks)
+            return original(values, symmetric=symmetric)
+
+        monkeypatch.setattr(_repacker, "_repack_dequantized_chunk", checked_chunk)
+        values = np.random.default_rng(1).normal(size=shape).astype(np.float32)
+        actual = repack_dequantized_tensor(values, symmetric=symmetric)
+        assert len(block_counts) > 1
+        assert sum(block_counts) == shape[0] * math.ceil(shape[1] / _BLOCK_SIZE)
+        _assert_repacked_bytes_equal(
+            actual, _reference_repack_dequantized(values, symmetric=symmetric)
+        )
+
+    @pytest.mark.parametrize("symmetric", [False, True])
+    @pytest.mark.parametrize("shape", [(4096, 97), (1, 131073)])
+    def test_transient_allocation_excludes_full_float_tensor(
+        self, monkeypatch, symmetric, shape
+    ):
+        limit = 64
+        monkeypatch.setattr(_repacker, "_REPACK_CHUNK_BLOCKS", limit)
+        values = np.ones(shape, dtype=np.float64)
+        tracing = tracemalloc.is_tracing()
+        if not tracing:
+            tracemalloc.start()
+        try:
+            baseline = tracemalloc.get_traced_memory()[0]
+            tracemalloc.reset_peak()
+            result = repack_dequantized_tensor(values, symmetric=symmetric)
+            peak = tracemalloc.get_traced_memory()[1] - baseline
+        finally:
+            if not tracing:
+                tracemalloc.stop()
+        output_bytes = result.weight.nbytes + result.scales.nbytes
+        if result.zero_points is not None:
+            output_bytes += result.zero_points.nbytes
+        # Allow all live scratch arrays plus interpreter overhead, but not even
+        # one float32 copy of either input. Also catches allocations outside tiles.
+        scratch_bound = limit * _BLOCK_SIZE * 64 + 128 * 1024
+        assert scratch_bound < values.size * np.dtype(np.float32).itemsize
+        assert peak - output_bytes < scratch_bound
+
+    @pytest.mark.parametrize(
+        ("values", "kwargs", "message"),
+        [
+            (np.zeros(32), {}, "Expected 2D"),
+            (np.zeros((1, 32)), {"bits": 8}, "supports only"),
+            (np.zeros((1, 32)), {"block_size": 64}, "supports only"),
+        ],
+    )
+    def test_invalid_layout_is_rejected(self, values, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            repack_dequantized_tensor(values, **kwargs)
 
 
 # ---- Q1_0 tests ----

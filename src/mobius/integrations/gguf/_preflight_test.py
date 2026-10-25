@@ -605,6 +605,9 @@ def test_budget_reflects_real_artifacts_only_no_second_copy(tmp_path):
     # VRAM is derived from the export artifact, not the source dtype bytes.
     assert report.vram_weights_bytes == report.output_bytes
     assert report.output_bytes <= report.total_bytes  # block-preserving, not widened
+    assert (
+        "host RAM peak: not estimated (dequantization/repacking excluded)" in report.render()
+    )
     # The report (including repacked int-quant types) must be JSON-serialisable
     # for the resumable cache — no stray numpy scalars from the header reader.
     import json as _json

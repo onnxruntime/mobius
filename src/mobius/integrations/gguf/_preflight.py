@@ -159,7 +159,8 @@ class GgufPreflightReport:
         type_stats: Per-quant-type lossless-conversion accounting (populated for
             a local header read; empty when only remote metadata is available).
         output_bytes: Estimated ONNX external-data size of the block-preserving
-            export (``None`` when the per-tensor types were not read).
+            export (``None`` when the per-tensor types were not read). Not a
+            bound on host RAM during dequantization or repacking.
         vram_weights_bytes: Weight footprint that must fit in device memory,
             derived from the export artifact (``None`` when unknown). This is a
             weights-only figure — no inference/activation speculation.
@@ -240,6 +241,9 @@ class GgufPreflightReport:
             )
             if self.vram_weights_bytes is not None:
                 lines.append(f"    weights VRAM: {_gib(self.vram_weights_bytes):.3f} GiB")
+            lines.append(
+                "    host RAM peak: not estimated (dequantization/repacking excluded)"
+            )
         if self.type_stats:
             lines.append("  tensor types (lossless disposition vs. the real repacker):")
             for stat in self.type_stats:
