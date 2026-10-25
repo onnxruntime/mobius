@@ -327,23 +327,9 @@ class Attention(nn.Module):
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
     ):
-        query_states, key_states, value_states = self._project_qkv(op, hidden_states)
-        if not math.isclose(self._key_multiplier, 1.0):
-            key_states = op.Mul(key_states, self._key_multiplier)
-
-        if self.q_norm is not None and self.k_norm is not None:
-            if self._qk_norm_full:
-                # Apply norm on 3D tensor (across all heads)
-                query_states = self.q_norm(op, query_states)
-                key_states = self.k_norm(op, key_states)
-            else:
-                # Apply norm per-head on 4D tensor
-                query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
-                key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
-                query_states = self.q_norm(op, query_states)
-                key_states = self.k_norm(op, key_states)
-                query_states = op.Reshape(query_states, [0, 0, -1])
-                key_states = op.Reshape(key_states, [0, 0, -1])
+        query_states, key_states, value_states = self._project_and_normalize_qkv(
+            op, hidden_states
+        )
 
         # Direct GroupQueryAttention path: skip external RoPE, fuse everything.
         if isinstance(attention_bias, GQAContext):
@@ -413,6 +399,24 @@ class Attention(nn.Module):
             self.k_proj(op, hidden_states),
             self.v_proj(op, hidden_states),
         )
+
+    def _project_and_normalize_qkv(
+        self, op: OpBuilder, hidden_states: ir.Value
+    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+        """Project Q/K/V and apply the configured key scaling and QK normalization."""
+        query, key, value = self._project_qkv(op, hidden_states)
+        if not math.isclose(self._key_multiplier, 1.0):
+            key = op.Mul(key, self._key_multiplier)
+        if self.q_norm is not None and self.k_norm is not None:
+            if self._qk_norm_full:
+                query = self.q_norm(op, query)
+                key = self.k_norm(op, key)
+            else:
+                query = self.q_norm(op, op.Reshape(query, [0, 0, -1, self.head_dim]))
+                key = self.k_norm(op, op.Reshape(key, [0, 0, -1, self.head_dim]))
+                query = op.Reshape(query, [0, 0, -1])
+                key = op.Reshape(key, [0, 0, -1])
+        return query, key, value
 
     def _project_output(self, op: OpBuilder, attn_output: ir.Value) -> ir.Value:
         """Apply architecture-specific processing before the output projection."""

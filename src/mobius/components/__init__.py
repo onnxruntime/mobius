@@ -5,6 +5,7 @@ __all__ = [
     "AdaLayerNormOutput",
     "AdaLayerNormZero",
     "Attention",
+    "BaseRope",
     "BatchNorm1d",
     "BatchNorm2d",
     "BertEmbeddings",
@@ -455,7 +456,7 @@ from mobius.components._rms_norm import (
     ScaleFreeRMSNorm,
     apply_rms_norm,
 )
-from mobius.components._rotary_embedding import apply_rotary_pos_emb, initialize_rope
+from mobius.components._rotary_embedding import BaseRope, apply_rotary_pos_emb, initialize_rope
 from mobius.components._sanm_attention import (
     SANMFFN as SANMFFN,
 )

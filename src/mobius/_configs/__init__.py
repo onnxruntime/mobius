@@ -112,6 +112,7 @@ from mobius._configs._sub_configs import (
     VisionConfig,
 )
 from mobius._configs._world_model import WorldModelConfig
+from mobius._configs.flint import FlintConfig
 from mobius._configs.vibevoice import (
     VibeVoiceASRStreamingConfig,
     VibeVoiceConfig,
@@ -138,6 +139,7 @@ __all__ = [
     "Eagle3Config",
     "EncoderConfig",
     "FalconH1Config",
+    "FlintConfig",
     "Gemma2Config",
     "Gemma3nAudioConfig",
     "Gemma3nConfig",
