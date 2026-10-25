@@ -2145,8 +2145,11 @@ class TestBuildQuantizedGguf:
     ):
         from gguf import GGMLQuantizationType
 
-        from mobius.integrations.gguf import build_from_gguf
+        from mobius._configs import QuantizationConfig
+        from mobius.integrations.gguf._builder import _load_quantized_state_dict
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
         from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.models import CausalLMModel
 
         original = GGUFModel.dequantize_raw_tensor
         inputs = []
@@ -2160,7 +2163,21 @@ class TestBuildQuantizedGguf:
             return values
 
         monkeypatch.setattr(GGUFModel, "dequantize_raw_tensor", checked_dequantize)
-        build_from_gguf(q8_0_projection_q4_head_gguf, keep_quantized=True)
+        source = GGUFModel(q8_0_projection_q4_head_gguf)
+        try:
+            config = dataclasses.replace(
+                gguf_to_config(source),
+                quantization=QuantizationConfig(
+                    bits=4,
+                    group_size=32,
+                    quant_method="gguf",
+                    sym=False,
+                    quantize_lm_head=True,
+                ),
+            )
+            _load_quantized_state_dict(source, "llama", CausalLMModel(config), config)
+        finally:
+            source.close()
         assert len(inputs) > 1
         assert all(ref() is None for ref in inputs)
 
