@@ -9782,6 +9782,7 @@ def _load_quantized_state_dict(
                         block_size=target_block_size,
                         symmetric=target_symmetric,
                     )
+                    del values
                     n_requantized += 1
             else:
                 _require_supported_requantization(
@@ -9796,6 +9797,7 @@ def _load_quantized_state_dict(
                     block_size=target_block_size,
                     symmetric=target_symmetric,
                 )
+                del values
                 n_requantized += 1
 
             packed = repacked.weight.reshape(num_experts, n_out, *repacked.weight.shape[1:])
@@ -9871,6 +9873,7 @@ def _load_quantized_state_dict(
                     block_size=target_block_size,
                     symmetric=target_symmetric,
                 )
+                del values
                 n_requantized += 1
             elif route is QuantImportRoute.AFFINE_REPACK and can_repack(qtype_val):
                 shape_2d = (int(np_shape[0]), int(np_shape[1]))
@@ -9892,6 +9895,7 @@ def _load_quantized_state_dict(
                         block_size=target_block_size,
                         symmetric=target_symmetric,
                     )
+                    del values
                     n_requantized += 1
             else:
                 _require_supported_requantization(
@@ -9906,6 +9910,7 @@ def _load_quantized_state_dict(
                     block_size=target_block_size,
                     symmetric=target_symmetric,
                 )
+                del values
                 n_requantized += 1
             w = torch.from_numpy(repacked.weight)
             s = torch.from_numpy(repacked.scales)

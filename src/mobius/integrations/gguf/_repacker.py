@@ -47,6 +47,8 @@ __all__ = [
 ]
 
 _BLOCK_SIZE = 32
+# Even so column chunks never split a byte containing two block zero-points.
+_REPACK_CHUNK_BLOCKS = 32768
 
 
 def _type_id(name: str) -> int:
@@ -612,6 +614,11 @@ def repack_dequantized_tensor(
     This is used for mixed GGUF presets such as Q4_K_M, where projection
     tensors may use Q4_K, Q5_0, Q6_K, and Q8_0 within one model while the
     ONNX graph must use one MatMulNBits configuration throughout.
+
+    Scratch arrays cover at most 32768 quantization blocks (4 MiB of float32
+    values), independently of either matrix dimension. The input matrix and
+    final packed outputs still occupy tensor-sized storage; this is not an
+    upper bound on total import RAM, including upstream dequantization.
     """
     if values.ndim != 2:
         raise ValueError(f"Expected 2D values (N, K), got shape {values.shape}")
@@ -622,6 +629,44 @@ def repack_dequantized_tensor(
             f"block_size={block_size}"
         )
 
+    n_out, k_in = values.shape
+    n_blocks = math.ceil(k_in / block_size)
+    weight = np.empty((n_out, n_blocks, block_size // 2), dtype=np.uint8)
+    scales = np.empty((n_out, n_blocks), dtype=np.float32)
+    zero_points = (
+        None if symmetric else np.empty((n_out, math.ceil(n_blocks / 2)), dtype=np.uint8)
+    )
+    rows_per_chunk = max(1, _REPACK_CHUNK_BLOCKS // max(n_blocks, 1))
+    for row_start in range(0, n_out, rows_per_chunk):
+        row_end = min(row_start + rows_per_chunk, n_out)
+        for block_start in range(0, n_blocks, _REPACK_CHUNK_BLOCKS):
+            block_end = min(block_start + _REPACK_CHUNK_BLOCKS, n_blocks)
+            chunk = _repack_dequantized_chunk(
+                values[
+                    row_start:row_end,
+                    block_start * block_size : min(block_end * block_size, k_in),
+                ],
+                symmetric=symmetric,
+            )
+            weight[row_start:row_end, block_start:block_end] = chunk.weight
+            scales[row_start:row_end, block_start:block_end] = chunk.scales
+            if zero_points is not None:
+                assert chunk.zero_points is not None
+                zero_points[row_start:row_end, block_start // 2 : (block_end + 1) // 2] = (
+                    chunk.zero_points
+                )
+            del chunk
+
+    return RepackedTensor(weight, scales, zero_points, block_size, bits)
+
+
+def _repack_dequantized_chunk(
+    values: np.ndarray,
+    *,
+    symmetric: bool,
+) -> RepackedTensor:
+    """Apply the original affine arithmetic to a bounded, block-aligned tile."""
+    block_size = _BLOCK_SIZE
     n_out, k_in = values.shape
     n_blocks = math.ceil(k_in / block_size)
     padded_k = n_blocks * block_size
@@ -668,7 +713,7 @@ def repack_dequantized_tensor(
         scales=scales.astype(np.float32),
         zero_points=packed_zero_points,
         block_size=block_size,
-        bits=bits,
+        bits=4,
     )
 
 

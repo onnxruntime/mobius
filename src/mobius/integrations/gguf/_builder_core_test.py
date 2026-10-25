@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -2138,6 +2139,30 @@ class TestBuildQuantizedGguf:
             "INT4 affine block-32"
         )
         assert "Q8_0:" in caplog.text
+
+    def test_requantized_float_inputs_are_released_between_tensors(
+        self, q8_0_projection_q4_head_gguf: Path, monkeypatch
+    ):
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        original = GGUFModel.dequantize_raw_tensor
+        inputs = []
+
+        def checked_dequantize(model, raw, qtype, shape):
+            if qtype in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
+                return original(model, raw, qtype, shape)
+            assert all(ref() is None for ref in inputs)
+            values = original(model, raw, qtype, shape)
+            inputs.append(weakref.ref(values))
+            return values
+
+        monkeypatch.setattr(GGUFModel, "dequantize_raw_tensor", checked_dequantize)
+        build_from_gguf(q8_0_projection_q4_head_gguf, keep_quantized=True)
+        assert len(inputs) > 1
+        assert all(ref() is None for ref in inputs)
 
     def test_quantized_source_float_output_head_dequantizes_consistently(
         self, tmp_path: Path
