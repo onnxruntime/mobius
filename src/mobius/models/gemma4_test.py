@@ -1268,13 +1268,14 @@ class TestGemma4BlockSequenceIds:
         assert "input_ids" not in dec_inputs
 
     @pytest.mark.parametrize("mask", [[1, 0, 1, 1], [1, 1, 1, 0]])
-    def test_cuda_export_preserves_global_cached_mask_holes(self, mask):
+    @pytest.mark.parametrize("text_task", [False, True], ids=["split", "text"])
+    def test_cuda_export_preserves_global_cached_mask_holes(self, mask, text_task):
         import numpy as np
 
         from mobius import build_from_module
         from mobius._pipeline_contract import requires_arbitrary_attention_mask
         from mobius._testing.ort_inference import OnnxModelSession
-        from mobius.tasks._gemma4 import Gemma4Task
+        from mobius.tasks._gemma4 import Gemma4Task, Gemma4TextCausalLMTask
 
         config = _tiny_gemma4_config(
             dtype=ir.DataType.FLOAT16,
@@ -1282,10 +1283,10 @@ class TestGemma4BlockSequenceIds:
             use_bidirectional_attention="vision",
             image_token_id=255,
         )
-        package = build_from_module(
-            Gemma4Model(config), config, task=Gemma4Task(), execution_provider="cuda"
-        )
-        decoder = package["decoder"]
+        module = Gemma4CausalLMModel(config) if text_task else Gemma4Model(config)
+        task = Gemma4TextCausalLMTask() if text_task else Gemma4Task()
+        package = build_from_module(module, config, task=task, execution_provider="cuda")
+        decoder = package["model" if text_task else "decoder"]
         assert requires_arbitrary_attention_mask(decoder.graph)
         assert not any(node.op_type == "GroupQueryAttention" for node in decoder.graph)
         global_attention = next(

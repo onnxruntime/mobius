@@ -273,6 +273,9 @@ class Gemma4TextCausalLMTask(ModelTask):
     Supports ``static_cache=True`` for pre-allocated TensorScatter-based
     KV cache (requires ORT ≥ 1.25.0).
 
+    Configs retaining vision-overlay attention preserve explicit masks during
+    optimization; stripped text-only configs remain eligible for GQA fusion.
+
     Inputs (dynamic cache):
         - input_ids: [batch, sequence_len] INT64
         - attention_mask: [batch, past_seq_len + seq_len] INT64
@@ -327,6 +330,12 @@ class Gemma4TextCausalLMTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
 
         graph, builder = _make_graph()
+        if (
+            config.use_bidirectional_attention == "vision"
+            and config.image_token_id is not None
+        ):
+            # Prefix-length GQA fusion cannot preserve internal mask holes.
+            declare_arbitrary_attention_mask(graph)
         op = builder.op
 
         input_ids = builder.input(
