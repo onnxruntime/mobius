@@ -28,6 +28,7 @@ from mobius.components import create_attention_bias
 from mobius.models.flint import (
     FLINT_CUDA_DOMAIN,
     FlintCausalLMModel,
+    FlintCUDALinear,
     FlintDecoderLayer,
     FlintGate,
     FlintMLP,
@@ -600,11 +601,11 @@ def test_flint_cuda_blocks(dtype, layer_index, tmp_path):
     critical = [
         event["args"]
         for event in events
-        if event.get("args", {}).get("op_name") in {"Attention", "MoE", "MatMul"}
+        if event.get("args", {}).get("op_name") in {"Attention", "MoE", "MatMul", "Gemm"}
         and "provider" in event.get("args", {})
     ]
     assert critical
-    required_ops = {"Attention", "MatMul"}
+    required_ops = {"Attention", "MatMul", "Gemm"}
     if layer_index not in config.mlp_only_layers:
         required_ops.add("MoE")
     assert required_ops <= {event["op_name"] for event in critical}
@@ -628,6 +629,28 @@ def test_flint_router_preserves_small_sigmoid_weights():
     expected /= expected.sum(-1, keepdim=True) + 1e-20
     np.testing.assert_allclose(actual["weights"], expected.numpy(), atol=1e-7)
     np.testing.assert_array_equal(actual["indices"], [[0, 1]])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_flint_cuda_down_projection_preserves_source_gemm_layout():
+    module = FlintCUDALinear(6144, 2048, bias=False)
+    state = _initialize(module, ir.DataType.BFLOAT16)
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, "query", 6144], ir.DataType.BFLOAT16)
+    with build_context(get_ep("cuda"), ir.DataType.BFLOAT16):
+        output = module(op, hidden)
+    output.name = "output"
+    graph.outputs.append(output)
+    rng = torch.Generator().manual_seed(81)
+    weight = state["weight"].cuda()
+    with closing(
+        OnnxModelSession(ir.Model(graph, ir_version=10), device="cuda", intra_op_num_threads=4)
+    ) as session:
+        for query in (16, 1):
+            x = torch.randn((1, query, 6144), generator=rng).bfloat16()
+            expected = functional.linear(x.cuda(), weight).cpu()
+            actual = session.run({"hidden": _numpy(x)})["output"]
+            np.testing.assert_array_equal(actual.astype(np.float32), expected.float().numpy())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

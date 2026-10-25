@@ -52,8 +52,32 @@ class FlintRotaryEmbedding(BaseRope):
         self.sin_cache._keep_float32 = True  # type: ignore[attr-defined]
 
 
+class FlintCUDALinear(Linear):
+    """Keep the source's weight layout and logical GEMM rows on CUDA."""
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        if ep_capabilities().name != "cuda":
+            return super().forward(op, hidden_states)
+        assert self.weight.shape is not None
+        flat = op.Reshape(hidden_states, [-1, self.weight.shape[1]])
+        # Pretransposing BF16 weights changes cuBLAS's reduction and narrow rounding.
+        output = op.Gemm(flat, self.weight, self.bias, transB=1)
+        shape = op.Concat(
+            op.Shape(hidden_states, end=-1),
+            op.Shape(self.weight, start=0, end=1),
+            axis=0,
+        )
+        return op.Reshape(output, shape)
+
+
 class FlintMLP(MLP):
     """Native projections with fused FP32 SwiGLU before its narrow store."""
+
+    def __init__(self, config: FlintConfig):
+        super().__init__(config)
+        self.down_proj = FlintCUDALinear(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         gate = self.gate_proj(op, hidden_states)
