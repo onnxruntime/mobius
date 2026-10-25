@@ -654,6 +654,35 @@ def test_flint_cuda_down_projection_preserves_source_gemm_layout():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_flint_mlp_preserves_source_silu_division_rounding():
+    config = _config(hidden_size=4, intermediate_size=2, dtype=ir.DataType.BFLOAT16)
+    module = FlintMLP(config)
+    _cast_module_dtype(module, config.dtype)
+    weights = {
+        "gate_proj.weight": torch.eye(4)[:2],
+        "up_proj.weight": torch.eye(4)[2:],
+        "down_proj.weight": torch.eye(4)[:, :2],
+    }
+    for name, parameter in module.named_parameters():
+        parameter.const_value = tensor_adapters.TorchTensor(weights[name].bfloat16())
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 1, 4], config.dtype)
+    with build_context(get_ep("cuda"), config.dtype):
+        output = module(op, hidden)
+    output.name = "output"
+    graph.outputs.append(output)
+    x = torch.tensor([[[-0.7578125, 0.78515625, 0.388671875, 0.00170135498046875]]])
+    gate, up = x.cuda().float().chunk(2, dim=-1)
+    activated = (functional.silu(gate) * up).bfloat16()
+    expected = torch.cat((activated, torch.zeros_like(activated)), dim=-1).float().cpu()
+    with closing(
+        OnnxModelSession(ir.Model(graph, ir_version=10), device="cuda", intra_op_num_threads=4)
+    ) as session:
+        actual = session.run({"hidden": _numpy(x.bfloat16())})["output"]
+    np.testing.assert_array_equal(actual.astype(np.float32), expected.numpy())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_flint_mlp_rounds_only_after_fused_swiglu():
     config = _config(hidden_size=4, intermediate_size=4, dtype=ir.DataType.BFLOAT16)
     module = FlintMLP(config)

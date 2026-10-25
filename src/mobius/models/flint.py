@@ -80,12 +80,11 @@ class FlintMLP(MLP):
         )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        gate = self.gate_proj(op, hidden_states)
-        up = self.up_proj(op, hidden_states)
-        combined = op.Mul(
-            op.Swish(op.Cast(gate, to=ir.DataType.FLOAT)),
-            op.Cast(up, to=ir.DataType.FLOAT),
-        )
+        gate = op.Cast(self.gate_proj(op, hidden_states), to=ir.DataType.FLOAT)
+        up = op.Cast(self.up_proj(op, hidden_states), to=ir.DataType.FLOAT)
+        # Source SiLU divides directly; multiplying by a reciprocal changes BF16 ties.
+        silu = op.Div(gate, op.Add(1.0, op.Exp(op.Neg(gate))))
+        combined = op.Mul(silu, up)
         return self.down_proj(op, op.CastLike(combined, hidden_states))
 
 
