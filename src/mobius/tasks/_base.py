@@ -127,6 +127,9 @@ def _make_graph(
 
 def _make_model(graph: ir.Graph) -> ir.Model:
     """Create an ``ir.Model`` with standard producer metadata."""
+    for node in graph:
+        if node.domain and node.version is not None:
+            graph.opset_imports.setdefault(node.domain, node.version)
     model = ir.Model(graph, ir_version=12)
     model.producer_name = "mobius"
     model.producer_version = mobius.__version__

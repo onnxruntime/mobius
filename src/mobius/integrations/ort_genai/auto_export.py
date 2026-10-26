@@ -57,7 +57,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from mobius.upstream_patches import apply_asset_patches
 
@@ -2058,14 +2058,16 @@ def write_ort_genai_config(
     is_decoder_only = _is_single_model_decoder_package(pkg)
 
     if hf_model_id is not None:
-        import transformers
+        from mobius.integrations.transformers._builder import _load_transformers_config
 
-        hf_config = transformers.AutoConfig.from_pretrained(
+        hf_config, _ = _load_transformers_config(
             hf_model_id,
+            revision=revision,
             trust_remote_code=trust_remote_code,
-            **_revision_kwargs(revision),
         )
-        model_type = hf_config.model_type
+        if hf_config is None:
+            raise ValueError(f"Unable to resolve model configuration for {hf_model_id!r}")
+        model_type = cast(Any, hf_config).model_type
         cfg_model_type = getattr(config, "model_type", None)
         # See _select_ort_model_type: decoder-only packages prefer the package's
         # own config.model_type; multimodal packages keep the HF parent type.
@@ -2183,6 +2185,23 @@ def write_ort_genai_config(
         has_speech=has_speech,
     )
     result["genai_config"] = genai_path
+    if is_decoder_only:
+        decoder = next(iter(pkg.values()))
+        libraries = json.loads(
+            decoder.metadata_props.get("mobius.required_custom_op_libraries", "[]")
+        )
+        if not isinstance(libraries, list) or any(
+            not isinstance(library, str) or not library for library in libraries
+        ):
+            raise ValueError("Invalid required custom-op library metadata")
+        if libraries:
+            with open(genai_path) as file:
+                generated = json.load(file)
+            generated["model"]["decoder"]["session_options"]["custom_ops_libraries"] = (
+                libraries
+            )
+            with open(genai_path, "w") as file:
+                json.dump(generated, file, indent=2)
 
     # Write processor config for VLMs
     processor_path = _write_vision_processor_config(

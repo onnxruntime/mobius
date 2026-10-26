@@ -50,6 +50,7 @@ __all__ = [
     "ExaOne4CausalLMModel",
     "FalconCausalLMModel",
     "FalconH1ForCausalLM",
+    "FlintCausalLMModel",
     "FluxTransformer2DModel",
     "FunASRForConditionalGeneration",
     "GPT2CausalLMModel",
@@ -271,6 +272,7 @@ from mobius.models.falcon import (
     MPTCausalLMModel,
 )
 from mobius.models.falcon_h1 import FalconH1ForCausalLM
+from mobius.models.flint import FlintCausalLMModel
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel

@@ -25,6 +25,7 @@ from mobius._registry import registry
 from mobius._weight_utils import WeightTransform
 from mobius.integrations._weight_loading import (
     _download_weights,
+    _resolve_shard_paths,
     stream_preprocessed_safetensors_to_model,
     stream_qdq_safetensors_to_model,
 )
@@ -623,6 +624,19 @@ def build_transformers_model(
             config,
             output_layer_indices=list(output_layer_indices),
         )
+    if model_type == "flint" and load_weights:
+        if (
+            execution_provider != "cuda"
+            or config.dtype != ir.DataType.BFLOAT16
+            or config.head_dim != 128
+        ):
+            raise ValueError(
+                "Flint checkpoint execution requires --execution-provider cuda, "
+                "--dtype bf16, head_dim=128 and the source-compatible CUDA library "
+                "on Hopper. Other routes are graph/debug-only."
+            )
+        if fp8_kv_cache or export_paged_attention:
+            raise NotImplementedError("Flint supports only BF16 dynamic KV caches")
     if glm_full_attention:
         if model_type != "glm_moe_dsa":
             raise ValueError(
@@ -693,7 +707,35 @@ def build_transformers_model(
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
-        if is_gptoss_mxfp4_source and keep_quantized:
+        if model_type == "flint":
+            from mobius.integrations.transformers._flint_weights import (
+                build_flint_streaming_plan,
+            )
+
+            if len(package) != 1:
+                raise ValueError("Flint streaming requires one decoder component")
+            paths = _resolve_shard_paths(model_id, revision)
+            model = next(iter(package.values()))
+            report = stream_preprocessed_safetensors_to_model(
+                model,
+                model_id,
+                lambda index, initializers: build_flint_streaming_plan(
+                    config, index, initializers
+                ),
+                revision=revision,
+                _resolved_paths=paths,
+            )
+            package.register_lazy_source_artifacts(
+                files=paths,
+                directories=(
+                    {pathlib.Path(path).parent.resolve() for path in paths}
+                    | {pathlib.Path(path).resolve().parent for path in paths}
+                ),
+            )
+            package.weight_loading_report = report
+            model.metadata_props["mobius.source_revision"] = revision or "local-or-unpinned"
+            model.metadata_props["mobius.weight_loading_status"] = "lazy-bound"
+        elif is_gptoss_mxfp4_source and keep_quantized:
             from mobius.integrations.transformers._gptoss_weights import (
                 stream_gptoss_mxfp4_safetensors_to_package,
             )

@@ -17,6 +17,7 @@ __all__ = [
     "resolve_dtype",
 ]
 
+import json
 import logging
 
 import onnx_ir as ir
@@ -176,6 +177,17 @@ def build_from_module(
         package = resolved_task.build(module, config)
 
     for name, model in package.items():
+        used_domains = {node.domain for node in model.graph}
+        libraries = [
+            library
+            for domain, domain_libraries in getattr(module, "custom_op_libraries", {}).items()
+            if domain in used_domains
+            for library in domain_libraries
+        ]
+        if libraries:
+            model.metadata_props["mobius.required_custom_op_libraries"] = json.dumps(
+                list(dict.fromkeys(libraries))
+            )
         descriptor = component_manifest.get(name)
         role = (
             descriptor.role if descriptor is not None else _MODEL_ROLE_MAP.get(name, "decoder")

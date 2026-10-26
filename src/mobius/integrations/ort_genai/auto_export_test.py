@@ -116,6 +116,49 @@ def _make_fake_llm_pkg(model_type: str = "qwen2"):
     )
 
 
+def test_custom_decoder_raw_config_and_required_library_metadata(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "flint",
+                "vocab_size": 256,
+                "bos_token_id": 1,
+                "eos_token_id": [2, 3],
+                "pad_token_id": 0,
+            }
+        )
+    )
+    package = _make_fake_llm_pkg("flint")
+    library = "lib/libonnxruntime_source_compat_cuda.so"
+    package["model"].metadata_props["mobius.required_custom_op_libraries"] = json.dumps(
+        [library]
+    )
+    with mock.patch(
+        "transformers.AutoConfig.from_pretrained", side_effect=ValueError("unknown")
+    ):
+        artifacts = write_ort_genai_config(
+            package, str(tmp_path / "output"), hf_model_id=str(source), ep="cuda"
+        )
+    generated = json.loads(Path(artifacts["genai_config"]).read_text())
+    assert generated["model"]["type"] == "decoder"
+    assert generated["model"]["eos_token_id"] == [2, 3]
+    assert generated["search"]["past_present_share_buffer"] is False
+    assert generated["model"]["decoder"]["session_options"]["custom_ops_libraries"] == [
+        library
+    ]
+
+
+def test_rejects_malformed_required_library_metadata(tmp_path):
+    package = _make_fake_llm_pkg()
+    package["model"].metadata_props["mobius.required_custom_op_libraries"] = json.dumps(
+        {"unexpected": "not a list"}
+    )
+    with pytest.raises(ValueError, match="Invalid required custom-op library metadata"):
+        write_ort_genai_config(package, str(tmp_path))
+
+
 class TestResolveOrtGenaiModelType:
     def test_known_model_type(self):
         assert _resolve_ort_genai_model_type("qwen3") == "qwen2"
