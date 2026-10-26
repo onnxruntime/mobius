@@ -58,6 +58,36 @@ def _tiny_gemma4_config(**overrides) -> Gemma4Config:
     return Gemma4Config(**defaults)
 
 
+@pytest.mark.parametrize(
+    ("model_tied", "quantization_tied"), [(True, False), (False, True), (False, False)]
+)
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_text_quantized_head_respects_embedding_tie(
+    model_tied: bool, quantization_tied: bool, symmetric: bool
+) -> None:
+    from mobius.components import TiedQuantizedLMHead
+
+    config = _tiny_gemma4_config(
+        tie_word_embeddings=model_tied,
+        quantization=QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="gguf",
+            sym=symmetric,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+            tie_word_embeddings=quantization_tied,
+        ),
+    )
+    model = Gemma4CausalLMModel(config)
+    tied = model_tied or quantization_tied
+    assert isinstance(model.lm_head, TiedQuantizedLMHead) == tied
+    if tied:
+        assert model.lm_head.qweight is model.model.embed_tokens.qweight
+        assert model.lm_head.scales is model.model.embed_tokens.scales
+        assert model.lm_head.zero_points is model.model.embed_tokens.zero_points
+
+
 class TestGemma4CausalLMPreprocessWeights:
     """Test Gemma4CausalLMModel.preprocess_weights."""
 
