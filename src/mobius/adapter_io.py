@@ -24,7 +24,11 @@ import onnx_ir as ir
 from onnx_ir.passes import common as common_passes
 from safetensors.numpy import load_file
 
-from mobius._constants import LAZY_SOURCE_FILES_META_KEY, QKV_PROJECTION_SOURCES_METADATA_KEY
+from mobius._constants import (
+    LAZY_SOURCE_FILES_META_KEY,
+    LEGACY_QKV_PROJECTION_SOURCES_METADATA_KEY,
+    QKV_PROJECTION_SOURCES_METADATA_KEY,
+)
 from mobius.adapters import (
     AdapterArtifact,
     AdapterServiceOptions,
@@ -193,6 +197,64 @@ def _packed_projection_sources(node: ir.Node, metadata: str) -> list[tuple[str, 
     return sources
 
 
+def _packed_float_projection(
+    model: ir.Model, split: ir.Node, source_count: int, module_key: str
+) -> ir.Node:
+    """Require the packer's MatMul-to-Split topology before restoring PEFT targets.
+
+    The packed activation must be private to Split; replacing a shared or public
+    activation could change consumers outside the adapter's projection group.
+    """
+    packed = split.inputs[0] if split.inputs else None
+    projection = packed.producer() if packed is not None else None
+    if (
+        split.domain != ""
+        or split.op_type != "Split"
+        or split.overload
+        or split.attributes.get_int("axis", 0) not in (-1, 2)
+        or len(split.outputs) != source_count
+        or packed is None
+        or projection is None
+        or projection.domain != ""
+        or projection.op_type != "MatMul"
+        or projection.overload
+        or projection.attributes
+        or len(projection.inputs) != 2
+        or len(projection.outputs) != 1
+        or packed in model.graph.outputs
+        or len(packed.uses()) != 1
+    ):
+        raise ValueError(f"PEFT module {module_key!r} has an unsupported packed projection")
+    return projection
+
+
+def _loaded_packed_projection_inputs(
+    model: ir.Model, projection: ir.Node, total_width: int, module_key: str
+) -> tuple[ir.Value, ir.Value]:
+    """Require a loaded static float weight before lazily slicing its columns.
+
+    Overridable, quantized, or symbolic weights cannot be restored by this
+    float-only path. Validate without materializing the packed payload.
+    """
+    x, weight = projection.inputs
+    if (
+        x is None
+        or weight is None
+        or not weight.is_initializer()
+        or weight in model.graph.inputs
+        or weight.const_value is None
+        or weight.shape is None
+        or len(weight.shape) != 2
+        or weight.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16)
+        or not all(isinstance(dim, int) and dim > 0 for dim in weight.shape)
+        or weight.shape[1] != total_width
+    ):
+        raise ValueError(
+            f"PEFT module {module_key!r} requires a loaded, folded packed projection weight"
+        )
+    return x, weight
+
+
 def _restore_packed_peft_projections(
     model: ir.Model, module_key: str, candidates: list[str]
 ) -> None:
@@ -205,6 +267,9 @@ def _restore_packed_peft_projections(
     groups = []
     for node in model.graph:
         metadata = node.metadata_props.get(QKV_PROJECTION_SOURCES_METADATA_KEY)
+        if metadata is None:
+            # Read previews written before adopting the persistent-key namespace.
+            metadata = node.metadata_props.get(LEGACY_QKV_PROJECTION_SOURCES_METADATA_KEY)
         if metadata is None:
             continue
         sources = _packed_projection_sources(node, metadata)
@@ -219,42 +284,11 @@ def _restore_packed_peft_projections(
     ):
         raise ValueError(f"PEFT module {module_key!r} has ambiguous packed projection targets")
     split, sources = groups[0]
-    packed = split.inputs[0] if split.inputs else None
-    projection = packed.producer() if packed is not None else None
-    if (
-        split.domain not in ("", "ai.onnx")
-        or split.op_type != "Split"
-        or split.overload
-        or split.attributes.get_int("axis", 0) not in (-1, 2)
-        or len(split.outputs) != len(sources)
-        or packed is None
-        or projection is None
-        or projection.domain not in ("", "ai.onnx")
-        or projection.op_type != "MatMul"
-        or projection.overload
-        or projection.attributes
-        or len(projection.inputs) != 2
-        or len(projection.outputs) != 1
-        or packed in model.graph.outputs
-        or len(packed.uses()) != 1
-    ):
-        raise ValueError(f"PEFT module {module_key!r} has an unsupported packed projection")
-    x, weight = projection.inputs
-    if (
-        x is None
-        or weight is None
-        or not weight.is_initializer()
-        or weight in model.graph.inputs
-        or weight.const_value is None
-        or weight.shape is None
-        or len(weight.shape) != 2
-        or weight.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16)
-        or not all(isinstance(dim, int) and dim > 0 for dim in weight.shape)
-        or weight.shape[1] != sum(width for _, width in sources)
-    ):
-        raise ValueError(
-            f"PEFT module {module_key!r} requires a loaded, folded packed projection weight"
-        )
+    projection = _packed_float_projection(model, split, len(sources), module_key)
+    x, weight = _loaded_packed_projection_inputs(
+        model, projection, sum(width for _, width in sources), module_key
+    )
+    assert weight.shape is not None and weight.const_value is not None
     names = [name for name, _ in sources]
     if len(set(names)) != len(names) or any(
         name in model.graph.initializers for name in names

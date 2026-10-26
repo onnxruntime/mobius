@@ -1,10 +1,12 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Pack projections, then split before normalization, RoPE, attention, or caches.
+"""Combine Q/K/V projections into one wider GEMM to reduce kernel launches.
 
-Supports distinct Q/K/V or Q/K with raw K reused for V. Parameter Concats defer
-packing until checkpoint binding. No weights are dequantized or requantized.
+Split before normalization, RoPE, attention, or caches so their input contracts
+remain unchanged. Supports distinct Q/K/V or Q/K with raw K reused for V.
+Parameter Concats preserve checkpoint names until weight binding; packing then
+joins the loaded weights without dequantizing or requantizing them.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ _DATA_ALL = frozenset({"Add", "Sub", "Mul", "Div", "Concat"})
 
 
 def _standard(node: ir.Node, op_type: str) -> bool:
-    return node.domain in ("", "ai.onnx") and node.op_type == op_type and not node.overload
+    return node.domain == "" and node.op_type == op_type and not node.overload
 
 
 def _parameter(
@@ -92,7 +94,7 @@ def _projection(graph: ir.Graph, value: ir.Value | None) -> ir.Node | None:
             projections.add(node)
         elif _standard(node, "Constant"):
             continue
-        elif node.domain in ("", "ai.onnx", "com.microsoft"):
+        elif node.domain in ("", "com.microsoft"):
             if node.op_type in _DATA_FIRST:
                 pending.extend(node.inputs[:1])
             elif node.domain != "com.microsoft" and node.op_type in _DATA_ALL:

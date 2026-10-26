@@ -27,7 +27,7 @@ def _reshape_shape(node: ir.Node, source_shape: tuple[int, ...]) -> tuple[int, .
         constant = shape_value.producer()
         if (
             constant is None
-            or constant.domain not in ("", "ai.onnx")
+            or constant.domain != ""
             or constant.op_type != "Constant"
             or len(constant.attributes) != 1
         ):
@@ -72,7 +72,7 @@ def _storage_layout_values(model: ir.Model) -> set[ir.Value]:
     """Find parameter views whose checkpoint storage ABI must remain explicit."""
     pending: list[ir.Value] = []
     for node in model.graph.all_nodes():
-        if node.domain in ("", "ai.onnx") and node.op_type == "DequantizeLinear":
+        if node.domain == "" and node.op_type == "DequantizeLinear":
             parameters = node.inputs[:3]
         elif node.domain == "com.microsoft" and node.op_type in ("MoE", "QMoE"):
             # Skip activations/routing. Expert weights, biases, scales, and
@@ -89,7 +89,7 @@ def _storage_layout_values(model: ir.Model) -> set[ir.Value]:
             continue
         protected.add(value)
         producer = value.producer()
-        if producer is None or producer.domain not in ("", "ai.onnx") or producer.overload:
+        if producer is None or producer.domain != "" or producer.overload:
             continue
         if producer.op_type in (
             "Identity",
@@ -107,6 +107,20 @@ def _storage_layout_values(model: ir.Model) -> set[ir.Value]:
             # DQ. Follow the scale path without evaluating its arithmetic.
             pending.extend(item for item in producer.inputs if item is not None)
     return protected
+
+
+def _initializer_owners(value: ir.Value, graphs: tuple[ir.Graph, ...]) -> list[ir.Graph]:
+    """Find registries containing this exact value, not just its name.
+
+    An If branch can capture a root initializer without owning it, and sibling
+    branches can own different values with the same name. Registry identity
+    determines where it is safe to remove a folded source.
+    """
+    return [
+        graph
+        for graph in graphs
+        if value.name is not None and graph.initializers.get(value.name) is value
+    ]
 
 
 class FoldWeightLayoutPass(ir.passes.InPlacePass):
@@ -128,20 +142,11 @@ class FoldWeightLayoutPass(ir.passes.InPlacePass):
         graphs = tuple(model.graphs())
         storage_layouts = _storage_layout_values(model)
 
-        # Registry identity is authoritative, including parent-owned captures.
-        # Do not infer ownership from the graph containing the consumer node.
-        def owners(value: ir.Value) -> list[ir.Graph]:
-            return [
-                scope
-                for scope in graphs
-                if value.name is not None and scope.initializers.get(value.name) is value
-            ]
-
         for graph in graphs:
             for node in list(graph):
                 if (
                     node.overload
-                    or node.domain not in ("", "ai.onnx")
+                    or node.domain != ""
                     or node.op_type
                     not in (
                         "Reshape",
@@ -160,7 +165,7 @@ class FoldWeightLayoutPass(ir.passes.InPlacePass):
                 # Keep tied tables shared instead of serializing a second full layout.
                 if (
                     len(source.uses()) != 1
-                    or len(owners(source)) != 1
+                    or len(_initializer_owners(source, graphs)) != 1
                     or any(
                         source in scope.inputs or source in scope.outputs for scope in graphs
                     )
@@ -255,7 +260,7 @@ class FoldWeightLayoutPass(ir.passes.InPlacePass):
                             value in scope.inputs or value in scope.outputs for scope in graphs
                         )
                     ):
-                        registries = owners(value)
+                        registries = _initializer_owners(value, graphs)
                         if len(registries) == 1:
                             del registries[0].initializers[value.name]
                 folded += 1

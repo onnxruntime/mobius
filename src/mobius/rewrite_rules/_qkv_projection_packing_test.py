@@ -18,7 +18,10 @@ from safetensors.numpy import save_file
 
 from mobius import ModelPackage
 from mobius._component_quantization import validate_quantized_component_bindings
-from mobius._constants import QKV_PROJECTION_SOURCES_METADATA_KEY
+from mobius._constants import (
+    LEGACY_QKV_PROJECTION_SOURCES_METADATA_KEY,
+    QKV_PROJECTION_SOURCES_METADATA_KEY,
+)
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep
 from mobius._optimizations import (
     _get_optimization_passes,
@@ -510,9 +513,19 @@ def test_projection_matching_does_not_read_lazy_parameters(quantized):
 
 @pytest.mark.parametrize("transposed", [False, True, "mixed"])
 @pytest.mark.parametrize("shared", [False, True])
-def test_peft_sources_survive_fold_and_serialization(tmp_path, transposed, shared):
+@pytest.mark.parametrize(
+    "metadata_key",
+    [QKV_PROJECTION_SOURCES_METADATA_KEY, LEGACY_QKV_PROJECTION_SOURCES_METADATA_KEY],
+)
+def test_peft_sources_survive_fold_and_serialization(
+    tmp_path, transposed, shared, metadata_key
+):
     model, weights, _, _ = _model(transposed=transposed, shared=shared)
     assert pack_qkv_projections_pass()(model).modified
+    split = next(node for node in model.graph if node.op_type == "Split")
+    assert QKV_PROJECTION_SOURCES_METADATA_KEY == "pkg.mobius.qkv_projection_sources"
+    metadata = split.metadata_props.pop(QKV_PROJECTION_SOURCES_METADATA_KEY)
+    split.metadata_props[metadata_key] = metadata
     fold_initializers_after_weights(model)
     package = ModelPackage({"model": model})
     package.save(tmp_path / "base")
@@ -525,18 +538,84 @@ def test_peft_sources_survive_fold_and_serialization(tmp_path, transposed, share
         np.testing.assert_array_equal(
             restored.graph.initializers[f"{name}.weight"].const_value.numpy(), original
         )
-    assert not any(
-        QKV_PROJECTION_SOURCES_METADATA_KEY in node.metadata_props for node in restored.graph
-    )
+    assert not any(metadata_key in node.metadata_props for node in restored.graph)
 
 
 def test_invalid_peft_source_metadata_fails_closed():
     model, _, _, _ = _model()
     pack_qkv_projections_pass()(model)
     split = next(node for node in model.graph if node.op_type == "Split")
+    split.metadata_props[LEGACY_QKV_PROJECTION_SOURCES_METADATA_KEY] = split.metadata_props[
+        QKV_PROJECTION_SOURCES_METADATA_KEY
+    ]
     split.metadata_props[QKV_PROJECTION_SOURCES_METADATA_KEY] = json.dumps({"version": 2})
     with pytest.raises(ValueError, match="unsupported"):
         _resolve_initializer_name(model, "q")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "split_axis",
+        "projection_domain",
+        "projection_attributes",
+        "public_activation",
+        "shared_activation",
+        "missing_input",
+        "unloaded_weight",
+        "overridable_weight",
+        "quantized_weight",
+        "weight_width",
+    ],
+)
+def test_invalid_packed_peft_projection_is_rejected_before_mutation(case):
+    model, _, _, _ = _model()
+    assert pack_qkv_projections_pass()(model).modified
+    fold_initializers_after_weights(model)
+    split = next(node for node in model.graph if node.op_type == "Split")
+    packed = split.inputs[0]
+    projection = packed.producer()
+    weight = projection.inputs[1]
+    if case == "split_axis":
+        split.attributes["axis"] = ir.AttrInt64("axis", 0)
+    elif case == "projection_domain":
+        projection.domain = "custom"
+    elif case == "projection_attributes":
+        projection.attributes["custom"] = ir.AttrInt64("custom", 1)
+    elif case == "public_activation":
+        model.graph.outputs.append(packed)
+    elif case == "shared_activation":
+        model.graph.append(ir.Node("", "Identity", [packed], num_outputs=1))
+    elif case == "missing_input":
+        projection.replace_input_with(0, None)
+    elif case == "unloaded_weight":
+        weight.const_value = None
+    elif case == "overridable_weight":
+        model.graph.inputs.append(weight)
+    elif case == "quantized_weight":
+        weight.dtype = ir.DataType.UINT8
+    elif case == "weight_width":
+        weight.shape = ir.Shape([64, 1])
+    before = tuple(model.graph)
+    initializers = dict(model.graph.initializers)
+    inputs = {node: tuple(node.inputs) for node in before}
+    message = (
+        "unsupported packed projection"
+        if case
+        in {
+            "split_axis",
+            "projection_domain",
+            "projection_attributes",
+            "public_activation",
+            "shared_activation",
+        }
+        else "requires a loaded, folded packed projection weight"
+    )
+    with pytest.raises(ValueError, match=message):
+        _resolve_initializer_name(model, "q")
+    assert tuple(model.graph) == before
+    assert dict(model.graph.initializers) == initializers
+    assert {node: tuple(node.inputs) for node in before} == inputs
 
 
 def _write_peft_adapter(directory, modules):
