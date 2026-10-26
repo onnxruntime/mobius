@@ -150,6 +150,7 @@ class TestMatMulNBitsFunctionSignature:
 
     @pytest.mark.parametrize("has_zero_points", [False, True])
     def test_direct_factory_does_not_claim_registry_ownership(self, has_zero_points):
+        assert FUNCTION_BODY_METADATA_KEY == "pkg.mobius.function_body"
         function = matmul_nbits(has_zero_points=has_zero_points)
         assert FUNCTION_BODY_METADATA_KEY not in function.metadata_props
         automatic = get_function(function.identifier())
@@ -158,6 +159,17 @@ class TestMatMulNBitsFunctionSignature:
             FUNCTION_BODY_METADATA_VALUE
         )
         assert FUNCTION_BODY_METADATA_KEY not in function.metadata_props
+
+    def test_legacy_marker_does_not_authorize_call_specialization(self):
+        model, *_ = _build_matmulnbits_model(n_out=8, k_in=64, block=32, has_zero_points=False)
+        function = matmul_nbits()
+        function.metadata_props["mobius.function_body"] = "1"
+        model.functions[function.identifier()] = function
+
+        register_function_bodies(model)
+
+        assert model.functions[function.identifier()] is function
+        assert next(iter(model.graph)).overload == ""
 
     @pytest.mark.parametrize("has_zero_points", [False, True])
     def test_automatic_registration_retains_provenance_and_specialization(

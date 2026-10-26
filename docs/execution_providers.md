@@ -102,23 +102,18 @@ These are applied during **Stage 2: Fusion** of the optimization pipeline.
 
 #### Projection packing and numerical limitations
 
-The existing float `PackQKV` GQA-input fusion stage is unchanged, but
-**`PackQKVProjections` is a new, additional float projection-packing stage**.
-It runs by default for both `decoder` and `masked-decoder` roles whenever the
-activation dtype is in the EP's existing `qkv_pack_dtypes` capability. Thus
-nonempty built-in float profiles, including CUDA's FLOAT/FP16/BF16 profile,
-enable this new behavior without a new opt-in. It handles compatible float
-projections that remain separate after GQA-input packing, including masked
-decoders and raw K reused for V. Only INT4 projection packing is default-off.
-It splits the packed result **before** normalization, RoPE, attention, or cache
-consumers. Sources must be static, non-overridable initializer parameters with
-compatible shapes and dtypes; ambiguous repeated sources, shared weights with
-outside consumers, and overlapping groups are declined before graph mutation.
-No attention-mask contract is relaxed to make packing possible.
+`PackQKVProjections` combines compatible projections into one GEMM and splits
+the result **before normalization, RoPE, attention, or caches**, without changing
+their contracts. It supports Q/K/V and Q/K with raw K reused for V.
 
-**INT4 projection packing is experimental and default-disabled on every
-built-in EP, including CUDA, for FP16 and BF16 alike.** Opt in only through
-the existing capability API:
+| Stage | Roles | Enablement |
+|---|---|---|
+| Existing float `PackQKV` GQA-input fusion | `decoder` | Unchanged |
+| Additional float `PackQKVProjections` | `decoder`, `masked-decoder` | Automatic for `qkv_pack_dtypes`, including CUDA FLOAT/FP16/BF16 |
+| INT4 projection packing | `decoder`, `masked-decoder` | **Experimental; disabled on every built-in EP**, including CUDA FP16/BF16 |
+
+Experimental INT4 opt-in uses the process-local capability API; stock `--ep cuda`
+does not enable it:
 
 ```python
 import dataclasses
@@ -135,58 +130,37 @@ register_ep(
 )
 ```
 
-This overrides the process-local profile for subsequent builds. Stock
-`--ep cuda` does not opt in. The capability is independent of float
-`qkv_pack_dtypes`; activation dtype (`--dtype`), weight quantization/storage,
-component precision overrides, and FP8 KV-cache flags remain independent
-choices. Packing does not promote precision, dequantize, or requantize weights.
+The INT4 capability is independent of float packing, activation/storage dtype,
+component precision, and FP8 KV caches. Packing never dequantizes, requantizes, or
+promotes weights. `_qkv_projection_packing.py` implements both float and INT4.
 
-Compatible INT4 groups share a rank-3 floating-point activation, attributes
-other than output width, and canonical UINT8 blocked weights. Scales match the
-activation dtype; zero points must be absent throughout or uniformly packed
-UINT8. Flat and row-major scale/zero-point storage are supported. Block size
-must be a power of two of at least 16; `accuracy_level` must be omitted or zero.
-Caller-owned function bodies, mixed bit widths, extra nonempty inputs, and
-incompatible layouts are not packed. Standard opset >= 13 is required.
-The canonical implementation is `_qkv_projection_packing.py` for both float
-and INT4, including the supported Q/K pair with K reused for V.
+Packing requires static, non-overridable, compatible parameters and opset >= 13;
+ambiguous or overlapping groups and weights with outside consumers are skipped.
+INT4 additionally requires a shared rank-3 activation, matching attributes except
+output width, canonical UINT8 blocked weights, same-dtype scales, and consistently
+absent or packed UINT8 zero points. Flat/row-major sidecars are supported;
+block size must be a power of two >= 16 and `accuracy_level` omitted or zero.
+Mixed bit widths, extra operands, and caller-owned function bodies are skipped.
 
-Parameter Concats retain checkpoint names until binding. Missing parameter
-leaves are validated even with `apply_weights(..., fold_constants=False)`.
-Normally the post-weight pipeline folds Concats and static Reshape/Transpose
-chains lazily, including layouts exposed by small integer shape-expression
-folding. That generic folding is always independent of experimental packing;
-it preserves dtype and does not eagerly load large weight tensors.
-Concats with runtime-overridable initializer inputs remain unfused, including
-initializers captured from a parent graph's inputs.
-Checkpoint-storage layout paths feeding MoE/QMoE parameters or
-`DequantizeLinear` are conservatively retained: their named expert/code/scale
-initializers and original byte layouts remain available to loaders and
-serialized-storage contracts. Ordinary layout folding and the existing
-2-D transpose optimization remain enabled.
+Post-weight folding is independent of experimental packing: parameter Concats
+retain checkpoint names until binding, then Concat/Reshape/Transpose chains fold
+lazily without changing dtype. Missing leaves are checked even with
+`fold_constants=False`. Overridable inputs and MoE/QMoE/QDQ storage-layout paths
+remain explicit to preserve loader names and byte layouts.
 
-**The PR754 INT4-packing numerical gate remains failed and unwaived.** Byte-exact packing
-does not imply identical floating-point outputs: changing GEMM output width can
-change CUDA kernel behavior. Representative large-dimension prefill and
-cached-decode logits exceeded the existing `rtol=atol=1e-2` criterion. Bounded
-MMLU/generation evidence does not resolve pointwise parity; neither tolerances
-nor automatic BF16/FP16 INT4-packing enablement have changed. This branch does
-not separately qualify numerical accuracy for the new float projection stage;
-do not infer a float numerical pass from the INT4 gate's scope. No production
-numerical accuracy or speed improvement is claimed.
+**The INT4 numerical gate remains failed and unwaived:** large-dimension CUDA
+prefill/cached-decode logits exceeded `rtol=atol=1e-2`. Changing GEMM width can
+change floating-point results despite byte-exact weights. MMLU/generation results
+do not clear that gate; float projection packing has no separate numerical
+qualification here. No production accuracy or speed improvement is claimed.
 
-For `ORT_FPA_INTB_GEMM=1`, keep exporter folding or ORT constant folding enabled:
-unfolded parameter Concats can prevent runtime prepacking when both are off.
-This is not a guarantee for every runtime version/configuration.
-
-Packed float sources retain adapter restoration metadata. Lazy restored/folded
-weights keep their backing-file ownership after source initializers are pruned.
-`ModelPackage.save()` checks model/shard, policy, adapter, package metadata, and
-MTP destinations before writing, rejecting known same-path, hardlink, or symlink
-aliases to lazy sources. Adapter files use `adapters/<alias>/adapter.json`,
-`adapter.onnx_adapter`, or `adapter_model.safetensors` plus `adapter_config.json`
-according to persistence options. These checks are **not** full TOCTOU
-protection for non-transactional saves; use a separate output directory.
+For `ORT_FPA_INTB_GEMM=1`, keep exporter or ORT constant folding enabled so
+parameter Concats do not block runtime prepacking; behavior is runtime-dependent.
+Packed float weights retain adapter-restoration metadata and lazy backing-file
+ownership after pruning. `ModelPackage.save()` rejects known same-path, hardlink,
+or symlink aliases to backing files across model, shard, policy, adapter, metadata,
+and MTP destinations. This is **not full TOCTOU protection**; save to a separate
+output directory.
 
 ### Tier 3 — EP-specific constraints (required, correctness)
 

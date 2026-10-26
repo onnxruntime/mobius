@@ -48,7 +48,15 @@ from onnxscript._internal.builder import build_function
 from mobius._constants import OPSET_VERSION
 
 DOMAIN = "com.microsoft"
-FUNCTION_BODY_METADATA_KEY = "mobius.function_body"
+FUNCTION_BODY_METADATA_KEY = "pkg.mobius.function_body"
+"""Mark registry-generated fallbacks that Mobius may specialize or pack against.
+
+An unmarked, caller-provided function may implement different semantics despite
+using the same operator identifier. The marker distinguishes our known fallback
+from those bodies; calling the factory directly does not stamp it.
+Legacy-only markers conservatively leave the body caller-owned: restoring an
+adapter needs the old source names, but optimizations need not trust an old body.
+"""
 FUNCTION_BODY_METADATA_VALUE = "1"
 
 

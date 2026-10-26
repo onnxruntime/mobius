@@ -38,6 +38,8 @@ from mobius.functions.matmul_block_quantized_fp4_weight import (
     matmul_block_quantized_fp4_weight,
 )
 from mobius.functions.matmul_nbits import (
+    FUNCTION_BODY_METADATA_KEY,
+    FUNCTION_BODY_METADATA_VALUE,
     matmul_nbits,
 )
 from mobius.functions.packed_multi_head_attention import (
@@ -49,7 +51,6 @@ from mobius.functions.skip_layer_normalization import (
 )
 
 _DOMAIN = "com.microsoft"
-_FUNCTION_BODY_MARKER = "mobius.function_body"
 _MATMUL_NBITS_ID = (_DOMAIN, "MatMulNBits", "")
 _MATMUL_NBITS_DEFAULT_ZERO_POINTS_ID = (_DOMAIN, "MatMulNBits", "default_zero_points")
 
@@ -89,13 +90,17 @@ def get_function(op_id: ir.OperatorIdentifier) -> ir.Function | None:
     if builder is None:
         return None
     function = builder()
-    function.metadata_props[_FUNCTION_BODY_MARKER] = "1"
+    function.metadata_props[FUNCTION_BODY_METADATA_KEY] = FUNCTION_BODY_METADATA_VALUE
     return function
 
 
 def _specialize_matmul_nbits_calls(model: ir.Model) -> None:
     existing = model.functions.get(_MATMUL_NBITS_ID)
-    if existing is not None and existing.metadata_props.get(_FUNCTION_BODY_MARKER) != "1":
+    if (
+        existing is not None
+        and existing.metadata_props.get(FUNCTION_BODY_METADATA_KEY)
+        != FUNCTION_BODY_METADATA_VALUE
+    ):
         return
 
     graphs = [model.graph, *(function.graph for function in model.functions.values())]

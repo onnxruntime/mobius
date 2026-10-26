@@ -33,6 +33,55 @@ from mobius._passes._dtype_utils import initializer_dtype
 logger = logging.getLogger(__name__)
 
 
+def _retire_sources(
+    model: ir.Model,
+    graphs: tuple[ir.Graph, ...],
+    values: tuple[ir.Value | None, ...],
+    packed: ir.Value,
+    *,
+    prune: bool,
+) -> None:
+    """Track lazy backing files and deregister dead child-Concat inputs.
+
+    A child graph may capture a parent initializer: remove it from its owning
+    registry, not the consumer's graph. Keep graph I/O and live shared inputs.
+    Deregistration must not clear const_value: the packed lazy callback still
+    reads these tensors. Root inputs remain for the usual dead-code pass.
+    """
+    source_files: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        tensor = value.const_value
+        if tensor is not None:
+            source_files.update(
+                (tensor.path,)
+                if isinstance(tensor, ir.ExternalTensor)
+                else tensor.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+            )
+        if (
+            not prune
+            or value.name is None
+            or value.uses()
+            or any(value in scope.inputs or value in scope.outputs for scope in graphs)
+        ):
+            continue
+        owners = [scope for scope in graphs if scope.initializers.get(value.name) is value]
+        if len(owners) == 1:
+            del owners[0].initializers[value.name]
+    if source_files:
+        if packed.const_value is not None:
+            packed.const_value.meta[LAZY_SOURCE_FILES_META_KEY] = frozenset(
+                (
+                    *packed.const_value.meta.get(LAZY_SOURCE_FILES_META_KEY, ()),
+                    *source_files,
+                )
+            )
+        model.meta[LAZY_SOURCE_FILES_META_KEY] = frozenset(
+            (*model.meta.get(LAZY_SOURCE_FILES_META_KEY, ()), *source_files)
+        )
+
+
 class FoldConcatInitializersPass(ir.passes.InPlacePass):
     """Fold ``Concat(init_0, init_1, ...)`` into a single packed initializer.
 
@@ -55,46 +104,6 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
         modified = False
         folded_count = 0
         graphs = tuple(model.graphs())
-
-        def retire_sources(
-            values: tuple[ir.Value | None, ...], packed: ir.Value, *, prune: bool
-        ) -> None:
-            source_files: set[str] = set()
-            for value in values:
-                if value is None:
-                    continue
-                tensor = value.const_value
-                if tensor is not None:
-                    source_files.update(
-                        (tensor.path,)
-                        if isinstance(tensor, ir.ExternalTensor)
-                        else tensor.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
-                    )
-                if (
-                    not prune
-                    or value.name is None
-                    or value.uses()
-                    or any(value in scope.inputs or value in scope.outputs for scope in graphs)
-                ):
-                    continue
-                owners = [
-                    scope for scope in graphs if scope.initializers.get(value.name) is value
-                ]
-                if len(owners) == 1:
-                    # Deregister only: lazy callbacks still hold these values
-                    # and need their const_value tensors to materialize later.
-                    del owners[0].initializers[value.name]
-            if source_files:
-                if packed.const_value is not None:
-                    packed.const_value.meta[LAZY_SOURCE_FILES_META_KEY] = frozenset(
-                        (
-                            *packed.const_value.meta.get(LAZY_SOURCE_FILES_META_KEY, ()),
-                            *source_files,
-                        )
-                    )
-                model.meta[LAZY_SOURCE_FILES_META_KEY] = frozenset(
-                    (*model.meta.get(LAZY_SOURCE_FILES_META_KEY, ()), *source_files)
-                )
 
         for node in list(model.graph.all_nodes()):
             if node.op_type != "Concat":
@@ -184,7 +193,9 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
                 # pre-pack weights survive RemoveUnusedNodesPass (~1.8 GB of
                 # orphaned weights serialized into the fp16 GQA model).
                 graph.remove(node, safe=True)
-                retire_sources(inputs, existing_val, prune=graph is not model.graph)
+                _retire_sources(
+                    model, graphs, inputs, existing_val, prune=graph is not model.graph
+                )
                 folded_count += 1
                 modified = True
 
@@ -229,7 +240,7 @@ class FoldConcatInitializersPass(ir.passes.InPlacePass):
             # folded q/k/v initializers' use lists are cleared; otherwise the
             # dead pre-pack weights survive RemoveUnusedNodesPass.
             graph.remove(node, safe=True)
-            retire_sources(inputs, new_val, prune=graph is not model.graph)
+            _retire_sources(model, graphs, inputs, new_val, prune=graph is not model.graph)
             folded_count += 1
             modified = True
 
