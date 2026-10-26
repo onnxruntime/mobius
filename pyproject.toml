@@ -35,6 +35,8 @@ gguf = ["gguf>=0.10.0"]
 testing = [
     "accelerate",
     "diffusers",
+    # Pinned Transformers references and HTTP error tests still import legacy httpx.
+    "httpx",
     "onnxruntime-easy>=0.1.1",
     # onnxruntime>=1.28 is required for the fused Attention kernel to apply
     # attention-logit soft-capping *before* the mask/bias (ONNX spec order).
