@@ -1,0 +1,9 @@
+{
+  "type": "OnnxMoEQuantization",
+  "config": {
+    "bits": 4,
+    "block_size": 128,
+    "save_as_external_data": true,
+    "all_tensors_to_one_file": true
+  }
+}

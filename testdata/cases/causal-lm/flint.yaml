@@ -1,0 +1,18 @@
+model_id: "RecursiveSI/flint"
+model_type: "flint"
+revision: "2a247be0c0aec895ccb0ac7ca92229ec6df37288"
+task_type: "text-generation"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 50
+  do_sample: false
+
+skip_reason: "Experimental CUDA-only custom-kernel target. Independent publisher BF16 logits/cache parity has not passed; no Transformers reference is published. ORT/GenAI agreement cannot supply independent goldens."
+notes: "Pinned 39.8B Flint: 49 layers, sigmoid top-6 MoE, learned attention sinks and 513-inclusive sliding windows. Qualified execution scope is Hopper BF16, one unpadded sequence and dynamic caches. The separately identified Olive routed-INT4 variant is not publisher-parity evidence."
