@@ -18,6 +18,7 @@ from typing import ClassVar
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
 from mobius._configs.fish_omni import FishOmniConfig
 from mobius.components import (
@@ -34,6 +35,12 @@ from mobius.components import (
     initialize_rope,
 )
 from mobius.components._attention import _apply_attention
+from mobius.generation._fish_omni import (
+    FishAudioSamplingInputs,
+    _all_rows,
+    _finite,
+    sample_codebook_or_greedy,
+)
 from mobius.models.qwen35 import (
     Qwen35MoEBlock,
     Qwen35MoEDecoderLayer,
@@ -181,7 +188,19 @@ class _FishMoEBlock(Qwen35MoEBlock):
     """Accumulate weighted expert outputs in FP32 before returning model dtype."""
 
     def __init__(self, config, gate=None):
+        if gate is None:
+            assert config.num_local_experts is not None
+            assert config.num_experts_per_tok is not None
+            gate = _FishRouter(
+                config.hidden_size,
+                config.num_local_experts,
+                config.num_experts_per_tok,
+                norm_topk_prob=config.norm_topk_prob,
+            )
         super().__init__(config, gate=gate)
+        self.packed_experts = (
+            _FishCudaExperts(config) if config.dtype == ir.DataType.FLOAT else None
+        )
         if self.experts is not None:
             for expert in self.experts:
                 assert isinstance(expert, MLP)
@@ -191,7 +210,12 @@ class _FishMoEBlock(Qwen35MoEBlock):
     def forward(self, op, hidden_states):
         if self.experts is None:
             return super().forward(op, hidden_states)
-        routing, selected = self.gate(op, hidden_states)
+        routing, selected, logits = self.gate(op, hidden_states)
+        caps = ep_capabilities()
+        if self.packed_experts is not None and caps.name == "cuda" and caps.supports_fused_moe:
+            # Floating CUDA MoE performs its own softmax/top-k from RAW logits.
+            routed = self.packed_experts(op, hidden_states, logits)
+            return self._add_shared_expert(op, hidden_states, routed)
         combined = None
         for index, expert in enumerate(self.experts):
             output = expert(op, hidden_states)
@@ -204,9 +228,75 @@ class _FishMoEBlock(Qwen35MoEBlock):
             combined = contribution if combined is None else op.Add(combined, contribution)
         assert combined is not None
         routed = op.CastLike(combined, hidden_states)
+        return self._add_shared_expert(op, hidden_states, routed)
+
+    def _add_shared_expert(self, op, hidden_states, routed):
         shared = self.shared_expert(op, hidden_states)
         gate = _sigmoid_float32(op, self.shared_expert_gate(op, hidden_states))
         return op.Add(routed, op.Mul(shared, gate))
+
+
+class _FishCudaExperts(nn.Module):
+    """Source-layout expert banks consumed sparsely by ORT's floating CUDA MoE."""
+
+    def __init__(self, config):
+        super().__init__()
+        assert config.num_local_experts is not None
+        assert config.moe_intermediate_size is not None
+        assert config.dtype == ir.DataType.FLOAT
+        self.num_experts = config.num_local_experts
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.top_k = config.num_experts_per_tok
+        self.normalize = int(config.norm_topk_prob)
+        self.gate_proj = _FishExpertBank(
+            [self.num_experts, self.intermediate_size, self.hidden_size]
+        )
+        self.up_proj = _FishExpertBank(
+            [self.num_experts, self.intermediate_size, self.hidden_size]
+        )
+        self.down_proj = _FishExpertBank(
+            [self.num_experts, self.hidden_size, self.intermediate_size]
+        )
+
+    def forward(self, op, hidden_states, router_logits):
+        # CUDA MoE declares [E,H,I]/[E,I,H], but consumes the original
+        # output-major HF bytes. Reshape changes the ABI shape, NOT the layout.
+        # This matches upstream test_moe_cuda.py's separate-FC3 Mixtral path.
+        gate = op.Reshape(
+            self.gate_proj(op), [self.num_experts, self.hidden_size, self.intermediate_size]
+        )
+        up = op.Reshape(
+            self.up_proj(op), [self.num_experts, self.hidden_size, self.intermediate_size]
+        )
+        down = op.Reshape(
+            self.down_proj(op), [self.num_experts, self.intermediate_size, self.hidden_size]
+        )
+        output = op.MoE(
+            op.Reshape(hidden_states, [-1, self.hidden_size]),
+            op.Reshape(router_logits, [-1, self.num_experts]),
+            gate,
+            None,
+            down,
+            None,
+            up,
+            activation_type="silu",
+            k=self.top_k,
+            normalize_routing_weights=self.normalize,
+            swiglu_fusion=0,
+            _domain="com.microsoft",
+        )
+        output.type = ir.TensorType(ir.DataType.FLOAT)
+        return op.Reshape(output, op.Shape(hidden_states))
+
+
+class _FishExpertBank(nn.Module):
+    def __init__(self, shape):
+        super().__init__()
+        self.weight = nn.Parameter(shape)
+
+    def forward(self, op):
+        return op.Identity(self.weight)
 
 
 class _FishRouter(SoftmaxTopKGate):
@@ -218,7 +308,7 @@ class _FishRouter(SoftmaxTopKGate):
         )
         if self.norm_topk_prob:
             weights = op.Div(weights, op.ReduceSum(weights, [-1], keepdims=True))
-        return op.CastLike(weights, hidden_states), indices
+        return op.CastLike(weights, hidden_states), indices, logits
 
 
 class _FishDecoderLayer(Qwen35MoEDecoderLayer):
@@ -465,6 +555,43 @@ class FishOmniAudioDecoder(nn.Module):
         position_ids,
         past_key_values,
     ):
+        hidden, bias, positions, present = self._shared_forward(
+            op,
+            hidden_states,
+            codes,
+            semantic_mask,
+            shared_input,
+            attention_mask,
+            position_ids,
+            past_key_values,
+        )
+        logits = []
+        offset = len(self.shared_layers)
+        for i, (layer, head) in enumerate(zip(self.residual_layers, self.codebook_heads)):
+            hidden, kv = layer(
+                op,
+                hidden,
+                op.Gather(codes, i, axis=-1),
+                semantic_mask,
+                bias,
+                positions,
+                past_key_values[offset + i],
+            )
+            present.append(kv)
+            logits.append(op.Unsqueeze(head(op, hidden), [-2]))
+        return op.Concat(*logits, axis=-2), present
+
+    def _shared_forward(
+        self,
+        op,
+        hidden_states,
+        codes,
+        semantic_mask,
+        shared_input,
+        attention_mask,
+        position_ids,
+        past_key_values,
+    ):
         positions = self.rotary_emb(op, position_ids)
         bias = create_attention_bias(
             op, input_ids=semantic_mask, attention_mask=attention_mask, dtype=self.config.dtype
@@ -483,21 +610,89 @@ class FishOmniAudioDecoder(nn.Module):
                 shared_input if i == 0 else None,
             )
             present.append(kv)
+        return hidden, bias, positions, present
+
+    def forward_sampled(
+        self,
+        op,
+        hidden_states,
+        codes,
+        semantic_mask,
+        shared_input,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        sampling: FishAudioSamplingInputs,
+    ):
+        """Prefill teacher-forced rows or sample one frame in one tower traversal."""
+        hidden, bias, positions, present = self._shared_forward(
+            op,
+            hidden_states,
+            codes,
+            semantic_mask,
+            shared_input,
+            attention_mask,
+            position_ids,
+            past_key_values,
+        )
+        last_codes = op.Gather(codes, -1, axis=1)
+        sampled = [op.Gather(last_codes, 0, axis=-1)]
+        valid = op.Expand(
+            op.Or(
+                op.Not(sampling.generate),
+                op.Equal(op.Squeeze(op.Shape(hidden_states, start=1, end=2), [0]), 1),
+            ),
+            op.Shape(sampling.counter),
+        )
+        counter = sampling.counter
         logits = []
         offset = len(self.shared_layers)
         for i, (layer, head) in enumerate(zip(self.residual_layers, self.codebook_heads)):
+            incoming = op.Where(
+                sampling.generate,
+                op.Unsqueeze(sampled[-1], [-1]),
+                op.Gather(codes, i, axis=-1),
+            )
             hidden, kv = layer(
                 op,
                 hidden,
-                op.Gather(codes, i, axis=-1),
+                incoming,
                 semantic_mask,
                 bias,
                 positions,
                 past_key_values[offset + i],
             )
             present.append(kv)
-            logits.append(op.Unsqueeze(head(op, hidden), [-2]))
-        return op.Concat(*logits, axis=-2), present
+            scores = head(op, hidden)
+            logits.append(op.Unsqueeze(scores, [-2]))
+            last_scores = op.Gather(scores, -1, axis=1)
+            assert self.config.tower is not None
+            token, counter, sample_valid = sample_codebook_or_greedy(
+                op,
+                last_scores,
+                sampling,
+                counter,
+                index=i,
+                vocabulary=self.config.tower.vocab_size,
+            )
+            finite = _all_rows(
+                op,
+                _finite(op, op.Reshape(op.Cast(scores, to=ir.DataType.FLOAT), [0, -1])),
+            )
+            valid = op.And(valid, op.And(finite, sample_valid))
+            sampled.append(token)
+        frame = op.Unsqueeze(
+            op.Concat(*[op.Unsqueeze(code, [-1]) for code in sampled], axis=-1), [1]
+        )
+        frame = op.Where(sampling.generate, frame, op.Unsqueeze(last_codes, [1]))
+        frame = op.Where(op.Unsqueeze(valid, [-1, -2]), frame, -1)
+        return (
+            op.Concat(*logits, axis=-2),
+            present,
+            frame,
+            op.Where(valid, counter, sampling.counter),
+            valid,
+        )
 
 
 class FishOmniModel(nn.Module):
@@ -519,6 +714,7 @@ class FishOmniModel(nn.Module):
             "audio_decoder.codebook_embeddings",
         ),
         "audio_decoder": ("audio_decoder_mtp_shared", "audio_decoder_mtp"),
+        "audio_generator": ("audio_decoder_mtp_shared", "audio_decoder_mtp"),
     }
 
     def __init__(self, config: FishOmniConfig):

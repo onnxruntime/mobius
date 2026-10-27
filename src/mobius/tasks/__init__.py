@@ -20,6 +20,7 @@ from __future__ import annotations
 
 __all__ = [
     "FishOmniTask",
+    "FishOmniGenerationTask",
     "AdapterTask",
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
@@ -162,7 +163,7 @@ from mobius.tasks._feature_extraction import (
     GGUFEmbeddingFeatureExtractionTask,
     GGUFEncoderFeatureExtractionTask,
 )
-from mobius.tasks._fish_omni import FishOmniTask
+from mobius.tasks._fish_omni import FishOmniGenerationTask, FishOmniTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
 from mobius.tasks._gemma3n import Gemma3nTask
 from mobius.tasks._gemma4 import (
@@ -251,6 +252,7 @@ from mobius.tasks._world_model import WorldModelTask
 
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "fish-omni": FishOmniTask,
+    "fish-omni-generation": FishOmniGenerationTask,
     "adapter": AdapterTask,
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,

@@ -9,6 +9,8 @@ They perform sampling in ONNX; the caller still orchestrates temporal decoding.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import onnx_ir as ir
 from onnxscript import GraphBuilder, OpBuilder
 
@@ -21,6 +23,67 @@ from mobius.generation._policy_components import (
     _make_graph,
     _set_public_shape,
 )
+
+
+class FishAudioSamplingInputs(NamedTuple):
+    """Tensor controls for the single-pass temporal tower task."""
+
+    generate: ir.Value
+    do_sample: ir.Value
+    temperature: ir.Value
+    top_k: ir.Value
+    top_p: ir.Value
+    seed: ir.Value
+    counter: ir.Value
+
+
+def sample_codebook_or_greedy(
+    op: OpBuilder,
+    logits: ir.Value,
+    sampling: FishAudioSamplingInputs,
+    counter: ir.Value,
+    *,
+    index: int,
+    vocabulary: int,
+) -> tuple[ir.Value, ir.Value, ir.Value]:
+    """Skip RNG/sorting entirely for greedy generation and prompt ingestion."""
+    active = op.And(sampling.generate, sampling.do_sample)
+
+    def stochastic(branch_op):
+        noises, _ = _noise(branch_op, logits, sampling.seed, counter, 1)
+        return _race(
+            branch_op,
+            logits,
+            sampling.temperature,
+            sampling.top_k,
+            sampling.top_p,
+            noises[0],
+        )
+
+    def greedy(branch_op):
+        float_logits = branch_op.Cast(logits, to=ir.DataType.FLOAT)
+        return (
+            branch_op.ArgMax(float_logits, axis=-1, keepdims=False),
+            _all_rows(branch_op, _finite(branch_op, float_logits)),
+        )
+
+    branches = []
+    for suffix, body in (("random", stochastic), ("greedy", greedy)):
+        name = f"codebook_{index}_{suffix}"
+        op.builder.push_module(name)
+        branch = op.builder.subgraph(
+            body,
+            inputs=[],
+            outputs=[ir.Value(name=f"{name}_token"), ir.Value(name=f"{name}_valid")],
+            name=name,
+        )
+        op.builder.pop_module()
+        branches.append(branch)
+    token, valid = op.If(active, then_branch=branches[0], else_branch=branches[1], _outputs=2)
+    advanced = op.Mod(
+        op.Add(op.Mod(counter, _RNG_MODULUS, fmod=0), vocabulary), _RNG_MODULUS, fmod=0
+    )
+    return token, op.Where(active, advanced, counter), valid
 
 
 def _finite(op: OpBuilder, value: ir.Value) -> ir.Value:

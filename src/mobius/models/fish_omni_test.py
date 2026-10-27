@@ -80,6 +80,55 @@ def test_fish_omni_registry_config_resolution():
     assert resolved.quantization is None
 
 
+def test_fish_omni_cuda_build_uses_sparse_fused_expert_banks():
+    config = tiny_config()
+    package = build_from_module(
+        FishOmniModel(config), config, task="fish-omni", execution_provider="cuda"
+    )
+    graph = package["decoder"].graph
+    assert sum(node.op_type == "MoE" for node in graph) == config.num_hidden_layers
+    assert not any(node.op_type == "TopK" for node in graph)
+    banks = [value for name, value in graph.initializers.items() if ".packed_experts." in name]
+    assert len(banks) == config.num_hidden_layers * 3
+    assert all(len(value.shape) == 3 for value in banks)
+    assert not any(".experts.0." in name for name in graph.initializers)
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.BFLOAT16])
+def test_fish_single_pass_task_reuses_tower_weights_and_layer_count(dtype):
+    config = dataclasses.replace(tiny_config(), dtype=dtype)
+    ep = "onnx-standard" if dtype == ir.DataType.BFLOAT16 else "default"
+    teacher = build_from_module(
+        FishOmniModel(config), config, task="fish-omni", execution_provider=ep
+    )["audio_decoder"]
+    generated = build_from_module(
+        FishOmniModel(config), config, task="fish-omni-generation", execution_provider=ep
+    )["audio_generator"]
+    assert {
+        name for name, value in teacher.graph.initializers.items() if value.const_value is None
+    } == {
+        name
+        for name, value in generated.graph.initializers.items()
+        if value.const_value is None
+    }
+    assert {value.name for value in generated.graph.outputs} >= {
+        "frame_codes",
+        "valid",
+        "next_counter",
+        "codebook_logits",
+    }
+    assert (
+        sum(value.name.startswith("past_key_values.") for value in generated.graph.inputs) == 6
+    )
+    assert sum(
+        node.op_type == "Attention"
+        for node in ir.traversal.RecursiveGraphIterator(teacher.graph)
+    ) == sum(
+        node.op_type == "Attention"
+        for node in ir.traversal.RecursiveGraphIterator(generated.graph)
+    )
+
+
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16])
 def test_fish_omni_rejects_unqualified_precision(dtype):
     with pytest.raises(ValueError, match="FP16 requires"):
@@ -111,22 +160,24 @@ def test_fish_omni_rejects_incompatible_configs(section, key, value):
         FishOmniConfig.from_transformers(_dict_to_pretrained_config(raw))
 
 
-def test_fish_omni_ort_genai_metadata_rejects_incomplete_runtime(tmp_path):
+@pytest.mark.parametrize("task", ["fish-omni", "fish-omni-generation"])
+def test_fish_omni_ort_genai_metadata_rejects_incomplete_runtime(tmp_path, task):
     from mobius.integrations.ort_genai import write_ort_genai_config
 
     config = tiny_config()
-    package = build_from_module(FishOmniModel(config), config, task="fish-omni")
+    package = build_from_module(FishOmniModel(config), config, task=task)
     output = tmp_path / "ort-genai"
     with pytest.raises(ValueError, match="next-frame codebook sampling"):
         write_ort_genai_config(package, str(output), hf_model_id="must-not-download")
     assert not output.exists()
 
 
-def test_fish_omni_onnx_genai_metadata_is_graph_derived_and_advisory(tmp_path):
+@pytest.mark.parametrize("task", ["fish-omni", "fish-omni-generation"])
+def test_fish_omni_onnx_genai_metadata_is_graph_derived_and_advisory(tmp_path, task):
     from mobius.integrations.onnx_genai import write_onnx_genai_config
 
     config = tiny_config()
-    package = build_from_module(FishOmniModel(config), config, task="fish-omni")
+    package = build_from_module(FishOmniModel(config), config, task=task)
     artifacts = write_onnx_genai_config(package, str(tmp_path))
     metadata = json.loads((tmp_path / "inference_metadata.yaml").read_text())
     assert set(artifacts) == {"inference_metadata", "runtime_compatibility"}

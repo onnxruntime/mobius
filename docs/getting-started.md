@@ -163,6 +163,47 @@ outputs; retain only the last invocation's present caches. Later code inputs
 may initially be zero because logit slice `i` depends only on codes `0..i`.
 This teacher-forced ABI favors a compact export over efficient fused sampling.
 
+For the faster generation ABI, explicitly select `task="fish-omni-generation"`.
+It replaces `audio_decoder` with `audio_generator`, **not** a second copy of its
+weights:
+
+```python
+pkg = build(
+    "fishaudio/drama-3",
+    dtype="f32",
+    execution_provider="cuda",
+    task="fish-omni-generation",
+    keep_quantized=False,
+)
+pkg.save("output/drama-3-fast", max_workers=1)
+```
+
+The FP32 CUDA route uses packed expert banks and `com.microsoft::MoE`, executing
+selected experts rather than evaluating all 256 experts per layer. Its raw-logit
+routing and physical expert-byte layout match ORT's floating MoE ABI. It still
+stores dense FP32 weights: this is **not native FP8**, and it does not remove the
+large model-memory requirement. The portable/default export remains available.
+
+`audio_generator` accepts the original tower inputs plus scalar BOOL `generate`
+and `do_sample`, and per-row `temperature`, `top_k`, `top_p`, `seed`, `counter`
+controls matching the sampling policies below. Set `generate=false` for
+teacher-forced prompt prefill; no RNG/sorting runs in this mode. For generation,
+use `T=1`, put the main semantic code in `codes[...,0]`, and set
+`generate=true`. `do_sample=false` is exact greedy selection; `true` performs
+the source sampling rule. The graph generates each residual code before the
+next layer consumes it, traversing the tower **once per frame**, instead of
+nine complete teacher-forced replays. With the released configuration this
+reduces tower-block evaluations from 117 to 13 per frame; this is a work-count
+reduction, **not a measured 9x latency claim**.
+
+Outputs include `frame_codes` INT64 `[B,1,10]`, `valid` BOOL `[B]`,
+`next_counter` INT64 `[B]`, logits and the complete committed KV state.
+Nonfinite active sampling/neural inputs or multi-frame generation produce
+`valid=false`, `frame_codes=-1`, and an unchanged counter. Do not commit cache
+outputs on an invalid result. Greedy generation and prefill do not advance RNG
+state. The BF16 standard-ONNX route also supports this one-pass task, but remains
+experimentally qualified as described above.
+
 Sampling math is exported in `policies/main_sampler.onnx` and
 `policies/codebook_sampler.onnx` and restored in `pkg.policy_components` on load.
 Both take last-step `logits` `[B,V]`, `temperature`/`top_p` FLOAT `[B]`, `top_k`,
@@ -228,6 +269,34 @@ the tower on GPU 4; comparison places embedding/audio/decoder on GPUs 0/1/2.
 Override these with the script's device flags on a shared host. The script
 retains full reference vectors and verifies the committed token-generation
 golden, while the generic waveform golden runner remains out of scope.
+
+For performance measurement, `scripts/benchmark_drama3.py` runs actual cached
+requests with I/O binding: recurrent/KV state and neural intermediates remain on
+the selected device, while only small policy outputs and the final waveform
+return to the host. It supports both the original replay task and the one-pass
+task, so their timings can be compared using the same ORT build and options.
+Supply the pinned HF `config.json` and the independent reference stage's
+`state-00.npz` prompt:
+
+```bash
+python scripts/benchmark_drama3.py --package output/drama-3-fast --config drama3-config.json --prompt drama3-validation/reference/state-00.npz --codec output/drama-3-codec --device cuda --device-id 0 --sample --frames 100 --output drama3-perf.json
+```
+
+The report separates initialization, prefill, first code frame, steady
+frames/second, p50/p95 frame latency and waveform decoding. End-to-end RTF includes
+prefill, generation and waveform decoding relative to actual audio duration.
+The codec is full-sequence: **first-code-frame latency is not streaming
+time-to-audio**. Omit `--codec` only for a token-pipeline diagnostic; such a run
+does not attest full speech performance.
+
+Use an idle, sufficiently large GPU. Busy devices are rejected by default;
+`--allow-contended` and `--profile` are explicitly unqualified diagnostics.
+Performance sign-off requires at least 50 complete frames, no competing GPU
+processes observed around the run, unprofiled timing and an independently
+established quality gate. The optional `--max-rtf` target defaults to `1.0`;
+qualified end-to-end runs exceeding it fail after writing their measurements.
+The current optimizations have source-parity and execution-path coverage, but
+**no fresh uncontended full-model H200 latency/RTF result is claimed**.
 
 ### Build from a GGUF file
 

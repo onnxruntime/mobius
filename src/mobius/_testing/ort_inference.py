@@ -78,7 +78,9 @@ def _numpy_to_ort_value(value: np.ndarray) -> ort.OrtValue:
         if value.dtype == np.bool_:
             # ORT supports tensor(bool) natively but DLPack does not, so
             # bypass ort_easy's DLPack-first path.
-            return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(value))
+            return ort.OrtValue.ortvalue_from_numpy(
+                np.ascontiguousarray(value) if value.ndim else value
+            )
         try:
             import ml_dtypes
         except ImportError:  # pragma: no cover

@@ -13,10 +13,29 @@ import torch
 from mobius._configs.fish_omni import FishOmniConfig
 from mobius._model_package import ModelPackage
 from mobius.integrations._weight_loading import (
+    StreamingExpertBankSource,
     StreamingWeightPlan,
     StreamingWeightSource,
     stream_preprocessed_safetensors_to_model,
 )
+
+
+def _classify_source(source, index, config, *, expert):
+    if source not in index:
+        raise ValueError(f"Missing Drama 3 checkpoint tensor {source!r}")
+    source_dtype = index[source][2]
+    if config.fp8_experts and expert:
+        if source_dtype != "F8_E4M3":
+            raise ValueError(f"Drama 3 FP8 expert {source!r} must have dtype F8_E4M3")
+        return StreamingWeightSource(
+            source,
+            mode="fp8_block_128",
+            scale_name=source.removesuffix(".weight") + ".weight_scale_inv",
+            reconstruction_dtype=torch.float32,
+        )
+    if source_dtype not in {"F32", "BF16", "F16"}:
+        raise ValueError(f"Unexpected Drama 3 weight dtype {source_dtype}: {source}")
+    return StreamingWeightSource(source)
 
 
 def _source_name(target: str) -> str:
@@ -26,6 +45,7 @@ def _source_name(target: str) -> str:
         return "audio_decoder.codebook_embeddings.weight"
     if target.startswith("decoder.model."):
         source = "model.language_model." + target.removeprefix("decoder.model.")
+        source = source.replace(".mlp.packed_experts.", ".mlp.experts.")
         return source.replace(".linear_attn.conv1d_weight", ".linear_attn.conv1d.weight")
     if target == "decoder.lm_head.weight":
         return "lm_head.weight"
@@ -45,28 +65,34 @@ def build_fish_omni_streaming_plan(
     config: FishOmniConfig,
 ) -> StreamingWeightPlan:
     """Map every learned parameter and classify each independently scaled expert."""
-    targets = {}
+    targets: dict[str, StreamingWeightSource | StreamingExpertBankSource] = {}
     for name, value in initializers.items():
         if value.const_value is not None:
             continue
         source = _source_name(name)
-        if source not in index:
-            raise ValueError(f"Missing Drama 3 checkpoint tensor {source!r}")
-        source_dtype = index[source][2]
-        expert = ".mlp.experts." in source
-        if config.fp8_experts and expert:
-            if source_dtype != "F8_E4M3":
-                raise ValueError(f"Drama 3 FP8 expert {source!r} must have dtype F8_E4M3")
-            targets[name] = StreamingWeightSource(
-                source,
-                mode="fp8_block_128",
-                scale_name=source.removesuffix(".weight") + ".weight_scale_inv",
-                reconstruction_dtype=torch.float32,
+        if any(
+            source.endswith(f".experts.{projection}.weight")
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        ):
+            assert config.num_local_experts is not None
+            prefix, projection = source.rsplit(".experts.", 1)
+            targets[name] = StreamingExpertBankSource(
+                tuple(
+                    (
+                        _classify_source(
+                            f"{prefix}.experts.{expert}.{projection}",
+                            index,
+                            config,
+                            expert=True,
+                        ),
+                    )
+                    for expert in range(config.num_local_experts)
+                )
             )
         else:
-            if source_dtype not in {"F32", "BF16", "F16"}:
-                raise ValueError(f"Unexpected Drama 3 weight dtype {source_dtype}: {source}")
-            targets[name] = StreamingWeightSource(source)
+            targets[name] = _classify_source(
+                source, index, config, expert=".mlp.experts." in source
+            )
     return StreamingWeightPlan(
         targets=targets,
         report={"architecture": "fish_omni", "codec_included": False},

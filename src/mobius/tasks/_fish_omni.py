@@ -13,6 +13,7 @@ from mobius._build_context import ep_capabilities
 from mobius._configs.fish_omni import FishOmniConfig
 from mobius._model_package import ModelPackage
 from mobius.generation._fish_omni import (
+    FishAudioSamplingInputs,
     build_fish_codebook_sampler,
     build_fish_main_sampler,
 )
@@ -39,6 +40,10 @@ class FishOmniTask(ModelTask):
         decoder="decoder",
         audio_decoder="audio_decoder",
     )
+    audio_model_name = "audio_decoder"
+
+    def _sampling_inputs(self, builder) -> FishAudioSamplingInputs | None:
+        return None
 
     def build(self, module, config: FishOmniConfig) -> ModelPackage:
         if config.dtype == ir.DataType.BFLOAT16 and ep_capabilities().name != "onnx-standard":
@@ -80,7 +85,7 @@ class FishOmniTask(ModelTask):
         models["decoder"] = _make_model(graph)
         _register_linear_attention_functions(models["decoder"], config)
 
-        graph, builder = _make_graph("audio_decoder")
+        graph, builder = _make_graph(self.audio_model_name)
         hidden = builder.input(
             "hidden_states", dtype=config.dtype, shape=[batch, seq, config.hidden_size]
         )
@@ -105,12 +110,40 @@ class FishOmniTask(ModelTask):
             ir.SymbolicDim(batch),
             past,
         )
-        logits, present = module.audio_decoder(
-            builder.op, hidden, codes, semantic, unseen, mask, positions, tower_caches
-        )
+        sampling = self._sampling_inputs(builder)
+        if sampling is None:
+            logits, present = module.audio_decoder(
+                builder.op, hidden, codes, semantic, unseen, mask, positions, tower_caches
+            )
+        else:
+            # A second method must retain __call__'s module scope without
+            # cloning any tower weights or placing parameters in subgraphs.
+            decoder = module.audio_decoder
+            builder.push_module(decoder.name or "audio_decoder", type(decoder).__qualname__)
+            try:
+                logits, present, frame, counter, valid = decoder.forward_sampled(
+                    builder.op,
+                    hidden,
+                    codes,
+                    semantic,
+                    unseen,
+                    mask,
+                    positions,
+                    tower_caches,
+                    sampling,
+                )
+            finally:
+                builder.pop_module()
+            frame.type = ir.TensorType(ir.DataType.INT64)
+            frame.shape = ir.Shape([batch, 1, config.num_codebooks])
+            counter.type, counter.shape = ir.TensorType(ir.DataType.INT64), ir.Shape([batch])
+            valid.type, valid.shape = ir.TensorType(ir.DataType.BOOL), ir.Shape([batch])
+            builder.add_output(frame, "frame_codes")
+            builder.add_output(counter, "next_counter")
+            builder.add_output(valid, "valid")
         builder.add_output(logits, "codebook_logits")
         _register_kv_cache_outputs(builder, present)
-        models["audio_decoder"] = _make_model(graph)
+        models[self.audio_model_name] = _make_model(graph)
         for model in models.values():
             model.metadata_props["mobius.fish_omni.scope"] = (
                 "Neural token graphs with ONNX sampling policies; caller orchestrates "
@@ -123,4 +156,31 @@ class FishOmniTask(ModelTask):
                 "main_sampler": build_fish_main_sampler(config),
                 "codebook_sampler": build_fish_codebook_sampler(config),
             },
+        )
+
+
+class FishOmniGenerationTask(FishOmniTask):
+    """Single-pass temporal codebook generation with shared teacher-forced prefill."""
+
+    audio_model_name = "audio_generator"
+    model_roles: ClassVar[dict[str, str]] = {
+        "embedding": "embedding",
+        "decoder": "decoder",
+        "audio_generator": "decoder",
+    }
+    components: ClassVar[ComponentSpec] = ComponentSpec(
+        embedding="embedding",
+        decoder="decoder",
+        audio_generator="audio_decoder",
+    )
+
+    def _sampling_inputs(self, builder) -> FishAudioSamplingInputs:
+        return FishAudioSamplingInputs(
+            builder.input("generate", ir.DataType.BOOL, []),
+            builder.input("do_sample", ir.DataType.BOOL, []),
+            builder.input("temperature", ir.DataType.FLOAT, ["batch"]),
+            builder.input("top_k", ir.DataType.INT64, ["batch"]),
+            builder.input("top_p", ir.DataType.FLOAT, ["batch"]),
+            builder.input("seed", ir.DataType.INT64, ["batch"]),
+            builder.input("counter", ir.DataType.INT64, ["batch"]),
         )
