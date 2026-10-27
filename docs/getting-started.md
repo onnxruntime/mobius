@@ -138,7 +138,9 @@ format. Initialize ordinary KV caches with sequence length zero; initialize
 DeltaNet conv/recurrent state with zeros and the **actual batch size**.
 Recurrent state is always FP32. Masks are INT64 `[B,past+T]` and positions are
 INT64 `[B,T]`. The audio tower's cache persists across **time**, not just within
-one frame. Padding must be removed before running the recurrent backbone;
+one frame. Serialized symbolic dimensions are component-qualified; initialize
+KV caches using their sequence axis (axis 2), not a bare dimension-name match.
+Padding must be removed before running the recurrent backbone;
 padded rows would otherwise update its state.
 
 For teacher-forced prompt ingestion, the backbone sees frame `p`, while the
@@ -159,9 +161,29 @@ Sampling (including repetition-aware resampling), reference audio encoding,
 the separately distributed `codec.pth`, waveform decoding, and ORT GenAI
 generation integration are external. `--runtime onnx-genai` writes graph-derived
 advisory component contracts, not an executable speech pipeline;
-`--runtime ort-genai` is explicitly rejected. No full-checkpoint waveform or
-generation-golden claim is made by this token-graph export. Fish Audio's
-checkpoint/source license is separate from Mobius's MIT license.
+`--runtime ort-genai` is explicitly rejected. Fish Audio's checkpoint/source
+license is separate from Mobius's MIT license.
+
+The complete pinned checkpoint was validated on H200 with ORT 1.28 CUDA and
+TF32 disabled: a 30-row prefill and 20 greedy frames match the independent
+upstream FP32 pipeline. Maximum observed decoder/tower logit differences were
+`3.624e-5` / `3.910e-5`. This is token-level evidence, not waveform or speech-quality
+validation. The native reference uses an argmax sampler for determinism.
+
+To reproduce on a sufficiently large CUDA host, select free devices and run:
+
+```bash
+python scripts/validate_drama3.py download --work-dir drama3-validation
+python scripts/validate_drama3.py export --work-dir drama3-validation
+python scripts/validate_drama3.py reference --work-dir drama3-validation
+python scripts/validate_drama3.py compare --work-dir drama3-validation
+```
+
+By default, reference loading spreads the backbone across GPUs 0-3 and places
+the tower on GPU 4; comparison places embedding/audio/decoder on GPUs 0/1/2.
+Override these with the script's device flags on a shared host. The script
+retains full reference vectors and verifies the committed token-generation
+golden, while the generic waveform golden runner remains out of scope.
 
 ### Build from a GGUF file
 
