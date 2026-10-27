@@ -46,6 +46,7 @@ class QuantizationCodec(Protocol):
         config: QuantizationConfig,
         *,
         kind: Literal["linear", "embedding"] = "linear",
+        in_features: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """Convert one packed record to Mobius's canonical parameter layout."""
 
@@ -177,6 +178,7 @@ class _LegacyAffineCodec:
         config: QuantizationConfig,
         *,
         kind: Literal["linear", "embedding"] = "linear",
+        in_features: int | None = None,
     ) -> dict[str, torch.Tensor]:
         if not isinstance(record.storage, PackedWeight):
             raise TypeError(f"weight {record.name!r} is not packed")
@@ -196,6 +198,7 @@ class _LegacyAffineCodec:
             tie_embeddings=False,
             embed_key=record.name if kind == "embedding" else "",
             qmoe_target_path=None,
+            in_features=in_features,
         )
         if kind == "embedding" and self.method in {"gptq", "awq"}:
             # The affine packers produce [rows, blocks, bytes]; Gather consumes

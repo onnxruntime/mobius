@@ -22,6 +22,7 @@ from onnxscript import nn
 
 from mobius._component_manifest import ComponentDescriptor, ComponentManifest
 from mobius._configs import BaseModelConfig, QuantizationConfig
+from mobius._quantization_utils import resolve_matmul_nbits_block_size
 from mobius._weight_utils import is_packed_quant_key
 from mobius.components import (
     ClippableLinear,
@@ -153,7 +154,8 @@ def _linear_layout_matches(
     )
     return (
         module._bits == quantization.bits
-        and module._block_size == quantization.group_size
+        and module._block_size
+        == resolve_matmul_nbits_block_size(quantization.group_size, module._k)
         and (module.zero_points is None) is quantization.sym
         and (
             module.zero_points is None or module.zero_points.dtype == expected_zero_point_dtype
@@ -726,6 +728,9 @@ def normalize_component_quantized_weights(
                     kind="embedding"
                     if isinstance(local_module, QuantizedEmbedding)
                     else "linear",
+                    in_features=local_module._k
+                    if isinstance(local_module, QuantizedLinear)
+                    else None,
                 )
             )
 

@@ -156,6 +156,105 @@ def test_specialized_quantized_subclass_fails_instead_of_losing_semantics():
         configure_component_quantization(module, config, _SingleTask())
 
 
+def test_per_channel_layout_keeps_specialized_forward():
+    class _SpecialQuantizedLinear(QuantizedLinear):
+        def __init__(self, in_features, out_features, bias=False):
+            super().__init__(in_features, out_features, block_size=-1, bias=bias)
+
+        def forward(self, op, x):
+            return super().forward(op, x)
+
+    module = _Projection(_SpecialQuantizedLinear)
+    original = module.proj
+    config = ArchitectureConfig(
+        component_quantization={
+            "model": QuantizationConfig(bits=4, group_size=-1, quant_method="olive", sym=True)
+        }
+    )
+
+    configure_component_quantization(module, config, _SingleTask())
+
+    assert module.proj is original
+    assert module.proj._block_size == 64
+
+
+def test_per_channel_component_plan_preserves_output_head_bit_override():
+    from mobius._configs import QuantizationOverride
+
+    module = nn.Module()
+    module.proj = Linear(96, 32, bias=False)
+    module.lm_head = Linear(96, 64, bias=False)
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=-1,
+        quant_method="olive",
+        sym=True,
+        quantize_lm_head=True,
+        overrides={"lm_head": QuantizationOverride(bits=8)},
+    )
+    config = ArchitectureConfig(component_quantization={"model": quantization})
+    task = _SingleTask()
+    manifest = configure_component_quantization(module, config, task)
+    packed = torch.arange(32 * 48).reshape(32, 48).to(torch.uint8)
+    head = torch.arange(64 * 96).reshape(64, 96).to(torch.uint8)
+
+    result = normalize_component_quantized_weights(
+        {
+            "proj.weight_qweight": packed,
+            "proj.weight_scales": torch.ones(32, 1),
+            "lm_head.weight_qweight": head,
+            "lm_head.weight_scales": torch.ones(64, 1),
+        },
+        module,
+        config,
+        ("model",),
+        manifest=manifest,
+        task=task,
+    )
+
+    assert (module.proj._bits, module.proj._block_size) == (4, 96)
+    assert (module.lm_head._bits, module.lm_head._block_size) == (8, 96)
+    assert result["proj.weight"].shape == (32, 1, 48)
+    assert result["lm_head.weight"].shape == (64, 1, 96)
+    torch.testing.assert_close(result["proj.weight"][:, 0, :48], packed)
+    torch.testing.assert_close(result["lm_head.weight"][:, 0, :96], head)
+    assert result["proj.scales"].shape == (32, 1)
+    assert result["lm_head.scales"].shape == (64, 1)
+
+
+@pytest.mark.parametrize("method", ["olive", "gptq", "awq"])
+@pytest.mark.parametrize("bits", [2, 4, 8])
+def test_per_channel_component_uses_logical_width_for_packing(method, bits):
+    import math
+
+    k, n = 33, 8
+    module = nn.Module()
+    module.proj = Linear(k, n, bias=False)
+    quantization = QuantizationConfig(bits=bits, group_size=-1, quant_method=method, sym=True)
+    config = ArchitectureConfig(component_quantization={"model": quantization})
+    task = _SingleTask()
+    manifest = configure_component_quantization(module, config, task)
+    if method == "olive":
+        packed = torch.arange(n * math.ceil(k * bits / 8)).to(torch.uint8).reshape(n, -1)
+        state_dict = {
+            "proj.weight_qweight": packed,
+            "proj.weight_scales": torch.ones(n, 1),
+        }
+        expected = packed
+    else:
+        packed = torch.arange(math.ceil(k * bits / 32) * n).to(torch.int32).reshape(-1, n)
+        state_dict = {"proj.qweight": packed, "proj.scales": torch.ones(1, n)}
+        expected = packed.T.contiguous().view(torch.uint8)[..., : math.ceil(k * bits / 8)]
+
+    result = normalize_component_quantized_weights(
+        state_dict, module, config, ("model",), manifest=manifest, task=task
+    )
+
+    assert module.proj._block_size == k
+    assert result["proj.weight"].shape == (n, 1, math.ceil(k * bits / 8))
+    torch.testing.assert_close(result["proj.weight"][:, 0], expected)
+
+
 def test_normalizes_weights_with_component_module_path_routing():
     module = _Composite()
     config = _config()

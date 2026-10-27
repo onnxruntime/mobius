@@ -19,6 +19,7 @@ The critical invariants:
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 from pathlib import Path
 
@@ -65,8 +66,8 @@ def _build_matmulnbits_model(
 
     Returns ``(model, feeds, packed_weight, scales, packed_zero_points)``.
     """
-    nb = k_in // block
-    blob = block // 2  # 4-bit → 2 values per byte
+    nb = math.ceil(k_in / block)
+    blob = math.ceil(block / 2)  # 4-bit → 2 values per byte
     rng = np.random.default_rng(seed)
     numpy_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
     packed = rng.integers(0, 256, (n_out, nb, blob), dtype=np.uint8)
@@ -204,6 +205,34 @@ class TestMatMulNBitsInlineParity:
         self._inline(inlined)
         got = _run(inlined, feeds2)
         np.testing.assert_allclose(got, reference, rtol=0, atol=0)
+
+    @pytest.mark.parametrize(
+        ("k", "block"),
+        [(7, 7), (33, 33), (96, 96), (1536, 1536), (7, 16), (33, 64), (65, 32)],
+    )
+    @pytest.mark.parametrize("has_zero_points", [False, True])
+    def test_inline_trims_single_block_padding(self, k, block, has_zero_points):
+        kwargs = {
+            "n_out": 8,
+            "k_in": k,
+            "block": block,
+            "has_zero_points": has_zero_points,
+        }
+        inlined, feeds, packed, scales, packed_zeros = _build_matmulnbits_model(**kwargs)
+        nb = math.ceil(k / block)
+        codes = np.empty((8, nb, packed.shape[-1] * 2), dtype=np.float32)
+        codes[..., 0::2] = packed & 0x0F
+        codes[..., 1::2] = packed >> 4
+        zeros = np.full((8, nb), 8, dtype=np.float32)
+        if has_zero_points:
+            zeros[:, 0::2] = packed_zeros & 0x0F
+            zeros[:, 1::2] = (packed_zeros >> 4)[:, : nb // 2]
+        weights = ((codes - zeros[..., None]) * scales[..., None]).reshape(8, -1)[:, :k]
+        reference = feeds["A"] @ weights.T
+
+        self._inline(inlined)
+
+        np.testing.assert_allclose(_run(inlined, feeds), reference, rtol=1e-5, atol=1e-5)
 
     @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
     @pytest.mark.parametrize("keep_empty_slot", [False, True])

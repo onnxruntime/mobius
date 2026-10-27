@@ -16,13 +16,14 @@ import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities
+from mobius._build_context import ep_capabilities, get_matmul_nbits_accuracy_level
+from mobius._quantization_utils import resolve_matmul_nbits_block_size
 
 # MatMulNBits packs weights into uint8 blobs.  The packed shape depends
 # on bits and block_size:
 #   packed_weights: [N, n_blocks, blob_size]  (uint8)
 #     where n_blocks = ceil(K / block_size)
-#           blob_size = block_size * bits / 8
+#           blob_size = ceil(block_size * bits / 8)
 #   scales:         [N, n_blocks]             (float16/float32)
 #   zero_points:    [N, ceil(n_blocks*bits/8)] (uint8, optional, bit-packed)
 
@@ -58,20 +59,15 @@ _NATIVE_BLOCK_FORMATS = {
 def _accuracy_level_attrs(bits: int) -> dict[str, int]:
     """Return the ``accuracy_level`` attribute for ``MatMulNBits``, if any.
 
-    Only emitted for 4-bit weights: ``accuracy_level`` is sourced from
-    ``EpCapabilities.default_int4_accuracy_level`` and its int8-accumulation
-    semantics are defined for INT4 ``MatMulNBits``. For 2-bit / 8-bit weights the
-    attribute is omitted so those paths keep ORT's default behavior.
-
-    ORT's MLAS CPU ``MatMulNBits`` kernel selects its compute path from the
-    ``accuracy_level`` attribute: unset/0 keeps the highest-precision fp32
-    dequant + fp32 GEMM path, while ``4`` dynamically quantizes activations to
-    int8 and uses int8 dot-products (SDOT/NEON on ARM, AVX-VNNI on x86) — the
-    same class of kernel llama.cpp uses, and typically 2-4x faster on CPU with
-    no observable quality loss for Q4 weights. The value is sourced from the
-    active EP's :attr:`EpCapabilities.default_int4_accuracy_level` (4 for CPU /
-    WebGPU). When it is 0 the attribute is omitted so ORT keeps its default.
+    An explicit build override takes precedence for every weight bit width,
+    including zero, which must override an EP's nonzero default. Otherwise,
+    preserve the existing INT4 EP default and omit the attribute for other
+    bit widths. This controls activation computation, not weight quantization;
+    supported kernels and numerical differences depend on the runtime and EP.
     """
+    override = get_matmul_nbits_accuracy_level()
+    if override is not None:
+        return {"accuracy_level": override}
     if bits != 4:
         return {}
     level = ep_capabilities().default_int4_accuracy_level
@@ -92,7 +88,9 @@ class QuantizedLinear(nn.Module):
         in_features: Input dimension (K).
         out_features: Output dimension (N).
         bits: Quantization bit-width (2, 4, or 8).
-        block_size: Number of elements per quantization group.
+        block_size: Number of elements per quantization group, or ``-1`` for
+            one scale per output channel. A full-channel block equals K and
+            need not be a power of two; native kernel support is backend-specific.
         has_zero_point: Whether asymmetric zero-point is used.
         zero_point_dtype: Dtype for the zero_points parameter when
             ``has_zero_point`` is true. ``UINT8`` (default) uses ORT's
@@ -117,8 +115,14 @@ class QuantizedLinear(nn.Module):
         super().__init__()
         if bits not in (2, 4, 8):
             raise ValueError(f"bits must be 2, 4, or 8, got {bits}")
-        if block_size < 16 or (block_size & (block_size - 1)):
-            raise ValueError(f"block_size must be a power of 2 >= 16, got {block_size}")
+        block_size = resolve_matmul_nbits_block_size(block_size, in_features)
+        if not (block_size == in_features and in_features > 0) and (
+            block_size < 16 or (block_size & (block_size - 1))
+        ):
+            raise ValueError(
+                "block_size must be a power of 2 >= 16 or equal to K > 0, "
+                f"got {block_size} for K={in_features}"
+            )
 
         self._bits = bits
         self._block_size = block_size
@@ -126,7 +130,7 @@ class QuantizedLinear(nn.Module):
         self._n = out_features
 
         n_blocks = math.ceil(in_features / block_size)
-        blob_size = block_size * bits // 8
+        blob_size = math.ceil(block_size * bits / 8)
 
         # Packed quantized weight tensor (uint8)
         self.weight = nn.Parameter(
@@ -599,7 +603,8 @@ def make_quantized_linear_factory(
 
     Args:
         bits: Quantization bit-width (typically 4).
-        block_size: Number of elements per quantization group.
+        block_size: Number of elements per quantization group, or ``-1`` for
+            per-output-channel quantization.
         has_zero_point: Whether to include zero-point parameters.
         zero_point_dtype: Dtype for the zero_points parameter (see
             :class:`QuantizedLinear`).

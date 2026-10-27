@@ -23,6 +23,7 @@ from collections.abc import Collection, Sequence
 import torch
 
 from mobius._configs import QuantizationConfig, QuantizedWeightFormat
+from mobius._quantization_utils import resolve_matmul_nbits_block_size
 
 logger = logging.getLogger(__name__)
 
@@ -884,7 +885,34 @@ def vlm_vision_weights(
     return renamed
 
 
-def _reshape_packed_qweight(value: torch.Tensor, blob_size: int) -> torch.Tensor:
+def _reshape_per_channel_qweight(
+    value: torch.Tensor,
+    bits: int,
+    *,
+    in_features: int | None = None,
+    storage_bits: int = 8,
+) -> torch.Tensor:
+    """Keep one packed row per channel, trimming only producer word padding."""
+    k = value.shape[-1] * 8 // bits if in_features is None else in_features
+    block_size = resolve_matmul_nbits_block_size(-1, k)
+    blob_size = math.ceil(block_size * bits / 8)
+    expected_bytes = math.ceil(block_size * bits / storage_bits) * (storage_bits // 8)
+    if value.shape[-1] != expected_bytes:
+        raise ValueError(
+            f"Per-channel packed width {value.shape[-1]} does not match "
+            f"K={k}, bits={bits}, storage_bits={storage_bits} "
+            f"(expected {expected_bytes} bytes)"
+        )
+    return value[..., :blob_size].reshape(*value.shape[:-1], 1, blob_size).contiguous()
+
+
+def _reshape_packed_qweight(
+    value: torch.Tensor,
+    bits: int,
+    group_size: int,
+    *,
+    in_features: int | None = None,
+) -> torch.Tensor:
     """Transpose and reshape a packed qweight tensor for MatMulNBits.
 
     Converts ``[..., K_packed, N]`` int32 to
@@ -893,7 +921,12 @@ def _reshape_packed_qweight(value: torch.Tensor, blob_size: int) -> torch.Tensor
     transposed = value.transpose(-1, -2).contiguous()
     prefix = transposed.shape[:-2]
     n = transposed.shape[-2]
-    packed = transposed.view(torch.uint8)
+    packed = transposed.reshape(-1).view(torch.uint8).reshape(*prefix, n, -1)
+    if group_size == -1:
+        return _reshape_per_channel_qweight(
+            packed, bits, in_features=in_features, storage_bits=32
+        )
+    blob_size = group_size * bits // 8
     n_blocks = packed.shape[-1] // blob_size
     return packed.reshape(*prefix, n, n_blocks, blob_size)
 
@@ -1250,6 +1283,8 @@ def preprocess_gptq_weights(
     state_dict: dict[str, torch.Tensor],
     bits: int = 4,
     group_size: int = 128,
+    *,
+    in_features: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Rename, transpose and reshape GPTQ weights for MatMulNBits.
 
@@ -1270,7 +1305,9 @@ def preprocess_gptq_weights(
     Args:
         state_dict: Model state dict with GPTQ keys.
         bits: Quantization bit-width (typically 4).
-        group_size: Number of elements per quantization group.
+        group_size: Number of elements per quantization group, or ``-1`` for
+            per-output-channel quantization.
+        in_features: Logical K for per-channel weights, excluding int32 packing padding.
 
     Returns:
         State dict with renamed, transposed and reshaped weights.
@@ -1278,14 +1315,17 @@ def preprocess_gptq_weights(
     import logging
 
     logger = logging.getLogger(__name__)
-    blob_size = group_size * bits // 8
     result: dict[str, torch.Tensor] = {}
 
     for key, value in state_dict.items():
         if key.endswith(".g_idx"):
             # g_idx maps element i to its quantization group.  For
             # non-desc_act models this is simply i // group_size.
-            trivial = torch.arange(value.numel(), dtype=value.dtype) // group_size
+            trivial = (
+                torch.zeros_like(value)
+                if group_size == -1
+                else torch.arange(value.numel(), dtype=value.dtype) // group_size
+            )
             if not torch.equal(value, trivial):
                 logger.warning(
                     "Dropping %s — desc_act models with non-trivial "
@@ -1296,7 +1336,9 @@ def preprocess_gptq_weights(
 
         if key.endswith(".qweight"):
             new_key = key.replace(".qweight", ".weight")
-            result[new_key] = _reshape_packed_qweight(value, blob_size)
+            result[new_key] = _reshape_packed_qweight(
+                value, bits, group_size, in_features=in_features
+            )
 
         elif key.endswith(".qzeros"):
             new_key = key.replace(".qzeros", ".zero_points")
@@ -1307,10 +1349,14 @@ def preprocess_gptq_weights(
                     f"Missing {qw_key} — qweight must be present alongside qzeros for {key}"
                 )
             k = state_dict[qw_key].shape[-2] * 32 // bits
-            n_blocks = math.ceil(k / group_size)
+            n_blocks = 1 if group_size == -1 else math.ceil(k / group_size)
             result[new_key] = _reshape_packed_qzeros(value, bits, n_blocks)
 
         elif key.endswith(".scales"):
+            if group_size == -1 and value.shape[-2] != 1:
+                raise ValueError(
+                    f"Per-channel scales for {key} must have one group, got {value.shape}"
+                )
             result[key] = value.transpose(-1, -2).contiguous()
 
         else:
@@ -1328,6 +1374,8 @@ def preprocess_olive_weights(
     tie_word_embeddings: bool = False,
     embed_key: str = "model.embed_tokens.weight",
     head_key: str = "lm_head.weight",
+    *,
+    in_features: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Rename and reshape Olive-packed quantized weights.
 
@@ -1363,12 +1411,14 @@ def preprocess_olive_weights(
     Args:
         state_dict: Model state dict with Olive quantization keys.
         bits: Quantization bit-width (typically 4).
-        group_size: Number of elements per quantization group.
+        group_size: Number of elements per quantization group, or ``-1`` for
+            per-output-channel linear quantization.
         quantize_embeddings: Whether the embedding table is quantized.
         quantize_lm_head: Whether the LM head is quantized.
         tie_word_embeddings: Whether embedding and LM head share weights.
         embed_key: Float embedding key used for the tied-head fallback.
         head_key: Float LM-head key used for the tied-head fallback.
+        in_features: Logical K for per-channel linear weights.
 
     Returns:
         State dict with renamed and reshaped weights (and, for a float tied
@@ -1440,12 +1490,17 @@ def preprocess_olive_weights(
         elif key.endswith("_qweight"):
             if value.dtype != torch.uint8:
                 raise ValueError(f"Olive qweight must be uint8 for {key}, got {value.dtype}")
+            new_key = _rename(key, "_qweight", "weight")
+            if group_size == -1:
+                result[new_key] = _reshape_per_channel_qweight(
+                    value, bits, in_features=in_features
+                )
+                continue
             if value.shape[-1] % blob_size != 0:
                 raise ValueError(
                     f"Olive qweight packed dimension for {key} ({value.shape[-1]}) "
                     f"must be divisible by blob_size ({blob_size})"
                 )
-            new_key = _rename(key, "_qweight", "weight")
             # Preserve all leading dims so fused expert-major tensors
             # ``[E, N, packed_K]`` reshape to ``[E, N, n_blocks, blob_size]``
             # for the QMoE repacker; 2-D linears ``[N, packed_K]`` are
@@ -1457,6 +1512,10 @@ def preprocess_olive_weights(
             new_key = _rename(key, "_qzeros", "zero_points")
             result[new_key] = value.contiguous()
         elif key.endswith("_scales"):
+            if group_size == -1 and value.shape[-1] != 1:
+                raise ValueError(
+                    f"Per-channel scales for {key} must have one group, got {value.shape}"
+                )
             new_key = _rename(key, "_scales", "scales")
             result[new_key] = value
         else:
@@ -1480,6 +1539,8 @@ def preprocess_awq_weights(
     state_dict: dict[str, torch.Tensor],
     bits: int = 4,
     group_size: int = 128,
+    *,
+    in_features: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Rename, transpose and reshape AWQ weights for MatMulNBits.
 
@@ -1491,18 +1552,21 @@ def preprocess_awq_weights(
     Args:
         state_dict: Model state dict with AWQ keys.
         bits: Quantization bit-width (typically 4).
-        group_size: Number of elements per quantization group.
+        group_size: Number of elements per quantization group, or ``-1`` for
+            per-output-channel quantization.
+        in_features: Logical K for per-channel weights, excluding int32 packing padding.
 
     Returns:
         State dict with renamed, transposed and reshaped weights.
     """
-    blob_size = group_size * bits // 8
     result: dict[str, torch.Tensor] = {}
 
     for key, value in state_dict.items():
         if key.endswith(".qweight"):
             new_key = key.replace(".qweight", ".weight")
-            result[new_key] = _reshape_packed_qweight(value, blob_size)
+            result[new_key] = _reshape_packed_qweight(
+                value, bits, group_size, in_features=in_features
+            )
 
         elif key.endswith(".qzeros"):
             new_key = key.replace(".qzeros", ".zero_points")
@@ -1513,7 +1577,7 @@ def preprocess_awq_weights(
                     f"Missing {qw_key} — qweight must be present alongside qzeros for {key}"
                 )
             k = state_dict[qw_key].shape[-2] * 32 // bits
-            n_blocks = math.ceil(k / group_size)
+            n_blocks = 1 if group_size == -1 else math.ceil(k / group_size)
             # AWQ zero points have an implicit +1 offset; subtract it
             # before unpacking so MatMulNBits sees the raw value.
             # For 4-bit, each byte packs TWO nibbles — subtract per-nibble
@@ -1530,6 +1594,10 @@ def preprocess_awq_weights(
                 result[new_key] = zp_int16.clamp(min=0).to(torch.uint8)
 
         elif key.endswith(".scales"):
+            if group_size == -1 and value.shape[-2] != 1:
+                raise ValueError(
+                    f"Per-channel scales for {key} must have one group, got {value.shape}"
+                )
             result[key] = value.transpose(-1, -2).contiguous()
 
         else:
@@ -1545,6 +1613,7 @@ def preprocess_quantized_weights(
     tie_embeddings: bool = False,
     embed_key: str = "model.embed_tokens.weight",
     head_key: str = "lm_head.weight",
+    in_features: int | None = None,
     qmoe_target_path: str | None = None,
     qmoe_quant_methods: Collection[str] = ("gptq", "awq", "olive"),
     qmoe_num_experts: int | None = None,
@@ -1564,6 +1633,7 @@ def preprocess_quantized_weights(
         tie_embeddings: Whether to alias missing float embedding/head weights.
         embed_key: Canonical float embedding-table key.
         head_key: Canonical float LM-head key.
+        in_features: Logical K when normalizing one per-channel linear weight.
         qmoe_target_path: MoE path replaced by packed QMoE parameter names.
             ``None`` means this model does not support or require QMoE handling.
         qmoe_quant_methods: Quantization methods supported by this caller when
@@ -1707,11 +1777,17 @@ def preprocess_quantized_weights(
 
     if quantization is not None and quantization.quant_method == "gptq":
         state_dict = preprocess_gptq_weights(
-            state_dict, bits=quantization.bits, group_size=quantization.group_size
+            state_dict,
+            bits=quantization.bits,
+            group_size=quantization.group_size,
+            in_features=in_features,
         )
     elif quantization is not None and quantization.quant_method == "awq":
         state_dict = preprocess_awq_weights(
-            state_dict, bits=quantization.bits, group_size=quantization.group_size
+            state_dict,
+            bits=quantization.bits,
+            group_size=quantization.group_size,
+            in_features=in_features,
         )
     elif quantization is not None and quantization.quant_method == "olive":
         projection_layouts = {
@@ -1762,6 +1838,7 @@ def preprocess_quantized_weights(
             tie_word_embeddings=olive_tie,
             embed_key=embed_key,
             head_key=head_key,
+            in_features=in_features,
         )
         if use_qmoe and qmoe_target_path is not None:
             return_state_dict = stack_per_expert_moe_weights(

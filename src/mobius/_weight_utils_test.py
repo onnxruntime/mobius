@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -601,6 +603,118 @@ class TestPreprocessGptqWeights:
         sd = {"q_proj.qzeros": torch.zeros(1, self.N, dtype=torch.int32)}
         with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
             preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    def test_per_channel_zero_group_indices_are_trivial(self, caplog):
+        result = preprocess_gptq_weights(
+            {"proj.g_idx": torch.zeros(96, dtype=torch.int32)}, group_size=-1
+        )
+        assert result == {}
+        assert "desc_act" not in caplog.text
+
+
+@pytest.mark.parametrize("preprocess", [preprocess_gptq_weights, preprocess_awq_weights])
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("prefix", [(), (2,)])
+@pytest.mark.parametrize("k", [7, 9, 33, 96, 1536, 6144])
+def test_per_channel_dotted_weights_preserve_codes_and_scales(preprocess, bits, prefix, k):
+    n = 8
+    packed = (
+        torch.arange(math.prod(prefix) * math.ceil(k * bits / 32) * n)
+        .reshape(*prefix, -1, n)
+        .to(torch.int32)
+    )
+    scales = torch.arange(1, math.prod(prefix) * n + 1).reshape(*prefix, 1, n).float()
+    raw = {
+        "proj.qweight": packed,
+        "proj.scales": scales,
+        "proj.qzeros": torch.full((*prefix, 1, n), 0x55555555, dtype=torch.int32),
+    }
+    result = preprocess(raw, bits=bits, group_size=-1, in_features=k)
+    weight = result["proj.weight"]
+    blob_size = math.ceil(k * bits / 8)
+    assert weight.shape == (*prefix, n, 1, blob_size)
+    expected = (
+        packed.transpose(-1, -2)
+        .contiguous()
+        .reshape(-1)
+        .view(torch.uint8)
+        .reshape(*prefix, n, -1)
+    )
+    torch.testing.assert_close(weight[..., 0, :], expected[..., :blob_size])
+    torch.testing.assert_close(result["proj.scales"], scales.transpose(-1, -2))
+    assert result["proj.zero_points"].shape == (*prefix, n, 1)
+    expected_zero = (
+        0x44
+        if preprocess is preprocess_awq_weights and bits == 4
+        else (0x54 if preprocess is preprocess_awq_weights else 0x55)
+    )
+    assert (result["proj.zero_points"] == expected_zero).all()
+
+
+@pytest.mark.parametrize("bits", [2, 4, 8])
+@pytest.mark.parametrize("prefix", [(), (2,)])
+@pytest.mark.parametrize("k", [7, 9, 33, 96, 1536, 6144])
+def test_per_channel_olive_weights_preserve_codes_and_scales(bits, prefix, k):
+    n = 8
+    blob_size = math.ceil(k * bits / 8)
+    packed = (
+        torch.arange(math.prod(prefix) * n * blob_size)
+        .reshape(*prefix, n, blob_size)
+        .to(torch.uint8)
+    )
+    scales = torch.arange(1, math.prod(prefix) * n + 1).reshape(*prefix, n, 1).float()
+    zeros = torch.full((*prefix, n, 1), 3, dtype=torch.uint8)
+    result = preprocess_olive_weights(
+        {
+            "proj.weight_qweight": packed,
+            "proj.weight_scales": scales,
+            "proj.weight_qzeros": zeros,
+        },
+        bits=bits,
+        group_size=-1,
+        in_features=k,
+    )
+    weight = result["proj.weight"]
+    assert weight.shape == (*prefix, n, 1, blob_size)
+    torch.testing.assert_close(weight[..., 0, :], packed)
+    assert result["proj.scales"] is scales
+    assert result["proj.zero_points"] is zeros
+
+
+@pytest.mark.parametrize("packed_bytes", [16, 18])
+def test_per_channel_olive_rejects_mismatched_logical_width(packed_bytes):
+    with pytest.raises(ValueError, match="Per-channel packed width"):
+        preprocess_olive_weights(
+            {"proj.weight_qweight": torch.zeros(8, packed_bytes, dtype=torch.uint8)},
+            bits=4,
+            group_size=-1,
+            in_features=33,
+        )
+
+
+@pytest.mark.parametrize("preprocess", [preprocess_gptq_weights, preprocess_awq_weights])
+@pytest.mark.parametrize("packed_words", [4, 6])
+def test_per_channel_dotted_rejects_mismatched_logical_width(preprocess, packed_words):
+    with pytest.raises(ValueError, match="Per-channel packed width"):
+        preprocess(
+            {"proj.qweight": torch.zeros(packed_words, 8, dtype=torch.int32)},
+            bits=4,
+            group_size=-1,
+            in_features=33,
+        )
+
+
+@pytest.mark.parametrize(
+    ("preprocess", "scales_key", "shape"),
+    [
+        (preprocess_olive_weights, "proj.weight_scales", (8, 2)),
+        (preprocess_gptq_weights, "proj.scales", (2, 8)),
+        (preprocess_awq_weights, "proj.scales", (2, 8)),
+    ],
+)
+def test_per_channel_rejects_multiple_scale_groups(preprocess, scales_key, shape):
+    with pytest.raises(ValueError, match="must have one group"):
+        preprocess({scales_key: torch.ones(shape)}, group_size=-1)
 
 
 class TestPreprocessOliveWeights:

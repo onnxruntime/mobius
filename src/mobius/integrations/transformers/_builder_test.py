@@ -38,6 +38,68 @@ class _DummyFp8Module(_DummyModule):
         raise AssertionError("mock streaming function should own planning")
 
 
+@pytest.mark.parametrize("level", [None, 0, 4])
+def test_build_forwards_matmul_nbits_accuracy_override(monkeypatch, level):
+    from mobius import build
+
+    config = make_config()
+    hf_config = SimpleNamespace(model_type="llama")
+    package = ModelPackage(
+        {"model": ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=10)}
+    )
+    core_build = mock.Mock(return_value=package)
+    monkeypatch.setattr(
+        transformers_builder, "_load_transformers_config", lambda *a, **k: (hf_config, False)
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *a, **k: (_DummyModule, "text-generation", "llama"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *a, **k: config)
+    monkeypatch.setattr(transformers_builder, "build_from_module", core_build)
+    assert (
+        build("local-model", load_weights=False, matmul_nbits_accuracy_level=level) is package
+    )
+    assert core_build.call_args.kwargs["matmul_nbits_accuracy_level"] == level
+
+
+@pytest.mark.parametrize("level", [-1, 5, True, False, 4.0, "4"])
+def test_build_rejects_invalid_accuracy_override_before_loading(monkeypatch, level):
+    loader = mock.Mock(side_effect=AssertionError("must validate before model loading"))
+    monkeypatch.setattr(transformers_builder, "_load_transformers_config", loader)
+    with pytest.raises(ValueError, match="matmul_nbits_accuracy_level"):
+        transformers_builder.build_transformers_model(
+            "local-model", matmul_nbits_accuracy_level=level
+        )
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize("level", [0, 4])
+def test_personaplex_rejects_accuracy_override(monkeypatch, level):
+    from mobius.integrations import _moshi
+
+    monkeypatch.setattr(_moshi, "_is_personaplex_checkpoint", lambda *a, **k: True)
+    with pytest.raises(ValueError, match="matmul_nbits_accuracy_level"):
+        transformers_builder.build_transformers_model(
+            "local-personaplex", matmul_nbits_accuracy_level=level
+        )
+
+
+@pytest.mark.parametrize("level", [0, 4])
+def test_reuse_rejects_accuracy_override(monkeypatch, level):
+    from mobius.models import reuse
+
+    monkeypatch.setattr(
+        transformers_builder, "_load_transformers_config", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(reuse, "_is_reuse_checkpoint", lambda *a, **k: True)
+    with pytest.raises(ValueError, match="matmul_nbits_accuracy_level"):
+        transformers_builder.build_transformers_model(
+            "local-reuse", matmul_nbits_accuracy_level=level
+        )
+
+
 def _native_gptoss_config(*, dtype=ir.DataType.FLOAT16):
     return make_config(
         model_type="gpt_oss",
@@ -1364,7 +1426,8 @@ def test_glm_full_attention_rejects_non_glm_model_type(monkeypatch) -> None:
         transformers_builder.build_transformers_model("fake/model", glm_full_attention=True)
 
 
-def test_build_threads_revision_to_diffusers_fallback(monkeypatch) -> None:
+@pytest.mark.parametrize("accuracy_level", [None, 0, 4])
+def test_build_threads_revision_to_diffusers_fallback(monkeypatch, accuracy_level) -> None:
     import transformers
 
     monkeypatch.setattr(
@@ -1392,6 +1455,7 @@ def test_build_threads_revision_to_diffusers_fallback(monkeypatch) -> None:
         "fake/diffusers",
         revision="pinned-revision",
         load_weights=False,
+        matmul_nbits_accuracy_level=accuracy_level,
     )
 
     assert result is expected
@@ -1403,6 +1467,7 @@ def test_build_threads_revision_to_diffusers_fallback(monkeypatch) -> None:
                 "dtype": None,
                 "load_weights": False,
                 "execution_provider": "default",
+                "matmul_nbits_accuracy_level": accuracy_level,
             },
         )
     ]

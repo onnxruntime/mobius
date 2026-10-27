@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import onnx_ir as ir
 import pytest
@@ -12,6 +13,7 @@ from mobius._build_context import (
     build_context,
     ep_capabilities,
     get_build_dtype,
+    get_matmul_nbits_accuracy_level,
     is_prefill_prefix_pruning_enabled,
     prefill_prefix_pruning,
 )
@@ -25,6 +27,66 @@ _CPU_CAPABILITIES = EpCapabilities(
     name="cpu",
     gqa_dtypes=frozenset({ir.DataType.FLOAT}),
 )
+
+
+@pytest.mark.parametrize("level", [None, 0, 1, 2, 3, 4])
+def test_matmul_nbits_accuracy_level_scoping(level):
+    assert get_matmul_nbits_accuracy_level() is None
+    with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=level):
+        assert get_matmul_nbits_accuracy_level() == level
+        with build_context(_CUDA_CAPABILITIES):
+            assert get_matmul_nbits_accuracy_level() is None
+        assert get_matmul_nbits_accuracy_level() == level
+        with (
+            pytest.raises(RuntimeError, match="deliberate"),
+            build_context(_CUDA_CAPABILITIES, matmul_nbits_accuracy_level=0),
+        ):
+            assert get_matmul_nbits_accuracy_level() == 0
+            raise RuntimeError("deliberate")
+        assert get_matmul_nbits_accuracy_level() == level
+    assert get_matmul_nbits_accuracy_level() is None
+
+
+@pytest.mark.parametrize("level", [-1, 5, True, False, 4.0, "4"])
+def test_matmul_nbits_accuracy_level_rejects_invalid_values_without_leaking(level):
+    with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=4):
+        with (
+            pytest.raises(ValueError, match="matmul_nbits_accuracy_level"),
+            build_context(_CUDA_CAPABILITIES, matmul_nbits_accuracy_level=level),
+        ):
+            pytest.fail("Invalid context should not be entered")
+        assert get_matmul_nbits_accuracy_level() == 4
+        assert ep_capabilities() is _CPU_CAPABILITIES
+    assert get_matmul_nbits_accuracy_level() is None
+
+
+def test_matmul_nbits_accuracy_level_thread_isolation():
+    barrier = threading.Barrier(2)
+
+    def build(level):
+        with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=level):
+            barrier.wait(timeout=5)
+            return get_matmul_nbits_accuracy_level()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(build, level) for level in (0, 4)]
+        assert [future.result(timeout=10) for future in futures] == [0, 4]
+    assert get_matmul_nbits_accuracy_level() is None
+
+
+def test_matmul_nbits_accuracy_level_async_isolation():
+    import asyncio
+
+    async def build(level):
+        with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=level):
+            await asyncio.sleep(0)
+            return get_matmul_nbits_accuracy_level()
+
+    async def run():
+        return await asyncio.gather(build(0), build(4))
+
+    assert asyncio.run(run()) == [0, 4]
+    assert get_matmul_nbits_accuracy_level() is None
 
 
 class TestBuildContextDefaults:
