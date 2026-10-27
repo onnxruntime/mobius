@@ -273,6 +273,7 @@ def benchmark(args):
     dtype = sessions["decoder"].session.get_outputs()[0].type
     element_type = {
         "tensor(float)": ir.DataType.FLOAT,
+        "tensor(float16)": ir.DataType.FLOAT16,
         "tensor(bfloat16)": ir.DataType.BFLOAT16,
     }[dtype]
 

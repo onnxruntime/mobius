@@ -122,16 +122,26 @@ weights and block-scaled FP8 experts. `--dequantize` is required: conversion
 streams parameters lazily into dense FP32 external data; `max_workers=1` bounds
 serialization to one parameter at a time. Native
 `bsgemm-moe` execution is **not** claimed. Plan for roughly 144 GB of dense FP32
-weights, plus the source checkpoint and runtime allocations. FP16 is rejected
-until its FP32 residual/mixed-output projection path is implemented. An opt-in
-BF16 dense-weight path uses `dtype="bf16", execution_provider="onnx-standard"`;
-its reduced upstream pipeline passes full-logit parity at `1e-2` and 20 exact
-cached greedy frames on CUDA. Full-checkpoint BF16 validation is pending.
+weights, plus the source checkpoint and runtime allocations. FP16 and BF16
+production exports remain **explicitly disabled**. Test-only qualification
+prototypes pass synthetic full-logit parity at `1e-2` and 20 exact cached greedy
+frames, but stricter pinned real-weight probes exposed remaining production-size
+rounding differences. Full-checkpoint reduced-precision validation is pending.
+The FP16 qualification
+prototype implements FP32 residual streams, native FP16-input/FP32-output
+`GemmFloat8` tower down projections, and logged FP32 saturation before backbone
+weight casts. Overflow and synthetic-source tests pass, but a pinned real-weight,
+production-dimension reduced fixture still exceeds the unchanged `1e-2` logit
+gate (FP16: 3 of 12288 prefill-tower values, maximum violating error `0.01171875`;
+BF16: 373 values, maximum violating error `0.0625`).
+That is a failed qualification, not permission to widen tolerances or advertise
+reduced-precision support. Checkpoint storage is never modified; other adapters retain their
+conversion behavior unless they explicitly opt into FP16 saturation.
 Recurrent state, nonlinear opmath and RoPE remain FP32. Masks are preserved
 when padding is present; redundant causal masks are omitted on unpadded
 reduced-precision attention to enable the source-compatible fused CUDA path.
-ORT 1.28's native BF16 `CausalConvWithState` fallback does not initialize on
-CUDA, so use the standard-ONNX export path for this dtype.
+ORT 1.28's native BF16 `CausalConvWithState` fallback also does not initialize
+on CUDA; qualification prototypes use standard-ONNX expansion for this dtype.
 
 | Graph | Inputs | Outputs |
 |---|---|---|
@@ -182,7 +192,11 @@ The FP32 CUDA route uses packed expert banks and `com.microsoft::MoE`, executing
 selected experts rather than evaluating all 256 experts per layer. Its raw-logit
 routing and physical expert-byte layout match ORT's floating MoE ABI. It still
 stores dense FP32 weights: this is **not native FP8**, and it does not remove the
-large model-memory requirement. The portable/default export remains available.
+large model-memory requirement. Other floating routes gather and evaluate only
+selected token/expert pairs, preserving their activation and routing rounding
+boundaries. Prefill is processed in bounded 16-token chunks; short prompts and
+single-token decode bypass padding/Scan. This avoids evaluating inactive experts
+whose FP16 overflows could otherwise poison output through `Inf * 0`.
 
 `audio_generator` accepts the original tower inputs plus scalar BOOL `generate`
 and `do_sample`, and per-row `temperature`, `top_k`, `top_p`, `seed`, `counter`
@@ -201,8 +215,11 @@ Outputs include `frame_codes` INT64 `[B,1,10]`, `valid` BOOL `[B]`,
 Nonfinite active sampling/neural inputs or multi-frame generation produce
 `valid=false`, `frame_codes=-1`, and an unchanged counter. Do not commit cache
 outputs on an invalid result. Greedy generation and prefill do not advance RNG
-state. The BF16 standard-ONNX route also supports this one-pass task, but remains
-experimentally qualified as described above.
+state. The test-only reduced-precision prototypes exercise this one-pass task
+and selected-only expert execution, without opening production admission or
+claiming the FP32 CUDA route's fused-expert kernel. Source-correct FP32 RoPE/mask dispatch can retain standard
+Attention rather than a GQA rewrite. No reduced-precision throughput claim is
+made without measurement.
 
 Sampling math is exported in `policies/main_sampler.onnx` and
 `policies/codebook_sampler.onnx` and restored in `pkg.policy_components` on load.

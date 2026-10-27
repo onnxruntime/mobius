@@ -42,8 +42,8 @@ class TestActivations:
         output = Float32SiLU()(builder.op, x)
         output.type, output.shape = x.type, x.shape
         builder.add_output(output, "output")
-        swish = next(node for node in graph if node.op_type == "Swish")
-        assert swish.inputs[0].producer().attributes["to"].as_int() == ir.DataType.FLOAT
+        division = next(node for node in graph if node.op_type == "Div")
+        assert division.inputs[0].producer().attributes["to"].as_int() == ir.DataType.FLOAT
         values = np.array([-1000, -8, -3, -0.75, -0.1, 0, 0.1, 0.75, 3, 8], np.float32)
         inputs = values.astype(array_dtype)
         reference = torch.nn.functional.silu(torch.tensor(values).to(torch_dtype))

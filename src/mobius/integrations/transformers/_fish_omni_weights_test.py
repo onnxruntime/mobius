@@ -11,7 +11,7 @@ import onnx_ir as ir
 import pytest
 import torch
 from _test_configs import FISH_OMNI_CONFIG
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from mobius import build_from_module
 from mobius.__main__ import main
@@ -30,12 +30,29 @@ from mobius.models.fish_omni_test import tiny_config
 
 def _checkpoint(package):
     torch.manual_seed(19)
-    return {
-        _source_name(name): torch.randn(tuple(value.shape), dtype=torch.float32) * 0.02
-        for model in package.values()
-        for name, value in model.graph.initializers.items()
-        if value.const_value is None
-    }
+    weights = {}
+    for model in package.values():
+        for name, value in model.graph.initializers.items():
+            if value.const_value is not None:
+                continue
+            tensor = torch.randn(tuple(value.shape), dtype=torch.float32) * 0.02
+            source = _source_name(name)
+            if ".packed_experts." in name:
+                prefix, projection = source.rsplit(".experts.", 1)
+                for expert, matrix in enumerate(tensor):
+                    if projection == "gate_up_proj.weight":
+                        gate, up = matrix.chunk(2, dim=0)
+                        weights[f"{prefix}.experts.{expert}.gate_proj.weight"] = (
+                            gate.contiguous()
+                        )
+                        weights[f"{prefix}.experts.{expert}.up_proj.weight"] = up.contiguous()
+                    else:
+                        weights[f"{prefix}.experts.{expert}.{projection}"] = (
+                            matrix.contiguous()
+                        )
+            else:
+                weights[source] = tensor
+    return weights
 
 
 def test_fish_omni_streams_all_components(tmp_path):
@@ -47,7 +64,25 @@ def test_fish_omni_streams_all_components(tmp_path):
     for model in package.values():
         for name, value in model.graph.initializers.items():
             assert value.const_value is not None, name
-            if name.startswith(
+            if ".packed_experts." in name:
+                prefix, projection = _source_name(name).rsplit(".experts.", 1)
+                projections = (
+                    ("gate_proj.weight", "up_proj.weight")
+                    if projection == "gate_up_proj.weight"
+                    else (projection,)
+                )
+                expected = torch.stack(
+                    [
+                        torch.cat(
+                            [weights[f"{prefix}.experts.{i}.{part}"] for part in projections]
+                        )
+                        for i in range(value.shape[0])
+                    ]
+                )
+                torch.testing.assert_close(
+                    torch.from_numpy(value.const_value.numpy()), expected
+                )
+            elif name.startswith(
                 (
                     "embedding.",
                     "decoder.model.layers.",
@@ -231,3 +266,66 @@ def test_fish_omni_cli_persists_three_weighted_models(tmp_path, task, ep):
         )
     report = json.loads((output / "weight-loading-report.json").read_text())
     assert report["native_fp8"] is False
+
+
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16, torch.float8_e4m3fn])
+def test_fp16_source_saturation_is_finite_logged_and_does_not_modify_checkpoint(
+    tmp_path, caplog, source_dtype
+):
+    fp8 = source_dtype == torch.float8_e4m3fn
+    config = dataclasses.replace(tiny_config(), dtype=ir.DataType.FLOAT16, fp8_experts=fp8)
+    name = "decoder.model.layers.0.mlp.experts.0.gate_proj.weight"
+    source = _source_name(name)
+    value = ir.Value(
+        name=name, shape=ir.Shape([128, 128]), type=ir.TensorType(ir.DataType.FLOAT16)
+    )
+    package = ModelPackage(
+        {"decoder": ir.Model(ir.Graph([], [], nodes=[], initializers=[value]), ir_version=12)},
+        config=config,
+    )
+    if fp8:
+        weights = torch.linspace(-1, 1, 128 * 128).reshape(128, 128).to(source_dtype)
+        scale = torch.tensor([[100000.0]], dtype=torch.float32)
+        checkpoint = {
+            source: weights,
+            source.removesuffix(".weight") + ".weight_scale_inv": scale,
+        }
+        reconstructed = weights.float() * scale
+    else:
+        weights = torch.linspace(-100000, 100000, 128 * 128).reshape(128, 128).to(source_dtype)
+        weights[0, 0] = 65536
+        checkpoint = {source: weights}
+        reconstructed = weights.float()
+    path = tmp_path / "model.safetensors"
+    save_file(checkpoint, path)
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    actual = torch.from_numpy(value.const_value.numpy())
+    torch.testing.assert_close(
+        actual, reconstructed.clamp(-65504, 65504).half(), rtol=0, atol=0
+    )
+    assert torch.isfinite(actual).all()
+    assert "Clamping" in caplog.text
+    restored = load_file(path)[source]
+    assert torch.equal(restored.view(torch.uint8), weights.view(torch.uint8))
+    expected_bound = weights.numel() * (weights.element_size() + 8 + 2)
+    assert (
+        package.weight_loading_report["largest_reconstruction_working_set_bytes"]
+        >= expected_bound
+    )
+
+
+def test_fp16_saturation_rejects_nonfinite_source_weights(tmp_path):
+    config = dataclasses.replace(tiny_config(), dtype=ir.DataType.FLOAT16)
+    name = "decoder.lm_head.weight"
+    source = _source_name(name)
+    value = ir.Value(
+        name=name, shape=ir.Shape([1, 2]), type=ir.TensorType(ir.DataType.FLOAT16)
+    )
+    package = ModelPackage(
+        {"decoder": ir.Model(ir.Graph([], [], nodes=[], initializers=[value]), ir_version=12)},
+        config=config,
+    )
+    save_file({source: torch.tensor([[float("nan"), 1.0]])}, tmp_path / "model.safetensors")
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    with pytest.raises(ValueError, match="Nonfinite streaming weight"):
+        value.const_value.numpy()

@@ -36,6 +36,7 @@ from mobius.integrations.transformers._fish_omni_weights import (
     stream_fish_omni_safetensors_to_package,
 )
 from mobius.models import FishOmniModel
+from mobius.models.fish_omni_test import reduced_precision_prototype_task
 from mobius.tasks.fish_codec import build_fish_codec_decoder
 
 
@@ -78,7 +79,9 @@ def test_zero_copy_contiguous_views_bind_the_correct_bytes(tmp_path):
 
 @pytest.mark.parametrize("task", ["fish-omni", "fish-omni-generation"])
 @pytest.mark.parametrize("sample", [False, True])
-@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.BFLOAT16])
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
 @pytest.mark.parametrize(
     "device",
     [
@@ -96,8 +99,8 @@ def test_zero_copy_contiguous_views_bind_the_correct_bytes(tmp_path):
 def test_benchmark_runs_actual_cached_graphs_without_claiming_full_model_perf(
     tmp_path, task, sample, device, dtype
 ):
-    if dtype == ir.DataType.BFLOAT16 and device == "cpu":
-        pytest.skip("Stock ORT CPU has no BF16 Attention kernel")
+    if dtype != ir.DataType.FLOAT and device == "cpu":
+        pytest.skip("Reduced-precision benchmark routes require CUDA")
     config = FishOmniConfig.from_transformers(
         _dict_to_pretrained_config(copy.deepcopy(FISH_OMNI_CONFIG))
     )
@@ -105,16 +108,36 @@ def test_benchmark_runs_actual_cached_graphs_without_claiming_full_model_perf(
     package = build_from_module(
         FishOmniModel(config),
         config,
-        task=task,
-        execution_provider="onnx-standard" if dtype == ir.DataType.BFLOAT16 else "default",
+        task=reduced_precision_prototype_task(task) if dtype != ir.DataType.FLOAT else task,
+        execution_provider={
+            ir.DataType.FLOAT: "default",
+            ir.DataType.FLOAT16: "cuda",
+            ir.DataType.BFLOAT16: "onnx-standard",
+        }[dtype],
     )
     torch.manual_seed(42)
-    weights = {
-        _source_name(name): torch.randn(tuple(value.shape)) * 0.1
-        for model in package.values()
-        for name, value in model.graph.initializers.items()
-        if value.const_value is None
-    }
+    weights = {}
+    for model in package.values():
+        for name, value in model.graph.initializers.items():
+            if value.const_value is not None:
+                continue
+            tensor = torch.randn(tuple(value.shape)) * 0.1
+            source = _source_name(name)
+            if ".packed_experts." in name:
+                prefix, projection = source.rsplit(".experts.", 1)
+                for expert, matrix in enumerate(tensor):
+                    if projection == "gate_up_proj.weight":
+                        gate, up = matrix.chunk(2, dim=0)
+                        weights[f"{prefix}.experts.{expert}.gate_proj.weight"] = (
+                            gate.contiguous()
+                        )
+                        weights[f"{prefix}.experts.{expert}.up_proj.weight"] = up.contiguous()
+                    else:
+                        weights[f"{prefix}.experts.{expert}.{projection}"] = (
+                            matrix.contiguous()
+                        )
+            else:
+                weights[source] = tensor
     # Keep the request alive: for either sign of hidden[0], a semantic row wins.
     weights["lm_head.weight"].zero_()
     weights["lm_head.weight"][config.semantic_start_token_id, 0] = 100
