@@ -6,6 +6,7 @@ Detailed design notes and proposals for `mobius` subsystems.
 :maxdepth: 1
 
 ../design
+mobius-2.0-architecture
 config-redesign
 deepseek-v4-flash-export
 qwen4-exp-text-core
