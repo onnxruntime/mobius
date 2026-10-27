@@ -294,6 +294,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "molmo": "VL model — requires image inputs",
     "phi4_multimodal": "VL model (14B) — needs GPU for golden",
     "phi4mm": "VL model (14B) — needs GPU for golden",
+    "qwen2_5_omni": "Six-stage audio, vision, Thinker, and Talker pipeline — L1 graph "
+    "and L3 Thinker parity are covered; the generic L4/L5 runner cannot orchestrate "
+    "multimodal inputs and codec-token generation",
     "qwen2_5_vl": "VL model — requires image inputs",
     "qwen2_vl": "VL model — requires image inputs",
     "qwen3_5": "VL model — hybrid VL, requires image inputs",
