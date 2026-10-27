@@ -52,11 +52,17 @@ from mobius.models.qwen35 import (
 def _float32_rope(config: ArchitectureConfig) -> nn.Module:
     rope = initialize_rope(dataclasses.replace(config, dtype=ir.DataType.FLOAT))
     assert rope is not None
+    for parameter in rope.parameters():
+        parameter._keep_float32 = True  # type: ignore[attr-defined]
     return rope
 
 
 def _sigmoid_float32(op, value):
-    return op.CastLike(op.Sigmoid(op.Cast(value, to=ir.DataType.FLOAT)), value)
+    # Avoid runtime sigmoid approximations losing small negative-tail values
+    # before the source's single FP16/BF16 rounding boundary.
+    value_f32 = op.Cast(value, to=ir.DataType.FLOAT)
+    sigmoid = op.Div(1.0, op.Add(1.0, op.Exp(op.Neg(value_f32))))
+    return op.CastLike(sigmoid, value)
 
 
 def _apply_fish_attention(
@@ -578,16 +584,33 @@ class _TowerAttention(nn.Module):
         return self.wo(op, op.Mul(attended, _sigmoid_float32(op, gate))), (pk, pv)
 
 
-class _FP32OutputLinear(Linear):
-    """Native FP16-input GEMM with FP32 output, without promoting the weight bank."""
+class _OutputMajorLinear(Linear):
+    """Keep the source's physical [out, in] weight layout in a 2-D GEMM."""
 
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
         self.in_features, self.out_features = in_features, out_features
 
     def forward(self, op, hidden):
+        projected = self._project(op, op.Reshape(hidden, [-1, self.in_features]))
+        projected.shape = ir.Shape([None, self.out_features])
+        shape = op.Concat(
+            op.Shape(hidden, end=-1), op.Constant(value_ints=[self.out_features]), axis=0
+        )
+        return op.Reshape(projected, shape)
+
+    def _project(self, op, hidden):
+        # A folded Transpose + MatMul changes CUDA's accumulation order;
+        # a single BF16 rounding difference can amplify in the next tower layer.
+        return op.Gemm(hidden, self.weight, transB=1)
+
+
+class _FP32OutputLinear(_OutputMajorLinear):
+    """Native FP16-input GEMM with FP32 output, without promoting the weight bank."""
+
+    def _project(self, op, hidden):
         projected = op.GemmFloat8(
-            op.Reshape(hidden, [-1, self.in_features]),
+            hidden,
             self.weight,
             transA=0,
             transB=1,
@@ -597,11 +620,7 @@ class _FP32OutputLinear(Linear):
             _domain="com.microsoft",
         )
         projected.type = ir.TensorType(ir.DataType.FLOAT)
-        projected.shape = ir.Shape([None, self.out_features])
-        shape = op.Concat(
-            op.Shape(hidden, end=-1), op.Constant(value_ints=[self.out_features]), axis=0
-        )
-        return op.Reshape(projected, shape)
+        return projected
 
 
 class _TowerMLP(nn.Module):
@@ -609,11 +628,12 @@ class _TowerMLP(nn.Module):
         super().__init__()
         self.w1 = Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.w3 = Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.w2 = (
-            _FP32OutputLinear(config.intermediate_size, config.hidden_size)
-            if config.dtype == ir.DataType.FLOAT16
-            else Linear(config.intermediate_size, config.hidden_size, bias=False)
-        )
+        if config.dtype == ir.DataType.FLOAT16:
+            self.w2 = _FP32OutputLinear(config.intermediate_size, config.hidden_size)
+        elif config.dtype == ir.DataType.BFLOAT16:
+            self.w2 = _OutputMajorLinear(config.intermediate_size, config.hidden_size)
+        else:
+            self.w2 = Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = Float32SiLU()
 
     def forward(self, op, hidden):

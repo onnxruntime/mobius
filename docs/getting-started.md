@@ -130,10 +130,19 @@ rounding differences. Full-checkpoint reduced-precision validation is pending.
 The FP16 qualification
 prototype implements FP32 residual streams, native FP16-input/FP32-output
 `GemmFloat8` tower down projections, and logged FP32 saturation before backbone
-weight casts. Overflow and synthetic-source tests pass, but a pinned real-weight,
-production-dimension reduced fixture still exceeds the unchanged `1e-2` logit
-gate (FP16: 3 of 12288 prefill-tower values, maximum violating error `0.01171875`;
+weight casts. Overflow and synthetic-source tests pass, but the initial pinned
+real-weight, production-dimension reduced fixture exceeded the unchanged `1e-2`
+logit gate (FP16: 3 of 12288 prefill-tower values, maximum violating error `0.01171875`;
 BF16: 373 values, maximum violating error `0.0625`).
+Subsequent source-fed probes identified negative-tail sigmoid rounding and
+down-projection accumulation order. Explicit FP32 exponential/division sigmoid
+and output-major BF16 `Gemm` restore bit-exact reduced-fixture BF16 prefill
+and the first two cached calls, but the third cached call still fails
+(62 of 4096 values, maximum violating error `0.03125`). Its first divergence
+is a one-ULP FP32 RMS variance reduction difference before BF16 rounding.
+These are diagnostic improvements, not completed reduced-precision qualification.
+The updated FP16 fixture still fails prefill (7 of 12288 values, maximum
+violating error `0.0166015625`).
 That is a failed qualification, not permission to widen tolerances or advertise
 reduced-precision support. Checkpoint storage is never modified; other adapters retain their
 conversion behavior unless they explicitly opt into FP16 saturation.

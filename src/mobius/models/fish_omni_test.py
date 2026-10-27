@@ -27,7 +27,13 @@ from mobius.integrations.transformers._config_resolver import (
     _dict_to_pretrained_config,
 )
 from mobius.models import FishOmniModel
-from mobius.models.fish_omni import _apply_fish_attention, _FishMoEBlock, _FP32OutputLinear
+from mobius.models.fish_omni import (
+    _apply_fish_attention,
+    _FishMoEBlock,
+    _FP32OutputLinear,
+    _OutputMajorLinear,
+    _sigmoid_float32,
+)
 from mobius.tasks import FishOmniGenerationTask, FishOmniTask, ModelTask
 from mobius.tasks._base import _make_graph, _make_model
 
@@ -68,6 +74,62 @@ def reduced_precision_prototype_task(task):
     return _GenerationProbe() if task == "fish-omni-generation" else _TeacherProbe()
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "dtype,torch_dtype,numpy_dtype",
+    [
+        (ir.DataType.FLOAT16, torch.float16, np.float16),
+        (ir.DataType.BFLOAT16, torch.bfloat16, ml_dtypes.bfloat16),
+    ],
+)
+def test_fish_sigmoid_preserves_native_negative_tail_rounding(
+    device, dtype, torch_dtype, numpy_dtype
+):
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA sigmoid parity requires Torch and ORT CUDA")
+    values = np.array(
+        [
+            -1000.0,
+            -20.0,
+            -15.4453125,
+            -12.828125,
+            -12.46875,
+            -9.5234375,
+            -9.1328125,
+            -8.859375,
+            -8.3984375,
+            -8.3671875,
+            -7.6015625,
+            -7.08984375,
+            -5.54296875,
+            -3.875,
+            -2.443359375,
+            0.0,
+            20.0,
+            1000.0,
+        ],
+        dtype=numpy_dtype,
+    )
+    graph = ir.Graph([], [], nodes=[], opset_imports={"": 24})
+    builder = GraphBuilder(graph)
+    x = builder.input("x", dtype, [len(values)])
+    y = _sigmoid_float32(builder.op, x)
+    y.type, y.shape = ir.TensorType(dtype), ir.Shape([len(values)])
+    builder.add_output(y, "y")
+    assert not any(node.op_type == "Sigmoid" for node in graph)
+    reference = torch.tensor(values.astype(np.float32), device=device, dtype=torch_dtype)
+    expected = reference.sigmoid().float().cpu().numpy()
+    session = OnnxModelSession(ir.Model(graph, ir_version=12), device=device)
+    try:
+        actual = session.run({"x": values})["y"].astype(np.float32)
+    finally:
+        session.close()
+    np.testing.assert_array_equal(actual, expected)
+
+
 @pytest.mark.parametrize(
     "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
 )
@@ -99,6 +161,7 @@ def test_fish_omni_build(dtype):
     tower = package["audio_decoder"]
     if dtype == ir.DataType.BFLOAT16:
         assert sum(node.op_type == "If" for node in tower.graph) == 3
+        assert sum(node.op_type == "Gemm" for node in tower.graph) == 3
     assert tuple(tower.graph.outputs[0].shape)[-2:] == (2, 16)
     assert sum(v.name.startswith("past_key_values.") for v in tower.graph.inputs) == 6
     assert any("q_norm.weight" in key for key in tower.graph.initializers)
@@ -359,6 +422,50 @@ def test_fish_attention_preserves_padding_and_cache(padded):
             np.testing.assert_array_equal(result["output"], changed["output"])
     finally:
         session.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "CUDAExecutionProvider" not in ort.get_available_providers(),
+    reason="Native BF16 projection layout parity requires CUDA",
+)
+def test_bf16_down_projection_preserves_native_output_major_accumulation():
+    class ProjectionTask(ModelTask):
+        def build(self, module, config):
+            graph, builder = _make_graph("projection")
+            x = builder.input("x", config.dtype, [1, 3, 6144])
+            output = module(builder.op, x)
+            output.type = ir.TensorType(config.dtype)
+            output.shape = ir.Shape([1, 3, 2048])
+            builder.add_output(output, "output")
+            return ModelPackage({"projection": _make_model(graph)})
+
+    config = dataclasses.replace(tiny_config(), dtype=ir.DataType.BFLOAT16)
+    graph = build_from_module(
+        _OutputMajorLinear(6144, 2048),
+        config,
+        task=ProjectionTask(),
+        execution_provider="onnx-standard",
+    )["projection"]
+    gemm = next(node for node in graph.graph if node.op_type == "Gemm")
+    assert gemm.attributes["transB"].as_int() == 1
+    assert not any(node.op_type == "Transpose" for node in graph.graph)
+    rng = torch.Generator(device="cuda").manual_seed(74)
+    weight = torch.randn(2048, 6144, dtype=torch.bfloat16, device="cuda", generator=rng)
+    x = torch.randn(3, 6144, dtype=torch.bfloat16, device="cuda", generator=rng)
+    expected = torch.nn.functional.linear(x, weight).float().cpu().numpy()[None]
+    parameter = next(
+        value for value in graph.graph.initializers.values() if value.const_value is None
+    )
+    parameter.const_value = ir.tensor(weight.float().cpu().numpy().astype(ml_dtypes.bfloat16))
+    session = OnnxModelSession(graph, device="cuda")
+    try:
+        actual = session.run({"x": x.float().cpu().numpy().astype(ml_dtypes.bfloat16)[None]})[
+            "output"
+        ].astype(np.float32)
+    finally:
+        session.close()
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.skipif(
