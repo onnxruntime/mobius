@@ -35,6 +35,7 @@ EMBEDDING_DEVICE = 0
 AUDIO_DEVICE = 1
 DECODER_DEVICE = 2
 DTYPE = "f32"
+DTYPE_NAMES = {"f32": "float32", "f16": "float16", "bf16": "bfloat16"}
 GOLDEN = (
     pathlib.Path(__file__).resolve().parents[1]
     / "testdata"
@@ -63,7 +64,11 @@ def empty_cache_ports(ports):
             shape[2] = 0
         assert all(isinstance(dim, int) for dim in shape), (port.name, shape)
         type_name = getattr(port, "type", "tensor(float)")
-        dtypes = {"tensor(float)": np.float32, "tensor(bfloat16)": ml_dtypes.bfloat16}
+        dtypes = {
+            "tensor(float)": np.float32,
+            "tensor(float16)": np.float16,
+            "tensor(bfloat16)": ml_dtypes.bfloat16,
+        }
         if type_name not in dtypes:
             raise ValueError(f"Unsupported cache dtype {type_name}: {port.name}")
         caches[port.name] = np.zeros(shape, dtype=dtypes[type_name])
@@ -150,7 +155,7 @@ def export(checkpoint):
         revision=REVISION,
         dtype=DTYPE,
         keep_quantized=False,
-        execution_provider="onnx-standard" if DTYPE == "bf16" else "default",
+        execution_provider={"f32": "default", "f16": "cuda", "bf16": "onnx-standard"}[DTYPE],
     )
     event("graph_and_bindings_ready", seconds=time.monotonic() - start)
     package.save(str(ROOT / "onnx"), max_workers=1)
@@ -194,7 +199,7 @@ def reference(checkpoint):
         checkpoint,
         devices=[f"cuda:{device}" for device in REFERENCE_DEVICES],
         tower_device=f"cuda:{REFERENCE_TOWER_DEVICE}",
-        dtype=torch.bfloat16 if DTYPE == "bf16" else torch.float32,
+        dtype={"f32": torch.float32, "f16": torch.float16, "bf16": torch.bfloat16}[DTYPE],
     )
     event("reference_loaded", seconds=time.monotonic() - start)
     backbone, tower = model.backbone, model.audio_decoder
@@ -284,7 +289,7 @@ def reference(checkpoint):
         "model_id": "fishaudio/drama-3",
         "revision": REVISION,
         "source_revision": SOURCE_REVISION,
-        "dtype": "bfloat16" if DTYPE == "bf16" else "float32",
+        "dtype": DTYPE_NAMES[DTYPE],
         "prompt": PROMPT,
         "prompt_rows": len(prompt),
         "prefill_shape": list(logits.shape),
@@ -312,7 +317,7 @@ def validate_reference_golden(golden):
     import numpy as np
 
     committed = json.loads(GOLDEN.read_text())
-    assert golden["dtype"] == ("bfloat16" if DTYPE == "bf16" else "float32"), "dtype"
+    assert golden["dtype"] == DTYPE_NAMES[DTYPE], "dtype"
     for field in (
         "model_id",
         "revision",
@@ -333,8 +338,8 @@ def validate_reference_golden(golden):
     np.testing.assert_allclose(
         golden["prefill_last_top10_logits"],
         committed["prefill_last_top10_logits"],
-        atol=1e-2 if DTYPE == "bf16" else 1e-4,
-        rtol=1e-2 if DTYPE == "bf16" else 1e-4,
+        atol=1e-2 if DTYPE != "f32" else 1e-4,
+        rtol=1e-2 if DTYPE != "f32" else 1e-4,
     )
 
 
@@ -401,7 +406,11 @@ def compare():
     def run(name, feeds):
         return run_session(sessions[name], feeds)
 
-    expected_type = "tensor(bfloat16)" if DTYPE == "bf16" else "tensor(float)"
+    expected_type = {
+        "f32": "tensor(float)",
+        "f16": "tensor(float16)",
+        "bf16": "tensor(bfloat16)",
+    }[DTYPE]
     assert sessions["decoder"].get_outputs()[0].type == expected_type
 
     def empty_cache(name):
@@ -428,7 +437,7 @@ def compare():
             "mean_abs_diff": float(difference.mean()) if difference.size else 0.0,
         }
         event("comparison", name=name, **metrics[name])
-        tolerance = 1e-2 if DTYPE == "bf16" else 1e-3
+        tolerance = 1e-2 if DTYPE != "f32" else 1e-3
         np.testing.assert_allclose(
             actual, expected, atol=tolerance, rtol=tolerance, err_msg=name
         )
@@ -552,12 +561,12 @@ def compare():
         "status": "passed",
         "revision": REVISION,
         "source_revision": SOURCE_REVISION,
-        "dtype": "bfloat16" if DTYPE == "bf16" else "float32",
+        "dtype": DTYPE_NAMES[DTYPE],
         "onnxruntime_version": ort.__version__,
         "provider": "CUDAExecutionProvider",
         "ort_graph_optimization": "ORT_ENABLE_BASIC",
-        "atol": 1e-2 if DTYPE == "bf16" else 1e-3,
-        "rtol": 1e-2 if DTYPE == "bf16" else 1e-3,
+        "atol": 1e-2 if DTYPE != "f32" else 1e-3,
+        "rtol": 1e-2 if DTYPE != "f32" else 1e-3,
         "prompt_rows": golden["prompt_rows"],
         "generated_frames": len(generated),
         "attempted_frames": golden["attempted_frames"],
@@ -576,7 +585,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", choices=("download", "export", "reference", "compare"))
     parser.add_argument("--work-dir", required=True, type=pathlib.Path)
-    parser.add_argument("--dtype", choices=("f32", "bf16"), default="f32")
+    parser.add_argument("--dtype", choices=("f32", "f16", "bf16"), default="f32")
     parser.add_argument("--golden", type=pathlib.Path)
     parser.add_argument("--reference-devices", default="0,1,2,3")
     parser.add_argument("--reference-tower-device", default=4, type=int)
@@ -594,12 +603,12 @@ if __name__ == "__main__":
     DTYPE = args.dtype
     if args.golden is not None:
         GOLDEN = args.golden.resolve()
-    elif DTYPE == "bf16":
-        GOLDEN = GOLDEN.with_name("drama-3_bf16_tokens_generation.json")
+    elif DTYPE != "f32":
+        GOLDEN = GOLDEN.with_name(f"drama-3_{DTYPE}_tokens_generation.json")
         if args.stage == "compare" and not GOLDEN.is_file():
             parser.error(
-                "BF16 comparison requires --golden pointing to the independent "
-                "reference stage's golden.json until a BF16 golden is committed"
+                "Reduced-precision comparison requires --golden pointing to the independent "
+                "reference stage's golden.json until a matching golden is committed"
             )
     if args.stage == "download":
         download()

@@ -33,6 +33,7 @@ from mobius.integrations.transformers._fish_omni_weights import (
     stream_fish_omni_safetensors_to_package,
 )
 from mobius.models import FishOmniModel
+from mobius.models.fish_omni_test import reduced_precision_prototype_task
 
 pytestmark = pytest.mark.integration
 _PREFIX = "fish_speech.models.text2semantic.fish_omni"
@@ -110,7 +111,11 @@ def _empty_cache(model):
         if value.name.endswith((".key", ".value")):
             shape[2] = 0
         assert all(isinstance(dim, int) for dim in shape), (value.name, shape)
-        dtype = ml_dtypes.bfloat16 if value.dtype == ir.DataType.BFLOAT16 else np.float32
+        dtype = {
+            ir.DataType.FLOAT: np.float32,
+            ir.DataType.FLOAT16: np.float16,
+            ir.DataType.BFLOAT16: ml_dtypes.bfloat16,
+        }[value.dtype]
         result[value.name] = np.zeros(shape, dtype=dtype)
     return result
 
@@ -147,17 +152,39 @@ def _next_cache(outputs):
                 reason="Fused sparse experts require CUDA",
             ),
         ),
+        pytest.param(
+            ir.DataType.FLOAT16,
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available()
+                or "CUDAExecutionProvider" not in ort.get_available_providers(),
+                reason="FP16 mixed-output projection requires CUDA",
+            ),
+        ),
     ],
 )
 def test_fish_omni_pipeline_prefill_and_cached_decode(
-    upstream, tmp_path, monkeypatch, backbone_codebooks, dtype, execution_provider, task
+    upstream,
+    tmp_path,
+    monkeypatch,
+    backbone_codebooks,
+    dtype,
+    execution_provider,
+    task,
+    prefill_length=4,
 ):
     raw = copy.deepcopy(FISH_OMNI_CONFIG)
+    if prefill_length > 4:
+        raw["text_config"]["max_position_embeddings"] = 64
     raw["audio_decoder_config"]["vq_backbone_codebooks"] = backbone_codebooks
     reference_config = upstream["config"].FishOmniConfig.from_dict(raw)
     torch.manual_seed(42)
     tolerance = 1e-4 if dtype == ir.DataType.FLOAT else 1e-2
-    torch_dtype = torch.float32 if dtype == ir.DataType.FLOAT else torch.bfloat16
+    torch_dtype = {
+        ir.DataType.FLOAT: torch.float32,
+        ir.DataType.FLOAT16: torch.float16,
+        ir.DataType.BFLOAT16: torch.bfloat16,
+    }[dtype]
     device = "cuda:0" if dtype != ir.DataType.FLOAT or execution_provider == "cuda" else "cpu"
     backbone = upstream["backbone"].FishOmniBackbone(
         reference_config.text, dtype=torch_dtype, device=device
@@ -175,7 +202,7 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
     package = build_from_module(
         FishOmniModel(config),
         config,
-        task=task,
+        task=reduced_precision_prototype_task(task) if dtype != ir.DataType.FLOAT else task,
         execution_provider=execution_provider,
     )
     save_file(_checkpoint(backbone, tower), tmp_path / "model.safetensors")
@@ -210,8 +237,9 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
         if fast
         else {}
     )
-    backbone.setup_caches(1, 32)
-    tower.setup_caches(32)
+    capacity = 64 if prefill_length > 4 else 32
+    backbone.setup_caches(1, capacity)
+    tower.setup_caches(capacity)
     caches = {name: _empty_cache(model) for name, model in package.items()}
     frames = torch.tensor(
         [[1, 0, 0, 0], [16, 0, 4, 7], [30, 14, 3, 5], [3, 0, 0, 0]], device=device
@@ -219,6 +247,9 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
     next_frames = torch.tensor(
         [[16, 0, 2, 8], [20, 4, 3, 1], [2, 0, 0, 0], [18, 2, 6, 9]], device=device
     )
+    if prefill_length != 4:
+        indices = torch.arange(prefill_length, device=device) % 4
+        frames, next_frames = frames[indices], next_frames[indices]
     start = 0
     sampled_logits = []
 
@@ -235,7 +266,7 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
         # Multi-token prompt followed by 20 reused-state steps exercises both
         # DeltaNet state and all shared/residual tower caches across time.
         with torch.no_grad():
-            for length in [4] + [1] * 20:
+            for length in [prefill_length] + [1] * 20:
                 positions = torch.arange(start, start + length, device=device)
                 positions_np = positions.cpu().numpy()[None]
                 if start:
@@ -373,7 +404,7 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                 caches["decoder"] = _next_cache(outputs)
                 caches[audio_name] = _next_cache(tower_output)
                 start += length
-        if execution_provider == "cuda":
+        if execution_provider == "cuda" and dtype == ir.DataType.FLOAT:
             profile = json.loads(
                 Path(sessions["decoder"]._session.end_profiling()).read_text()
             )
@@ -509,3 +540,121 @@ def test_sampled_tower_matches_sequential_replays_and_rejects_multiframe_generat
         sampler.close()
         for session in sessions.values():
             session.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "CUDAExecutionProvider" not in ort.get_available_providers(),
+    reason="Native mixed-output tower requires CUDA",
+)
+def test_fp16_tower_matches_source_when_down_projections_exceed_half_range(upstream, tmp_path):
+    raw = copy.deepcopy(FISH_OMNI_CONFIG)
+    native_config = upstream["config"].FishOmniConfig.from_dict(raw)
+    backbone = upstream["backbone"].FishOmniBackbone(
+        native_config.text, dtype=torch.float16, device="cuda:0"
+    )
+    tower = upstream["tower"].FishOmniAudioDecoder(
+        native_config, dtype=torch.float16, device="cuda:0"
+    )
+    with torch.no_grad():
+        for module in (backbone, tower):
+            for parameter in module.parameters():
+                parameter.zero_()
+        for layer in [*tower.shared_layers, *tower.residual_layers]:
+            table = layer.semantic_embedding if layer.shared else layer.codebook_embedding
+            table.weight.fill_(1)
+            layer.eh_proj.weight[:, : native_config.audio_decoder.dim].fill_(
+                1 / native_config.audio_decoder.dim
+            )
+            mlp = layer.transformer_layer.feed_forward
+            mlp.w1.weight.fill_(1 / native_config.audio_decoder.dim)
+            mlp.w3.weight.fill_(1 / native_config.audio_decoder.dim)
+            mlp.w2.weight.fill_(10000)
+        for head in tower.codebook_heads:
+            head.weight.fill_(0.01)
+    config = dataclasses.replace(
+        FishOmniConfig.from_transformers(_dict_to_pretrained_config(raw)),
+        dtype=ir.DataType.FLOAT16,
+    )
+    package = build_from_module(
+        FishOmniModel(config),
+        config,
+        task=reduced_precision_prototype_task("fish-omni"),
+        execution_provider="cuda",
+    )
+    save_file(_checkpoint(backbone, tower), tmp_path / "model.safetensors")
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    graph = package["audio_decoder"]
+    tower.setup_caches(8)
+    hidden = torch.ones((1, config.hidden_size), dtype=torch.float16, device="cuda")
+    codes = torch.tensor([[3, 4, 5]], dtype=torch.int64, device="cuda")
+    frames = torch.cat(
+        (torch.tensor([[config.semantic_start_token_id + 3]], device="cuda"), codes), dim=-1
+    )
+    positions = torch.zeros(1, dtype=torch.int64, device="cuda")
+    semantic = torch.ones(1, dtype=torch.bool, device="cuda")
+    projected = []
+    handles = [
+        layer.transformer_layer.feed_forward.w2.register_forward_hook(
+            lambda _module, _inputs, output: projected.append(output.detach())
+        )
+        for layer in [*tower.shared_layers, *tower.residual_layers]
+    ]
+    with torch.no_grad():
+        h = tower.run_shared(hidden, codes[:, 0], semantic, positions, frames)
+        expected = []
+        for index, (layer, head) in enumerate(
+            zip(tower.residual_layers, tower.codebook_heads)
+        ):
+            h = layer(h, codes[:, index], semantic, positions)
+            expected.append(head(h).float().cpu().numpy())
+    for handle in handles:
+        handle.remove()
+    assert projected
+    assert all(
+        value.dtype == torch.float32 and value.max().item() > 65504 for value in projected
+    )
+    session = OnnxModelSession(graph, device="cuda")
+    try:
+        actual = session.run(
+            {
+                **_empty_cache(graph),
+                "hidden_states": np.ones((1, 1, config.hidden_size), np.float16),
+                "codes": codes.cpu().numpy()[None],
+                "semantic_mask": np.ones((1, 1), bool),
+                "shared_input": np.zeros((1, 1, config.hidden_size), np.float16),
+                "attention_mask": np.ones((1, 1), np.int64),
+                "position_ids": np.zeros((1, 1), np.int64),
+            }
+        )["codebook_logits"]
+    finally:
+        session.close()
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(
+        actual.astype(np.float32), np.stack(expected, axis=-2)[None], atol=1e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "CUDAExecutionProvider" not in ort.get_available_providers(),
+    reason="Chunked reduced-precision source parity requires CUDA",
+)
+@pytest.mark.parametrize(
+    "dtype,ep",
+    [(ir.DataType.FLOAT16, "cuda"), (ir.DataType.BFLOAT16, "onnx-standard")],
+)
+@pytest.mark.parametrize("prefill_length", [17, 32])
+def test_chunked_sparse_prefill_and_reused_state_match_source(
+    upstream, tmp_path, monkeypatch, dtype, ep, prefill_length
+):
+    test_fish_omni_pipeline_prefill_and_cached_decode(
+        upstream,
+        tmp_path,
+        monkeypatch,
+        1,
+        dtype,
+        ep,
+        "fish-omni-generation",
+        prefill_length=prefill_length,
+    )

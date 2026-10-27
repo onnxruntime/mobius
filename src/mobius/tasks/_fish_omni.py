@@ -45,12 +45,26 @@ class FishOmniTask(ModelTask):
     def _sampling_inputs(self, builder) -> FishAudioSamplingInputs | None:
         return None
 
-    def build(self, module, config: FishOmniConfig) -> ModelPackage:
+    def _validate_precision(self, config: FishOmniConfig) -> None:
+        if config.dtype == ir.DataType.FLOAT16 and ep_capabilities().name != "cuda":
+            raise ValueError(
+                "Drama 3 FP16 currently requires execution_provider='cuda' "
+                "for the native FP16-input/FP32-output projection"
+            )
         if config.dtype == ir.DataType.BFLOAT16 and ep_capabilities().name != "onnx-standard":
             raise ValueError(
                 "Drama 3 BF16 currently requires execution_provider='onnx-standard' "
                 "and a runtime with BF16 CUDA Attention support"
             )
+        if config.dtype in (ir.DataType.FLOAT16, ir.DataType.BFLOAT16):
+            raise ValueError(
+                "Drama 3 reduced-precision export is disabled pending real-weight numerical "
+                "qualification. Production-dimension FP16 and BF16 reference probes exceed "
+                "the unchanged 1e-2 logit gate; use FP32."
+            )
+
+    def build(self, module, config: FishOmniConfig) -> ModelPackage:
+        self._validate_precision(config)
         self._validate_components(module)
         assert config.tower is not None
         batch, seq = "batch", "sequence_len"

@@ -124,4 +124,10 @@ class Float32SiLU(SiLU):
     """SiLU with FP32 opmath and a single cast to the activation dtype."""
 
     def forward(self, op: OpBuilder, x: ir.Value):
-        return op.CastLike(op.Swish(op.Cast(x, to=ir.DataType.FLOAT)), x)
+        return op.CastLike(float32_silu(op, x), x)
+
+
+def float32_silu(op: OpBuilder, x: ir.Value):
+    """Torch CUDA SiLU opmath: FP32 division before any output narrowing."""
+    wide = op.Cast(x, to=ir.DataType.FLOAT)
+    return op.Div(wide, op.Add(1.0, op.Exp(op.Neg(wide))))

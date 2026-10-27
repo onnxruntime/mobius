@@ -106,6 +106,8 @@ class StreamingWeightSource:
     # whose reference loader reconstructs directly in the compute dtype can
     # opt in without changing the existing adapters' rounding semantics.
     reconstruction_dtype: torch.dtype = torch.bfloat16
+    # Opt-in source-loader saturation; other precisions/adapters are unchanged.
+    saturate_float16: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -704,6 +706,29 @@ def _load_indexed_tensor(
     return tensor
 
 
+def _cast_preprocessed_source(
+    tensor: torch.Tensor, source: StreamingWeightSource, target_dtype: torch.dtype
+) -> torch.Tensor:
+    if source.saturate_float16 and target_dtype == torch.float16:
+        # Compare the scalar maximum in Python: BF16 cannot represent 65504,
+        # so a BF16 tensor comparison/clamp would round that bound to 65536.
+        maximum = float(tensor.abs().max().item()) if tensor.numel() else 0.0
+        if not math.isfinite(maximum):
+            raise ValueError(f"Nonfinite streaming weight '{source.source_name}'")
+        limit = torch.finfo(torch.float16).max
+        if maximum > limit:
+            wide = tensor.to(torch.float32)
+            overflow = int((wide.abs() > limit).sum().item())
+            logger.warning(
+                "Clamping %d values outside the FP16 range in '%s'",
+                overflow,
+                source.source_name,
+            )
+            # Never modify caller-owned/memory-mapped checkpoint storage.
+            tensor = wide.clamp(-limit, limit)
+    return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
+
+
 def _materialize_preprocessed_source(
     source: StreamingWeightSource,
     key_index: Mapping[str, tuple[str, list[int], str]],
@@ -721,7 +746,7 @@ def _materialize_preprocessed_source(
             name=source.source_name,
             target_dtype=source.reconstruction_dtype,
         )
-        return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
+        return _cast_preprocessed_source(tensor, source, target_dtype)
     if source.mode == "fp8_scalar":
         if not source_dtype.startswith("F8"):
             raise ValueError(
@@ -738,14 +763,14 @@ def _materialize_preprocessed_source(
             )
         tensor = tensor.to(torch.bfloat16)
         tensor.mul_(scale.to(torch.bfloat16))
-        return tensor if target_dtype == torch.bfloat16 else tensor.to(target_dtype)
+        return _cast_preprocessed_source(tensor, source, target_dtype)
     if source.mode == "direct":
         if source_dtype.startswith("F8"):
             raise ValueError(
                 f"Streaming source '{source.source_name}' is FP8 but was not explicitly "
                 "classified as scaled FP8"
             )
-        return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
+        return _cast_preprocessed_source(tensor, source, target_dtype)
     raise AssertionError(f"Unknown streaming weight mode: {source.mode}")
 
 
@@ -1067,10 +1092,20 @@ def stream_preprocessed_safetensors_to_model(
                 if tensor_adapters.to_torch_dtype(initializer.dtype) != reconstruction_dtype
                 else 0
             )
+            # Conservative bound: two FP32 temporaries plus the overflow mask.
+            saturation_bytes = (
+                math.prod(source_shape) * 9
+                if source.saturate_float16 and initializer.dtype == ir.DataType.FLOAT16
+                else 0
+            )
             largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
             largest_reconstruction_working_set_bytes = max(
                 largest_reconstruction_working_set_bytes,
-                source_bytes + reconstruction_bytes + cast_bytes + scale_bytes,
+                source_bytes
+                + reconstruction_bytes
+                + cast_bytes
+                + scale_bytes
+                + saturation_bytes,
             )
         else:
             if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:
@@ -1092,10 +1127,25 @@ def stream_preprocessed_safetensors_to_model(
                     dense_projection_bytes = (
                         math.prod(source_shape) * initializer.dtype.bitwidth + 7
                     ) // 8
-                    bf16_projection_bytes = math.prod(source_shape) * 2
+                    reconstruction_dtype = (
+                        projection.reconstruction_dtype
+                        if projection.mode == "fp8_block_128"
+                        else torch.bfloat16
+                    )
+                    reconstruction_bytes = (
+                        math.prod(source_shape)
+                        * torch.empty((), dtype=reconstruction_dtype).element_size()
+                    )
                     cast_projection_bytes = (
                         dense_projection_bytes
-                        if initializer.dtype != ir.DataType.BFLOAT16
+                        if tensor_adapters.to_torch_dtype(initializer.dtype)
+                        != reconstruction_dtype
+                        else 0
+                    )
+                    saturation_bytes = (
+                        math.prod(source_shape) * 9
+                        if projection.saturate_float16
+                        and initializer.dtype == ir.DataType.FLOAT16
                         else 0
                     )
                     largest_source_tensor_bytes = max(
@@ -1105,9 +1155,10 @@ def stream_preprocessed_safetensors_to_model(
                     max_transient_bytes = max(
                         max_transient_bytes,
                         source_bytes
-                        + bf16_projection_bytes
+                        + reconstruction_bytes
                         + cast_projection_bytes
-                        + scale_bytes,
+                        + scale_bytes
+                        + saturation_bytes,
                     )
                 if rows != expected_shape[1]:
                     raise ValueError(

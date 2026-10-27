@@ -53,10 +53,12 @@ class TestCausalConvNdWithState:
         )
         op_types = [node.op_type for node in func.graph]
         if activation in ("silu", "swish"):
-            assert "Swish" in op_types
+            assert "Div" in op_types
+            assert "Exp" in op_types
             assert "Sigmoid" not in op_types
         else:
-            assert "Swish" not in op_types
+            assert "Div" not in op_types
+            assert "Exp" not in op_types
             assert "Sigmoid" not in op_types
 
     def test_invalid_ndim_raises(self):

@@ -20,7 +20,7 @@ from mobius.integrations._weight_loading import (
 )
 
 
-def _classify_source(source, index, config, *, expert):
+def _classify_source(source, index, config, *, expert, saturate_float16=False):
     if source not in index:
         raise ValueError(f"Missing Drama 3 checkpoint tensor {source!r}")
     source_dtype = index[source][2]
@@ -32,10 +32,11 @@ def _classify_source(source, index, config, *, expert):
             mode="fp8_block_128",
             scale_name=source.removesuffix(".weight") + ".weight_scale_inv",
             reconstruction_dtype=torch.float32,
+            saturate_float16=saturate_float16,
         )
     if source_dtype not in {"F32", "BF16", "F16"}:
         raise ValueError(f"Unexpected Drama 3 weight dtype {source_dtype}: {source}")
-    return StreamingWeightSource(source)
+    return StreamingWeightSource(source, saturate_float16=saturate_float16)
 
 
 def _source_name(target: str) -> str:
@@ -70,28 +71,42 @@ def build_fish_omni_streaming_plan(
         if value.const_value is not None:
             continue
         source = _source_name(name)
+        saturate = value.dtype == ir.DataType.FLOAT16 and (
+            source.startswith("model.language_model.") or source == "lm_head.weight"
+        )
         if any(
             source.endswith(f".experts.{projection}.weight")
-            for projection in ("gate_proj", "up_proj", "down_proj")
+            for projection in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
         ):
             assert config.num_local_experts is not None
             prefix, projection = source.rsplit(".experts.", 1)
+            projections = (
+                ("gate_proj.weight", "up_proj.weight")
+                if projection == "gate_up_proj.weight"
+                else (projection,)
+            )
             targets[name] = StreamingExpertBankSource(
                 tuple(
-                    (
+                    tuple(
                         _classify_source(
-                            f"{prefix}.experts.{expert}.{projection}",
+                            f"{prefix}.experts.{expert}.{part}",
                             index,
                             config,
                             expert=True,
-                        ),
+                            saturate_float16=saturate,
+                        )
+                        for part in projections
                     )
                     for expert in range(config.num_local_experts)
                 )
             )
         else:
             targets[name] = _classify_source(
-                source, index, config, expert=".mlp.experts." in source
+                source,
+                index,
+                config,
+                expert=".mlp.experts." in source,
+                saturate_float16=saturate,
             )
     return StreamingWeightPlan(
         targets=targets,

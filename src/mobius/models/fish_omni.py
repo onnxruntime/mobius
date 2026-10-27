@@ -22,7 +22,6 @@ from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
 from mobius._configs.fish_omni import FishOmniConfig
 from mobius.components import (
-    MLP,
     Embedding,
     Float32SiLU,
     Linear,
@@ -32,9 +31,11 @@ from mobius.components import (
     SoftmaxTopKGate,
     apply_rotary_pos_emb,
     create_attention_bias,
+    float32_silu,
     initialize_rope,
 )
 from mobius.components._attention import _apply_attention
+from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
 from mobius.generation._fish_omni import (
     FishAudioSamplingInputs,
     _all_rows,
@@ -128,7 +129,7 @@ class _FishGatedNorm(PostGatedRMSNorm):
         scaled = op.Mul(rounded, self.weight)
         gated = op.Mul(
             op.Cast(scaled, to=ir.DataType.FLOAT),
-            op.Swish(op.Cast(gate, to=ir.DataType.FLOAT)),
+            float32_silu(op, gate),
         )
         return op.CastLike(gated, hidden_states)
 
@@ -198,36 +199,12 @@ class _FishMoEBlock(Qwen35MoEBlock):
                 norm_topk_prob=config.norm_topk_prob,
             )
         super().__init__(config, gate=gate)
-        self.packed_experts = (
-            _FishCudaExperts(config) if config.dtype == ir.DataType.FLOAT else None
-        )
-        if self.experts is not None:
-            for expert in self.experts:
-                assert isinstance(expert, MLP)
-                expert.act_fn = Float32SiLU()
+        self.packed_experts = _FishExperts(config)
         self.shared_expert.act_fn = Float32SiLU()
 
     def forward(self, op, hidden_states):
-        if self.experts is None:
-            return super().forward(op, hidden_states)
         routing, selected, logits = self.gate(op, hidden_states)
-        caps = ep_capabilities()
-        if self.packed_experts is not None and caps.name == "cuda" and caps.supports_fused_moe:
-            # Floating CUDA MoE performs its own softmax/top-k from RAW logits.
-            routed = self.packed_experts(op, hidden_states, logits)
-            return self._add_shared_expert(op, hidden_states, routed)
-        combined = None
-        for index, expert in enumerate(self.experts):
-            output = expert(op, hidden_states)
-            match = op.CastLike(op.Equal(selected, index), routing)
-            weight = op.ReduceSum(op.Mul(routing, match), [-1], keepdims=True)
-            contribution = op.Mul(
-                op.Cast(output, to=ir.DataType.FLOAT),
-                op.Cast(weight, to=ir.DataType.FLOAT),
-            )
-            combined = contribution if combined is None else op.Add(combined, contribution)
-        assert combined is not None
-        routed = op.CastLike(combined, hidden_states)
+        routed = self.packed_experts(op, hidden_states, routing, selected, logits)
         return self._add_shared_expert(op, hidden_states, routed)
 
     def _add_shared_expert(self, op, hidden_states, routed):
@@ -236,41 +213,152 @@ class _FishMoEBlock(Qwen35MoEBlock):
         return op.Add(routed, op.Mul(shared, gate))
 
 
-class _FishCudaExperts(nn.Module):
-    """Source-layout expert banks consumed sparsely by ORT's floating CUDA MoE."""
+class _FishExperts(nn.Module):
+    """Selected-only expert execution with bounded portable prefill scratch."""
 
     def __init__(self, config):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
-        assert config.dtype == ir.DataType.FLOAT
+        assert config.num_experts_per_tok is not None
         self.num_experts = config.num_local_experts
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         self.top_k = config.num_experts_per_tok
         self.normalize = int(config.norm_topk_prob)
+        self.dtype = config.dtype
+        self.act_fn = Float32SiLU()
         self.gate_proj = _FishExpertBank(
             [self.num_experts, self.intermediate_size, self.hidden_size]
         )
         self.up_proj = _FishExpertBank(
             [self.num_experts, self.intermediate_size, self.hidden_size]
         )
+        self.gate_up_proj = _FishExpertBank(
+            [self.num_experts, 2 * self.intermediate_size, self.hidden_size]
+        )
         self.down_proj = _FishExpertBank(
             [self.num_experts, self.hidden_size, self.intermediate_size]
         )
 
-    def forward(self, op, hidden_states, router_logits):
+    def forward(self, op, hidden_states, weights, selected, router_logits):
+        # Materialize banks in the root module scope, never inside If/Scan.
+        caps = ep_capabilities()
+        if self.dtype == ir.DataType.FLOAT and caps.name == "cuda" and caps.supports_fused_moe:
+            return self._fused(
+                op,
+                hidden_states,
+                router_logits,
+                self.gate_proj(op),
+                self.up_proj(op),
+                self.down_proj(op),
+            )
+        gate_up, down = self.gate_up_proj(op), self.down_proj(op)
+        hidden = op.Reshape(hidden_states, [-1, self.hidden_size])
+        weights = op.Reshape(weights, [-1, self.top_k])
+        selected = op.Reshape(selected, [-1, self.top_k])
+        length = op.Shape(hidden, start=0, end=1)
+        count = op.Squeeze(length, [0])
+        chunk_size = 16
+
+        def direct(branch_op):
+            return self._selected(branch_op, hidden, weights, selected, gate_up, down)
+
+        def chunked(branch_op):
+            padding = branch_op.Mod(branch_op.Neg(count), chunk_size, fmod=0)
+            rows = branch_op.Unsqueeze(padding, [0])
+
+            def pad(value, width, zero):
+                tail = branch_op.Expand(zero, branch_op.Concat(rows, [width], axis=0))
+                return branch_op.Reshape(
+                    branch_op.Concat(value, tail, axis=0), [-1, chunk_size, width]
+                )
+
+            h_chunks = pad(hidden, self.hidden_size, branch_op.CastLike(0.0, hidden))
+            w_chunks = pad(weights, self.top_k, branch_op.CastLike(0.0, weights))
+            i_chunks = pad(selected, self.top_k, branch_op.Constant(value_int=0))
+            assert gate_up.name is not None
+            prefix = gate_up.name + "_selected_chunks_"
+            h = ir.Value(
+                name=prefix + "hidden",
+                type=ir.TensorType(self.dtype),
+                shape=ir.Shape([chunk_size, self.hidden_size]),
+            )
+            w = ir.Value(
+                name=prefix + "weights",
+                type=ir.TensorType(self.dtype),
+                shape=ir.Shape([chunk_size, self.top_k]),
+            )
+            ids = ir.Value(
+                name=prefix + "ids",
+                type=ir.TensorType(ir.DataType.INT64),
+                shape=ir.Shape([chunk_size, self.top_k]),
+            )
+            body, builder = create_body_graph([], [h, w, ids], name=prefix + "body")
+            output = self._selected(builder.op, h, w, ids, gate_up, down)
+            output.type = ir.TensorType(self.dtype)
+            output.shape = ir.Shape([chunk_size, self.hidden_size])
+            output.name = prefix + "output"
+            body.outputs.append(output)
+            rename_subgraph_values(body, prefix)
+            scanned = branch_op.Scan(
+                h_chunks, w_chunks, i_chunks, body=body, num_scan_inputs=3
+            )
+            return branch_op.Slice(
+                branch_op.Reshape(scanned, [-1, self.hidden_size]), [0], length, [0]
+            )
+
+        branches = []
+        for name, body in (("selected_direct", direct), ("selected_chunks", chunked)):
+            op.builder.push_module(name)
+            branch = op.builder.subgraph(
+                body,
+                inputs=[],
+                outputs=[ir.Value(name=name + "_output", type=ir.TensorType(self.dtype))],
+                name=name,
+            )
+            op.builder.pop_module()
+            branches.append(branch)
+        result = op.If(
+            op.LessOrEqual(count, chunk_size),
+            then_branch=branches[0],
+            else_branch=branches[1],
+        )
+        return op.Reshape(result, op.Shape(hidden_states))
+
+    def _selected(self, op, hidden, weights, selected, gate_up_bank, down_bank):
+        ids = op.Reshape(selected, [-1])
+        pairs = op.Range(0, op.Size(ids), 1)
+        inputs = op.Unsqueeze(op.Gather(hidden, op.Div(pairs, self.top_k), axis=0), [-1])
+        projected = op.Squeeze(op.MatMul(op.Gather(gate_up_bank, ids, axis=0), inputs), [-1])
+        gate, up = op.Split(
+            projected, [self.intermediate_size, self.intermediate_size], axis=-1, _outputs=2
+        )
+        activated = op.Mul(self.act_fn(op, gate), up)
+        projected = op.Squeeze(
+            op.MatMul(op.Gather(down_bank, ids, axis=0), op.Unsqueeze(activated, [-1])),
+            [-1],
+        )
+        # Both coefficient rounding and expert-output rounding precede FP32 weighting.
+        contribution = op.Mul(
+            op.Cast(projected, to=ir.DataType.FLOAT),
+            op.Cast(op.Reshape(weights, [-1, 1]), to=ir.DataType.FLOAT),
+        )
+        summed = op.ReduceSum(
+            op.Reshape(contribution, [-1, self.top_k, self.hidden_size]), [1], keepdims=0
+        )
+        return op.CastLike(summed, hidden)
+
+    def _fused(self, op, hidden_states, router_logits, gate_bank, up_bank, down_bank):
         # CUDA MoE declares [E,H,I]/[E,I,H], but consumes the original
         # output-major HF bytes. Reshape changes the ABI shape, NOT the layout.
         # This matches upstream test_moe_cuda.py's separate-FC3 Mixtral path.
         gate = op.Reshape(
-            self.gate_proj(op), [self.num_experts, self.hidden_size, self.intermediate_size]
+            gate_bank, [self.num_experts, self.hidden_size, self.intermediate_size]
         )
-        up = op.Reshape(
-            self.up_proj(op), [self.num_experts, self.hidden_size, self.intermediate_size]
-        )
+        up = op.Reshape(up_bank, [self.num_experts, self.hidden_size, self.intermediate_size])
         down = op.Reshape(
-            self.down_proj(op), [self.num_experts, self.intermediate_size, self.hidden_size]
+            down_bank, [self.num_experts, self.intermediate_size, self.hidden_size]
         )
         output = op.MoE(
             op.Reshape(hidden_states, [-1, self.hidden_size]),
@@ -314,6 +402,7 @@ class _FishRouter(SoftmaxTopKGate):
 class _FishDecoderLayer(Qwen35MoEDecoderLayer):
     def __init__(self, config, layer_idx):
         super().__init__(config, layer_idx)
+        self._compute_dtype = config.dtype
         self.mlp = _FishMoEBlock(
             config,
             gate=_FishRouter(
@@ -330,6 +419,28 @@ class _FishDecoderLayer(Qwen35MoEDecoderLayer):
             )
         else:
             self.self_attn = _FishAttention(config)
+
+    def forward(self, op, hidden_states, attention_bias, position_embeddings, past_key_value):
+        if self._compute_dtype != ir.DataType.FLOAT16:
+            return super().forward(
+                op, hidden_states, attention_bias, position_embeddings, past_key_value
+            )
+        # Native FP16 uses FP32 residuals, but both mixers consume rounded FP16 norms.
+        residual = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        normed = op.Cast(self.input_layernorm(op, residual), to=ir.DataType.FLOAT16)
+        if self.layer_type == "linear_attention":
+            attended, conv, state = self.linear_attn(
+                op, normed, past_key_value[0], past_key_value[1]
+            )
+            present = (conv, state)
+        else:
+            attended, present = self.self_attn(
+                op, normed, attention_bias, position_embeddings, past_key_value
+            )
+        residual = op.Add(residual, op.Cast(attended, to=ir.DataType.FLOAT))
+        normed = op.Cast(self.post_attention_layernorm(op, residual), to=ir.DataType.FLOAT16)
+        output = self.mlp(op, normed)
+        return op.Add(residual, op.Cast(output, to=ir.DataType.FLOAT)), present
 
 
 class _FishTextModel(Qwen35MoETextModel):
@@ -348,8 +459,11 @@ class FishOmniBackbone(nn.Module):
         super().__init__()
         self.model = _FishTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        self._compute_dtype = config.dtype
 
     def forward(self, op, inputs_embeds, attention_mask, position_ids, past_key_values):
+        if self._compute_dtype == ir.DataType.FLOAT16:
+            inputs_embeds = op.Cast(inputs_embeds, to=ir.DataType.FLOAT)
         hidden, present = self.model(
             op,
             input_ids=None,
@@ -358,6 +472,8 @@ class FishOmniBackbone(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        if self._compute_dtype == ir.DataType.FLOAT16:
+            hidden = op.Cast(hidden, to=ir.DataType.FLOAT16)
         return self.lm_head(op, hidden), hidden, present
 
 
@@ -394,9 +510,9 @@ class FishOmniEmbedding(nn.Module):
             return op.ReduceSum(embeds, [-2], keepdims=False)
 
         count = cfg.vq_backbone_codebooks
-        mixed = op.Div(
+        mixed = op.Mul(
             op.Cast(op.Add(text, code_sum(1, count + 1)), to=ir.DataType.FLOAT),
-            math.sqrt(1 + count),
+            1.0 / math.sqrt(1 + count),
         )
         mixed = op.CastLike(mixed, text)
         unseen = code_sum(count + 1, cfg.num_codebooks)
@@ -462,12 +578,42 @@ class _TowerAttention(nn.Module):
         return self.wo(op, op.Mul(attended, _sigmoid_float32(op, gate))), (pk, pv)
 
 
+class _FP32OutputLinear(Linear):
+    """Native FP16-input GEMM with FP32 output, without promoting the weight bank."""
+
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=False)
+        self.in_features, self.out_features = in_features, out_features
+
+    def forward(self, op, hidden):
+        projected = op.GemmFloat8(
+            op.Reshape(hidden, [-1, self.in_features]),
+            self.weight,
+            transA=0,
+            transB=1,
+            alpha=1.0,
+            beta=0.0,
+            dtype=int(ir.DataType.FLOAT),
+            _domain="com.microsoft",
+        )
+        projected.type = ir.TensorType(ir.DataType.FLOAT)
+        projected.shape = ir.Shape([None, self.out_features])
+        shape = op.Concat(
+            op.Shape(hidden, end=-1), op.Constant(value_ints=[self.out_features]), axis=0
+        )
+        return op.Reshape(projected, shape)
+
+
 class _TowerMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.w1 = Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.w3 = Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.w2 = Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.w2 = (
+            _FP32OutputLinear(config.intermediate_size, config.hidden_size)
+            if config.dtype == ir.DataType.FLOAT16
+            else Linear(config.intermediate_size, config.hidden_size, bias=False)
+        )
         self.act_fn = Float32SiLU()
 
     def forward(self, op, hidden):
@@ -482,8 +628,16 @@ class _TowerTransformer(nn.Module):
         self.attention_norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.feed_forward = _TowerMLP(config)
+        self._compute_dtype = config.dtype
 
     def forward(self, op, hidden, bias, positions, past):
+        if self._compute_dtype == ir.DataType.FLOAT16:
+            hidden = op.Cast(hidden, to=ir.DataType.FLOAT)
+            normed = op.Cast(self.attention_norm(op, hidden), to=ir.DataType.FLOAT16)
+            attended, present = self.attention(op, normed, bias, positions, past)
+            residual = op.Add(hidden, op.Cast(attended, to=ir.DataType.FLOAT))
+            normed = op.Cast(self.ffn_norm(op, residual), to=ir.DataType.FLOAT16)
+            return op.Add(residual, self.feed_forward(op, normed)), present
         attended, present = self.attention(
             op, self.attention_norm(op, hidden), bias, positions, past
         )
@@ -516,7 +670,7 @@ class _TowerLayer(nn.Module):
             op, op.Concat(self.enorm(op, embedded), self.hnorm(op, hidden), axis=-1)
         )
         output, present = self.transformer_layer(op, mixed, bias, positions, past)
-        return self.final_layernorm(op, output), present
+        return op.CastLike(self.final_layernorm(op, output), mixed), present
 
 
 class FishOmniAudioDecoder(nn.Module):

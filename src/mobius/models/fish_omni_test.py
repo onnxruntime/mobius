@@ -14,10 +14,12 @@ import onnxruntime as ort
 import pytest
 import torch
 from _test_configs import FISH_OMNI_CONFIG
-from onnxscript import GraphBuilder
+from onnxscript import GraphBuilder, nn
 
 from mobius import build_from_module
+from mobius._build_context import ep_capabilities
 from mobius._configs.fish_omni import FishOmniConfig
+from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations.transformers._config_resolver import (
@@ -25,7 +27,9 @@ from mobius.integrations.transformers._config_resolver import (
     _dict_to_pretrained_config,
 )
 from mobius.models import FishOmniModel
-from mobius.models.fish_omni import _apply_fish_attention
+from mobius.models.fish_omni import _apply_fish_attention, _FishMoEBlock, _FP32OutputLinear
+from mobius.tasks import FishOmniGenerationTask, FishOmniTask, ModelTask
+from mobius.tasks._base import _make_graph, _make_model
 
 
 def tiny_config():
@@ -34,14 +38,52 @@ def tiny_config():
     )
 
 
-@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.BFLOAT16])
+class _ReducedPrecisionQualificationOnly:
+    def _validate_precision(self, config):
+        if config.dtype not in (ir.DataType.FLOAT16, ir.DataType.BFLOAT16):
+            return super()._validate_precision(config)
+        expected = "cuda" if config.dtype == ir.DataType.FLOAT16 else "onnx-standard"
+        if ep_capabilities().name != expected:
+            raise ValueError("Qualification probe has the wrong execution provider")
+
+    def build(self, module, config):
+        package = super().build(module, config)
+        for model in package.values():
+            model.metadata_props["mobius.precision_validation"] = (
+                "unqualified-reduced-precision-prototype"
+            )
+        return package
+
+
+class _TeacherProbe(_ReducedPrecisionQualificationOnly, FishOmniTask):
+    pass
+
+
+class _GenerationProbe(_ReducedPrecisionQualificationOnly, FishOmniGenerationTask):
+    pass
+
+
+def reduced_precision_prototype_task(task):
+    """Test only: probe prepared math without opening production admission."""
+    return _GenerationProbe() if task == "fish-omni-generation" else _TeacherProbe()
+
+
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
 def test_fish_omni_build(dtype):
     config = dataclasses.replace(tiny_config(), dtype=dtype)
     package = build_from_module(
         FishOmniModel(config),
         config,
-        task="fish-omni",
-        execution_provider="onnx-standard" if dtype == ir.DataType.BFLOAT16 else "default",
+        task=reduced_precision_prototype_task("fish-omni")
+        if dtype != ir.DataType.FLOAT
+        else "fish-omni",
+        execution_provider={
+            ir.DataType.FLOAT: "default",
+            ir.DataType.FLOAT16: "cuda",
+            ir.DataType.BFLOAT16: "onnx-standard",
+        }[dtype],
     )
     assert set(package) == {"decoder", "embedding", "audio_decoder"}
     assert set(package.policy_components) == {"main_sampler", "codebook_sampler"}
@@ -94,15 +136,31 @@ def test_fish_omni_cuda_build_uses_sparse_fused_expert_banks():
     assert not any(".experts.0." in name for name in graph.initializers)
 
 
-@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.BFLOAT16])
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
 def test_fish_single_pass_task_reuses_tower_weights_and_layer_count(dtype):
     config = dataclasses.replace(tiny_config(), dtype=dtype)
-    ep = "onnx-standard" if dtype == ir.DataType.BFLOAT16 else "default"
+    ep = {
+        ir.DataType.FLOAT: "default",
+        ir.DataType.FLOAT16: "cuda",
+        ir.DataType.BFLOAT16: "onnx-standard",
+    }[dtype]
     teacher = build_from_module(
-        FishOmniModel(config), config, task="fish-omni", execution_provider=ep
+        FishOmniModel(config),
+        config,
+        task=reduced_precision_prototype_task("fish-omni")
+        if dtype != ir.DataType.FLOAT
+        else "fish-omni",
+        execution_provider=ep,
     )["audio_decoder"]
     generated = build_from_module(
-        FishOmniModel(config), config, task="fish-omni-generation", execution_provider=ep
+        FishOmniModel(config),
+        config,
+        task=reduced_precision_prototype_task("fish-omni-generation")
+        if dtype != ir.DataType.FLOAT
+        else "fish-omni-generation",
+        execution_provider=ep,
     )["audio_generator"]
     assert {
         name for name, value in teacher.graph.initializers.items() if value.const_value is None
@@ -129,16 +187,32 @@ def test_fish_single_pass_task_reuses_tower_weights_and_layer_count(dtype):
     )
 
 
-@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16])
+@pytest.mark.parametrize("dtype", [ir.DataType.DOUBLE])
 def test_fish_omni_rejects_unqualified_precision(dtype):
-    with pytest.raises(ValueError, match="FP16 requires"):
+    with pytest.raises(ValueError, match="requires floating"):
         FishOmniModel(dataclasses.replace(tiny_config(), dtype=dtype))
 
 
-def test_fish_omni_bfloat16_rejects_unqualified_ep():
-    config = dataclasses.replace(tiny_config(), dtype=ir.DataType.BFLOAT16)
-    with pytest.raises(ValueError, match="requires execution_provider='onnx-standard'"):
+@pytest.mark.parametrize(
+    "dtype,ep",
+    [(ir.DataType.BFLOAT16, "onnx-standard"), (ir.DataType.FLOAT16, "cuda")],
+)
+def test_fish_omni_reduced_precision_rejects_unqualified_ep(dtype, ep):
+    config = dataclasses.replace(tiny_config(), dtype=dtype)
+    with pytest.raises(ValueError, match=f"requires execution_provider='{ep}'"):
         build_from_module(FishOmniModel(config), config, task="fish-omni")
+
+
+@pytest.mark.parametrize(
+    "dtype,ep",
+    [(ir.DataType.FLOAT16, "cuda"), (ir.DataType.BFLOAT16, "onnx-standard")],
+)
+def test_reduced_precision_production_export_stays_closed_after_real_weight_failure(dtype, ep):
+    config = dataclasses.replace(tiny_config(), dtype=dtype)
+    with pytest.raises(ValueError, match="disabled pending real-weight numerical"):
+        build_from_module(
+            FishOmniModel(config), config, task="fish-omni", execution_provider=ep
+        )
 
 
 @pytest.mark.parametrize(
@@ -285,3 +359,186 @@ def test_fish_attention_preserves_padding_and_cache(padded):
             np.testing.assert_array_equal(result["output"], changed["output"])
     finally:
         session.close()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "CUDAExecutionProvider" not in ort.get_available_providers(),
+    reason="Mixed-output FP16 GEMM requires CUDA",
+)
+def test_fp16_projection_preserves_values_above_half_range():
+    class ProjectionTask(ModelTask):
+        def build(self, module, config):
+            graph, builder = _make_graph("projection")
+            x = builder.input("x", ir.DataType.FLOAT16, [1, 2, 4])
+            output = module(builder.op, x)
+            output.type = ir.TensorType(ir.DataType.FLOAT)
+            output.shape = ir.Shape([1, 2, 2])
+            builder.add_output(output, "output")
+            return ModelPackage({"projection": _make_model(graph)})
+
+    config = dataclasses.replace(tiny_config(), dtype=ir.DataType.FLOAT16)
+    graph = build_from_module(
+        _FP32OutputLinear(4, 2), config, task=ProjectionTask(), execution_provider="cuda"
+    )["projection"]
+    weights = [
+        value for value in graph.graph.initializers.values() if value.const_value is None
+    ]
+    assert len(weights) == 1
+    assert weights[0].dtype == ir.DataType.FLOAT16
+    weights[0].const_value = ir.tensor(np.full((2, 4), 1000, dtype=np.float16))
+    session = OnnxModelSession(graph, device="cuda")
+    try:
+        actual = session.run({"x": np.full((1, 2, 4), 1000, dtype=np.float16)})["output"]
+    finally:
+        session.close()
+    assert actual.dtype == np.float32
+    np.testing.assert_array_equal(actual, np.full((1, 2, 2), 4_000_000, dtype=np.float32))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "CUDAExecutionProvider" not in ort.get_available_providers(),
+    reason="FP16 residual stress test requires CUDA",
+)
+def test_fp16_backbone_residual_stream_does_not_overflow():
+    class ConstantMLP(nn.Module):
+        def forward(self, op, hidden):
+            return op.Expand(op.CastLike(60000.0, hidden), op.Shape(hidden))
+
+    class ConstantLinearAttention(ConstantMLP):
+        def forward(self, op, hidden, conv_state, recurrent_state):
+            return super().forward(op, hidden), op.Abs(conv_state), op.Abs(recurrent_state)
+
+    class ConstantAttention(ConstantMLP):
+        def forward(self, op, hidden, bias, positions, past):
+            return super().forward(op, hidden), (op.Abs(past[0]), op.Abs(past[1]))
+
+    config = dataclasses.replace(tiny_config(), dtype=ir.DataType.FLOAT16)
+    module = FishOmniModel(config)
+    for layer in module.decoder.model.layers:
+        layer.mlp = ConstantMLP()
+        if layer.layer_type == "linear_attention":
+            layer.linear_attn = ConstantLinearAttention()
+        else:
+            layer.self_attn = ConstantAttention()
+    graph = build_from_module(
+        module,
+        config,
+        task=reduced_precision_prototype_task("fish-omni"),
+        execution_provider="cuda",
+    )["decoder"]
+    for value in graph.graph.initializers.values():
+        if value.const_value is None:
+            value.const_value = ir.tensor(np.zeros(tuple(value.shape), dtype=np.float16))
+    cache = {}
+    for value in graph.graph.inputs:
+        if value.name.startswith("past_key_values."):
+            shape = list(value.shape)
+            shape[0] = 1
+            if value.name.endswith((".key", ".value")):
+                shape[2] = 0
+            dtype = np.float32 if value.dtype == ir.DataType.FLOAT else np.float16
+            cache[value.name] = np.zeros(shape, dtype=dtype)
+    session = OnnxModelSession(graph, device="cuda")
+    try:
+        result = session.run(
+            {
+                **cache,
+                "inputs_embeds": np.full((1, 1, config.hidden_size), 60000, dtype=np.float16),
+                "attention_mask": np.ones((1, 1), np.int64),
+                "position_ids": np.zeros((1, 1), np.int64),
+            }
+        )
+    finally:
+        session.close()
+    # Two 60000-valued sublayer outputs per layer exceed FP16 residual range.
+    # Normalization of the finite FP32 residual is exactly one after FP16 rounding.
+    np.testing.assert_array_equal(
+        result["hidden_states"], np.ones((1, 1, config.hidden_size), dtype=np.float16)
+    )
+
+
+class _MoEOnlyTask(ModelTask):
+    def build(self, module, config):
+        graph, builder = _make_graph("experts")
+        x = builder.input("x", config.dtype, ["tokens", config.hidden_size])
+        output = module(builder.op, x)
+        output.type = ir.TensorType(config.dtype)
+        output.shape = ir.Shape(["tokens", config.hidden_size])
+        builder.add_output(output, "output")
+        return ModelPackage({"experts": _make_model(graph)})
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "CUDAExecutionProvider" not in ort.get_available_providers(),
+    reason="FP16 sparse expert overflow test requires CUDA",
+)
+def test_unselected_fp16_expert_overflow_cannot_poison_output():
+    config = dataclasses.replace(
+        tiny_config(), dtype=ir.DataType.FLOAT16, num_local_experts=2, num_experts_per_tok=1
+    )
+    model = build_from_module(
+        _FishMoEBlock(config), config, task=_MoEOnlyTask(), execution_provider="onnx-standard"
+    )["experts"]
+    for name, value in model.graph.initializers.items():
+        if value.const_value is not None:
+            continue
+        data = np.zeros(tuple(value.shape), np.float16)
+        if name == "gate.weight":
+            data[0, 0], data[1, 0] = 1, -1
+        elif "packed_experts" in name:
+            # Expert 1's finite projections overflow if executed; it is never selected.
+            data[1] = 100
+        value.const_value = ir.tensor(data)
+    session = OnnxModelSession(model, device="cuda")
+    try:
+        output = session.run({"x": np.ones((1, config.hidden_size), np.float16)})["output"]
+    finally:
+        session.close()
+    np.testing.assert_array_equal(output, np.zeros_like(output))
+
+
+@pytest.mark.parametrize("tokens", [1, 16, 17, 31, 32, 33])
+def test_sparse_expert_chunk_boundaries_match_selected_only_math(tokens):
+    config = tiny_config()
+    model = build_from_module(
+        _FishMoEBlock(config), config, task=_MoEOnlyTask(), execution_provider="onnx-standard"
+    )["experts"]
+    rng = np.random.default_rng(42)
+    weights = {}
+    for name, value in model.graph.initializers.items():
+        if value.const_value is None:
+            data = rng.normal(0, 0.1, tuple(value.shape)).astype(np.float32)
+            value.const_value = ir.tensor(data)
+            weights[name] = torch.tensor(data)
+    x = torch.tensor(rng.normal(0, 0.1, (tokens, config.hidden_size)).astype(np.float32))
+    probabilities = torch.nn.functional.linear(x, weights["gate.weight"]).softmax(-1)
+    routing, ids = probabilities.topk(config.num_experts_per_tok, dim=-1)
+    routing /= routing.sum(-1, keepdim=True)
+    expected = torch.zeros_like(x)
+    for row in range(tokens):
+        for rank in range(config.num_experts_per_tok):
+            expert = ids[row, rank]
+            gate, up = torch.nn.functional.linear(
+                x[row], weights["packed_experts.gate_up_proj.weight"][expert]
+            ).chunk(2, dim=-1)
+            projected = torch.nn.functional.linear(
+                torch.nn.functional.silu(gate) * up,
+                weights["packed_experts.down_proj.weight"][expert],
+            )
+            expected[row] += routing[row, rank] * projected
+    shared = torch.nn.functional.silu(
+        torch.nn.functional.linear(x, weights["shared_expert.gate_proj.weight"])
+    ) * torch.nn.functional.linear(x, weights["shared_expert.up_proj.weight"])
+    shared = torch.nn.functional.linear(shared, weights["shared_expert.down_proj.weight"])
+    expected += (
+        shared * torch.nn.functional.linear(x, weights["shared_expert_gate.weight"]).sigmoid()
+    )
+    session = OnnxModelSession(model)
+    try:
+        actual = session.run({"x": x.numpy()})["output"]
+    finally:
+        session.close()
+    np.testing.assert_allclose(actual, expected.numpy(), atol=1e-4, rtol=1e-4)
