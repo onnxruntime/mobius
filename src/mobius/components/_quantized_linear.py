@@ -59,11 +59,26 @@ _NATIVE_BLOCK_FORMATS = {
 def _accuracy_level_attrs(bits: int) -> dict[str, int]:
     """Return the ``accuracy_level`` attribute for ``MatMulNBits``, if any.
 
+    Without an override, only emitted for 4-bit weights: ``accuracy_level`` is
+    sourced from ``EpCapabilities.default_int4_accuracy_level`` and its
+    int8-accumulation semantics are defined for INT4 ``MatMulNBits``. For
+    2-bit / 8-bit weights the attribute is omitted so those paths keep ORT's
+    default behavior.
+
+    ORT's MLAS CPU ``MatMulNBits`` kernel selects its compute path from the
+    ``accuracy_level`` attribute: unset/0 keeps the highest-precision fp32
+    dequant + fp32 GEMM path, while ``4`` dynamically quantizes activations to
+    int8 and uses int8 dot-products (SDOT/NEON on ARM, AVX-VNNI on x86) — the
+    same class of kernel llama.cpp uses, and typically 2-4x faster on CPU with
+    no observable quality loss for Q4 weights. The default value is sourced
+    from the active EP's :attr:`EpCapabilities.default_int4_accuracy_level`
+    (4 for CPU / WebGPU). When this EP default is 0 the attribute is omitted
+    so ORT keeps its default.
+
     An explicit build override takes precedence for every weight bit width,
-    including zero, which must override an EP's nonzero default. Otherwise,
-    preserve the existing INT4 EP default and omit the attribute for other
-    bit widths. This controls activation computation, not weight quantization;
-    supported kernels and numerical differences depend on the runtime and EP.
+    including zero, which overrides an EP's nonzero default. It controls
+    activation computation, not weight quantization. Omitting the override
+    preserves the default behavior above.
     """
     override = get_matmul_nbits_accuracy_level()
     if override is not None:
