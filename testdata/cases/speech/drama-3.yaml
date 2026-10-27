@@ -7,5 +7,5 @@ level: "L4+L5"
 inputs:
   prompts:
     - "Hello, this is a speech synthesis test."
-skip_reason: "Token-graph export only: full-checkpoint waveform and generation goldens require the external Fish Speech codec and sampler."
-notes: "Pinned L2 model is registered; reduced upstream prefill and temporal-cache parity is covered in tests/integration/fish_omni_test.py. No fabricated L4/L5 goldens."
+skip_reason: "The generic TTS waveform golden runner requires the external codec and sampler; token-level goldens are validated separately."
+notes: "The full pinned checkpoint passed H200 CUDA prefill and 20-frame greedy parity. Reproduce with scripts/validate_drama3.py; the token reference fixture is testdata/golden/speech/drama-3_tokens_generation.json. No waveform or reduced-precision claim."

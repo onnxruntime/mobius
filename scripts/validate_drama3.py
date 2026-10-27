@@ -1,0 +1,561 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Validate full Drama 3 token graphs against pinned Fish Speech inference.
+
+Run download, export, reference, and compare as separate processes. The default
+reference placement requires five CUDA devices; comparison uses three. Outputs
+include full reference tensors, exact frame IDs, error bounds and an ORT CUDA
+profile. The waveform codec is intentionally outside this validator.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import importlib.util
+import json
+import os
+import pathlib
+import sys
+import time
+import types
+import urllib.request
+
+from mobius._configs.fish_omni import DRAMA3_REVISION, DRAMA3_SOURCE_REVISION
+
+ROOT: pathlib.Path
+REVISION = DRAMA3_REVISION
+SOURCE_REVISION = DRAMA3_SOURCE_REVISION
+PROMPT = "Hello, this is a speech synthesis test."
+REFERENCE_DEVICES: tuple[int, ...] = (0, 1, 2, 3)
+REFERENCE_TOWER_DEVICE = 4
+EMBEDDING_DEVICE = 0
+AUDIO_DEVICE = 1
+DECODER_DEVICE = 2
+GOLDEN = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "testdata"
+    / "golden"
+    / "speech"
+    / "drama-3_tokens_generation.json"
+)
+
+
+def event(kind, **details):
+    print(json.dumps({"event": kind, **details}), flush=True)
+
+
+def empty_cache_ports(ports):
+    import numpy as np
+
+    caches = {}
+    for port in ports:
+        if not port.name.startswith("past_key_values."):
+            continue
+        shape = list(port.shape)
+        shape[0] = 1
+        if port.name.endswith((".key", ".value")):
+            assert len(shape) == 4
+            shape[2] = 0
+        assert all(isinstance(dim, int) for dim in shape), (port.name, shape)
+        caches[port.name] = np.zeros(shape, dtype=np.float32)
+    return caches
+
+
+def download():
+    from huggingface_hub import snapshot_download
+
+    path = snapshot_download(
+        "fishaudio/drama-3",
+        revision=REVISION,
+        cache_dir=str(ROOT / "hf-cache"),
+        allow_patterns=[
+            "config.json",
+            "model*.safetensors",
+            "model.safetensors.index.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "chat_template.jinja",
+            "LICENSE",
+        ],
+        max_workers=8,
+    )
+    (ROOT / "checkpoint-path.txt").write_text(path)
+    event("checkpoint_ready", revision=REVISION)
+
+
+def checkpoint_path():
+    path = pathlib.Path((ROOT / "checkpoint-path.txt").read_text().strip()).resolve()
+    if not path.is_dir() or path.name != REVISION:
+        raise ValueError(f"Expected the immutable checkpoint snapshot {REVISION}, got {path}")
+    return path
+
+
+def load_upstream():
+    prefix = "fish_speech.models.text2semantic"
+    for name in ("fish_speech", "fish_speech.models", prefix, f"{prefix}.fish_omni"):
+        package = types.ModuleType(name)
+        package.__path__ = []
+        sys.modules[name] = package
+    result = {}
+    source_dir = ROOT / "upstream" / SOURCE_REVISION
+    source_dir.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "errors",
+        "sampling",
+        "fish_omni.fp8_moe",
+        "fish_omni.config",
+        "fish_omni.layers",
+        "fish_omni.moe",
+        "fish_omni.backbone",
+        "fish_omni.tower",
+        "fish_omni.model",
+        "fish_omni.generate",
+    ):
+        path = source_dir / (name + ".py")
+        if not path.exists():
+            url = (
+                "https://raw.githubusercontent.com/fishaudio/fish-speech/"
+                f"{SOURCE_REVISION}/fish_speech/models/text2semantic/"
+                f"{name.replace('.', '/')}.py"
+            )
+            with urllib.request.urlopen(url, timeout=60) as response:
+                path.write_bytes(response.read())
+        spec = importlib.util.spec_from_file_location(f"{prefix}.{name}", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load the pinned reference module {name!r}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        result[name.rsplit(".", 1)[-1]] = module
+    return result
+
+
+def export(checkpoint):
+    from mobius import build
+
+    start = time.monotonic()
+    event("export_start")
+    package = build(str(checkpoint), revision=REVISION, dtype="f32", keep_quantized=False)
+    event("graph_and_bindings_ready", seconds=time.monotonic() - start)
+    package.save(str(ROOT / "onnx"), max_workers=1)
+    event("export_complete", seconds=time.monotonic() - start)
+    (ROOT / "export-result.json").write_text(
+        json.dumps(
+            {
+                "revision": REVISION,
+                "seconds": time.monotonic() - start,
+                "weight_loading_report": package.weight_loading_report,
+                "files": {
+                    str(path.relative_to(ROOT / "onnx")): path.stat().st_size
+                    for path in (ROOT / "onnx").rglob("*")
+                    if path.is_file()
+                },
+            },
+            indent=2,
+        )
+    )
+
+
+def reference(checkpoint):
+    os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+    os.environ["FISH_DRAMA3_FP8_EXPERTS"] = "0"
+    os.environ["FISH_DRAMA3_CUDA_GRAPH"] = "0"
+    import numpy as np
+    import torch
+
+    torch.set_num_threads(8)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    upstream = load_upstream()
+    start = time.monotonic()
+    event(
+        "reference_load_start",
+        devices=REFERENCE_DEVICES,
+        tower_device=REFERENCE_TOWER_DEVICE,
+    )
+    model = upstream["model"].FishOmniModel.from_pretrained(
+        checkpoint,
+        devices=[f"cuda:{device}" for device in REFERENCE_DEVICES],
+        tower_device=f"cuda:{REFERENCE_TOWER_DEVICE}",
+        dtype=torch.float32,
+    )
+    event("reference_loaded", seconds=time.monotonic() - start)
+    backbone, tower = model.backbone, model.audio_decoder
+    prompt = upstream["generate"].build_drama3_prompt(PROMPT, model.tokenizer, model.config)
+    states = []
+    active_heads: list[np.ndarray] = []
+    original_embed = tower.embed_backbone
+    original_forward = backbone.forward
+    original_prefill = tower.prefill
+    original_decode = tower.decode_step
+
+    def array(tensor):
+        return tensor.detach().float().cpu().numpy()
+
+    def embed(frames, text):
+        output = original_embed(frames, text)
+        unseen = tower.embedding_sum(
+            frames.to(tower.device),
+            1 + tower.config.vq_backbone_codebooks,
+            tower.config.num_codebooks,
+        )
+        unseen = torch.where(
+            tower.is_semantic(frames[:, 0].to(tower.device))[:, None], unseen, 0.0
+        )
+        states.append(
+            {
+                "input_frames": frames.detach().cpu().numpy(),
+                "inputs_embeds": array(output)[None],
+                "shared_input": array(unseen)[None],
+            }
+        )
+        return output
+
+    def forward(*args, **kwargs):
+        hidden = original_forward(*args, **kwargs)
+        states[-1]["hidden_states"] = array(hidden)
+        states[-1]["logits"] = array(backbone.compute_logits(hidden))
+        states[-1]["position_ids"] = kwargs["input_pos"].cpu().numpy()[None]
+        return hidden
+
+    def prefill(*args, **kwargs):
+        active_heads.clear()
+        output = original_prefill(*args, **kwargs)
+        states[-1]["prefill_tower_logits"] = np.stack(active_heads, axis=-2)[None]
+        return output
+
+    def decode(*args, **kwargs):
+        active_heads.clear()
+        output = original_decode(*args, **kwargs)
+        states[-1]["tower_logits"] = np.stack(active_heads, axis=-2)[None]
+        states[-1]["sampled_frame"] = output.detach().cpu().numpy()
+        return output
+
+    def capture_head(head):
+        def capture(_module, _inputs, output):
+            active_heads.append(array(head(output)))
+
+        return capture
+
+    handles = [
+        layer.register_forward_hook(capture_head(head))
+        for layer, head in zip(tower.residual_layers, tower.codebook_heads)
+    ]
+    tower.embed_backbone = embed
+    backbone.forward = forward
+    tower.prefill = prefill
+    tower.decode_step = decode
+    upstream["tower"].sample_top_k_top_p = lambda logits, *a, **kw: logits.argmax(-1)
+    with torch.inference_mode():
+        generated, finish = upstream["generate"].generate_drama3(
+            model,
+            prompt,
+            max_new_tokens=20,
+            temperature=1.0,
+            top_k=30,
+            top_p=1.0,
+        )
+    for handle in handles:
+        handle.remove()
+    output_dir = ROOT / "reference"
+    output_dir.mkdir(exist_ok=True)
+    for index, state in enumerate(states):
+        np.savez(output_dir / f"state-{index:02}.npz", **state)
+    logits = states[0]["logits"]
+    top = np.argsort(logits[0, -1])[-10:][::-1]
+    golden = {
+        "model_id": "fishaudio/drama-3",
+        "revision": REVISION,
+        "source_revision": SOURCE_REVISION,
+        "dtype": "float32",
+        "prompt": PROMPT,
+        "prompt_rows": len(prompt),
+        "prefill_shape": list(logits.shape),
+        "prefill_last_top10": top.tolist(),
+        "prefill_last_top10_logits": logits[0, -1, top].tolist(),
+        "prefill_logits_sha256": hashlib.sha256(logits.tobytes()).hexdigest(),
+        "max_new_tokens": 20,
+        "do_sample": False,
+        "finish_reason": finish,
+        "generated_frames": generated.tolist(),
+        "attempted_frames": len(states),
+        "seconds": time.monotonic() - start,
+    }
+    (output_dir / "golden.json").write_text(json.dumps(golden, indent=2))
+    event(
+        "reference_complete",
+        **{
+            k: golden[k]
+            for k in ("prompt_rows", "finish_reason", "attempted_frames", "seconds")
+        },
+    )
+
+
+def validate_reference_golden(golden):
+    import numpy as np
+
+    committed = json.loads(GOLDEN.read_text())
+    for field in (
+        "model_id",
+        "revision",
+        "source_revision",
+        "dtype",
+        "prompt",
+        "max_new_tokens",
+        "do_sample",
+        "finish_reason",
+    ):
+        assert golden[field] == committed[field], field
+    assert len(golden["generated_frames"]) == len(committed["generated_frames"])
+    np.testing.assert_array_equal(golden["generated_frames"], committed["generated_frames"])
+    assert golden["prefill_shape"] == committed["prefill_shape"]
+    np.testing.assert_array_equal(
+        golden["prefill_last_top10"], committed["prefill_last_top10"]
+    )
+    np.testing.assert_allclose(
+        golden["prefill_last_top10_logits"],
+        committed["prefill_last_top10_logits"],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+def compare():
+    os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+    import numpy as np
+    import onnxruntime as ort
+
+    golden = json.loads((ROOT / "reference" / "golden.json").read_text())
+    validate_reference_golden(golden)
+    config = json.loads((checkpoint_path() / "config.json").read_text())
+    ort.preload_dlls()
+    sessions = {}
+    start = time.monotonic()
+    for name, device in (
+        ("embedding", EMBEDDING_DEVICE),
+        ("audio_decoder", AUDIO_DEVICE),
+        ("decoder", DECODER_DEVICE),
+    ):
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 8
+        options.inter_op_num_threads = 1
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        options.enable_mem_pattern = False
+        options.add_session_config_entry("session.disable_prepacking", "1")
+        if name == "decoder":
+            options.enable_profiling = True
+            options.profile_file_prefix = str(ROOT / "decoder-profile")
+        event("ort_session_start", component=name, device=device)
+        sessions[name] = ort.InferenceSession(
+            str(ROOT / "onnx" / name / "model.onnx"),
+            sess_options=options,
+            providers=[
+                (
+                    "CUDAExecutionProvider",
+                    {
+                        "device_id": device,
+                        "use_tf32": "0",
+                        "arena_extend_strategy": "kSameAsRequested",
+                    },
+                ),
+                "CPUExecutionProvider",
+            ],
+        )
+        event("ort_session_ready", component=name, seconds=time.monotonic() - start)
+
+    def run(name, feeds):
+        session = sessions[name]
+        output = session.run(None, feeds)
+        names = [port.name for port in session.get_outputs()]
+        assert len(names) == len(output)
+        return dict(zip(names, output))
+
+    def empty_cache(name):
+        return empty_cache_ports(sessions[name].get_inputs())
+
+    def next_cache(output):
+        return {
+            key.replace("present.", "past_key_values.", 1): value
+            for key, value in output.items()
+            if key.startswith("present.")
+        }
+
+    metrics = {}
+
+    def check(name, actual, expected):
+        assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
+        assert np.isfinite(actual).all(), name
+        difference = np.abs(actual - expected)
+        maximum = float(difference.max()) if difference.size else 0.0
+        metrics[name] = {
+            "shape": list(actual.shape),
+            "max_abs_diff": maximum,
+            "mean_abs_diff": float(difference.mean()) if difference.size else 0.0,
+        }
+        event("comparison", name=name, **metrics[name])
+        np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-3, err_msg=name)
+
+    count = config["audio_decoder_config"]["num_codebooks"]
+    vocab = config["audio_decoder_config"]["vocab_size"]
+    semantic_start = config["semantic_start_token_id"]
+    semantic_end = config["semantic_end_token_id"]
+    eos = config["eos_token_id"]
+    candidates = np.array([eos, *range(semantic_start, semantic_end + 1)])
+    decoder_cache, tower_cache = empty_cache("decoder"), empty_cache("audio_decoder")
+    generated = []
+    current_frames: np.ndarray | None = None
+    profile_summary = None
+    for step in range(golden["attempted_frames"]):
+        with np.load(ROOT / "reference" / f"state-{step:02}.npz") as state:
+            if step == 0:
+                current_frames = state["input_frames"]
+            else:
+                assert current_frames is not None
+                np.testing.assert_array_equal(current_frames, state["input_frames"])
+            assert current_frames is not None
+            embedded = run("embedding", {"frames": current_frames[None]})
+            check(f"state_{step}.embedding", embedded["inputs_embeds"], state["inputs_embeds"])
+            check(
+                f"state_{step}.shared_input", embedded["shared_input"], state["shared_input"]
+            )
+            positions = state["position_ids"]
+            mask = np.ones((1, int(positions[0, -1]) + 1), dtype=np.int64)
+            decoded = run(
+                "decoder",
+                {
+                    **decoder_cache,
+                    "inputs_embeds": embedded["inputs_embeds"],
+                    "position_ids": positions,
+                    "attention_mask": mask,
+                },
+            )
+            if step == 0:
+                profile_path = pathlib.Path(sessions["decoder"].end_profiling())
+                counts: collections.Counter[tuple[str, str]] = collections.Counter()
+                for entry in json.loads(profile_path.read_text()):
+                    args = entry.get("args", {})
+                    if "provider" in args:
+                        counts[(args["provider"], args.get("op_name", "unknown"))] += 1
+                profile_summary = {
+                    f"{provider}/{op}": n for (provider, op), n in counts.items()
+                }
+                assert (
+                    sum(
+                        counts[("CUDAExecutionProvider", op)]
+                        for op in ("MatMul", "FusedMatMul", "Gemm")
+                    )
+                    > 0
+                )
+                (ROOT / "profile-summary.json").write_text(
+                    json.dumps(profile_summary, indent=2)
+                )
+                event("cuda_profile_verified", counts=profile_summary)
+            check(f"state_{step}.hidden", decoded["hidden_states"], state["hidden_states"])
+            check(f"state_{step}.logits", decoded["logits"], state["logits"])
+            decoder_cache = next_cache(decoded)
+            if step == 0:
+                prompt = current_frames
+                prefilled = run(
+                    "audio_decoder",
+                    {
+                        **tower_cache,
+                        "hidden_states": decoded["hidden_states"][:, :-1],
+                        "shared_input": embedded["shared_input"][:, :-1],
+                        "codes": prompt[None, 1:, 1:],
+                        "semantic_mask": (
+                            (prompt[None, 1:, 0] >= semantic_start)
+                            & (prompt[None, 1:, 0] <= semantic_end)
+                        ),
+                        "position_ids": positions[:, :-1],
+                        "attention_mask": mask[:, :-1],
+                    },
+                )
+                check(
+                    "prefill.tower",
+                    prefilled["codebook_logits"],
+                    state["prefill_tower_logits"],
+                )
+                tower_cache = next_cache(prefilled)
+            main = int(candidates[decoded["logits"][0, -1, candidates].argmax()])
+            codes = np.zeros((1, 1, count), dtype=np.int64)
+            codes[0, 0, 0] = np.clip(main - semantic_start, 0, vocab - 1)
+            semantic = np.array([[semantic_start <= main <= semantic_end]])
+            for index in range(count - 1):
+                tower_output = run(
+                    "audio_decoder",
+                    {
+                        **tower_cache,
+                        "hidden_states": decoded["hidden_states"][:, -1:],
+                        "shared_input": embedded["shared_input"][:, -1:],
+                        "codes": codes,
+                        "semantic_mask": semantic,
+                        "position_ids": positions[:, -1:],
+                        "attention_mask": mask,
+                    },
+                )
+                codes[0, 0, index + 1] = tower_output["codebook_logits"][0, 0, index].argmax()
+            check(
+                f"state_{step}.tower", tower_output["codebook_logits"], state["tower_logits"]
+            )
+            current_frames = np.concatenate((np.array([[[main]]]), codes), axis=-1)[0]
+            np.testing.assert_array_equal(current_frames, state["sampled_frame"])
+            tower_cache = next_cache(tower_output)
+            event("frame_matches", step=step, frame=current_frames.tolist())
+            if main == eos:
+                break
+            generated.extend(current_frames.tolist())
+    assert len(generated) == len(golden["generated_frames"])
+    np.testing.assert_array_equal(generated, golden["generated_frames"])
+    report = {
+        "status": "passed",
+        "revision": REVISION,
+        "source_revision": SOURCE_REVISION,
+        "dtype": "float32",
+        "onnxruntime_version": ort.__version__,
+        "provider": "CUDAExecutionProvider",
+        "ort_graph_optimization": "ORT_ENABLE_BASIC",
+        "atol": 1e-3,
+        "rtol": 1e-3,
+        "prompt_rows": golden["prompt_rows"],
+        "generated_frames": len(generated),
+        "attempted_frames": golden["attempted_frames"],
+        "seconds": time.monotonic() - start,
+        "metrics": metrics,
+        "profile_summary": profile_summary,
+    }
+    (ROOT / "validation-result.json").write_text(json.dumps(report, indent=2))
+    event(
+        "REAL_CHECKPOINT_VALIDATION_PASSED",
+        **{key: report[key] for key in ("generated_frames", "attempted_frames", "seconds")},
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("stage", choices=("download", "export", "reference", "compare"))
+    parser.add_argument("--work-dir", required=True, type=pathlib.Path)
+    parser.add_argument("--reference-devices", default="0,1,2,3")
+    parser.add_argument("--reference-tower-device", default=4, type=int)
+    parser.add_argument("--embedding-device", default=0, type=int)
+    parser.add_argument("--audio-device", default=1, type=int)
+    parser.add_argument("--decoder-device", default=2, type=int)
+    args = parser.parse_args()
+    ROOT = args.work_dir.resolve()
+    ROOT.mkdir(parents=True, exist_ok=True)
+    REFERENCE_DEVICES = tuple(int(device) for device in args.reference_devices.split(","))
+    REFERENCE_TOWER_DEVICE = args.reference_tower_device
+    EMBEDDING_DEVICE = args.embedding_device
+    AUDIO_DEVICE = args.audio_device
+    DECODER_DEVICE = args.decoder_device
+    if args.stage == "download":
+        download()
+    elif args.stage == "export":
+        export(checkpoint_path())
+    elif args.stage == "reference":
+        reference(checkpoint_path())
+    else:
+        compare()
