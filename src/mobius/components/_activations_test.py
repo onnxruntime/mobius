@@ -5,9 +5,16 @@
 
 from __future__ import annotations
 
+import ml_dtypes
+import numpy as np
+import onnx_ir as ir
 import pytest
+import torch
+from onnxscript import GraphBuilder
 
 from mobius._testing import count_op_type, create_test_builder, create_test_input
+from mobius._testing.ort_inference import OnnxModelSession
+from mobius.components import Float32SiLU
 from mobius.components._activations import (
     ACT2FN,
     gelu,
@@ -21,6 +28,32 @@ from mobius.components._activations import (
 
 
 class TestActivations:
+    @pytest.mark.parametrize(
+        ("dtype", "array_dtype", "torch_dtype"),
+        [
+            (ir.DataType.FLOAT16, np.float16, torch.float16),
+            (ir.DataType.BFLOAT16, ml_dtypes.bfloat16, torch.bfloat16),
+        ],
+    )
+    def test_float32_silu_rounds_only_at_output(self, dtype, array_dtype, torch_dtype):
+        graph = ir.Graph([], [], nodes=[], opset_imports={"": 24})
+        builder = GraphBuilder(graph)
+        x = builder.input("x", dtype, [10])
+        output = Float32SiLU()(builder.op, x)
+        output.type, output.shape = x.type, x.shape
+        builder.add_output(output, "output")
+        swish = next(node for node in graph if node.op_type == "Swish")
+        assert swish.inputs[0].producer().attributes["to"].as_int() == ir.DataType.FLOAT
+        values = np.array([-1000, -8, -3, -0.75, -0.1, 0, 0.1, 0.75, 3, 8], np.float32)
+        inputs = values.astype(array_dtype)
+        reference = torch.nn.functional.silu(torch.tensor(values).to(torch_dtype))
+        session = OnnxModelSession(ir.Model(graph, ir_version=12))
+        try:
+            actual = session.run({"x": inputs})["output"]
+        finally:
+            session.close()
+        np.testing.assert_array_equal(actual.astype(np.float32), reference.float().numpy())
+
     def _run_activation(self, act_fn):
         builder, op, _graph = create_test_builder()
         x = create_test_input(builder, "x", [2, 3, 64])

@@ -122,10 +122,16 @@ weights and block-scaled FP8 experts. `--dequantize` is required: conversion
 streams parameters lazily into dense FP32 external data; `max_workers=1` bounds
 serialization to one parameter at a time. Native
 `bsgemm-moe` execution is **not** claimed. Plan for roughly 144 GB of dense FP32
-weights, plus the source checkpoint and runtime allocations. Only FP32 is
-currently accepted. FP16 is rejected because released residuals/down projections
-exceed its range; BF16 is rejected because reduced upstream numerical parity
-does not pass the `1e-2` gate. Tolerances are not relaxed to qualify it.
+weights, plus the source checkpoint and runtime allocations. FP16 is rejected
+until its FP32 residual/mixed-output projection path is implemented. An opt-in
+BF16 dense-weight path uses `dtype="bf16", execution_provider="onnx-standard"`;
+its reduced upstream pipeline passes full-logit parity at `1e-2` and 20 exact
+cached greedy frames on CUDA. Full-checkpoint BF16 validation is pending.
+Recurrent state, nonlinear opmath and RoPE remain FP32. Masks are preserved
+when padding is present; redundant causal masks are omitted on unpadded
+reduced-precision attention to enable the source-compatible fused CUDA path.
+ORT 1.28's native BF16 `CausalConvWithState` fallback does not initialize on
+CUDA, so use the standard-ONNX export path for this dtype.
 
 | Graph | Inputs | Outputs |
 |---|---|---|
@@ -157,9 +163,47 @@ outputs; retain only the last invocation's present caches. Later code inputs
 may initially be zero because logit slice `i` depends only on codes `0..i`.
 This teacher-forced ABI favors a compact export over efficient fused sampling.
 
-Sampling (including repetition-aware resampling), reference audio encoding,
-the separately distributed `codec.pth`, waveform decoding, and ORT GenAI
-generation integration are external. `--runtime onnx-genai` writes graph-derived
+Sampling math is exported in `policies/main_sampler.onnx` and
+`policies/codebook_sampler.onnx` and restored in `pkg.policy_components` on load.
+Both take last-step `logits` `[B,V]`, `temperature`/`top_p` FLOAT `[B]`, `top_k`,
+`seed`, and `counter` INT64 `[B]`. The main sampler also takes the last 16 main
+tokens as `history` INT64 `[B,16]`, restricts candidates to EOS and the semantic
+band, and rerolls only repeated semantic tokens. It returns `semantic_code`
+alongside `token`, `valid`, and `next_counter`. The codebook sampler returns the
+latter three fields and is invoked after each conditioned codebook projection.
+Check every `valid` result: invalid/nonfinite inputs produce `token=-1` and
+leave the counter unchanged.
+
+These policies implement Fish's drop-crossing-token nucleus rule, temperature
+floor `1e-5`, and exponential-race sampling. They use explicit, reproducible
+counter RNG state, **not Torch/Philox seed-bit identity**. Main sampling always
+consumes both first/retry draws; counters advance by twice the compact candidate
+count for main tokens and by the codebook vocabulary size for residual tokens,
+modulo `2**31-1`. The caller updates history and orchestrates the temporal loop;
+no huge neural weights are duplicated in the sampling policies.
+
+Reference audio encoding and ORT GenAI generation integration remain external.
+The waveform decoder can be
+exported as a separate FP32 ONNX graph:
+
+```python
+from mobius.tasks.fish_codec import load_drama3_codec_decoder
+
+codec = load_drama3_codec_decoder()  # pinned codec.pth, or checkpoint_path=local_path
+codec.save("output/drama-3-codec")
+# For generated NumPy frames [B,T,11], feed:
+codes = frames[..., 1:].transpose(0, 2, 1)  # INT64 [B,10,T]
+```
+
+`waveform_decoder` produces FP32 `[B,1,T*2048]` at 44100 Hz. It is a full-sequence
+decoder, not a streaming-cache codec. Keep it FP32 independently of the text/tower
+dtype. The pinned real codec matches all 40960 samples from the 20-frame native
+token golden on CPU: maximum absolute error `1.848e-6`, RMSE `1.184e-7`,
+SNR `117.79 dB`. This verifies decoding, not reference encoding or speech quality.
+Its residual-codebook upper clamping matches upstream, including tower IDs above
+the codec's nine residual vocabularies of 1024.
+
+`--runtime onnx-genai` writes graph-derived
 advisory component contracts, not an executable speech pipeline;
 `--runtime ort-genai` is explicitly rejected. Fish Audio's checkpoint/source
 license is separate from Mobius's MIT license.

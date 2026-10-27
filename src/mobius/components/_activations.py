@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import TYPE_CHECKING
+from collections.abc import Callable
 
+import onnx_ir as ir
 from onnxscript import OpBuilder, nn
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 def silu(op: OpBuilder, x):
@@ -66,7 +64,7 @@ def linear(op: OpBuilder, x):
 
 # Mapping from activation string names to functions.
 # Each function takes (op: OpBuilder, x) and returns the activated tensor.
-ACT2FN: OrderedDict[str, callable] = OrderedDict(
+ACT2FN: OrderedDict[str, Callable[[OpBuilder, ir.Value], ir.Value]] = OrderedDict(
     {
         "gegelu": gelu,
         "gelu": gelu,
@@ -120,3 +118,10 @@ class SiLU(nn.Module):
 
     def forward(self, op: OpBuilder, x: ir.Value):
         return silu(op, x)
+
+
+class Float32SiLU(SiLU):
+    """SiLU with FP32 opmath and a single cast to the activation dtype."""
+
+    def forward(self, op: OpBuilder, x: ir.Value):
+        return op.CastLike(op.Swish(op.Cast(x, to=ir.DataType.FLOAT)), x)

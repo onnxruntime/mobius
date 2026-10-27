@@ -34,6 +34,7 @@ REFERENCE_TOWER_DEVICE = 4
 EMBEDDING_DEVICE = 0
 AUDIO_DEVICE = 1
 DECODER_DEVICE = 2
+DTYPE = "f32"
 GOLDEN = (
     pathlib.Path(__file__).resolve().parents[1]
     / "testdata"
@@ -48,6 +49,7 @@ def event(kind, **details):
 
 
 def empty_cache_ports(ports):
+    import ml_dtypes
     import numpy as np
 
     caches = {}
@@ -60,7 +62,11 @@ def empty_cache_ports(ports):
             assert len(shape) == 4
             shape[2] = 0
         assert all(isinstance(dim, int) for dim in shape), (port.name, shape)
-        caches[port.name] = np.zeros(shape, dtype=np.float32)
+        type_name = getattr(port, "type", "tensor(float)")
+        dtypes = {"tensor(float)": np.float32, "tensor(bfloat16)": ml_dtypes.bfloat16}
+        if type_name not in dtypes:
+            raise ValueError(f"Unsupported cache dtype {type_name}: {port.name}")
+        caches[port.name] = np.zeros(shape, dtype=dtypes[type_name])
     return caches
 
 
@@ -139,7 +145,13 @@ def export(checkpoint):
 
     start = time.monotonic()
     event("export_start")
-    package = build(str(checkpoint), revision=REVISION, dtype="f32", keep_quantized=False)
+    package = build(
+        str(checkpoint),
+        revision=REVISION,
+        dtype=DTYPE,
+        keep_quantized=False,
+        execution_provider="onnx-standard" if DTYPE == "bf16" else "default",
+    )
     event("graph_and_bindings_ready", seconds=time.monotonic() - start)
     package.save(str(ROOT / "onnx"), max_workers=1)
     event("export_complete", seconds=time.monotonic() - start)
@@ -147,6 +159,7 @@ def export(checkpoint):
         json.dumps(
             {
                 "revision": REVISION,
+                "dtype": DTYPE,
                 "seconds": time.monotonic() - start,
                 "weight_loading_report": package.weight_loading_report,
                 "files": {
@@ -181,7 +194,7 @@ def reference(checkpoint):
         checkpoint,
         devices=[f"cuda:{device}" for device in REFERENCE_DEVICES],
         tower_device=f"cuda:{REFERENCE_TOWER_DEVICE}",
-        dtype=torch.float32,
+        dtype=torch.bfloat16 if DTYPE == "bf16" else torch.float32,
     )
     event("reference_loaded", seconds=time.monotonic() - start)
     backbone, tower = model.backbone, model.audio_decoder
@@ -271,7 +284,7 @@ def reference(checkpoint):
         "model_id": "fishaudio/drama-3",
         "revision": REVISION,
         "source_revision": SOURCE_REVISION,
-        "dtype": "float32",
+        "dtype": "bfloat16" if DTYPE == "bf16" else "float32",
         "prompt": PROMPT,
         "prompt_rows": len(prompt),
         "prefill_shape": list(logits.shape),
@@ -299,6 +312,7 @@ def validate_reference_golden(golden):
     import numpy as np
 
     committed = json.loads(GOLDEN.read_text())
+    assert golden["dtype"] == ("bfloat16" if DTYPE == "bf16" else "float32"), "dtype"
     for field in (
         "model_id",
         "revision",
@@ -319,15 +333,32 @@ def validate_reference_golden(golden):
     np.testing.assert_allclose(
         golden["prefill_last_top10_logits"],
         committed["prefill_last_top10_logits"],
-        atol=1e-4,
-        rtol=1e-4,
+        atol=1e-2 if DTYPE == "bf16" else 1e-4,
+        rtol=1e-2 if DTYPE == "bf16" else 1e-4,
     )
+
+
+def run_session(session, feeds):
+    """Bridge NumPy/BF16 feeds and outputs without changing their tensor types."""
+    import numpy as np
+
+    from mobius._testing.ort_inference import _numpy_to_ort_value, _ort_value_to_numpy
+
+    converted = {
+        name: _numpy_to_ort_value(np.ascontiguousarray(value) if value.ndim else value)
+        for name, value in feeds.items()
+    }
+    values = session(**converted)
+    ports = session.get_outputs()
+    assert len(ports) == len(values)
+    return {port.name: _ort_value_to_numpy(value) for port, value in zip(ports, values)}
 
 
 def compare():
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     import numpy as np
     import onnxruntime as ort
+    import onnxruntime_easy as ort_easy
 
     golden = json.loads((ROOT / "reference" / "golden.json").read_text())
     validate_reference_golden(golden)
@@ -350,7 +381,7 @@ def compare():
             options.enable_profiling = True
             options.profile_file_prefix = str(ROOT / "decoder-profile")
         event("ort_session_start", component=name, device=device)
-        sessions[name] = ort.InferenceSession(
+        sessions[name] = ort_easy.EasySession(
             str(ROOT / "onnx" / name / "model.onnx"),
             sess_options=options,
             providers=[
@@ -368,11 +399,10 @@ def compare():
         event("ort_session_ready", component=name, seconds=time.monotonic() - start)
 
     def run(name, feeds):
-        session = sessions[name]
-        output = session.run(None, feeds)
-        names = [port.name for port in session.get_outputs()]
-        assert len(names) == len(output)
-        return dict(zip(names, output))
+        return run_session(sessions[name], feeds)
+
+    expected_type = "tensor(bfloat16)" if DTYPE == "bf16" else "tensor(float)"
+    assert sessions["decoder"].get_outputs()[0].type == expected_type
 
     def empty_cache(name):
         return empty_cache_ports(sessions[name].get_inputs())
@@ -388,6 +418,7 @@ def compare():
 
     def check(name, actual, expected):
         assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
+        actual = actual.astype(np.float32)
         assert np.isfinite(actual).all(), name
         difference = np.abs(actual - expected)
         maximum = float(difference.max()) if difference.size else 0.0
@@ -397,7 +428,10 @@ def compare():
             "mean_abs_diff": float(difference.mean()) if difference.size else 0.0,
         }
         event("comparison", name=name, **metrics[name])
-        np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-3, err_msg=name)
+        tolerance = 1e-2 if DTYPE == "bf16" else 1e-3
+        np.testing.assert_allclose(
+            actual, expected, atol=tolerance, rtol=tolerance, err_msg=name
+        )
 
     count = config["audio_decoder_config"]["num_codebooks"]
     vocab = config["audio_decoder_config"]["vocab_size"]
@@ -480,7 +514,9 @@ def compare():
                     state["prefill_tower_logits"],
                 )
                 tower_cache = next_cache(prefilled)
-            main = int(candidates[decoded["logits"][0, -1, candidates].argmax()])
+            main = int(
+                candidates[decoded["logits"][0, -1, candidates].astype(np.float32).argmax()]
+            )
             codes = np.zeros((1, 1, count), dtype=np.int64)
             codes[0, 0, 0] = np.clip(main - semantic_start, 0, vocab - 1)
             semantic = np.array([[semantic_start <= main <= semantic_end]])
@@ -497,7 +533,9 @@ def compare():
                         "attention_mask": mask,
                     },
                 )
-                codes[0, 0, index + 1] = tower_output["codebook_logits"][0, 0, index].argmax()
+                codes[0, 0, index + 1] = (
+                    tower_output["codebook_logits"][0, 0, index].astype(np.float32).argmax()
+                )
             check(
                 f"state_{step}.tower", tower_output["codebook_logits"], state["tower_logits"]
             )
@@ -514,12 +552,12 @@ def compare():
         "status": "passed",
         "revision": REVISION,
         "source_revision": SOURCE_REVISION,
-        "dtype": "float32",
+        "dtype": "bfloat16" if DTYPE == "bf16" else "float32",
         "onnxruntime_version": ort.__version__,
         "provider": "CUDAExecutionProvider",
         "ort_graph_optimization": "ORT_ENABLE_BASIC",
-        "atol": 1e-3,
-        "rtol": 1e-3,
+        "atol": 1e-2 if DTYPE == "bf16" else 1e-3,
+        "rtol": 1e-2 if DTYPE == "bf16" else 1e-3,
         "prompt_rows": golden["prompt_rows"],
         "generated_frames": len(generated),
         "attempted_frames": golden["attempted_frames"],
@@ -538,6 +576,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("stage", choices=("download", "export", "reference", "compare"))
     parser.add_argument("--work-dir", required=True, type=pathlib.Path)
+    parser.add_argument("--dtype", choices=("f32", "bf16"), default="f32")
+    parser.add_argument("--golden", type=pathlib.Path)
     parser.add_argument("--reference-devices", default="0,1,2,3")
     parser.add_argument("--reference-tower-device", default=4, type=int)
     parser.add_argument("--embedding-device", default=0, type=int)
@@ -551,6 +591,16 @@ if __name__ == "__main__":
     EMBEDDING_DEVICE = args.embedding_device
     AUDIO_DEVICE = args.audio_device
     DECODER_DEVICE = args.decoder_device
+    DTYPE = args.dtype
+    if args.golden is not None:
+        GOLDEN = args.golden.resolve()
+    elif DTYPE == "bf16":
+        GOLDEN = GOLDEN.with_name("drama-3_bf16_tokens_generation.json")
+        if args.stage == "compare" and not GOLDEN.is_file():
+            parser.error(
+                "BF16 comparison requires --golden pointing to the independent "
+                "reference stage's golden.json until a BF16 golden is committed"
+            )
     if args.stage == "download":
         download()
     elif args.stage == "export":

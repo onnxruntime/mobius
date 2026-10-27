@@ -121,6 +121,7 @@ __all__ = [
     "SequenceMambaBlock",
     "SequenceSelectiveScan",
     "SiLU",
+    "Float32SiLU",
     "Siglip2NaFlexVisionEmbeddings",
     "Siglip2NaFlexVisionModel",
     "SigmoidTopKGate",
@@ -165,7 +166,7 @@ __all__ = [
     "siglip2_naflex_attention_mask",
 ]
 
-from mobius.components._activations import SiLU, get_activation
+from mobius.components._activations import Float32SiLU, SiLU, get_activation
 from mobius.components._attention import (
     Attention,
     FusedQKVAttention,

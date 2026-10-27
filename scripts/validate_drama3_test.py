@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import ml_dtypes
+import numpy as np
 import pytest
 import validate_drama3
 from validate_drama3 import (
@@ -58,6 +60,65 @@ def test_unknown_nonbatch_cache_dimension_is_an_error():
                 )
             ]
         )
+
+
+def test_empty_cache_preserves_bfloat16_and_float32_state_types():
+    cache = empty_cache_ports(
+        [
+            SimpleNamespace(
+                name="past_key_values.0.key",
+                shape=["batch", 2, "past", 8],
+                type="tensor(bfloat16)",
+            ),
+            SimpleNamespace(
+                name="past_key_values.0.recurrent_state",
+                shape=["batch", 2, 8, 8],
+                type="tensor(float)",
+            ),
+        ]
+    )
+    assert cache["past_key_values.0.key"].dtype == ml_dtypes.bfloat16
+    assert cache["past_key_values.0.recurrent_state"].dtype == np.float32
+
+
+def test_unknown_cache_dtype_is_an_error():
+    with pytest.raises(ValueError, match="Unsupported cache dtype"):
+        empty_cache_ports(
+            [
+                SimpleNamespace(
+                    name="past_key_values.0.conv_state",
+                    shape=["batch", 8, 3],
+                    type="tensor(double)",
+                )
+            ]
+        )
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_runtime_bridge_preserves_types_and_output_names(tmp_path, dtype):
+    import onnx_ir as ir
+    import onnxruntime as ort
+    import onnxruntime_easy as ort_easy
+    from onnxscript import GraphBuilder
+
+    element_type = ir.DataType.FLOAT if dtype == "float32" else ir.DataType.BFLOAT16
+    array_type = np.float32 if dtype == "float32" else ml_dtypes.bfloat16
+    graph = ir.Graph([], [], nodes=[], opset_imports={"": 24})
+    builder = GraphBuilder(graph)
+    x = builder.input("x", element_type, [2])
+    result = builder.op.Identity(x)
+    result.type, result.shape = x.type, x.shape
+    builder.add_output(result, "result")
+    path = tmp_path / "bridge.onnx"
+    ir.save(ir.Model(graph, ir_version=12), path)
+    session = ort_easy.EasySession(
+        str(path), sess_options=ort.SessionOptions(), providers=["CPUExecutionProvider"]
+    )
+    values = np.array([0.75, -1.5], dtype=array_type)
+    output = validate_drama3.run_session(session, {"x": values})
+    assert set(output) == {"result"}
+    assert output["result"].dtype == values.dtype
+    np.testing.assert_array_equal(output["result"], values)
 
 
 def test_committed_token_golden_is_pinned_and_complete():

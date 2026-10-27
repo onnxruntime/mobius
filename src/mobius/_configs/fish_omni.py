@@ -20,7 +20,7 @@ DRAMA3_SOURCE_REVISION = "541566932abbaebcb0a40e562a1f846738383f38"
 
 @dataclasses.dataclass
 class FishOmniConfig(ArchitectureConfig):
-    """Drama 3 token generation; the separately distributed codec is external."""
+    """Drama 3 token generation; the waveform codec is exported separately."""
 
     tower: ArchitectureConfig | None = None
     num_codebooks: int = 10
@@ -195,10 +195,9 @@ class FishOmniConfig(ArchitectureConfig):
                 "Drama 3 affine component quantization is unsupported; "
                 "use the FP32 graph with explicit FP8 checkpoint dequantization."
             )
-        if self.dtype != ir.DataType.FLOAT:
+        if self.dtype not in (ir.DataType.FLOAT, ir.DataType.BFLOAT16):
             raise ValueError(
-                "Drama 3 currently requires dtype='f32'. FP16 residuals/down projections "
-                "overflow; BF16 has not passed the upstream numerical parity gate."
+                "Drama 3 FP16 requires an FP32 residual/mixed-output projection path."
             )
         if self.tower is None:
             raise ValueError("Drama 3 requires an audio tower configuration")

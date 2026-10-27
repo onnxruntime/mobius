@@ -227,6 +227,8 @@ class GatedDeltaNet(nn.Module):
         # Decomposed form of op.LpNormalization(x, axis=-1, p=2).
         # TODO: Use op.LpNormalization directly once ORT >=1.25 supports it.
         q_4d = op.Reshape(query, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
+        if self._stash_type != self._dtype:
+            q_4d = op.Cast(q_4d, to=self._stash_type)
         q_norm_squared = op.ReduceSumSquare(q_4d, [-1], keepdims=1)
         if self._qk_l2norm_eps:
             q_norm_squared = op.Add(
@@ -237,6 +239,8 @@ class GatedDeltaNet(nn.Module):
         query = op.Reshape(op.Div(q_4d, q_l2), qk_3d_shape)  # (B, T, key_dim)
 
         k_4d = op.Reshape(key, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
+        if self._stash_type != self._dtype:
+            k_4d = op.Cast(k_4d, to=self._stash_type)
         k_norm_squared = op.ReduceSumSquare(k_4d, [-1], keepdims=1)
         if self._qk_l2norm_eps:
             k_norm_squared = op.Add(
@@ -248,7 +252,8 @@ class GatedDeltaNet(nn.Module):
 
         # === Compute gating parameters ===
         # beta: (B, T, num_v_heads)
-        beta = op.Sigmoid(b)
+        beta_input = op.Cast(b, to=self._stash_type) if self._stash_type != self._dtype else b
+        beta = op.Sigmoid(beta_input)
         # Compute decay: g = -exp(A_log) * softplus(a + dt_bias).
         # Mirrors HF: -A_log.float().exp() * softplus(a.float() + dt_bias).
         if self._dtype == ir.DataType.FLOAT16 or self._stash_type != self._dtype:

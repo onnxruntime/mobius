@@ -6,12 +6,16 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import importlib.util
 import sys
 import types
 import urllib.request
 
+import ml_dtypes
 import numpy as np
+import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 import torch
 from _test_configs import FISH_OMNI_CONFIG
@@ -103,7 +107,8 @@ def _empty_cache(model):
         if value.name.endswith((".key", ".value")):
             shape[2] = 0
         assert all(isinstance(dim, int) for dim in shape), (value.name, shape)
-        result[value.name] = np.zeros(shape, dtype=np.float32)
+        dtype = ml_dtypes.bfloat16 if value.dtype == ir.DataType.BFLOAT16 else np.float32
+        result[value.name] = np.zeros(shape, dtype=dtype)
     return result
 
 
@@ -116,40 +121,75 @@ def _next_cache(outputs):
 
 
 @pytest.mark.parametrize("backbone_codebooks", [0, 1])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        ir.DataType.FLOAT,
+        pytest.param(
+            ir.DataType.BFLOAT16,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available()
+                or "CUDAExecutionProvider" not in ort.get_available_providers(),
+                reason="BF16 numerical parity requires PyTorch and ORT CUDA",
+            ),
+        ),
+    ],
+)
 def test_fish_omni_pipeline_prefill_and_cached_decode(
-    upstream, tmp_path, monkeypatch, backbone_codebooks
+    upstream, tmp_path, monkeypatch, backbone_codebooks, dtype
 ):
     raw = copy.deepcopy(FISH_OMNI_CONFIG)
     raw["audio_decoder_config"]["vq_backbone_codebooks"] = backbone_codebooks
     reference_config = upstream["config"].FishOmniConfig.from_dict(raw)
     torch.manual_seed(42)
-    tolerance = 1e-4
+    tolerance = 1e-4 if dtype == ir.DataType.FLOAT else 1e-2
+    torch_dtype = torch.float32 if dtype == ir.DataType.FLOAT else torch.bfloat16
+    device = "cpu" if dtype == ir.DataType.FLOAT else "cuda:0"
     backbone = upstream["backbone"].FishOmniBackbone(
-        reference_config.text, dtype=torch.float32
+        reference_config.text, dtype=torch_dtype, device=device
     )
-    tower = upstream["tower"].FishOmniAudioDecoder(reference_config, dtype=torch.float32)
+    tower = upstream["tower"].FishOmniAudioDecoder(
+        reference_config, dtype=torch_dtype, device=device
+    )
     for module in (backbone, tower):
         for parameter in module.parameters():
             torch.nn.init.normal_(parameter, mean=0.0, std=0.1)
         module.eval()
-    config = FishOmniConfig.from_transformers(_dict_to_pretrained_config(raw))
-    package = build_from_module(FishOmniModel(config), config, task="fish-omni")
+    config = dataclasses.replace(
+        FishOmniConfig.from_transformers(_dict_to_pretrained_config(raw)), dtype=dtype
+    )
+    package = build_from_module(
+        FishOmniModel(config),
+        config,
+        task="fish-omni",
+        execution_provider="default" if dtype == ir.DataType.FLOAT else "onnx-standard",
+    )
     save_file(_checkpoint(backbone, tower), tmp_path / "model.safetensors")
     stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
     output = tmp_path / "onnx"
     package.save(str(output), max_workers=1, progress_bar=False)
     package = ModelPackage.load(str(output))
-    sessions = {name: OnnxModelSession(model) for name, model in package.items()}
+    assert set(package.policy_components) == {"main_sampler", "codebook_sampler"}
+    if dtype != ir.DataType.FLOAT:
+        ort.preload_dlls()
+    sessions = {
+        name: OnnxModelSession(model, device="cpu" if dtype == ir.DataType.FLOAT else "cuda")
+        for name, model in package.items()
+    }
     backbone.setup_caches(1, 32)
     tower.setup_caches(32)
     caches = {name: _empty_cache(model) for name, model in package.items()}
-    frames = torch.tensor([[1, 0, 0, 0], [16, 0, 4, 7], [30, 14, 3, 5], [3, 0, 0, 0]])
-    next_frames = torch.tensor([[16, 0, 2, 8], [20, 4, 3, 1], [2, 0, 0, 0], [18, 2, 6, 9]])
+    frames = torch.tensor(
+        [[1, 0, 0, 0], [16, 0, 4, 7], [30, 14, 3, 5], [3, 0, 0, 0]], device=device
+    )
+    next_frames = torch.tensor(
+        [[16, 0, 2, 8], [20, 4, 3, 1], [2, 0, 0, 0], [18, 2, 6, 9]], device=device
+    )
     start = 0
     sampled_logits = []
 
     def greedy(logits, *args, **kwargs):
-        sampled_logits.append(logits.detach().float().numpy())
+        sampled_logits.append(logits.detach().float().cpu().numpy())
         return logits.argmax(dim=-1)
 
     monkeypatch.setattr(
@@ -162,14 +202,15 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
         # DeltaNet state and all shared/residual tower caches across time.
         with torch.no_grad():
             for length in [4] + [1] * 20:
-                positions = torch.arange(start, start + length)
+                positions = torch.arange(start, start + length, device=device)
+                positions_np = positions.cpu().numpy()[None]
                 if start:
                     frames = next_frames[-1:].clone()
-                embedded = sessions["embedding"].run({"frames": frames.numpy()[None]})
+                embedded = sessions["embedding"].run({"frames": frames.cpu().numpy()[None]})
                 ref_embed = tower.embed_backbone(frames, backbone.embed(frames[:, 0]))
                 np.testing.assert_allclose(
                     embedded["inputs_embeds"][0].astype(np.float32),
-                    ref_embed.float().numpy(),
+                    ref_embed.float().cpu().numpy(),
                     atol=tolerance,
                     rtol=tolerance,
                 )
@@ -178,22 +219,24 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                     {
                         **caches["decoder"],
                         "inputs_embeds": embedded["inputs_embeds"],
-                        "position_ids": positions.numpy()[None],
+                        "position_ids": positions_np,
                         "attention_mask": mask,
                     }
                 )
                 hidden = backbone(inputs_embeds=ref_embed[None], input_pos=positions)
                 np.testing.assert_allclose(
                     outputs["hidden_states"].astype(np.float32),
-                    hidden.float().numpy(),
+                    hidden.float().cpu().numpy(),
                     atol=tolerance,
                     rtol=tolerance,
+                    err_msg=f"decoder hidden states at position {start}",
                 )
                 np.testing.assert_allclose(
                     outputs["logits"].astype(np.float32),
-                    backbone.compute_logits(hidden).float().numpy(),
+                    backbone.compute_logits(hidden).float().cpu().numpy(),
                     atol=tolerance,
                     rtol=tolerance,
+                    err_msg=f"decoder logits at position {start}",
                 )
                 if start:
                     candidates = [
@@ -226,7 +269,7 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                                 "shared_input": embedded["shared_input"],
                                 "codes": next_codes,
                                 "semantic_mask": semantic,
-                                "position_ids": positions.numpy()[None],
+                                "position_ids": positions_np,
                                 "attention_mask": mask,
                             }
                         )
@@ -241,14 +284,14 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                         hidden[0],
                         positions,
                         frames,
-                        torch.zeros(1, 16, dtype=torch.int64),
+                        torch.zeros(1, 16, dtype=torch.int64, device=device),
                         temperature=1.0,
                         top_k=16,
                         top_p=1.0,
                     )
                     np.testing.assert_array_equal(
                         np.concatenate((np.array([[[main]]]), next_codes), axis=-1)[0],
-                        next_frames.numpy(),
+                        next_frames.cpu().numpy(),
                     )
                     np.testing.assert_allclose(
                         tower_output["codebook_logits"].astype(np.float32),
@@ -266,9 +309,9 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                         **caches["audio_decoder"],
                         "hidden_states": outputs["hidden_states"],
                         "shared_input": embedded["shared_input"],
-                        "codes": next_frames[:, 1:].numpy()[None],
-                        "semantic_mask": semantic.numpy()[None],
-                        "position_ids": positions.numpy()[None],
+                        "codes": next_frames[:, 1:].cpu().numpy()[None],
+                        "semantic_mask": semantic.cpu().numpy()[None],
+                        "position_ids": positions_np,
                         "attention_mask": mask,
                     }
                 )
@@ -279,7 +322,7 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                 ):
                     h = layer(h, next_frames[:, i + 1], semantic, positions)
                     expected.append(head(h))
-                expected = torch.stack(expected, dim=-2)[None].float().numpy()
+                expected = torch.stack(expected, dim=-2)[None].float().cpu().numpy()
                 np.testing.assert_allclose(
                     tower_output["codebook_logits"].astype(np.float32),
                     expected,

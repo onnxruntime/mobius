@@ -4,12 +4,14 @@
 """Drama 3 frame embeddings, hybrid text decoder, and temporal codebook decoder.
 
 Replicates Fish Speech's FishOmniBackbone and FishOmniAudioDecoder. Graphs
-consume token/code frames rather than waveforms; prompt formatting, sampling,
-and the separately distributed audio codec remain caller responsibilities.
+consume token/code frames rather than waveforms. The task attaches ONNX sampling
+policies; the waveform codec is exported independently by mobius.tasks.fish_codec.
+The caller still formats prompts and orchestrates temporal decoding.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import ClassVar
 
@@ -19,16 +21,192 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import ArchitectureConfig
 from mobius._configs.fish_omni import FishOmniConfig
 from mobius.components import (
+    MLP,
     Embedding,
+    Float32SiLU,
     Linear,
     OffsetRMSNorm,
+    PostGatedRMSNorm,
+    Qwen35Attention,
     SoftmaxTopKGate,
     apply_rotary_pos_emb,
     create_attention_bias,
     initialize_rope,
 )
 from mobius.components._attention import _apply_attention
-from mobius.models.qwen35 import Qwen35MoEDecoderLayer, Qwen35MoETextModel
+from mobius.models.qwen35 import (
+    Qwen35MoEBlock,
+    Qwen35MoEDecoderLayer,
+    Qwen35MoETextModel,
+)
+
+
+def _float32_rope(config: ArchitectureConfig) -> nn.Module:
+    rope = initialize_rope(dataclasses.replace(config, dtype=ir.DataType.FLOAT))
+    assert rope is not None
+    return rope
+
+
+def _sigmoid_float32(op, value):
+    return op.CastLike(op.Sigmoid(op.Cast(value, to=ir.DataType.FLOAT)), value)
+
+
+def _apply_fish_attention(
+    op, query, key, value, bias, past_key, past_value, *, dtype, **kwargs
+):
+    if dtype == ir.DataType.FLOAT or bias is None:
+        return _apply_attention(op, query, key, value, bias, past_key, past_value, **kwargs)
+
+    # The last causal query can see every key. An all-zero last bias row
+    # therefore proves there is no padding; Attention supplies causality itself.
+    # Omitting that redundant mask enables the source's fused BF16 attention
+    # instead of rounding softmax probabilities in ORT's unfused fallback.
+    last_row = op.Cast(op.Gather(bias, -1, axis=-2), to=ir.DataType.FLOAT)
+    unpadded = op.Equal(
+        op.ReduceMax(op.Abs(last_row), keepdims=False),
+        op.CastLike(0.0, last_row),
+    )
+
+    def unmasked(branch_op):
+        return _apply_attention(
+            branch_op, query, key, value, None, past_key, past_value, **kwargs
+        )
+
+    def masked(branch_op):
+        return _apply_attention(
+            branch_op, query, key, value, bias, past_key, past_value, **kwargs
+        )
+
+    branches = []
+    for name, body in (("unpadded_attention", unmasked), ("padded_attention", masked)):
+        op.builder.push_module(name)
+        branch = op.builder.subgraph(
+            body,
+            inputs=[],
+            outputs=[
+                ir.Value(name=f"{name}_{suffix}") for suffix in ("output", "key", "value")
+            ],
+            name=name,
+        )
+        op.builder.pop_module()
+        branches.append(branch)
+    return op.If(unpadded, then_branch=branches[0], else_branch=branches[1], _outputs=3)
+
+
+def _rotate_float32(op, value, positions, *, heads, rotary_dim, interleaved):
+    rotated = apply_rotary_pos_emb(
+        op,
+        op.Cast(value, to=ir.DataType.FLOAT),
+        positions,
+        num_heads=heads,
+        rotary_embedding_dim=rotary_dim,
+        interleaved=interleaved,
+    )
+    return op.CastLike(rotated, value)
+
+
+class _FishGatedNorm(PostGatedRMSNorm):
+    """Normalize in FP32, round activation/scale, then apply the FP32 SiLU gate."""
+
+    def forward(self, op, hidden_states, gate):
+        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        unit_scale = op.Expand(op.Constant(value_float=1.0), [self.hidden_size])
+        normalized = op.RMSNormalization(
+            hidden_f32,
+            unit_scale,
+            epsilon=self.variance_epsilon,
+            axis=-1,
+        )
+        rounded = op.CastLike(normalized, hidden_states)
+        scaled = op.Mul(rounded, self.weight)
+        gated = op.Mul(
+            op.Cast(scaled, to=ir.DataType.FLOAT),
+            op.Swish(op.Cast(gate, to=ir.DataType.FLOAT)),
+        )
+        return op.CastLike(gated, hidden_states)
+
+
+class _FishAttention(Qwen35Attention):
+    """Gated GQA with FP32 partial rotation before rounding Q/K back."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._compute_dtype = config.dtype
+
+    def forward(
+        self, op, hidden_states, attention_bias, position_embeddings, past_key_value=None
+    ):
+        q_gate = op.Reshape(
+            self.q_proj(op, hidden_states),
+            [0, 0, self.num_attention_heads, self.head_dim * 2],
+        )
+        query, gate = op.Split(q_gate, num_outputs=2, axis=-1, _outputs=2)
+        gate = op.Reshape(gate, [0, 0, -1])
+        key = op.Reshape(self.k_proj(op, hidden_states), [0, 0, -1, self.head_dim])
+        query = op.Reshape(self.q_norm(op, query), [0, 0, -1])
+        key = op.Reshape(self.k_norm(op, key), [0, 0, -1])
+        query = _rotate_float32(
+            op,
+            query,
+            position_embeddings,
+            heads=self.num_attention_heads,
+            rotary_dim=self.rotary_embedding_dim,
+            interleaved=self._rope_interleave,
+        )
+        key = _rotate_float32(
+            op,
+            key,
+            position_embeddings,
+            heads=self.num_key_value_heads,
+            rotary_dim=self.rotary_embedding_dim,
+            interleaved=self._rope_interleave,
+        )
+        attended, pk, pv = _apply_fish_attention(
+            op,
+            query,
+            key,
+            self.v_proj(op, hidden_states),
+            attention_bias,
+            past_key_value[0] if past_key_value is not None else None,
+            past_key_value[1] if past_key_value is not None else None,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            scale=self.scaling,
+            dtype=self._compute_dtype,
+        )
+        return self.o_proj(op, op.Mul(attended, _sigmoid_float32(op, gate))), (pk, pv)
+
+
+class _FishMoEBlock(Qwen35MoEBlock):
+    """Accumulate weighted expert outputs in FP32 before returning model dtype."""
+
+    def __init__(self, config, gate=None):
+        super().__init__(config, gate=gate)
+        if self.experts is not None:
+            for expert in self.experts:
+                assert isinstance(expert, MLP)
+                expert.act_fn = Float32SiLU()
+        self.shared_expert.act_fn = Float32SiLU()
+
+    def forward(self, op, hidden_states):
+        if self.experts is None:
+            return super().forward(op, hidden_states)
+        routing, selected = self.gate(op, hidden_states)
+        combined = None
+        for index, expert in enumerate(self.experts):
+            output = expert(op, hidden_states)
+            match = op.CastLike(op.Equal(selected, index), routing)
+            weight = op.ReduceSum(op.Mul(routing, match), [-1], keepdims=True)
+            contribution = op.Mul(
+                op.Cast(output, to=ir.DataType.FLOAT),
+                op.Cast(weight, to=ir.DataType.FLOAT),
+            )
+            combined = contribution if combined is None else op.Add(combined, contribution)
+        assert combined is not None
+        routed = op.CastLike(combined, hidden_states)
+        shared = self.shared_expert(op, hidden_states)
+        gate = _sigmoid_float32(op, self.shared_expert_gate(op, hidden_states))
+        return op.Add(routed, op.Mul(shared, gate))
 
 
 class _FishRouter(SoftmaxTopKGate):
@@ -43,21 +221,42 @@ class _FishRouter(SoftmaxTopKGate):
         return op.CastLike(weights, hidden_states), indices
 
 
+class _FishDecoderLayer(Qwen35MoEDecoderLayer):
+    def __init__(self, config, layer_idx):
+        super().__init__(config, layer_idx)
+        self.mlp = _FishMoEBlock(
+            config,
+            gate=_FishRouter(
+                config.hidden_size,
+                config.num_local_experts,
+                config.num_experts_per_tok,
+                norm_topk_prob=config.norm_topk_prob,
+            ),
+        )
+        if self.layer_type == "linear_attention":
+            self.linear_attn.norm = _FishGatedNorm(
+                config.linear_value_head_dim,
+                eps=config.rms_norm_eps,
+            )
+        else:
+            self.self_attn = _FishAttention(config)
+
+
+class _FishTextModel(Qwen35MoETextModel):
+    def __init__(self, config):
+        super().__init__(config)
+        self.layers = nn.ModuleList(
+            [_FishDecoderLayer(config, index) for index in range(config.num_hidden_layers)]
+        )
+        self.rotary_emb = _float32_rope(config)
+
+
 class FishOmniBackbone(nn.Module):
     """Hybrid Qwen3.5-MoE decoder producing both logits and normalized hidden states."""
 
     def __init__(self, config: FishOmniConfig):
         super().__init__()
-        self.model = Qwen35MoETextModel(config)
-        assert config.num_local_experts is not None and config.num_experts_per_tok is not None
-        for layer in self.model.layers:
-            assert isinstance(layer, Qwen35MoEDecoderLayer)
-            layer.mlp.gate = _FishRouter(
-                config.hidden_size,
-                config.num_local_experts,
-                config.num_experts_per_tok,
-                norm_topk_prob=config.norm_topk_prob,
-            )
+        self.model = _FishTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(self, op, inputs_embeds, attention_mask, position_ids, past_key_values):
@@ -106,8 +305,10 @@ class FishOmniEmbedding(nn.Module):
 
         count = cfg.vq_backbone_codebooks
         mixed = op.Div(
-            op.Add(text, code_sum(1, count + 1)), op.CastLike(math.sqrt(1 + count), text)
+            op.Cast(op.Add(text, code_sum(1, count + 1)), to=ir.DataType.FLOAT),
+            math.sqrt(1 + count),
         )
+        mixed = op.CastLike(mixed, text)
         unseen = code_sum(count + 1, cfg.num_codebooks)
         zero = op.CastLike(0.0, text)
         return op.Where(semantic, mixed, text), op.Where(semantic, unseen, zero)
@@ -139,23 +340,23 @@ class _TowerAttention(nn.Module):
         q = self.q_norm(op, op.Reshape(q, [0, 0, -1, cfg.head_dim]))
         k = self.k_norm(op, op.Reshape(k, [0, 0, -1, cfg.head_dim]))
         q, k = op.Reshape(q, [0, 0, -1]), op.Reshape(k, [0, 0, -1])
-        q = apply_rotary_pos_emb(
+        q = _rotate_float32(
             op,
             q,
             positions,
-            num_heads=cfg.num_attention_heads,
-            rotary_embedding_dim=self.rotary_dim,
+            heads=cfg.num_attention_heads,
+            rotary_dim=self.rotary_dim,
             interleaved=True,
         )
-        k = apply_rotary_pos_emb(
+        k = _rotate_float32(
             op,
             k,
             positions,
-            num_heads=cfg.num_key_value_heads,
-            rotary_embedding_dim=self.rotary_dim,
+            heads=cfg.num_key_value_heads,
+            rotary_dim=self.rotary_dim,
             interleaved=True,
         )
-        attended, pk, pv = _apply_attention(
+        attended, pk, pv = _apply_fish_attention(
             op,
             q,
             k,
@@ -166,8 +367,9 @@ class _TowerAttention(nn.Module):
             num_attention_heads=cfg.num_attention_heads,
             num_key_value_heads=cfg.num_key_value_heads,
             scale=cfg.head_dim**-0.5,
+            dtype=cfg.dtype,
         )
-        return self.wo(op, op.Mul(attended, op.Sigmoid(gate))), (pk, pv)
+        return self.wo(op, op.Mul(attended, _sigmoid_float32(op, gate))), (pk, pv)
 
 
 class _TowerMLP(nn.Module):
@@ -176,10 +378,11 @@ class _TowerMLP(nn.Module):
         self.w1 = Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.w3 = Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.w2 = Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.act_fn = Float32SiLU()
 
     def forward(self, op, hidden):
         gate = self.w1(op, hidden)
-        return self.w2(op, op.Mul(op.Mul(gate, op.Sigmoid(gate)), self.w3(op, hidden)))
+        return self.w2(op, op.Mul(self.act_fn(op, gate), self.w3(op, hidden)))
 
 
 class _TowerTransformer(nn.Module):
@@ -233,14 +436,15 @@ class FishOmniAudioDecoder(nn.Module):
         super().__init__()
         assert config.tower is not None
         self.config = config
+        tower_config = dataclasses.replace(config.tower, dtype=config.dtype)
         self.shared_layers = nn.ModuleList(
             [
-                _TowerLayer(config.tower, shared=True)
+                _TowerLayer(tower_config, shared=True)
                 for _ in range(config.shared_enrichment_layers)
             ]
         )
         self.residual_layers = nn.ModuleList(
-            [_TowerLayer(config.tower, shared=False) for _ in range(config.num_codebooks - 1)]
+            [_TowerLayer(tower_config, shared=False) for _ in range(config.num_codebooks - 1)]
         )
         self.codebook_heads = nn.ModuleList(
             [
@@ -248,9 +452,7 @@ class FishOmniAudioDecoder(nn.Module):
                 for _ in range(config.num_codebooks - 1)
             ]
         )
-        rotary_emb = initialize_rope(config.tower)
-        assert rotary_emb is not None
-        self.rotary_emb = rotary_emb
+        self.rotary_emb = _float32_rope(config.tower)
 
     def forward(
         self,
@@ -302,8 +504,9 @@ class FishOmniModel(nn.Module):
     """Fish Audio Drama 3 token-generation pipeline with temporal codebook MTP.
 
     Exports frame embedding, hybrid MoE decoder, and teacher-forced audio decoder
-    graphs. Sampling, reference-bracket prompt formatting, and waveform codec
-    execution are external. FP8 experts require explicit streaming dequantization.
+    graphs with ONNX sampling policies. Reference-bracket prompt formatting and
+    temporal orchestration remain caller-owned; the waveform codec is exported
+    separately. FP8 experts require explicit streaming dequantization.
     """
 
     default_task: str = "fish-omni"
