@@ -19,6 +19,7 @@ from safetensors.torch import save_file
 
 from mobius import build_from_module
 from mobius._configs.fish_omni import DRAMA3_SOURCE_REVISION, FishOmniConfig
+from mobius._model_package import ModelPackage
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations.transformers._config_resolver import _dict_to_pretrained_config
 from mobius.integrations.transformers._fish_omni_weights import (
@@ -97,10 +98,11 @@ def _empty_cache(model):
     for value in model.graph.inputs:
         if not value.name.startswith("past_key_values."):
             continue
-        shape = [
-            dim if isinstance(dim, int) else (0 if str(dim) == "past_sequence_len" else 1)
-            for dim in value.shape
-        ]
+        shape = list(value.shape)
+        shape[0] = 1
+        if value.name.endswith((".key", ".value")):
+            shape[2] = 0
+        assert all(isinstance(dim, int) for dim in shape), (value.name, shape)
         result[value.name] = np.zeros(shape, dtype=np.float32)
     return result
 
@@ -134,6 +136,9 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
     package = build_from_module(FishOmniModel(config), config, task="fish-omni")
     save_file(_checkpoint(backbone, tower), tmp_path / "model.safetensors")
     stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    output = tmp_path / "onnx"
+    package.save(str(output), max_workers=1, progress_bar=False)
+    package = ModelPackage.load(str(output))
     sessions = {name: OnnxModelSession(model) for name, model in package.items()}
     backbone.setup_caches(1, 32)
     tower.setup_caches(32)
