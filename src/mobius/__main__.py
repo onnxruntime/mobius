@@ -529,6 +529,8 @@ def _save_package(
 ) -> None:
     """Save a ModelPackage to disk, applying optimizations and runtime configs."""
     runtime = getattr(args, "runtime", None)
+    if getattr(args, "inline_functions", False):
+        pkg.inline_functions()
 
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
@@ -794,6 +796,9 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             target_config=target_config,
             _gguf_model=gguf_model if runtime is not None else None,
         )
+
+    if getattr(args, "inline_functions", False):
+        pkg.inline_functions()
 
     if args.release:
         for model in pkg.values():
@@ -1242,6 +1247,11 @@ def _add_shared_build_arguments(parser: argparse.ArgumentParser) -> None:
         choices=["onnx", "safetensors"],
         default="onnx",
         help="External data format (default: onnx).",
+    )
+    parser.add_argument(
+        "--inline-functions",
+        action="store_true",
+        help="Inline Mobius component functions before saving for flat ONNX consumers.",
     )
     parser.add_argument(
         "--max-shard-size",

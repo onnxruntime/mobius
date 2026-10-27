@@ -159,8 +159,9 @@ def test_maybe_apply_opset_lowering_skipped_for_default_ep(
     assert pkg["embedding"].graph.opset_imports[""] == 24
 
 
-def test_maybe_apply_opset_lowering_skipped_for_cpu_ep(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("execution_provider", ["cpu", "onnx-standard"])
+def test_maybe_apply_opset_lowering_skipped_for_cpu_and_canonical(
+    monkeypatch: pytest.MonkeyPatch, execution_provider: str
 ) -> None:
     # The "cpu" EP gate: the CPU EP already registers opset-24 kernels, so
     # lowering never fires for it even with the flag enabled (mirrors the
@@ -168,7 +169,7 @@ def test_maybe_apply_opset_lowering_skipped_for_cpu_ep(
     monkeypatch.setattr(flags, "ort_lower_opset_for_ep", True)
     pkg = ModelPackage({"embedding": _model_with(_standard_nodes())})
 
-    _maybe_apply_opset_lowering(pkg, execution_provider="cpu")
+    _maybe_apply_opset_lowering(pkg, execution_provider=execution_provider)
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
 

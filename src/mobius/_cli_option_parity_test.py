@@ -223,7 +223,15 @@ class TestSharedSaveOptions:
         assert str(parsed) == value or parsed == int(value)
 
     @pytest.mark.parametrize(
-        "flag", ["--max-shard-size", "--max-workers", "--external-data", "--dtype", "--ep"]
+        "flag",
+        [
+            "--max-shard-size",
+            "--max-workers",
+            "--external-data",
+            "--dtype",
+            "--ep",
+            "--inline-functions",
+        ],
     )
     def test_help_text_matches_across_commands(self, flag):
         """Same flag, same wording — these had already drifted once."""
@@ -240,6 +248,14 @@ class TestSharedSaveOptions:
             helps[command] = action.help
         assert helps["build"] == helps["build-gguf"], (
             f"{flag} is documented differently on build vs build-gguf: {helps}"
+        )
+
+    @pytest.mark.parametrize("command", ["build", "build-gguf"])
+    def test_inline_functions_is_opt_in(self, command):
+        argv = [command, *_SOURCE_ARGS[command], "--output", "out_dir"]
+        assert build_parser().parse_args(argv).inline_functions is False
+        assert (
+            build_parser().parse_args([*argv, "--inline-functions"]).inline_functions is True
         )
 
     def test_max_shard_size_reaches_the_gguf_save(self):

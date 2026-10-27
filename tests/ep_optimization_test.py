@@ -21,9 +21,12 @@ import onnx
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
+import torch
 from _test_configs import _base_config
 
 from mobius._builder import build_from_module
+from mobius._component_functions import COMPONENT_DOMAIN, inline_component_functions
+from mobius._model_package import ModelPackage
 from mobius._optimizations import _count_ops, optimize_model, validate_standard_onnx
 from mobius._pipeline_contract import declare_arbitrary_attention_mask
 from mobius._registry import registry
@@ -818,7 +821,10 @@ def test_onnx_standard_validates_after_transformers_weight_binding(monkeypatch):
 
 
 def _non_standard_nodes(model: ir.Model) -> list[tuple[str, str]]:
-    """Return (domain, op_type) pairs for all nodes with non-standard domains."""
+    """Check the semantic closure, then inspect the flat consumer representation."""
+    validate_standard_onnx(model)
+    model = model.clone()
+    inline_component_functions(model)
     return [
         (node.domain, node.op_type)
         for node in model.graph.all_nodes()
@@ -885,6 +891,122 @@ def test_onnx_standard_ep_has_no_gqa():
     model = pkg["model"]
     gqa_count = _count_ops(model, "GroupQueryAttention")
     assert gqa_count == 0, f"'onnx-standard' EP should have no GQA, got {gqa_count}"
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+def test_component_functions_roundtrip_and_multistep_decode(tmp_path: Path, dtype):
+    config = _base_config(dtype=dtype, tie_word_embeddings=True)
+    package = build_from_module(
+        registry.get("llama")(config), config, execution_provider="onnx-standard"
+    )
+    model = package["model"]
+    assert model.functions
+    assert all(function.domain == COMPONENT_DOMAIN for function in model.functions.values())
+    assert any(node.domain == COMPONENT_DOMAIN for node in model.graph)
+    rng = np.random.default_rng(42)
+    weights = {
+        name: torch.from_numpy(
+            rng.normal(0, 0.1, size=tuple(value.shape)).astype(value.dtype.numpy())
+        )
+        for name, value in model.graph.initializers.items()
+        if value.const_value is None
+    }
+    package.apply_weights(weights)
+    canonical_dir = tmp_path / "canonical"
+    package.save(str(canonical_dir), progress_bar=False)
+    canonical = ModelPackage.load(str(canonical_dir))
+    validate_standard_onnx(canonical["model"])
+    onnx.checker.check_model(str(canonical_dir / "model.onnx"), full_check=True)
+
+    flat = ModelPackage.load(str(canonical_dir))
+    initializers = set(flat["model"].graph.initializers)
+    flat.inline_functions()
+    assert not flat["model"].functions
+    assert set(flat["model"].graph.initializers) == initializers
+    flat_dir = tmp_path / "flat"
+    flat.save(str(flat_dir), progress_bar=False)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    sessions = [
+        ort.InferenceSession(
+            str(directory / "model.onnx"),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        for directory in (canonical_dir, flat_dir)
+    ]
+    output_names = [value.name for value in canonical["model"].graph.outputs]
+    states = [
+        {
+            value.name: np.zeros(
+                [
+                    dim if isinstance(dim, int) else 1 if index == 0 else 0
+                    for index, dim in enumerate(value.shape)
+                ],
+                dtype=value.dtype.numpy(),
+            )
+            for value in canonical["model"].graph.inputs
+            if value.name.startswith("past_key_values.")
+        }
+        for _ in sessions
+    ]
+    seen = 0
+    tokens = np.array([[3, 5, 7]], dtype=np.int64)
+    for _ in range(4):
+        length = tokens.shape[1]
+        inputs = {
+            "input_ids": tokens,
+            "attention_mask": np.ones((1, seen + length), dtype=np.int64),
+            "position_ids": np.arange(seen, seen + length, dtype=np.int64)[None],
+        }
+        results = [
+            dict(zip(output_names, session.run(None, {**inputs, **state}), strict=True))
+            for session, state in zip(sessions, states, strict=True)
+        ]
+        for name in output_names:
+            np.testing.assert_allclose(
+                results[0][name], results[1][name], rtol=1e-3, atol=1e-3
+            )
+        for state, result in zip(states, results, strict=True):
+            state.update(
+                {
+                    name.replace("present.", "past_key_values."): value
+                    for name, value in result.items()
+                    if name.startswith("present.")
+                }
+            )
+        seen += length
+        tokens = results[0]["logits"][:, -1].argmax(-1)[:, None]
+
+
+@pytest.mark.parametrize(
+    "corruption,match",
+    [("missing", "no standard"), ("body", "test.custom"), ("cycle", "cyclic")],
+)
+def test_component_function_validator_rejects_invalid_closure(corruption, match):
+    model = _make_llama_pkg("onnx-standard")["model"]
+    call = next(node for node in model.graph if node.domain == COMPONENT_DOMAIN)
+    function = model.functions[call.op_identifier()]
+    if corruption == "missing":
+        del model.functions[function.identifier()]
+    elif corruption == "body":
+        function[0].domain = "test.custom"
+    else:
+        function[0].domain, function[0].op_type, function[0].overload = function.identifier()
+        function.opset_imports[COMPONENT_DOMAIN] = 1
+    with pytest.raises(ValueError, match=match):
+        validate_standard_onnx(model)
+
+
+def test_component_export_does_not_erase_unknown_overload():
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 2])
+    scale = create_test_input(builder, "scale", [2])
+    y = op.RMSNormalization(x, scale, epsilon=1e-5)
+    y.producer().overload = "unknown"
+    graph.outputs.append(y)
+    with pytest.raises(ValueError, match=r"RMSNormalization.*overload='unknown'"):
+        optimize_model(ir.Model(graph, ir_version=12), ep="onnx-standard")
 
 
 def test_optimize_model_eliminates_weight_transpose_after_weights():

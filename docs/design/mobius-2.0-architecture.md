@@ -11,7 +11,7 @@ Because ONNX was originally designed in the ResNet/BERT era as a **single-level,
 1. **If graphs are exported as flat, fine-grained standard ops** (`MatMul`, `Add`, `Softmax`, `Reshape`, `Slice`, `Scan`), GPU/CPU runtimes suffer severe memory-bandwidth bottlenecks without fused kernels (FlashAttention, GroupQueryAttention, fused RoPE, fused MoE). Reconstructing high-level semantics downstream via C++ or Python subgraph pattern matching is brittle: minor architectural variations (e.g., QK-Norm in Qwen3/Gemma4, logit softcapping, gated residual scaling, or RoPE layout permutations) silently break pattern matchers and trigger catastrophic CPU fallbacks (`MemcpyToHost`).
 2. **If graphs are exported with coarse-grained custom/contrib ops** (`com.microsoft::GroupQueryAttention`, `SkipSimplifiedLayerNormalization`, `MatMulNBits`, `QMoE`), NPU compilers (QNN HTP, OpenVINO) and shader backends (WebGPU, DirectML) either reject the graph or require incompatible operator signatures and tensor layouts.
 
-In **Mobius 1.x**, this tension forced the model exporter to absorb hardware-specific lowering logic (`src/mobius/_execution_providers.py`, `src/mobius/_optimizations.py`, `src/mobius/rewrite_rules/`), while model authors still had to hand-write a new Python class under `src/mobius/models/` (now 220+ files) for every new HuggingFace release.
+In **Mobius 1.x**, this tension forced the model exporter to absorb hardware-specific lowering logic (`src/mobius/_execution_providers.py`, `src/mobius/_optimizations.py`, `src/mobius/rewrite_rules/`). Architecture-specific composition and weight adaptation still require substantial work under `src/mobius/models/`, even where models already share a backbone.
 
 ### 1.2 Why `torch.export` and `GGUF` Do Not Solve This
 
@@ -20,7 +20,7 @@ In **Mobius 1.x**, this tension forced the model exporter to absorb hardware-spe
 
 ### 1.3 The Mobius 2.0 + Olive 2.0 Vision
 
-**Mobius 2.0** and **Olive 2.0** reduce the $O(M \times H)$ matrix into **$O(M) + O(H)$** through a strict architectural boundary:
+**Mobius 2.0** and **Olive 2.0** aim to move implementation maintenance toward **$O(M) + O(H)$** through a strict architectural boundary. This does not eliminate the model-by-target validation matrix: a backend still has to support a model's actual semantics.
 
 ```
 HuggingFace Checkpoint + Architecture Spec
@@ -30,22 +30,30 @@ HuggingFace Checkpoint + Architecture Spec
 │ MOBIUS 2.0 — O(M) Canonical Semantic Graph Builder                   │
 │  • Zero EP branching: always emits Hierarchical Standard ONNX        │
 │  • Preserves high-level Component boundaries via ONNX FunctionProto  │
-│  • Declarative Hybrid Backbone + Weight Mapping DSL (80% config-only)│
-│  • AST + Safetensors Agent Synthesis with L1/L2 numerical oracle     │
+│  • Incremental component composition and source weight mapping     │
+│  • Existing Python model classes remain supported                  │
 │  • Unified Multi-Component + Stateful ModelPackage contract          │
 └──────────────────────────────────────────────────────────────────────┘
                    │
-                   │  Single Canonical Standard ONNX ModelPackage
+                   │  Canonical Standard ONNX ModelPackage per build specification
                    ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │ OLIVE 2.0 — O(H) Hardware Compiler, Quantizer & EP Lowering Engine   │
-│  • Accelerator-agnostic MobiusBuilder caching 1 canonical package    │
-│  • Function-Boundary Graph Surgery (O(1) replacement vs regex match) │
+│  • Accelerator-agnostic caching for each canonical build            │
+│  • Function-boundary dispatch with semantic eligibility checks     │
 │  • EP-specific Lowering & Legalization (CUDA, DML, QNN, OV, WebGPU)  │
 │  • Orthogonal Block-Quantization & QDQ Lowering (MatMulNBits / QDQ)  │
 │  • Target ABI Adaptation (KV buffer sharing, 4D PLI, 256MB chunking) │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+### 1.4 Implementation Invariants
+
+1. **One mathematical implementation**: Components remain the source of truth. Function bodies are built from the same implementation or preserve an existing standard-ONNX computation. A blueprint only composes components; it must not implement a second copy of their mathematics. Olive performs verified equivalent target transformations.
+2. **Canonical per build specification, not one artifact for every use**: Checkpoint revision, model/config revision, dtype, selected components, semantic I/O and cache mode, and contract versions identify a build. Different EPs reuse that build; different dtypes or state semantics may require different packages. Cache keys must include the complete build specification.
+3. **Source quantization is not target quantization**: Mobius remains responsible for importing and interpreting already-quantized checkpoints, including packed storage, scales, zero points, and shared weights. Olive owns target quantization and kernel-format lowering. Canonicalization must not require eagerly materializing every quantized weight as a floating-point matrix.
+4. **Preserve support during migration**: Existing model classes and source formats remain supported. Legacy EP builds remain available until the corresponding Olive path has passed correctness and performance checks. Switching defaults and removing old paths are separate, gated changes.
+5. **Explicit acceptance, not graph-build-only completion**: Validate prefill, multiple decode steps, cache/recurrent-state continuity, quantized and shared weights, package save/load, and actual target performance. L1/L2 checks are useful development gates, not sufficient evidence for end-to-end model support.
 
 ---
 
@@ -53,22 +61,26 @@ HuggingFace Checkpoint + Architecture Spec
 
 ### 2.1 Always-Standard ONNX with Hierarchical `FunctionProto` Boundaries
 
-Mobius 2.0 eliminates the `--execution-provider` axis from graph construction. Every `mobius build` produces **one canonical Standard ONNX (`ai.onnx` opset 24) graph**.
+The canonical build path eliminates the `--execution-provider` axis from graph construction and preserves **standard ONNX opset-24 semantics**. During Phase 1, select this path explicitly with `execution_provider="onnx-standard"`; legacy defaults and EP paths remain unchanged. The default switches only after the Phase 2 migration gate.
 
 Crucially, Mobius 2.0 **must not flatten components into an unstructured sea of primitive ops**. Doing so would force Olive to rediscover high-level blocks via fragile subgraph pattern matching. Instead, Mobius 2.0 introduces **Hierarchical Standard ONNX**:
 
 1. **Dual-Level Representation (`ir.Function` + Standard Body)**:
-   - Every reusable building block in `mobius.components` (`Attention`, `RotaryEmbedding`, `MRoPE`, `RMSNorm`, `LayerNorm`, `FusedGateUpMLP`, `MoELayer`, `GatedDeltaNet`, `CausalConvWithState`, `AdaLayerNormZero`) is emitted as a call to a local **`ir.Function` (`FunctionProto`)** in the `mobius.components` domain.
-   - The body of each `ir.Function` is composed **100% of conformant Standard ONNX ops (`ai.onnx` opset 24)**.
+   - Preserve meaningful mathematical boundaries using local **`ir.Function`** definitions in the `mobius.components` domain. Start with attention, normalization, rotary embedding, and existing stateful function bodies; extend to compound MLP/MoE and other blocks incrementally. Wrapping every small primitive is not a requirement.
+   - A self-contained function's body must resolve entirely to standard ONNX operations. Validate its nested subgraphs and transitive local-function dependencies, not just the top-level node domains.
+   - Function construction uses `onnx_ir` APIs, not explicit protobuf construction.
 2. **Semantic Attributes on Function Calls**:
    - Each function call node carries explicit, machine-readable attributes and metadata (`q_num_heads`, `kv_num_heads`, `head_dim`, `scale`, `softcap`, `sliding_window`, `rope_theta`, `interleaved`, `moe_topk`, `norm_eps`) so downstream Olive passes never have to reverse-engineer hyperparameters from constant tensors inside the subgraph.
-3. **Universal Portability + $O(1)$ Optimization**:
-   - Any standard ONNX runtime can execute the model directly or inline all `ir.Function` bodies in a single pass (`onnx_ir.passes.common.InlinePass`).
-   - Olive 2.0 can inspect the top-level `ir.Function` node and either replace it in $O(1)$ with an EP-specific contrib op (`com.microsoft::GroupQueryAttention`, `SkipSimplifiedLayerNormalization`, `QMoE`) or inline its standard body for NPUs.
+   - Define versioned input/output ordering, optional-input presence, attribute defaults, parameter roles, and state updates. Semantic attributes must describe the actual body, not an independently maintained approximation.
+   - Keep checkpoint-bound initializers addressable in their owning graph and pass weights explicitly across function boundaries. Preserve shared initializer identity and lazy weight binding.
+3. **Portable Representation and Target-Checked Dispatch**:
+   - Consumers can preserve supported local functions or expand their bodies with `onnx_ir.passes.common.InlinePass`. Provide `--inline-functions` for flat consumers.
+   - A standard body does not guarantee that every EP implements every op, dtype, or dynamic shape it contains. Target legalization and runtime verification remain necessary.
+   - Function identifiers make candidate dispatch direct, but kernel replacement still checks masks, cache layout, head dimensions, attribute combinations, dtype, and outputs. Neither constant-time optimization nor zero missed fusions is a correctness guarantee.
 
 ### 2.2 Complete Removal of EP Conditional Logic from Mobius
 
-All EP-specific capability flags currently in `src/mobius/_execution_providers.py` and consumed across `models/`, `components/`, and `tasks/` are removed from Mobius graph construction:
+The destination architecture removes EP-specific capability flags from canonical graph construction. Existing flags in `src/mobius/_execution_providers.py` and their consumers migrate one verified target path at a time; they are not all deleted in Phase 1:
 
 | Current Mobius 1.x EP Coupling | Mobius 2.0 Canonical Output | Olive 2.0 Target Pass |
 | :--- | :--- | :--- |
@@ -81,17 +93,17 @@ All EP-specific capability flags currently in `src/mobius/_execution_providers.p
 | `ep.max_buffer_size=256MB` (WebGPU) | Unsplit canonical `Embedding` table | Olive `SplitLargeInitializerBuffers` pass for WebGPU |
 | `ep.supports_fp8_kv_cache=True` (CUDA) | Model-dtype KV cache I/O | Olive `Fp8KvCachePass` for CUDA SM89+ |
 
-### 2.3 Declarative Hybrid Backbone & Weight-Mapping DSL (Eliminating 80% of Hand-Written Model Files)
+### 2.3 Incremental Declarative Composition and Weight Mapping
 
-An audit of the 220+ files in `src/mobius/models/` shows that **over 80% of new model architectures do not introduce any new mathematical operators or components**. They only vary along three declarative axes:
+Many architectures reuse existing mathematics and differ along three composition axes. The fraction that can be configured without custom model code must be measured through representative migrations; **80% is not an established coverage result or a release requirement**.
 1. **Block Composition & Layer Schedule**: Interleaving different block types across layers (e.g., `[GatedDeltaNet, GatedDeltaNet, GatedDeltaNet, FullAttention] * 16` in Qwen3.5/3.8, or alternating Sliding-Window and Global Attention in Gemma3/4).
 2. **Block Micro-Topology Hooks**: Pre-Norm vs. Post-Norm, QK-Norm (per-head vs. full-dim), logit softcapping, residual multipliers, and KV-cache sharing across layers (`shared_kv_source_layer`).
 3. **Checkpoint Weight Naming & Layout**: Renaming prefixes, splitting packed `wqkv` or `gate_up_proj` tensors, stacking expert weights, or transposing Conv1d weights.
 
-Mobius 2.0 replaces repetitive `nn.Module` subclasses in `src/mobius/models/` with a two-part declarative engine:
+Extract repeated composition patterns into a declarative layer after the canonical path works. Existing `nn.Module` model classes remain a first-class option, especially for novel topology. Avoid a universal model class controlled by an expanding collection of flags.
 
 #### A. `DeclarativeHybridModel` Blueprint Schema
-Instead of writing a new Python `forward()` method for every model family, architectures are registered via a declarative `ArchitectureBlueprint`:
+A prospective `ArchitectureBlueprint` composes existing component variants without duplicating their `forward()` mathematics. The following illustrates the intended shape, not an implemented public API:
 
 ```python
 gemma4_text_blueprint = ArchitectureBlueprint(
@@ -118,7 +130,7 @@ gemma4_text_blueprint = ArchitectureBlueprint(
 ```
 
 #### B. Declarative Weight-Mapping DSL
-Instead of imperative `preprocess_weights(state_dict)` loops in every model file, Mobius 2.0 provides composable, lazy-streaming-compatible weight rules:
+Gradually replace repeated `preprocess_weights(state_dict)` operations with composable, lazy-streaming-compatible rules. Retain custom transforms for cases the common rules cannot express:
 
 ```python
 weight_rules = WeightMappingSpec([
@@ -138,13 +150,14 @@ weight_rules = WeightMappingSpec([
     ),
 ])
 ```
-Because these rules are declarative and invertible, **lazy safetensors streaming (`StreamingTransformedWeightSource`) and Olive's pre-quantized sidecar binding work automatically for every model without custom per-model glue code**.
+Rules must declare and validate source/target names, shape, dtype, packing, grouping axes, and quantized-sidecar ownership before compiling into existing streaming plans (`StreamingTransformedWeightSource`, expert-bank sources, and direct bindings). Declarative rules are not inherently invertible and do not automatically make arbitrary packed weights safe to split or transpose. Preserve fused layouts when required by the source format; shared-table and sidecar behavior require their own checks.
 
-### 2.4 AST + Safetensors Guided Agent Synthesis for Novel Architectures
+### 2.4 Deferred, Assisted Model Synthesis
 
-For the remaining ~20% of models that introduce genuinely new mathematical blocks (e.g., DeepSeek MLA/CSA, Qwen GatedDeltaNet, or a novel Diffusion/World-Model conditioning block):
-1. Engineers or the automated synthesis agent only implement the **isolated mathematical leaf component** in `src/mobius/components/` using Standard ONNX ops.
-2. Because Mobius 2.0 no longer requires EP-specific branching or manual quantized-sidecar plumbing inside model classes, an automated **AST + Safetensors Transpiler Workflow** can inspect the upstream HuggingFace `modeling_<arch>.py` AST alongside `model.safetensors.index.json`, synthesize the `ArchitectureBlueprint` + leaf `Component`, and validate it automatically against the **L1 (graph build + shape inference)** and **L2 (layer-by-layer numerical parity vs. PyTorch Eager at `atol=1e-4`)** gates.
+Model synthesis is an optional productivity tool, not a dependency of the architecture:
+1. Implement genuinely new mathematics as isolated components, and keep model-specific composition in a model class or an applicable blueprint.
+2. A later AST + Safetensors-assisted workflow may generate draft components, blueprints, and weight plans from upstream implementations and checkpoint metadata.
+3. Generated code passes the same review and numerical gates as handwritten code. L1 graph construction, L2 full-config compatibility, and L3 synthetic parity do not replace multi-token, stateful, multimodal, and target-runtime validation. Tolerances follow the dtype and existing test conventions rather than one universal threshold.
 
 ### 2.5 First-Class Stateful & Multi-Component `ModelPackage` Contract
 
@@ -154,18 +167,21 @@ To natively support **Multimodal VLMs, Audio/Speech pipelines, Diffusion DiTs, a
   - `RecurrentStateSpec(kind="conv_state" | "ssm_state", shape=..., dtype=...)`
   - `LatentBufferStateSpec(kind="ring_buffer" | "ode_latent", shape=..., dtype=...)`
 - Multi-stage pipelines (e.g., `@vision_encoder`, `@audio_encoder`, `@embedding`, `@decoder`, `@denoise_step`, `@world_state_transition`) are exported as named components in a single self-contained `ModelPackage` with verified cross-component tensor contracts and shared weight ownership.
+- State contracts describe initialization/reset semantics, input-to-output updates, shape/dtype, and logical ownership/aliasing. Hardware-specific buffer allocation and scheduling remain downstream responsibilities.
+- Start with existing KV, convolution, and recurrent state conventions. Paged-cache algorithms, world-model orchestration, and latent-ring-buffer execution are not implied by adding a descriptor and are outside the first release.
 
 ---
 
 ## 3. Part II: Olive 2.0 Improvements ($O(H)$ Hardware Lowering & Optimization Layer)
 
-With Mobius 2.0 guaranteeing a clean, hierarchical Standard ONNX `ModelPackage`, **Olive 2.0** becomes the single source of truth for all hardware-specific graph transformations, quantization, and runtime packaging.
+With Mobius providing a canonical semantic `ModelPackage`, **Olive 2.0** owns target-specific graph transformations, target quantization, and runtime packaging. Source checkpoint import remains in Mobius.
 
 ### 3.1 Accelerator-Agnostic `MobiusBuilder` Pass
 
 In `olive/passes/onnx/mobius_model_builder.py`:
-1. `MobiusBuilder` defaults to `execution_provider="onnx-standard"` and sets `is_accelerator_agnostic = True`.
-2. In a multi-target Olive workflow (e.g., targeting `CUDA`, `QNN HTP`, `OpenVINO NPU`, and `WebGPU` from the same checkpoint), **Olive runs `MobiusBuilder` exactly once**, caching the canonical Standard ONNX `ModelPackage` and fanning out to target-specific lowering pipelines.
+1. In canonical mode, `MobiusBuilder` selects `execution_provider="onnx-standard"` and reports accelerator independence. Legacy target-specific builds must not claim accelerator independence.
+2. Cache one canonical package **per complete build specification**, then fan out to target-specific pipelines. Different precision, source revision, selected components, or semantic state contracts do not share the same build result.
+3. Generate target-specific runtime metadata after lowering. Merely changing the cache flag is insufficient while the builder still emits EP-dependent graphs or runtime configuration.
 
 ### 3.2 Function-Boundary-Driven Graph Surgery (`FunctionTargetSurgeon`)
 
@@ -178,8 +194,8 @@ Canonical Mobius 2.0 Graph (with mobius.components::* Function nodes)
          │
          ├── If EP has native fused kernel (e.g., CUDA / DML / WebGPU GQA):
          │     Replace `mobius.components::Attention` + `RotaryEmbedding` call
-         │     directly with `com.microsoft::GroupQueryAttention` in O(1) using
-         │     the function node's semantic attributes.
+         │     with `com.microsoft::GroupQueryAttention` only after checking
+         │     the function contract and kernel semantic eligibility.
          │
          └── If EP requires primitive ops (e.g., QNN HTP / OpenVINO NPU):
                1. Inline `mobius.components::*` function body to Standard ONNX
@@ -191,8 +207,8 @@ Canonical Mobius 2.0 Graph (with mobius.components::* Function nodes)
 ```
 
 **Why this is transformative**:
-- **Zero false negatives**: Architectural variations (such as QK-Norm between QKV projection and RoPE, or attention logit softcapping) are explicit inputs/attributes on the `mobius.components::Attention` function boundary rather than unexpected nodes that break a 25-node `onnxscript` pattern matcher.
-- **Clean separation of concerns**: Adding a new fused kernel for a new hardware backend (e.g., a fused `GatedDeltaNet` or `MLA` kernel on CUDA or NPU) only requires adding a `FunctionTargetSurgeon` in Olive—zero changes to Mobius model definitions.
+- **Less structural guesswork**: Explicit component identity and attributes reduce dependence on fragile primitive patterns. Unsupported masks, cache modes, head layouts, or attribute combinations must still reject a fusion; preserve or inline the standard body only when the target can execute it.
+- **Clean separation of concerns**: A new backend kernel can be added in Olive without modifying model mathematics when the existing semantic contract fully describes it. New semantics require a compatible, versioned contract change rather than an unchecked replacement.
 
 ### 3.3 Target ABI, Layout, and Buffer Legalization Passes in Olive
 
@@ -212,17 +228,20 @@ Olive 2.0 consolidates all hardware-imposed I/O and memory constraints into comp
 
 ### 3.4 Orthogonal Quantization & Shared-Weight Lowering
 
-In Olive 2.0, weight quantization operates cleanly on the canonical Standard ONNX graph prior to EP fusion:
+In Olive 2.0, target weight quantization operates on the canonical graph before compatible EP fusion. Already-quantized checkpoint inputs retain their source quantization semantics; this is not a requirement to quantize them again:
 1. **Unified Weight Quantization (`OnnxMatMulNBits` / `NVModelOpt` / `INC` / `AIMET`)**:
    - Quantizes `Linear`, `Embedding`, and `MoELayer` weights on the canonical graph.
    - Respects `ComponentManifest.shared_weights` (`SharedWeightInfo`): when `embedding` and `decoder` are quantized in the same Olive workflow, tied tables share quantized initializers; when exported standalone, Olive materializes independent quantized tensors.
 2. **EP-Specific Quantization Format Lowering**:
    - **CUDA / DML / WebGPU / CPU**: Retains `com.microsoft::MatMulNBits` and applies `PackQKVForGroupQueryAttention` (folding packed `q_weight`, `k_weight`, `v_weight`, scales, and zero-points via `FoldConcatInitializersPass`) and `FuseBlockQuantizedMoE` (`QMoE`).
    - **QNN HTP / TRT-RTX / OpenVINO**: Converts `MatMulNBits` to standard `DequantizeLinear + MatMul` (QDQ) via `MatMulNBitsToQDQ` (`olive/passes/onnx/mnb_to_qdq.py`).
+3. **Function-Aware Weight Binding**:
+   - Quantization passes must follow explicit function parameters to owning graph initializers, inspect function bodies where needed, and preserve shared bindings.
+   - A pass that cannot process a preserved function must report that limitation or use a defined inlining stage. It must not silently skip quantization or break later semantic fusion.
 
 ### 3.5 Unified `EpLoweringPipeline` Profiles in Olive
 
-Instead of requiring users to manually chain 10 individual `GraphSurgeries` and quantization passes in JSON configs, Olive 2.0 provides declarative **EP Target Profiles** (`olive/passes/onnx/genai_runtime_profiles.py`) that expand into the exact lowering sequence for each `(AcceleratorSpec, Precision)`:
+Add declarative **EP Target Profiles** that expand into a validated lowering sequence for each `(AcceleratorSpec, Precision)`, rather than requiring users to assemble it manually. Keep this compiler-profile responsibility distinct from the existing `GenAIModelRuntimeProfiles` pass, which manages runtime overlays and decoder variants. The following table specifies intended pipelines, not an already-implemented profile API:
 
 | Target Profile | Olive 2.0 Automated Lowering Sequence |
 | :--- | :--- |
@@ -236,7 +255,7 @@ Instead of requiring users to manually chain 10 individual `GraphSurgeries` and 
 
 ## 4. Part III: Long-Term Horizon — Next-Gen Cross-Platform IR for LLM, Diffusion & World Models
 
-As AI models evolve from text-only Transformers to **Unified Multimodal World Models** (combining autoregressive token generation, continuous Diffusion/Flow-Matching denoisers, 3D spatio-temporal memory banks, and recurrent state-space layers), the `Mobius 2.0 -> Olive 2.0` architecture provides a bridge toward a true **Multi-Level Component & Tile IR**:
+This section is a research direction, not a Phase 1-4 acceptance requirement or a commitment to implement a new compiler/runtime. As models combine autoregressive generation, diffusion, memory, and recurrence, the semantic boundaries may provide a bridge toward **Multi-Level Component & Tile IR**:
 
 1. **Level 1 — Semantic Component & Stateful Module IR (Mobius 2.0 Output)**:
    - A single self-contained `ModelPackage` containing multiple callable entry points (`@encode_vision`, `@update_world_memory`, `@denoise_step`, `@decode_token`), shared block-quantized weights, and explicit `StateSpec` buffers.
@@ -249,18 +268,24 @@ As AI models evolve from text-only Transformers to **Unified Multimodal World Mo
 ## 5. Phased Implementation Roadmap
 
 ### Phase 1: Establish the Hierarchical Standard ONNX Contract
-- [ ] Update `mobius.components` (`Attention`, `RotaryEmbedding`, `RMSNorm`, `MoELayer`, `GatedDeltaNet`, `CausalConvWithState`) to emit structured `ir.Function` nodes with semantic attributes and 100% Standard ONNX (opset 24) bodies.
-- [ ] Make `execution_provider="onnx-standard"` the canonical default in Mobius 2.0 while preserving an opt-in `--inline-functions` flag for flat standard-ONNX consumers.
+- [x] Preserve key mathematical boundaries and existing standard stateful function bodies on the explicit `onnx-standard` build path, without duplicating component mathematics. The initial slice lifts existing `Attention`, `RMSNormalization`, `LayerNormalization`, and `RotaryEmbedding` operations and reuses stateful `LinearAttention` and `CausalConvWithState` bodies; compound component extraction remains incremental.
+- [x] Validate the complete local-function closure and keep canonical core opset 24; do not apply EP kernel-version workarounds to this path.
+- [x] Add opt-in `--inline-functions` and `ModelPackage.inline_functions()` for flat consumers, retaining graph I/O, initializer names, shared weights, and numerical behavior.
+- [ ] Keep existing model classes, defaults, and EP paths working. Compound-block coverage can expand incrementally; do not claim that every component is already represented by a function.
 
-### Phase 2: Migrate All EP Lowering & Legalization from Mobius to Olive
-- [ ] Update Olive's `MobiusBuilder` (`olive/passes/onnx/mobius_model_builder.py`) to build once with `onnx-standard` (`is_accelerator_agnostic = True`).
-- [ ] Port remaining EP-specific passes from `src/mobius/_optimizations.py` and `src/mobius/_execution_providers.py` into Olive's `olive/passes/onnx/graph_surgery/` and `genai_runtime_profiles.py` (including 4D PLI handling, WebGPU 256 MiB buffer splitting, and `FunctionTargetSurgeon` rules).
-- [ ] Deprecate `ep_capabilities()` branching inside `src/mobius/models/` and `src/mobius/tasks/`.
+### Phase 2: Verify Canonical-to-Target Pipelines, Then Migrate Defaults
+- [ ] Add function-contract-aware dispatch and function-aware quantization in Olive, reusing existing graph surgeries instead of reimplementing them.
+- [ ] Make canonical `MobiusBuilder` caching accelerator-independent per complete build specification and move target runtime packaging downstream.
+- [ ] Prove the same canonical package works through at least two target pipelines, using a standard dense LLM and a complex hybrid or multimodal model.
+- [ ] Verify prefill and multi-step decode, recurrent/cache updates, package save/load, source quantization and shared weights, and actual target performance against existing behavior. Record target/runtime versions and numerical tolerances; disclose unavailable hardware instead of claiming validation.
+- [ ] Migrate EP-specific graph construction and legalization target by target. Only switch the default and remove old paths after their replacement has passed these gates.
 
-### Phase 3: Declarative Hybrid Backbone & Weight-Mapping DSL in Mobius
-- [ ] Introduce `ArchitectureBlueprint` and `DeclarativeHybridModel` in `src/mobius/models/` to unify standard, sliding-window, MoE, and hybrid SSM/DeltaNet architectures under config-driven layer schedules.
-- [ ] Introduce `WeightMappingSpec` to replace imperative `preprocess_weights` methods with declarative, streaming-safe weight transforms.
+### Phase 3: Extract Repeated Composition, Weight, and State Contracts
+- [ ] Measure repeated model composition and introduce narrowly scoped blueprints using existing component variants. Preserve custom Python composition and the existing registry's model coverage.
+- [ ] Compile validated weight rules into existing streaming plans, checking packed layouts, dtype/shape, source quantization sidecars, and shared ownership. Migrate representative models before making coverage claims.
+- [ ] Extend `ComponentManifest` with versioned state descriptors for existing KV, convolution, and recurrent I/O. Preserve state contracts through serialization and target lowering without adding a Mobius runtime scheduler.
 
-### Phase 4: Automated Model Synthesis & World-Model State Contracts
-- [ ] Build the AST + Safetensors-driven synthesis tool that generates `ArchitectureBlueprint` definitions from HuggingFace repositories and validates them automatically with L1/L2 parity tests.
-- [ ] Extend `ComponentManifest` with first-class `StateSpec` descriptors for unified KV-cache, recurrent SSM state, and Diffusion/World-Model latent memory orchestration across Mobius and Olive.
+### Phase 4: Optional Assisted Synthesis
+- [ ] Prototype AST + Safetensors-assisted generation only after component and weight contracts have stabilized.
+- [ ] Treat generated artifacts as reviewable drafts subject to the same numerical, generation, packaging, and target-runtime gates as manual implementations.
+- [ ] Evaluate adaptation effort and maintainability on real architectures before expanding automation. General-purpose AST translation and world-model execution remain separate research work.

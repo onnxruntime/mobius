@@ -206,7 +206,7 @@ def _maybe_apply_opset_lowering(package: ModelPackage, execution_provider: str) 
     """Lower default-domain opset 24 to 23 for sub-models where it is safe."""
     if not flags.ort_lower_opset_for_ep:
         return
-    if execution_provider in ("default", "cpu"):
+    if execution_provider in ("default", "cpu", "onnx-standard"):
         return
     for name, model in package.items():
         if "" not in model.graph.opset_imports:

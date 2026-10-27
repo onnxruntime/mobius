@@ -58,6 +58,12 @@ import onnxscript.optimizer._constant_folding
 from onnx_ir.passes import common as common_passes
 from onnxscript.rewriter import rewrite
 
+from mobius._component_functions import (
+    COMPONENT_DOMAIN,
+    COMPONENT_VERSION,
+    preserve_component_functions,
+    preserve_stateful_functions,
+)
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
 from mobius._passes import (
@@ -252,7 +258,9 @@ _STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx", "ai.onnx.ml"}
 
 
 def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None:
-    """Reject nonstandard operator identifiers, including lexical subgraphs/functions."""
+    """Validate standard operators and self-contained component-function bodies."""
+    validated: set[ir.OperatorIdentifier] = set()
+    active: set[ir.OperatorIdentifier] = set()
 
     def get_version(domain: str, imports: dict[str, int]) -> int | None:
         version = imports.get(domain)
@@ -264,6 +272,14 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
     def check(
         domain: str, op_type: str, version: int | None, path: str, *, overload: str
     ) -> None:
+        identifier = (domain, op_type, overload)
+        if (
+            domain == COMPONENT_DOMAIN
+            and version == COMPONENT_VERSION
+            and identifier in model.functions
+        ):
+            visit_function(model.functions[identifier], path)
+            return
         if overload == "" and domain in _STANDARD_ONNX_DOMAINS and version is not None:
             try:
                 onnx.defs.get_schema(op_type, version, "" if domain == "ai.onnx" else domain)
@@ -291,11 +307,29 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
                     for i, subgraph in enumerate(attribute.as_graphs()):
                         visit(subgraph, imports, f"{node_path}/{name}[{i}]")
 
+    def visit_function(function: ir.Function, path: str) -> None:
+        identifier = function.identifier()
+        if identifier in active:
+            raise ValueError(
+                f"onnx-standard component {component!r} at {path}: "
+                f"cyclic component function {identifier!r}"
+            )
+        if identifier in validated:
+            return
+        if function.graph.initializers:
+            raise ValueError(
+                f"onnx-standard component {component!r} at {path}: "
+                "function initializers must be explicit inputs or Constant nodes"
+            )
+        active.add(identifier)
+        visit(function.graph, dict(function.opset_imports), path)
+        active.remove(identifier)
+        validated.add(identifier)
+
     model_imports = dict(model.graph.opset_imports)
     visit(model.graph, model_imports, "graph")
     for function in model.functions.values():
         path = f"function/{function.domain}::{function.name}"
-        imports = dict(function.opset_imports)
         # The model versions the function identifier; its own imports version its body.
         check(
             function.domain,
@@ -304,7 +338,7 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
             path,
             overload=function.overload,
         )
-        visit(function.graph, imports, path)
+        visit_function(function, path)
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +461,8 @@ def _get_optimization_passes(
     """
     fuse: list[tuple[str, list]] = []
     lower: list[tuple[str, list | ir.passes.InPlacePass]] = []
+    if caps.name == "onnx-standard":
+        return fuse, lower
 
     # --- Attention fusion (decoder only) ---
     if model_role == "decoder" and dtype in caps.gqa_dtypes:
@@ -601,14 +637,13 @@ def optimize_model(
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
     register_function_bodies(model)
+    if caps.name == "onnx-standard":
+        preserve_stateful_functions(model)
 
     # Build InlinePass criteria: expand custom ops this EP doesn't support.
     def _should_inline(func: ir.Function) -> bool:
-        # onnx-standard EP: inline every function whose domain is not a standard
-        # ONNX domain. This covers both the well-known ops below AND parametric
-        # ops like CausalConvWithState and LinearAttention registered per-model.
-        if caps.name == "onnx-standard" and func.domain not in _STANDARD_ONNX_DOMAINS:
-            return True
+        if caps.name == "onnx-standard":
+            return func.domain not in _STANDARD_ONNX_DOMAINS | {COMPONENT_DOMAIN}
         # ORT's CUDA EP has no CausalConvWithState kernel. Keeping the local
         # function call causes TransformerMemcpy to inspect a node without a
         # provider assignment and abort session initialization. Inline its
@@ -776,6 +811,7 @@ def optimize_model(
     # Rewrites may insert producers after existing consumers.
     model.graph.sort()
     if caps.name == "onnx-standard":
+        preserve_component_functions(model)
         validate_standard_onnx(model, component=model.graph.name or model_role)
 
 

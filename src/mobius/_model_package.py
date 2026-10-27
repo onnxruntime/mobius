@@ -618,6 +618,15 @@ class ModelPackage(UserDict[str, ir.Model]):
                 )
             self.add_adapter_artifact(artifact)
 
+    def inline_functions(self) -> None:
+        """Expand Mobius component functions in-place for flat ONNX consumers."""
+        from mobius._component_functions import inline_component_functions
+
+        for model in self.values():
+            inline_component_functions(model)
+        if self.mtp_head is not None:
+            self.mtp_head.inline_functions()
+
     def register_lazy_source_artifacts(
         self,
         *,

@@ -20,8 +20,10 @@ import pytest
 import torch
 import transformers
 
+from mobius._component_functions import inline_component_functions
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
+from mobius._optimizations import validate_standard_onnx
 from mobius.integrations._weight_loading import apply_weights
 from mobius.integrations.transformers._builder import build_transformers_model
 
@@ -52,6 +54,9 @@ def _hf_config(*, reduced: bool = False):
 
 
 def _assert_standard(model: ir.Model) -> None:
+    validate_standard_onnx(model)
+    model = model.clone()
+    inline_component_functions(model)
     assert not model.functions, "standard-only export must inline local functions"
     nodes = list(model.graph.all_nodes())
     for node in nodes:
@@ -78,7 +83,14 @@ def _build(config, path: Path, dtype: str, *, text_only: bool = True):
         assert set(package) == {"decoder", "vision_encoder", "embedding"}
         assert package.config.vision is not None
         decoder = package["decoder"]
-    assert any(node.op_type == "Scan" for node in decoder.graph.all_nodes())
+    assert any(
+        node.op_type == "Scan"
+        for graph in [
+            decoder.graph,
+            *(function.graph for function in decoder.functions.values()),
+        ]
+        for node in graph.all_nodes()
+    )
     for model in package.values():
         _assert_standard(model)
     return package
@@ -168,10 +180,15 @@ def test_qwen38_unspecified_state_dtype_preserves_existing_behavior(
 
 def test_qwen38_standard_check_rejects_nested_custom_op(tmp_path: Path):
     model = _build(_hf_config(reduced=True), tmp_path / "config", "f32")["model"]
-    scan = next(node for node in model.graph if node.op_type == "Scan")
+    scan = next(
+        node
+        for function in model.functions.values()
+        for node in function.all_nodes()
+        if node.op_type == "Scan"
+    )
     body = scan.attributes["body"].value
     next(node for node in body if node.op_type == "MatMul").domain = "com.microsoft"
-    with pytest.raises(AssertionError, match=r"com\.microsoft"):
+    with pytest.raises(ValueError, match=r"com\.microsoft"):
         _assert_standard(model)
 
 
@@ -335,10 +352,16 @@ def _assert_cuda_matrix(profile, role: str):
 @pytest.mark.integration_fast
 @pytest.mark.parametrize("dtype", ["f32", "f16"])
 @pytest.mark.parametrize("batch,prefill", [(1, 1), (2, 6)])
-def test_qwen38_standard_cuda_hf_parity(tmp_path: Path, dtype: str, batch: int, prefill: int):
+@pytest.mark.parametrize(
+    "execution_provider,device",
+    [("CPUExecutionProvider", "cpu"), ("CUDAExecutionProvider", "cuda")],
+)
+def test_qwen38_standard_hf_parity(
+    tmp_path: Path, dtype: str, batch: int, prefill: int, execution_provider: str, device: str
+):
     """Compare full logits and every carried state at prefill and four decode steps."""
-    if (
-        "CUDAExecutionProvider" not in ort.get_available_providers()
+    if device == "cuda" and (
+        execution_provider not in ort.get_available_providers()
         or not torch.cuda.is_available()
     ):
         pytest.skip("CUDA ORT and PyTorch are required")
@@ -349,7 +372,9 @@ def test_qwen38_standard_cuda_hf_parity(tmp_path: Path, dtype: str, batch: int, 
     config.text_config._attn_implementation = "eager"
     torch_dtype = torch.float32 if dtype == "f32" else torch.float16
     reference = (
-        Qwen3_5ForCausalLM._from_config(config.text_config, dtype=torch_dtype).eval().cuda()
+        Qwen3_5ForCausalLM._from_config(config.text_config, dtype=torch_dtype)
+        .eval()
+        .to(device)
     )
     package = _build(config, tmp_path / "config", dtype)
     model = package["model"]
@@ -367,13 +392,15 @@ def test_qwen38_standard_cuda_hf_parity(tmp_path: Path, dtype: str, batch: int, 
     options = ort.SessionOptions()
     options.intra_op_num_threads = 1
     options.enable_profiling = True
-    options.profile_file_prefix = str(tmp_path / "cuda-profile")
+    options.profile_file_prefix = str(tmp_path / f"{device}-profile")
     session = ort.InferenceSession(
         str(tmp_path / "package/model.onnx"),
         sess_options=options,
-        providers=[("CUDAExecutionProvider", {"use_tf32": "0"})],
+        providers=[
+            (execution_provider, {"use_tf32": "0"}) if device == "cuda" else execution_provider
+        ],
     )
-    assert session.get_providers()[0] == "CUDAExecutionProvider"
+    assert session.get_providers()[0] == execution_provider
     rng = np.random.default_rng(38)
     tokens = rng.integers(3, 256, size=(batch, prefill), dtype=np.int64)
     state_feeds = _initial_feeds(model, batch)
@@ -387,9 +414,9 @@ def test_qwen38_standard_cuda_hf_parity(tmp_path: Path, dtype: str, batch: int, 
         positions = np.broadcast_to(np.arange(seen, seen + length), tokens.shape).copy()
         with torch.no_grad():
             expected = reference(
-                input_ids=torch.from_numpy(tokens).cuda(),
-                attention_mask=torch.from_numpy(mask).cuda(),
-                position_ids=torch.from_numpy(positions).cuda(),
+                input_ids=torch.from_numpy(tokens).to(device),
+                attention_mask=torch.from_numpy(mask).to(device),
+                position_ids=torch.from_numpy(positions).to(device),
                 past_key_values=cache,
                 use_cache=True,
             )
@@ -431,7 +458,8 @@ def test_qwen38_standard_cuda_hf_parity(tmp_path: Path, dtype: str, batch: int, 
         seen += length
         tokens = expected_tokens[:, None]
     profile = json.loads(Path(session.end_profiling()).read_text())
-    _assert_cuda_matrix(profile, "decoder")
+    if device == "cuda":
+        _assert_cuda_matrix(profile, "decoder")
 
 
 def _vl_inputs(config, case: str, batch: int) -> dict[str, np.ndarray]:

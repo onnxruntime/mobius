@@ -61,7 +61,7 @@ runtime or hardware target.
 | `dml` | `f16` | DirectML (Windows GPU) — GQA without fused RoPE. |
 | `trt-rtx` | `f16` or `bf16` | NVIDIA TensorRT-RTX — GQA, no SkipLayerNorm. |
 | `webgpu` | `f16` or `f32` | Browser / WebAssembly — Shape ops replaced with portable alternatives. |
-| `onnx-standard` | any | Strict ONNX standard — zero custom-domain ops; safe for any conformant ONNX runtime. |
+| `onnx-standard` | any | Canonical standard-ONNX semantics with local `mobius.components` functions; no vendor fusions. Use `--inline-functions` for flat consumers. Target op/dtype support still needs validation. |
 
 Run `mobius list eps` to see all registered execution providers and their
 capabilities.
@@ -87,9 +87,23 @@ mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep trt-rtx --dty
 # WebGPU
 mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep webgpu --dtype f16
 
-# Strict ONNX standard (zero custom ops)
+# Hierarchical standard ONNX (standard bodies, no vendor fusions)
 mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep onnx-standard
+
+# Flat standard ONNX for consumers that do not handle local functions
+mobius build --model meta-llama/Llama-3.2-1B --output output --ep onnx-standard --inline-functions
 ```
+
+The canonical path retains core opset 24 rather than applying EP-specific
+opset-version workarounds. Attention, normalization, rotary embedding, and
+existing stateful function bodies preserve explicit semantic boundaries.
+This initial coverage does not functionize every compound model block.
+Checkpoint-bound initializers and model I/O keep their names.
+
+`--inline-functions` is also available on `build-gguf`. It expands Mobius
+component functions before saving, including an attached MTP package, without
+changing unrelated vendor fusions on legacy EP builds. The equivalent Python
+operation is `pkg.inline_functions()` after `build()`.
 
 #### Standard Qwen3.8-27B VLM packaging versus runtime selection
 
@@ -131,6 +145,9 @@ Standard dynamic KV caches require `past_present_share_buffer=false`; CUDA
 graph capture remains off. Hybrid cache slots retain global indices and
 independent FP16 convolution/FP32 recurrent types. Successful packaging does
 not prove a particular native GenAI build can execute those states.
+The previously qualified flat artifacts can be reproduced with
+`--inline-functions`. Retained component-function artifacts require their own
+runtime qualification; successful config generation alone is not that evidence.
 
 Qwen processor metadata now preserves RGB from `DecodeImage` through ordinary
 `Normalize`; `PatchImage` owns patch packing. Regenerate processor metadata to

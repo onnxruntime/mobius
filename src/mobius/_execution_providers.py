@@ -399,11 +399,10 @@ def _register_builtins() -> None:
             supports_tensor_scatter=False,  # no HTP TensorScatter — ScatterND (batch=1)
             supports_range=False,  # no HTP Range — Constant(arange)+Slice in static bias
         ),
-        # onnx-standard: ONNX-only runtime — emits zero custom-domain ops.
-        # All com.microsoft ops (SkipLayerNorm, PackedMHA) are expanded via
-        # InlinePass to their standard-ONNX function bodies. No GQA or QKV
-        # packing fusion is applied. Use this EP to produce models that run
-        # on any conformant ONNX runtime without ORT extensions.
+        # onnx-standard: canonical standard-ONNX semantics with local component
+        # functions. Vendor fusions are expanded; standard attention/norm/RoPE
+        # and stateful computations retain semantic boundaries. Consumers can
+        # use ModelPackage.inline_functions() or --inline-functions to flatten.
         # KV buffer sharing is unsupported here: GQA isn't emitted, so
         # standard Attention's concat-grow semantics handle the cache.
         EpCapabilities(

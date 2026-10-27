@@ -18,6 +18,7 @@ import pytest
 import transformers
 
 from mobius.__main__ import build_parser, main
+from mobius._optimizations import validate_standard_onnx
 from mobius.integrations.ort_genai import write_ort_genai_config
 from mobius.integrations.transformers._builder import build_transformers_model
 
@@ -59,8 +60,7 @@ def _tiny_config(directory: Path) -> None:
 
 
 def _assert_abi(model: ir.Model) -> None:
-    assert not model.functions
-    assert all(node.domain in {"", "ai.onnx"} for node in model.graph.all_nodes())
+    validate_standard_onnx(model)
     ports = {value.name: value for value in model.graph.inputs}
     outputs = {value.name: value for value in model.graph.outputs}
     assert ports["inputs_embeds"].dtype == ir.DataType.FLOAT16
@@ -81,7 +81,10 @@ def _assert_abi(model: ir.Model) -> None:
 
 
 @pytest.mark.parametrize("runtime", [None, "ort-genai"])
-def test_tiny_standard_vlm_cli_routes(tmp_path: Path, runtime: str | None) -> None:
+@pytest.mark.parametrize("inline_functions", [False, True])
+def test_tiny_standard_vlm_cli_routes(
+    tmp_path: Path, runtime: str | None, inline_functions: bool
+) -> None:
     source = tmp_path / "hf"
     _tiny_config(source)
     destination = tmp_path / "package"
@@ -98,6 +101,8 @@ def test_tiny_standard_vlm_cli_routes(tmp_path: Path, runtime: str | None) -> No
     ]
     if runtime:
         argv.extend(["--runtime", runtime])
+    if inline_functions:
+        argv.append("--inline-functions")
     main(argv)
     assert {path.name for path in destination.iterdir() if path.is_dir()} == {
         "decoder",
@@ -109,9 +114,12 @@ def test_tiny_standard_vlm_cli_routes(tmp_path: Path, runtime: str | None) -> No
         for name in ("decoder", "embedding", "vision_encoder")
     }
     _assert_abi(models["decoder"])
+    assert bool(models["decoder"].functions) is not inline_functions
     for model in models.values():
-        assert not model.functions
-        assert all(node.domain in {"", "ai.onnx"} for node in model.graph.all_nodes())
+        validate_standard_onnx(model)
+        if inline_functions:
+            assert not model.functions
+            assert all(node.domain in {"", "ai.onnx"} for node in model.graph.all_nodes())
     assert models["vision_encoder"].graph.inputs[0].dtype == ir.DataType.FLOAT
     metadata = destination / "genai_config.json"
     assert metadata.exists() == bool(runtime)
