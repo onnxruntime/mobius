@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import ml_dtypes
@@ -119,6 +120,40 @@ def test_runtime_bridge_preserves_types_and_output_names(tmp_path, dtype):
     assert set(output) == {"result"}
     assert output["result"].dtype == values.dtype
     np.testing.assert_array_equal(output["result"], values)
+
+
+def test_runtime_bridge_selects_the_session_cuda_device(monkeypatch):
+    import torch
+
+    active = []
+    events = []
+
+    @contextmanager
+    def device(index):
+        events.append(("enter", index))
+        active.append(index)
+        try:
+            yield
+        finally:
+            assert active.pop() == index
+            events.append(("exit", index))
+
+    class Session:
+        def get_provider_options(self):
+            return {"CUDAExecutionProvider": {"device_id": "3"}}
+
+        def __call__(self, **feeds):
+            assert active == [3]
+            return [feeds["x"]]
+
+        def get_outputs(self):
+            return [SimpleNamespace(name="result")]
+
+    monkeypatch.setattr(torch.cuda, "device", device)
+    values = np.array([0.75, -1.5], dtype=np.float32)
+    result = validate_drama3.run_session(Session(), {"x": values})
+    np.testing.assert_array_equal(result["result"], values)
+    assert events == [("enter", 3), ("exit", 3)]
 
 
 def test_committed_token_golden_is_pinned_and_complete():

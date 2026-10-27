@@ -130,8 +130,6 @@ class BaseRope(nn.Module):
             name="sin_cache",
             data=ir.tensor(sin_cache_data),
         )
-        self.cos_cache._keep_float32 = True  # type: ignore[attr-defined]
-        self.sin_cache._keep_float32 = True  # type: ignore[attr-defined]
 
     def _cast_embeddings(
         self,

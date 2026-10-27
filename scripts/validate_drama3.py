@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -353,7 +354,16 @@ def run_session(session, feeds):
         name: _numpy_to_ort_value(np.ascontiguousarray(value) if value.ndim else value)
         for name, value in feeds.items()
     }
-    values = session(**converted)
+    cuda_options = session.get_provider_options().get("CUDAExecutionProvider")
+    device_context: contextlib.AbstractContextManager[object] = contextlib.nullcontext()
+    if cuda_options is not None:
+        import torch
+
+        # Cross-component calls can leave another GPU current on this thread;
+        # ORT's stream events must be created/recorded on the session's device.
+        device_context = torch.cuda.device(int(cuda_options["device_id"]))
+    with device_context:
+        values = session(**converted)
     ports = session.get_outputs()
     assert len(ports) == len(values)
     return {port.name: _ort_value_to_numpy(value) for port, value in zip(ports, values)}
