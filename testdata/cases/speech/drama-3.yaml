@@ -1,0 +1,11 @@
+model_id: "fishaudio/drama-3"
+model_type: "fish_omni"
+revision: "b2b5ee998034b2975720906c815e7fb0e9f007bd"
+task_type: "text-to-speech"
+dtype: "float32"
+level: "L4+L5"
+inputs:
+  prompts:
+    - "Hello, this is a speech synthesis test."
+skip_reason: "Token-graph export only: full-checkpoint waveform and generation goldens require the external Fish Speech codec and sampler."
+notes: "Pinned L2 model is registered; reduced upstream prefill and temporal-cache parity is covered in tests/integration/fish_omni_test.py. No fabricated L4/L5 goldens."

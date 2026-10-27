@@ -12,6 +12,7 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 from _test_configs import (
+    FISH_OMNI_CONFIG,
     SPEECH_CONFIGS,
     TINY_HEAD_DIM,
     TINY_HEADS,
@@ -78,6 +79,19 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     },
     "vibevoice-asr-streaming": {"audio_encoder", "embedding", "decoder"},
 }
+
+
+def test_fish_omni_package_builds():
+    """Drama 3's dedicated ABI is not the generic input_ids/logits TTS matrix."""
+    from mobius._configs.fish_omni import FishOmniConfig
+    from mobius.integrations.transformers._config_resolver import _dict_to_pretrained_config
+
+    config = FishOmniConfig.from_transformers(_dict_to_pretrained_config(FISH_OMNI_CONFIG))
+    module = registry.get("fish_omni")(config)
+    package = build_from_module(module, config, task="fish-omni")
+    assert set(package) == {"embedding", "decoder", "audio_decoder"}
+    _assert_outputs_have_shapes_and_dtypes(package, "fish_omni")
+    _run_onnx_checker(package, "fish_omni")
 
 
 class TestBuildGraphWhisper:
