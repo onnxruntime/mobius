@@ -9,6 +9,7 @@ import copy
 import dataclasses
 import importlib.util
 import json
+import os
 import sys
 import types
 import urllib.request
@@ -33,10 +34,140 @@ from mobius.integrations.transformers._fish_omni_weights import (
     stream_fish_omni_safetensors_to_package,
 )
 from mobius.models import FishOmniModel
+from mobius.models.fish_omni import _FishFP8Experts
 from mobius.models.fish_omni_test import reduced_precision_prototype_task
+from mobius.tasks import ModelTask
+from mobius.tasks._base import _make_graph, _make_model
 
 pytestmark = pytest.mark.integration
 _PREFIX = "fish_speech.models.text2semantic.fish_omni"
+
+
+@pytest.mark.skipif(
+    os.environ.get("MOBIUS_TEST_DRAMA3_NATIVE_FP8") != "1",
+    reason="Opt in with an FP8-QMoE-enabled runtime implementing dynamic_fp8",
+)
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+@pytest.mark.parametrize("length", [1, 19, 33])
+def test_native_fp8_exported_experts_match_pinned_w8a8_source(upstream_fp8, dtype, length):
+    from onnx_ir import tensor_adapters
+
+    from mobius.models.fish_omni_test import native_fp8_prototype_config
+
+    assert torch.cuda.is_available()
+    assert torch.cuda.get_device_capability() >= (8, 9)
+    assert "fp8-qmoe=1" in ort.get_build_info()
+    config = dataclasses.replace(
+        native_fp8_prototype_config(dtype),
+        hidden_size=256,
+        moe_intermediate_size=256,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+    )
+
+    class ExpertsTask(ModelTask):
+        def build(self, module, config):
+            graph, builder = _make_graph("experts")
+            x = builder.input("x", config.dtype, [1, length, config.hidden_size])
+            logits = builder.input("router_logits", config.dtype, [1, length, 4])
+            result = module(builder.op, x, None, None, logits)
+            result.type, result.shape = x.type, x.shape
+            builder.add_output(result, "output")
+            return ModelPackage({"experts": _make_model(graph)})
+
+    model = build_from_module(
+        _FishFP8Experts(config), config, task=ExpertsTask(), execution_provider="cuda"
+    )["experts"]
+    torch.manual_seed(94)
+    compute_dtype = {
+        ir.DataType.FLOAT: torch.float32,
+        ir.DataType.FLOAT16: torch.float16,
+        ir.DataType.BFLOAT16: torch.bfloat16,
+    }[dtype]
+    weights = {}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        weights[projection + ".weight"] = torch.randn(4, 256, 256, device="cuda").to(
+            torch.float8_e4m3fn
+        )
+        weights[projection + ".weight_scale_inv"] = (
+            torch.rand(4, 2, 2, device="cuda") * 0.06 + 0.02
+        )
+    for name, value in model.graph.initializers.items():
+        if value.const_value is None:
+            value.const_value = tensor_adapters.TorchTensor(weights[name].cpu(), name=name)
+    x = torch.randn(length, 256, device="cuda", dtype=compute_dtype)
+    logits = torch.randn(length, 4, device="cuda", dtype=compute_dtype)
+    probabilities = logits.float().softmax(-1)
+    coefficients, selected = probabilities.topk(2, dim=-1)
+    coefficients = (coefficients / coefficients.sum(-1, keepdim=True)).to(compute_dtype)
+    gate_up = torch.cat(
+        [
+            weights["gate_proj.weight"].view(torch.uint8),
+            weights["up_proj.weight"].view(torch.uint8),
+        ],
+        dim=1,
+    ).view(torch.float8_e4m3fn)
+    scales = torch.cat(
+        [
+            weights["gate_proj.weight_scale_inv"],
+            weights["up_proj.weight_scale_inv"],
+        ],
+        dim=1,
+    )
+    expected = upstream_fp8.fp8_moe_forward(
+        x,
+        selected,
+        coefficients,
+        gate_up,
+        scales,
+        weights["down_proj.weight"],
+        weights["down_proj.weight_scale_inv"],
+    )
+    array_dtype = {
+        ir.DataType.FLOAT: np.float32,
+        ir.DataType.FLOAT16: np.float16,
+        ir.DataType.BFLOAT16: ml_dtypes.bfloat16,
+    }[dtype]
+    session = OnnxModelSession(model, device="cuda")
+    try:
+        actual = session.run(
+            {
+                "x": x.float().cpu().numpy().astype(array_dtype)[None],
+                "router_logits": logits.float().cpu().numpy().astype(array_dtype)[None],
+            }
+        )["output"]
+    finally:
+        session.close()
+    assert actual.dtype == np.dtype(array_dtype)
+    np.testing.assert_allclose(
+        actual.astype(np.float32)[0],
+        expected.float().cpu().numpy(),
+        atol=2e-6 if dtype == ir.DataType.FLOAT else 1e-2,
+        rtol=2e-5 if dtype == ir.DataType.FLOAT else 1e-2,
+    )
+
+
+def _load_reference_module(name, tmp_path, monkeypatch):
+    url = (
+        f"https://raw.githubusercontent.com/fishaudio/fish-speech/"
+        f"{DRAMA3_SOURCE_REVISION}/fish_speech/models/text2semantic/fish_omni/{name}.py"
+    )
+    with urllib.request.urlopen(url, timeout=60) as response:
+        path = tmp_path / f"{name}.py"
+        path.write_bytes(response.read())
+    spec = importlib.util.spec_from_file_location(f"{_PREFIX}.{name}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def upstream_fp8(tmp_path, monkeypatch):
+    return _load_reference_module("fp8_moe", tmp_path, monkeypatch)
 
 
 @pytest.fixture
@@ -53,19 +184,7 @@ def upstream(tmp_path, monkeypatch):
         monkeypatch.setitem(sys.modules, name, package)
     modules = {}
     for name in ("fp8_moe", "config", "layers", "moe", "backbone", "tower"):
-        url = (
-            f"https://raw.githubusercontent.com/fishaudio/fish-speech/"
-            f"{DRAMA3_SOURCE_REVISION}/fish_speech/models/text2semantic/fish_omni/{name}.py"
-        )
-        with urllib.request.urlopen(url, timeout=60) as response:
-            path = tmp_path / f"{name}.py"
-            path.write_bytes(response.read())
-        spec = importlib.util.spec_from_file_location(f"{_PREFIX}.{name}", path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, spec.name, module)
-        spec.loader.exec_module(module)
-        modules[name] = module
+        modules[name] = _load_reference_module(name, tmp_path, monkeypatch)
     return modules
 
 

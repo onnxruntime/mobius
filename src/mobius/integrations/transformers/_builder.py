@@ -661,10 +661,7 @@ def build_transformers_model(
         if output_layer_indices is not None or fp8_kv_cache or kv_cache_scales is not None:
             raise ValueError("Drama 3 does not support hidden-layer capture or FP8 KV caches")
         if load_weights and config.fp8_experts and keep_quantized:
-            raise ValueError(
-                "Drama 3 native bsgemm-moe FP8 execution is not supported. "
-                "Use keep_quantized=False (--dequantize) for streaming dense conversion."
-            )
+            config = dataclasses.replace(config, native_fp8_experts=True)
 
     from mobius.tasks import get_task
 

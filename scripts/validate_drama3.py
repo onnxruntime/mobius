@@ -36,6 +36,7 @@ EMBEDDING_DEVICE = 0
 AUDIO_DEVICE = 1
 DECODER_DEVICE = 2
 DTYPE = "f32"
+EXPERT_EXECUTION = "dense"
 DTYPE_NAMES = {"f32": "float32", "f16": "float16", "bf16": "bfloat16"}
 GOLDEN = (
     pathlib.Path(__file__).resolve().parents[1]
@@ -146,7 +147,7 @@ def load_upstream():
     return result
 
 
-def export(checkpoint, *, task="fish-omni", execution_provider=None):
+def export(checkpoint, *, task="fish-omni", execution_provider=None, native_fp8=False):
     from mobius import build
 
     start = time.monotonic()
@@ -155,10 +156,14 @@ def export(checkpoint, *, task="fish-omni", execution_provider=None):
         str(checkpoint),
         revision=REVISION,
         dtype=DTYPE,
-        keep_quantized=False,
+        keep_quantized=native_fp8,
         task=task,
         execution_provider=execution_provider
-        or {"f32": "default", "f16": "cuda", "bf16": "onnx-standard"}[DTYPE],
+        or (
+            "cuda"
+            if native_fp8
+            else {"f32": "default", "f16": "cuda", "bf16": "onnx-standard"}[DTYPE]
+        ),
     )
     event("graph_and_bindings_ready", seconds=time.monotonic() - start)
     package.save(str(ROOT / "onnx"), max_workers=1)
@@ -168,6 +173,7 @@ def export(checkpoint, *, task="fish-omni", execution_provider=None):
             {
                 "revision": REVISION,
                 "dtype": DTYPE,
+                "expert_execution": "dynamic_fp8" if native_fp8 else "dense",
                 "seconds": time.monotonic() - start,
                 "weight_loading_report": package.weight_loading_report,
                 "files": {
@@ -181,9 +187,9 @@ def export(checkpoint, *, task="fish-omni", execution_provider=None):
     )
 
 
-def reference(checkpoint):
+def reference(checkpoint, *, native_fp8=False):
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
-    os.environ["FISH_DRAMA3_FP8_EXPERTS"] = "0"
+    os.environ["FISH_DRAMA3_FP8_EXPERTS"] = "1" if native_fp8 else "0"
     os.environ["FISH_DRAMA3_CUDA_GRAPH"] = "0"
     import numpy as np
     import torch
@@ -206,6 +212,8 @@ def reference(checkpoint):
     )
     event("reference_loaded", seconds=time.monotonic() - start)
     backbone, tower = model.backbone, model.audio_decoder
+    if any(layer.mlp.experts.fp8 != native_fp8 for layer in backbone.model.layers):
+        raise AssertionError("Pinned source did not activate the requested expert execution")
     prompt = upstream["generate"].build_drama3_prompt(PROMPT, model.tokenizer, model.config)
     states = []
     active_heads: list[np.ndarray] = []
@@ -293,6 +301,7 @@ def reference(checkpoint):
         "revision": REVISION,
         "source_revision": SOURCE_REVISION,
         "dtype": DTYPE_NAMES[DTYPE],
+        "expert_execution": "dynamic_fp8" if native_fp8 else "dense",
         "prompt": PROMPT,
         "prompt_rows": len(prompt),
         "prefill_shape": list(logits.shape),
@@ -320,6 +329,8 @@ def validate_reference_golden(golden):
     import numpy as np
 
     committed = json.loads(GOLDEN.read_text())
+    assert golden.get("expert_execution", "dense") == EXPERT_EXECUTION, "expert_execution"
+    assert committed.get("expert_execution", "dense") == EXPERT_EXECUTION, "expert_execution"
     assert golden["dtype"] == DTYPE_NAMES[DTYPE], "dtype"
     for field in (
         "model_id",
@@ -458,6 +469,15 @@ def compare(*, audio_model_name=None):
         "bf16": "tensor(bfloat16)",
     }[DTYPE]
     assert sessions["decoder"].get_outputs()[0].type == expected_type
+    runtime_features = (
+        sessions["decoder"]
+        .get_modelmeta()
+        .custom_metadata_map.get("mobius.required_runtime_features", "")
+    )
+    actual_experts = (
+        "dynamic_fp8" if "activation_quantization=dynamic_fp8" in runtime_features else "dense"
+    )
+    assert actual_experts == EXPERT_EXECUTION, "Graph and reference expert execution differ"
 
     def empty_cache(name):
         return empty_cache_ports(sessions[name].get_inputs())
@@ -539,6 +559,11 @@ def compare(*, audio_model_name=None):
                     )
                     > 0
                 )
+                if EXPERT_EXECUTION == "dynamic_fp8":
+                    assert (
+                        counts[("CUDAExecutionProvider", "QMoE")]
+                        == config["text_config"]["num_hidden_layers"]
+                    ), "Native FP8 experts did not execute on CUDA"
                 (ROOT / "profile-summary.json").write_text(
                     json.dumps(profile_summary, indent=2)
                 )
@@ -615,6 +640,7 @@ def compare(*, audio_model_name=None):
         "revision": REVISION,
         "source_revision": SOURCE_REVISION,
         "dtype": DTYPE_NAMES[DTYPE],
+        "expert_execution": EXPERT_EXECUTION,
         "audio_component": audio_model_name,
         "onnxruntime_version": ort.__version__,
         "provider": "CUDAExecutionProvider",
@@ -640,6 +666,7 @@ if __name__ == "__main__":
     parser.add_argument("stage", choices=("download", "export", "reference", "compare"))
     parser.add_argument("--work-dir", required=True, type=pathlib.Path)
     parser.add_argument("--dtype", choices=("f32", "f16", "bf16"), default="f32")
+    parser.add_argument("--native-fp8", action="store_true")
     parser.add_argument(
         "--task", choices=("fish-omni", "fish-omni-generation"), default="fish-omni"
     )
@@ -660,20 +687,27 @@ if __name__ == "__main__":
     AUDIO_DEVICE = args.audio_device
     DECODER_DEVICE = args.decoder_device
     DTYPE = args.dtype
+    EXPERT_EXECUTION = "dynamic_fp8" if args.native_fp8 else "dense"
     if args.golden is not None:
         GOLDEN = args.golden.resolve()
-    elif DTYPE != "f32":
-        GOLDEN = GOLDEN.with_name(f"drama-3_{DTYPE}_tokens_generation.json")
+    elif DTYPE != "f32" or args.native_fp8:
+        suffix = f"fp8_{DTYPE}" if args.native_fp8 else DTYPE
+        GOLDEN = GOLDEN.with_name(f"drama-3_{suffix}_tokens_generation.json")
         if args.stage == "compare" and not GOLDEN.is_file():
             parser.error(
-                "Reduced-precision comparison requires --golden pointing to the independent "
+                "Native-FP8/reduced-precision comparison requires --golden pointing to the independent "
                 "reference stage's golden.json until a matching golden is committed"
             )
     if args.stage == "download":
         download()
     elif args.stage == "export":
-        export(checkpoint_path(), task=args.task, execution_provider=args.execution_provider)
+        export(
+            checkpoint_path(),
+            task=args.task,
+            execution_provider=args.execution_provider,
+            native_fp8=args.native_fp8,
+        )
     elif args.stage == "reference":
-        reference(checkpoint_path())
+        reference(checkpoint_path(), native_fp8=args.native_fp8)
     else:
         compare(audio_model_name=args.audio_component)

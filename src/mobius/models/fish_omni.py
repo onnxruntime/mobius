@@ -205,7 +205,9 @@ class _FishMoEBlock(Qwen35MoEBlock):
                 norm_topk_prob=config.norm_topk_prob,
             )
         super().__init__(config, gate=gate)
-        self.packed_experts = _FishExperts(config)
+        self.packed_experts = (
+            _FishFP8Experts(config) if config.native_fp8_experts else _FishExperts(config)
+        )
         self.shared_expert.act_fn = Float32SiLU()
 
     def forward(self, op, hidden_states):
@@ -375,6 +377,72 @@ class _FishExperts(nn.Module):
             _domain="com.microsoft",
         )
         output.type = ir.TensorType(ir.DataType.FLOAT)
+        return op.Reshape(output, op.Shape(hidden_states))
+
+
+class _FishFP8ExpertBank(nn.Module):
+    def __init__(self, experts, rows, columns):
+        super().__init__()
+        self.weight = nn.Parameter([experts, rows, columns], dtype=ir.DataType.FLOAT8E4M3FN)
+        self.weight_scale_inv = nn.Parameter(
+            [experts, rows // 128, columns // 128], dtype=ir.DataType.FLOAT
+        )
+        self.weight_scale_inv._keep_float32 = True  # type: ignore[attr-defined]
+
+    def forward(self, op):
+        return op.Identity(self.weight), op.Identity(self.weight_scale_inv)
+
+
+class _FishFP8Experts(nn.Module):
+    """Source dynamic W8A8 with unchanged E4M3 bytes and multiplicative FP32 grids."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+        self.dtype = config.dtype
+        self.gate_proj = _FishFP8ExpertBank(
+            config.num_local_experts, config.moe_intermediate_size, config.hidden_size
+        )
+        self.up_proj = _FishFP8ExpertBank(
+            config.num_local_experts, config.moe_intermediate_size, config.hidden_size
+        )
+        self.down_proj = _FishFP8ExpertBank(
+            config.num_local_experts, config.hidden_size, config.moe_intermediate_size
+        )
+
+    def forward(self, op, hidden_states, weights, selected, router_logits):
+        if ep_capabilities().name != "cuda":
+            raise ValueError("Drama 3 native dynamic FP8 requires execution_provider='cuda'")
+        gate, gate_scale = self.gate_proj(op)
+        up, up_scale = self.up_proj(op)
+        down, down_scale = self.down_proj(op)
+        # QMoE owns softmax/top-k and the source's coefficient narrowing.
+        # Unsupported devices/route counts must error in the opt-in runtime,
+        # never silently fall back to weight-only FP8 or dense expert scratch.
+        output = op.QMoE(
+            op.Reshape(hidden_states, [-1, self.hidden_size]),
+            op.Reshape(router_logits, [-1, self.num_experts]),
+            gate,
+            gate_scale,
+            None,
+            down,
+            down_scale,
+            None,
+            up,
+            up_scale,
+            quant_type="fp8",
+            expert_weight_bits=8,
+            block_size=128,
+            activation_quantization="dynamic_fp8",
+            activation_type="silu",
+            swiglu_fusion=0,
+            k=self.top_k,
+            normalize_routing_weights=1,
+            _domain="com.microsoft",
+        )
+        output.type = ir.TensorType(self.dtype)
         return op.Reshape(output, op.Shape(hidden_states))
 
 

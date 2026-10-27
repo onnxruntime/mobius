@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
@@ -40,6 +41,27 @@ from mobius.models.fish_omni_test import reduced_precision_prototype_task
 from mobius.tasks.fish_codec import build_fish_codec_decoder
 
 
+def test_cpu_benchmark_rejects_untracked_cuda_component_placement(tmp_path):
+    args = parser().parse_args(
+        [
+            "--package",
+            str(tmp_path),
+            "--config",
+            str(tmp_path / "config.json"),
+            "--prompt",
+            str(tmp_path / "prompt.npz"),
+            "--output",
+            str(tmp_path / "result.json"),
+            "--device",
+            "cpu",
+            "--embedding-device",
+            "cuda",
+        ]
+    )
+    with pytest.raises(ValueError, match="CUDA component placement"):
+        benchmark(args)
+
+
 def test_busy_gpu_cannot_be_a_performance_pass():
     busy = {"memory_used_mib": 130000, "utilization_percent": 100}
     with pytest.raises(RuntimeError, match="refusing misleading"):
@@ -54,6 +76,29 @@ def test_busy_gpu_cannot_be_a_performance_pass():
 def test_scalar_boolean_keeps_its_rank():
     value = _numpy_to_ort_value(np.array(True))
     assert value.shape() == []
+
+
+def test_cpu_views_and_outputs_keep_cpu_device_zero_with_nonzero_cuda_id():
+    value = _numpy_to_ort_value(np.zeros((1, 1, 4), np.float32))
+    calls = []
+
+    def bind(kind, name, **kwargs):
+        calls.append((kind, name, kwargs["device_type"], kwargs["device_id"]))
+
+    binding = SimpleNamespace(
+        bind_input=lambda name, **kwargs: bind("input", name, **kwargs),
+        bind_output=lambda name, **kwargs: bind("output", name, **kwargs),
+        synchronize_outputs=lambda: None,
+        get_outputs=lambda: [value],
+    )
+    session = BoundSession.__new__(BoundSession)
+    session.session = SimpleNamespace(
+        io_binding=lambda: binding, run_with_iobinding=lambda binding: None
+    )
+    session.outputs, session.device, session.device_id = ["output"], "cuda", 3
+    actual = session.run({"x": sequence_view(value, 0, 1)}, cpu_outputs=("output",))
+    assert actual["output"] is value
+    assert calls == [("input", "x", "cpu", 0), ("output", "output", "cpu", 0)]
 
 
 def test_zero_copy_contiguous_views_bind_the_correct_bytes(tmp_path):
@@ -150,7 +195,13 @@ def test_benchmark_runs_actual_cached_graphs_without_claiming_full_model_perf(
     source_config.write_text(json.dumps(FISH_OMNI_CONFIG))
     prompt = tmp_path / "prompt.npz"
     np.savez(prompt, input_frames=np.array([[1, 0, 0, 0], [3, 0, 0, 0]], np.int64))
-    with_codec = task == "fish-omni-generation" and device == "cpu"
+    mixed_placement = (
+        task == "fish-omni-generation"
+        and device == "cuda"
+        and dtype == ir.DataType.FLOAT
+        and not sample
+    )
+    with_codec = task == "fish-omni-generation" and (device == "cpu" or mixed_placement)
     codec_path = tmp_path / "codec"
     if with_codec:
         codec = build_fish_codec_decoder(
@@ -192,14 +243,26 @@ def test_benchmark_runs_actual_cached_graphs_without_claiming_full_model_perf(
             *(["--sample"] if sample else []),
             *(["--allow-contended", "--profile"] if device == "cuda" else []),
             *(["--codec", str(codec_path)] if with_codec else []),
+            *(["--embedding-device", "cpu"] if mixed_placement else []),
+            *(["--codec-conv1d-pad-to-nc1d"] if mixed_placement else []),
         ]
     )
     result = benchmark(args)
     assert result["generated_frames"] == 4
+    assert result["expert_execution"] == "dense"
     assert result["single_pass_tower"] == (task == "fish-omni-generation")
     assert result["measurement_qualified"] is False
     assert result["meets_end_to_end_rtf_target"] is None
     assert result["gpu_resident_caches"] == (device == "cuda")
+    assert result["embedding_device"] == ("cpu" if mixed_placement else device)
+    assert result["codec_device"] == (device if with_codec else None)
+    if mixed_placement:
+        assert (
+            result["codec_provider_options"]["CUDAExecutionProvider"][
+                "cudnn_conv1d_pad_to_nc1d"
+            ]
+            == "1"
+        )
     if with_codec:
         assert result["end_to_end_rtf"] > 0
         assert result["waveform_seconds"] > 0

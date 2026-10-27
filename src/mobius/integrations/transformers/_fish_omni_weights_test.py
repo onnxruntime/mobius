@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import json
 
+import numpy as np
 import onnx_ir as ir
 import pytest
 import torch
@@ -25,7 +26,11 @@ from mobius.integrations.transformers._fish_omni_weights import (
     stream_fish_omni_safetensors_to_package,
 )
 from mobius.models import FishOmniModel
-from mobius.models.fish_omni_test import tiny_config
+from mobius.models.fish_omni_test import (
+    native_fp8_prototype_config,
+    reduced_precision_prototype_task,
+    tiny_config,
+)
 
 
 def _checkpoint(package):
@@ -53,6 +58,75 @@ def _checkpoint(package):
             else:
                 weights[source] = tensor
     return weights
+
+
+@pytest.mark.parametrize("failure", [None, "scale_dtype", "scale_shape", "target_dtype"])
+def test_native_fp8_streaming_preserves_original_code_bytes_and_fp32_grids(tmp_path, failure):
+    config = native_fp8_prototype_config()
+    package = build_from_module(
+        FishOmniModel(config),
+        config,
+        task=reduced_precision_prototype_task("fish-omni"),
+        execution_provider="cuda",
+    )
+    weights = _checkpoint(package)
+    for name, value in list(weights.items()):
+        if ".mlp.experts." not in name:
+            continue
+        if name.endswith(".weight"):
+            # Every finite E4M3FN byte, including negative zero and both extrema.
+            raw = torch.arange(value.numel()).remainder(254)
+            raw = torch.where(raw >= 127, raw + 1, raw)
+            weights[name] = raw.to(torch.uint8).reshape(value.shape).view(torch.float8_e4m3fn)
+        else:
+            weights[name] = value.abs() + 0.01
+    scale = next(name for name in weights if name.endswith(".weight_scale_inv"))
+    if failure == "scale_dtype":
+        weights[scale] = weights[scale].bfloat16()
+    elif failure == "scale_shape":
+        weights[scale] = torch.ones((1, 2))
+    elif failure == "target_dtype":
+        target = next(
+            value
+            for name, value in package["decoder"].graph.initializers.items()
+            if ".packed_experts." in name and name.endswith(".weight")
+        )
+        target.type = ir.TensorType(ir.DataType.FLOAT)
+    save_file(weights, tmp_path / "model.safetensors")
+    if failure:
+        with pytest.raises((ValueError, TypeError), match=r"FP32|shape|identical FP8"):
+            stream_fish_omni_safetensors_to_package(
+                package, str(tmp_path), config, revision=None
+            )
+        assert all(
+            value.const_value is None
+            for name, value in package["decoder"].graph.initializers.items()
+            if ".packed_experts." in name
+        )
+        return
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    assert package.weight_loading_report["native_fp8"] is True
+    assert package.weight_loading_report["activation_quantization"] == "dynamic_fp8"
+    path = tmp_path / "decoder.onnx"
+    ir.save(package["decoder"], path, external_data="decoder.data")
+    saved = ir.load(path)
+    for name, value in saved.graph.initializers.items():
+        if ".packed_experts." not in name:
+            continue
+        prefix, projection = _source_name(name).rsplit(".experts.", 1)
+        source = [
+            weights[f"{prefix}.experts.{i}.{projection}"]
+            for i in range(config.num_local_experts)
+        ]
+        if name.endswith(".weight"):
+            assert value.dtype == ir.DataType.FLOAT8E4M3FN
+            expected = torch.stack([tensor.view(torch.uint8) for tensor in source]).numpy()
+            np.testing.assert_array_equal(value.const_value.numpy().view(np.uint8), expected)
+        else:
+            assert value.dtype == ir.DataType.FLOAT
+            np.testing.assert_array_equal(
+                value.const_value.numpy(), torch.stack(source).numpy()
+            )
 
 
 def test_fish_omni_streams_all_components(tmp_path):
