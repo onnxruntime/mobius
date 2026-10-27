@@ -131,6 +131,33 @@ def test_fish_omni_fp8_scales_are_reconstructed_in_fp32(tmp_path, dtype):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_fish_omni_cuda_banks_preserve_fp8_reconstruction_and_expert_order(tmp_path):
+    config = dataclasses.replace(tiny_config(), fp8_experts=True)
+    name = "decoder.model.layers.0.mlp.packed_experts.gate_proj.weight"
+    count = config.num_local_experts
+    value = ir.Value(
+        name=name, shape=ir.Shape([count, 128, 128]), type=ir.TensorType(ir.DataType.FLOAT)
+    )
+    package = ModelPackage(
+        {"decoder": ir.Model(ir.Graph([], [], nodes=[], initializers=[value]), ir_version=12)},
+        config=config,
+    )
+    tensors = {}
+    expected = []
+    for expert in range(count):
+        source = f"model.language_model.layers.0.mlp.experts.{expert}.gate_proj.weight"
+        weight = torch.linspace(-1, 1, 128 * 128).reshape(128, 128).to(torch.float8_e4m3fn)
+        scale = torch.tensor([[0.123456 * (expert + 1)]], dtype=torch.float32)
+        tensors[source] = weight
+        tensors[source.removesuffix(".weight") + ".weight_scale_inv"] = scale
+        expected.append(weight.float() * scale)
+    save_file(tensors, tmp_path / "model.safetensors")
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    torch.testing.assert_close(
+        torch.from_numpy(value.const_value.numpy()), torch.stack(expected), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("revision", [None, "explicit-revision"])
 def test_fish_omni_revision_reaches_first_config_read(monkeypatch, revision):
     seen = []
@@ -166,7 +193,15 @@ def test_fish_omni_requires_explicit_dequantization_before_weight_io(monkeypatch
         _builder.build_transformers_model("fishaudio/drama-3")
 
 
-def test_fish_omni_cli_persists_three_weighted_models(tmp_path):
+@pytest.mark.parametrize(
+    "task,ep",
+    [
+        ("fish-omni", "default"),
+        ("fish-omni-generation", "default"),
+        ("fish-omni-generation", "cuda"),
+    ],
+)
+def test_fish_omni_cli_persists_three_weighted_models(tmp_path, task, ep):
     config = tiny_config()
     package = build_from_module(FishOmniModel(config), config, task="fish-omni")
     (tmp_path / "config.json").write_text(json.dumps(FISH_OMNI_CONFIG), encoding="utf-8")
@@ -179,12 +214,17 @@ def test_fish_omni_cli_persists_three_weighted_models(tmp_path):
             str(tmp_path),
             "--dtype",
             "f32",
+            "--task",
+            task,
+            "--execution-provider",
+            ep,
             "--dequantize",
             "--output",
             str(output),
         ]
     )
-    for component in ("embedding", "decoder", "audio_decoder"):
+    audio = "audio_generator" if task == "fish-omni-generation" else "audio_decoder"
+    for component in ("embedding", "decoder", audio):
         model = ir.load(output / component / "model.onnx")
         assert all(
             value.const_value is not None for value in model.graph.initializers.values()

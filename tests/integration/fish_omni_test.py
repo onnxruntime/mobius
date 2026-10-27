@@ -8,9 +8,11 @@ from __future__ import annotations
 import copy
 import dataclasses
 import importlib.util
+import json
 import sys
 import types
 import urllib.request
+from pathlib import Path
 
 import ml_dtypes
 import numpy as np
@@ -25,6 +27,7 @@ from mobius import build_from_module
 from mobius._configs.fish_omni import DRAMA3_SOURCE_REVISION, FishOmniConfig
 from mobius._model_package import ModelPackage
 from mobius._testing.ort_inference import OnnxModelSession
+from mobius.generation._fish_omni import build_fish_codebook_sampler
 from mobius.integrations.transformers._config_resolver import _dict_to_pretrained_config
 from mobius.integrations.transformers._fish_omni_weights import (
     stream_fish_omni_safetensors_to_package,
@@ -121,22 +124,33 @@ def _next_cache(outputs):
 
 
 @pytest.mark.parametrize("backbone_codebooks", [0, 1])
+@pytest.mark.parametrize("task", ["fish-omni", "fish-omni-generation"])
 @pytest.mark.parametrize(
-    "dtype",
+    "dtype,execution_provider",
     [
-        ir.DataType.FLOAT,
+        (ir.DataType.FLOAT, "default"),
         pytest.param(
             ir.DataType.BFLOAT16,
+            "onnx-standard",
             marks=pytest.mark.skipif(
                 not torch.cuda.is_available()
                 or "CUDAExecutionProvider" not in ort.get_available_providers(),
                 reason="BF16 numerical parity requires PyTorch and ORT CUDA",
             ),
         ),
+        pytest.param(
+            ir.DataType.FLOAT,
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available()
+                or "CUDAExecutionProvider" not in ort.get_available_providers(),
+                reason="Fused sparse experts require CUDA",
+            ),
+        ),
     ],
 )
 def test_fish_omni_pipeline_prefill_and_cached_decode(
-    upstream, tmp_path, monkeypatch, backbone_codebooks, dtype
+    upstream, tmp_path, monkeypatch, backbone_codebooks, dtype, execution_provider, task
 ):
     raw = copy.deepcopy(FISH_OMNI_CONFIG)
     raw["audio_decoder_config"]["vq_backbone_codebooks"] = backbone_codebooks
@@ -144,7 +158,7 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
     torch.manual_seed(42)
     tolerance = 1e-4 if dtype == ir.DataType.FLOAT else 1e-2
     torch_dtype = torch.float32 if dtype == ir.DataType.FLOAT else torch.bfloat16
-    device = "cpu" if dtype == ir.DataType.FLOAT else "cuda:0"
+    device = "cuda:0" if dtype != ir.DataType.FLOAT or execution_provider == "cuda" else "cpu"
     backbone = upstream["backbone"].FishOmniBackbone(
         reference_config.text, dtype=torch_dtype, device=device
     )
@@ -161,8 +175,8 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
     package = build_from_module(
         FishOmniModel(config),
         config,
-        task="fish-omni",
-        execution_provider="default" if dtype == ir.DataType.FLOAT else "onnx-standard",
+        task=task,
+        execution_provider=execution_provider,
     )
     save_file(_checkpoint(backbone, tower), tmp_path / "model.safetensors")
     stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
@@ -170,12 +184,32 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
     package.save(str(output), max_workers=1, progress_bar=False)
     package = ModelPackage.load(str(output))
     assert set(package.policy_components) == {"main_sampler", "codebook_sampler"}
-    if dtype != ir.DataType.FLOAT:
+    if device != "cpu":
         ort.preload_dlls()
     sessions = {
-        name: OnnxModelSession(model, device="cpu" if dtype == ir.DataType.FLOAT else "cuda")
+        name: OnnxModelSession(
+            model,
+            device="cpu" if device == "cpu" else "cuda",
+            enable_profiling=name == "decoder" and execution_provider == "cuda",
+            profile_file_prefix=str(tmp_path / f"{name}_profile"),
+        )
         for name, model in package.items()
     }
+    fast = task == "fish-omni-generation"
+    audio_name = "audio_generator" if fast else "audio_decoder"
+    sampling = (
+        {
+            "generate": np.array(False),
+            "do_sample": np.array(False),
+            "temperature": np.ones(1, np.float32),
+            "top_k": np.array([config.tower.vocab_size], np.int64),
+            "top_p": np.ones(1, np.float32),
+            "seed": np.array([42], np.int64),
+            "counter": np.zeros(1, np.int64),
+        }
+        if fast
+        else {}
+    )
     backbone.setup_caches(1, 32)
     tower.setup_caches(32)
     caches = {name: _empty_cache(model) for name, model in package.items()}
@@ -261,10 +295,12 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                             ]
                         ]
                     )
-                    for i in range(config.num_codebooks - 1):
-                        tower_output = sessions["audio_decoder"].run(
+                    for i in range(1 if fast else config.num_codebooks - 1):
+                        tower_output = sessions[audio_name].run(
                             {
-                                **caches["audio_decoder"],
+                                **sampling,
+                                **({"generate": np.array(True)} if fast else {}),
+                                **caches[audio_name],
                                 "hidden_states": outputs["hidden_states"],
                                 "shared_input": embedded["shared_input"],
                                 "codes": next_codes,
@@ -273,11 +309,15 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                                 "attention_mask": mask,
                             }
                         )
-                        next_codes[0, 0, i + 1] = (
-                            tower_output["codebook_logits"][0, 0, i]
-                            .astype(np.float32)
-                            .argmax()
-                        )
+                        if fast:
+                            assert tower_output["valid"].all()
+                            next_codes = tower_output["frame_codes"]
+                        else:
+                            next_codes[0, 0, i + 1] = (
+                                tower_output["codebook_logits"][0, 0, i]
+                                .astype(np.float32)
+                                .argmax()
+                            )
                     sampled_logits.clear()
                     next_frames = tower.decode_step(
                         backbone.compute_logits(hidden)[0],
@@ -300,13 +340,14 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                         rtol=tolerance,
                     )
                     caches["decoder"] = _next_cache(outputs)
-                    caches["audio_decoder"] = _next_cache(tower_output)
+                    caches[audio_name] = _next_cache(tower_output)
                     start += length
                     continue
                 semantic = tower.is_semantic(next_frames[:, 0])
-                tower_output = sessions["audio_decoder"].run(
+                tower_output = sessions[audio_name].run(
                     {
-                        **caches["audio_decoder"],
+                        **sampling,
+                        **caches[audio_name],
                         "hidden_states": outputs["hidden_states"],
                         "shared_input": embedded["shared_input"],
                         "codes": next_frames[:, 1:].cpu().numpy()[None],
@@ -330,8 +371,141 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
                     rtol=tolerance,
                 )
                 caches["decoder"] = _next_cache(outputs)
-                caches["audio_decoder"] = _next_cache(tower_output)
+                caches[audio_name] = _next_cache(tower_output)
                 start += length
+        if execution_provider == "cuda":
+            profile = json.loads(
+                Path(sessions["decoder"]._session.end_profiling()).read_text()
+            )
+            actual_moe = sum(
+                item.get("args", {}).get("op_name") == "MoE"
+                and item.get("args", {}).get("provider") == "CUDAExecutionProvider"
+                for item in profile
+            )
+            assert actual_moe == 21 * config.num_hidden_layers
     finally:
+        for session in sessions.values():
+            session.close()
+
+
+def test_sampled_tower_matches_sequential_replays_and_rejects_multiframe_generate(
+    upstream, tmp_path
+):
+    raw = copy.deepcopy(FISH_OMNI_CONFIG)
+    native_config = upstream["config"].FishOmniConfig.from_dict(raw)
+    torch.manual_seed(42)
+    backbone = upstream["backbone"].FishOmniBackbone(native_config.text, dtype=torch.float32)
+    tower = upstream["tower"].FishOmniAudioDecoder(native_config, dtype=torch.float32)
+    for module in (backbone, tower):
+        for parameter in module.parameters():
+            torch.nn.init.normal_(parameter, mean=0, std=0.1)
+    config = FishOmniConfig.from_transformers(_dict_to_pretrained_config(raw))
+    save_file(_checkpoint(backbone, tower), tmp_path / "model.safetensors")
+    models = {}
+    for task, name in (
+        ("fish-omni", "audio_decoder"),
+        ("fish-omni-generation", "audio_generator"),
+    ):
+        package = build_from_module(FishOmniModel(config), config, task=task)
+        stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+        models[name] = package[name]
+    sessions = {
+        name: OnnxModelSession(
+            model,
+            enable_profiling=name == "audio_generator",
+            profile_file_prefix=str(tmp_path / f"{name}_profile"),
+        )
+        for name, model in models.items()
+    }
+    sampler = OnnxModelSession(build_fish_codebook_sampler(config).model)
+    rng = np.random.default_rng(42)
+    inputs = {
+        "hidden_states": rng.normal(size=(1, 1, config.hidden_size)).astype(np.float32),
+        "shared_input": rng.normal(size=(1, 1, config.hidden_size)).astype(np.float32),
+        "semantic_mask": np.ones((1, 1), bool),
+        "attention_mask": np.ones((1, 1), np.int64),
+        "position_ids": np.zeros((1, 1), np.int64),
+    }
+    codes = np.zeros((1, 1, config.num_codebooks), np.int64)
+    codes[0, 0, 0] = 3
+    controls = {
+        "temperature": np.array([0.8], np.float32),
+        "top_k": np.array([4], np.int64),
+        "top_p": np.array([0.9], np.float32),
+        "seed": np.array([42], np.int64),
+    }
+    initial_counter = np.array([17], np.int64)
+    try:
+        expected_codes = codes.copy()
+        counter = initial_counter
+        for index in range(config.num_codebooks - 1):
+            expected = sessions["audio_decoder"].run(
+                {**_empty_cache(models["audio_decoder"]), **inputs, "codes": expected_codes}
+            )
+            sample = sampler.run(
+                {
+                    **controls,
+                    "counter": counter,
+                    "logits": expected["codebook_logits"][:, 0, index],
+                }
+            )
+            expected_codes[0, 0, index + 1] = sample["token"][0]
+            counter = sample["next_counter"]
+        actual = sessions["audio_generator"].run(
+            {
+                **_empty_cache(models["audio_generator"]),
+                **inputs,
+                **controls,
+                "codes": codes,
+                "counter": initial_counter,
+                "generate": np.array(True),
+                "do_sample": np.array(True),
+            }
+        )
+        assert actual["valid"].all()
+        np.testing.assert_array_equal(actual["frame_codes"], expected_codes)
+        np.testing.assert_array_equal(actual["next_counter"], counter)
+        for name, value in expected.items():
+            np.testing.assert_allclose(actual[name], value, atol=1e-4, rtol=1e-4)
+        doubled = {key: np.repeat(value, 2, axis=1) for key, value in inputs.items()}
+        doubled["position_ids"] = np.array([[0, 1]], np.int64)
+        invalid = sessions["audio_generator"].run(
+            {
+                **_empty_cache(models["audio_generator"]),
+                **doubled,
+                **controls,
+                "codes": np.repeat(codes, 2, axis=1),
+                "counter": initial_counter,
+                "generate": np.array(True),
+                "do_sample": np.array(False),
+            }
+        )
+        assert not invalid["valid"].any()
+        assert (invalid["frame_codes"] == -1).all()
+        np.testing.assert_array_equal(invalid["next_counter"], initial_counter)
+        prefill = sessions["audio_generator"].run(
+            {
+                **_empty_cache(models["audio_generator"]),
+                **doubled,
+                **controls,
+                "temperature": np.array([np.nan], np.float32),
+                "top_p": np.array([np.nan], np.float32),
+                "codes": np.repeat(codes, 2, axis=1),
+                "counter": initial_counter,
+                "generate": np.array(False),
+                "do_sample": np.array(True),
+            }
+        )
+        assert prefill["valid"].all()
+        np.testing.assert_array_equal(prefill["next_counter"], initial_counter)
+        profile = json.loads(
+            Path(sessions["audio_generator"]._session.end_profiling()).read_text()
+        )
+        assert (
+            sum(item.get("args", {}).get("op_name") == "TopK" for item in profile)
+            == config.num_codebooks - 1
+        )
+    finally:
+        sampler.close()
         for session in sessions.values():
             session.close()

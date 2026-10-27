@@ -651,9 +651,12 @@ def build_transformers_model(
     if model_type == "fish_omni":
         from mobius.tasks import FishOmniTask
 
-        if task != "fish-omni" and not isinstance(task, FishOmniTask):
+        if task not in ("fish-omni", "fish-omni-generation") and not isinstance(
+            task, FishOmniTask
+        ):
             raise ValueError(
-                "Drama 3 requires task='fish-omni'; it is not a generic causal LM"
+                "Drama 3 requires task='fish-omni' or 'fish-omni-generation'; "
+                "it is not a generic causal LM"
             )
         if output_layer_indices is not None or fp8_kv_cache or kv_cache_scales is not None:
             raise ValueError("Drama 3 does not support hidden-layer capture or FP8 KV caches")
