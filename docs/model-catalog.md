@@ -112,6 +112,10 @@ Models combining Mamba/SSM layers with transformer attention layers.
 
 Models that process both images and text.
 
+For Gemma4 26B-A4B, see the [draft runtime qualification and FP32 pixel input
+contract](gemma4-runtime.md), including the failed strict parity gate and limits
+of the prior evaluation evidence.
+
 | Model Type | Module Class | Task | Example HuggingFace Model |
 |---|---|---|---|
 | `llava` | `LLaVAModel` | `vision-language` | `llava-hf/llava-1.5-7b-hf` |

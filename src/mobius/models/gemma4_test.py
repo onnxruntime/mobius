@@ -58,6 +58,133 @@ def _tiny_gemma4_config(**overrides) -> Gemma4Config:
     return Gemma4Config(**defaults)
 
 
+class TestGemma4HfPrecisionAlignment:
+    @pytest.mark.parametrize(
+        "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+    )
+    @pytest.mark.parametrize("quantized", [False, True])
+    @pytest.mark.parametrize("optimized", [False, True])
+    def test_vision_accepts_float32_processor_pixels(self, dtype, quantized, optimized):
+        from mobius._builder import _cast_module_dtype, build_from_module
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            dtype=dtype,
+            enable_moe_block=False,
+            quantization=(
+                QuantizationConfig(
+                    quant_method="olive", bits=4, group_size=16, quantize_vision=True
+                )
+                if quantized
+                else None
+            ),
+        )
+        module = Gemma4Model(config)
+        _cast_module_dtype(module, dtype)
+        package = (
+            build_from_module(module, config, task="gemma4")
+            if optimized
+            else Gemma4Task().build(module, config)
+        )
+        graph = package["vision_encoder"].graph
+        assert graph.inputs[0].name == "pixel_values"
+        assert graph.inputs[0].dtype == ir.DataType.FLOAT
+        projection = next(node for node in graph if node.op_type in {"MatMul", "MatMulNBits"})
+        assert projection.inputs[0].dtype == dtype
+
+    @pytest.mark.parametrize(
+        ("dtype", "torch_dtype"),
+        [
+            (ir.DataType.FLOAT, torch.float32),
+            (ir.DataType.FLOAT16, torch.float16),
+            (ir.DataType.BFLOAT16, torch.bfloat16),
+        ],
+    )
+    def test_pixel_normalization_before_projection_cast(self, dtype, torch_dtype):
+        import numpy as np
+        from onnx_ir import tensor_adapters
+
+        from mobius._builder import _cast_module_dtype
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import _Gemma4VisionPatchEmbedder
+        from mobius.tasks._base import _make_graph
+
+        module = _Gemma4VisionPatchEmbedder(1, 4, 1)
+        _cast_module_dtype(module, dtype)
+        graph, builder = _make_graph()
+        pixels = builder.input("pixel_values", ir.DataType.FLOAT, [1, 256, 3])
+        positions = builder.input("positions", ir.DataType.INT64, [1, 256, 2])
+        module(builder.op, pixels, positions)
+        projection = next(node for node in graph if node.op_type == "MatMul")
+        normalized = projection.inputs[0]
+        # Execute only normalization: no CPU BF16 MatMul kernel is needed.
+        normalized_f32 = builder.op.Cast(normalized, to=ir.DataType.FLOAT)
+        builder.add_output(normalized_f32, "normalized")
+        module.position_embedding_table.const_value = tensor_adapters.TorchTensor(
+            torch.zeros(2, 1, 4, dtype=torch_dtype)
+        )
+        prefix = ir.convenience.extract(graph, [pixels], [normalized_f32])
+        values = (torch.arange(256).float() / 255).reshape(1, 256, 1).expand(1, 256, 3)
+        expected = (2 * (values - 0.5)).to(torch_dtype).float().numpy()
+        actual = OnnxModelSession(ir.Model(prefix, ir_version=10), device="cpu").run(
+            {"pixel_values": values.numpy().copy()}
+        )["normalized"]
+        np.testing.assert_array_equal(actual, expected)
+        if dtype == ir.DataType.BFLOAT16:
+            old = (values.to(torch_dtype) * 2 - 1).float().numpy()
+            assert np.count_nonzero(old != expected) == 128 * 3
+
+    @pytest.mark.parametrize(
+        ("dtype", "torch_dtype"),
+        [
+            (ir.DataType.FLOAT, torch.float32),
+            (ir.DataType.FLOAT16, torch.float16),
+            (ir.DataType.BFLOAT16, torch.bfloat16),
+        ],
+    )
+    def test_router_scalar_after_learned_scale(self, dtype, torch_dtype):
+        import ml_dtypes
+        import numpy as np
+
+        from mobius._builder import _cast_module_dtype
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import _Gemma4MoeRouter
+        from mobius.tasks._base import _make_graph
+
+        # A non-power-of-two hidden size exposes BF16 scalar-rounding differences.
+        generator = torch.Generator().manual_seed(7)
+        normed = torch.randn(4, 2816, generator=generator).to(torch_dtype)
+        scale = (0.2 + torch.rand(2816, generator=generator)).to(torch_dtype)
+        learned = normed * scale
+        expected = (learned * (2816**-0.5)).float().numpy()
+        module = _Gemma4MoeRouter(2816, 4)
+        _cast_module_dtype(module, dtype)
+        graph, builder = _make_graph()
+        hidden = builder.input("hidden", dtype, [4, 2816])
+        module(builder.op, hidden)
+        projection = next(node for node in graph if node.op_type == "MatMul")
+        scaled = projection.inputs[0]
+        assert scaled.producer().op_type == "CastLike"
+        learned_value = scaled.producer().inputs[1]
+        assert learned_value.producer().op_type == "Mul"
+        assert learned_value.producer().inputs[0].producer().op_type == "RMSNormalization"
+        output = builder.op.Cast(scaled, to=ir.DataType.FLOAT)
+        builder.add_output(output, "scaled")
+        prefix = ir.convenience.extract(graph, [learned_value], [output])
+        np_dtype = {
+            ir.DataType.FLOAT: np.float32,
+            ir.DataType.FLOAT16: np.float16,
+            ir.DataType.BFLOAT16: ml_dtypes.bfloat16,
+        }[dtype]
+        actual = OnnxModelSession(ir.Model(prefix, ir_version=10), device="cpu").run(
+            {learned_value.name: learned.float().numpy().astype(np_dtype)}
+        )["scaled"]
+        np.testing.assert_array_equal(actual, expected)
+        if dtype == ir.DataType.BFLOAT16:
+            folded = normed * (scale * (2816**-0.5))
+            assert np.count_nonzero(folded.float().numpy() != expected) > 0
+
+
 class TestGemma4CausalLMPreprocessWeights:
     """Test Gemma4CausalLMModel.preprocess_weights."""
 
@@ -75,16 +202,16 @@ class TestGemma4CausalLMPreprocessWeights:
         assert "model.layers.0.fc2_experts_weights" in result
         assert "model.layers.0.experts.gate_up_proj" not in result
 
-    def test_router_scale_folding(self):
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_router_scale_preserved(self, dtype):
         config = _tiny_gemma4_config()
         model = Gemma4CausalLMModel(config)
 
-        scale_val = torch.tensor([2.0])
+        scale_val = torch.tensor([2.0], dtype=dtype)
         fake_sd = {"model.layers.0.router.scale": scale_val.clone()}
         result = model.preprocess_weights(fake_sd)
 
-        expected = 2.0 * (64**-0.5)  # hidden_size=64
-        assert abs(result["model.layers.0.router.scale"].item() - expected) < 1e-6
+        torch.testing.assert_close(result["model.layers.0.router.scale"], scale_val)
 
     def test_quantized_moe_experts_fail_closed(self):
         config = _tiny_gemma4_config(
@@ -121,18 +248,18 @@ class TestGemma4ModelPreprocessWeights:
         assert "decoder.model.layers.0.fc1_experts_weights" in result
         assert "decoder.model.layers.0.fc2_experts_weights" in result
 
-    def test_router_scale_folding(self):
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    def test_router_scale_preserved(self, dtype):
         config = _tiny_gemma4_config()
         model = Gemma4Model(config)
 
-        scale_val = torch.tensor([2.0])
+        scale_val = torch.tensor([2.0], dtype=dtype)
         fake_sd = {"model.language_model.layers.0.router.scale": scale_val.clone()}
         result = model.preprocess_weights(fake_sd)
 
-        expected = 2.0 * (64**-0.5)
         key = "decoder.model.layers.0.router.scale"
         assert key in result
-        assert abs(result[key].item() - expected) < 1e-6
+        torch.testing.assert_close(result[key], scale_val)
 
     def test_quantized_moe_experts_fail_closed(self):
         config = _tiny_gemma4_config(
@@ -1103,14 +1230,28 @@ class TestGemma4BlockSequenceIds:
         assert "block_sequence_ids" not in dec_inputs
         assert "input_ids" in dec_inputs
 
-        # Decoder attention must drop GQA and disable the op's built-in causal
-        # mask (is_causal=0) so the baked blockwise bias is honored.
+        # Only local layers disable the built-in causal mask for the image overlay.
         dec = pkg["decoder"].graph
         assert not any(n.op_type == "GroupQueryAttention" for n in dec)
         attn_nodes = [n for n in dec if n.op_type == "Attention"]
-        assert attn_nodes
-        for n in attn_nodes:
-            assert n.attributes["is_causal"].as_int() == 0
+        assert len(attn_nodes) == len(config.layer_types)
+        for node, layer_type in zip(attn_nodes, config.layer_types, strict=True):
+            expected = 0 if layer_type == "sliding_attention" else 1
+            assert node.attributes["is_causal"].as_int() == expected
+        # A global mask must have no data dependency on the image block overlay.
+        global_bias = attn_nodes[1].inputs[3]
+        pending = [global_bias]
+        visited = set()
+        while pending:
+            value = pending.pop()
+            if value is None or value.producer() is None:
+                continue
+            producer = value.producer()
+            if producer in visited:
+                continue
+            visited.add(producer)
+            assert producer.op_type != "Or"
+            pending.extend(producer.inputs)
 
     def test_no_block_sequence_ids_when_causal(self):
         """Without bidirectional attention, no input_ids/overlay is wired."""
@@ -1125,6 +1266,82 @@ class TestGemma4BlockSequenceIds:
         assert "block_sequence_ids" not in emb_outputs
         assert "block_sequence_ids" not in dec_inputs
         assert "input_ids" not in dec_inputs
+
+    @pytest.mark.parametrize("mask", [[1, 0, 1, 1], [1, 1, 1, 0]])
+    @pytest.mark.parametrize("text_task", [False, True], ids=["split", "text"])
+    def test_cuda_export_preserves_global_cached_mask_holes(self, mask, text_task):
+        import numpy as np
+
+        from mobius import build_from_module
+        from mobius._pipeline_contract import requires_arbitrary_attention_mask
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.tasks._gemma4 import Gemma4Task, Gemma4TextCausalLMTask
+
+        config = _tiny_gemma4_config(
+            dtype=ir.DataType.FLOAT16,
+            enable_moe_block=False,
+            use_bidirectional_attention="vision",
+            image_token_id=255,
+        )
+        module = Gemma4CausalLMModel(config) if text_task else Gemma4Model(config)
+        task = Gemma4TextCausalLMTask() if text_task else Gemma4Task()
+        package = build_from_module(module, config, task=task, execution_provider="cuda")
+        decoder = package["model" if text_task else "decoder"]
+        assert requires_arbitrary_attention_mask(decoder.graph)
+        assert not any(node.op_type == "GroupQueryAttention" for node in decoder.graph)
+        global_attention = next(
+            node
+            for node in decoder.graph
+            if node.op_type == "Attention"
+            and node.attributes["kv_num_heads"].as_int() == config.num_global_key_value_heads
+        )
+        assert global_attention.attributes["is_causal"].as_int() == 1
+        bias = global_attention.inputs[3]
+        assert bias is not None and bias.name is not None
+        # Execute the actual optimized bias with one query and three past slots.
+        # Equal token counts must not collapse these distinct visible-key sets.
+        inputs = [
+            value
+            for value in decoder.graph.inputs
+            if value.name in {"input_ids", "attention_mask"}
+        ]
+        graph = ir.convenience.extract(decoder.graph, inputs, [bias])
+        session = OnnxModelSession(ir.Model(graph, ir_version=10), device="cpu")
+        try:
+            actual = session.run(
+                {
+                    "input_ids": np.array([[5]], dtype=np.int64),
+                    "attention_mask": np.array([mask], dtype=np.int64),
+                }
+            )[bias.name]
+        finally:
+            session.close()
+        np.testing.assert_array_equal(actual[0, 0, 0] > -1, np.array(mask, dtype=bool))
+
+    def test_text_only_cuda_export_keeps_gqa_eligibility(self):
+        from mobius import build_from_module
+        from mobius._pipeline_contract import requires_arbitrary_attention_mask
+
+        config = _tiny_gemma4_config(
+            model_type="gemma4_text",
+            dtype=ir.DataType.FLOAT16,
+            enable_moe_block=False,
+            vision=None,
+            image_token_id=None,
+            use_bidirectional_attention=None,
+        )
+        package = build_from_module(
+            Gemma4CausalLMModel(config),
+            config,
+            task="gemma4-text-generation",
+            execution_provider="cuda",
+        )
+        graph = package["model"].graph
+        assert not requires_arbitrary_attention_mask(graph)
+        assert (
+            sum(node.op_type == "GroupQueryAttention" for node in graph)
+            == config.num_hidden_layers
+        )
 
 
 def _tiny_gemma4_unified_config(**overrides) -> Gemma4Config:
@@ -1360,6 +1577,413 @@ def _build_gemma4_text(config: Gemma4Config) -> ir.Model:
     return task.build(module, config)["model"]
 
 
+class TestGemma4NativeMoe:
+    @pytest.fixture(autouse=True)
+    def custom_runtime_opt_in(self):
+        from mobius._flags import override_flags
+
+        with override_flags(gemma4_custom_geglu=True):
+            yield
+
+    @staticmethod
+    def _quantization(**overrides):
+        return QuantizationConfig(
+            quant_method="olive", bits=4, group_size=16, quantize_moe=True, **overrides
+        )
+
+    @pytest.mark.parametrize("quantized", [False, True])
+    @pytest.mark.parametrize(
+        "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+    )
+    def test_native_geglu_uses_raw_logits_and_separate_expert_norm(
+        self, quantized, dtype, tmp_path
+    ):
+        import numpy as np
+
+        from mobius._build_context import build_context
+        from mobius._builder import _cast_module_dtype
+        from mobius._constants import GEMMA4_CUSTOM_GEGLU_METADATA_KEY
+        from mobius._execution_providers import get_ep
+        from mobius.tasks._gemma4 import Gemma4TextCausalLMTask
+
+        config = _tiny_gemma4_text_moe_config(
+            dtype=dtype, quantization=self._quantization() if quantized else None
+        )
+        if quantized and dtype == ir.DataType.FLOAT:
+            with pytest.raises(NotImplementedError, match="FLOAT16 or BFLOAT16"):
+                Gemma4CausalLMModel(config)
+            return
+        module = Gemma4CausalLMModel(config)
+        _cast_module_dtype(module, dtype)
+        with build_context(get_ep("cuda"), dtype):
+            graph = Gemma4TextCausalLMTask().build(module, config)["model"].graph
+        nodes = [node for node in graph if node.op_type == ("QMoE" if quantized else "MoE")]
+        assert len(nodes) == 2
+        for node in nodes:
+            assert node.metadata_props[GEMMA4_CUSTOM_GEGLU_METADATA_KEY] == (
+                "custom-cuda-geglu-v1"
+            )
+            assert node.attributes["activation_type"].value == "geglu"
+            assert node.attributes["swiglu_fusion"].value == 1
+            router = node.inputs[1]
+            while router.producer().op_type == "Reshape":
+                router = router.producer().inputs[0]
+            assert router.producer().op_type == "MatMul"
+            scaled = router.producer().inputs[0]
+            assert scaled.producer().op_type == "CastLike"
+            learned = scaled.producer().inputs[1]
+            norm = learned.producer().inputs[0].producer()
+            assert norm.op_type == "RMSNormalization"
+            expert_norm = node.inputs[0].producer()
+            assert expert_norm.op_type == "RMSNormalization"
+            assert norm.inputs[0] is expert_norm.inputs[0]
+            assert norm is not expert_norm
+        if quantized:
+            assert graph.initializers["model.layers.0.moe.fc1_experts_weights"].dtype == (
+                ir.DataType.UINT8
+            )
+            assert graph.initializers["model.layers.0.moe.gate.proj.weight"].dtype == dtype
+        # The requirement belongs to the exported operator, not transient flags.
+        for initializer in graph.initializers.values():
+            if initializer.const_value is None:
+                assert initializer.shape is not None and initializer.dtype is not None
+                initializer.const_value = ir.tensor(
+                    np.zeros(list(initializer.shape), dtype=initializer.dtype.numpy())
+                )
+        ir.save(ir.Model(graph, ir_version=10), tmp_path / "native.onnx")
+        restored = ir.load(tmp_path / "native.onnx")
+        restored_nodes = [
+            node for node in restored.graph if node.op_type == ("QMoE" if quantized else "MoE")
+        ]
+        assert len(restored_nodes) == 2
+        assert all(
+            node.metadata_props[GEMMA4_CUSTOM_GEGLU_METADATA_KEY] == "custom-cuda-geglu-v1"
+            for node in restored_nodes
+        )
+
+    def test_default_cuda_is_portable_and_quantized_experts_require_opt_in(self):
+        from mobius._builder import build_from_module
+        from mobius._flags import override_flags
+
+        with override_flags(gemma4_custom_geglu=False):
+            config = _tiny_gemma4_text_moe_config(dtype=ir.DataType.BFLOAT16)
+            package = build_from_module(
+                Gemma4CausalLMModel(config), config, execution_provider="cuda"
+            )
+            assert not any(node.op_type in {"MoE", "QMoE"} for node in package["model"].graph)
+            assert any(node.op_type == "Softmax" for node in package["model"].graph)
+            with pytest.raises(NotImplementedError, match="MOBIUS_GEMMA4_CUSTOM_GEGLU"):
+                Gemma4CausalLMModel(
+                    dataclasses.replace(config, quantization=self._quantization())
+                )
+
+    def test_native_experts_fail_closed_on_unsupported_ep_and_layout(self):
+        config = _tiny_gemma4_text_moe_config(
+            dtype=ir.DataType.BFLOAT16, quantization=self._quantization()
+        )
+        with pytest.raises(NotImplementedError, match="GEGLU-capable"):
+            _build_gemma4_text(config)
+        for hidden_act in ("gelu", "silu"):
+            with pytest.raises(NotImplementedError, match="tanh-GELU"):
+                Gemma4CausalLMModel(dataclasses.replace(config, hidden_act=hidden_act))
+        quantization = dataclasses.replace(
+            config.quantization,
+            overrides={
+                "model.language_model.layers.0.experts.down_proj": QuantizationOverride(bits=8)
+            },
+        )
+        with pytest.raises(NotImplementedError, match="INT4"):
+            Gemma4CausalLMModel(dataclasses.replace(config, quantization=quantization))
+
+    @pytest.mark.parametrize("multimodal", [False, True])
+    @pytest.mark.parametrize("symmetric", [False, True])
+    @pytest.mark.parametrize("component_plan", [False, True])
+    def test_expert_payloads_and_module_layouts(self, multimodal, symmetric, component_plan):
+        from mobius._component_quantization import configure_component_quantization
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        quantization = self._quantization(
+            sym=symmetric,
+            overrides=(
+                {
+                    "model.language_model.layers.0.self_attn.q_proj": QuantizationOverride(
+                        bits=8
+                    )
+                }
+                if component_plan
+                else {}
+            ),
+        )
+        config = _tiny_gemma4_config(
+            dtype=ir.DataType.BFLOAT16,
+            hidden_act="gelu_pytorch_tanh",
+            quantization=quantization,
+            component_quantization={"decoder": quantization} if component_plan else None,
+        )
+        prefix = "model.language_model.layers.0" if multimodal else "model.layers.0"
+        target = "decoder.model.layers.0.moe" if multimodal else "model.layers.0.moe"
+        gate = torch.arange(4 * 64 * 32).to(torch.uint8).reshape(4, 64, 32)
+        down = torch.arange(4 * 64 * 16).to(torch.uint8).reshape(4, 64, 16)
+        output_scale = torch.tensor([-2.0, 0.0, 0.5, 1.5], dtype=torch.bfloat16)
+        state = {
+            f"{prefix}.experts.gate_up_proj_qweight": gate,
+            f"{prefix}.experts.gate_up_proj_scales": torch.ones(
+                4, 64, 4, dtype=torch.bfloat16
+            ),
+            f"{prefix}.experts.down_proj_qweight": down,
+            f"{prefix}.experts.down_proj_scales": torch.ones(4, 64, 2, dtype=torch.bfloat16),
+            f"{prefix}.router.scale": torch.ones(64, dtype=torch.bfloat16),
+            f"{prefix}.router.proj.weight": torch.ones(4, 64, dtype=torch.bfloat16),
+            f"{prefix}.router.per_expert_scale": output_scale,
+        }
+        if not symmetric:
+            state[f"{prefix}.experts.gate_up_proj_qzeros"] = torch.full(
+                (4, 64, 2), 0x93, dtype=torch.uint8
+            )
+            state[f"{prefix}.experts.down_proj_qzeros"] = torch.full(
+                (4, 64, 1), 0x57, dtype=torch.uint8
+            )
+        module = (Gemma4Model if multimodal else Gemma4CausalLMModel)(config)
+        result = module.preprocess_weights(dict(state))
+        torch.testing.assert_close(result[f"{target}.fc1_experts_weights"], gate)
+        torch.testing.assert_close(result[f"{target}.fc2_experts_weights"], down)
+        torch.testing.assert_close(
+            result[f"{target}.fc2_scales"],
+            torch.ones(4, 64, 2, dtype=torch.bfloat16) * output_scale[:, None, None],
+        )
+        torch.testing.assert_close(
+            result[f"{target}.gate.scale"], torch.ones(64, dtype=torch.bfloat16)
+        )
+        assert (f"{target}.fc1_experts_zero_points" in result) is not symmetric
+        if not symmetric:
+            assert torch.all(result[f"{target}.fc1_experts_zero_points"] == 0x93)
+        if component_plan and multimodal:
+            from mobius.components import Linear
+
+            task = Gemma4Task()
+            manifest = configure_component_quantization(module, config, task)
+            normalized = normalize_component_quantized_weights(
+                result,
+                module,
+                config,
+                ("decoder", "vision_encoder", "embedding"),
+                manifest=manifest,
+                task=task,
+            )
+            assert normalized.keys() == result.keys()
+            torch.testing.assert_close(normalized[f"{target}.fc1_experts_weights"], gate)
+            assert module.decoder.model.layers[0].self_attn.q_proj._bits == 8
+            assert isinstance(module.decoder.model.layers[0].moe.gate.proj, Linear)
+        invalid = dict(state)
+        invalid[f"{prefix}.experts.down_proj_qweight"] = down[..., :-1]
+        with pytest.raises(ValueError, match="expected shape"):
+            module.preprocess_weights(invalid)
+        invalid = dict(state)
+        invalid.pop(f"{prefix}.experts.down_proj_scales")
+        with pytest.raises(ValueError, match="expected sidecars"):
+            module.preprocess_weights(invalid)
+
+    @pytest.mark.parametrize("key", ["moe", "quantize_moe"])
+    def test_quantization_metadata_opt_in(self, key):
+        quantization = QuantizationConfig.from_value(
+            {"quant_method": "olive", "bits": 4, "group_size": 16, key: True}
+        )
+        assert quantization.quantize_moe
+
+    def test_canonical_quantize_moe_takes_precedence_over_legacy_alias(self):
+        quantization = QuantizationConfig.from_value(
+            {"quant_method": "olive", "quantize_moe": False, "moe": True}
+        )
+        assert not quantization.quantize_moe
+
+
+class TestGemma4VisionStandardization:
+    def test_bf16_kernel_three_pool_matches_actual_hf_rounding(self):
+        import numpy as np
+        from transformers import Gemma4VisionConfig as HFVisionConfig
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4VisionPooler as HFVisionPooler,
+        )
+
+        from mobius._testing import create_test_builder, create_test_input
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import Gemma4VisionPooler
+
+        hidden = torch.ones(1, 9, 4, dtype=torch.bfloat16)
+        hidden[:, -1] = 1.03125
+        positions = torch.tensor([[(x, y) for y in range(3) for x in range(3)]])
+        hf_pooler = HFVisionPooler(HFVisionConfig(hidden_size=4))
+        expected, _ = hf_pooler(
+            hidden, positions, torch.zeros(1, 9, dtype=torch.bool), output_length=1
+        )
+        # Actual pinned HF rounds the FP32 mean to 1, then scales by sqrt(4).
+        torch.testing.assert_close(expected, torch.full((1, 1, 4), 2.0), rtol=0, atol=0)
+        rounded_coefficients = torch.full((1, 1, 9), 1 / 9, dtype=torch.bfloat16)
+        old_mean = (rounded_coefficients.float() @ hidden.float()).to(torch.bfloat16)
+        # Sensitive to premature coefficient cast; compare exactly in BF16.
+        torch.testing.assert_close(
+            old_mean, torch.full_like(old_mean, 1.0078125), rtol=0, atol=0
+        )
+
+        builder, op, graph = create_test_builder()
+        features = create_test_input(builder, "features", [1, 9, 4], dtype=ir.DataType.FLOAT)
+        pos = create_test_input(builder, "positions", [1, 9, 2], dtype=ir.DataType.INT64)
+        output = Gemma4VisionPooler(4, kernel_size=3)(
+            op, op.Cast(features, to=ir.DataType.BFLOAT16), pos
+        )
+        output.name = "pooled"
+        graph.outputs.append(output)
+        matmul = next(node for node in graph if node.op_type == "MatMul")
+        assert all(value.dtype == ir.DataType.FLOAT for value in matmul.inputs)
+        actual = OnnxModelSession(ir.Model(graph, ir_version=10), device="cpu").run(
+            {"features": hidden.float().numpy(), "positions": positions.numpy()}
+        )["pooled"]
+        np.testing.assert_array_equal(actual, expected.numpy())
+
+    @pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+    def test_bf16_pool_zeroes_padded_nonfinite_like_actual_hf(self, nonfinite):
+        import numpy as np
+        from transformers import Gemma4VisionConfig as HFVisionConfig
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4VisionPooler as HFVisionPooler,
+        )
+
+        from mobius._testing import create_test_builder, create_test_input
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import Gemma4VisionPooler
+
+        hidden = torch.ones(1, 9, 4, dtype=torch.bfloat16)
+        hidden[:, -1] = nonfinite
+        positions = torch.tensor([[(x, y) for y in range(3) for x in range(3)]])
+        positions[:, -1] = -1
+        padding = (positions == -1).all(dim=-1)
+        expected, _ = HFVisionPooler(HFVisionConfig(hidden_size=4))(
+            hidden, positions, padding, output_length=1
+        )
+        assert torch.isfinite(expected).all()
+        rounded_mean = torch.tensor(8 / 9, dtype=torch.bfloat16).float()
+        torch.testing.assert_close(
+            expected, (rounded_mean * 2).expand(1, 1, 4), rtol=0, atol=0
+        )
+
+        builder, op, graph = create_test_builder()
+        features = create_test_input(builder, "features", [1, 9, 4], dtype=ir.DataType.FLOAT)
+        pos = create_test_input(builder, "positions", [1, 9, 2], dtype=ir.DataType.INT64)
+        output = Gemma4VisionPooler(4, kernel_size=3)(
+            op, op.Cast(features, to=ir.DataType.BFLOAT16), pos
+        )
+        output.name = "pooled"
+        graph.outputs.append(output)
+        actual = OnnxModelSession(ir.Model(graph, ir_version=10), device="cpu").run(
+            {"features": hidden.float().numpy(), "positions": positions.numpy()}
+        )["pooled"]
+        np.testing.assert_array_equal(actual, expected.numpy())
+
+    @pytest.mark.parametrize("missing", ["vision", "hidden_size"])
+    def test_vision_encoder_requires_concrete_hidden_size(self, missing):
+        from mobius._configs import VisionConfig
+        from mobius.models.gemma4 import _Gemma4VisionEncoderModel
+
+        with pytest.raises(ValueError, match=r"vision\.hidden_size"):
+            _Gemma4VisionEncoderModel(
+                _tiny_gemma4_config(
+                    vision=None if missing == "vision" else VisionConfig(hidden_size=None)
+                )
+            )
+
+    @pytest.mark.parametrize("standardize", [False, True])
+    def test_actual_hf_vision_entrypoint_with_padding(self, standardize):
+        import numpy as np
+        from transformers import Gemma4VisionConfig as HFVisionConfig
+        from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionModel
+
+        from mobius import ModelPackage
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import _Gemma4VisionEncoderModel
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        torch.manual_seed(42)
+        hf_config = HFVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=16,
+            patch_size=4,
+            pooling_kernel_size=2,
+            position_embedding_size=8,
+            standardize=standardize,
+            use_clipped_linears=False,
+        )
+        hf_config._attn_implementation = "eager"
+        reference = Gemma4VisionModel(hf_config).eval()
+        if standardize:
+            reference.std_bias.copy_(torch.linspace(-5.0, 5.0, 32))
+            reference.std_scale.copy_(torch.linspace(0.1, 2.0, 32))
+        vision = dataclasses.replace(
+            _tiny_gemma4_config().vision,
+            pooling_kernel_size=2,
+            position_embedding_size=8,
+            standardize=standardize,
+        )
+        config = _tiny_gemma4_config(vision=vision)
+        module = _Gemma4VisionEncoderModel(config)
+        package = ModelPackage({"vision_encoder": Gemma4Task()._build_vision(module, config)})
+        projection = torch.randn(64, 32) * 0.1
+        weights = {
+            "vision_tower." + name: value for name, value in reference.state_dict().items()
+        }
+        weights["embed_vision.embedding_projection.weight"] = projection
+        package.apply_weights(module.preprocess_weights(weights))
+        positions = torch.tensor(
+            [[*[[x, y] for y in range(2) for x in range(4)], *[[-1, -1]] * 4]]
+        )
+        pixels = torch.rand(1, 12, 48)
+        with torch.inference_mode():
+            features = reference(
+                pixel_values=pixels, pixel_position_ids=positions
+            ).last_hidden_state
+            expected = torch.nn.functional.linear(
+                torch.nn.functional.rms_norm(features, (32,), eps=vision.norm_eps), projection
+            )
+        actual = OnnxModelSession(package["vision_encoder"], device="cpu").run(
+            {"pixel_values": pixels.numpy(), "pixel_position_ids": positions.numpy()}
+        )["image_features"]
+        assert actual.shape == (2, 64)
+        np.testing.assert_allclose(actual, expected.numpy(), atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("standardize", [False, True])
+    def test_config_and_weight_mapping(self, standardize):
+        from types import SimpleNamespace
+
+        from mobius._configs._vision_defaults import apply_vision_defaults
+        from mobius.models.gemma4 import _Gemma4VisionEncoderModel
+
+        fields = {}
+        apply_vision_defaults(
+            SimpleNamespace(vision_config={"standardize": standardize}),
+            None,
+            "gemma4",
+            fields,
+        )
+        assert fields["standardize"] is standardize
+        config = _tiny_gemma4_config(
+            vision=dataclasses.replace(_tiny_gemma4_config().vision, standardize=standardize)
+        )
+        module = _Gemma4VisionEncoderModel(config)
+        assert (module.std_bias is not None) is standardize
+        if standardize:
+            bias, scale = torch.arange(32).float(), torch.ones(32)
+            state = {"vision_tower.std_bias": bias, "vision_tower.std_scale": scale}
+            assert module.preprocess_weights(state) == {"std_bias": bias, "std_scale": scale}
+            result = Gemma4Model(config).preprocess_weights(
+                {"model." + key: value for key, value in state.items()}
+            )
+            assert result["vision_encoder.std_bias"] is bias
+            assert result["vision_encoder.std_scale"] is scale
+
+
 class TestGemma4MoeFallbackActivation:
     """The unfused MoE fallback must apply the EXACT ``hidden_act`` (ACT2FN).
 
@@ -1397,6 +2021,76 @@ class TestGemma4MoeFallbackActivation:
         acts = self._activation_nodes(model)
         assert acts, "MoE fallback must emit an activation op"
         assert all(op == "Gelu" and approx == "tanh" for op, approx in acts), acts
+
+    @pytest.mark.parametrize("selected_expert", [0, 1])
+    @pytest.mark.parametrize("expert_scale", [0.0, 1.0])
+    def test_nonfinite_expert_is_masked_by_selection_not_weight(
+        self, selected_expert, expert_scale
+    ):
+        import numpy as np
+
+        from mobius._testing import create_test_builder, create_test_input
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import Gemma4DecoderLayer
+
+        class FallbackOnly(Gemma4DecoderLayer):
+            def forward(
+                self,
+                op,
+                hidden_states,
+                attention_bias,
+                position_embeddings=None,
+                shared_kv_states=None,
+                per_layer_input=None,
+                past_key_value=None,
+                is_causal=1,
+                static_kv_seqlen=None,
+            ):
+                self.router(op, hidden_states)
+                return self._dispatch_moe_fallback(op, hidden_states, attention_bias)
+
+        config = _tiny_gemma4_text_moe_config(
+            dtype=ir.DataType.FLOAT,
+            num_local_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+        )
+        module = FallbackOnly(config, 0)
+        fc1 = np.zeros((2, 32, 64), dtype=np.float32)
+        fc1[1] = np.finfo(np.float32).max
+        fc2 = np.zeros((2, 64, 16), dtype=np.float32)
+        fc2[1] = 1
+        module.fc1_experts_weights.const_value = ir.tensor(fc1)
+        module.fc2_experts_weights.const_value = ir.tensor(fc2)
+        module.router.per_expert_scale.const_value = ir.tensor(
+            np.full(2, expert_scale, dtype=np.float32)
+        )
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "normed_flat", [1, 64])
+        probs = create_test_input(builder, "router_probs", [1, 2])
+        output = module(op, x, probs)
+        output.name = "fallback"
+        output.shape = ir.Shape([1, 64])
+        output.dtype = ir.DataType.FLOAT
+        graph.outputs.append(output)
+        graph = ir.convenience.extract(graph, [x, probs], [output])
+        session = OnnxModelSession(ir.Model(graph, ir_version=10), device="cpu")
+        try:
+            actual = session.run(
+                {
+                    "normed_flat": np.ones((1, 64), dtype=np.float32),
+                    "router_probs": np.eye(2, dtype=np.float32)[
+                        selected_expert : selected_expert + 1
+                    ],
+                }
+            )["fallback"]
+        finally:
+            session.close()
+        if selected_expert == 0:
+            np.testing.assert_array_equal(actual, np.zeros((1, 64), dtype=np.float32))
+        else:
+            # Even a zero learned scale must not hide a selected expert's NaNs.
+            assert not np.isfinite(actual).any()
 
 
 class TestGemma4OutputLayerIndices:
