@@ -51,7 +51,21 @@ class FishOmniTask(ModelTask):
                 "Drama 3 FP16 currently requires execution_provider='cuda' "
                 "for the native FP16-input/FP32-output projection"
             )
-        if config.dtype == ir.DataType.BFLOAT16 and ep_capabilities().name != "onnx-standard":
+        if config.native_fp8_experts and ep_capabilities().name != "cuda":
+            raise ValueError(
+                "Drama 3 native FP8 requires execution_provider='cuda'; "
+                "use --dequantize for portable FP32."
+            )
+        if config.native_fp8_experts and config.dtype == ir.DataType.FLOAT:
+            raise ValueError(
+                "Drama 3 native FP8 export is disabled pending real-weight numerical "
+                "qualification; use --dequantize for the qualified dense FP32 route."
+            )
+        if (
+            config.dtype == ir.DataType.BFLOAT16
+            and not config.native_fp8_experts
+            and ep_capabilities().name != "onnx-standard"
+        ):
             raise ValueError(
                 "Drama 3 BF16 currently requires execution_provider='onnx-standard' "
                 "and a runtime with BF16 CUDA Attention support"
@@ -162,6 +176,14 @@ class FishOmniTask(ModelTask):
             model.metadata_props["mobius.fish_omni.scope"] = (
                 "Neural token graphs with ONNX sampling policies; caller orchestrates "
                 "temporal decoding and prompt formatting; waveform decoder exported separately"
+            )
+        if config.native_fp8_experts:
+            models["decoder"].metadata_props["mobius.required_runtime_features"] = (
+                "CUDA SM89+; fp8-qmoe=1; QMoE activation_quantization=dynamic_fp8"
+            )
+            assert config.num_experts_per_tok is not None
+            models["decoder"].metadata_props["mobius.native_fp8.max_tokens_per_call"] = str(
+                65535 // config.num_experts_per_tok
             )
         return ModelPackage(
             models,

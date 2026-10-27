@@ -29,6 +29,7 @@ class FishOmniConfig(ArchitectureConfig):
     semantic_start_token_id: int = 248099
     semantic_end_token_id: int = 252194
     fp8_experts: bool = False
+    native_fp8_experts: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> FishOmniConfig:
@@ -197,6 +198,26 @@ class FishOmniConfig(ArchitectureConfig):
             )
         if self.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16):
             raise ValueError("Drama 3 requires floating FP32, FP16 or BF16 compute")
+        if self.native_fp8_experts:
+            if not self.fp8_experts or self.dtype not in (
+                ir.DataType.FLOAT,
+                ir.DataType.FLOAT16,
+                ir.DataType.BFLOAT16,
+            ):
+                raise ValueError(
+                    "Drama 3 native FP8 requires FP8 source weights and floating compute; "
+                    "use keep_quantized=False (--dequantize) for FP32."
+                )
+            if (
+                self.hidden_size % 128
+                or not self.moe_intermediate_size
+                or self.moe_intermediate_size % 128
+                or not self.norm_topk_prob
+            ):
+                raise ValueError(
+                    "Drama 3 native FP8 requires 128-aligned experts and normalized routing; "
+                    "use --dequantize for the dense FP32 route."
+                )
         if self.tower is None:
             raise ValueError("Drama 3 requires an audio tower configuration")
         self.tower.validate()

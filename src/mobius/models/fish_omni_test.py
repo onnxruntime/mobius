@@ -46,9 +46,16 @@ def tiny_config():
 
 class _ReducedPrecisionQualificationOnly:
     def _validate_precision(self, config):
-        if config.dtype not in (ir.DataType.FLOAT16, ir.DataType.BFLOAT16):
+        if not config.native_fp8_experts and config.dtype not in (
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+        ):
             return super()._validate_precision(config)
-        expected = "cuda" if config.dtype == ir.DataType.FLOAT16 else "onnx-standard"
+        expected = (
+            "cuda"
+            if config.dtype == ir.DataType.FLOAT16 or config.native_fp8_experts
+            else "onnx-standard"
+        )
         if ep_capabilities().name != expected:
             raise ValueError("Qualification probe has the wrong execution provider")
 
@@ -56,7 +63,9 @@ class _ReducedPrecisionQualificationOnly:
         package = super().build(module, config)
         for model in package.values():
             model.metadata_props["mobius.precision_validation"] = (
-                "unqualified-reduced-precision-prototype"
+                "unqualified-native-fp8-prototype"
+                if config.native_fp8_experts
+                else "unqualified-reduced-precision-prototype"
             )
         return package
 
@@ -72,6 +81,66 @@ class _GenerationProbe(_ReducedPrecisionQualificationOnly, FishOmniGenerationTas
 def reduced_precision_prototype_task(task):
     """Test only: probe prepared math without opening production admission."""
     return _GenerationProbe() if task == "fish-omni-generation" else _TeacherProbe()
+
+
+def native_fp8_prototype_config(dtype=ir.DataType.FLOAT16):
+    config = tiny_config()
+    return dataclasses.replace(
+        config,
+        dtype=dtype,
+        hidden_size=128,
+        moe_intermediate_size=128,
+        fp8_experts=True,
+        native_fp8_experts=True,
+        tower=dataclasses.replace(config.tower, hidden_size=128),
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+def test_native_fp8_prototype_preserves_storage_and_dynamic_runtime_contract(dtype):
+    config = native_fp8_prototype_config(dtype)
+    package = build_from_module(
+        FishOmniModel(config),
+        config,
+        task=_TeacherProbe(),
+        execution_provider="cuda",
+    )
+    decoder = package["decoder"]
+    nodes = [node for node in decoder.graph if node.op_type == "QMoE"]
+    assert len(nodes) == config.num_hidden_layers
+    for node in nodes:
+        assert node.domain == "com.microsoft"
+        assert node.attributes["activation_quantization"].as_string() == "dynamic_fp8"
+        assert node.attributes["block_size"].as_int() == 128
+        assert node.attributes["expert_weight_bits"].as_int() == 8
+        assert node.attributes["swiglu_fusion"].as_int() == 0
+        assert node.inputs[4] is None and node.inputs[7] is None
+        assert all(node.inputs[i].dtype == ir.DataType.FLOAT8E4M3FN for i in (2, 5, 8))
+        assert all(node.inputs[i].dtype == ir.DataType.FLOAT for i in (3, 6, 9))
+        assert node.inputs[1].dtype == dtype
+    banks = {
+        name: value
+        for name, value in decoder.graph.initializers.items()
+        if ".packed_experts." in name
+    }
+    assert len(banks) == config.num_hidden_layers * 6
+    assert all(
+        value.dtype
+        == (
+            ir.DataType.FLOAT
+            if name.endswith(".weight_scale_inv")
+            else ir.DataType.FLOAT8E4M3FN
+        )
+        for name, value in banks.items()
+    )
+    assert "dynamic_fp8" in decoder.metadata_props["mobius.required_runtime_features"]
+    assert decoder.metadata_props["mobius.precision_validation"].startswith("unqualified")
+    with pytest.raises(ValueError, match="disabled pending real-weight"):
+        build_from_module(
+            FishOmniModel(config), config, task="fish-omni", execution_provider="cuda"
+        )
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

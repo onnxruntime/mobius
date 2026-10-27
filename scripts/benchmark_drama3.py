@@ -63,7 +63,16 @@ def codebook_view(value, index):
 class BoundSession:
     """Bind caches/hidden states on-device; copy only small policy/audio outputs."""
 
-    def __init__(self, path, *, device, device_id=0, profile=False, profile_directory=None):
+    def __init__(
+        self,
+        path,
+        *,
+        device,
+        device_id=0,
+        profile=False,
+        profile_directory=None,
+        cudnn_conv1d_pad_to_nc1d=False,
+    ):
         options = ort.SessionOptions()
         options.intra_op_num_threads = 8
         options.inter_op_num_threads = 1
@@ -85,6 +94,7 @@ class BoundSession:
                         "device_id": device_id,
                         "use_tf32": "0",
                         "arena_extend_strategy": "kSameAsRequested",
+                        "cudnn_conv1d_pad_to_nc1d": str(int(cudnn_conv1d_pad_to_nc1d)),
                     },
                 ),
                 "CPUExecutionProvider",
@@ -93,7 +103,7 @@ class BoundSession:
             else ["CPUExecutionProvider"]
         )
         self.session = ort.InferenceSession(str(path), options, providers=providers)
-        self.device, self.device_id = device, device_id
+        self.device, self.device_id = device, device_id if device == "cuda" else 0
         self.outputs = [port.name for port in self.session.get_outputs()]
 
     def run(self, feeds, *, fetches=None, cpu_outputs=()):
@@ -106,10 +116,11 @@ class BoundSession:
         for name, value in feeds.items():
             if isinstance(value, TensorView):
                 owners[name] = value.owner
+                owner_device = value.owner.device_name()
                 binding.bind_input(
                     name,
-                    device_type=value.owner.device_name(),
-                    device_id=self.device_id,
+                    device_type=owner_device,
+                    device_id=self.device_id if owner_device == "cuda" else 0,
                     element_type=value.owner.element_type(),
                     shape=value.shape,
                     buffer_ptr=value.owner.data_ptr() + value.offset,
@@ -125,7 +136,9 @@ class BoundSession:
                 binding.bind_ortvalue_input(name, owners[name])
         for name in names:
             target = "cpu" if name in cpu_outputs else self.device
-            binding.bind_output(name, device_type=target, device_id=self.device_id)
+            binding.bind_output(
+                name, device_type=target, device_id=self.device_id if target == "cuda" else 0
+            )
         self.session.run_with_iobinding(binding)
         binding.synchronize_outputs()
         values = binding.get_outputs()
@@ -225,6 +238,12 @@ def greedy_model(config, dtype):
 def benchmark(args):
     if args.frames < 2 or args.warmup < 1:
         raise ValueError("Use at least two measured frames and one warmup request")
+    if args.device == "cpu" and "cuda" in (args.embedding_device, args.codec_device):
+        raise ValueError("CUDA component placement requires --device cuda")
+    if args.codec_conv1d_pad_to_nc1d and (
+        args.codec is None or (args.codec_device or args.device) != "cuda"
+    ):
+        raise ValueError("The cuDNN codec layout option requires a CUDA codec")
     if not np.isfinite(args.max_rtf) or args.max_rtf <= 0 or args.device_id < 0:
         raise ValueError("Use a finite positive RTF target and nonnegative device ID")
     idle = True
@@ -251,7 +270,15 @@ def benchmark(args):
         "profile_directory": args.output.parent / "drama3-profiles",
     }
     sessions = {
-        name: BoundSession(args.package / name / "model.onnx", **kwargs)
+        name: BoundSession(
+            args.package / name / "model.onnx",
+            **{
+                **kwargs,
+                "device": (args.embedding_device or args.device)
+                if name == "embedding"
+                else args.device,
+            },
+        )
         for name in ("embedding", "decoder", audio_name)
     }
     policy = {
@@ -271,6 +298,11 @@ def benchmark(args):
         if args.sample:
             sessions[name] = BoundSession(args.package / "policies" / f"{name}.onnx", **kwargs)
     dtype = sessions["decoder"].session.get_outputs()[0].type
+    runtime_features = (
+        sessions["decoder"]
+        .session.get_modelmeta()
+        .custom_metadata_map.get("mobius.required_runtime_features", "")
+    )
     element_type = {
         "tensor(float)": ir.DataType.FLOAT,
         "tensor(float16)": ir.DataType.FLOAT16,
@@ -457,7 +489,14 @@ def benchmark(args):
             path = args.codec / "waveform_decoder" / "model.onnx"
             if not path.is_file():
                 path = args.codec / "model.onnx"
-            sessions["waveform_decoder"] = BoundSession(path, **kwargs)
+            sessions["waveform_decoder"] = BoundSession(
+                path,
+                **{
+                    **kwargs,
+                    "device": args.codec_device or args.device,
+                    "cudnn_conv1d_pad_to_nc1d": args.codec_conv1d_pad_to_nc1d,
+                },
+            )
             metadata = sessions["waveform_decoder"].session.get_modelmeta().custom_metadata_map
             if (
                 metadata.get("sample_rate") != "44100"
@@ -498,6 +537,15 @@ def benchmark(args):
             "ort_version": ort.__version__,
             "ort_build": ort.get_build_info(),
             "device": args.device,
+            "embedding_device": sessions["embedding"].device,
+            "codec_device": sessions["waveform_decoder"].device
+            if args.codec is not None
+            else None,
+            "codec_provider_options": sessions[
+                "waveform_decoder"
+            ].session.get_provider_options()
+            if args.codec is not None
+            else None,
             "provider_options": (
                 {
                     "device_id": args.device_id,
@@ -512,6 +560,9 @@ def benchmark(args):
             "gpu_after_warmup": after_warmup,
             "gpu_after_measurement": after_measurement,
             "dtype": dtype,
+            "expert_execution": "dynamic_fp8"
+            if "activation_quantization=dynamic_fp8" in runtime_features
+            else "dense",
             "single_pass_tower": fast,
             "sampling": args.sample,
             "seed": args.seed,
@@ -589,6 +640,17 @@ def parser():
     result.add_argument("--output", required=True, type=Path)
     result.add_argument("--codec", type=Path)
     result.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    result.add_argument(
+        "--embedding-device",
+        choices=("cpu", "cuda"),
+        help="Override embedding placement to leave more GPU memory for the codec",
+    )
+    result.add_argument("--codec-device", choices=("cpu", "cuda"))
+    result.add_argument(
+        "--codec-conv1d-pad-to-nc1d",
+        action="store_true",
+        help="Use cuDNN's alternative 1-D codec layout; measure on the target GPU",
+    )
     result.add_argument("--device-id", type=int, default=0)
     result.add_argument("--frames", type=int, default=100)
     result.add_argument("--warmup", type=int, default=2)

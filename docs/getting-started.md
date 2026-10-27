@@ -152,6 +152,26 @@ reduced-precision attention to enable the source-compatible fused CUDA path.
 ORT 1.28's native BF16 `CausalConvWithState` fallback also does not initialize
 on CUDA; qualification prototypes use standard-ONNX expansion for this dtype.
 
+Native W8A8 execution is implemented in
+[microsoft/onnxruntime#33644](https://github.com/microsoft/onnxruntime/pull/33644).
+The exporter prepares typed E4M3FN expert banks and unchanged multiplicative
+FP32 grids for `QMoE(activation_quantization="dynamic_fp8")`, without a
+dequantize-to-half proxy. Byte-preserving save/load and opt-in FP32/FP16/BF16
+expert-only parity against pinned Triton pass on the custom runtime
+(`MOBIUS_TEST_DRAMA3_NATIVE_FP8=1`). This is **not full-model low-dtype
+qualification**: production native-FP8 admission also remains closed. A complete
+native-FP8/FP32 probe fails the unchanged prefill hidden-state gate
+(43436 of 61440 values, maximum absolute error `0.68518`), although all 40
+real expert layers pass when supplied identical source inputs and logits.
+The first expert input differs by only `1.192e-7`, but changes one FP8 code;
+those discontinuities amplify across subsequent layers. The independent source
+reference repeats bit-exactly. This is a pipeline qualification failure, not a
+reason to substitute weight-only FP8 or widen tolerances. The custom
+CUDA build needs `onnxruntime_USE_FP8_QMOE=ON`, SM89+, and the new mode; old
+weight-only FP8 is not an equivalent fallback. The runtime rejects more than
+65,535 token/expert pairs per call (8,191 tokens at top-8); the graph records
+that limit and never silently falls back to dense expert conversion.
+
 | Graph | Inputs | Outputs |
 |---|---|---|
 | `embedding` | `frames`: INT64 `[B,T,11]`, each row `[main_token, code0, ..., code9]` | `inputs_embeds`, `shared_input`: `[B,T,H]` |
@@ -293,6 +313,43 @@ The prefill profile asserts 40 actual CUDA MoE executions. This fresh check
 qualifies the changed fast token graph for this case; it is not a latency or
 speech-quality measurement.
 
+Recorded single-H200 measurements of this dense-FP32 graph use ORT 1.28
+(`0368187f84`), TF32 disabled, two full-request warmups, the same 30-row prompt,
+CPU embeddings, CUDA decoder/tower/codec, and no competing GPU processes:
+
+| Tower / policy | Complete frames | Steady frames/s | p50 / p95 frame ms | End-to-end RTF |
+|---|---:|---:|---:|---:|
+| Replay / greedy | 100 | 14.92 | 64.67 / 66.22 | 1.549 |
+| Single pass / greedy | 100 | 32.79 | 28.58 / 28.71 | **0.770** |
+| Single pass / sampled | 53 (native EOS) | 26.31 | 34.12 / 34.50 | 1.058 |
+
+The two greedy runs produce identical 100-frame hashes; the optimized
+resident-state 20-frame prefix also matches the independent source golden.
+Single-pass greedy is 2.20x faster in steady frame rate and 2.01x faster
+end-to-end than replay in this controlled comparison, not 9x. Its prefill is
+334 ms, first code frame 341 ms, and full waveform delivery 3.58 seconds for
+4.64 seconds of audio. Model initialization is separate, approximately
+101-105 seconds; GPU memory remains very large (about 142,161 MiB in the
+single-pass greedy run). These are warmed single-request observations, not
+universal throughput or streaming-audio claims. **The sampled run still misses
+the RTF 1.0 target** and is not a performance pass.
+
+A separately qualified custom ORT 1.32 build combining
+[microsoft/onnxruntime#33644](https://github.com/microsoft/onnxruntime/pull/33644)
+and [microsoft/onnxruntime#33645](https://github.com/microsoft/onnxruntime/pull/33645),
+with the codec's NC1D layout enabled, reaches **RTF 0.901** on the same sampled
+53-frame case (29.28 steady frames/s, 30.28 / 30.57 ms p50 / p95, 348 ms first
+code frame). It produces the identical sampled-frame hash and passes the
+independent 20-frame/full-vector dense-FP32 reference on that runtime.
+This run still uses **dense FP32 experts**, not the unqualified native-FP8
+pipeline. The combined build includes QMoE commit `e3181530` and XOR commit
+`e90d897c`, CUDA 13.3 / SM90, FP8 QMoE enabled, and Flash/MEA attention disabled.
+Its wheel SHA256 is
+`f7e2f4cb9255e0556ca9cbc03c40189219880039eb76cdea23a000c0f2ae97dc`.
+Initialization is separate (88.61 seconds), and waveform delivery is
+full-sequence, not streaming. These cross-runtime observations do not isolate
+the XOR kernel's speedup; separate kernel profiles confirm its CUDA placement.
+
 To reproduce on a sufficiently large CUDA host, select free devices and run:
 
 ```bash
@@ -315,18 +372,34 @@ full logits and frame IDs against the same independent reference.
 `--audio-component audio_decoder` explicitly selects the replay graph when a
 package contains both tower variants. Invalid generation or changed greedy RNG
 state is an error, never a successful comparison.
+Experimental native-FP8 references use `--native-fp8` and a separate work
+directory; comparison requires its independent `--golden` until qualification.
+The validator records and checks expert execution mode, so a native reference
+cannot silently be compared as dense FP32. These flags do not bypass the
+production native-export gate.
 
 For performance measurement, `scripts/benchmark_drama3.py` runs actual cached
 requests with I/O binding: recurrent/KV state and neural intermediates remain on
 the selected device, while only small policy outputs and the final waveform
 return to the host. It supports both the original replay task and the one-pass
 task, so their timings can be compared using the same ORT build and options.
+For a memory-constrained single H200, `--embedding-device cpu` keeps the
+roughly 2 GiB vocabulary lookup on the host while leaving decoder/tower caches
+on CUDA. Only the small embedding activations cross devices; this reserves GPU
+headroom for `--codec-device cuda`. Component placement is recorded in the
+report. `--codec-device cpu` is also supported, with its actual decode time
+included in end-to-end RTF.
 Supply the pinned HF `config.json` and the independent reference stage's
 `state-00.npz` prompt:
 
 ```bash
-python scripts/benchmark_drama3.py --package output/drama-3-fast --config drama3-config.json --prompt drama3-validation/reference/state-00.npz --codec output/drama-3-codec --device cuda --device-id 0 --sample --frames 100 --output drama3-perf.json
+python scripts/benchmark_drama3.py --package output/drama-3-fast --config drama3-config.json --prompt drama3-validation/reference/state-00.npz --codec output/drama-3-codec --device cuda --device-id 0 --embedding-device cpu --codec-device cuda --codec-conv1d-pad-to-nc1d --frames 100 --output drama3-perf.json
 ```
+
+Add `--sample` for the ONNX stochastic policy. The recorded real-time sampled
+case requires the custom runtime above; stock ORT 1.28 falls back to CPU for
+integer XOR in the RNG. The codec layout option is explicit and should be
+measured on the deployment GPU rather than assumed universally faster.
 
 The report separates initialization, prefill, first code frame, steady
 frames/second, p50/p95 frame latency and waveform decoding. End-to-end RTF includes

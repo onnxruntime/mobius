@@ -24,9 +24,15 @@ def _classify_source(source, index, config, *, expert, saturate_float16=False):
     if source not in index:
         raise ValueError(f"Missing Drama 3 checkpoint tensor {source!r}")
     source_dtype = index[source][2]
+    if expert and source.endswith(".weight_scale_inv"):
+        if not config.native_fp8_experts or source_dtype != "F32":
+            raise ValueError(f"Native Drama 3 FP8 scales must be FP32: {source}")
+        return StreamingWeightSource(source)
     if config.fp8_experts and expert:
         if source_dtype != "F8_E4M3":
             raise ValueError(f"Drama 3 FP8 expert {source!r} must have dtype F8_E4M3")
+        if config.native_fp8_experts:
+            return StreamingWeightSource(source, mode="fp8_native")
         return StreamingWeightSource(
             source,
             mode="fp8_block_128",
@@ -75,8 +81,9 @@ def build_fish_omni_streaming_plan(
             source.startswith("model.language_model.") or source == "lm_head.weight"
         )
         if any(
-            source.endswith(f".experts.{projection}.weight")
+            source.endswith(f".experts.{projection}.{suffix}")
             for projection in ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+            for suffix in ("weight", "weight_scale_inv")
         ):
             assert config.num_local_experts is not None
             prefix, projection = source.rsplit(".experts.", 1)
@@ -110,7 +117,15 @@ def build_fish_omni_streaming_plan(
             )
     return StreamingWeightPlan(
         targets=targets,
-        report={"architecture": "fish_omni", "codec_included": False},
+        report={
+            "architecture": "fish_omni",
+            "codec_included": False,
+            "native_fp8": config.native_fp8_experts,
+            "output_weight_format": "mixed-block-fp8-128"
+            if config.native_fp8_experts
+            else "dense",
+            "activation_quantization": "dynamic_fp8" if config.native_fp8_experts else "none",
+        },
     )
 
 

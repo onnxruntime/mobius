@@ -270,6 +270,37 @@ def test_reference_mismatch_fails_before_model_loading(change):
         validate_reference_golden(golden)
 
 
+def test_native_fp8_reference_cannot_be_compared_as_dense():
+    golden = json.loads(GOLDEN.read_text())
+    golden["expert_execution"] = "dynamic_fp8"
+    with pytest.raises(AssertionError, match="expert_execution"):
+        validate_reference_golden(golden)
+
+
+@pytest.mark.parametrize("native_fp8", [False, True])
+def test_export_preserves_the_requested_expert_execution(tmp_path, monkeypatch, native_fp8):
+    import mobius
+
+    calls = {}
+    package = SimpleNamespace(
+        weight_loading_report={},
+        save=lambda *args, **kwargs: None,
+    )
+
+    def build(*args, **kwargs):
+        calls.update(kwargs)
+        return package
+
+    monkeypatch.setattr(mobius, "build", build)
+    monkeypatch.setattr(validate_drama3, "ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(validate_drama3, "DTYPE", "f32")
+    validate_drama3.export(tmp_path, native_fp8=native_fp8)
+    assert calls["keep_quantized"] is native_fp8
+    assert calls["execution_provider"] == ("cuda" if native_fp8 else "default")
+    report = json.loads((tmp_path / "export-result.json").read_text())
+    assert report["expert_execution"] == ("dynamic_fp8" if native_fp8 else "dense")
+
+
 def test_stale_checkpoint_path_is_not_relabelled_as_the_pinned_revision(tmp_path, monkeypatch):
     wrong = tmp_path / "other-revision"
     wrong.mkdir()
