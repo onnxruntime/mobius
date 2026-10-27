@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Three-graph Drama 3 token-generation ABI."""
+"""Drama 3 neural graphs and ONNX sampling policies."""
 
 from __future__ import annotations
 
@@ -9,8 +9,13 @@ from typing import ClassVar
 
 import onnx_ir as ir
 
+from mobius._build_context import ep_capabilities
 from mobius._configs.fish_omni import FishOmniConfig
 from mobius._model_package import ModelPackage
+from mobius.generation._fish_omni import (
+    build_fish_codebook_sampler,
+    build_fish_main_sampler,
+)
 from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 from mobius.tasks._cache_utils import (
     _make_hybrid_cache_inputs,
@@ -36,6 +41,11 @@ class FishOmniTask(ModelTask):
     )
 
     def build(self, module, config: FishOmniConfig) -> ModelPackage:
+        if config.dtype == ir.DataType.BFLOAT16 and ep_capabilities().name != "onnx-standard":
+            raise ValueError(
+                "Drama 3 BF16 currently requires execution_provider='onnx-standard' "
+                "and a runtime with BF16 CUDA Attention support"
+            )
         self._validate_components(module)
         assert config.tower is not None
         batch, seq = "batch", "sequence_len"
@@ -103,6 +113,14 @@ class FishOmniTask(ModelTask):
         models["audio_decoder"] = _make_model(graph)
         for model in models.values():
             model.metadata_props["mobius.fish_omni.scope"] = (
-                "Token generation only; external sampling, prompt formatting and waveform codec"
+                "Neural token graphs with ONNX sampling policies; caller orchestrates "
+                "temporal decoding and prompt formatting; waveform decoder exported separately"
             )
-        return ModelPackage(models, config=config)
+        return ModelPackage(
+            models,
+            config=config,
+            policy_components={
+                "main_sampler": build_fish_main_sampler(config),
+                "codebook_sampler": build_fish_codebook_sampler(config),
+            },
+        )

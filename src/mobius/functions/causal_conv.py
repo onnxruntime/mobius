@@ -128,7 +128,10 @@ def causal_conv_nd_with_state(
 
         # Step 5: Apply activation.
         if activation in ("silu", "swish"):
-            output = op.Swish(conv_out)
+            output = op.CastLike(
+                op.Swish(op.Cast(conv_out, to=ir.DataType.FLOAT)),
+                conv_out,
+            )
         elif activation == "none":
             output = conv_out
         else:
