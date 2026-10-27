@@ -234,12 +234,6 @@ class _FishExperts(nn.Module):
         self.normalize = int(config.norm_topk_prob)
         self.dtype = config.dtype
         self.act_fn = Float32SiLU()
-        self.gate_proj = _FishExpertBank(
-            [self.num_experts, self.intermediate_size, self.hidden_size]
-        )
-        self.up_proj = _FishExpertBank(
-            [self.num_experts, self.intermediate_size, self.hidden_size]
-        )
         self.gate_up_proj = _FishExpertBank(
             [self.num_experts, 2 * self.intermediate_size, self.hidden_size]
         )
@@ -255,8 +249,7 @@ class _FishExperts(nn.Module):
                 op,
                 hidden_states,
                 router_logits,
-                self.gate_proj(op),
-                self.up_proj(op),
+                self.gate_up_proj(op),
                 self.down_proj(op),
             )
         gate_up, down = self.gate_up_proj(op), self.down_proj(op)
@@ -355,29 +348,30 @@ class _FishExperts(nn.Module):
         )
         return op.CastLike(summed, hidden)
 
-    def _fused(self, op, hidden_states, router_logits, gate_bank, up_bank, down_bank):
-        # CUDA MoE declares [E,H,I]/[E,I,H], but consumes the original
-        # output-major HF bytes. Reshape changes the ABI shape, NOT the layout.
-        # This matches upstream test_moe_cuda.py's separate-FC3 Mixtral path.
-        gate = op.Reshape(
-            gate_bank, [self.num_experts, self.hidden_size, self.intermediate_size]
+    def _fused(self, op, hidden_states, router_logits, gate_up_bank, down_bank):
+        # Legacy ABI shapes consume output-major bytes, not transposed storage.
+        # Prepack [gate | up] offline: passing FC3 would copy the complete
+        # 2 GiB expert bank on every layer invocation in the released model.
+        gate_up = op.Reshape(
+            gate_up_bank, [self.num_experts, self.hidden_size, 2 * self.intermediate_size]
         )
-        up = op.Reshape(up_bank, [self.num_experts, self.hidden_size, self.intermediate_size])
         down = op.Reshape(
             down_bank, [self.num_experts, self.intermediate_size, self.hidden_size]
         )
         output = op.MoE(
             op.Reshape(hidden_states, [-1, self.hidden_size]),
             op.Reshape(router_logits, [-1, self.num_experts]),
-            gate,
+            gate_up,
             None,
             down,
             None,
-            up,
-            activation_type="silu",
+            activation_type="swiglu",
+            activation_alpha=1.0,
+            activation_beta=0.0,
+            swiglu_limit=float("inf"),
             k=self.top_k,
             normalize_routing_weights=self.normalize,
-            swiglu_fusion=0,
+            swiglu_fusion=2,
             _domain="com.microsoft",
         )
         output.type = ir.TensorType(ir.DataType.FLOAT)
@@ -464,7 +458,9 @@ class FishOmniBackbone(nn.Module):
     def __init__(self, config: FishOmniConfig):
         super().__init__()
         self.model = _FishTextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        # The released head exceeds ORT's 1 GiB constant-folding limit;
+        # retain output-major storage instead of transposing 2 GiB every step.
+        self.lm_head = _OutputMajorLinear(config.hidden_size, config.vocab_size)
         self._compute_dtype = config.dtype
 
     def forward(self, op, inputs_embeds, attention_mask, position_ids, past_key_values):

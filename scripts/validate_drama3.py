@@ -146,7 +146,7 @@ def load_upstream():
     return result
 
 
-def export(checkpoint):
+def export(checkpoint, *, task="fish-omni", execution_provider=None):
     from mobius import build
 
     start = time.monotonic()
@@ -156,7 +156,9 @@ def export(checkpoint):
         revision=REVISION,
         dtype=DTYPE,
         keep_quantized=False,
-        execution_provider={"f32": "default", "f16": "cuda", "bf16": "onnx-standard"}[DTYPE],
+        task=task,
+        execution_provider=execution_provider
+        or {"f32": "default", "f16": "cuda", "bf16": "onnx-standard"}[DTYPE],
     )
     event("graph_and_bindings_ready", seconds=time.monotonic() - start)
     package.save(str(ROOT / "onnx"), max_workers=1)
@@ -369,7 +371,32 @@ def run_session(session, feeds):
     return {port.name: _ort_value_to_numpy(value) for port, value in zip(ports, values)}
 
 
-def compare():
+def run_tower_session(session, feeds, *, generate=False):
+    """Run teacher-forced or single-pass greedy tower against the same reference."""
+    import numpy as np
+
+    names = {port.name for port in session.get_inputs()}
+    if "generate" in names:
+        feeds = {
+            **feeds,
+            "generate": np.array(generate),
+            "do_sample": np.array(False),
+            "temperature": np.array([0.7], np.float32),
+            "top_k": np.array([30], np.int64),
+            "top_p": np.array([0.95], np.float32),
+            "seed": np.array([42], np.int64),
+            "counter": np.zeros(1, np.int64),
+        }
+    result = run_session(session, feeds)
+    if "generate" in names:
+        if not result["valid"].all():
+            raise FloatingPointError("Single-pass tower rejected reference inputs")
+        if result["next_counter"].any():
+            raise AssertionError("Greedy single-pass tower advanced RNG state")
+    return result
+
+
+def compare(*, audio_model_name=None):
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     import numpy as np
     import onnxruntime as ort
@@ -380,6 +407,12 @@ def compare():
     config = json.loads((checkpoint_path() / "config.json").read_text())
     ort.preload_dlls()
     sessions = {}
+    if audio_model_name is None:
+        audio_model_name = (
+            "audio_generator"
+            if (ROOT / "onnx" / "audio_generator" / "model.onnx").is_file()
+            else "audio_decoder"
+        )
     start = time.monotonic()
     for name, device in (
         ("embedding", EMBEDDING_DEVICE),
@@ -396,8 +429,9 @@ def compare():
             options.enable_profiling = True
             options.profile_file_prefix = str(ROOT / "decoder-profile")
         event("ort_session_start", component=name, device=device)
+        component = audio_model_name if name == "audio_decoder" else name
         sessions[name] = ort_easy.EasySession(
-            str(ROOT / "onnx" / name / "model.onnx"),
+            str(ROOT / "onnx" / component / "model.onnx"),
             sess_options=options,
             providers=[
                 (
@@ -413,7 +447,9 @@ def compare():
         )
         event("ort_session_ready", component=name, seconds=time.monotonic() - start)
 
-    def run(name, feeds):
+    def run(name, feeds, *, generate=False):
+        if name == "audio_decoder":
+            return run_tower_session(sessions[name], feeds, generate=generate)
         return run_session(sessions[name], feeds)
 
     expected_type = {
@@ -539,7 +575,8 @@ def compare():
             codes = np.zeros((1, 1, count), dtype=np.int64)
             codes[0, 0, 0] = np.clip(main - semantic_start, 0, vocab - 1)
             semantic = np.array([[semantic_start <= main <= semantic_end]])
-            for index in range(count - 1):
+            single_pass = audio_model_name == "audio_generator"
+            for index in range(1 if single_pass else count - 1):
                 tower_output = run(
                     "audio_decoder",
                     {
@@ -551,10 +588,16 @@ def compare():
                         "position_ids": positions[:, -1:],
                         "attention_mask": mask,
                     },
+                    generate=True,
                 )
-                codes[0, 0, index + 1] = (
-                    tower_output["codebook_logits"][0, 0, index].astype(np.float32).argmax()
-                )
+                if single_pass:
+                    codes = tower_output["frame_codes"]
+                else:
+                    codes[0, 0, index + 1] = (
+                        tower_output["codebook_logits"][0, 0, index]
+                        .astype(np.float32)
+                        .argmax()
+                    )
             check(
                 f"state_{step}.tower", tower_output["codebook_logits"], state["tower_logits"]
             )
@@ -572,6 +615,7 @@ def compare():
         "revision": REVISION,
         "source_revision": SOURCE_REVISION,
         "dtype": DTYPE_NAMES[DTYPE],
+        "audio_component": audio_model_name,
         "onnxruntime_version": ort.__version__,
         "provider": "CUDAExecutionProvider",
         "ort_graph_optimization": "ORT_ENABLE_BASIC",
@@ -596,6 +640,11 @@ if __name__ == "__main__":
     parser.add_argument("stage", choices=("download", "export", "reference", "compare"))
     parser.add_argument("--work-dir", required=True, type=pathlib.Path)
     parser.add_argument("--dtype", choices=("f32", "f16", "bf16"), default="f32")
+    parser.add_argument(
+        "--task", choices=("fish-omni", "fish-omni-generation"), default="fish-omni"
+    )
+    parser.add_argument("--execution-provider", choices=("default", "cuda", "onnx-standard"))
+    parser.add_argument("--audio-component", choices=("audio_decoder", "audio_generator"))
     parser.add_argument("--golden", type=pathlib.Path)
     parser.add_argument("--reference-devices", default="0,1,2,3")
     parser.add_argument("--reference-tower-device", default=4, type=int)
@@ -623,8 +672,8 @@ if __name__ == "__main__":
     if args.stage == "download":
         download()
     elif args.stage == "export":
-        export(checkpoint_path())
+        export(checkpoint_path(), task=args.task, execution_provider=args.execution_provider)
     elif args.stage == "reference":
         reference(checkpoint_path())
     else:
-        compare()
+        compare(audio_model_name=args.audio_component)

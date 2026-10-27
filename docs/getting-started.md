@@ -199,7 +199,11 @@ pkg.save("output/drama-3-fast", max_workers=1)
 
 The FP32 CUDA route uses packed expert banks and `com.microsoft::MoE`, executing
 selected experts rather than evaluating all 256 experts per layer. Its raw-logit
-routing and physical expert-byte layout match ORT's floating MoE ABI. It still
+routing and physical expert-byte layout match ORT's floating MoE ABI. Gate/up
+rows are concatenated offline, with half-split SwiGLU fusion and no FC3 input:
+the separate-FC3 runtime path would copy a complete 2 GiB expert bank on every
+layer invocation. The vocabulary projection also uses output-major `Gemm`,
+avoiding a 2 GiB runtime weight transpose above ORT's constant-folding limit. It still
 stores dense FP32 weights: this is **not native FP8**, and it does not remove the
 large model-memory requirement. Other floating routes gather and evaluate only
 selected token/expert pairs, preserving their activation and routing rounding
@@ -275,11 +279,19 @@ advisory component contracts, not an executable speech pipeline;
 `--runtime ort-genai` is explicitly rejected. Fish Audio's checkpoint/source
 license is separate from Mobius's MIT license.
 
-The complete pinned checkpoint was validated on H200 with ORT 1.28 CUDA and
+The original complete pinned FP32 export was validated on H200 with ORT 1.28 CUDA and
 TF32 disabled: a 30-row prefill and 20 greedy frames match the independent
 upstream FP32 pipeline. Maximum observed decoder/tower logit differences were
 `3.624e-5` / `3.910e-5`. This is token-level evidence, not waveform or speech-quality
 validation. The native reference uses an argmax sampler for determinism.
+
+The current pre-fused CUDA MoE plus single-pass tower route also passes that
+independent complete-checkpoint case: all vectors for the 30-row prefill and
+20 exact complete frames, with maximum decoder/tower logit differences
+`5.150e-5` / `4.673e-5` and hidden difference `2.289e-5`.
+The prefill profile asserts 40 actual CUDA MoE executions. This fresh check
+qualifies the changed fast token graph for this case; it is not a latency or
+speech-quality measurement.
 
 To reproduce on a sufficiently large CUDA host, select free devices and run:
 
@@ -295,6 +307,14 @@ the tower on GPU 4; comparison places embedding/audio/decoder on GPUs 0/1/2.
 Override these with the script's device flags on a shared host. The script
 retains full reference vectors and verifies the committed token-generation
 golden, while the generic waveform golden runner remains out of scope.
+To qualify the accelerated route instead, add
+`--task fish-omni-generation --execution-provider cuda` to the export command
+in a fresh output directory. Comparison automatically selects `audio_generator`
+when present, uses one greedy conditioned tower call per frame, and checks its
+full logits and frame IDs against the same independent reference.
+`--audio-component audio_decoder` explicitly selects the replay graph when a
+package contains both tower variants. Invalid generation or changed greedy RNG
+state is an error, never a successful comparison.
 
 For performance measurement, `scripts/benchmark_drama3.py` runs actual cached
 requests with I/O binding: recurrent/KV state and neural intermediates remain on

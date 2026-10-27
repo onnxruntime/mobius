@@ -154,6 +154,10 @@ def test_fish_omni_build(dtype):
         "shared_input",
     }
     decoder = package["decoder"]
+    head = decoder.graph.initializers["decoder.lm_head.weight"]
+    consumers = tuple(head.consumers())
+    assert consumers
+    assert all(node.op_type == "Gemm" for node in consumers)
     assert "past_key_values.0.recurrent_state" in {v.name for v in decoder.graph.inputs}
     recurrent = next(v for v in decoder.graph.inputs if v.name.endswith("recurrent_state"))
     assert recurrent.dtype == ir.DataType.FLOAT
@@ -170,6 +174,14 @@ def test_fish_omni_build(dtype):
         for m in package.values()
         for v in m.graph.initializers.values()
     )
+    rotary_caches = [
+        value
+        for model in package.values()
+        for name, value in model.graph.initializers.items()
+        if name.endswith((".cos_cache", ".sin_cache"))
+    ]
+    assert rotary_caches
+    assert all(value.dtype == ir.DataType.FLOAT for value in rotary_caches)
 
 
 def test_fish_omni_registry_config_resolution():
@@ -194,8 +206,13 @@ def test_fish_omni_cuda_build_uses_sparse_fused_expert_banks():
     assert sum(node.op_type == "MoE" for node in graph) == config.num_hidden_layers
     assert not any(node.op_type == "TopK" for node in graph)
     banks = [value for name, value in graph.initializers.items() if ".packed_experts." in name]
-    assert len(banks) == config.num_hidden_layers * 3
+    assert len(banks) == config.num_hidden_layers * 2
     assert all(len(value.shape) == 3 for value in banks)
+    for node in graph:
+        if node.op_type == "MoE":
+            assert len(node.inputs) <= 6 or node.inputs[6] is None
+            assert node.attributes["activation_type"].as_string() == "swiglu"
+            assert node.attributes["swiglu_fusion"].as_int() == 2
     assert not any(".experts.0." in name for name in graph.initializers)
 
 
