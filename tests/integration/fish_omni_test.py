@@ -14,6 +14,7 @@ import urllib.request
 import numpy as np
 import pytest
 import torch
+from _test_configs import FISH_OMNI_CONFIG
 from safetensors.torch import save_file
 
 from mobius import build_from_module
@@ -24,7 +25,6 @@ from mobius.integrations.transformers._fish_omni_weights import (
     stream_fish_omni_safetensors_to_package,
 )
 from mobius.models import FishOmniModel
-from tests._test_configs import FISH_OMNI_CONFIG
 
 pytestmark = pytest.mark.integration
 _PREFIX = "fish_speech.models.text2semantic.fish_omni"
@@ -153,7 +153,7 @@ def test_fish_omni_pipeline_prefill_and_cached_decode(
         greedy,
     )
     try:
-        # Multi-token prompt followed by two reused-state steps exercises both
+        # Multi-token prompt followed by 20 reused-state steps exercises both
         # DeltaNet state and all shared/residual tower caches across time.
         with torch.no_grad():
             for length in [4] + [1] * 20:

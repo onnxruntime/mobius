@@ -10,6 +10,7 @@ import json
 import onnx_ir as ir
 import pytest
 import torch
+from _test_configs import FISH_OMNI_CONFIG
 from safetensors.torch import save_file
 
 from mobius import build_from_module
@@ -25,7 +26,6 @@ from mobius.integrations.transformers._fish_omni_weights import (
 )
 from mobius.models import FishOmniModel
 from mobius.models.fish_omni_test import tiny_config
-from tests._test_configs import FISH_OMNI_CONFIG
 
 
 def _checkpoint(package):
