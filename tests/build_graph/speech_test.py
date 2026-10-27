@@ -46,6 +46,7 @@ from mobius.tasks import (
 
 _SPEECH_MODEL_PARAMS = _make_params(SPEECH_CONFIGS)
 _SPEECH_TASK_KEYS: dict[str, set[str]] = {
+    "fish-omni": {"embedding", "decoder", "audio_decoder"},
     "speech-to-text": {"encoder", "decoder"},
     "speech-language": {"audio_encoder", "embedding", "decoder"},
     "codec": {"decoder", "encoder"},
@@ -1243,6 +1244,10 @@ class TestBuildSpeechGraph:
         config = _base_config(**config_overrides)
         task = get_task(_default_task_for_model(model_type))
         config = _with_component_quantization(config, task)
+        if model_type == "fish_omni":
+            with pytest.raises(ValueError, match="affine component quantization"):
+                registry.get(model_type)(config)
+            return
 
         package = build_from_module(
             registry.get(model_type)(config),

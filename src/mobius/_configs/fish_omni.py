@@ -190,6 +190,11 @@ class FishOmniConfig(ArchitectureConfig):
     def validate(self) -> None:
         """Reject unsafe precision instead of overflowing the released checkpoint."""
         super().validate()
+        if self.quantization is not None or self.component_quantization:
+            raise ValueError(
+                "Drama 3 affine component quantization is unsupported; "
+                "use the FP32 graph with explicit FP8 checkpoint dequantization."
+            )
         if self.dtype != ir.DataType.FLOAT:
             raise ValueError(
                 "Drama 3 currently requires dtype='f32'. FP16 residuals/down projections "

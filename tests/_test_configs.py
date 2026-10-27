@@ -72,11 +72,12 @@ from mobius._configs import (
     WhisperConfig,
     YolosConfig,
     Zamba2Config,
+    _as_attribute_config,
 )
+from mobius._configs.fish_omni import FishOmniConfig
 from mobius.models import EsmConfig, ReUseConfig
 
-# Drama 3 has a temporal codebook ABI and is covered by model-local tests,
-# rather than the generic input_ids/logits causal-LM matrix.
+# Tiny composite config for Drama 3's model-local parity and speech graph matrix.
 FISH_OMNI_CONFIG = {
     "model_type": "fish_omni",
     "architectures": ["FishOmniModel"],
@@ -3594,6 +3595,14 @@ def vl_overrides(model_type: str) -> dict:
 # Speech / TTS / Codec configs
 # ---------------------------------------------------------------------------
 SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "fish_omni",
+        {
+            "_config_cls": FishOmniConfig,
+            **vars(FishOmniConfig.from_transformers(_as_attribute_config(FISH_OMNI_CONFIG))),
+        },
+        True,
+    ),
     # --- Parakeet CTC (feature-input offline FastConformer) ---
     (
         "parakeet_ctc",
