@@ -628,7 +628,17 @@ def normalize_component_quantized_weights(
     component_names = tuple(component_names)
     manifest = manifest or _default_manifest(module, config, task)
     mapping = getattr(config, "component_quantization", None)
-    if mapping is None and not _uses_global_module_rules(config, manifest):
+    quantization = getattr(config, "quantization", None)
+    global_per_channel = (
+        quantization is not None
+        and quantization.quant_method in {"gptq", "awq"}
+        and quantization.group_size == -1
+    )
+    if (
+        mapping is None
+        and not _uses_global_module_rules(config, manifest)
+        and not global_per_channel
+    ):
         return state_dict
     routed = _route_component_weights(state_dict, manifest, component_names)
     result = dict(state_dict)

@@ -224,13 +224,16 @@ def test_per_channel_component_plan_preserves_output_head_bit_override():
 
 @pytest.mark.parametrize("method", ["olive", "gptq", "awq"])
 @pytest.mark.parametrize("bits", [2, 4, 8])
-def test_per_channel_component_uses_logical_width_for_packing(method, bits):
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_component_uses_logical_width_for_packing(method, bits, group_size):
     import math
 
     k, n = 33, 8
     module = nn.Module()
     module.proj = Linear(k, n, bias=False)
-    quantization = QuantizationConfig(bits=bits, group_size=-1, quant_method=method, sym=True)
+    quantization = QuantizationConfig(
+        bits=bits, group_size=group_size, quant_method=method, sym=True
+    )
     config = ArchitectureConfig(component_quantization={"model": quantization})
     task = _SingleTask()
     manifest = configure_component_quantization(module, config, task)

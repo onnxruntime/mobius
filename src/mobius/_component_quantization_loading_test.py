@@ -210,6 +210,51 @@ def _t5_config(encoder, decoder) -> ArchitectureConfig:
     )
 
 
+@pytest.mark.parametrize("method", ["gptq", "awq"])
+@pytest.mark.parametrize("bits", [4, 8])
+def test_global_per_channel_loading_uses_each_projection_logical_width(method, bits):
+    quantization = _quantization(quant_method=method, bits=bits, group_size=-1, sym=False)
+    config = make_config(num_hidden_layers=1, intermediate_size=33, quantization=quantization)
+    module = CausalLMModel(config)
+    package = _build(module)
+    state_dict = {}
+    expected = {}
+    for projection, k, n in (("down_proj", 33, 64), ("gate_proj", 64, 33)):
+        name = f"model.layers.0.mlp.{projection}"
+        packed = torch.arange(math.ceil(k * bits / 32) * n, dtype=torch.int32).reshape(-1, n)
+        scales = _floats(1, n)
+        state_dict.update(
+            {
+                f"{name}.qweight": packed,
+                f"{name}.scales": scales,
+                f"{name}.qzeros": torch.full((1, n), 0x55555555, dtype=torch.int32),
+            }
+        )
+        blob_size = math.ceil(k * bits / 8)
+        weight = (
+            torch.stack([(packed >> shift) & 255 for shift in (0, 8, 16, 24)], dim=-1)
+            .transpose(0, 1)
+            .reshape(n, -1)[:, :blob_size]
+            .to(torch.uint8)
+            .reshape(n, 1, blob_size)
+        )
+        zero = 0x44 if method == "awq" and bits == 4 else (0x54 if method == "awq" else 0x55)
+        expected[name] = (
+            k,
+            weight,
+            scales.T,
+            torch.full((n, 1), zero, dtype=torch.uint8),
+        )
+
+    _load(module, package, state_dict)
+
+    for name, (k, weight, scales, zeros) in expected.items():
+        _assert_layout(package, "model", f"{name}.weight", bits, k)
+        _assert_bound(package, "model", f"{name}.weight", weight)
+        _assert_bound(package, "model", f"{name}.scales", scales)
+        _assert_bound(package, "model", f"{name}.zero_points", zeros)
+
+
 @pytest.mark.parametrize(("method", "bits"), [("gptq", 8), ("awq", 4)])
 def test_t5_raw_dotted_scales_survive_canonical_parameter_filter(method, bits):
     encoder = _quantization(quant_method=method, bits=bits, group_size=32)

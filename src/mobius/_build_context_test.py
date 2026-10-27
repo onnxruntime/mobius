@@ -31,18 +31,19 @@ _CPU_CAPABILITIES = EpCapabilities(
 
 @pytest.mark.parametrize("level", [None, 0, 1, 2, 3, 4])
 def test_matmul_nbits_accuracy_level_scoping(level):
+    def raise_in_inner_context():
+        with build_context(_CUDA_CAPABILITIES, matmul_nbits_accuracy_level=0):
+            assert get_matmul_nbits_accuracy_level() == 0
+            raise RuntimeError("deliberate")
+
     assert get_matmul_nbits_accuracy_level() is None
     with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=level):
         assert get_matmul_nbits_accuracy_level() == level
         with build_context(_CUDA_CAPABILITIES):
             assert get_matmul_nbits_accuracy_level() is None
         assert get_matmul_nbits_accuracy_level() == level
-        with (
-            pytest.raises(RuntimeError, match="deliberate"),
-            build_context(_CUDA_CAPABILITIES, matmul_nbits_accuracy_level=0),
-        ):
-            assert get_matmul_nbits_accuracy_level() == 0
-            raise RuntimeError("deliberate")
+        with pytest.raises(RuntimeError, match="deliberate"):
+            raise_in_inner_context()
         assert get_matmul_nbits_accuracy_level() == level
     assert get_matmul_nbits_accuracy_level() is None
 

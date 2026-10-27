@@ -1315,6 +1315,8 @@ def preprocess_gptq_weights(
     import logging
 
     logger = logging.getLogger(__name__)
+    if group_size == in_features:
+        group_size = -1
     result: dict[str, torch.Tensor] = {}
 
     for key, value in state_dict.items():
@@ -1424,6 +1426,8 @@ def preprocess_olive_weights(
         State dict with renamed and reshaped weights (and, for a float tied
         head, the aliased ``lm_head.weight``).
     """
+    if group_size == in_features:
+        group_size = -1
     blob_size = group_size * bits // 8
     result: dict[str, torch.Tensor] = {}
 
@@ -1559,6 +1563,8 @@ def preprocess_awq_weights(
     Returns:
         State dict with renamed, transposed and reshaped weights.
     """
+    if group_size == in_features:
+        group_size = -1
     result: dict[str, torch.Tensor] = {}
 
     for key, value in state_dict.items():
@@ -1623,6 +1629,7 @@ def preprocess_quantized_weights(
     qmoe_source_moe_paths: tuple[str, ...] = (),
     reject_quantized_embeddings_lm_head: bool = False,
     defer_non_expert_sidecars: bool = False,
+    defer_per_channel_sidecars: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Apply shared quantization conversion, tying, and QMoE packing.
 
@@ -1650,6 +1657,8 @@ def preprocess_quantized_weights(
         defer_non_expert_sidecars: Keep ordinary packed sidecars raw for the
             component loader to resolve per-projection layouts. Expert packing
             and float weight tying still run here.
+        defer_per_channel_sidecars: Defer GPTQ/AWQ per-channel sidecars when
+            logical K is unknown. Leaf codecs disable this to normalize immediately.
 
     Returns:
         The preprocessed weight dictionary.
@@ -1766,7 +1775,14 @@ def preprocess_quantized_weights(
         )
 
     deferred = {}
-    if defer_non_expert_sidecars:
+    if defer_non_expert_sidecars or (
+        defer_per_channel_sidecars
+        and in_features is None
+        and quantization is not None
+        and quantization.quant_method in {"gptq", "awq"}
+        and quantization.group_size == -1
+    ):
+        # Int32 word padding can only be trimmed once the leaf supplies logical K.
         deferred = {
             key: value
             for key, value in state_dict.items()

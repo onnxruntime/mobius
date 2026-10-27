@@ -199,6 +199,7 @@ class _LegacyAffineCodec:
             embed_key=record.name if kind == "embedding" else "",
             qmoe_target_path=None,
             in_features=in_features,
+            defer_per_channel_sidecars=False,
         )
         if kind == "embedding" and self.method in {"gptq", "awq"}:
             # The affine packers produce [rows, blocks, bytes]; Gather consumes

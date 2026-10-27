@@ -615,8 +615,13 @@ class TestPreprocessGptqWeights:
 @pytest.mark.parametrize("preprocess", [preprocess_gptq_weights, preprocess_awq_weights])
 @pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("prefix", [(), (2,)])
-@pytest.mark.parametrize("k", [7, 9, 33, 96, 1536, 6144])
-def test_per_channel_dotted_weights_preserve_codes_and_scales(preprocess, bits, prefix, k):
+@pytest.mark.parametrize(
+    ("k", "group_size"),
+    [(7, -1), (9, -1), (33, -1), (96, -1), (1536, -1), (6144, -1), (33, 33)],
+)
+def test_per_channel_dotted_weights_preserve_codes_and_scales(
+    preprocess, bits, prefix, k, group_size
+):
     n = 8
     packed = (
         torch.arange(math.prod(prefix) * math.ceil(k * bits / 32) * n)
@@ -629,7 +634,7 @@ def test_per_channel_dotted_weights_preserve_codes_and_scales(preprocess, bits, 
         "proj.scales": scales,
         "proj.qzeros": torch.full((*prefix, 1, n), 0x55555555, dtype=torch.int32),
     }
-    result = preprocess(raw, bits=bits, group_size=-1, in_features=k)
+    result = preprocess(raw, bits=bits, group_size=group_size, in_features=k)
     weight = result["proj.weight"]
     blob_size = math.ceil(k * bits / 8)
     assert weight.shape == (*prefix, n, 1, blob_size)
@@ -653,8 +658,11 @@ def test_per_channel_dotted_weights_preserve_codes_and_scales(preprocess, bits, 
 
 @pytest.mark.parametrize("bits", [2, 4, 8])
 @pytest.mark.parametrize("prefix", [(), (2,)])
-@pytest.mark.parametrize("k", [7, 9, 33, 96, 1536, 6144])
-def test_per_channel_olive_weights_preserve_codes_and_scales(bits, prefix, k):
+@pytest.mark.parametrize(
+    ("k", "group_size"),
+    [(7, -1), (9, -1), (33, -1), (96, -1), (1536, -1), (6144, -1), (33, 33)],
+)
+def test_per_channel_olive_weights_preserve_codes_and_scales(bits, prefix, k, group_size):
     n = 8
     blob_size = math.ceil(k * bits / 8)
     packed = (
@@ -671,7 +679,7 @@ def test_per_channel_olive_weights_preserve_codes_and_scales(bits, prefix, k):
             "proj.weight_qzeros": zeros,
         },
         bits=bits,
-        group_size=-1,
+        group_size=group_size,
         in_features=k,
     )
     weight = result["proj.weight"]
@@ -682,24 +690,28 @@ def test_per_channel_olive_weights_preserve_codes_and_scales(bits, prefix, k):
 
 
 @pytest.mark.parametrize("packed_bytes", [16, 18])
-def test_per_channel_olive_rejects_mismatched_logical_width(packed_bytes):
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_olive_rejects_mismatched_logical_width(packed_bytes, group_size):
     with pytest.raises(ValueError, match="Per-channel packed width"):
         preprocess_olive_weights(
             {"proj.weight_qweight": torch.zeros(8, packed_bytes, dtype=torch.uint8)},
             bits=4,
-            group_size=-1,
+            group_size=group_size,
             in_features=33,
         )
 
 
 @pytest.mark.parametrize("preprocess", [preprocess_gptq_weights, preprocess_awq_weights])
 @pytest.mark.parametrize("packed_words", [4, 6])
-def test_per_channel_dotted_rejects_mismatched_logical_width(preprocess, packed_words):
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_dotted_rejects_mismatched_logical_width(
+    preprocess, packed_words, group_size
+):
     with pytest.raises(ValueError, match="Per-channel packed width"):
         preprocess(
             {"proj.qweight": torch.zeros(packed_words, 8, dtype=torch.int32)},
             bits=4,
-            group_size=-1,
+            group_size=group_size,
             in_features=33,
         )
 
@@ -712,9 +724,10 @@ def test_per_channel_dotted_rejects_mismatched_logical_width(preprocess, packed_
         (preprocess_awq_weights, "proj.scales", (2, 8)),
     ],
 )
-def test_per_channel_rejects_multiple_scale_groups(preprocess, scales_key, shape):
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_rejects_multiple_scale_groups(preprocess, scales_key, shape, group_size):
     with pytest.raises(ValueError, match="must have one group"):
-        preprocess({scales_key: torch.ones(shape)}, group_size=-1)
+        preprocess({scales_key: torch.ones(shape)}, group_size=group_size, in_features=33)
 
 
 class TestPreprocessOliveWeights:
