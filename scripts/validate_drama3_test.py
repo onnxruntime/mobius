@@ -156,6 +156,94 @@ def test_runtime_bridge_selects_the_session_cuda_device(monkeypatch):
     assert events == [("enter", 3), ("exit", 3)]
 
 
+@pytest.mark.parametrize("generate", [False, True])
+def test_tower_bridge_selects_teacher_or_single_pass_without_rng(monkeypatch, generate):
+    session = SimpleNamespace(
+        get_inputs=lambda: [SimpleNamespace(name="generate")],
+    )
+    output = {"valid": np.array([True]), "next_counter": np.zeros(1, np.int64)}
+    hidden = np.zeros((1, 1, 8), np.float32)
+
+    def run(actual, feeds):
+        assert actual is session
+        assert feeds["hidden_states"] is hidden
+        assert feeds["generate"].shape == ()
+        assert bool(feeds["generate"]) is generate
+        assert not bool(feeds["do_sample"])
+        np.testing.assert_array_equal(feeds["counter"], [0])
+        return output
+
+    monkeypatch.setattr(validate_drama3, "run_session", run)
+    assert (
+        validate_drama3.run_tower_session(
+            session, {"hidden_states": hidden}, generate=generate
+        )
+        is output
+    )
+
+
+@pytest.mark.parametrize("invalid", ["valid", "counter"])
+def test_tower_bridge_rejects_invalid_generation_or_greedy_rng_advance(monkeypatch, invalid):
+    session = SimpleNamespace(get_inputs=lambda: [SimpleNamespace(name="generate")])
+    monkeypatch.setattr(
+        validate_drama3,
+        "run_session",
+        lambda *args: {
+            "valid": np.array([invalid != "valid"]),
+            "next_counter": np.array([int(invalid == "counter")], np.int64),
+        },
+    )
+    with pytest.raises(
+        FloatingPointError if invalid == "valid" else AssertionError,
+        match=r"rejected|advanced",
+    ):
+        validate_drama3.run_tower_session(session, {}, generate=True)
+
+
+def test_tower_bridge_preserves_legacy_teacher_feeds(monkeypatch):
+    session = SimpleNamespace(get_inputs=lambda: [SimpleNamespace(name="hidden_states")])
+    feeds = {"hidden_states": np.zeros((1, 3, 8), np.float32)}
+    output = {"codebook_logits": np.zeros((1, 3, 2, 16), np.float32)}
+
+    def run(actual, actual_feeds):
+        assert actual is session and actual_feeds is feeds
+        return output
+
+    monkeypatch.setattr(validate_drama3, "run_session", run)
+    assert validate_drama3.run_tower_session(session, feeds) is output
+
+
+def test_full_export_forwards_explicit_task_and_execution_provider(tmp_path, monkeypatch):
+    import mobius
+
+    calls = {}
+
+    class Package:
+        def __init__(self):
+            self.weight_loading_report = {}
+
+        def save(self, path, *, max_workers):
+            calls["save"] = (path, max_workers)
+
+    def build(model, **kwargs):
+        calls["build"] = (model, kwargs)
+        return Package()
+
+    monkeypatch.setattr(mobius, "build", build)
+    monkeypatch.setattr(validate_drama3, "ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(validate_drama3, "DTYPE", "f32")
+    validate_drama3.export(
+        tmp_path / "checkpoint", task="fish-omni-generation", execution_provider="cuda"
+    )
+    model, options = calls["build"]
+    assert model == str(tmp_path / "checkpoint")
+    assert options["revision"] == REVISION
+    assert options["task"] == "fish-omni-generation"
+    assert options["execution_provider"] == "cuda"
+    assert options["keep_quantized"] is False
+    assert calls["save"] == (str(tmp_path / "onnx"), 1)
+
+
 def test_committed_token_golden_is_pinned_and_complete():
     golden = json.loads(GOLDEN.read_text())
     validate_reference_golden(golden)
