@@ -2034,6 +2034,12 @@ def write_ort_genai_config(
             "KV caches, DPM-Solver sampling, and prefilled voice-prompt caches; it "
             "cannot be represented by an ONNX Runtime GenAI configuration."
         )
+    if getattr(config, "model_type", None) == "fish_omni":
+        raise ValueError(
+            "Drama 3 requires host-owned next-frame codebook sampling, temporal "
+            "audio-decoder caches and an external waveform codec; an ONNX Runtime "
+            "GenAI pipeline configuration is not implemented."
+        )
     os.makedirs(directory, exist_ok=True)
     if set(pkg) in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
         pkg, "gguf_projector_type", None

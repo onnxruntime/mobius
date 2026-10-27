@@ -102,6 +102,10 @@ class StreamingWeightSource:
     mode: Literal["direct", "fp8_scalar", "fp8_block_128"] = "direct"
     scale_name: str | None = None
     expected_scale: float | None = None
+    # Existing checkpoint adapters reconstruct through BF16. Architectures
+    # whose reference loader reconstructs directly in the compute dtype can
+    # opt in without changing the existing adapters' rounding semantics.
+    reconstruction_dtype: torch.dtype = torch.bfloat16
 
 
 @dataclasses.dataclass(frozen=True)
@@ -715,9 +719,9 @@ def _materialize_preprocessed_source(
             tensor,
             scale,
             name=source.source_name,
-            target_dtype=torch.bfloat16,
+            target_dtype=source.reconstruction_dtype,
         )
-        return tensor if target_dtype == torch.bfloat16 else tensor.to(target_dtype)
+        return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
     if source.mode == "fp8_scalar":
         if not source_dtype.startswith("F8"):
             raise ValueError(
@@ -1049,12 +1053,24 @@ def stream_preprocessed_safetensors_to_model(
                     f"{expected_shape}, checkpoint source '{source.source_name}' has "
                     f"{source_shape}"
                 )
-            bf16_bytes = math.prod(source_shape) * 2
-            cast_bytes = target_bytes if initializer.dtype != ir.DataType.BFLOAT16 else 0
+            reconstruction_dtype = (
+                source.reconstruction_dtype
+                if source.mode == "fp8_block_128"
+                else torch.bfloat16
+            )
+            reconstruction_bytes = (
+                math.prod(source_shape)
+                * torch.empty((), dtype=reconstruction_dtype).element_size()
+            )
+            cast_bytes = (
+                target_bytes
+                if tensor_adapters.to_torch_dtype(initializer.dtype) != reconstruction_dtype
+                else 0
+            )
             largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
             largest_reconstruction_working_set_bytes = max(
                 largest_reconstruction_working_set_bytes,
-                source_bytes + bf16_bytes + cast_bytes + scale_bytes,
+                source_bytes + reconstruction_bytes + cast_bytes + scale_bytes,
             )
         else:
             if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:

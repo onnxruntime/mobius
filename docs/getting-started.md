@@ -94,6 +94,75 @@ pkg = build("llava-hf/llava-1.5-7b-hf")
 pkg = build("facebook/wav2vec2-base")
 ```
 
+### Export Drama 3 token generation
+
+Drama 3 exports three graphs, not a standalone text-to-waveform service:
+
+```python
+from mobius import build
+
+pkg = build(
+    "fishaudio/drama-3",
+    revision="b2b5ee998034b2975720906c815e7fb0e9f007bd",
+    dtype="f32",
+    keep_quantized=False,
+)
+pkg.save("output/drama-3", max_workers=1)
+```
+
+Equivalent CLI:
+
+```bash
+mobius build --model fishaudio/drama-3 --revision b2b5ee998034b2975720906c815e7fb0e9f007bd --dtype f32 --dequantize --max-workers 1 --output output/drama-3
+```
+
+The official model ID defaults to this pinned revision; explicit revisions and
+local checkpoint directories are honored. The 35B checkpoint stores BF16
+weights and block-scaled FP8 experts. `--dequantize` is required: conversion
+streams parameters lazily into dense FP32 external data; `max_workers=1` bounds
+serialization to one parameter at a time. Native
+`bsgemm-moe` execution is **not** claimed. Plan for roughly 144 GB of dense FP32
+weights, plus the source checkpoint and runtime allocations. Only FP32 is
+currently accepted. FP16 is rejected because released residuals/down projections
+exceed its range; BF16 is rejected because reduced upstream numerical parity
+does not pass the `1e-2` gate. Tolerances are not relaxed to qualify it.
+
+| Graph | Inputs | Outputs |
+|---|---|---|
+| `embedding` | `frames`: INT64 `[B,T,11]`, each row `[main_token, code0, ..., code9]` | `inputs_embeds`, `shared_input`: `[B,T,H]` |
+| `decoder` | `inputs_embeds`, `attention_mask`, `position_ids`, per-layer KV/conv/recurrent state | `logits`, `hidden_states`, updated states |
+| `audio_decoder` | `hidden_states`, `codes`: INT64 `[B,T,10]`, `semantic_mask`: BOOL `[B,T]`, `shared_input`, mask, positions, tower KV caches | `codebook_logits`: `[B,T,9,4096]`, updated tower KV caches |
+
+Use the checkpoint tokenizer and Fish Speech's `reference-bracket-v1` prompt
+format. Initialize ordinary KV caches with sequence length zero; initialize
+DeltaNet conv/recurrent state with zeros and the **actual batch size**.
+Recurrent state is always FP32. Masks are INT64 `[B,past+T]` and positions are
+INT64 `[B,T]`. The audio tower's cache persists across **time**, not just within
+one frame. Padding must be removed before running the recurrent backbone;
+padded rows would otherwise update its state.
+
+For teacher-forced prompt ingestion, the backbone sees frame `p`, while the
+tower's `codes` and `semantic_mask` label frame `p+1`; `shared_input` comes
+from frame `p`. `semantic_mask` tests the next main token against the inclusive
+semantic band `[248099,252194]`. Code zero is that main token minus 248099
+(clipped to `[0,4095]`); EOS is 248046.
+
+For generation, sample the main token from decoder logits restricted to EOS
+and the semantic band. Fill code zero, then run `audio_decoder` once per
+remaining codebook, sampling code `i+1` from logit slice `i`. Each invocation
+uses the **same previous-frame caches**, not the preceding invocation's
+outputs; retain only the last invocation's present caches. Later code inputs
+may initially be zero because logit slice `i` depends only on codes `0..i`.
+This teacher-forced ABI favors a compact export over efficient fused sampling.
+
+Sampling (including repetition-aware resampling), reference audio encoding,
+the separately distributed `codec.pth`, waveform decoding, and ORT GenAI
+generation integration are external. `--runtime onnx-genai` writes graph-derived
+advisory component contracts, not an executable speech pipeline;
+`--runtime ort-genai` is explicitly rejected. No full-checkpoint waveform or
+generation-golden claim is made by this token-graph export. Fish Audio's
+checkpoint/source license is separate from Mobius's MIT license.
+
 ### Build from a GGUF file
 
 Convert a GGUF model (e.g. from llama.cpp) to ONNX. Quantized target storage is
