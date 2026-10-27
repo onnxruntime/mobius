@@ -797,8 +797,8 @@ class TestBuildGraphDtype:
         "dtype_str",
         ["f16", "bf16"],
     )
-    def test_gemma4_encoder_inputs_match_model_dtype(self, dtype_str):
-        """Gemma4 vision/audio encoder inputs match the model's compute dtype."""
+    def test_gemma4_encoder_input_dtypes(self, dtype_str):
+        """Vision takes FP32 processor pixels; audio keeps the compute dtype."""
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
 
         config = Gemma4Config(
@@ -846,11 +846,11 @@ class TestBuildGraphDtype:
         task = get_task("gemma4")
         pkg = task.build(module, config)
 
-        # Vision encoder pixel_values must match config.dtype
+        # Normalize processor pixels in FP32 before casting to the projection dtype.
         vision_model = pkg["vision_encoder"]
         pv_input = vision_model.graph.inputs[0]
         assert pv_input.name == "pixel_values"
-        assert pv_input.dtype == config.dtype
+        assert pv_input.dtype == ir.DataType.FLOAT
 
         # Audio encoder input_features must match config.dtype
         audio_model = pkg["audio_encoder"]

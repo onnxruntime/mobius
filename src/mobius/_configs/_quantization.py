@@ -108,6 +108,8 @@ class QuantizationConfig:
     # positional construction, so inserting a field earlier would silently
     # change the meaning of existing callers' arguments.
     weight_format: QuantizedWeightFormat = QuantizedWeightFormat.INTEGER_AFFINE
+    # Olive explicitly opts fused expert tensors into native QMoE packing.
+    quantize_moe: bool = False
 
     def __post_init__(self) -> None:
         """Normalize serialized enum values without inferring storage semantics."""
@@ -249,6 +251,7 @@ class QuantizationConfig:
             quantize_embeddings=bool(qc.get("embeds")),
             quantize_lm_head=bool(qc.get("lm_head")),
             quantize_vision=bool(qc.get("quantize_vision")),
+            quantize_moe=bool(qc.get("quantize_moe", qc.get("moe", False))),
             tie_word_embeddings=bool(qc.get("tie_word_embeddings")),
             modules_to_not_convert=exclusions,
             overrides=overrides,

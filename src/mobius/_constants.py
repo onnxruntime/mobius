@@ -24,6 +24,8 @@ it cannot overwrite that backing file before the callback reads it. This is
 transient Python bookkeeping, not serialized ``metadata_props``.
 """
 
+GEMMA4_CUSTOM_GEGLU_METADATA_KEY = "mobius.gemma4.required_runtime_feature"
+
 # ---------------------------------------------------------------------------
 # Static KV cache ABI
 # ---------------------------------------------------------------------------

@@ -97,6 +97,11 @@ class _Flags:
            block overlay + padding) on the external-KV static-cache
            ``Attention`` path (``is_causal=0``) for float-bias decoders,
            instead of the maskless ``is_causal=1`` default.
+       * - ``gemma4_custom_geglu``
+         - ``MOBIUS_GEMMA4_CUSTOM_GEGLU``
+         - ``False``
+         - Opt in to the experimental custom CUDA GEGLU MoE/QMoE ABI.
+           Ordinary CUDA selection does not imply this runtime support.
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -176,6 +181,17 @@ class _Flags:
 
     Default ``False``: the maskless ``is_causal=1`` static-cache emission is
     unchanged, so no shipped model's graph changes unless this flag is set.
+    """
+
+    gemma4_custom_geglu: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_GEMMA4_CUSTOM_GEGLU", False)
+    )
+    """Opt in to Gemma4's experimental custom CUDA tanh-GEGLU MoE/QMoE ABI.
+
+    Requires a separately qualified custom runtime, not an unmodified released
+    ORT wheel. Default float exports use the portable exact-activation fallback;
+    quantized experts fail closed without this opt-in. The flag does not enable
+    native dispatch for non-CUDA providers.
     """
 
     allow_dense_moe_experts: bool = dataclasses.field(
