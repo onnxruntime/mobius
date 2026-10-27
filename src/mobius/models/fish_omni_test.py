@@ -9,6 +9,7 @@ import json
 
 import onnx_ir as ir
 import pytest
+from _test_configs import FISH_OMNI_CONFIG
 
 from mobius import build_from_module
 from mobius._configs.fish_omni import FishOmniConfig
@@ -18,7 +19,6 @@ from mobius.integrations.transformers._config_resolver import (
     _dict_to_pretrained_config,
 )
 from mobius.models import FishOmniModel
-from tests._test_configs import FISH_OMNI_CONFIG
 
 
 def tiny_config():
