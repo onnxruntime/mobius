@@ -82,7 +82,7 @@ def test_query_timeout_kills_only_owned_child_and_bounded_reaps(monkeypatch, cle
     assert evidence["stderr"] == "NVML stalled"
     assert evidence["kill_attempted"] is True
     assert evidence["reaped"] is (cleanup in ("reaped", "kill-error"))
-    assert query.timeouts[0] == 20
+    assert 0 < query.timeouts[0] <= 20
     assert 0 <= query.timeouts[1] <= 2
     assert query.kills == 1 and len(launched) == 1
     assert ("kill_error" in evidence) is (cleanup == "kill-error")
@@ -101,7 +101,7 @@ def test_cleanup_consumed_grace_never_gets_a_second_full_wait(monkeypatch):
         )
     )
     install_queries(monkeypatch, query)
-    ticks = iter([0.0, 20.0, 22.5, 22.5])
+    ticks = iter([0.0, 0.0, 20.0, 22.5, 22.5])
     monkeypatch.setattr(runtime.time, "monotonic", lambda: next(ticks))
     with pytest.raises(runtime.GpuSnapshotError):
         runtime.gpu_snapshot(0)
@@ -128,6 +128,80 @@ def test_query_spawn_failure_is_unknown_without_retry(monkeypatch):
         runtime.gpu_snapshot(0)
     assert caught.value.evidence["failed_query"]["owned_pid"] is None
     assert "FileNotFoundError" in caught.value.evidence["failed_query"]["error"]
+    assert caught.value.evidence["failed_query"]["returncode"] is None
+    assert caught.value.evidence["failed_query"]["elapsed_seconds"] >= 0
+
+
+@pytest.mark.parametrize("wait_fails", [False, True])
+def test_slow_startup_consumes_the_query_deadline(monkeypatch, wait_fails):
+    now = [0.0]
+    query = QueryProcess(
+        output="0, H100, GPU-zero, 0, 0\n",
+        waits=(subprocess.TimeoutExpired("nvidia-smi", 13), -9) if wait_fails else (0,),
+    )
+    original_start = query.start
+    original_wait = query.wait
+
+    def slow_start(command, **kwargs):
+        now[0] = 7.0
+        return original_start(command, **kwargs)
+
+    def wait(*, timeout):
+        now[0] += timeout
+        return original_wait(timeout=timeout)
+
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(runtime.subprocess, "Popen", slow_start)
+    monkeypatch.setattr(query, "wait", wait)
+    if wait_fails:
+        with pytest.raises(runtime.GpuSnapshotError) as caught:
+            runtime._gpu_query(["nvidia-smi"])
+        assert caught.value.evidence["timed_out"] is True
+        assert caught.value.evidence["elapsed_seconds"] <= 22
+        assert query.kills == 1
+    else:
+        result = runtime._gpu_query(["nvidia-smi"])
+        assert result["status"] == "OBSERVED"
+        assert result["elapsed_seconds"] == pytest.approx(20)
+    assert query.timeouts[0] == 13
+
+
+@pytest.mark.parametrize("startup", [20.0, 25.0])
+def test_expired_startup_cannot_be_a_successful_query(monkeypatch, startup):
+    now = [0.0]
+    query = QueryProcess(output="late output", waits=(-9,))
+    original_start = query.start
+
+    def expired_start(command, **kwargs):
+        now[0] = startup
+        return original_start(command, **kwargs)
+
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(runtime.subprocess, "Popen", expired_start)
+    with pytest.raises(runtime.GpuSnapshotError) as caught:
+        runtime._gpu_query(["nvidia-smi"])
+    assert caught.value.evidence["status"] == "UNKNOWN"
+    assert caught.value.evidence["timed_out"] is True
+    assert caught.value.evidence["elapsed_seconds"] == pytest.approx(startup)
+    assert query.timeouts == [2]  # Cleanup only; no fresh 20-second query wait.
+    assert query.kills == 1
+
+
+def test_slow_spawn_error_keeps_actual_elapsed_and_unknown_exit(monkeypatch):
+    now = [0.0]
+
+    def failure(*args, **kwargs):
+        now[0] = 7.0
+        raise OSError("spawn failed after delay")
+
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(runtime.subprocess, "Popen", failure)
+    with pytest.raises(runtime.GpuSnapshotError) as caught:
+        runtime._gpu_query(["nvidia-smi"])
+    assert caught.value.evidence["elapsed_seconds"] == pytest.approx(7)
+    assert caught.value.evidence["returncode"] is None
+    assert caught.value.evidence["owned_pid"] is None
+    assert caught.value.evidence["reaped"] is False
 
 
 def test_app_query_timeout_retains_successful_gpu_query_evidence(monkeypatch):

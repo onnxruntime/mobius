@@ -298,6 +298,13 @@ class GpuSnapshotError(RuntimeError):
         self.evidence = evidence
 
 
+def _wait_gpu_query(process, command, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(command, 20)
+    process.wait(timeout=remaining)
+
+
 def _gpu_query(command):
     evidence = {
         "command": command,
@@ -305,6 +312,7 @@ def _gpu_query(command):
         "query_deadline_seconds": 20,
         "cleanup_grace_seconds": 2,
         "owned_pid": None,
+        "returncode": None,
         "reaped": False,
         "timed_out": False,
         "stdout": "",
@@ -314,17 +322,19 @@ def _gpu_query(command):
     # hangs. Inspect only bounded raw output after the bounded wait/cleanup.
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         started = time.monotonic()
+        deadline = started + 20
         try:
             process = subprocess.Popen(command, stdout=stdout, stderr=stderr)
         except OSError as error:
             evidence["error"] = f"{type(error).__name__}: {error}"
+            evidence["elapsed_seconds"] = time.monotonic() - started
             raise GpuSnapshotError(
                 "GPU query could not start; health UNKNOWN", evidence
             ) from error
         evidence["owned_pid"] = process.pid
         failure = None
         try:
-            process.wait(timeout=20)
+            _wait_gpu_query(process, command, deadline)
             evidence["reaped"] = True
         except (subprocess.TimeoutExpired, OSError) as error:
             failure = error

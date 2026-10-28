@@ -275,7 +275,14 @@ gate is RTF <= 1.0, with at least 50 frames, a full raw-bit audit, and CUDA
 ownership required for qualification. No percentile trimming or frame-hash-only
 admission is supported. A CPU run is always diagnostic, never native acceptance.
 
-Each `nvidia-smi` query has a 20-second deadline. Timeout or wait errors trigger
+Each `nvidia-smi` query has one absolute 20-second deadline starting before
+process creation. Startup time consumes this budget; `wait` receives only its
+remaining time, never a new 20 seconds. An already-expired startup is UNKNOWN
+and goes straight to owned cleanup, even if it produced plausible output.
+Spawn errors retain actual elapsed time with `owned_pid`/`returncode` null.
+OS process creation itself cannot be interrupted before it returns an owned
+handle; such startup overruns are reported, not relabelled deadline-compliant.
+Timeout or wait errors trigger
 one kill of that query's owned child and a bounded two-second cleanup/reap grace;
 no automatic retry, other-GPU retry, process-name/global kill, or unbounded pipe
 draining is used. A snapshot has two queries, so reserve up to 44 seconds for a
