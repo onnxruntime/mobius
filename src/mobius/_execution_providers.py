@@ -53,18 +53,19 @@ class EpCapabilities:
     Attributes:
         name: Canonical EP name (e.g. ``"cuda"``).
         gqa_dtypes: dtypes for which GroupQueryAttention fusion is supported.
-        qkv_pack_dtypes: Dtypes enabling both the existing decoder-only
-            GroupQueryAttention input packing (PackQKV) and the new additional
-            float projection packing (PackQKVProjections) for decoder and
-            masked-decoder roles. Nonempty built-in profiles, including CUDA,
-            enable the new float stage by default; INT4 uses its separate
-            capability below. Set to an empty frozenset for EPs that do not
+        qkv_pack_dtypes: Dtypes enabling the existing decoder-only GQA-input
+            packing stage (PackQKV). Does not enable the separate projection-only
+            float or INT4 stages. Set to an empty frozenset for EPs that do not
             support packed QKV inputs (e.g. DML, which always unpacks via
             UnpackQKV in the lowering stage).
         matmul_nbits_qkv_pack_dtypes: Activation dtypes for projection-only INT4
             packing, which preserves separate normalization/attention branches.
             Experimental: empty on every built-in EP, including CUDA. Explicit
             opt-in does not waive the unresolved large-model numerical gate.
+        qkv_projection_pack_dtypes: Dtypes for projection-only float packing
+            (PackQKVProjections) for decoder and masked-decoder roles, independent
+            of qkv_pack_dtypes and matmul_nbits_qkv_pack_dtypes. Experimental:
+            empty on every built-in EP until numerical execution is qualified.
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
@@ -180,6 +181,9 @@ class EpCapabilities:
     requires_graph_capture_rewrite: bool = False
     # Append new capabilities to preserve all existing positional arguments.
     matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
+        default_factory=frozenset
+    )
+    qkv_projection_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
         default_factory=frozenset
     )
 

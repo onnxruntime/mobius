@@ -461,7 +461,7 @@ def _get_optimization_passes(
         fuse.append(("PackQKV", list(pack_qkv_for_gqa_rules())))
 
     if model_role in {"decoder", "masked-decoder"}:
-        if dtype in caps.qkv_pack_dtypes:
+        if dtype in caps.qkv_projection_pack_dtypes:
             fuse.append(("PackQKVProjections", pack_qkv_projections_pass()))
         if dtype in caps.matmul_nbits_qkv_pack_dtypes:
             fuse.append(("PackMatMulNBitsQKV", pack_matmul_nbits_qkv_pass()))

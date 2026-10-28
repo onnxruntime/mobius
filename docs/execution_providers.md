@@ -109,11 +109,13 @@ their contracts. It supports Q/K/V and Q/K with raw K reused for V.
 | Stage | Roles | Enablement |
 |---|---|---|
 | Existing float `PackQKV` GQA-input fusion | `decoder` | Unchanged |
-| Additional float `PackQKVProjections` | `decoder`, `masked-decoder` | Automatic for `qkv_pack_dtypes`, including CUDA FLOAT/FP16/BF16 |
+| Additional float `PackQKVProjections` | `decoder`, `masked-decoder` | **Experimental; disabled on every built-in EP**; explicit `qkv_projection_pack_dtypes` opt-in |
 | INT4 projection packing | `decoder`, `masked-decoder` | **Experimental; disabled on every built-in EP**, including CUDA FP16/BF16 |
 
-Experimental INT4 opt-in uses the process-local capability API; stock `--ep cuda`
-does not enable it:
+Experimental float and INT4 projection packing use independent process-local
+capabilities. Stock `--ep cuda` enables neither new stage; the existing
+`qkv_pack_dtypes`-gated GQA-input packing is unchanged. Set only the capabilities
+you intend to evaluate (the example opts into both):
 
 ```python
 import dataclasses
@@ -124,15 +126,18 @@ from mobius import get_ep, register_ep
 register_ep(
     dataclasses.replace(
         get_ep("cuda"),
+        qkv_projection_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
         matmul_nbits_qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
     ),
     overwrite=True,
 )
 ```
 
-The INT4 capability is independent of float packing, activation/storage dtype,
-component precision, and FP8 KV caches. Packing never dequantizes, requantizes, or
-promotes weights. `_qkv_projection_packing.py` implements both float and INT4.
+Both opt-ins are independent of legacy float packing, activation/storage dtype,
+component precision, and FP8 KV caches. Neither byte-exact payload tests nor
+CPU FLOAT execution tests qualify CUDA FP16/BF16 numerical parity. Packing never
+dequantizes, requantizes, or promotes weights.
+`_qkv_projection_packing.py` implements both float and INT4.
 
 Packing requires static, non-overridable, compatible parameters and opset >= 13;
 ambiguous or overlapping groups and weights with outside consumers are skipped.
@@ -188,7 +193,8 @@ Every EP is fully described by a single `EpCapabilities` entry in the
 class EpCapabilities:
     name: str
     gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
-    qkv_pack_dtypes: frozenset[ir.DataType]          # both float packing stages
+    qkv_pack_dtypes: frozenset[ir.DataType]          # legacy GQA-input packing only
+    qkv_projection_pack_dtypes: frozenset[ir.DataType]  # experimental float; default empty
     supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
     supports_skip_layer_norm: bool = True            # False → InlinePass expansion
     supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
