@@ -158,6 +158,7 @@ __all__ = [
     "YouTuVLVisionEncoder",
     "apply_rms_norm",
     "apply_rotary_pos_emb",
+    "apply_partial_rotary_pos_emb",
     "build_packed_token_offset",
     "create_attention_bias",
     "create_decoder_layer",
@@ -380,6 +381,7 @@ from mobius.components._paged_mla import (
     paged_attention_rejection as paged_attention_rejection,
 )
 from mobius.components._parakeet_audio import ParakeetFastConformerEncoder
+from mobius.components._partial_rotary_embedding import apply_partial_rotary_pos_emb
 from mobius.components._pixtral_vision import (
     Mistral3MultiModalProjector as Mistral3MultiModalProjector,
 )

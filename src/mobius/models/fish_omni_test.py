@@ -54,6 +54,15 @@ def tiny_config():
     )
 
 
+def learned_parameter_shapes(module):
+    # Runtime RoPE replaces nonlearned low-dtype caches, never checkpoint weights.
+    return {
+        name: list(parameter.shape)
+        for name, parameter in module.named_parameters()
+        if not name.endswith(("rotary_emb.cos_cache", "rotary_emb.sin_cache"))
+    }
+
+
 class _ReducedPrecisionQualificationOnly:
     def _validate_precision(self, config):
         if not config.native_fp8_experts and config.dtype not in (
@@ -112,12 +121,7 @@ def native_fp8_prototype_config(dtype=ir.DataType.FLOAT16):
 def test_fish_projection_layout_is_scoped_and_preserves_weight_names(dtype):
     baseline = FishOmniModel(tiny_config())
     module = FishOmniModel(dataclasses.replace(tiny_config(), dtype=dtype))
-    expected_names = {
-        name: list(parameter.shape) for name, parameter in baseline.named_parameters()
-    }
-    assert {
-        name: list(parameter.shape) for name, parameter in module.named_parameters()
-    } == expected_names
+    assert learned_parameter_shapes(module) == learned_parameter_shapes(baseline)
     for component in (module.decoder, module.audio_decoder):
         projections = [child for child in component.modules() if isinstance(child, Linear)]
         assert projections
@@ -142,12 +146,7 @@ def test_fish_projection_layout_is_scoped_and_preserves_weight_names(dtype):
 def test_fish_norm_selection_is_scoped_and_preserves_parameter_paths(dtype):
     baseline = FishOmniModel(tiny_config())
     module = FishOmniModel(dataclasses.replace(tiny_config(), dtype=dtype))
-    expected_names = {
-        name: list(parameter.shape) for name, parameter in baseline.named_parameters()
-    }
-    assert {
-        name: list(parameter.shape) for name, parameter in module.named_parameters()
-    } == expected_names
+    assert learned_parameter_shapes(module) == learned_parameter_shapes(baseline)
     baseline_offsets = {
         name for name, child in baseline.named_modules() if type(child) is OffsetRMSNorm
     }
@@ -396,7 +395,7 @@ def test_fish_omni_build(dtype):
         for name, value in model.graph.initializers.items()
         if name.endswith((".cos_cache", ".sin_cache"))
     ]
-    assert rotary_caches
+    assert bool(rotary_caches) == (dtype == ir.DataType.FLOAT)
     assert all(value.dtype == ir.DataType.FLOAT for value in rotary_caches)
     for model in (decoder, tower):
         norms = [node for node in model.graph if node.op_type == "RMSNormalization"]
