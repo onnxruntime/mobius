@@ -1113,6 +1113,63 @@ def test_output_root_is_new_and_never_rewrites_frozen_inputs(consumer):
     assert not (consumer.assets / "forbidden-output").exists()
 
 
+def test_unknown_gpu_snapshot_persists_failed_report_without_model_session(
+    consumer, tmp_path, monkeypatch
+):
+    import audit_drama3
+    from drama3_runtime import GpuSnapshotError
+
+    profile = consumer.profile
+    profile.update(
+        device="cuda",
+        gpu_uuid="GPU-owned",
+        providers=[
+            [
+                "CUDAExecutionProvider",
+                {"device_id": "0", "use_tf32": "0", "enable_cuda_graph": "0"},
+            ],
+            "CPUExecutionProvider",
+        ],
+    )
+    profile["runtime"].update(cuda_toolkit="13.0.48", cublas="13.0.0.19", cudnn="9.14.0.64")
+    consumer.selection.write_text(json.dumps(profile))
+    evidence = {
+        "status": "UNKNOWN",
+        "failed_query": {"owned_pid": 123456, "reaped": False, "stderr": "NVML timeout"},
+    }
+
+    def unknown(_device):
+        raise GpuSnapshotError("health UNKNOWN", evidence)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("No model/runtime session may start after unknown health")
+
+    monkeypatch.setattr(audit_drama3, "gpu_snapshot", unknown)
+    monkeypatch.setattr(audit_drama3, "load_sessions", forbidden)
+    args = audit_drama3.parser().parse_args(
+        [
+            "--inputs",
+            str(consumer.inputs),
+            "--inputs-sha256",
+            digest(consumer.inputs),
+            "--selection",
+            str(consumer.selection),
+            "--selection-sha256",
+            digest(consumer.selection),
+            "--output",
+            str(tmp_path / "unknown-gpu"),
+            "--lease-uuid",
+            "GPU-owned",
+        ]
+    )
+    with pytest.raises(GpuSnapshotError, match="UNKNOWN"):
+        audit_drama3.run(args)
+    report = json.loads((tmp_path / "unknown-gpu" / "report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["gpu_snapshot_error"] == evidence
+    assert report["native_cuda13_acceptance"] is False
+
+
 @pytest.mark.parametrize(
     "mode",
     [

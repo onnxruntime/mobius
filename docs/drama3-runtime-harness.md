@@ -275,6 +275,21 @@ gate is RTF <= 1.0, with at least 50 frames, a full raw-bit audit, and CUDA
 ownership required for qualification. No percentile trimming or frame-hash-only
 admission is supported. A CPU run is always diagnostic, never native acceptance.
 
+Each `nvidia-smi` query has a 20-second deadline. Timeout or wait errors trigger
+one kill of that query's owned child and a bounded two-second cleanup/reap grace;
+no automatic retry, other-GPU retry, process-name/global kill, or unbounded pipe
+draining is used. A snapshot has two queries, so reserve up to 44 seconds for a
+failed/slow snapshot in any future lease budget, in addition to model work.
+Timeout, nonzero exit, spawn/kill/reap failure, malformed ownership/health CSV,
+missing/ambiguous selected GPU or oversized output aborts with explicit
+**UNKNOWN** health, never zero/empty healthy defaults. An unreaped owned PID is
+reported as unresolved, not claimed cleaned up. Partial stdout/stderr, return
+status and cleanup details are preserved in a `gpu_snapshot_error` JSON event
+and in audit failure reports; successful snapshots retain raw query evidence.
+An empty successful compute-app query is valid, but failed collection is not.
+Device/UUID selection and contention/numeric/provider/performance gates remain
+unchanged. These bounds are verified with CPU mocks, not physical NVML queries.
+
 The current native consumer graphs/shared CUDA 13 runtime and lease are external
 prerequisites. A not-ready selection fails clearly. CPU synthetic/mock checks
 and historical CUDA 12 source fixtures are not CUDA 13 execution, full-model

@@ -14,9 +14,11 @@ import ctypes
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -288,44 +290,172 @@ def next_cache(outputs, device):
     return result
 
 
-def gpu_snapshot(device_id):
-    text = subprocess.check_output(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,name,uuid,memory.used,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ],
-        text=True,
-    )
+class GpuSnapshotError(RuntimeError):
+    """Unknown GPU health with raw query and bounded owned-process cleanup evidence."""
+
+    def __init__(self, message, evidence):
+        super().__init__(message)
+        self.evidence = evidence
+
+
+def _gpu_query(command):
+    evidence = {
+        "command": command,
+        "status": "UNKNOWN",
+        "query_deadline_seconds": 20,
+        "cleanup_grace_seconds": 2,
+        "owned_pid": None,
+        "reaped": False,
+        "timed_out": False,
+        "stdout": "",
+        "stderr": "",
+    }
+    # Files avoid unbounded pipe draining or reader threads when an NVML child
+    # hangs. Inspect only bounded raw output after the bounded wait/cleanup.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        started = time.monotonic()
+        try:
+            process = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+        except OSError as error:
+            evidence["error"] = f"{type(error).__name__}: {error}"
+            raise GpuSnapshotError(
+                "GPU query could not start; health UNKNOWN", evidence
+            ) from error
+        evidence["owned_pid"] = process.pid
+        failure = None
+        try:
+            process.wait(timeout=20)
+            evidence["reaped"] = True
+        except (subprocess.TimeoutExpired, OSError) as error:
+            failure = error
+            evidence["timed_out"] = isinstance(error, subprocess.TimeoutExpired)
+            evidence["error"] = f"{type(error).__name__}: {error}"
+            cleanup_started = time.monotonic()
+            evidence["kill_attempted"] = True
+            try:
+                # Only this query's Popen child is killed; no global/name kill.
+                process.kill()
+            except OSError as cleanup_error:
+                evidence["kill_error"] = f"{type(cleanup_error).__name__}: {cleanup_error}"
+            try:
+                process.wait(timeout=max(0.0, 2 - (time.monotonic() - cleanup_started)))
+                evidence["reaped"] = True
+            except (subprocess.TimeoutExpired, OSError) as cleanup_error:
+                evidence["reap_error"] = f"{type(cleanup_error).__name__}: {cleanup_error}"
+        evidence["returncode"] = process.returncode
+        evidence["elapsed_seconds"] = time.monotonic() - started
+        for name, stream in (("stdout", stdout), ("stderr", stderr)):
+            stream.seek(0)
+            raw = stream.read(1024 * 1024 + 1)
+            evidence[name] = raw[: 1024 * 1024].decode("utf-8", errors="replace")
+            evidence[name + "_truncated"] = len(raw) > 1024 * 1024
+        if failure is not None or process.returncode != 0:
+            raise GpuSnapshotError("GPU query failed; health UNKNOWN", evidence) from failure
+        if evidence["stdout_truncated"] or evidence["stderr_truncated"]:
+            raise GpuSnapshotError("GPU query output exceeded limit; health UNKNOWN", evidence)
+    evidence["status"] = "OBSERVED"
+    return evidence
+
+
+def _snapshot_rows(text, columns):
+    rows = list(csv.reader(io.StringIO(text), strict=True, skipinitialspace=True))
+    if any(len(row) != columns or any(not item.strip() for item in row) for row in rows):
+        raise ValueError("Malformed GPU query CSV")
+    return [[item.strip() for item in row] for row in rows]
+
+
+def _collect_gpu_snapshot(device_id, queries):
+    if not isinstance(device_id, int) or device_id < 0:
+        raise ValueError("Invalid CUDA device ID")
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     selected = visible.split(",")[device_id].strip() if visible else str(device_id)
-    processes = subprocess.check_output(
-        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
-        text=True,
+    if not selected or (not selected.isdigit() and not selected.startswith("GPU-")):
+        raise ValueError("Invalid CUDA visible-device selector")
+    queries.append(
+        _gpu_query(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,uuid,memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ]
+        )
     )
-    for row in csv.reader(io.StringIO(text)):
-        if (selected.isdigit() and int(row[0]) == int(selected)) or (
-            not selected.isdigit() and row[2].strip().startswith(selected)
+    queries.append(
+        _gpu_query(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=gpu_uuid,pid",
+                "--format=csv,noheader,nounits",
+            ]
+        )
+    )
+    rows = _snapshot_rows(queries[0]["stdout"], 5)
+    processes = _snapshot_rows(queries[1]["stdout"], 2)
+    matches = []
+    seen_indices, seen_uuids = set(), set()
+    for row in rows:
+        index, _name, uuid, memory, utilization = row
+        if (
+            not index.isdigit()
+            or not memory.isdigit()
+            or not utilization.isdigit()
+            or int(utilization) > 100
+            or not uuid.startswith("GPU-")
+            or int(index) in seen_indices
+            or uuid in seen_uuids
         ):
-            return {
-                "device_id": device_id,
-                "physical_index": int(row[0]),
-                "uuid": row[2].strip(),
-                "name": row[1].strip(),
-                "memory_used_mib": int(row[3]),
-                "utilization_percent": int(row[4]),
-                "foreign_pids": [
-                    int(process[1])
-                    for process in csv.reader(io.StringIO(processes))
-                    if process
-                    and process[0].strip() == row[2].strip()
-                    and int(process[1]) != os.getpid()
-                ],
-            }
-    raise ValueError(f"CUDA device {device_id} not found")
+            raise ValueError("Invalid GPU identity or health data")
+        seen_indices.add(int(index))
+        seen_uuids.add(uuid)
+        if (selected.isdigit() and int(index) == int(selected)) or (
+            not selected.isdigit() and uuid.startswith(selected)
+        ):
+            matches.append(row)
+    if len(matches) != 1:
+        raise ValueError("Selected GPU missing or UUID selector ambiguous")
+    if any(
+        not uuid.startswith("GPU-") or not pid.isdigit() or int(pid) <= 0
+        for uuid, pid in processes
+    ):
+        raise ValueError("Invalid GPU process ownership data")
+    row = matches[0]
+    return {
+        "status": "OBSERVED",
+        "device_id": device_id,
+        "physical_index": int(row[0]),
+        "uuid": row[2],
+        "name": row[1],
+        "memory_used_mib": int(row[3]),
+        "utilization_percent": int(row[4]),
+        "foreign_pids": [
+            int(pid) for uuid, pid in processes if uuid == row[2] and int(pid) != os.getpid()
+        ],
+        "queries": queries,
+    }
+
+
+def gpu_snapshot(device_id):
+    queries = []
+    try:
+        return _collect_gpu_snapshot(device_id, queries)
+    except (GpuSnapshotError, ValueError, IndexError, csv.Error, OSError) as error:
+        evidence = {
+            "status": "UNKNOWN",
+            "device_id": device_id,
+            "queries": queries,
+            "error": f"{type(error).__name__}: {error}",
+        }
+        if isinstance(error, GpuSnapshotError):
+            evidence["failed_query"] = error.evidence
+        print(json.dumps({"event": "gpu_snapshot_error", **evidence}), flush=True)
+        raise GpuSnapshotError(
+            "GPU health/ownership UNKNOWN; refusing measurement", evidence
+        ) from error
 
 
 def require_idle(snapshot, allow_contended):
+    if snapshot.get("status") == "UNKNOWN":
+        raise GpuSnapshotError("GPU health UNKNOWN; refusing measurement", snapshot)
     busy = (
         snapshot["utilization_percent"] > 5
         or snapshot["memory_used_mib"] > 1024

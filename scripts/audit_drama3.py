@@ -25,6 +25,7 @@ from drama3_runtime import (
     SOURCE_CONTEXT_CONTRACT,
     SOURCE_CONTEXT_METADATA,
     BoundSession,
+    GpuSnapshotError,
     gpu_snapshot,
     next_cache,
     ort_to_numpy,
@@ -969,6 +970,8 @@ def run(args):
         finish_acceptance(report, benchmark=args.benchmark)
     except (ValueError, RuntimeError, AssertionError, OSError, FloatingPointError) as error:
         report["error"] = f"{type(error).__name__}: {error}"
+        if isinstance(error, GpuSnapshotError):
+            report["gpu_snapshot_error"] = error.evidence
         if report["codec_numerical_quality"]["status"] == "PENDING":
             report["codec_numerical_quality"]["status"] = "FAILED"
         raise
