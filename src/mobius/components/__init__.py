@@ -163,6 +163,7 @@ __all__ = [
     "create_static_cache_attention_bias",
     "get_activation",
     "initialize_rope",
+    "ordered_row_reduce",
     "make_quantized_linear_factory",
     "make_clippable_quantized_linear_factory",
     "siglip2_naflex_attention_mask",
@@ -351,6 +352,7 @@ from mobius.components._ocr_projectors import (
     PaddleOCRProjector,
     YouTuVLProjector,
 )
+from mobius.components._ordered_reduction import ordered_row_reduce
 from mobius.components._paged_mla import (
     PagedCacheState as PagedCacheState,
 )
