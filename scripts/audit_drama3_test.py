@@ -55,7 +55,6 @@ def descriptor(path):
     [
         ("", "dense"),
         ("com.microsoft::QMoE", "dense"),
-        ("com.microsoft::QMoE[fp8_execution_profile=native]", "dense"),
         ("activation_quantization=dynamic_fp8", "dynamic_fp8"),
         (
             (
@@ -108,10 +107,30 @@ def test_compatible_qmoe_rejects_missing_or_wrong_weight_loading(field):
 
 @pytest.mark.parametrize(
     "features",
-    ["", "com.microsoft::QMoE", "com.microsoft::QMoE[fp8_execution_profile=unknown]"],
+    ["", "com.microsoft::QMoE"],
 )
 def test_weight_report_alone_cannot_select_dynamic_fp8(features):
     assert expert_execution(features, json.dumps(candidate_loading())) == "dense"
+
+
+@pytest.mark.parametrize("loading", [None, "valid"])
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "",
+        ";activation_quantization=dynamic_fp8",
+        ";com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]",
+    ],
+)
+@pytest.mark.parametrize("profile", ["unknown", "native"])
+def test_unsupported_qmoe_profile_never_falls_through_to_legacy(profile, suffix, loading):
+    features = f"com.microsoft::QMoE[fp8_execution_profile={profile}]{suffix}"
+    with pytest.raises(ValueError, match="Unsupported or conflicting QMoE profile"):
+        expert_execution(features, json.dumps(candidate_loading()) if loading else None)
+
+
+def test_legacy_exact_dynamic_fp8_contract_remains_supported_without_candidate_profile():
+    assert expert_execution("activation_quantization=dynamic_fp8") == "dynamic_fp8"
 
 
 @pytest.mark.parametrize(
@@ -158,7 +177,7 @@ def test_load_sessions_requires_compatible_profile_weights_and_actual_dtype(
     if variant == "compatible":
         assert set(load_sessions(profile)) == set(profile["components"])
     else:
-        with pytest.raises(ValueError, match=r"dtype|expert execution"):
+        with pytest.raises(ValueError, match=r"dtype|expert execution|QMoE profile"):
             load_sessions(profile)
 
 
@@ -1095,7 +1114,15 @@ def test_output_root_is_new_and_never_rewrites_frozen_inputs(consumer):
 
 
 @pytest.mark.parametrize(
-    "mode", ["ok", "foreign-cuda", "selected-cuda12", "torch", "unhashed-provider"]
+    "mode",
+    [
+        "ok",
+        "allowed-unloaded",
+        "foreign-cuda",
+        "selected-cuda12",
+        "torch",
+        "unhashed-provider",
+    ],
 )
 def test_loaded_library_attestation_without_loading_cuda(consumer, mode):
     profile = copy.deepcopy(consumer.profile)
@@ -1107,6 +1134,7 @@ def test_loaded_library_attestation_without_loading_cuda(consumer, mode):
         "libonnxruntime_providers_cuda.so",
         "libcudart.so.12",
         "libtorch_cuda.so",
+        "libcudnn_cnn.so.9",
     ):
         path = consumer.assets / name
         path.write_bytes(b"synthetic mapping, not a loaded library")
@@ -1118,6 +1146,10 @@ def test_loaded_library_attestation_without_loading_cuda(consumer, mode):
     if mode == "selected-cuda12":
         profile["runtime"]["libraries"].append(
             descriptor(Path(paths["/mock/libcudart.so.12"]))
+        )
+    if mode == "allowed-unloaded":
+        profile["runtime"]["libraries"].append(
+            descriptor(Path(paths["/mock/libcudnn_cnn.so.9"]))
         )
     if mode != "unhashed-provider":
         profile["runtime"]["files"].append(
@@ -1147,13 +1179,29 @@ def mapped_path(value):
         return Maps()
     return Path(paths.get(str(value), value))
 audit_drama3.Path = mapped_path
-audit_drama3.runtime_identity(profile)
+result = audit_drama3.runtime_identity(profile)
+assert result['loaded_library_check'] == 'passed'
+actual = {Path(item['path']).name for item in result['actual_loaded_cuda_libraries']}
+assert actual == {'libcudart.so.13', 'libcublas.so.13'}
+if mode == 'allowed-unloaded':
+    assert [Path(item['path']).name for item in result['allowed_cuda_libraries_not_loaded']] == [
+        'libcudnn_cnn.so.9']
+else:
+    assert result['allowed_cuda_libraries_not_loaded'] == []
+class NoMaps:
+    def __init__(self, value):
+        assert str(value) != '/proc/self/maps', 'Pre-op check must not read GPU library maps'
+        self.path = Path(value)
+    def __getattr__(self, name):
+        return getattr(self.path, name)
+audit_drama3.Path = NoMaps
+assert audit_drama3.runtime_identity(profile, check_loaded=False)['loaded_library_check'] == 'not_requested'
 """,
         consumer.selection,
         json.dumps(paths),
         mode,
     )
-    if mode == "ok":
+    if mode in ("ok", "allowed-unloaded"):
         assert completed.returncode == 0, completed.stderr
     else:
         assert completed.returncode != 0

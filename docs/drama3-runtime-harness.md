@@ -110,16 +110,35 @@ cannot select this mode. Decoder dtype and exact selected runtime-feature
 metadata are checked independently. Package-level context metadata may appear
 on all components: decoder `inputs_embeds` and tower `hidden_states` calls
 validate positions and caches; the stateless embedding has no such controls.
+An explicit unsupported or conflicting QMoE profile is rejected before the
+legacy dynamic-activation marker is considered; that marker cannot override an
+unknown profile. Prepared native launch commands use the exact composed
+interpreter with `-I` isolation and insert only the explicitly pinned harness
+script path, never a builder environment through `PYTHONPATH`.
 
 `files` must include the installed native ORT binding and all loaded ORT
-provider/runtime binaries. `libraries` must equal the actual loaded CUDA
+provider/runtime binaries. `libraries` pins the **expected allowed** CUDA
 library inventory (driver, cudart, cuBLAS/Lt, cuDNN sublibraries, NVRTC, and
-nvJitLink when loaded), using resolved paths and actual file hashes. Loaded
+nvJitLink when applicable), using resolved paths and actual file hashes. All
+actual loaded CUDA libraries must belong to this pinned inventory; a permitted
+DSO need not already be loaded (for example cuDNN CNN before the first codec
+operation). Pre-op identity checks verify file hashes, not whether future lazy
+libraries are mapped. Actual maps are captured/verified after the first tower
+prefill, the complete neural audit, codec execution, and measured request.
+Reports distinguish `actual_loaded_cuda_libraries` from
+`allowed_cuda_libraries_not_loaded`; neither is inferred from the other. Loaded
 library attestation currently requires Linux `/proc/self/maps`; unsupported
 attestation is an error, not a qualified fallback. This inventory and the pinned
 wheel/build identify the runtime; version labels alone are not acceptance.
 The runtime owner supplies exact source/toolkit provenance for that shared build.
 Private plugin registration is deliberately unsupported.
+
+Parent activation must preserve native-component qualification scopes. QMoE,
+attention and TRSM operator PASS evidence is mandatory, alongside the full-model
+gates. A pinned standard-primitives report that records the historical real
+expert BF16 BMM mismatch is diagnostic, not a fabricated all-PASS result and not
+a blanket bit-identity prerequisite for compatible QMoE. Its discrepancy stays
+visible; full-model vector/raw-bit qualification remains unchanged.
 
 All components use the same explicit provider/options/session-config/disabled
 optimizer selection. Actual ORT providers/options must match it exactly.

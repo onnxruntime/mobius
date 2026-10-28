@@ -180,6 +180,11 @@ def load_inputs(path, sha256, dtype):
 def runtime_identity(profile, *, check_loaded=True):
     """Verify installed ORT plus all selected native binaries and loaded CUDA DSOs."""
     runtime = profile["runtime"]
+    result = {
+        "ort_version": ort.__version__,
+        "ort_build": ort.get_build_info(),
+        "loaded_library_check": "not_requested",
+    }
     if (
         ort.__version__ != runtime["ort_version"]
         or ort.get_build_info() != runtime["ort_build"]
@@ -234,11 +239,22 @@ def runtime_identity(profile, *, check_loaded=True):
                         raise RuntimeError(f"Pre-CUDA13 library loaded: {library}")
                 if "libtorch" in name or name.startswith("libc10"):
                     raise RuntimeError("Torch native library loaded in the target process")
-        if loaded != selected or not any("libcudart" in item.name for item in loaded):
+        if not loaded <= selected or not any("libcudart" in item.name for item in loaded):
             raise RuntimeError("Loaded CUDA library inventory differs from selected runtime")
         if not loaded_ort <= set(files):
             raise RuntimeError("Loaded ORT provider/runtime binary is not fingerprinted")
-    return {"ort_version": ort.__version__, "ort_build": ort.get_build_info()}
+        descriptors = {
+            str(Path(item["path"]).resolve()): item for item in runtime["libraries"]
+        }
+        result.update(
+            loaded_library_check="passed",
+            actual_loaded_cuda_libraries=[descriptors[str(path)] for path in sorted(loaded)],
+            allowed_cuda_libraries_not_loaded=[
+                descriptors[str(path)] for path in sorted(selected - loaded)
+            ],
+            actual_loaded_ort_files=[str(path) for path in sorted(loaded_ort)],
+        )
+    return result
 
 
 def load_sessions(profile, *, evidence_root=None):
@@ -299,7 +315,11 @@ def load_sessions(profile, *, evidence_root=None):
 def expert_execution(features, weight_loading=None):
     """Recognize explicit dynamic-FP8 contracts, not generic QMoE availability."""
     contracts = {feature.strip() for feature in features.split(";")}
-    if "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]" in contracts:
+    compatible = "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]"
+    profiles = {feature for feature in contracts if feature.startswith("com.microsoft::QMoE[")}
+    if profiles - {compatible}:
+        raise ValueError(f"Unsupported or conflicting QMoE profile: {sorted(profiles)}")
+    if compatible in profiles:
         if weight_loading is None:
             raise ValueError("Compatible QMoE requires dynamic-FP8 weight-loading provenance")
         loading = json.loads(weight_loading)
@@ -877,12 +897,20 @@ def run(args):
         report["runtime"] = runtime_identity(profile, check_loaded=False)
         audit = ReferenceAudit(request_data, profile["dtype"], raw_bits=args.raw_bits)
         report["audit_progress"] = audit.metrics
+
+        def observe(step, stage, feeds, outputs):
+            audit(step, stage, feeds, outputs)
+            if profile["device"] == "cuda" and step == 0 and stage == "prefill":
+                report["runtime_after_prefill"] = runtime_identity(profile)
+
         frames, _ = request(
-            sessions, config, prompt, golden["attempted_frames"], observer=audit
+            sessions, config, prompt, golden["attempted_frames"], observer=observe
         )
         report["audit"] = audit.finish()
         del report["audit_progress"]
         np.testing.assert_array_equal(frames, golden["generated_frames"])
+        if profile["device"] == "cuda":
+            report["runtime_after_neural"] = runtime_identity(profile)
         waveform, _ = decode_waveform(sessions["codec"], frames)
         if waveform_reference is not None:
             codec_metadata = sessions["codec"].session.get_modelmeta().custom_metadata_map
