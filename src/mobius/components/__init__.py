@@ -43,6 +43,9 @@ __all__ = [
     "FCMLP",
     "FusedGateUpMLP",
     "GatedDeltaNet",
+    "chunk_gated_delta_rule",
+    "recurrent_gated_delta_rule",
+    "ordered_matrix_reduce_128",
     "GatedMLP",
     "GatedRMSNorm",
     "KimiDeltaAttention",
@@ -180,6 +183,11 @@ from mobius.components._attention import (
     Qwen35Attention as Qwen35Attention,
 )
 from mobius.components._audio import ConformerEncoder
+from mobius.components._chunk_delta_rule import (
+    chunk_gated_delta_rule,
+    ordered_matrix_reduce_128,
+    recurrent_gated_delta_rule,
+)
 from mobius.components._clip_sidecars import (
     MeralionAudioSidecar,
     MeralionProjector,

@@ -25,6 +25,10 @@ from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.components import Linear, OffsetRMSNorm, OutputMajorLinear
 from mobius.components._ordered_reduction_test import _reference_row_reduce
+from mobius.generation._fish_omni_context import (
+    SOURCE_CONTEXT_CONTRACT,
+    SOURCE_CONTEXT_METADATA,
+)
 from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _dict_to_pretrained_config,
@@ -34,6 +38,7 @@ from mobius.models.fish_omni import (
     _apply_fish_attention,
     _FishGatedNorm,
     _FishMoEBlock,
+    _FishSourceGatedDeltaNet,
     _FishSourceGatedNorm,
     _FishSourceOffsetNorm,
     _FP32OutputLinear,
@@ -405,6 +410,60 @@ def test_fish_omni_build(dtype):
             assert model.metadata_props["mobius.precision_validation"].startswith(
                 "unqualified"
             )
+    if dtype == ir.DataType.FLOAT:
+        assert SOURCE_CONTEXT_METADATA not in decoder.metadata_props
+    else:
+        assert decoder.metadata_props[SOURCE_CONTEXT_METADATA] == SOURCE_CONTEXT_CONTRACT
+        assert (
+            "no mixed/static/capture qualification"
+            in decoder.metadata_props["mobius.fish_omni.context_limits"]
+        )
+        assert (
+            "not-cuBLAS-bit-parity"
+            in decoder.metadata_props["mobius.fish_omni.gdn_arithmetic"]
+        )
+        assert not any(
+            node.op_type
+            in ("LinearAttention", "CausalConvWithState", "UnitLowerTriangularSolve")
+            for node in ir.traversal.RecursiveGraphIterator(decoder.graph)
+        )
+        assert not decoder.functions
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_source_gdn_dispatch_uses_continuation_and_length_not_cache_values(dtype):
+    module = _FishSourceGatedDeltaNet(dataclasses.replace(tiny_config(), dtype=dtype))
+    graph, builder = _make_graph("source_dispatch")
+    x = builder.input("x", dtype, ["batch", "time", module.hidden_size])
+    conv = builder.input("conv", dtype, ["batch", module.conv_dim, 3])
+    state = builder.input(
+        "state",
+        ir.DataType.FLOAT,
+        ["batch", module.num_v_heads, module.head_k_dim, module.head_v_dim],
+    )
+    continuing = builder.input("continuing", ir.DataType.BOOL, [])
+    module(builder.op, x, conv, state, continuing)
+    dispatch = next(node for node in graph if node.op_type == "If")
+    condition = dispatch.inputs[0].producer()
+    assert condition.op_type == "And"
+    assert continuing in condition.inputs
+    length_test = next(
+        value.producer() for value in condition.inputs if value is not continuing
+    )
+    assert length_test.op_type == "Equal"
+    shape = length_test.inputs[0].producer().inputs[0].producer()
+    assert shape.op_type == "Shape"
+    assert shape.inputs[0] is x
+    assert shape.attributes["start"].as_int() == 1
+    assert shape.attributes["end"].as_int() == 2
+    assert "recurrent" in dispatch.attributes["then_branch"].as_graph().name
+    assert "chunks" in dispatch.attributes["else_branch"].as_graph().name
+    runtime_exp = next(
+        node
+        for node in graph
+        if node.op_type == "Exp" and node.inputs[0].producer().op_type == "Expand"
+    )
+    assert runtime_exp.inputs[0].producer().inputs[1].producer().op_type == "Concat"
 
 
 def test_fish_omni_registry_config_resolution():

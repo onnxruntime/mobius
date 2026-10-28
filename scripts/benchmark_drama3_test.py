@@ -31,6 +31,7 @@ from mobius import build_from_module
 from mobius._configs.fish_codec import FishCodecConfig
 from mobius._configs.fish_omni import FishOmniConfig
 from mobius._testing.ort_inference import _numpy_to_ort_value
+from mobius.generation._fish_omni_context import SOURCE_CONTEXT_CONTRACT
 from mobius.integrations.transformers._config_resolver import _dict_to_pretrained_config
 from mobius.integrations.transformers._fish_omni_weights import (
     _source_name,
@@ -68,7 +69,9 @@ def test_bound_session_forwards_convolution_search(tmp_path, monkeypatch, algori
 
     def inference_session(path, options, *, providers):
         seen.append(providers)
-        return SimpleNamespace(get_outputs=list)
+        return SimpleNamespace(
+            get_outputs=list, get_modelmeta=lambda: SimpleNamespace(custom_metadata_map={})
+        )
 
     monkeypatch.setattr(ort, "InferenceSession", inference_session)
     BoundSession(tmp_path / "model.onnx", device="cuda", cudnn_conv_algo_search=algorithm)
@@ -80,6 +83,22 @@ def test_bound_session_rejects_unknown_convolution_search_before_loading(tmp_pat
     with pytest.raises(ValueError, match="Unknown cuDNN convolution search"):
         BoundSession(
             tmp_path / "missing.onnx", device="cuda", cudnn_conv_algo_search="invalid"
+        )
+
+
+def test_bound_session_rejects_mixed_source_positions_before_binding():
+    session = BoundSession.__new__(BoundSession)
+    session.context_contract = SOURCE_CONTEXT_CONTRACT
+    # No runtime/binding exists: contract rejection must happen before either.
+    with pytest.raises(ValueError, match="shared contiguous"):
+        session.run(
+            {
+                "inputs_embeds": np.zeros((2, 1, 32), np.float32),
+                "position_ids": np.array([[3], [4]], np.int64),
+                "attention_mask": np.ones((2, 4), np.int64),
+                "past_key_values.1.key": np.zeros((2, 1, 3, 4), np.float32),
+                "past_key_values.1.value": np.zeros((2, 1, 3, 4), np.float32),
+            }
         )
 
 
@@ -117,6 +136,7 @@ def test_cpu_views_and_outputs_keep_cpu_device_zero_with_nonzero_cuda_id():
         io_binding=lambda: binding, run_with_iobinding=lambda binding: None
     )
     session.outputs, session.device, session.device_id = ["output"], "cuda", 3
+    session.context_contract = None
     actual = session.run({"x": sequence_view(value, 0, 1)}, cpu_outputs=("output",))
     assert actual["output"] is value
     assert calls == [("input", "x", "cpu", 0), ("output", "output", "cpu", 0)]

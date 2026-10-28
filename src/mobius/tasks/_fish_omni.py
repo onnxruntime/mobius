@@ -17,6 +17,10 @@ from mobius.generation._fish_omni import (
     build_fish_codebook_sampler,
     build_fish_main_sampler,
 )
+from mobius.generation._fish_omni_context import (
+    SOURCE_CONTEXT_CONTRACT,
+    SOURCE_CONTEXT_METADATA,
+)
 from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 from mobius.tasks._cache_utils import (
     _make_hybrid_cache_inputs,
@@ -111,7 +115,19 @@ class FishOmniTask(ModelTask):
         builder.add_output(hidden, "hidden_states")
         _register_hybrid_cache_outputs(builder, present, config.layer_types or [])
         models["decoder"] = _make_model(graph)
-        _register_linear_attention_functions(models["decoder"], config)
+        if config.dtype == ir.DataType.FLOAT:
+            _register_linear_attention_functions(models["decoder"], config)
+        if config.dtype != ir.DataType.FLOAT:
+            models["decoder"].metadata_props[SOURCE_CONTEXT_METADATA] = SOURCE_CONTEXT_CONTRACT
+            models["decoder"].metadata_props["mobius.fish_omni.gdn_arithmetic"] = (
+                "portable-fp32-chunk64; standard-ONNX-forward-substitution; "
+                "not-cuBLAS-bit-parity; unqualified-reduced-precision"
+            )
+            models["decoder"].metadata_props["mobius.fish_omni.context_limits"] = (
+                "Caller validation required: shared contiguous position_ids rows; "
+                "unpadded mask; dynamic past KV length equals position start; "
+                "position zero resets both GDN carries; no mixed/static/capture qualification"
+            )
 
         graph, builder = _make_graph(self.audio_model_name)
         hidden = builder.input(

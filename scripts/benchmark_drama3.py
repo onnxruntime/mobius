@@ -30,6 +30,11 @@ from onnxscript import GraphBuilder
 from validate_drama3 import empty_cache_ports
 
 from mobius._testing.ort_inference import _numpy_to_ort_value, _ort_value_to_numpy
+from mobius.generation._fish_omni_context import (
+    SOURCE_CONTEXT_CONTRACT,
+    SOURCE_CONTEXT_METADATA,
+    validate_source_context,
+)
 
 
 @dataclass(frozen=True)
@@ -109,8 +114,37 @@ class BoundSession:
         self.session = ort.InferenceSession(str(path), options, providers=providers)
         self.device, self.device_id = device, device_id if device == "cuda" else 0
         self.outputs = [port.name for port in self.session.get_outputs()]
+        self.context_contract = self.session.get_modelmeta().custom_metadata_map.get(
+            SOURCE_CONTEXT_METADATA
+        )
+        if self.context_contract not in (None, SOURCE_CONTEXT_CONTRACT):
+            raise ValueError(f"Unknown Fish context contract: {self.context_contract}")
 
     def run(self, feeds, *, fetches=None, cpu_outputs=()):
+        if self.context_contract == SOURCE_CONTEXT_CONTRACT:
+
+            def shape(value):
+                if isinstance(value, TensorView):
+                    return value.shape
+                return value.shape() if isinstance(value, ort.OrtValue) else value.shape
+
+            # Position/mask controls stay on CPU; inspect cache shapes without
+            # device copies or deriving continuation from cached tensor values.
+            if not all(
+                isinstance(feeds[name], np.ndarray)
+                for name in ("position_ids", "attention_mask")
+            ):
+                raise ValueError("Source Fish context controls must be CPU NumPy arrays")
+            validate_source_context(
+                feeds["position_ids"],
+                feeds["attention_mask"],
+                shape(feeds["inputs_embeds"]),
+                {
+                    name: shape(value)
+                    for name, value in feeds.items()
+                    if name.startswith("past_key_values.")
+                },
+            )
         names = self.outputs if fetches is None else list(fetches)
         if not set(names) <= set(self.outputs):
             raise ValueError(f"Unknown output names: {set(names) - set(self.outputs)}")

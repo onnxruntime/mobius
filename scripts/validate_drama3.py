@@ -512,6 +512,19 @@ def compare(*, audio_model_name=None, optimization_level="basic"):
     def run(name, feeds, *, generate=False):
         if name == "audio_decoder":
             return run_tower_session(sessions[name], feeds, generate=generate)
+        if name == "decoder" and DTYPE != "f32":
+            from mobius.generation._fish_omni_context import validate_source_context
+
+            validate_source_context(
+                feeds["position_ids"],
+                feeds["attention_mask"],
+                feeds["inputs_embeds"].shape,
+                {
+                    key: value.shape
+                    for key, value in feeds.items()
+                    if key.startswith("past_key_values.")
+                },
+            )
         return run_session(sessions[name], feeds)
 
     expected_type = {
