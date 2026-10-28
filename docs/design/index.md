@@ -8,6 +8,7 @@ Detailed design notes and proposals for `mobius` subsystems.
 ../design
 config-redesign
 deepseek-v4-flash-export
+drama3-cuda13-candidate
 qwen4-exp-text-core
 gguf-support-proposal
 golden-infra-design
