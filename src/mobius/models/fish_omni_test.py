@@ -18,11 +18,13 @@ from onnxscript import GraphBuilder, nn
 
 from mobius import build_from_module
 from mobius._build_context import ep_capabilities
+from mobius._builder import _cast_module_dtype
 from mobius._configs.fish_omni import FishOmniConfig
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.components import Linear, OutputMajorLinear
+from mobius.components import Linear, OffsetRMSNorm, OutputMajorLinear
+from mobius.components._ordered_reduction_test import _reference_row_reduce
 from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _dict_to_pretrained_config,
@@ -30,7 +32,10 @@ from mobius.integrations.transformers._config_resolver import (
 from mobius.models import FishOmniModel
 from mobius.models.fish_omni import (
     _apply_fish_attention,
+    _FishGatedNorm,
     _FishMoEBlock,
+    _FishSourceGatedNorm,
+    _FishSourceOffsetNorm,
     _FP32OutputLinear,
     _sigmoid_float32,
 )
@@ -124,6 +129,113 @@ def test_fish_projection_layout_is_scoped_and_preserves_weight_names(dtype):
     Linear(4, 3, bias=False)(builder.op, x)
     assert any(node.op_type == "MatMul" for node in graph)
     assert not any(node.op_type == "Gemm" for node in graph)
+
+
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+def test_fish_norm_selection_is_scoped_and_preserves_parameter_paths(dtype):
+    baseline = FishOmniModel(tiny_config())
+    module = FishOmniModel(dataclasses.replace(tiny_config(), dtype=dtype))
+    expected_names = {
+        name: list(parameter.shape) for name, parameter in baseline.named_parameters()
+    }
+    assert {
+        name: list(parameter.shape) for name, parameter in module.named_parameters()
+    } == expected_names
+    baseline_offsets = {
+        name for name, child in baseline.named_modules() if type(child) is OffsetRMSNorm
+    }
+    assert baseline_offsets
+    actual_offsets = {
+        name: child
+        for name, child in module.named_modules()
+        if isinstance(child, OffsetRMSNorm)
+    }
+    assert actual_offsets.keys() == baseline_offsets
+    expected_class = OffsetRMSNorm if dtype == ir.DataType.FLOAT else _FishSourceOffsetNorm
+    assert all(type(child) is expected_class for child in actual_offsets.values())
+    norms = [child for child in module.modules() if isinstance(child, _FishGatedNorm)]
+    assert norms
+    expected_class = _FishGatedNorm if dtype == ir.DataType.FLOAT else _FishSourceGatedNorm
+    assert all(type(child) is expected_class for child in norms)
+    graph, builder = _make_graph("unrelated_norm")
+    x = builder.input("x", ir.DataType.FLOAT, [1, 32])
+    OffsetRMSNorm(32)(builder.op, x)
+    assert any(node.op_type == "RMSNormalization" for node in graph)
+    assert not any(node.op_type == "Pad" for node in graph)
+
+
+@pytest.mark.parametrize("kind", ["offset", "gated"])
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+@pytest.mark.parametrize("shape", [(256,), (17, 256), (2, 2, 4, 256), (2, 0, 256)])
+def test_fish_source_norm_numeric_rounding_and_shape(kind, dtype, shape):
+    width = shape[-1]
+    norm = _FishSourceOffsetNorm(width) if kind == "offset" else _FishSourceGatedNorm(width)
+    rng = np.random.default_rng(74)
+    values = (rng.standard_normal(shape) * 300).astype(dtype.numpy())
+    weight = rng.uniform(-0.2, 0.2, width).astype(dtype.numpy())
+    gate = rng.uniform(-3, 3, shape).astype(dtype.numpy())
+    _cast_module_dtype(norm, dtype)
+    norm.weight = nn.Parameter([width], data=ir.tensor(weight))
+    graph, builder = _make_graph("source_norm")
+    x = builder.input("x", dtype, [*[f"d{i}" for i in range(len(shape) - 1)], width])
+    if kind == "gated":
+        g = builder.input("gate", dtype, list(x.shape))
+        y = norm(builder.op, x, g)
+    else:
+        y = norm(builder.op, x)
+    assert y.shape == x.shape
+    y.type = ir.TensorType(dtype)
+    builder.add_output(y, "y")
+    assert not any(node.op_type == "RMSNormalization" for node in graph)
+    assert all(node.domain == "" for node in graph)
+    wide = values.astype(np.float32)
+    variance = _reference_row_reduce(wide * wide, normalize=True)
+    normalized = wide * np.power(variance + np.float32(1e-6), np.float32(-0.5))
+    if kind == "offset":
+        expected = (normalized * (weight.astype(np.float32) + 1)).astype(dtype.numpy())
+    else:
+        # Two distinct low-dtype boundaries precede the FP32 gate multiplication.
+        rounded = normalized.astype(dtype.numpy())
+        scaled = (rounded.astype(np.float32) * weight.astype(np.float32)).astype(dtype.numpy())
+        wide_gate = gate.astype(np.float32)
+        silu = wide_gate / (1 + np.exp(-wide_gate))
+        expected = (scaled.astype(np.float32) * silu).astype(dtype.numpy())
+    feeds = {"x": values, **({"gate": gate} if kind == "gated" else {})}
+    session = OnnxModelSession(ir.Model(graph, ir_version=11), intra_op_num_threads=1)
+    try:
+        actual = session.run(feeds)["y"]
+    finally:
+        session.close()
+    assert actual.shape == shape
+    assert actual.dtype == expected.dtype
+    np.testing.assert_array_equal(actual.view(np.uint16), expected.view(np.uint16))
+    if kind == "gated" and values.size:
+        unrounded = (normalized * weight.astype(np.float32) * silu).astype(dtype.numpy())
+        assert np.any(unrounded.view(np.uint16) != expected.view(np.uint16))
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_fish_source_offset_norm_keeps_fp32_residual_and_low_dtype_weight(dtype):
+    norm = _FishSourceOffsetNorm(32)
+    _cast_module_dtype(norm, dtype)
+    weight = np.full(32, 0.0004, dtype=dtype.numpy())
+    norm.weight = nn.Parameter([32], data=ir.tensor(weight))
+    graph, builder = _make_graph("residual_norm")
+    x = builder.input("x", ir.DataType.FLOAT, ["rows", 32])
+    y = norm(builder.op, x)
+    y.type = ir.TensorType(ir.DataType.FLOAT)
+    builder.add_output(y, "y")
+    session = OnnxModelSession(ir.Model(graph, ir_version=11), intra_op_num_threads=1)
+    try:
+        actual = session.run({"x": np.full((3, 32), 120_000, dtype=np.float32)})["y"]
+    finally:
+        session.close()
+    assert actual.dtype == np.float32
+    expected = np.broadcast_to(1 + weight.astype(np.float32), (3, 32))
+    np.testing.assert_allclose(actual, expected, rtol=2e-7)
+    assert np.isfinite(actual).all()
 
 
 @pytest.mark.parametrize(
@@ -281,6 +393,18 @@ def test_fish_omni_build(dtype):
     ]
     assert rotary_caches
     assert all(value.dtype == ir.DataType.FLOAT for value in rotary_caches)
+    for model in (decoder, tower):
+        norms = [node for node in model.graph if node.op_type == "RMSNormalization"]
+        if dtype == ir.DataType.FLOAT:
+            assert norms
+        else:
+            assert not norms
+            assert any(node.op_type == "Pad" for node in model.graph)
+            assert any(node.op_type == "Pow" for node in model.graph)
+            assert not any("Ordered" in node.op_type for node in model.graph)
+            assert model.metadata_props["mobius.precision_validation"].startswith(
+                "unqualified"
+            )
 
 
 def test_fish_omni_registry_config_resolution():

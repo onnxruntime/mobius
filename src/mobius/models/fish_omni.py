@@ -7,6 +7,10 @@ Replicates Fish Speech's FishOmniBackbone and FishOmniAudioDecoder. Graphs
 consume token/code frames rather than waveforms. The task attaches ONNX sampling
 policies; the waveform codec is exported independently by mobius.tasks.fish_codec.
 The caller still formats prompts and orchestrates temporal decoding.
+
+Reduced-precision qualification graphs use portable source-ordered row
+reductions for offset/gated RMS norms. FP32 norms retain their existing graph;
+these scoped substitutions do not open public reduced-precision admission.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from mobius.components import (
     create_attention_bias,
     float32_silu,
     initialize_rope,
+    ordered_row_reduce,
 )
 from mobius.components._attention import _apply_attention
 from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
@@ -55,6 +60,10 @@ def _fish_linear_class(config):
     # Keep the qualified FP32 projection selection. Reduced-precision source
     # projections require output-major GEMM rather than folded MatMul.
     return Linear if config.dtype == ir.DataType.FLOAT else OutputMajorLinear
+
+
+def _fish_offset_norm_class(config):
+    return OffsetRMSNorm if config.dtype == ir.DataType.FLOAT else _FishSourceOffsetNorm
 
 
 def _float32_rope(config: ArchitectureConfig) -> nn.Module:
@@ -148,12 +157,61 @@ class _FishGatedNorm(PostGatedRMSNorm):
         return op.CastLike(gated, hidden_states)
 
 
+def _source_normalized(op, hidden_states, width, epsilon):
+    wide = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+    variance = ordered_row_reduce(op, op.Mul(wide, wide), width, normalize=True)
+    inverse = op.Pow(op.Add(variance, epsilon), -0.5)
+    return op.Mul(wide, inverse)
+
+
+class _FishSourceOffsetNorm(OffsetRMSNorm):
+    """Source-ordered variance; FP32 offset and scale before the final cast."""
+
+    def forward(self, op, hidden_states):
+        normalized = _source_normalized(
+            op, hidden_states, int(self.weight.shape[0]), self.variance_epsilon
+        )
+        gamma = op.Add(op.Cast(self.weight, to=ir.DataType.FLOAT), 1.0)
+        result = op.CastLike(op.Mul(normalized, gamma), hidden_states)
+        result.shape = hidden_states.shape
+        return result
+
+
+class _FishSourceGatedNorm(_FishGatedNorm):
+    """Source-ordered variance with separate activation and learned-scale rounding."""
+
+    def forward(self, op, hidden_states, gate):
+        normalized = _source_normalized(
+            op, hidden_states, self.hidden_size, self.variance_epsilon
+        )
+        rounded = op.CastLike(normalized, hidden_states)
+        # A low-dtype product is exact in FP32 before narrowing. Spell out
+        # that boundary: CPU lacks BF16 Mul, and FP16 promotion can erase it.
+        scaled = op.CastLike(
+            op.Mul(
+                op.Cast(rounded, to=ir.DataType.FLOAT),
+                op.Cast(self.weight, to=ir.DataType.FLOAT),
+            ),
+            hidden_states,
+        )
+        result = op.CastLike(
+            op.Mul(op.Cast(scaled, to=ir.DataType.FLOAT), float32_silu(op, gate)),
+            hidden_states,
+        )
+        result.shape = hidden_states.shape
+        return result
+
+
 class _FishAttention(Qwen35Attention):
     """Gated GQA with FP32 partial rotation before rounding Q/K back."""
 
     def __init__(self, config):
         super().__init__(config, linear_class=_fish_linear_class(config))
         self._compute_dtype = config.dtype
+        if config.dtype != ir.DataType.FLOAT:
+            norm = _fish_offset_norm_class(config)
+            self.q_norm = norm(config.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = norm(config.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self, op, hidden_states, attention_bias, position_embeddings, past_key_value=None
@@ -503,10 +561,17 @@ class _FishDecoderLayer(Qwen35MoEDecoderLayer):
         super().__init__(config, layer_idx)
         self._compute_dtype = config.dtype
         self.mlp = _FishMoEBlock(config)
+        if config.dtype != ir.DataType.FLOAT:
+            norm = _fish_offset_norm_class(config)
+            self.input_layernorm = norm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = norm(config.hidden_size, eps=config.rms_norm_eps)
         if self.layer_type == "linear_attention":
             if config.dtype != ir.DataType.FLOAT:
                 self.linear_attn = Qwen35GatedDeltaNet(config, linear_class=OutputMajorLinear)
-            self.linear_attn.norm = _FishGatedNorm(
+            gated_norm = (
+                _FishGatedNorm if config.dtype == ir.DataType.FLOAT else _FishSourceGatedNorm
+            )
+            self.linear_attn.norm = gated_norm(
                 config.linear_value_head_dim,
                 eps=config.rms_norm_eps,
             )
@@ -543,6 +608,10 @@ class _FishTextModel(Qwen35MoETextModel):
             [_FishDecoderLayer(config, index) for index in range(config.num_hidden_layers)]
         )
         self.rotary_emb = _float32_rope(config)
+        if config.dtype != ir.DataType.FLOAT:
+            self.norm = _fish_offset_norm_class(config)(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
 
 
 class FishOmniBackbone(nn.Module):
@@ -628,8 +697,9 @@ class _TowerAttention(nn.Module):
         self.wo = linear(self.q_width, config.hidden_size, bias=False)
         # Released configs say attention_qk_norm=False, but the trained tower
         # always uses zero-centered per-head Q/K norms (Fish Speech TowerAttention).
-        self.q_norm = OffsetRMSNorm(config.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = OffsetRMSNorm(config.head_dim, eps=config.rms_norm_eps)
+        norm = _fish_offset_norm_class(config)
+        self.q_norm = norm(config.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = norm(config.head_dim, eps=config.rms_norm_eps)
 
     def forward(self, op, hidden, bias, positions, past):
         cfg = self.config
@@ -720,8 +790,9 @@ class _TowerTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attention = _TowerAttention(config)
-        self.attention_norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn_norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        norm = _fish_offset_norm_class(config)
+        self.attention_norm = norm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = norm(config.hidden_size, eps=config.rms_norm_eps)
         self.feed_forward = _TowerMLP(config)
         self._compute_dtype = config.dtype
 
@@ -749,13 +820,14 @@ class _TowerLayer(nn.Module):
             self.semantic_embedding = Embedding(config.vocab_size, config.hidden_size)
         else:
             self.codebook_embedding = Embedding(config.vocab_size, config.hidden_size)
-        self.enorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        norm = _fish_offset_norm_class(config)
+        self.enorm = norm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = norm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = _fish_linear_class(config)(
             2 * config.hidden_size, config.hidden_size, bias=False
         )
         self.transformer_layer = _TowerTransformer(config)
-        self.final_layernorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_layernorm = norm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, op, hidden, codes, semantic, bias, positions, past, shared_input=None):
         table = self.semantic_embedding if self.shared else self.codebook_embedding
