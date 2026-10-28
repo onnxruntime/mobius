@@ -9,6 +9,7 @@ import copy
 import json
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import ml_dtypes
 import numpy as np
@@ -293,6 +294,27 @@ def test_reference_accepts_the_pinned_torch_release(version):
 def test_reference_rejects_a_different_torch_release(version):
     with pytest.raises(RuntimeError, match=r"requires torch==2\.8\.0"):
         validate_drama3.validate_reference_torch_version(version)
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+def test_reference_rejects_nonfinite_outputs(value, monkeypatch):
+    tensor = Mock()
+    tensor.detach.return_value.float.return_value.cpu.return_value.numpy.return_value = (
+        np.array([value], np.float32)
+    )
+    monkeypatch.setattr(validate_drama3, "DTYPE", "f16")
+    with pytest.raises(FloatingPointError, match=r"nonfinite decoder\.logits in f16"):
+        validate_drama3.reference_array(tensor, name="decoder.logits")
+
+
+@pytest.mark.parametrize("value", [[], [-1.0, 0.0, 1.0]])
+def test_reference_preserves_finite_outputs(value):
+    expected = np.array(value, np.float32)
+    tensor = Mock()
+    tensor.detach.return_value.float.return_value.cpu.return_value.numpy.return_value = (
+        expected
+    )
+    assert validate_drama3.reference_array(tensor, name="decoder.logits") is expected
 
 
 def test_reference_environment_changes_are_not_silently_compared(tmp_path, monkeypatch):

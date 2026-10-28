@@ -195,6 +195,17 @@ def validate_reference_torch_version(version: str) -> None:
         )
 
 
+def reference_array(tensor, *, name: str):
+    import numpy as np
+
+    value = tensor.detach().float().cpu().numpy()
+    if not np.isfinite(value).all():
+        raise FloatingPointError(
+            f"Pinned Fish Speech reference produced nonfinite {name} in {DTYPE} execution"
+        )
+    return value
+
+
 def reference(checkpoint, *, native_fp8=False):
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     os.environ["FISH_DRAMA3_FP8_EXPERTS"] = "1" if native_fp8 else "0"
@@ -231,9 +242,6 @@ def reference(checkpoint, *, native_fp8=False):
     original_prefill = tower.prefill
     original_decode = tower.decode_step
 
-    def array(tensor):
-        return tensor.detach().float().cpu().numpy()
-
     def embed(frames, text):
         output = original_embed(frames, text)
         unseen = tower.embedding_sum(
@@ -247,16 +255,18 @@ def reference(checkpoint, *, native_fp8=False):
         states.append(
             {
                 "input_frames": frames.detach().cpu().numpy(),
-                "inputs_embeds": array(output)[None],
-                "shared_input": array(unseen)[None],
+                "inputs_embeds": reference_array(output, name="embedding")[None],
+                "shared_input": reference_array(unseen, name="shared_input")[None],
             }
         )
         return output
 
     def forward(*args, **kwargs):
         hidden = original_forward(*args, **kwargs)
-        states[-1]["hidden_states"] = array(hidden)
-        states[-1]["logits"] = array(backbone.compute_logits(hidden))
+        states[-1]["hidden_states"] = reference_array(hidden, name="decoder.hidden_states")
+        states[-1]["logits"] = reference_array(
+            backbone.compute_logits(hidden), name="decoder.logits"
+        )
         states[-1]["position_ids"] = kwargs["input_pos"].cpu().numpy()[None]
         return hidden
 
@@ -275,7 +285,9 @@ def reference(checkpoint, *, native_fp8=False):
 
     def capture_head(head):
         def capture(_module, _inputs, output):
-            active_heads.append(array(head(output)))
+            active_heads.append(
+                reference_array(head(output), name=f"tower.head_{len(active_heads)}.logits")
+            )
 
         return capture
 
