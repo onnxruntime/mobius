@@ -186,12 +186,18 @@ The candidate is limited to batch-one short prefill and explicitly bypasses a
 failing symbolic-shape pass, so it is diagnostic, not a production export.
 Normal graph construction now succeeds with the existing constraint-propagation
 optimization in
-[justinchuby/onnx-shape-inference#135](https://github.com/justinchuby/onnx-shape-inference/pull/135).
+[onnx/onnx-shape-inference#135](https://github.com/onnx/onnx-shape-inference/pull/135).
 A normally built candidate reuses the unchanged external weights only after
 checking computation graphs, generated constants and initializer contracts;
 all 120 expert-boundary tensors reproduce the original prefill exactly.
-CUDA-library-aligned BF16 replay and the FP16 whole-model comparison remain
-pending. Source-ordered reductions
+FP16 tower inference additionally uses
+[corrected `GemmFloat8` geometry and output typing](https://github.com/onnx/onnx-shape-inference/commit/d915e3dc6490abf07081e873ff43d4baef81de97);
+the normal FP16 build completes without skipped shape passes and preserves all
+120 original expert-boundary tensors.
+On the CUDA 13 runtime, the complete native-FP8/FP16 candidate fails the same
+prefill gate in 16862 of 61440 values, with maximum error `1.158203125`.
+Its source replay reproduces all 20 reference states exactly. CUDA-library-aligned
+BF16 and FP16 comparisons remain pending. Source-ordered reductions
 and [a CUDA reciprocal-square-root fast path](https://github.com/microsoft/onnxruntime/pull/33662)
 give bit-exact normalization on real first-layer inputs; source-layout `Gemm`
 also matches all five isolated DeltaNet projections exactly. An artifact-only
