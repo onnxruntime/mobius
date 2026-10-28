@@ -136,6 +136,9 @@ the validator checks the Torch version before loading the model. New references
 record Torch, CUDA and Triton versions, and comparisons check that metadata when
 both goldens include it. Reference collection checks embeddings, hidden states
 and logits for finite values before writing a golden.
+Reference collection defaults to 20 frames. Use `reference --max-new-tokens 100`
+with a separate `--work-dir` for longer runs without replacing an earlier oracle;
+the requested limit is passed to the source generator and recorded in its golden.
 Earlier Torch 2.10 diagnostics are retained separately:
 CUDA reduction order differs between these releases. The committed token golden
 has been regenerated with Torch 2.8.0+cu126 / Triton 3.4.0; all 20 frame IDs are
@@ -524,6 +527,11 @@ measured on the deployment GPU rather than assumed universally faster.
 The report separates initialization, prefill, first code frame, steady
 frames/second, p50/p95 frame latency and waveform decoding. End-to-end RTF includes
 prefill, generation and waveform decoding relative to actual audio duration.
+`frame_ms` retains every measured frame latency, including the first; steady
+statistics exclude that first frame. `--cudnn-conv-algo-search` selects
+`EXHAUSTIVE` (the unchanged default), `HEURISTIC` or `DEFAULT` for CUDA sessions
+and records the selection. Recheck numerical parity when changing this option:
+different convolution algorithms can change floating-point results.
 The codec is full-sequence: **first-code-frame latency is not streaming
 time-to-audio**. Omit `--codec` only for a token-pipeline diagnostic; such a run
 does not attest full speech performance.

@@ -72,7 +72,10 @@ class BoundSession:
         profile=False,
         profile_directory=None,
         cudnn_conv1d_pad_to_nc1d=False,
+        cudnn_conv_algo_search="EXHAUSTIVE",
     ):
+        if cudnn_conv_algo_search not in ("EXHAUSTIVE", "HEURISTIC", "DEFAULT"):
+            raise ValueError(f"Unknown cuDNN convolution search: {cudnn_conv_algo_search!r}")
         options = ort.SessionOptions()
         options.intra_op_num_threads = 8
         options.inter_op_num_threads = 1
@@ -95,6 +98,7 @@ class BoundSession:
                         "use_tf32": "0",
                         "arena_extend_strategy": "kSameAsRequested",
                         "cudnn_conv1d_pad_to_nc1d": str(int(cudnn_conv1d_pad_to_nc1d)),
+                        "cudnn_conv_algo_search": cudnn_conv_algo_search,
                     },
                 ),
                 "CPUExecutionProvider",
@@ -236,6 +240,7 @@ def greedy_model(config, dtype):
 
 
 def benchmark(args):
+    conv_algo_search = getattr(args, "cudnn_conv_algo_search", "EXHAUSTIVE")
     if args.frames < 2 or args.warmup < 1:
         raise ValueError("Use at least two measured frames and one warmup request")
     if args.device == "cpu" and "cuda" in (args.embedding_device, args.codec_device):
@@ -268,6 +273,7 @@ def benchmark(args):
         "device_id": args.device_id,
         "profile": args.profile,
         "profile_directory": args.output.parent / "drama3-profiles",
+        "cudnn_conv_algo_search": conv_algo_search,
     }
     sessions = {
         name: BoundSession(
@@ -551,6 +557,7 @@ def benchmark(args):
                     "device_id": args.device_id,
                     "use_tf32": "0",
                     "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": conv_algo_search,
                 }
                 if args.device == "cuda"
                 else {}
@@ -591,6 +598,7 @@ def benchmark(args):
             "steady_frames_per_second": len(steady) / sum(steady) if steady else None,
             "p50_frame_ms": statistics.median(steady) * 1000 if steady else None,
             "p95_frame_ms": float(np.percentile(steady, 95)) * 1000 if steady else None,
+            "frame_ms": [seconds * 1000 for seconds in durations],
             "token_pipeline_rtf": elapsed / audio_seconds,
             "waveform_seconds": waveform_seconds,
             "time_to_waveform_seconds": elapsed + waveform_seconds
@@ -652,6 +660,12 @@ def parser():
         help="Use cuDNN's alternative 1-D codec layout; measure on the target GPU",
     )
     result.add_argument("--device-id", type=int, default=0)
+    result.add_argument(
+        "--cudnn-conv-algo-search",
+        choices=("EXHAUSTIVE", "HEURISTIC", "DEFAULT"),
+        default="EXHAUSTIVE",
+        help="cuDNN convolution search for CUDA sessions (default: EXHAUSTIVE)",
+    )
     result.add_argument("--frames", type=int, default=100)
     result.add_argument("--warmup", type=int, default=2)
     result.add_argument("--sample", action="store_true")
