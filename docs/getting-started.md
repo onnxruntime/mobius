@@ -152,13 +152,21 @@ propagates into the tower.
 Identical real BF16 expert-matmul operands isolate one cached discrepancy to
 the CUDA library version: cuBLAS 12.6.4 matches the Torch 2.8+cu126 reference
 exactly, while cuBLAS 13.6.0 changes three output values. Algorithm and workspace
-controls reproduce the same distinction. A separate CUDA 12.6 runtime is being
-built for model replay; merely matching the ORT version does not match the
-loaded cuBLAS implementation.
+controls reproduce the same distinction. A separately built CUDA 12.6 runtime
+now reproduces all three unchanged ORT matmul forms and four direct cuBLAS
+controls exactly. Its source is `dceae081a48ac45b32af785b057c0a30b8aa6856`, wheel
+SHA256 `9baea5c2f5e300c39b903fb99364917a861aef291c90583360003d04c82589b5`.
+QMoE, XOR, Pow, full-head Flash and Log1p operator gates pass on that runtime;
+whole-model reduced-precision gates still fail. Matching the ORT version alone
+does not match the loaded cuBLAS implementation.
 
 Recurrent state, nonlinear opmath and RoPE remain FP32. Masks are preserved
-when padding is present; redundant causal masks are omitted on unpadded
-reduced-precision attention to enable the source-compatible fused CUDA path.
+when padding is present. The unpadded reduced-precision prototype omits redundant
+causal masks to enable Flash. Profiling the actual pinned backbone instead shows
+CUTLASS memory-efficient attention with its explicit BOOL causal mask. A separate
+native MEA prototype retains that mask and matches the actual source attention
+fixture bit-for-bit; a forced-Flash operator comparison is not source-backend
+qualification.
 ORT 1.28's native BF16 `CausalConvWithState` fallback also does not initialize
 on CUDA; qualification prototypes use standard-ONNX expansion for this dtype.
 
@@ -197,13 +205,23 @@ the normal FP16 build completes without skipped shape passes and preserves all
 On the CUDA 13 runtime, the complete native-FP8/FP16 candidate fails the same
 prefill gate in 16862 of 61440 values, with maximum error `1.158203125`.
 Its source replay reproduces all 20 reference states exactly. CUDA-library-aligned
-BF16 and FP16 comparisons remain pending. Source-ordered reductions
+original/normal/Log1p variants also fail their unchanged prefill gates; matching
+the numerical libraries does not by itself qualify native models.
+Source-ordered reductions
 and [a CUDA reciprocal-square-root fast path](https://github.com/microsoft/onnxruntime/pull/33662)
 give bit-exact normalization on real first-layer inputs; source-layout `Gemm`
 also matches all five isolated DeltaNet projections exactly. An artifact-only
 cached recurrence matches source output and state bitwise for zero/nonzero
-cache inputs. Remaining prefix work concerns softplus, CPU-folded learned
-exponentials and chunked triangular solves.
+cache inputs. Native unit-lower triangular solves now remove the first prefix
+discrepancy: the first expert inputs and logits are bit-exact for both dtypes.
+With source-output controls for the experts, runtime CUDA RoPE, native triangular
+solves and source MEA reproduce all 80 prefill expert-input/logit vectors and the
+final hidden tensor exactly. This is diagnostic isolation, never whole-model
+qualification. The remaining earliest difference is inside QMoE: matching the
+source sigmoid sequence corrects 301 activation-scale discrepancies, while
+down-projection accumulation is still under investigation. The captured Triton
+down kernel uses register-local FP8-to-FP16 conversion and FP16 MMA; that source
+compute mode is distinct from native FP8 MMA and must be reported as such.
 
 Stable `Log(Add(x, 1))` fusion is implemented for CUDA and native WebGPU in
 [this independent ORT change](https://github.com/microsoft/onnxruntime/commit/3c0638c4c402900e42d1a9a0f6ee8d9ea7015460).
