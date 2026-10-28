@@ -19,6 +19,7 @@ import dataclasses
 import math
 from typing import ClassVar
 
+import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
@@ -35,12 +36,15 @@ from mobius.components import (
     Qwen35Attention,
     SoftmaxTopKGate,
     apply_rotary_pos_emb,
+    chunk_gated_delta_rule,
     create_attention_bias,
     float32_silu,
     initialize_rope,
     ordered_row_reduce,
+    recurrent_gated_delta_rule,
 )
 from mobius.components._attention import _apply_attention
+from mobius.components._gated_deltanet import _DepthwiseConv1d
 from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
 from mobius.generation._fish_omni import (
     FishAudioSamplingInputs,
@@ -200,6 +204,131 @@ class _FishSourceGatedNorm(_FishGatedNorm):
         )
         result.shape = hidden_states.shape
         return result
+
+
+class _FishSourceConv(_DepthwiseConv1d):
+    """Unpadded depthwise convolution; the cache contains only real joined history."""
+
+    def __init__(self, channels, kernel_size):
+        super().__init__(channels, kernel_size)
+        self._history = kernel_size - 1
+
+    def forward(self, op, input_val, conv_state):
+        joined = op.Concat(conv_state, input_val, axis=-1)
+        convolved = op.Conv(joined, self.weight, group=self._channels)
+        output = op.CastLike(float32_silu(op, convolved), input_val)
+        present = (
+            op.Slice(joined, [-self._history], [np.iinfo(np.int64).max], [2])
+            if self._history
+            else op.Slice(joined, [0], [0], [2])
+        )
+        return output, present
+
+
+class _FishSourceGatedDeltaNet(Qwen35GatedDeltaNet):
+    """Source-layout GDN with explicit sequence reset and chunk/recurrent dispatch.
+
+    The portable solve does not reproduce cuBLAS bits. This qualification
+    implementation leaves production reduced-precision admission closed.
+    """
+
+    def __init__(self, config):
+        super().__init__(config, linear_class=OutputMajorLinear)
+        assert self.head_v_dim is not None
+        if (
+            self.num_k_heads is None
+            or self.num_k_heads < 1
+            or self.num_v_heads is None
+            or self.num_v_heads < 1
+            or self.num_v_heads % self.num_k_heads != 0
+        ):
+            raise ValueError(
+                "Source GDN requires value heads to be a positive multiple of key heads"
+            )
+        self.conv1d = _FishSourceConv(self.conv_dim, self.conv_kernel_size)
+        self.norm = _FishSourceGatedNorm(self.head_v_dim, eps=config.rms_norm_eps)
+
+    def forward(self, op, hidden_states, conv_state, recurrent_state, continue_state):
+        assert self.num_v_heads is not None and self.num_k_heads is not None
+        batch = op.Shape(hidden_states, start=0, end=1)
+        length = op.Shape(hidden_states, start=1, end=2)
+        # Where, rather than multiplication by zero, ignores stale NaN/Inf too.
+        conv_state = op.Where(
+            continue_state,
+            conv_state,
+            op.Expand(op.CastLike(0.0, conv_state), op.Shape(conv_state)),
+        )
+        recurrent_state = op.Where(
+            continue_state, recurrent_state, op.Expand(0.0, op.Shape(recurrent_state))
+        )
+        mixed = op.Transpose(self.in_proj_qkv(op, hidden_states), perm=[0, 2, 1])
+        mixed, present_conv = self.conv1d(op, mixed, conv_state)
+        query, key, value = op.Split(
+            op.Transpose(mixed, perm=[0, 2, 1]),
+            [self.key_dim, self.key_dim, self.value_dim],
+            axis=-1,
+            _outputs=3,
+        )
+        q_shape = op.Concat(batch, length, [self.num_k_heads, self.head_k_dim], axis=0)
+        v_shape = op.Concat(batch, length, [self.num_v_heads, self.head_v_dim], axis=0)
+        query, key = [op.Reshape(x, q_shape) for x in (query, key)]
+        if self.num_v_heads != self.num_k_heads:
+            groups = self.num_v_heads // self.num_k_heads
+            indices = np.repeat(np.arange(self.num_k_heads, dtype=np.int64), groups)
+            repeats = op.Constant(value=ir.tensor(indices))
+            query, key = [op.Gather(x, repeats, axis=2) for x in (query, key)]
+        value = op.Reshape(value, v_shape)
+        beta_input = op.Cast(self.in_proj_b(op, hidden_states), to=ir.DataType.FLOAT)
+        beta = op.Div(1.0, op.Add(1.0, op.Exp(op.Neg(beta_input))))
+        alpha = op.Add(
+            op.Cast(self.in_proj_a(op, hidden_states), to=ir.DataType.FLOAT),
+            op.Cast(self.dt_bias, to=ir.DataType.FLOAT),
+        )
+        # Torch softplus's threshold-20 branch is explicit. The portable
+        # Softplus kernel is mathematical evidence, not native Log1p bit parity.
+        softplus = op.Where(op.Greater(alpha, 20.0), alpha, op.Softplus(alpha))
+        # A runtime-dependent shape prevents CPU folding of learned Exp from
+        # replacing the source device's rounding in later native qualification.
+        expanded_log = op.Expand(
+            op.Cast(self.A_log, to=ir.DataType.FLOAT),
+            op.Concat(batch, length, [self.num_v_heads], axis=0),
+        )
+        decay = op.Mul(op.Neg(op.Exp(expanded_log)), softplus)
+        branches = []
+        for name, rule in (
+            ("source_recurrent", recurrent_gated_delta_rule),
+            ("source_chunks", chunk_gated_delta_rule),
+        ):
+
+            def body(branch_op, rule=rule):
+                dimensions = dict(key_width=self.head_k_dim, value_width=self.head_v_dim)
+                if rule is chunk_gated_delta_rule:
+                    dimensions["heads"] = self.num_v_heads
+                return rule(
+                    branch_op, query, key, value, decay, beta, recurrent_state, **dimensions
+                )
+
+            op.builder.push_module(name)
+            branch = op.builder.subgraph(
+                body,
+                inputs=[],
+                outputs=[
+                    ir.Value(name=name + "_output", type=ir.TensorType(ir.DataType.FLOAT)),
+                    ir.Value(name=name + "_state", type=ir.TensorType(ir.DataType.FLOAT)),
+                ],
+                name=name,
+            )
+            op.builder.pop_module()
+            branches.append(branch)
+        recurrent = op.And(continue_state, op.Equal(op.Squeeze(length, [0]), 1))
+        core, present_state = op.If(
+            recurrent, then_branch=branches[0], else_branch=branches[1], _outputs=2
+        )
+        core = op.Reshape(op.CastLike(core, hidden_states), [-1, self.head_v_dim])
+        gate = op.Reshape(self.in_proj_z(op, hidden_states), [-1, self.head_v_dim])
+        normalized = self.norm(op, core, gate)
+        output = op.Reshape(normalized, op.Concat(batch, length, [self.value_dim], axis=0))
+        return self.out_proj(op, output), present_conv, present_state
 
 
 class _FishAttention(Qwen35Attention):
@@ -567,7 +696,7 @@ class _FishDecoderLayer(Qwen35MoEDecoderLayer):
             self.post_attention_layernorm = norm(config.hidden_size, eps=config.rms_norm_eps)
         if self.layer_type == "linear_attention":
             if config.dtype != ir.DataType.FLOAT:
-                self.linear_attn = Qwen35GatedDeltaNet(config, linear_class=OutputMajorLinear)
+                self.linear_attn = _FishSourceGatedDeltaNet(config)
             gated_norm = (
                 _FishGatedNorm if config.dtype == ir.DataType.FLOAT else _FishSourceGatedNorm
             )
@@ -578,27 +707,43 @@ class _FishDecoderLayer(Qwen35MoEDecoderLayer):
         else:
             self.self_attn = _FishAttention(config)
 
-    def forward(self, op, hidden_states, attention_bias, position_embeddings, past_key_value):
-        if self._compute_dtype != ir.DataType.FLOAT16:
+    def forward(
+        self,
+        op,
+        hidden_states,
+        attention_bias,
+        position_embeddings,
+        past_key_value,
+        continue_state=None,
+    ):
+        if self._compute_dtype == ir.DataType.FLOAT:
             return super().forward(
                 op, hidden_states, attention_bias, position_embeddings, past_key_value
             )
-        # Native FP16 uses FP32 residuals, but both mixers consume rounded FP16 norms.
-        residual = op.Cast(hidden_states, to=ir.DataType.FLOAT)
-        normed = op.Cast(self.input_layernorm(op, residual), to=ir.DataType.FLOAT16)
+        if continue_state is None:
+            raise ValueError(
+                "Source Fish layers require explicit position-derived continuation"
+            )
+        # FP16 uses FP32 residuals; BF16 keeps the source's BF16 residual boundary.
+        residual = (
+            op.Cast(hidden_states, to=ir.DataType.FLOAT)
+            if self._compute_dtype == ir.DataType.FLOAT16
+            else hidden_states
+        )
+        normed = op.Cast(self.input_layernorm(op, residual), to=self._compute_dtype)
         if self.layer_type == "linear_attention":
             attended, conv, state = self.linear_attn(
-                op, normed, past_key_value[0], past_key_value[1]
+                op, normed, past_key_value[0], past_key_value[1], continue_state
             )
             present = (conv, state)
         else:
             attended, present = self.self_attn(
                 op, normed, attention_bias, position_embeddings, past_key_value
             )
-        residual = op.Add(residual, op.Cast(attended, to=ir.DataType.FLOAT))
-        normed = op.Cast(self.post_attention_layernorm(op, residual), to=ir.DataType.FLOAT16)
+        residual = op.Add(residual, op.CastLike(attended, residual))
+        normed = op.Cast(self.post_attention_layernorm(op, residual), to=self._compute_dtype)
         output = self.mlp(op, normed)
-        return op.Add(residual, op.Cast(output, to=ir.DataType.FLOAT)), present
+        return op.Add(residual, op.CastLike(output, residual)), present
 
 
 class _FishTextModel(Qwen35MoETextModel):
@@ -612,6 +757,55 @@ class _FishTextModel(Qwen35MoETextModel):
             self.norm = _fish_offset_norm_class(config)(
                 config.hidden_size, eps=config.rms_norm_eps
             )
+
+    def forward(
+        self,
+        op,
+        input_ids,
+        attention_mask,
+        position_ids,
+        past_key_values=None,
+        inputs_embeds=None,
+        deepstack_embeds=None,
+    ):
+        if self._dtype == ir.DataType.FLOAT:
+            return super().forward(
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values,
+                inputs_embeds,
+                deepstack_embeds,
+            )
+        if past_key_values is None or len(past_key_values) != len(self.layers):
+            raise ValueError(
+                "Source Fish decoder requires one explicit dynamic cache per layer"
+            )
+        hidden = (
+            inputs_embeds if inputs_embeds is not None else self.embed_tokens(op, input_ids)
+        )
+        assert self.rotary_emb is not None
+        positions = self.rotary_emb(op, position_ids)
+        bias = create_attention_bias(
+            op,
+            input_ids=hidden if input_ids is None else input_ids,
+            attention_mask=attention_mask,
+            dtype=self._dtype,
+        )
+        # Qualified callers validate shared contiguous [B,T] rows and
+        # past KV length == position_ids[0,0]. No mixed/static cache claim.
+        first = op.Gather(op.Gather(position_ids, 0, axis=0), 0, axis=0)
+        continuing = op.Greater(first, 0)
+        present = []
+        for index, (layer, cache) in enumerate(zip(self.layers, past_key_values)):
+            hidden, current = layer(
+                op, hidden, bias, positions, cache, continue_state=continuing
+            )
+            present.append(current)
+            if deepstack_embeds is not None and index < len(deepstack_embeds):
+                hidden = op.Add(hidden, deepstack_embeds[index])
+        return self.norm(op, hidden), present
 
 
 class FishOmniBackbone(nn.Module):

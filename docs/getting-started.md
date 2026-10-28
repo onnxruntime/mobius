@@ -130,6 +130,55 @@ prototype implements FP32 residual streams, native FP16-input/FP32-output
 weight casts. Checkpoint storage is unchanged; other adapters retain their
 conversion behavior unless they opt into FP16 saturation.
 
+Reduced-precision qualification graphs now use a scoped source-structured GDN:
+head expansion precedes FP32 Q/K normalization, convolution retains only real
+joined history, and the portable chunk core uses 64-token chunks with a
+standard-ONNX unit-lower forward substitution. Its reduction and prefix
+association are explicit; the portable solve and Softplus do **not** promise
+cuBLAS/Log1p bit parity. No custom ordered-reduction or triangular-solve runtime
+is required by this portable graph. FP32 graphs and public precision guards are
+unchanged.
+
+The internal continuation signal comes from `position_ids[0,0] > 0`, not from
+sequence length or cache values. Position zero ignores **both** incoming GDN
+carries, even when nonzero. Only continuing `T=1` calls use recurrence; initial
+`T=1` and all multi-token calls use chunks. No new graph ports are added.
+Qualification decoders declare
+`mobius.fish_omni.context_contract=shared-contiguous-dynamic-v1`: every batch row
+must share contiguous nonnegative positions, masks must be unpadded, and all
+dynamic KV lengths must equal the first position (empty KV at zero). The
+validation and bound benchmark drivers reject violations before execution;
+the graph itself does not validate this metadata contract. Mixed-row positions,
+static-capacity KV, and CUDA graph capture are not qualified.
+
+For private reduced **component** evidence, run
+`scripts/collect_drama3_gdn_fixture.py --checkpoint <pinned-local-snapshot> --source-dir <pinned-source-directory> --output <new-private-directory>`
+in the Torch 2.8 CPU reference environment. It verifies the pinned source hash,
+invokes the unmodified upstream GDN, and records checkpoint/source and tensor
+provenance. It does not download assets or accept license terms: the Fish Audio
+checkpoint has a separate license, and trained slices must remain outside this
+MIT repository. Set `MOBIUS_DRAMA3_GDN_FIXTURE` to that directory and run
+`python -m pytest tests/integration/fish_omni_gdn_test.py`.
+The fixture uses layer 0, hidden columns/rows `0:32`, key head 0, value heads
+`0:2`, and full 128-wide heads, with trained embedding inputs. CPU comparisons
+cover FP32/FP16, B1/B2, initial/nonzero reset and cached T1/2/30/64/65/128/129/257,
+returned-cache reuse, and real-GDN text-position wiring. Separate synthetic H32
+tests cross the source prefix scheduler's `B*H*chunks > 32` boundary.
+CPU FP16 uses the unchanged `atol=rtol=1e-2` component gate; native-half GEMM
+association differs from the Torch CPU reference, so tiny outputs can have
+relative drift despite passing the absolute gate.
+This is not full-checkpoint, whole-model B2/T257, BF16 CUDA, or native-runtime
+qualification. Final full-pipeline vector acceptance must use the exact chosen
+`ORT_ENABLE_ALL`, provider-option and library profile before performance
+admission; an EXTENDED audit plus an ALL frame hash is not equivalent.
+The earlier custom CUDA 12.6 wheel below is private diagnostic evidence, not
+a supported deployment recommendation. Current
+[official ORT CUDA package policy](https://github.com/microsoft/onnxruntime/blob/e3d000e3fe1b113c4153e6250dd605c2d03da3f0/docs/execution-providers/CUDA-ExecutionProvider.md#L30-L56)
+requires CUDA 12.8+ for CUDA 12 packages and defaults to CUDA 13 from ORT 1.27.
+The active runtime acceptance target is **exactly CUDA 13.0**, with a separately
+pinned reference; CUDA 12.8 is not an acceptance target and CUDA 13.3 is only
+supplementary. Retain the earlier CUDA 12.6 oracles and failures unchanged.
+
 The pinned Fish Speech source declares `torch==2.8.0`. Run
 `scripts/validate_drama3.py reference` in a separate environment with that release;
 the validator checks the Torch version before loading the model. New references
