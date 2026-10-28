@@ -120,32 +120,31 @@ The official model ID defaults to this pinned revision; explicit revisions and
 local checkpoint directories are honored. The 35B checkpoint stores BF16
 weights and block-scaled FP8 experts. `--dequantize` is required: conversion
 streams parameters lazily into dense FP32 external data; `max_workers=1` bounds
-serialization to one parameter at a time. Native
-`bsgemm-moe` execution is **not** claimed. Plan for roughly 144 GB of dense FP32
+serialization to one parameter at a time. Plan for roughly 144 GB of dense FP32
 weights, plus the source checkpoint and runtime allocations. FP16 and BF16
-production exports remain **explicitly disabled**. Test-only qualification
-prototypes pass synthetic full-logit parity at `1e-2` and 20 exact cached greedy
-frames, but stricter pinned real-weight probes exposed remaining production-size
-rounding differences. Full-checkpoint reduced-precision validation is pending.
-The FP16 qualification
+production exports remain disabled while real-weight qualification continues.
+Test-only prototypes pass synthetic full-logit parity at `1e-2` and 20 exact
+cached greedy frames. The FP16
 prototype implements FP32 residual streams, native FP16-input/FP32-output
 `GemmFloat8` tower down projections, and logged FP32 saturation before backbone
-weight casts. Overflow and synthetic-source tests pass, but the initial pinned
-real-weight, production-dimension reduced fixture exceeded the unchanged `1e-2`
-logit gate (FP16: 3 of 12288 prefill-tower values, maximum violating error `0.01171875`;
-BF16: 373 values, maximum violating error `0.0625`).
-Subsequent source-fed probes identified negative-tail sigmoid rounding and
-down-projection accumulation order. Explicit FP32 exponential/division sigmoid
-and output-major BF16 `Gemm` restore bit-exact reduced-fixture BF16 prefill
-and the first two cached calls, but the third cached call still fails
-(62 of 4096 values, maximum violating error `0.03125`). Its first divergence
-is a one-ULP FP32 RMS variance reduction difference before BF16 rounding.
-These are diagnostic improvements, not completed reduced-precision qualification.
-The updated FP16 fixture still fails prefill (7 of 12288 values, maximum
-violating error `0.0166015625`).
-That is a failed qualification, not permission to widen tolerances or advertise
-reduced-precision support. Checkpoint storage is never modified; other adapters retain their
-conversion behavior unless they explicitly opt into FP16 saturation.
+weight casts. Checkpoint storage is unchanged; other adapters retain their
+conversion behavior unless they opt into FP16 saturation.
+
+The pinned Fish Speech source declares `torch==2.8.0`. Run
+`scripts/validate_drama3.py reference` in a separate environment with that release;
+the validator checks the Torch version before loading the model. New references
+record Torch, CUDA and Triton versions, and comparisons check that metadata when
+both goldens include it. Earlier Torch 2.10 diagnostics are retained separately:
+CUDA reduction order differs between these releases.
+
+Fresh Torch 2.8 production-dimension, one-layer real-weight probes still exceed
+the `atol=rtol=1e-2` gate: FP16 prefill-tower output has 5 violations among 12288
+values (maximum violating error `0.01248169`); BF16 cached tower output has
+200 violations among 4096 values (maximum `0.125`). With identical source
+hidden-state inputs, the BF16 tower matches bit-for-bit through prefill and three
+cached calls. The remaining pipeline difference starts in the backbone and
+propagates into the tower.
+
 Recurrent state, nonlinear opmath and RoPE remain FP32. Masks are preserved
 when padding is present; redundant causal masks are omitted on unpadded
 reduced-precision attention to enable the source-compatible fused CUDA path.
@@ -158,17 +157,20 @@ The exporter prepares typed E4M3FN expert banks and unchanged multiplicative
 FP32 grids for `QMoE(activation_quantization="dynamic_fp8")`, without a
 dequantize-to-half proxy. Byte-preserving save/load and opt-in FP32/FP16/BF16
 expert-only parity against pinned Triton pass on the custom runtime
-(`MOBIUS_TEST_DRAMA3_NATIVE_FP8=1`). This is **not full-model low-dtype
-qualification**: production native-FP8 admission also remains closed. A complete
-native-FP8/FP32 probe fails the unchanged prefill hidden-state gate
+(`MOBIUS_TEST_DRAMA3_NATIVE_FP8=1`). Production native-FP8 admission remains closed.
+The earlier complete native-FP8/FP32 probe, using Torch 2.10, failed the prefill
+hidden-state gate
 (43436 of 61440 values, maximum absolute error `0.68518`), although all 40
 real expert layers pass when supplied identical source inputs and logits.
 The first expert input differs by only `1.192e-7`, but changes one FP8 code;
-those discontinuities amplify across subsequent layers. The independent source
-reference repeats bit-exactly. This is a pipeline qualification failure, not a
-reason to substitute weight-only FP8 or widen tolerances. The custom
-CUDA build needs `onnxruntime_USE_FP8_QMOE=ON`, SM89+, and the new mode; old
-weight-only FP8 is not an equivalent fallback. The runtime rejects more than
+those discontinuities amplify across subsequent layers. Qualification against
+the declared Torch 2.8 environment is in progress. Source-ordered reductions
+and [a CUDA reciprocal-square-root fast path](https://github.com/microsoft/onnxruntime/pull/33662)
+give bit-exact normalization on real first-layer inputs; source-layout `Gemm`
+also matches all five isolated DeltaNet projections exactly. The next differences
+are inside DeltaNet gating, normalization and recurrent arithmetic.
+The custom CUDA build needs `onnxruntime_USE_FP8_QMOE=ON`, SM89+, and dynamic
+activation quantization. The runtime rejects more than
 65,535 token/expert pairs per call (8,191 tokens at top-8); the graph records
 that limit and never silently falls back to dense expert conversion.
 
