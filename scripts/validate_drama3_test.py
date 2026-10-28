@@ -250,6 +250,12 @@ def test_committed_token_golden_is_pinned_and_complete():
     validate_reference_golden(golden)
     assert golden["revision"] == REVISION
     assert golden["source_revision"] == SOURCE_REVISION
+    assert golden["expert_execution"] == "dense"
+    assert golden["reference_environment"] == {
+        "torch": "2.8.0+cu126",
+        "torch_cuda": "12.6",
+        "triton": "3.4.0",
+    }
     assert golden["max_new_tokens"] == len(golden["generated_frames"]) == 20
     for frame in golden["generated_frames"]:
         assert len(frame) == 11
@@ -308,6 +314,7 @@ def test_reference_environment_preserves_matching_and_legacy_goldens(
     tmp_path, monkeypatch, record_committed, record_actual
 ):
     committed = json.loads(GOLDEN.read_text())
+    committed.pop("reference_environment", None)
     actual = copy.deepcopy(committed)
     environment = {"torch": "2.8.0+cu126", "torch_cuda": "12.6", "triton": "3.4.0"}
     if record_committed:
