@@ -27,6 +27,8 @@ from typing import Any
 
 import numpy as np
 import onnx_ir as ir
+from onnx_shape_inference import ShapeInferenceContext
+from onnx_shape_inference import registry as shape_registry
 from onnxscript import OpBuilder
 
 from mobius._build_context import ep_capabilities
@@ -111,8 +113,7 @@ def _unknown_dimension(dim: object) -> bool:
     return dim is None or (isinstance(dim, ir.SymbolicDim) and dim.value is None)
 
 
-def unit_lower_triangular_solve(op: OpBuilder, system: ir.Value, rhs: ir.Value) -> ir.Value:
-    """Emit the FLOAT, exact-prefix, no-broadcast provider boundary."""
+def _validate_unit_lower_inputs(system: ir.Value, rhs: ir.Value) -> ir.Shape:
     if system.shape is None or len(system.shape) < 2:
         raise ValueError("UnitLowerTriangularSolve requires rank >= 2")
     shape = _require_tensor(system, ir.DataType.FLOAT, len(system.shape))
@@ -124,9 +125,65 @@ def unit_lower_triangular_solve(op: OpBuilder, system: ir.Value, rhs: ir.Value) 
         or list(shape[:-1]) != list(other[:-1])
     ):
         raise ValueError("UnitLowerTriangularSolve requires square A and exact RHS prefix")
+    return other
+
+
+def unit_lower_triangular_solve(op: OpBuilder, system: ir.Value, rhs: ir.Value) -> ir.Value:
+    """Emit the FLOAT, exact-prefix, no-broadcast provider boundary."""
+    _validate_unit_lower_inputs(system, rhs)
     output = op.UnitLowerTriangularSolve(system, rhs, _domain="com.microsoft")
     output.type, output.shape = rhs.type, rhs.shape
     return output
+
+
+def _infer_unit_lower(ctx: ShapeInferenceContext, node: ir.Node) -> None:
+    if len(node.inputs) != 2 or any(value is None for value in node.inputs):
+        raise ValueError("UnitLowerTriangularSolve requires exactly two tensor inputs")
+    system, rhs = node.inputs
+    assert system is not None and rhs is not None
+    shape = _validate_unit_lower_inputs(system, rhs)
+    ctx.set_shape_and_dtype(node.outputs[0], shape=shape, dtype=ir.DataType.FLOAT)
+
+
+def _infer_causal_right(ctx: ShapeInferenceContext, node: ir.Node) -> None:
+    if len(node.inputs) != 3 or any(value is None for value in node.inputs):
+        raise ValueError("CausalRightAttention requires exactly three tensor inputs")
+    query, key, value = node.inputs
+    assert query is not None and key is not None and value is not None
+    dtype = query.dtype
+    if dtype not in (ir.DataType.FLOAT16, ir.DataType.BFLOAT16):
+        raise ValueError("CausalRightAttention requires F16/BF16")
+    q, k, v = [_require_tensor(x, dtype, 4) for x in (query, key, value)]
+    if (
+        any(shape[-1] != 256 for shape in (q, k, v))
+        or not _compatible_dimensions(k, v)
+        or not _compatible_dimensions(q[:2], k[:2])
+    ):
+        raise ValueError("CausalRightAttention requires matching [B,H,S/T,256] geometry")
+    for dim, maximum in ((q[0], 8), (q[1], 32), (q[2], 256), (k[2], 256)):
+        if isinstance(dim, int) and not 1 <= dim <= maximum:
+            raise ValueError("CausalRightAttention input exceeds native operator bounds")
+    if isinstance(q[2], int) and isinstance(k[2], int) and q[2] > k[2]:
+        raise ValueError("CausalRightAttention requires S <= T")
+    scale = node.attributes.get("scale")
+    if scale is None or not math.isfinite(scale.as_float()) or scale.as_float() <= 0:
+        raise ValueError("CausalRightAttention requires finite positive scale")
+    ctx.set_shape_and_dtype(node.outputs[0], shape=q, dtype=dtype)
+
+
+def _register_candidate_shape_inference() -> None:
+    # Use the dependency's documented extension API, not a pass replacement.
+    # Future native registrations take precedence over these builder boundaries.
+    shape_registry.collect()
+    for name, function in (
+        ("UnitLowerTriangularSolve", _infer_unit_lower),
+        ("CausalRightAttention", _infer_causal_right),
+    ):
+        if shape_registry.get("com.microsoft", name, 1) is None:
+            shape_registry.register("com.microsoft", name, since_version=1)(function)
+
+
+_register_candidate_shape_inference()
 
 
 def causal_right_attention(

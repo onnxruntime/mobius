@@ -54,6 +54,13 @@ An internal construction token represents the scoped model's unpadded contract.
 The adapter rejects arbitrary masks; it does not inspect node/value names or
 strip a supplied additive mask.
 
+The adapter registers these two native shape/type contracts using
+`onnx_shape_inference.registry`'s documented extension API when a native handler
+is absent. Attention returns Q's shape/type; the unit-lower solve returns B's
+shape/type after checking exact prefixes. This supplies missing builder
+inference without replacing a pass, suppressing a warning, or advertising a
+runtime capability. Existing dependency handlers take precedence.
+
 Before **every** execution the caller must validate shared contiguous nonnegative
 position rows, an all-one INT64 attention mask, dynamic KV append length equal to
 the position start, matching cache shapes/dtypes, and:

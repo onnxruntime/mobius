@@ -12,6 +12,7 @@ import json
 import numpy as np
 import onnx_ir as ir
 import pytest
+from onnx_shape_inference import ShapeInferenceContext, infer_symbolic_shapes
 from onnxscript import optimizer
 
 from mobius import build_from_module
@@ -26,6 +27,8 @@ from mobius.models._fish_omni_cuda13 import (
     Cuda13QualificationModel,
     Cuda13QualificationTask,
     _Cuda13Experts,
+    _infer_causal_right,
+    _infer_unit_lower,
     causal_right_attention,
     native_candidate_manifest,
     saved_native_candidate_manifest,
@@ -430,6 +433,74 @@ def test_native_solve_boundary(a, b, dtype, valid):
     assert output.shape == rhs.shape and output.dtype == rhs.dtype
     node = output.producer()
     assert node.op_type == "UnitLowerTriangularSolve" and not node.attributes
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_native_boundary_symbolic_inference_is_registered(dtype, caplog):
+    graph, builder, args = attention_graph(dtype=dtype, batch="batch", length="S", past="P")
+    output, _, _ = causal_right_attention(
+        builder.op,
+        *args,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        scale=0.0625,
+        dtype=dtype,
+    )
+    attention = next(n for n in graph if n.op_type == "CausalRightAttention")
+    builder_diagnostics = dict(attention.metadata_props)
+    attention.outputs[0].shape = attention.outputs[0].type = None
+    builder.add_output(output, "y")
+    model = _make_model(graph)
+    infer_symbolic_shapes(model, policy="strict")
+    assert attention.outputs[0].dtype == dtype
+    assert attention.outputs[0].shape == attention.inputs[0].shape
+    assert not any("No shape inference registered" in r.message for r in caplog.records)
+    assert dict(attention.metadata_props) == builder_diagnostics
+
+
+def test_native_solve_symbolic_inference_preserves_exact_rhs_contract(caplog):
+    graph, builder = _make_graph("native_solve_inference")
+    system = builder.input("a", ir.DataType.FLOAT, ["B", 32, "C", 64, 64])
+    rhs = builder.input("b", ir.DataType.FLOAT, ["B", 32, "C", 64, 128])
+    output = unit_lower_triangular_solve(builder.op, system, rhs)
+    builder_diagnostics = dict(output.producer().metadata_props)
+    output.shape = output.type = None
+    builder.add_output(output, "y")
+    infer_symbolic_shapes(_make_model(graph), policy="strict")
+    assert output.shape == rhs.shape and output.dtype == ir.DataType.FLOAT
+    assert not any("No shape inference registered" in r.message for r in caplog.records)
+    assert dict(output.producer().metadata_props) == builder_diagnostics
+
+
+@pytest.mark.parametrize("case", ["rhs_broadcast", "rhs_half", "causal_head", "causal_scale"])
+def test_registered_native_inference_rejects_invalid_contract(case):
+    _graph, builder = _make_graph("invalid_native_contract")
+    if case.startswith("rhs"):
+        a = builder.input("a", ir.DataType.FLOAT, [2, 64, 64])
+        b = builder.input("b", ir.DataType.FLOAT, [2, 64, 128])
+        output = builder.op.UnitLowerTriangularSolve(a, b, _domain="com.microsoft")
+        if case == "rhs_broadcast":
+            b.shape = ir.Shape([1, 64, 128])
+        else:
+            b.type = ir.TensorType(ir.DataType.FLOAT16)
+        function = _infer_unit_lower
+    else:
+        q = builder.input("q", ir.DataType.FLOAT16, [2, 4, 3, 256])
+        k = builder.input("k", ir.DataType.FLOAT16, [2, 4, 7, 256])
+        v = builder.input("v", ir.DataType.FLOAT16, [2, 4, 7, 256])
+        if case == "causal_head":
+            k.shape = v.shape = ir.Shape([2, 2, 7, 256])
+        output = builder.op.CausalRightAttention(
+            q,
+            k,
+            v,
+            scale=0.0 if case == "causal_scale" else 0.0625,
+            _domain="com.microsoft",
+        )
+        function = _infer_causal_right
+    context = ShapeInferenceContext({"": 24, "com.microsoft": 1}, policy="strict")
+    with pytest.raises(ValueError):
+        function(context, output.producer())
 
 
 @pytest.mark.parametrize(
