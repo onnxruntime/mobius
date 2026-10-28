@@ -38,6 +38,12 @@ DECODER_DEVICE = 2
 DTYPE = "f32"
 EXPERT_EXECUTION = "dense"
 DTYPE_NAMES = {"f32": "float32", "f16": "float16", "bf16": "bfloat16"}
+ORT_OPTIMIZATION_LEVELS = {
+    "disabled": "ORT_DISABLE_ALL",
+    "basic": "ORT_ENABLE_BASIC",
+    "extended": "ORT_ENABLE_EXTENDED",
+    "all": "ORT_ENABLE_ALL",
+}
 GOLDEN = (
     pathlib.Path(__file__).resolve().parents[1]
     / "testdata"
@@ -437,12 +443,16 @@ def run_tower_session(session, feeds, *, generate=False):
     return result
 
 
-def compare(*, audio_model_name=None):
+def compare(*, audio_model_name=None, optimization_level="basic"):
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     import numpy as np
     import onnxruntime as ort
     import onnxruntime_easy as ort_easy
 
+    if optimization_level not in ORT_OPTIMIZATION_LEVELS:
+        raise ValueError(f"Unknown ORT optimization level: {optimization_level!r}")
+    optimization_name = ORT_OPTIMIZATION_LEVELS[optimization_level]
+    optimization = getattr(ort.GraphOptimizationLevel, optimization_name)
     golden = json.loads((ROOT / "reference" / "golden.json").read_text())
     validate_reference_golden(golden)
     config = json.loads((checkpoint_path() / "config.json").read_text())
@@ -463,13 +473,18 @@ def compare(*, audio_model_name=None):
         options = ort.SessionOptions()
         options.intra_op_num_threads = 8
         options.inter_op_num_threads = 1
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        options.graph_optimization_level = optimization
         options.enable_mem_pattern = False
         options.add_session_config_entry("session.disable_prepacking", "1")
         if name == "decoder":
             options.enable_profiling = True
             options.profile_file_prefix = str(ROOT / "decoder-profile")
-        event("ort_session_start", component=name, device=device)
+        event(
+            "ort_session_start",
+            component=name,
+            device=device,
+            ort_graph_optimization=optimization_name,
+        )
         component = audio_model_name if name == "audio_decoder" else name
         sessions[name] = ort_easy.EasySession(
             str(ROOT / "onnx" / component / "model.onnx"),
@@ -675,7 +690,7 @@ def compare(*, audio_model_name=None):
         "audio_component": audio_model_name,
         "onnxruntime_version": ort.__version__,
         "provider": "CUDAExecutionProvider",
-        "ort_graph_optimization": "ORT_ENABLE_BASIC",
+        "ort_graph_optimization": optimization_name,
         "atol": 1e-2 if DTYPE != "f32" else 1e-3,
         "rtol": 1e-2 if DTYPE != "f32" else 1e-3,
         "prompt_rows": golden["prompt_rows"],
@@ -703,6 +718,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--execution-provider", choices=("default", "cuda", "onnx-standard"))
     parser.add_argument("--audio-component", choices=("audio_decoder", "audio_generator"))
+    parser.add_argument(
+        "--optimization-level",
+        choices=tuple(ORT_OPTIMIZATION_LEVELS),
+        default="basic",
+        help="ORT comparison optimization level (default: basic)",
+    )
     parser.add_argument("--golden", type=pathlib.Path)
     parser.add_argument("--reference-devices", default="0,1,2,3")
     parser.add_argument("--reference-tower-device", default=4, type=int)
@@ -741,4 +762,7 @@ if __name__ == "__main__":
     elif args.stage == "reference":
         reference(checkpoint_path(), native_fp8=args.native_fp8)
     else:
-        compare(audio_model_name=args.audio_component)
+        compare(
+            audio_model_name=args.audio_component,
+            optimization_level=args.optimization_level,
+        )

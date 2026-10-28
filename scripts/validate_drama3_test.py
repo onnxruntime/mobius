@@ -33,6 +33,75 @@ def test_logging_accepts_a_metric_name(capsys):
     }
 
 
+@pytest.mark.parametrize(
+    "level, expected",
+    [
+        (None, "ORT_ENABLE_BASIC"),
+        ("disabled", "ORT_DISABLE_ALL"),
+        ("basic", "ORT_ENABLE_BASIC"),
+        ("extended", "ORT_ENABLE_EXTENDED"),
+        ("all", "ORT_ENABLE_ALL"),
+    ],
+)
+def test_comparison_sets_every_session_and_reports_optimization_level(
+    tmp_path, monkeypatch, capsys, level, expected
+):
+    import onnxruntime as ort
+    import onnxruntime_easy as ort_easy
+
+    (tmp_path / "reference").mkdir()
+    (tmp_path / "reference" / "golden.json").write_text(
+        json.dumps({"attempted_frames": 0, "generated_frames": [], "prompt_rows": 0})
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "audio_decoder_config": {"num_codebooks": 1, "vocab_size": 2},
+                "semantic_start_token_id": 4,
+                "semantic_end_token_id": 5,
+                "eos_token_id": 3,
+            }
+        )
+    )
+    monkeypatch.setattr(validate_drama3, "ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(validate_drama3, "checkpoint_path", lambda: tmp_path)
+    monkeypatch.setattr(validate_drama3, "validate_reference_golden", lambda golden: None)
+    monkeypatch.setattr(ort, "preload_dlls", lambda: None)
+    options = []
+
+    def session(path, *, sess_options, providers):
+        options.append(sess_options.graph_optimization_level)
+        return SimpleNamespace(
+            get_inputs=list,
+            get_outputs=lambda: [SimpleNamespace(type="tensor(float)")],
+            get_modelmeta=lambda: SimpleNamespace(custom_metadata_map={}),
+        )
+
+    monkeypatch.setattr(ort_easy, "EasySession", session)
+    kwargs = {} if level is None else {"optimization_level": level}
+    validate_drama3.compare(**kwargs)
+    assert options == [getattr(ort.GraphOptimizationLevel, expected)] * 3
+    report = json.loads((tmp_path / "validation-result.json").read_text())
+    assert report["ort_graph_optimization"] == expected
+    starts = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if json.loads(line)["event"] == "ort_session_start"
+    ]
+    assert [entry["component"] for entry in starts] == [
+        "embedding",
+        "audio_decoder",
+        "decoder",
+    ]
+    assert all(entry["ort_graph_optimization"] == expected for entry in starts)
+
+
+def test_comparison_rejects_unknown_optimization_level_before_loading(monkeypatch):
+    monkeypatch.delattr(validate_drama3, "ROOT", raising=False)
+    with pytest.raises(ValueError, match="Unknown ORT optimization level"):
+        validate_drama3.compare(optimization_level="invalid")
+
+
 def test_empty_cache_uses_the_abi_not_symbolic_dimension_names():
     ports = [
         SimpleNamespace(
