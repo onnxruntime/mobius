@@ -12,6 +12,8 @@ No custom runtime, static-cache, or CUDA graph capture capability is implied.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder
@@ -143,12 +145,15 @@ def chunk_gated_delta_rule(
     heads: int,
     key_width: int,
     value_width: int,
+    unit_lower_solver: Callable[[OpBuilder, ir.Value, ir.Value], ir.Value] | None = None,
 ) -> tuple[ir.Value, ir.Value]:
     """Run source-structured 64-token chunks, including a partial final chunk.
 
     Q/K normalization happens after head expansion and transposition. FP32
     output [B,T,H,V] and state [B,H,K,V] are returned; callers own narrowing
     and resetting incoming state at the beginning of a new sequence.
+    An explicit ``unit_lower_solver`` may replace only the two FLOAT unit-lower
+    systems with matching [B,H,chunks,64] prefixes; the default stays portable.
     """
     batch = op.Shape(query, start=0, end=1)
     length = op.Shape(query, start=1, end=2)
@@ -190,8 +195,20 @@ def chunk_gated_delta_rule(
     intra = op.Mul(op.MatMul(query, key_t), pairwise)
     exp_cumulative = op.Exp(cumulative)
     decayed_keys = op.Mul(keys_beta, op.Unsqueeze(exp_cumulative, [-1]))
-    solved_values = _unit_lower_solve(op, system, values, heads, value_width, "value_solve")
-    solved_keys = _unit_lower_solve(op, system, decayed_keys, heads, key_width, "key_solve")
+    if unit_lower_solver is None:
+        solved_values = _unit_lower_solve(
+            op, system, values, heads, value_width, "value_solve"
+        )
+        solved_keys = _unit_lower_solve(
+            op, system, decayed_keys, heads, key_width, "key_solve"
+        )
+    else:
+        # Both RHS share the exact dynamic batch/head/chunk prefix; no broadcasting.
+        for tensor, width in ((system, 64), (values, value_width), (decayed_keys, key_width)):
+            tensor.type = ir.TensorType(ir.DataType.FLOAT)
+            tensor.shape = ir.Shape(["batch", heads, "chunks", 64, width])
+        solved_values = unit_lower_solver(op, system, values)
+        solved_keys = unit_lower_solver(op, system, decayed_keys)
     weighted_query = op.Mul(query, op.Unsqueeze(exp_cumulative, [-1]))
     last = op.Slice(cumulative, [-1], [np.iinfo(np.int64).max], [-1])
     weighted_key = op.Mul(key, op.Unsqueeze(op.Exp(op.Sub(last, cumulative)), [-1]))

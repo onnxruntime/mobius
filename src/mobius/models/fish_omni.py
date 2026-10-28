@@ -293,6 +293,9 @@ class _FishSourceGatedDeltaNet(Qwen35GatedDeltaNet):
         self.conv1d = _FishSourceConv(self.conv_dim, self.conv_kernel_size)
         self.norm = _FishSourceGatedNorm(self.head_v_dim, eps=config.rms_norm_eps)
 
+    def _chunk_rule(self, op, *args, **kwargs):
+        return chunk_gated_delta_rule(op, *args, **kwargs)
+
     def forward(self, op, hidden_states, conv_state, recurrent_state, continue_state):
         assert self.num_v_heads is not None and self.num_k_heads is not None
         batch = op.Shape(hidden_states, start=0, end=1)
@@ -342,12 +345,12 @@ class _FishSourceGatedDeltaNet(Qwen35GatedDeltaNet):
         branches = []
         for name, rule in (
             ("source_recurrent", recurrent_gated_delta_rule),
-            ("source_chunks", chunk_gated_delta_rule),
+            ("source_chunks", self._chunk_rule),
         ):
 
-            def body(branch_op, rule=rule):
+            def body(branch_op, rule=rule, name=name):
                 dimensions = dict(key_width=self.head_k_dim, value_width=self.head_v_dim)
-                if rule is chunk_gated_delta_rule:
+                if name == "source_chunks":
                     dimensions["heads"] = self.num_v_heads
                 return rule(
                     branch_op, query, key, value, decay, beta, recurrent_state, **dimensions
@@ -390,6 +393,9 @@ class _FishAttention(Qwen35Attention):
     def _rotate(self, op, value, positions, **kwargs):
         return _rotate_float32(op, value, positions, **kwargs)
 
+    def _attend(self, op, *args, **kwargs):
+        return _apply_fish_attention(op, *args, **kwargs)
+
     def forward(
         self, op, hidden_states, attention_bias, position_embeddings, past_key_value=None
     ):
@@ -418,7 +424,7 @@ class _FishAttention(Qwen35Attention):
             rotary_dim=self.rotary_embedding_dim,
             interleaved=self._rope_interleave,
         )
-        attended, pk, pv = _apply_fish_attention(
+        attended, pk, pv = self._attend(
             op,
             query,
             key,
@@ -671,6 +677,15 @@ class _FishFP8Experts(nn.Module):
             config.num_local_experts, config.hidden_size, config.moe_intermediate_size
         )
 
+    def _execution_attributes(self, hidden_states, router_logits):
+        return {}
+
+    def _qmoe_inputs(self, op, hidden_states, router_logits):
+        return (
+            op.Reshape(hidden_states, [-1, self.hidden_size]),
+            op.Reshape(router_logits, [-1, self.num_experts]),
+        )
+
     def forward(self, op, hidden_states, weights, selected, router_logits):
         if ep_capabilities().name != "cuda":
             raise ValueError("Drama 3 native dynamic FP8 requires execution_provider='cuda'")
@@ -680,9 +695,9 @@ class _FishFP8Experts(nn.Module):
         # QMoE owns softmax/top-k and the source's coefficient narrowing.
         # Unsupported devices/route counts must error in the opt-in runtime,
         # never silently fall back to weight-only FP8 or dense expert scratch.
+        inputs = self._qmoe_inputs(op, hidden_states, router_logits)
         output = op.QMoE(
-            op.Reshape(hidden_states, [-1, self.hidden_size]),
-            op.Reshape(router_logits, [-1, self.num_experts]),
+            *inputs,
             gate,
             gate_scale,
             None,
@@ -700,6 +715,7 @@ class _FishFP8Experts(nn.Module):
             k=self.top_k,
             normalize_routing_weights=1,
             _domain="com.microsoft",
+            **self._execution_attributes(hidden_states, router_logits),
         )
         output.type = ir.TensorType(self.dtype)
         return op.Reshape(output, op.Shape(hidden_states))
@@ -826,6 +842,9 @@ class _FishTextModel(Qwen35MoETextModel):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
+    def _attention_bias(self, op, **kwargs):
+        return create_attention_bias(op, **kwargs)
+
     def forward(
         self,
         op,
@@ -855,7 +874,7 @@ class _FishTextModel(Qwen35MoETextModel):
         )
         assert self.rotary_emb is not None
         positions = self.rotary_emb(op, position_ids)
-        bias = create_attention_bias(
+        bias = self._attention_bias(
             op,
             input_ids=hidden if input_ids is None else input_ids,
             attention_mask=attention_mask,
@@ -966,6 +985,9 @@ class _TowerAttention(nn.Module):
     def _rotate(self, op, value, positions, **kwargs):
         return _rotate_float32(op, value, positions, **kwargs)
 
+    def _attend(self, op, *args, **kwargs):
+        return _apply_fish_attention(op, *args, **kwargs)
+
     def forward(self, op, hidden, bias, positions, past):
         cfg = self.config
         q, gate, k, v = op.Split(
@@ -993,7 +1015,7 @@ class _TowerAttention(nn.Module):
             rotary_dim=self.rotary_dim,
             interleaved=True,
         )
-        attended, pk, pv = _apply_fish_attention(
+        attended, pk, pv = self._attend(
             op,
             q,
             k,
@@ -1154,6 +1176,9 @@ class FishOmniAudioDecoder(nn.Module):
             else _FishTowerSourceRope(tower_config)
         )
 
+    def _attention_bias(self, op, **kwargs):
+        return create_attention_bias(op, **kwargs)
+
     def forward(
         self,
         op,
@@ -1203,7 +1228,7 @@ class FishOmniAudioDecoder(nn.Module):
         past_key_values,
     ):
         positions = self.rotary_emb(op, position_ids)
-        bias = create_attention_bias(
+        bias = self._attention_bias(
             op, input_ids=semantic_mask, attention_mask=attention_mask, dtype=self.config.dtype
         )
         hidden = hidden_states
