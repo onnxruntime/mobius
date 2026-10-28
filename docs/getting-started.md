@@ -135,7 +135,9 @@ The pinned Fish Speech source declares `torch==2.8.0`. Run
 the validator checks the Torch version before loading the model. New references
 record Torch, CUDA and Triton versions, and comparisons check that metadata when
 both goldens include it. Earlier Torch 2.10 diagnostics are retained separately:
-CUDA reduction order differs between these releases.
+CUDA reduction order differs between these releases. The committed token golden
+has been regenerated with Torch 2.8.0+cu126 / Triton 3.4.0; all 20 frame IDs are
+unchanged.
 
 Fresh Torch 2.8 production-dimension, one-layer real-weight probes still exceed
 the `atol=rtol=1e-2` gate: FP16 prefill-tower output has 5 violations among 12288
@@ -307,13 +309,20 @@ upstream FP32 pipeline. Maximum observed decoder/tower logit differences were
 `3.624e-5` / `3.910e-5`. This is token-level evidence, not waveform or speech-quality
 validation. The native reference uses an argmax sampler for determinism.
 
-The current pre-fused CUDA MoE plus single-pass tower route also passes that
-independent complete-checkpoint case: all vectors for the 30-row prefill and
-20 exact complete frames, with maximum decoder/tower logit differences
-`5.150e-5` / `4.673e-5` and hidden difference `2.289e-5`.
-The prefill profile asserts 40 actual CUDA MoE executions. This fresh check
-qualifies the changed fast token graph for this case; it is not a latency or
-speech-quality measurement.
+The current pre-fused CUDA MoE plus single-pass tower route has also been
+requalified against the complete independent Torch 2.8.0+cu126 reference:
+all vectors for the 30-row prefill and 20 exact complete frames pass, using CPU
+embedding and CUDA decoder/tower on one H200. Both prefill profiles contain
+40 actual CUDA MoE executions.
+
+| Runtime | Maximum decoder-logit error | Maximum tower-logit error | Maximum hidden error |
+|---|---:|---:|---:|
+| Stock ORT 1.28 | `5.5313e-5` | `5.0306e-5` | `2.2888e-5` |
+| Custom ORT 1.32, QMoE + XOR + Pow | `5.1498e-5` | `5.0545e-5` | `2.3842e-5` |
+
+The second correctness run uses the separately preserved combined-Pow wheel
+(`da934e6b1791e3225c7f2e2a61a35a5ebd907d2946a8f0c0e02c7e455dd6395d`).
+The performance measurements below retain their original two-patch runtime.
 
 Recorded single-H200 measurements of this dense-FP32 graph use ORT 1.28
 (`0368187f84`), TF32 disabled, two full-request warmups, the same 30-row prompt,
