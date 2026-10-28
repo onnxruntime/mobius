@@ -184,6 +184,12 @@ in nine BF16 values (maximum `0.000244140625`); later layers amplify the differe
 An independent source replay reproduces all 20 saved states bit-for-bit.
 The candidate is limited to batch-one short prefill and explicitly bypasses a
 failing symbolic-shape pass, so it is diagnostic, not a production export.
+Normal graph construction now succeeds with the existing constraint-propagation
+optimization in
+[justinchuby/onnx-shape-inference#135](https://github.com/justinchuby/onnx-shape-inference/pull/135).
+A normally built candidate reuses the unchanged external weights only after
+checking computation graphs, generated constants and initializer contracts;
+all 120 expert-boundary tensors reproduce the original prefill exactly.
 CUDA-library-aligned BF16 replay and the FP16 whole-model comparison remain
 pending. Source-ordered reductions
 and [a CUDA reciprocal-square-root fast path](https://github.com/microsoft/onnxruntime/pull/33662)
@@ -197,6 +203,14 @@ Stable `Log(Add(x, 1))` fusion is implemented for CUDA and native WebGPU in
 [this independent ORT change](https://github.com/microsoft/onnxruntime/commit/3c0638c4c402900e42d1a9a0f6ee8d9ea7015460).
 It keeps the exported graph in standard ONNX and activates at
 `ORT_ENABLE_EXTENDED` or `ORT_ENABLE_ALL`, after provider assignment.
+Use `scripts/validate_drama3.py compare --optimization-level extended` (with the
+usual work directory and reference arguments) to qualify this path. Comparison
+defaults to BASIC; the selected level applies to every component and is recorded
+in session-start events and the validation report.
+The complete FP32 pipeline also passes EXTENDED on the combined QMoE/XOR/Pow/Flash
+runtime: 30-row prefill, all cached vectors, 20 exact frames and 40 actual CUDA
+MoE executions, with maximum decoder/tower/hidden errors
+`5.149841e-5` / `5.054474e-5` / `2.384186e-5`.
 The portable FP32 source-softplus subgraph matches all 960 real reference values
 exactly on CUDA while preserving the preceding `Exp` rounding.
 Native WebGPU FP32 and feature-enabled FP16 were exercised through lavapipe
