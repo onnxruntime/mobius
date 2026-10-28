@@ -226,11 +226,18 @@ that case's BF16 output exact. This source-compatible mode retains FP8 storage
 and activation quantization but uses FP16 MMA, not native hardware FP8 MMA.
 
 With that mode, native triangular solves, source MEA and runtime source-style
-RoPE in both decoder and tower, source-faithful top-k routing now gives a complete
-saved/reloaded BF16 pipeline pass: 30-row prefill, every cached vector and all
-20 complete generated frames. A separate raw-bit audit checks all 101 compared
-tensors: **14,469,504 FP32-transport bit patterns, zero differences**. No source
-expert outputs replace runtime computation.
+RoPE in both decoder and tower, source-faithful top-k routing now gives complete
+saved/reloaded **BF16 and FP16** pipeline passes: 30-row prefill, every cached
+vector and all 20 complete generated frames for each dtype. Separate raw-bit
+audits check all 101 compared tensors per dtype: **14,469,504 FP32-transport bit
+patterns each, zero differences**. No source expert outputs replace runtime
+computation. FP16 uses a separately registered, genuinely half-typed operator and
+the source's contiguous-eight FP32 normalization tree before narrowing routing
+coefficients; the validated BF16 binary remains unchanged.
+Actual target-generated frames from each dtype also pass the saved FP32 codec's
+independent CPU comparison for all 40,960 samples: BF16-derived frames have
+maximum error `6.556511e-7` / SNR `121.65 dB`; FP16-derived frames have
+`8.344650e-7` / `121.39 dB`. The waveform codec itself remains FP32.
 
 The routing correction follows the pinned Torch CUDA softmax, threshold gather
 and unstable bitonic top-k order. Previously, swapping two equal-logit expert
@@ -239,8 +246,15 @@ one layer-12 output differed despite exact per-expert arithmetic and recurrent
 caches. An arbitrary stable tie-index rule would not reproduce that source
 contract.
 
-This validates a private batch-one/short-prefill configuration, not production
-reduced-precision admission or performance. The source-compatible compute is
+These validate private batch-one/short-prefill configurations, not production
+reduced-precision admission or performance. A warm, resident-cache BF16
+20-frame diagnostic reaches 5.70 frames/s with token-only RTF 4.35; it has no
+codec and is neither performance qualification nor faster than realtime.
+Allocation-free, source-ordered reduction prototypes preserve both complete
+20-frame raw-bit audits. Their later BF16 resident-cache diagnostic reaches
+9.82 frames/s (p50 `80.25 ms`), token-only RTF `2.73`; the same short-run/no-codec
+qualification limits apply.
+The source-compatible compute is
 register-local FP16 MMA; native hardware FP8 MMA remains separately unqualified.
 An independent generalized chunk-core probe also matches source output/state
 bits in 32 synthetic cases (batches 1/2, lengths 1/2/30/64/65/128/129/257,
