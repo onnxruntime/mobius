@@ -36,9 +36,6 @@ Available passes
     graph initializer) into a single pre-concatenated initializer.  Used to
     pre-pack QKV weight matrices after weight loading.
 
-:class:`FoldWeightLayoutPass`
-    Folds static Reshape/Transpose chains into lazy initializers, including
-    higher-rank layout conversions of quantized weights, scales, and zero points.
 """
 
 from __future__ import annotations
@@ -46,13 +43,11 @@ from __future__ import annotations
 __all__ = [
     "FoldTransposedInitializerPass",
     "FoldConcatInitializersPass",
-    "FoldWeightLayoutPass",
     "Fp8KvCachePass",
     "RemoveDeadGraphInputsPass",
 ]
 
 from mobius._passes._fold_concat import FoldConcatInitializersPass
 from mobius._passes._fold_transpose import FoldTransposedInitializerPass
-from mobius._passes._fold_weight_layout import FoldWeightLayoutPass
 from mobius._passes._fp8_kv_cache import Fp8KvCachePass
 from mobius._passes._remove_dead_inputs import RemoveDeadGraphInputsPass

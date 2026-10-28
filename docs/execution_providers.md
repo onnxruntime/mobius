@@ -142,11 +142,11 @@ absent or packed UINT8 zero points. Flat/row-major sidecars are supported;
 block size must be a power of two >= 16 and `accuracy_level` omitted or zero.
 Mixed bit widths, extra operands, and caller-owned function bodies are skipped.
 
-Post-weight folding is independent of experimental packing: parameter Concats
-retain checkpoint names until binding, then Concat/Reshape/Transpose chains fold
-lazily without changing dtype. Missing leaves are checked even with
-`fold_constants=False`. Overridable inputs and MoE/QMoE/QDQ storage-layout paths
-remain explicit to preserve loader names and byte layouts.
+Parameter Concats retain checkpoint names until binding, then initializer
+Concats and matrix Transposes fold lazily without changing dtype. Missing leaves
+are checked even with `fold_constants=False`. Generic Reshape/Transpose layout
+folding is not part of this pipeline; those transformations remain explicit.
+Overridable inputs remain untouched.
 
 **The INT4 numerical gate remains failed and unwaived:** large-dimension CUDA
 prefill/cached-decode logits exceeded `rtol=atol=1e-2`. Changing GEMM width can

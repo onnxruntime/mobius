@@ -74,8 +74,8 @@ class FoldTransposedInitializerPass(ir.passes.InPlacePass):
 
             # Register legacy ``weight_t`` names only for root-owned weights.
             # A Transpose inside If/Loop can capture a root weight and still use
-            # this pass. Child-local weights belong to FoldWeightLayoutPass:
-            # registering them at the root would collide across sibling scopes.
+            # this pass. Skip child-local weights: registering them at the root
+            # would collide across sibling scopes.
             if (
                 not inp.is_initializer()
                 or inp.is_graph_input()
