@@ -177,6 +177,17 @@ also matches all five isolated DeltaNet projections exactly. An artifact-only
 cached recurrence matches source output and state bitwise for zero/nonzero
 cache inputs. Remaining prefix work concerns softplus, CPU-folded learned
 exponentials and chunked triangular solves.
+
+Stable `Log(Add(x, 1))` fusion is implemented for CUDA and native WebGPU in
+[this independent ORT change](https://github.com/microsoft/onnxruntime/commit/3c0638c4c402900e42d1a9a0f6ee8d9ea7015460).
+It keeps the exported graph in standard ONNX and activates at
+`ORT_ENABLE_EXTENDED` or `ORT_ENABLE_ALL`, after provider assignment.
+The portable FP32 source-softplus subgraph matches all 960 real reference values
+exactly on CUDA while preserving the preceding `Exp` rounding.
+Native WebGPU FP32 and feature-enabled FP16 were exercised through lavapipe
+(software Vulkan); physical-WebGPU and browser/WASM execution remain untested.
+Deprecated JSEP is excluded by ORT policy.
+
 The custom CUDA build needs `onnxruntime_USE_FP8_QMOE=ON`, SM89+, and dynamic
 activation quantization. The runtime rejects more than
 65,535 token/expert pairs per call (8,191 tokens at top-8); the graph records
