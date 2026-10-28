@@ -134,7 +134,9 @@ The pinned Fish Speech source declares `torch==2.8.0`. Run
 `scripts/validate_drama3.py reference` in a separate environment with that release;
 the validator checks the Torch version before loading the model. New references
 record Torch, CUDA and Triton versions, and comparisons check that metadata when
-both goldens include it. Earlier Torch 2.10 diagnostics are retained separately:
+both goldens include it. Reference collection checks embeddings, hidden states
+and logits for finite values before writing a golden.
+Earlier Torch 2.10 diagnostics are retained separately:
 CUDA reduction order differs between these releases. The committed token golden
 has been regenerated with Torch 2.8.0+cu126 / Triton 3.4.0; all 20 frame IDs are
 unchanged.
@@ -166,11 +168,15 @@ hidden-state gate
 real expert layers pass when supplied identical source inputs and logits.
 The first expert input differs by only `1.192e-7`, but changes one FP8 code;
 those discontinuities amplify across subsequent layers. Qualification against
-the declared Torch 2.8 environment is in progress. Source-ordered reductions
+the declared Torch 2.8 environment is in progress. Complete native-FP8 source runs
+in BF16 and FP16 each produce 20 finite frames; matching whole-model ONNX
+comparisons are pending. Source-ordered reductions
 and [a CUDA reciprocal-square-root fast path](https://github.com/microsoft/onnxruntime/pull/33662)
 give bit-exact normalization on real first-layer inputs; source-layout `Gemm`
-also matches all five isolated DeltaNet projections exactly. The next differences
-are inside DeltaNet gating, normalization and recurrent arithmetic.
+also matches all five isolated DeltaNet projections exactly. An artifact-only
+cached recurrence matches source output and state bitwise for zero/nonzero
+cache inputs. Remaining prefix work concerns softplus, CPU-folded learned
+exponentials and chunked triangular solves.
 The custom CUDA build needs `onnxruntime_USE_FP8_QMOE=ON`, SM89+, and dynamic
 activation quantization. The runtime rejects more than
 65,535 token/expert pairs per call (8,191 tokens at top-8); the graph records
