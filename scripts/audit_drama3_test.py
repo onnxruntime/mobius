@@ -24,6 +24,7 @@ from audit_drama3 import (
     ReferenceAudit,
     checked_file,
     digest,
+    finish_acceptance,
     load_inputs,
     performance_result,
     validate_ownership,
@@ -388,6 +389,12 @@ def test_actual_cpu_chain_in_fresh_framework_blocked_process(consumer, tmp_path)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     report = json.loads((tmp_path / "results" / "report.json").read_text())
     assert report["status"] == "passed"
+    assert report["codec_numerical_quality"]["status"] == "UNVERIFIED"
+    assert report["codec_numerical_quality"]["independent_waveform_reference"] is None
+    assert report["native_cuda13_acceptance"] is False
+    assert report["blocked_acceptance_gates"] == [
+        "independent_fp32_codec_waveform_numerical_quality"
+    ]
     assert report["audit"]["source_fields"] == 25
     assert report["audit"]["float_tensors"] == 16
     assert report["audit"]["f32_patterns"] == 80
@@ -633,6 +640,25 @@ def test_instrumented_cuda_timing_cannot_qualify_even_below_rtf_gate():
     assert result["end_to_end_rtf"] < 1.0
     assert result["measurement_qualified"] is False
     assert result["meets_end_to_end_rtf_target"] is None
+
+
+def test_passing_neural_and_performance_gates_cannot_qualify_missing_codec_oracle():
+    report = {
+        "performance": {
+            "measurement_qualified": True,
+            "meets_end_to_end_rtf_target": True,
+        },
+        "codec_numerical_quality": {
+            "status": "UNVERIFIED",
+            "independent_waveform_reference": None,
+        },
+    }
+    finish_acceptance(report, benchmark=True)
+    assert report["native_cuda13_neural_and_performance_gates_passed"] is True
+    assert report["native_cuda13_acceptance"] is False
+    assert report["blocked_acceptance_gates"] == [
+        "independent_fp32_codec_waveform_numerical_quality"
+    ]
 
 
 def test_missing_weights_fail_explicitly(consumer):

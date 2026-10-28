@@ -716,6 +716,15 @@ def run(args):
         "selection": profile,
         "reference_environment": golden["reference_environment"],
         "native_cuda13_acceptance": False,
+        "codec_numerical_quality": {
+            "status": "UNVERIFIED",
+            "independent_waveform_reference": None,
+            "reason": (
+                "The immutable neural DATA manifest contains no waveform oracle. "
+                "Codec execution, finite output, duration and hash do not establish "
+                "independent FP32 waveform numerical parity."
+            ),
+        },
     }
     try:
         snapshots = []
@@ -769,11 +778,7 @@ def run(args):
         if args.diagnostics:
             report["diagnostics"] = collect_evidence(sessions, evidence_root)
         report["status"] = "passed"
-        report["native_cuda13_acceptance"] = (
-            args.benchmark
-            and report["performance"]["measurement_qualified"]
-            and report["performance"]["meets_end_to_end_rtf_target"] is True
-        )
+        finish_acceptance(report, benchmark=args.benchmark)
     except (ValueError, RuntimeError, AssertionError, OSError, FloatingPointError) as error:
         report["error"] = f"{type(error).__name__}: {error}"
         raise
@@ -782,6 +787,19 @@ def run(args):
             json.dump(report, stream, indent=2)
             stream.write("\n")
     return report
+
+
+def finish_acceptance(report, *, benchmark):
+    """Keep passing neural/timing checks separate from the missing codec quality gate."""
+    report["native_cuda13_neural_and_performance_gates_passed"] = (
+        benchmark
+        and report["performance"]["measurement_qualified"]
+        and report["performance"]["meets_end_to_end_rtf_target"] is True
+    )
+    # This consumer has no independent waveform-reference comparison contract.
+    # Neither a selected graph hash nor successful codec execution closes it.
+    report["native_cuda13_acceptance"] = False
+    report["blocked_acceptance_gates"] = ["independent_fp32_codec_waveform_numerical_quality"]
 
 
 def fail_rtf():

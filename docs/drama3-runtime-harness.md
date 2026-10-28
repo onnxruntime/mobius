@@ -125,6 +125,18 @@ graph metadata requires them. This harness does not lower/rewrite graphs.
 
 ## Execution and gates
 
+The immutable DATA manifest has **no independent waveform oracle**. This harness
+executes the actual-frame FP32 codec and checks dtype, shape, finite samples,
+duration and hashes; it does **not** compare that waveform numerically against an
+independently invoked source CPU codec. Reports therefore always mark
+`codec_numerical_quality.status` as `UNVERIFIED` and list the independent FP32
+waveform numerical-quality gate as blocked. Even if neural and performance
+checks pass (`native_cuda13_neural_and_performance_gates_passed`),
+`native_cuda13_acceptance` remains false. A report `status: passed` describes
+only the checks this consumer actually performed, not full codec/root quality.
+Independent codec quality remains a separate qualification; this change does
+not collect a new reference, change an oracle, or substitute source frames.
+
 Use `--diagnostics` for a separate, explicitly **unqualified** evidence run.
 ORT saves its actual optimized graph for each component under the new output
 root, and emits execution profiles. The report hashes these graphs and profile
