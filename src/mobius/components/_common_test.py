@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
+import pytest
+from onnxscript import nn
 
 from mobius._testing import count_op_type, create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.components._common import (
     Embedding,
     Linear,
+    OutputMajorLinear,
     build_packed_token_offset,
     create_attention_bias,
     create_padding_mask,
@@ -52,6 +55,72 @@ class TestLinear:
         assert result is not None
         assert count_op_type(graph, "MatMul") >= 1
         assert count_op_type(graph, "Add") == 0
+
+
+class TestOutputMajorLinear:
+    @pytest.mark.parametrize("bias", [False, True])
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            [4],
+            ["rows", 4],
+            ["batch", "tokens", 4],
+            ["batch", 2, "tokens", 4],
+        ],
+    )
+    def test_dynamic_forward_preserves_layout_and_values(self, bias, shape):
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", shape)
+        linear = OutputMajorLinear(4, 3, bias)
+        result = linear(op, x)
+        result.type = ir.TensorType(ir.DataType.FLOAT)
+        assert list(result.shape) == [*x.shape[:-1], 3]
+        result.name = "output"
+        graph.outputs.append(result)
+        gemm = next(node for node in graph if node.op_type == "Gemm")
+        assert gemm.attributes["transB"].as_int() == 1
+        assert not any(node.op_type in ("MatMul", "Transpose") for node in graph)
+        assert gemm.inputs[1].shape == ir.Shape([3, 4])
+        assert bool(len(gemm.inputs) > 2 and gemm.inputs[2] is not None) == bias
+        assert [name for name, _ in linear.named_parameters()] == (
+            ["weight", "bias"] if bias else ["weight"]
+        )
+
+        rng = np.random.default_rng(42)
+        weight = rng.standard_normal((3, 4)).astype(np.float32)
+        offset = rng.standard_normal(3).astype(np.float32)
+        for name, parameter in graph.initializers.items():
+            parameter.const_value = ir.tensor(offset if name.endswith("bias") else weight)
+        session = OnnxModelSession(ir.Model(graph, ir_version=10))
+        try:
+            for batch, tokens in ((1, 1), (2, 5), (3, 0)):
+                sizes = {"batch": batch, "tokens": tokens, "rows": batch * tokens}
+                concrete = [sizes[dim] if isinstance(dim, str) else dim for dim in shape]
+                values = rng.standard_normal(concrete).astype(np.float32)
+                expected = values @ weight.T
+                if bias:
+                    expected += offset
+                actual = session.run({"x": values})["output"]
+                assert actual.shape == expected.shape
+                np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+        finally:
+            session.close()
+
+    @pytest.mark.parametrize(
+        "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+    )
+    def test_dtype_and_parameter_names_match_linear(self, dtype):
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", ["batch", "tokens", 4], dtype=dtype)
+        linear = OutputMajorLinear(4, 3, False)
+        linear.weight = nn.Parameter([3, 4], dtype=dtype)
+        result = linear(op, x)
+        assert result.dtype == dtype
+        assert list(result.shape) == [*x.shape[:-1], 3]
+        assert [(name, list(p.shape)) for name, p in linear.named_parameters()] == [
+            (name, list(p.shape)) for name, p in Linear(4, 3, False).named_parameters()
+        ]
+        assert count_op_type(graph, "Gemm") == 1
 
 
 class TestEmbedding:

@@ -22,6 +22,7 @@ from mobius._configs.fish_omni import FishOmniConfig
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
+from mobius.components import Linear, OutputMajorLinear
 from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _dict_to_pretrained_config,
@@ -31,7 +32,6 @@ from mobius.models.fish_omni import (
     _apply_fish_attention,
     _FishMoEBlock,
     _FP32OutputLinear,
-    _OutputMajorLinear,
     _sigmoid_float32,
 )
 from mobius.tasks import FishOmniGenerationTask, FishOmniTask, ModelTask
@@ -94,6 +94,36 @@ def native_fp8_prototype_config(dtype=ir.DataType.FLOAT16):
         native_fp8_experts=True,
         tower=dataclasses.replace(config.tower, hidden_size=128),
     )
+
+
+@pytest.mark.parametrize(
+    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+)
+def test_fish_projection_layout_is_scoped_and_preserves_weight_names(dtype):
+    baseline = FishOmniModel(tiny_config())
+    module = FishOmniModel(dataclasses.replace(tiny_config(), dtype=dtype))
+    expected_names = {
+        name: list(parameter.shape) for name, parameter in baseline.named_parameters()
+    }
+    assert {
+        name: list(parameter.shape) for name, parameter in module.named_parameters()
+    } == expected_names
+    for component in (module.decoder, module.audio_decoder):
+        projections = [child for child in component.modules() if isinstance(child, Linear)]
+        assert projections
+        if dtype == ir.DataType.FLOAT:
+            assert all(
+                type(child) is Linear or child is module.decoder.lm_head
+                for child in projections
+            )
+        else:
+            assert all(isinstance(child, OutputMajorLinear) for child in projections)
+    # Constructing Fish modules must never change another architecture's Linear.
+    graph, builder = _make_graph("unrelated_projection")
+    x = builder.input("x", ir.DataType.FLOAT, [1, 2, 4])
+    Linear(4, 3, bias=False)(builder.op, x)
+    assert any(node.op_type == "MatMul" for node in graph)
+    assert not any(node.op_type == "Gemm" for node in graph)
 
 
 @pytest.mark.parametrize(
@@ -234,7 +264,7 @@ def test_fish_omni_build(dtype):
     tower = package["audio_decoder"]
     if dtype == ir.DataType.BFLOAT16:
         assert sum(node.op_type == "If" for node in tower.graph) == 3
-        assert sum(node.op_type == "Gemm" for node in tower.graph) == 3
+        assert sum(node.op_type == "Gemm" for node in tower.graph) == 20
     assert tuple(tower.graph.outputs[0].shape)[-2:] == (2, 16)
     assert sum(v.name.startswith("past_key_values.") for v in tower.graph.inputs) == 6
     assert any("q_norm.weight" in key for key in tower.graph.initializers)
@@ -528,7 +558,7 @@ def test_bf16_down_projection_preserves_native_output_major_accumulation():
 
     config = dataclasses.replace(tiny_config(), dtype=ir.DataType.BFLOAT16)
     graph = build_from_module(
-        _OutputMajorLinear(6144, 2048),
+        OutputMajorLinear(6144, 2048, bias=False),
         config,
         task=ProjectionTask(),
         execution_provider="onnx-standard",

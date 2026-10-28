@@ -38,6 +38,42 @@ class Linear(nn.Module):
         return result
 
 
+class OutputMajorLinear(Linear):
+    """Linear projection retaining physical ``[out, in]`` weights in a 2-D GEMM.
+
+    Flatten leading activation dimensions before GEMM and restore them afterward.
+    Unlike a folded Transpose + MatMul, this preserves the source GEMM layout
+    and its provider-specific accumulation order. Parameter names and constructor
+    arguments match :class:`Linear`; no checkpoint repacking is required.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+    ):
+        super().__init__(in_features, out_features, bias)
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, op: OpBuilder, x: ir.Value):
+        projected = self._project(
+            op, op.Reshape(x, op.Constant(value_ints=[-1, self.in_features]))
+        )
+        projected.shape = ir.Shape([None, self.out_features])
+        shape = op.Concat(
+            op.Shape(x, end=-1), op.Constant(value_ints=[self.out_features]), axis=0
+        )
+        result = op.Reshape(projected, shape, allowzero=1)
+        if x.shape is not None:
+            result.shape = ir.Shape([*x.shape[:-1], self.out_features])
+        return result
+
+    def _project(self, op: OpBuilder, x: ir.Value):
+        return op.Gemm(x, self.weight, self.bias, transB=1)
+
+
 class Embedding(nn.Module):
     """Embedding layer using ONNX Gather op."""
 
