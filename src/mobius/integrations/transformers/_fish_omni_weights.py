@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import pathlib
 from collections.abc import Mapping
 
 import onnx_ir as ir
@@ -16,6 +17,8 @@ from mobius.integrations._weight_loading import (
     StreamingExpertBankSource,
     StreamingWeightPlan,
     StreamingWeightSource,
+    _lazy_safetensors_source_parent_aliases,
+    _resolve_shard_paths,
     stream_preprocessed_safetensors_to_model,
 )
 
@@ -141,6 +144,8 @@ def stream_fish_omni_safetensors_to_package(
     The aggregate graph is only a binding inventory and is never executed or
     serialized. One generic planner checks all three components transactionally, including unexpected
     source keys, rather than ignoring another component's unchecked tensors.
+    Register the resolved checkpoint artifacts so partial saves cannot overwrite
+    shards or indexes still needed by another component's lazy tensors.
     """
     parameters: dict[str, ir.Value] = {}
     for model in package.values():
@@ -163,6 +168,7 @@ def stream_fish_omni_safetensors_to_package(
         ),
         ir_version=12,
     )
+    paths = _resolve_shard_paths(model_id, revision)
     report = stream_preprocessed_safetensors_to_model(
         inventory,
         model_id,
@@ -170,6 +176,20 @@ def stream_fish_omni_safetensors_to_package(
             index, initializers, config
         ),
         revision=revision,
+        _resolved_paths=paths,
+    )
+    source_paths = list(paths)
+    local_directory = pathlib.Path(model_id)
+    if local_directory.is_dir():
+        local_index = local_directory / "model.safetensors.index.json"
+        if local_index.is_file():
+            source_paths.append(str(local_index))
+    source_directories = set(_lazy_safetensors_source_parent_aliases(source_paths))
+    if local_directory.is_dir():
+        source_directories.add(local_directory.resolve())
+    package.register_lazy_source_artifacts(
+        files=source_paths,
+        directories=source_directories,
     )
     for name, value in parameters.items():
         value.const_value = inventory.graph.initializers[name].const_value

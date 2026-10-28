@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
+from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
@@ -19,6 +20,7 @@ from mobius.__main__ import main
 from mobius._configs.fish_omni import DRAMA3_REVISION
 from mobius._model_package import ModelPackage
 from mobius.integrations.transformers import _builder
+from mobius.integrations.transformers import _fish_omni_weights as fish_weights
 from mobius.integrations.transformers._config_resolver import _dict_to_pretrained_config
 from mobius.integrations.transformers._fish_omni_weights import (
     _source_name,
@@ -58,6 +60,215 @@ def _checkpoint(package):
             else:
                 weights[source] = tensor
     return weights
+
+
+def _lazy_checkpoint(directory, layout):
+    directory.mkdir(parents=True)
+    models = {}
+    weights = {}
+    for i, (component, name) in enumerate(
+        (
+            ("embedding", "embedding.embed_tokens.weight"),
+            ("decoder", "decoder.lm_head.weight"),
+            ("audio_decoder", "audio_decoder.codebook_heads.0.weight"),
+        )
+    ):
+        value = ir.Value(
+            name=name, shape=ir.Shape([16, 16]), type=ir.TensorType(ir.DataType.FLOAT)
+        )
+        models[component] = ir.Model(
+            ir.Graph([], [value], nodes=[], initializers=[value], opset_imports={"": 24}),
+            ir_version=12,
+        )
+        weights[_source_name(name)] = torch.full((16, 16), float(i + 1))
+    if layout == "single":
+        save_file(weights, directory / "model.safetensors")
+    else:
+        shard_directory = directory / "weights" if layout == "nested" else directory
+        shard_directory.mkdir(exist_ok=True)
+        weight_map = {}
+        for i, (name, tensor) in enumerate(weights.items()):
+            shard = shard_directory / f"model-{i + 1:05d}-of-00003.safetensors"
+            save_file({name: tensor}, shard)
+            weight_map[name] = shard.relative_to(directory).as_posix()
+        (directory / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+    config = tiny_config()
+    return ModelPackage(models, config=config), config, weights
+
+
+def _snapshot(directory):
+    return {
+        path.relative_to(directory): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+def _assert_lazy_values(package, weights):
+    for model in package.values():
+        for name, value in model.graph.initializers.items():
+            np.testing.assert_array_equal(
+                value.const_value.numpy(), weights[_source_name(name)].numpy()
+            )
+
+
+@pytest.mark.parametrize("layout", ["single", "indexed", "nested"])
+@pytest.mark.parametrize("alias", ["direct", "relative", "directory_symlink"])
+def test_fish_partial_save_rejects_checkpoint_directory(tmp_path, monkeypatch, layout, alias):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, layout)
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    destination = checkpoint
+    if alias == "relative":
+        monkeypatch.chdir(tmp_path)
+        destination = Path("checkpoint")
+    elif alias == "directory_symlink":
+        destination = tmp_path / "alias"
+        try:
+            destination.symlink_to(checkpoint, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlinks are unavailable: {error}")
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="source checkpoint directory"):
+        package.save(
+            str(destination),
+            components=lambda name: name == "embedding",
+            external_data="safetensors",
+            progress_bar=False,
+        )
+    assert _snapshot(tmp_path) == before
+    _assert_lazy_values(package, weights)
+
+
+@pytest.mark.parametrize("source_kind", ["shard", "index"])
+@pytest.mark.parametrize("alias_kind", ["hardlink", "symlink"])
+def test_fish_partial_save_rejects_source_file_alias(tmp_path, source_kind, alias_kind):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, "indexed")
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    source = checkpoint / (
+        "model-00001-of-00003.safetensors"
+        if source_kind == "shard"
+        else "model.safetensors.index.json"
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+    alias = output / "model.safetensors"
+    try:
+        if alias_kind == "hardlink":
+            alias.hardlink_to(source)
+        else:
+            alias.symlink_to(source)
+    except OSError as error:
+        pytest.skip(f"{alias_kind}s are unavailable: {error}")
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="aliases lazy source file"):
+        package.save(
+            str(output),
+            components=lambda name: name == "embedding",
+            external_data="safetensors",
+            progress_bar=False,
+        )
+    assert _snapshot(tmp_path) == before
+    _assert_lazy_values(package, weights)
+
+
+def test_fish_full_save_rejects_component_directory_overlapping_checkpoint(tmp_path):
+    output = tmp_path / "output"
+    checkpoint = output / "embedding"
+    package, config, weights = _lazy_checkpoint(checkpoint, "nested")
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="source checkpoint directory"):
+        package.save(str(output), external_data="safetensors", progress_bar=False)
+    assert _snapshot(tmp_path) == before
+    _assert_lazy_values(package, weights)
+
+
+@pytest.mark.parametrize("layout", ["single", "indexed", "nested"])
+@pytest.mark.parametrize("partial", [False, True])
+def test_fish_noncolliding_save_preserves_checkpoint(tmp_path, layout, partial):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, layout)
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    before = _snapshot(checkpoint)
+    output = tmp_path / "output"
+    package.save(
+        str(output),
+        components=(lambda name: name == "embedding") if partial else None,
+        external_data="safetensors",
+        progress_bar=False,
+    )
+    loaded = ModelPackage.load(str(output))
+    assert len(loaded) == (1 if partial else 3)
+    _assert_lazy_values(loaded, weights)
+    assert _snapshot(checkpoint) == before
+    _assert_lazy_values(package, weights)
+
+
+def test_fish_resolves_shards_once_with_revision(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, "single")
+    paths = [str(checkpoint / "model.safetensors")]
+    calls = []
+
+    def resolve(model_id, revision):
+        calls.append((model_id, revision))
+        return paths
+
+    monkeypatch.setattr(fish_weights, "_resolve_shard_paths", resolve)
+    stream_fish_omni_safetensors_to_package(
+        package, "synthetic/drama-3", config, revision="pinned-revision"
+    )
+    assert calls == [("synthetic/drama-3", "pinned-revision")]
+    assert package._native_streaming_source_files == frozenset({Path(paths[0]).resolve()})
+    _assert_lazy_values(package, weights)
+
+
+def test_fish_registers_nested_shards_and_local_index(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, "nested")
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    assert package._native_streaming_source_files == frozenset(
+        path.resolve() for path in checkpoint.rglob("*") if path.is_file()
+    )
+    assert package._native_streaming_source_directories == frozenset(
+        {checkpoint.resolve(), (checkpoint / "weights").resolve()}
+    )
+    _assert_lazy_values(package, weights)
+
+
+@pytest.mark.parametrize("destination_kind", ["snapshot", "blobs"])
+def test_fish_registers_snapshot_and_blob_directory_aliases(tmp_path, destination_kind):
+    checkpoint = tmp_path / "snapshot"
+    package, config, weights = _lazy_checkpoint(checkpoint, "single")
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    shard = checkpoint / "model.safetensors"
+    blob = blobs / "blob"
+    shard.rename(blob)
+    try:
+        shard.symlink_to(blob)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    assert package._native_streaming_source_files == frozenset({blob.resolve()})
+    assert package._native_streaming_source_directories == frozenset(
+        {checkpoint.resolve(), blobs.resolve()}
+    )
+    before = _snapshot(tmp_path)
+    destination = checkpoint if destination_kind == "snapshot" else blobs
+    with pytest.raises(ValueError, match="source checkpoint directory"):
+        package.save(
+            str(destination),
+            components=lambda name: name == "embedding",
+            external_data="safetensors",
+            progress_bar=False,
+        )
+    assert _snapshot(tmp_path) == before
+    _assert_lazy_values(package, weights)
 
 
 @pytest.mark.parametrize("failure", [None, "scale_dtype", "scale_shape", "target_dtype"])
@@ -194,6 +405,8 @@ def test_fish_omni_rejects_bad_checkpoint_transactionally(tmp_path, failure):
     with pytest.raises(ValueError):
         stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
     assert all(value.const_value is None for value in unbound)
+    assert not package._native_streaming_source_files
+    assert not package._native_streaming_source_directories
 
 
 def test_fish_omni_fp8_classification():
