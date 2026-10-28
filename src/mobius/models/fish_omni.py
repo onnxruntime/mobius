@@ -9,8 +9,12 @@ policies; the waveform codec is exported independently by mobius.tasks.fish_code
 The caller still formats prompts and orchestrates temporal decoding.
 
 Reduced-precision qualification graphs use portable source-ordered row
-reductions for offset/gated RMS norms. FP32 norms retain their existing graph;
-these scoped substitutions do not open public reduced-precision admission.
+reductions for offset/gated RMS norms and runtime FP32 partial RoPE. FP32
+modules retain their existing graphs; these scoped substitutions do not open
+public reduced-precision admission. Runtime fusion can change RoPE rounding:
+RotaryEmbeddingFusion can re-fuse the expanded graph. CPU component proofs use
+disabled optimization; they do not qualify ORT_ENABLE_ALL. Source-bit
+qualification still requires the exact optimizer/provider/library profile.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from mobius.components import (
     PostGatedRMSNorm,
     Qwen35Attention,
     SoftmaxTopKGate,
+    apply_partial_rotary_pos_emb,
     apply_rotary_pos_emb,
     chunk_gated_delta_rule,
     create_attention_bias,
@@ -76,6 +81,46 @@ def _float32_rope(config: ArchitectureConfig) -> nn.Module:
     for parameter in rope.parameters():
         parameter._keep_float32 = True  # type: ignore[attr-defined]
     return rope
+
+
+class _FishSourceRope(nn.Module):
+    """Backbone FP32 runtime frequencies: reciprocal of a positive power.
+
+    Matches the frequency ordering in FishOmniBackbone at Fish Speech revision
+    541566932abbaebcb0a40e562a1f846738383f38. Input/output shapes are
+    [B,T] positions -> two FP32 [B,T,R/2] cosine/sine tensors.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        assert config.partial_rotary_factor is not None
+        assert config.rope_theta is not None
+        self.width = int(config.head_dim * config.partial_rotary_factor)
+        self.theta = config.rope_theta
+
+    def _inverse_frequency(self, op, theta, exponent):
+        # Reverse division in the pinned Torch source is Reciprocal, not Div.
+        return op.Reciprocal(op.Pow(theta, exponent))
+
+    def forward(self, op, position_ids):
+        exponent = op.Constant(
+            value=ir.tensor(np.arange(0, self.width, 2, dtype=np.float32) / self.width)
+        )
+        shape = op.Concat(op.Shape(position_ids), [self.width // 2], axis=0)
+        # A runtime-shaped theta keeps Pow off the parameter-only CPU folding path.
+        theta = op.Expand(op.Constant(value_float=self.theta), shape)
+        frequency = self._inverse_frequency(op, theta, exponent)
+        angles = op.Mul(
+            op.Unsqueeze(op.Cast(position_ids, to=ir.DataType.FLOAT), [-1]), frequency
+        )
+        return op.Cos(angles), op.Sin(angles)
+
+
+class _FishTowerSourceRope(_FishSourceRope):
+    """Tower frequencies use negative Pow, not the backbone's reciprocal path."""
+
+    def _inverse_frequency(self, op, theta, exponent):
+        return op.Pow(theta, op.Neg(exponent))
 
 
 def _sigmoid_float32(op, value):
@@ -342,6 +387,9 @@ class _FishAttention(Qwen35Attention):
             self.q_norm = norm(config.head_dim, eps=config.rms_norm_eps)
             self.k_norm = norm(config.head_dim, eps=config.rms_norm_eps)
 
+    def _rotate(self, op, value, positions, **kwargs):
+        return _rotate_float32(op, value, positions, **kwargs)
+
     def forward(
         self, op, hidden_states, attention_bias, position_embeddings, past_key_value=None
     ):
@@ -354,7 +402,7 @@ class _FishAttention(Qwen35Attention):
         key = op.Reshape(self.k_proj(op, hidden_states), [0, 0, -1, self.head_dim])
         query = op.Reshape(self.q_norm(op, query), [0, 0, -1])
         key = op.Reshape(self.k_norm(op, key), [0, 0, -1])
-        query = _rotate_float32(
+        query = self._rotate(
             op,
             query,
             position_embeddings,
@@ -362,7 +410,7 @@ class _FishAttention(Qwen35Attention):
             rotary_dim=self.rotary_embedding_dim,
             interleaved=self._rope_interleave,
         )
-        key = _rotate_float32(
+        key = self._rotate(
             op,
             key,
             position_embeddings,
@@ -384,6 +432,19 @@ class _FishAttention(Qwen35Attention):
             dtype=self._compute_dtype,
         )
         return self.o_proj(op, op.Mul(attended, _sigmoid_float32(op, gate))), (pk, pv)
+
+
+class _FishSourceAttention(_FishAttention):
+    def _rotate(self, op, value, positions, *, heads, rotary_dim, interleaved):
+        return apply_partial_rotary_pos_emb(
+            op,
+            value,
+            positions,
+            num_heads=heads,
+            head_dim=self.head_dim,
+            rotary_embedding_dim=rotary_dim,
+            interleaved=interleaved,
+        )
 
 
 class _FishMoEBlock(Qwen35MoEBlock):
@@ -705,7 +766,10 @@ class _FishDecoderLayer(Qwen35MoEDecoderLayer):
                 eps=config.rms_norm_eps,
             )
         else:
-            self.self_attn = _FishAttention(config)
+            attention = (
+                _FishAttention if config.dtype == ir.DataType.FLOAT else _FishSourceAttention
+            )
+            self.self_attn = attention(config)
 
     def forward(
         self,
@@ -752,7 +816,11 @@ class _FishTextModel(Qwen35MoETextModel):
         self.layers = nn.ModuleList(
             [_FishDecoderLayer(config, index) for index in range(config.num_hidden_layers)]
         )
-        self.rotary_emb = _float32_rope(config)
+        self.rotary_emb = (
+            _float32_rope(config)
+            if config.dtype == ir.DataType.FLOAT
+            else _FishSourceRope(config)
+        )
         if config.dtype != ir.DataType.FLOAT:
             self.norm = _fish_offset_norm_class(config)(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -895,6 +963,9 @@ class _TowerAttention(nn.Module):
         self.q_norm = norm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = norm(config.head_dim, eps=config.rms_norm_eps)
 
+    def _rotate(self, op, value, positions, **kwargs):
+        return _rotate_float32(op, value, positions, **kwargs)
+
     def forward(self, op, hidden, bias, positions, past):
         cfg = self.config
         q, gate, k, v = op.Split(
@@ -906,7 +977,7 @@ class _TowerAttention(nn.Module):
         q = self.q_norm(op, op.Reshape(q, [0, 0, -1, cfg.head_dim]))
         k = self.k_norm(op, op.Reshape(k, [0, 0, -1, cfg.head_dim]))
         q, k = op.Reshape(q, [0, 0, -1]), op.Reshape(k, [0, 0, -1])
-        q = _rotate_float32(
+        q = self._rotate(
             op,
             q,
             positions,
@@ -914,7 +985,7 @@ class _TowerAttention(nn.Module):
             rotary_dim=self.rotary_dim,
             interleaved=True,
         )
-        k = _rotate_float32(
+        k = self._rotate(
             op,
             k,
             positions,
@@ -936,6 +1007,19 @@ class _TowerAttention(nn.Module):
             dtype=cfg.dtype,
         )
         return self.wo(op, op.Mul(attended, _sigmoid_float32(op, gate))), (pk, pv)
+
+
+class _FishSourceTowerAttention(_TowerAttention):
+    def _rotate(self, op, value, positions, *, heads, rotary_dim, interleaved):
+        return apply_partial_rotary_pos_emb(
+            op,
+            value,
+            positions,
+            num_heads=heads,
+            head_dim=self.config.head_dim,
+            rotary_embedding_dim=rotary_dim,
+            interleaved=interleaved,
+        )
 
 
 class _FP32OutputLinear(OutputMajorLinear):
@@ -983,7 +1067,10 @@ class _TowerMLP(nn.Module):
 class _TowerTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.attention = _TowerAttention(config)
+        attention = (
+            _TowerAttention if config.dtype == ir.DataType.FLOAT else _FishSourceTowerAttention
+        )
+        self.attention = attention(config)
         norm = _fish_offset_norm_class(config)
         self.attention_norm = norm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = norm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1061,7 +1148,11 @@ class FishOmniAudioDecoder(nn.Module):
                 for _ in range(config.num_codebooks - 1)
             ]
         )
-        self.rotary_emb = _float32_rope(config.tower)
+        self.rotary_emb = (
+            _float32_rope(config.tower)
+            if config.dtype == ir.DataType.FLOAT
+            else _FishTowerSourceRope(tower_config)
+        )
 
     def forward(
         self,
