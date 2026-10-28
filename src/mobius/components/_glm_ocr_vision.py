@@ -319,9 +319,11 @@ class GlmOcrVisionModel(Qwen25VLVisionModel):
             patch_index,
             op.Unsqueeze(patch_counts, [1]),
         )  # [num_images, max_patches]
-        return op.Compress(
+        flat_valid = op.Reshape(valid, [-1])
+        valid_indices = op.Squeeze(op.NonZero(flat_valid), [0])
+        return op.Gather(
             op.Reshape(position_ids, [-1, 2]),
-            op.Reshape(valid, [-1]),
+            valid_indices,
             axis=0,
         )
 
@@ -360,9 +362,12 @@ class GlmOcrVisionModel(Qwen25VLVisionModel):
             frame_shape,
         )  # [num_images, max_temporal]
         valid = op.Less(frame_index, op.Unsqueeze(temporal, [1]))
-        frame_lengths = op.Compress(
+        flat_valid = op.Reshape(valid, [-1])
+        valid_indices = op.Squeeze(op.NonZero(flat_valid), [0])
+        frame_lengths = op.Gather(
             op.Reshape(frame_lengths, [-1]),
-            op.Reshape(valid, [-1]),
+            valid_indices,
+            axis=0,
         )
         cumulative = op.CumSum(frame_lengths, op.Constant(value_int=0))
         return op.Pad(
