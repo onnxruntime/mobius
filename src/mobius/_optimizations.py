@@ -21,8 +21,8 @@ support requires only a new registry entry — no changes to this module.
 Post-weight passes
 ------------------
 :func:`fold_initializers_after_weights` should be called after weights are loaded.
-It lazily folds initializer matrix Transpose and Concat nodes for projection
-packing. Generic Reshape/Transpose layout chains remain explicit.
+It lazily folds initializer Transpose, Concat, and static Reshape/Transpose
+chains, independently of experimental projection packing.
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ __all__ = [
 import contextlib
 import dataclasses
 import logging
+import math
 import warnings
 
 import onnx
@@ -62,6 +63,7 @@ from mobius._flags import flags
 from mobius._passes import (
     FoldConcatInitializersPass,
     FoldTransposedInitializerPass,
+    FoldWeightLayoutPass,
     Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
 )
@@ -795,12 +797,14 @@ def optimize_model(
 
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
-    """Lazily fold initializer matrix Transpose and Concat nodes.
+    """Lazily fold weight Transpose, Concat, and static layout chains.
 
-    Preserve the shipped root Transpose naming convention and fold projection
-    packing to a fixed point. Generic weight layout chains remain explicit.
+    Fold small integer shape expressions first without exposing weight payloads
+    to the general constant folder. Preserve the shipped root Transpose naming
+    convention, then fold layouts and packing to a fixed point.
     """
     common_passes.LiftConstantsToInitializersPass()(model)
+    hidden: dict[ir.Value, ir.TensorProtocol] = {}
     for graph in model.graphs():
         for value in graph.initializers.values():
             tensor = value.const_value
@@ -814,9 +818,29 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
                     model.meta[LAZY_SOURCE_FILES_META_KEY] = frozenset(
                         (*model.meta.get(LAZY_SOURCE_FILES_META_KEY, ()), *source_files)
                     )
+            if tensor is not None and not (
+                tensor.dtype == ir.DataType.INT64
+                and all(isinstance(dim, int) for dim in tensor.shape)
+                and math.prod(tensor.shape.numpy()) <= 8192
+            ):
+                hidden[value] = tensor
+                value.const_value = None
+    try:
+        # Partial evaluators also simplify Identity without reading its input.
+        # In particular, an output Identity transfers its public output name
+        # to the producer value before lazy layout folding. Size limits and
+        # should_fold do not gate those upstream symbolic simplifications.
+        onnxscript.optimizer._constant_folding.FoldConstantsPass(
+            shape_inference=False, input_size_limit=8192, output_size_limit=8192
+        )(model)
+    finally:
+        for value, tensor in hidden.items():
+            value.const_value = tensor
+    common_passes.LiftConstantsToInitializersPass()(model)
     common_passes.RemoveUnusedNodesPass()(model)
     lazy_passes = (
         FoldTransposedInitializerPass(),
+        FoldWeightLayoutPass(),
         FoldConcatInitializersPass(),
     )
     while True:
