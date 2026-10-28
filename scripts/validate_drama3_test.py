@@ -185,17 +185,42 @@ def test_reference_forwards_and_records_generation_limit(tmp_path, monkeypatch, 
         ),
         "fp8_moe": SimpleNamespace(triton=SimpleNamespace(__version__="test")),
     }
-    monkeypatch.setattr(validate_drama3, "ROOT", tmp_path, raising=False)
-    monkeypatch.setattr(validate_drama3, "DTYPE", "f32")
-    monkeypatch.setattr(validate_drama3, "REFERENCE_DEVICES", (0,))
-    monkeypatch.setattr(validate_drama3, "REFERENCE_TOWER_DEVICE", 0)
-    monkeypatch.setattr(validate_drama3, "validate_reference_torch_version", lambda _: None)
-    monkeypatch.setattr(validate_drama3, "load_upstream", lambda: upstream)
-    monkeypatch.setattr(torch, "set_num_threads", Mock())
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
-    kwargs = {} if limit is None else {"max_new_tokens": limit}
-    validate_drama3.reference(tmp_path, **kwargs)
+    original_guard = validate_drama3.validate_reference_torch_version
+    original_matmul, original_cudnn = torch.backends.cuda.matmul, torch.backends.cudnn
+    original_flags = original_matmul.allow_tf32, original_cudnn.allow_tf32
+    environment = {
+        name: os.environ.get(name)
+        for name in (
+            "NVIDIA_TF32_OVERRIDE",
+            "FISH_DRAMA3_FP8_EXPERTS",
+            "FISH_DRAMA3_CUDA_GRAPH",
+        )
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(validate_drama3, "ROOT", tmp_path, raising=False)
+        patch.setattr(validate_drama3, "DTYPE", "f32")
+        patch.setattr(validate_drama3, "REFERENCE_DEVICES", (0,))
+        patch.setattr(validate_drama3, "REFERENCE_TOWER_DEVICE", 0)
+        patch.setattr(validate_drama3, "validate_reference_torch_version", lambda _: None)
+        patch.setattr(validate_drama3, "load_upstream", lambda: upstream)
+        patch.setattr(torch, "set_num_threads", Mock())
+        # Torch exposes these flags dynamically; patch containers, not descriptors.
+        patch.setattr(torch.backends.cuda, "matmul", SimpleNamespace(allow_tf32=True))
+        patch.setattr(torch.backends, "cudnn", SimpleNamespace(allow_tf32=True))
+        for name in environment:
+            patch.setenv(name, "1")
+        kwargs = {} if limit is None else {"max_new_tokens": limit}
+        validate_drama3.reference(tmp_path, **kwargs)
+        assert not torch.backends.cuda.matmul.allow_tf32
+        assert not torch.backends.cudnn.allow_tf32
+        assert all(os.environ[name] == "0" for name in environment)
+    assert validate_drama3.validate_reference_torch_version is original_guard
+    with pytest.raises(RuntimeError, match=r"requires torch==2\.8\.0"):
+        validate_drama3.validate_reference_torch_version("2.7.1")
+    assert torch.backends.cuda.matmul is original_matmul
+    assert torch.backends.cudnn is original_cudnn
+    assert (original_matmul.allow_tf32, original_cudnn.allow_tf32) == original_flags
+    assert {name: os.environ.get(name) for name in environment} == environment
     golden = json.loads((tmp_path / "reference" / "golden.json").read_text())
     assert golden["max_new_tokens"] == requested
     assert len(golden["generated_frames"]) == requested
