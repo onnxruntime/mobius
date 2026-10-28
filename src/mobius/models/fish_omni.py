@@ -26,6 +26,7 @@ from mobius.components import (
     Float32SiLU,
     Linear,
     OffsetRMSNorm,
+    OutputMajorLinear,
     PostGatedRMSNorm,
     Qwen35Attention,
     SoftmaxTopKGate,
@@ -43,10 +44,17 @@ from mobius.generation._fish_omni import (
     sample_codebook_or_greedy,
 )
 from mobius.models.qwen35 import (
+    Qwen35GatedDeltaNet,
     Qwen35MoEBlock,
     Qwen35MoEDecoderLayer,
     Qwen35MoETextModel,
 )
+
+
+def _fish_linear_class(config):
+    # Keep the qualified FP32 projection selection. Reduced-precision source
+    # projections require output-major GEMM rather than folded MatMul.
+    return Linear if config.dtype == ir.DataType.FLOAT else OutputMajorLinear
 
 
 def _float32_rope(config: ArchitectureConfig) -> nn.Module:
@@ -144,7 +152,7 @@ class _FishAttention(Qwen35Attention):
     """Gated GQA with FP32 partial rotation before rounding Q/K back."""
 
     def __init__(self, config):
-        super().__init__(config)
+        super().__init__(config, linear_class=_fish_linear_class(config))
         self._compute_dtype = config.dtype
 
     def forward(
@@ -198,13 +206,16 @@ class _FishMoEBlock(Qwen35MoEBlock):
         if gate is None:
             assert config.num_local_experts is not None
             assert config.num_experts_per_tok is not None
-            gate = _FishRouter(
+            router = (
+                _FishRouter if config.dtype == ir.DataType.FLOAT else _FishOutputMajorRouter
+            )
+            gate = router(
                 config.hidden_size,
                 config.num_local_experts,
                 config.num_experts_per_tok,
                 norm_topk_prob=config.norm_topk_prob,
             )
-        super().__init__(config, gate=gate)
+        super().__init__(config, gate=gate, linear_class=_fish_linear_class(config))
         self.packed_experts = (
             _FishFP8Experts(config) if config.native_fp8_experts else _FishExperts(config)
         )
@@ -456,8 +467,11 @@ class _FishExpertBank(nn.Module):
 
 
 class _FishRouter(SoftmaxTopKGate):
+    def _project_logits(self, op, hidden_states):
+        return op.MatMul(hidden_states, op.Transpose(self.weight, perm=[1, 0]))
+
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        logits = op.MatMul(hidden_states, op.Transpose(self.weight, perm=[1, 0]))
+        logits = self._project_logits(op, hidden_states)
         probabilities = op.Softmax(op.Cast(logits, to=ir.DataType.FLOAT), axis=-1)
         weights, indices = op.TopK(
             probabilities, op.Constant(value_ints=[self.top_k]), axis=-1, _outputs=2
@@ -467,20 +481,31 @@ class _FishRouter(SoftmaxTopKGate):
         return op.CastLike(weights, hidden_states), indices, logits
 
 
+class _FishOutputMajorRouter(_FishRouter):
+    """Source-layout router without adding a checkpoint weight-name segment."""
+
+    def _project_logits(self, op, hidden_states):
+        width, hidden = (int(dim) for dim in self.weight.shape)
+        projected = op.Gemm(
+            op.Reshape(hidden_states, op.Constant(value_ints=[-1, hidden])),
+            self.weight,
+            transB=1,
+        )
+        projected.shape = ir.Shape([None, width])
+        shape = op.Concat(
+            op.Shape(hidden_states, end=-1), op.Constant(value_ints=[width]), axis=0
+        )
+        return op.Reshape(projected, shape, allowzero=1)
+
+
 class _FishDecoderLayer(Qwen35MoEDecoderLayer):
     def __init__(self, config, layer_idx):
         super().__init__(config, layer_idx)
         self._compute_dtype = config.dtype
-        self.mlp = _FishMoEBlock(
-            config,
-            gate=_FishRouter(
-                config.hidden_size,
-                config.num_local_experts,
-                config.num_experts_per_tok,
-                norm_topk_prob=config.norm_topk_prob,
-            ),
-        )
+        self.mlp = _FishMoEBlock(config)
         if self.layer_type == "linear_attention":
+            if config.dtype != ir.DataType.FLOAT:
+                self.linear_attn = Qwen35GatedDeltaNet(config, linear_class=OutputMajorLinear)
             self.linear_attn.norm = _FishGatedNorm(
                 config.linear_value_head_dim,
                 eps=config.rms_norm_eps,
@@ -528,7 +553,7 @@ class FishOmniBackbone(nn.Module):
         self.model = _FishTextModel(config)
         # The released head exceeds ORT's 1 GiB constant-folding limit;
         # retain output-major storage instead of transposing 2 GiB every step.
-        self.lm_head = _OutputMajorLinear(config.hidden_size, config.vocab_size)
+        self.lm_head = OutputMajorLinear(config.hidden_size, config.vocab_size, bias=False)
         self._compute_dtype = config.dtype
 
     def forward(self, op, inputs_embeds, attention_mask, position_ids, past_key_values):
@@ -598,8 +623,9 @@ class _TowerAttention(nn.Module):
         self.rotary_dim = int(config.head_dim * config.partial_rotary_factor)
         self.q_width = config.num_attention_heads * config.head_dim
         self.kv_width = config.num_key_value_heads * config.head_dim
-        self.wqkv = Linear(config.hidden_size, 2 * (self.q_width + self.kv_width), bias=False)
-        self.wo = Linear(self.q_width, config.hidden_size, bias=False)
+        linear = _fish_linear_class(config)
+        self.wqkv = linear(config.hidden_size, 2 * (self.q_width + self.kv_width), bias=False)
+        self.wo = linear(self.q_width, config.hidden_size, bias=False)
         # Released configs say attention_qk_norm=False, but the trained tower
         # always uses zero-centered per-head Q/K norms (Fish Speech TowerAttention).
         self.q_norm = OffsetRMSNorm(config.head_dim, eps=config.rms_norm_eps)
@@ -648,29 +674,11 @@ class _TowerAttention(nn.Module):
         return self.wo(op, op.Mul(attended, _sigmoid_float32(op, gate))), (pk, pv)
 
 
-class _OutputMajorLinear(Linear):
-    """Keep the source's physical [out, in] weight layout in a 2-D GEMM."""
+class _FP32OutputLinear(OutputMajorLinear):
+    """Native FP16-input GEMM with FP32 output, without promoting the weight bank."""
 
     def __init__(self, in_features, out_features):
         super().__init__(in_features, out_features, bias=False)
-        self.in_features, self.out_features = in_features, out_features
-
-    def forward(self, op, hidden):
-        projected = self._project(op, op.Reshape(hidden, [-1, self.in_features]))
-        projected.shape = ir.Shape([None, self.out_features])
-        shape = op.Concat(
-            op.Shape(hidden, end=-1), op.Constant(value_ints=[self.out_features]), axis=0
-        )
-        return op.Reshape(projected, shape)
-
-    def _project(self, op, hidden):
-        # A folded Transpose + MatMul changes CUDA's accumulation order;
-        # a single BF16 rounding difference can amplify in the next tower layer.
-        return op.Gemm(hidden, self.weight, transB=1)
-
-
-class _FP32OutputLinear(_OutputMajorLinear):
-    """Native FP16-input GEMM with FP32 output, without promoting the weight bank."""
 
     def _project(self, op, hidden):
         projected = op.GemmFloat8(
@@ -690,12 +698,15 @@ class _FP32OutputLinear(_OutputMajorLinear):
 class _TowerMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.w1 = Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.w3 = Linear(config.hidden_size, config.intermediate_size, bias=False)
+        linear = _fish_linear_class(config)
+        self.w1 = linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.w3 = linear(config.hidden_size, config.intermediate_size, bias=False)
         if config.dtype == ir.DataType.FLOAT16:
             self.w2 = _FP32OutputLinear(config.intermediate_size, config.hidden_size)
         elif config.dtype == ir.DataType.BFLOAT16:
-            self.w2 = _OutputMajorLinear(config.intermediate_size, config.hidden_size)
+            self.w2 = OutputMajorLinear(
+                config.intermediate_size, config.hidden_size, bias=False
+            )
         else:
             self.w2 = Linear(config.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = Float32SiLU()
@@ -740,7 +751,9 @@ class _TowerLayer(nn.Module):
             self.codebook_embedding = Embedding(config.vocab_size, config.hidden_size)
         self.enorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.eh_proj = Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.eh_proj = _fish_linear_class(config)(
+            2 * config.hidden_size, config.hidden_size, bias=False
+        )
         self.transformer_layer = _TowerTransformer(config)
         self.final_layernorm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -776,7 +789,9 @@ class FishOmniAudioDecoder(nn.Module):
         )
         self.codebook_heads = nn.ModuleList(
             [
-                Linear(config.hidden_size, config.tower.vocab_size, bias=False)
+                _fish_linear_class(config)(
+                    config.hidden_size, config.tower.vocab_size, bias=False
+                )
                 for _ in range(config.num_codebooks - 1)
             ]
         )
