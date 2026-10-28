@@ -127,15 +127,72 @@ graph metadata requires them. This harness does not lower/rewrite graphs.
 
 The immutable DATA manifest has **no independent waveform oracle**. This harness
 executes the actual-frame FP32 codec and checks dtype, shape, finite samples,
-duration and hashes; it does **not** compare that waveform numerically against an
-independently invoked source CPU codec. Reports therefore always mark
-`codec_numerical_quality.status` as `UNVERIFIED` and list the independent FP32
-waveform numerical-quality gate as blocked. Even if neural and performance
-checks pass (`native_cuda13_neural_and_performance_gates_passed`),
+duration and hashes. Without the optional independent reference below, reports
+mark `codec_numerical_quality.status` as `UNVERIFIED` and list the independent
+FP32 waveform numerical-quality gate as blocked. Even if neural and performance
+checks pass (`native_cuda13_neural_and_performance_gates_passed`), root
 `native_cuda13_acceptance` remains false. A report `status: passed` describes
-only the checks this consumer actually performed, not full codec/root quality.
-Independent codec quality remains a separate qualification; this change does
-not collect a new reference, change an oracle, or substitute source frames.
+only performed checks, not a missing codec qualification.
+
+An optional `waveform_reference` in the **separately hash-pinned selection**
+provides an independent reference provenance JSON descriptor:
+
+```json
+{
+  "waveform_reference": {
+    "path": "<independent-waveform-provenance.json>",
+    "sha256": "<out-of-band provenance manifest SHA256>"
+  }
+}
+```
+
+The provenance JSON must contain:
+
+```json
+{
+  "schema_version": 1,
+  "checkpoint_revision": "b2b5ee998034b2975720906c815e7fb0e9f007bd",
+  "source_revision": "541566932abbaebcb0a40e562a1f846738383f38",
+  "codec_revision": "b2b5ee998034b2975720906c815e7fb0e9f007bd",
+  "collector": {"path": "<independent CPU collector>", "sha256": "<SHA256>"},
+  "source_device": "cpu",
+  "independent_source_invocation": true,
+  "source_command": ["<source CPU python>", "<collector>", "<recorded arguments>"],
+  "frames_sha256": "<actual target-generated INT64 frame bytes SHA256>",
+  "frames_shape": [100, 11],
+  "frames_dtype": "int64",
+  "dtype": "float32",
+  "sample_rate": 44100,
+  "samples_per_frame": 2048,
+  "waveform": {"path": "<independent-waveform.npz>", "sha256": "<SHA256>"}
+}
+```
+
+The NPZ contains only the `waveform` array. The reference producer runs an
+independently invoked source CPU codec in a **separate process**, later, using
+the actual captured target frames; it must not import Torch into the CUDA 13
+target process. That producer owns truthful source/collector/checkpoint pins
+and independence provenance. The consumer verifies the pinned declaration and
+files, not the historical process itself, and never executes the collector.
+No reference generation, trained weights or source arrays are added to this
+repository, and no existing oracle is overwritten.
+
+The target codec still receives only actual generated codes. Expected samples
+reach only the comparator. A supplied malformed, stale, differently generated,
+wrong-codec, or failed numerical reference is an explicit failure, never an
+unverified success. The codec graph's actual `codec_revision` metadata must
+match the independent provenance. Manifest/NPZ/collector hashes and actual
+frame dtype/shape/bytes, 44100Hz and hop 2048 are checked.
+
+Both expected and actual must be finite FP32 `[1,1,frames*2048]`, expected RMS
+must exceed `1e-3`, and the existing frozen waveform gate is unchanged:
+`np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=1e-3)`.
+RMSE/SNR are reported only, with no added threshold (exact match reports SNR
+as `"infinity"`). The independently referenced audit waveform and measured
+waveform must both pass for a benchmark root pass. A verified codec comparison
+cannot bypass actual CUDA 13 identity, neural/raw-bit audit, non-instrumented
+performance, leased ownership, frame count or RTF <= 1.0 requirements. CPU/mock
+comparison tests do not qualify real checkpoint or CUDA 13 waveform parity.
 
 Use `--diagnostics` for a separate, explicitly **unqualified** evidence run.
 ORT saves its actual optimized graph for each component under the new output

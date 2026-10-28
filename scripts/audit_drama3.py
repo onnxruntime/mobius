@@ -624,6 +624,110 @@ def decode_waveform(session, frames):
     return waveform, elapsed
 
 
+def load_waveform_reference(profile):
+    """Read an optional independent CPU reference; never execute its collector."""
+    descriptor = profile.get("waveform_reference")
+    if descriptor is None:
+        return None
+    require_reference_descriptor(descriptor)
+    provenance = checked_json(descriptor["path"], descriptor["sha256"])
+    if not isinstance(provenance, dict):
+        raise TypeError("Independent waveform provenance must be a JSON object")
+    required = {
+        "schema_version",
+        "checkpoint_revision",
+        "source_revision",
+        "codec_revision",
+        "collector",
+        "source_device",
+        "independent_source_invocation",
+        "source_command",
+        "frames_sha256",
+        "frames_shape",
+        "frames_dtype",
+        "dtype",
+        "sample_rate",
+        "samples_per_frame",
+        "waveform",
+    }
+    if not required <= provenance.keys():
+        raise ValueError(f"Missing waveform provenance fields: {required - provenance.keys()}")
+    if (
+        provenance["schema_version"] != 1
+        or provenance["checkpoint_revision"] != CHECKPOINT
+        or provenance["source_revision"] != SOURCE
+        or provenance["codec_revision"] != CHECKPOINT
+        or provenance["source_device"] != "cpu"
+        or provenance["independent_source_invocation"] is not True
+        or not isinstance(provenance["source_command"], list)
+        or not provenance["source_command"]
+        or not all(isinstance(arg, str) and arg for arg in provenance["source_command"])
+        or provenance["dtype"] != "float32"
+        or provenance["frames_dtype"] != "int64"
+        or provenance["sample_rate"] != 44100
+        or provenance["samples_per_frame"] != 2048
+    ):
+        raise ValueError("Invalid independent CPU waveform provenance contract")
+    for key in ("collector", "waveform"):
+        require_reference_descriptor(provenance[key])
+        checked_file(provenance[key])
+    return provenance
+
+
+def require_reference_descriptor(descriptor):
+    if not isinstance(descriptor, dict) or not {"path", "sha256"} <= descriptor.keys():
+        raise ValueError("Waveform/collector provenance requires path and SHA256")
+
+
+def compare_waveform(actual, frames, provenance, reference_descriptor, *, codec_revision):
+    """Apply the existing frozen FP32 waveform gates to actual target-frame audio."""
+    if (
+        codec_revision != provenance["codec_revision"]
+        or frames.dtype != np.int64
+        or list(frames.shape) != provenance["frames_shape"]
+        or hashlib.sha256(frames.tobytes()).hexdigest() != provenance["frames_sha256"]
+    ):
+        raise ValueError("Waveform reference codec revision or actual target frames differ")
+    checked_file(provenance["collector"])
+    path = checked_file(provenance["waveform"])
+    with np.load(path, allow_pickle=False) as arrays:
+        if arrays.files != ["waveform"]:
+            raise ValueError("Independent waveform NPZ must contain only 'waveform'")
+        expected = arrays["waveform"]
+    shape = (1, 1, len(frames) * 2048)
+    if (
+        expected.dtype != np.float32
+        or actual.dtype != np.float32
+        or expected.shape != shape
+        or actual.shape != shape
+        or not np.isfinite(expected).all()
+        or not np.isfinite(actual).all()
+    ):
+        raise ValueError("Waveform comparison requires finite FP32 [1,1,frames*2048]")
+    expected_rms = float(np.sqrt(np.mean(expected**2)))
+    if not expected_rms > 1e-3:
+        raise ValueError("Independent source waveform RMS must exceed 1e-3")
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=1e-3)
+    error = actual.astype(np.float64) - expected
+    mse = float(np.mean(error**2))
+    power = float(np.mean(expected.astype(np.float64) ** 2))
+    # SNR/RMSE are diagnostics only; exact equality has infinite SNR.
+    return {
+        "status": "VERIFIED",
+        "independent_waveform_reference": reference_descriptor,
+        "provenance": provenance,
+        "target_frames_sha256": provenance["frames_sha256"],
+        "shape": list(shape),
+        "dtype": "float32",
+        "atol": 1e-4,
+        "rtol": 1e-3,
+        "expected_rms": expected_rms,
+        "max_abs": float(np.max(np.abs(error))),
+        "rmse": float(np.sqrt(mse)),
+        "snr_db": float(10 * np.log10(power / mse)) if mse else "infinity",
+    }
+
+
 def validate_ownership(snapshots, uuid):
     if any(item["uuid"] != uuid or item["foreign_pids"] for item in snapshots):
         raise RuntimeError(
@@ -688,6 +792,7 @@ def run(args):
     if args.warmup < 1:
         raise ValueError("At least one complete warmup request is required")
     verify_artifacts(profile)
+    waveform_reference = load_waveform_reference(profile)
     # Refuse overwrites, including a report path beneath any read-only input root.
     output = args.output.resolve()
     inputs = [
@@ -701,6 +806,14 @@ def run(args):
         inputs.extend(
             Path(item["path"]).resolve()
             for item in [component["graph"], *component["external_data"]]
+        )
+    if waveform_reference is not None:
+        inputs.extend(
+            [
+                Path(profile["waveform_reference"]["path"]).resolve(),
+                checked_file(waveform_reference["collector"]),
+                checked_file(waveform_reference["waveform"]),
+            ]
         )
     if any(output == path or path.parent in output.parents for path in inputs):
         raise ValueError("Output root must be separate from read-only input directories")
@@ -717,10 +830,12 @@ def run(args):
         "reference_environment": golden["reference_environment"],
         "native_cuda13_acceptance": False,
         "codec_numerical_quality": {
-            "status": "UNVERIFIED",
-            "independent_waveform_reference": None,
+            "status": "PENDING" if waveform_reference is not None else "UNVERIFIED",
+            "independent_waveform_reference": profile.get("waveform_reference"),
             "reason": (
-                "The immutable neural DATA manifest contains no waveform oracle. "
+                "Supplied independent CPU waveform reference has not yet been compared."
+                if waveform_reference is not None
+                else "The immutable neural DATA manifest contains no waveform oracle. "
                 "Codec execution, finite output, duration and hash do not establish "
                 "independent FP32 waveform numerical parity."
             ),
@@ -745,6 +860,15 @@ def run(args):
         del report["audit_progress"]
         np.testing.assert_array_equal(frames, golden["generated_frames"])
         waveform, _ = decode_waveform(sessions["codec"], frames)
+        if waveform_reference is not None:
+            codec_metadata = sessions["codec"].session.get_modelmeta().custom_metadata_map
+            report["codec_numerical_quality"] = compare_waveform(
+                waveform,
+                frames,
+                waveform_reference,
+                profile["waveform_reference"],
+                codec_revision=codec_metadata.get("codec_revision"),
+            )
         report["runtime_after_audit"] = runtime_identity(profile)
         report["generated_frames_sha256"] = hashlib.sha256(frames.tobytes()).hexdigest()
         report["waveform_sha256"] = hashlib.sha256(waveform.tobytes()).hexdigest()
@@ -758,10 +882,18 @@ def run(args):
                 snapshots.append(gpu_snapshot(profile["device_id"]))
                 validate_ownership(snapshots, profile["gpu_uuid"])
             measured, timing = request(sessions, config, prompt, golden["attempted_frames"])
-            _, codec_seconds = decode_waveform(sessions["codec"], measured)
+            measured_waveform, codec_seconds = decode_waveform(sessions["codec"], measured)
             if profile["device"] == "cuda":
                 snapshots.append(gpu_snapshot(profile["device_id"]))
             np.testing.assert_array_equal(measured, frames)
+            if waveform_reference is not None:
+                report["measured_codec_numerical_quality"] = compare_waveform(
+                    measured_waveform,
+                    measured,
+                    waveform_reference,
+                    profile["waveform_reference"],
+                    codec_revision=codec_metadata.get("codec_revision"),
+                )
             report["performance"] = performance_result(
                 timing,
                 codec_seconds,
@@ -777,10 +909,16 @@ def run(args):
         verify_artifacts(profile)
         if args.diagnostics:
             report["diagnostics"] = collect_evidence(sessions, evidence_root)
+        if waveform_reference is not None:
+            checked_file(profile["waveform_reference"])
+            checked_file(waveform_reference["collector"])
+            checked_file(waveform_reference["waveform"])
         report["status"] = "passed"
         finish_acceptance(report, benchmark=args.benchmark)
     except (ValueError, RuntimeError, AssertionError, OSError, FloatingPointError) as error:
         report["error"] = f"{type(error).__name__}: {error}"
+        if report["codec_numerical_quality"]["status"] == "PENDING":
+            report["codec_numerical_quality"]["status"] = "FAILED"
         raise
     finally:
         with (output / "report.json").open("x") as stream:
@@ -790,16 +928,27 @@ def run(args):
 
 
 def finish_acceptance(report, *, benchmark):
-    """Keep passing neural/timing checks separate from the missing codec quality gate."""
+    """Require independent codec parity in addition to qualified neural/timing gates."""
     report["native_cuda13_neural_and_performance_gates_passed"] = (
         benchmark
         and report["performance"]["measurement_qualified"]
         and report["performance"]["meets_end_to_end_rtf_target"] is True
     )
-    # This consumer has no independent waveform-reference comparison contract.
-    # Neither a selected graph hash nor successful codec execution closes it.
-    report["native_cuda13_acceptance"] = False
-    report["blocked_acceptance_gates"] = ["independent_fp32_codec_waveform_numerical_quality"]
+    codec_verified = report["codec_numerical_quality"]["status"] == "VERIFIED"
+    measured_codec_verified = (
+        not benchmark
+        or report.get("measured_codec_numerical_quality", {}).get("status") == "VERIFIED"
+    )
+    report["native_cuda13_acceptance"] = (
+        report["native_cuda13_neural_and_performance_gates_passed"]
+        and codec_verified
+        and measured_codec_verified
+    )
+    report["blocked_acceptance_gates"] = (
+        []
+        if codec_verified and measured_codec_verified
+        else ["independent_fp32_codec_waveform_numerical_quality"]
+    )
 
 
 def fail_rtf():

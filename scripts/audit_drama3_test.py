@@ -23,9 +23,11 @@ from audit_drama3 import (
     SOURCE,
     ReferenceAudit,
     checked_file,
+    compare_waveform,
     digest,
     finish_acceptance,
     load_inputs,
+    load_waveform_reference,
     performance_result,
     validate_ownership,
     validate_profile,
@@ -185,7 +187,11 @@ def consumer(tmp_path):
         paths["codec"],
         [("codes", i64, [1, 2, t])],
         codec,
-        metadata={"sample_rate": "44100", "samples_per_frame": "2048"},
+        metadata={
+            "sample_rate": "44100",
+            "samples_per_frame": "2048",
+            "codec_revision": CHECKPOINT,
+        },
     )
     # Independent NumPy expectations: no output/cache from a target session is
     # used to build the fixture. The second prompt/frame differs from the first.
@@ -380,6 +386,197 @@ assert result['native_cuda13_acceptance'] is False
         "--raw-bits",
         *extra,
     )
+
+
+@pytest.fixture
+def waveform_reference(consumer):
+    import hashlib
+
+    frames = np.asarray(consumer.golden["generated_frames"], np.int64)
+    expected = np.repeat(frames[:, 1:].sum(-1).astype(np.float32), 2048)[None, None]
+    reference = consumer.assets / "independent-waveform.npz"
+    np.savez(reference, waveform=expected)
+    collector = consumer.assets / "synthetic-collector.py"
+    collector.write_text("# Synthetic CPU fixture provenance; never executed by consumer.\n")
+    provenance = {
+        "schema_version": 1,
+        "checkpoint_revision": CHECKPOINT,
+        "source_revision": SOURCE,
+        "codec_revision": CHECKPOINT,
+        "collector": descriptor(collector),
+        "source_device": "cpu",
+        "independent_source_invocation": True,
+        "source_command": ["python", str(collector), "--cpu"],
+        "frames_sha256": hashlib.sha256(frames.tobytes()).hexdigest(),
+        "frames_shape": list(frames.shape),
+        "frames_dtype": "int64",
+        "dtype": "float32",
+        "sample_rate": 44100,
+        "samples_per_frame": 2048,
+        "waveform": descriptor(reference),
+    }
+    manifest = consumer.assets / "independent-waveform-provenance.json"
+    manifest.write_text(json.dumps(provenance))
+    consumer.profile["waveform_reference"] = descriptor(manifest)
+    consumer.selection.write_text(json.dumps(consumer.profile))
+    return SimpleNamespace(
+        consumer=consumer,
+        manifest=manifest,
+        provenance=provenance,
+        frames=frames,
+        expected=expected,
+        reference=reference,
+        collector=collector,
+    )
+
+
+def test_independent_waveform_reference_is_read_only_expectation_in_blocked_process(
+    waveform_reference, tmp_path
+):
+    fixture = waveform_reference
+    before = {
+        path: digest(path) for path in (fixture.manifest, fixture.reference, fixture.collector)
+    }
+    completed = execute_consumer(
+        fixture.consumer, tmp_path / "with-waveform", "--benchmark", "--warmup", "1"
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads((tmp_path / "with-waveform" / "report.json").read_text())
+    assert report["codec_numerical_quality"]["status"] == "VERIFIED"
+    assert report["measured_codec_numerical_quality"]["status"] == "VERIFIED"
+    assert report["codec_numerical_quality"]["snr_db"] == "infinity"
+    assert report["blocked_acceptance_gates"] == []
+    assert report["native_cuda13_acceptance"] is False  # CPU cannot qualify native gates.
+    assert {path: digest(path) for path in before} == before
+    np.testing.assert_array_equal(
+        np.load(tmp_path / "with-waveform" / "waveform.npy"), fixture.expected
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "source",
+        "codec",
+        "checkpoint",
+        "collector-hash",
+        "waveform-hash",
+        "source-device",
+        "independence",
+        "command",
+        "sample-rate",
+        "hop",
+        "dtype",
+        "frames-dtype",
+    ],
+)
+def test_waveform_provenance_rejects_missing_or_inconsistent_pins(
+    waveform_reference, mutation
+):
+    fixture = waveform_reference
+    value = copy.deepcopy(fixture.provenance)
+    if mutation == "missing":
+        del value["collector"]
+    elif mutation in ("source", "codec", "checkpoint"):
+        value[mutation + "_revision"] = "0" * 40
+    elif mutation in ("collector-hash", "waveform-hash"):
+        value[mutation.split("-")[0]]["sha256"] = "0" * 64
+    else:
+        key, invalid = {
+            "source-device": ("source_device", "cuda"),
+            "independence": ("independent_source_invocation", False),
+            "command": ("source_command", []),
+            "sample-rate": ("sample_rate", 24000),
+            "hop": ("samples_per_frame", 512),
+            "dtype": ("dtype", "float16"),
+            "frames-dtype": ("frames_dtype", "int32"),
+        }[mutation]
+        value[key] = invalid
+    fixture.manifest.write_text(json.dumps(value))
+    fixture.consumer.profile["waveform_reference"] = descriptor(fixture.manifest)
+    with pytest.raises(ValueError):
+        load_waveform_reference(fixture.consumer.profile)
+
+
+def test_waveform_provenance_manifest_hash_is_verified(waveform_reference):
+    fixture = waveform_reference
+    fixture.manifest.write_text("{}")
+    with pytest.raises(ValueError, match="SHA256"):
+        load_waveform_reference(fixture.consumer.profile)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["frames", "codec", "shape", "dtype", "nan", "rms", "numerical", "npz-key"]
+)
+def test_independent_waveform_comparison_rejects_wrong_expected_data(
+    waveform_reference, mutation
+):
+    fixture = waveform_reference
+    provenance = copy.deepcopy(fixture.provenance)
+    expected = fixture.expected.copy()
+    codec_revision = CHECKPOINT
+    if mutation == "frames":
+        provenance["frames_sha256"] = "0" * 64
+    elif mutation == "codec":
+        codec_revision = "0" * 40
+    elif mutation == "shape":
+        expected = expected[..., :-1]
+    elif mutation == "dtype":
+        expected = expected.astype(np.float64)
+    elif mutation == "nan":
+        expected.flat[0] = np.nan
+    elif mutation == "rms":
+        expected.fill(0)
+    elif mutation == "numerical":
+        expected += 1
+    np.savez(
+        fixture.reference,
+        **{"incorrect" if mutation == "npz-key" else "waveform": expected},
+    )
+    provenance["waveform"] = descriptor(fixture.reference)
+    with pytest.raises((ValueError, AssertionError)):
+        compare_waveform(
+            fixture.expected,
+            fixture.frames,
+            provenance,
+            fixture.consumer.profile["waveform_reference"],
+            codec_revision=codec_revision,
+        )
+
+
+def test_failed_waveform_gate_does_not_replace_target_audio(waveform_reference, tmp_path):
+    fixture = waveform_reference
+    # Wrong but non-silent independent expectation; neural/frame expectations are unchanged.
+    np.savez(fixture.reference, waveform=fixture.expected + 1)
+    fixture.provenance["waveform"] = descriptor(fixture.reference)
+    fixture.manifest.write_text(json.dumps(fixture.provenance))
+    fixture.consumer.profile["waveform_reference"] = descriptor(fixture.manifest)
+    fixture.consumer.selection.write_text(json.dumps(fixture.consumer.profile))
+    completed = execute_consumer(fixture.consumer, tmp_path / "bad-waveform")
+    assert completed.returncode != 0
+    report = json.loads((tmp_path / "bad-waveform" / "report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["codec_numerical_quality"]["status"] == "FAILED"
+    assert report["native_cuda13_acceptance"] is False
+    assert "AssertionError" in report["error"]
+
+
+def test_waveform_metrics_use_only_existing_allclose_gate(waveform_reference):
+    fixture = waveform_reference
+    actual = fixture.expected + np.float32(0.00005)
+    result = compare_waveform(
+        actual,
+        fixture.frames,
+        fixture.provenance,
+        fixture.consumer.profile["waveform_reference"],
+        codec_revision=CHECKPOINT,
+    )
+    assert result["status"] == "VERIFIED"
+    assert result["rmse"] > 0
+    assert np.isfinite(result["snr_db"])
+    assert result["atol"] == pytest.approx(1e-4)
+    assert result["rtol"] == pytest.approx(1e-3)
 
 
 def test_actual_cpu_chain_in_fresh_framework_blocked_process(consumer, tmp_path):
@@ -659,6 +856,53 @@ def test_passing_neural_and_performance_gates_cannot_qualify_missing_codec_oracl
     assert report["blocked_acceptance_gates"] == [
         "independent_fp32_codec_waveform_numerical_quality"
     ]
+
+
+@pytest.mark.parametrize("neural_performance", [False, True])
+@pytest.mark.parametrize("codec", ["UNVERIFIED", "VERIFIED"])
+@pytest.mark.parametrize("measured_codec", ["UNVERIFIED", "VERIFIED"])
+def test_root_acceptance_requires_both_waveform_comparisons_and_all_native_gates(
+    neural_performance, codec, measured_codec
+):
+    report = {
+        "performance": {
+            "measurement_qualified": neural_performance,
+            "meets_end_to_end_rtf_target": neural_performance,
+        },
+        "codec_numerical_quality": {"status": codec},
+        "measured_codec_numerical_quality": {"status": measured_codec},
+    }
+    finish_acceptance(report, benchmark=True)
+    assert report["native_cuda13_acceptance"] is (
+        neural_performance and codec == "VERIFIED" and measured_codec == "VERIFIED"
+    )
+
+
+@pytest.mark.parametrize("gate", ["all", "cpu", "short", "not-raw", "instrumented", "slow"])
+def test_verified_codec_does_not_bypass_native_performance_controls(gate):
+    count = 49 if gate == "short" else 100
+    timing = {
+        "frame_seconds": [0.001] * count,
+        "token_pipeline_seconds": 10.0 if gate == "slow" else 0.11,
+        "prefill_seconds": 0.01,
+        "first_frame_seconds": 0.011,
+    }
+    performance = performance_result(
+        timing,
+        0.01,
+        np.zeros((count, 3), np.int64),
+        [{"uuid": "GPU-owned", "foreign_pids": []} for _ in range(3)],
+        {"device": "cpu" if gate == "cpu" else "cuda", "gpu_uuid": "GPU-owned"},
+        {"raw_bits_required": gate != "not-raw"},
+        instrumented=gate == "instrumented",
+    )
+    report = {
+        "performance": performance,
+        "codec_numerical_quality": {"status": "VERIFIED"},
+        "measured_codec_numerical_quality": {"status": "VERIFIED"},
+    }
+    finish_acceptance(report, benchmark=True)
+    assert report["native_cuda13_acceptance"] is (gate == "all")
 
 
 def test_missing_weights_fail_explicitly(consumer):
