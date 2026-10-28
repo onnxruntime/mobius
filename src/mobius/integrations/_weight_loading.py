@@ -497,6 +497,17 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
     return {k: v for k, v in result.items() if not any(k.endswith(s) for s in aux_suffixes)}
 
 
+def _lazy_safetensors_source_parent_aliases(paths: list[str]) -> frozenset[pathlib.Path]:
+    """Return both directory identities from which lazy shards may be read."""
+    # HF snapshots can contain shard symlinks into the blob cache. Resolving
+    # the parent preserves the snapshot directory, while resolving the whole
+    # shard path follows the symlink and identifies the blob directory.
+    return frozenset(
+        {pathlib.Path(path).parent.resolve() for path in paths}
+        | {pathlib.Path(path).resolve().parent for path in paths}
+    )
+
+
 def _resolve_shard_paths(model_id: str, revision: str | None = None) -> list[str]:
     """Resolve local safetensors shard paths for the streaming loader.
 
