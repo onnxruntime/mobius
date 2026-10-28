@@ -287,12 +287,36 @@ def load_sessions(profile, *, evidence_root=None):
         .session.get_modelmeta()
         .custom_metadata_map.get("mobius.required_runtime_features", "")
     )
-    experts = "dynamic_fp8" if "activation_quantization=dynamic_fp8" in features else "dense"
+    decoder_metadata = sessions["decoder"].session.get_modelmeta().custom_metadata_map
+    experts = expert_execution(features, decoder_metadata.get("mobius.weight_loading"))
     if experts != profile["expert_execution"]:
         raise ValueError("Actual decoder expert execution differs from selected profile")
     if {port.name for port in sessions["main_policy"].session.get_inputs()} != {"logits"}:
         raise ValueError("Greedy main policy must be the existing saved logits-only graph")
     return sessions
+
+
+def expert_execution(features, weight_loading=None):
+    """Recognize explicit dynamic-FP8 contracts, not generic QMoE availability."""
+    contracts = {feature.strip() for feature in features.split(";")}
+    if "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]" in contracts:
+        if weight_loading is None:
+            raise ValueError("Compatible QMoE requires dynamic-FP8 weight-loading provenance")
+        loading = json.loads(weight_loading)
+        expected = {
+            "format": "mobius.weight-loading-report.v1",
+            "architecture": "fish_omni",
+            "activation_quantization": "dynamic_fp8",
+            "native_fp8": True,
+            "output_weight_format": "mixed-block-fp8-128",
+            "revision": CHECKPOINT,
+        }
+        if not isinstance(loading, dict) or any(
+            loading.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError("Compatible QMoE weight-loading semantics do not match")
+        return "dynamic_fp8"
+    return "dynamic_fp8" if "activation_quantization=dynamic_fp8" in contracts else "dense"
 
 
 def collect_evidence(sessions, root):

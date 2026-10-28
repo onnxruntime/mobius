@@ -25,8 +25,10 @@ from audit_drama3 import (
     checked_file,
     compare_waveform,
     digest,
+    expert_execution,
     finish_acceptance,
     load_inputs,
+    load_sessions,
     load_waveform_reference,
     performance_result,
     validate_ownership,
@@ -46,6 +48,118 @@ from onnxscript import GraphBuilder
 
 def descriptor(path):
     return {"path": str(path), "sha256": digest(path), "bytes": path.stat().st_size}
+
+
+@pytest.mark.parametrize(
+    "features,expected",
+    [
+        ("", "dense"),
+        ("com.microsoft::QMoE", "dense"),
+        ("com.microsoft::QMoE[fp8_execution_profile=native]", "dense"),
+        ("activation_quantization=dynamic_fp8", "dynamic_fp8"),
+        (
+            (
+                "CUDA13.0; SM90; com.microsoft::CausalRightAttention; "
+                "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]; "
+                "com.microsoft::UnitLowerTriangularSolve"
+            ),
+            "dynamic_fp8",
+        ),
+        ("unrelated_activation_quantization=dynamic_fp8", "dense"),
+    ],
+)
+def test_expert_execution_recognizes_exact_candidate_and_legacy_contracts(features, expected):
+    assert expert_execution(features, json.dumps(candidate_loading())) == expected
+
+
+def candidate_loading():
+    return {
+        "format": "mobius.weight-loading-report.v1",
+        "architecture": "fish_omni",
+        "activation_quantization": "dynamic_fp8",
+        "native_fp8": True,
+        "output_weight_format": "mixed-block-fp8-128",
+        "revision": CHECKPOINT,
+    }
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "format",
+        "architecture",
+        "activation_quantization",
+        "native_fp8",
+        "output_weight_format",
+        "revision",
+        "missing",
+    ],
+)
+def test_compatible_qmoe_rejects_missing_or_wrong_weight_loading(field):
+    loading = candidate_loading()
+    if field != "missing":
+        loading[field] = "incorrect"
+    with pytest.raises(ValueError, match="weight-loading"):
+        expert_execution(
+            "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]",
+            None if field == "missing" else json.dumps(loading),
+        )
+
+
+@pytest.mark.parametrize(
+    "features",
+    ["", "com.microsoft::QMoE", "com.microsoft::QMoE[fp8_execution_profile=unknown]"],
+)
+def test_weight_report_alone_cannot_select_dynamic_fp8(features):
+    assert expert_execution(features, json.dumps(candidate_loading())) == "dense"
+
+
+@pytest.mark.parametrize(
+    "variant", ["compatible", "weight-only", "wrong-profile", "wrong-dtype"]
+)
+def test_load_sessions_requires_compatible_profile_weights_and_actual_dtype(
+    consumer, monkeypatch, variant
+):
+    profile = copy.deepcopy(consumer.profile)
+    profile["expert_execution"] = "dynamic_fp8"
+    feature = "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]"
+    if variant == "weight-only":
+        feature = ""
+    elif variant == "wrong-profile":
+        feature = "com.microsoft::QMoE[fp8_execution_profile=unknown]"
+    profile["components"]["decoder"]["required_runtime_features"] = feature
+
+    def metadata_session(path, **kwargs):
+        name = path.parent.name
+        meta = {}
+        if name == "decoder":
+            meta = {
+                "mobius.required_runtime_features": feature,
+                "mobius.weight_loading": json.dumps(candidate_loading()),
+            }
+        elif name == "codec":
+            meta = {"sample_rate": "44100", "samples_per_frame": "2048"}
+        dtype = "tensor(float16)" if variant == "wrong-dtype" else "tensor(float)"
+        return SimpleNamespace(
+            session=SimpleNamespace(
+                get_modelmeta=lambda: SimpleNamespace(custom_metadata_map=meta),
+                get_outputs=lambda: [
+                    SimpleNamespace(type=dtype if name == "decoder" else "tensor(float)")
+                ],
+                get_inputs=lambda: (
+                    [SimpleNamespace(name="logits", type="tensor(float)")]
+                    if name == "main_policy"
+                    else []
+                ),
+            )
+        )
+
+    monkeypatch.setattr("audit_drama3.BoundSession", metadata_session)
+    if variant == "compatible":
+        assert set(load_sessions(profile)) == set(profile["components"])
+    else:
+        with pytest.raises(ValueError, match=r"dtype|expert execution"):
+            load_sessions(profile)
 
 
 def save_graph(path, inputs, build, *, metadata=None):
@@ -90,7 +204,12 @@ def consumer(tmp_path):
             ("shared_input", op.Identity(value), f32, [1, t, 3]),
         ]
 
-    save_graph(paths["embedding"], [("frames", i64, [1, t, 3])], embedding)
+    save_graph(
+        paths["embedding"],
+        [("frames", i64, [1, t, 3])],
+        embedding,
+        metadata={SOURCE_CONTEXT_METADATA: SOURCE_CONTEXT_CONTRACT},
+    )
     cache_inputs = [
         ("past_key_values.0.key", f32, [1, 1, "past", 1]),
         ("past_key_values.0.value", f32, [1, 1, "past", 1]),
@@ -174,6 +293,7 @@ def consumer(tmp_path):
             *cache_inputs,
         ],
         tower,
+        metadata={SOURCE_CONTEXT_METADATA: SOURCE_CONTEXT_CONTRACT},
     )
     paths["main_policy"].parent.mkdir()
     ir.save(greedy_model(config, f32), paths["main_policy"])
@@ -651,6 +771,21 @@ def test_bf16_gpu_pointer_is_never_dereferenced():
     value = SimpleNamespace(data_type=lambda: "tensor(bfloat16)", device_name=lambda: "cuda")
     with pytest.raises(ValueError, match="CPU-bound"):
         ort_to_numpy(value)
+
+
+def test_tower_package_context_metadata_rejects_mixed_positions_before_binding():
+    session = BoundSession.__new__(BoundSession)
+    session.context_contract = SOURCE_CONTEXT_CONTRACT
+    with pytest.raises(ValueError, match="shared contiguous"):
+        session.run(
+            {
+                "hidden_states": np.zeros((2, 1, 32), np.float32),
+                "position_ids": np.array([[3], [4]], np.int64),
+                "attention_mask": np.ones((2, 4), np.int64),
+                "past_key_values.0.key": np.zeros((2, 1, 3, 4), np.float32),
+                "past_key_values.0.value": np.zeros((2, 1, 3, 4), np.float32),
+            }
+        )
 
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])

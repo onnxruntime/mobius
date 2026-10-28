@@ -207,7 +207,16 @@ class BoundSession:
             raise ValueError(f"Unknown Fish context contract: {self.context_contract}")
 
     def run(self, feeds, *, fetches=None, cpu_outputs=()):
-        if self.context_contract == SOURCE_CONTEXT_CONTRACT:
+        context_input = (
+            "inputs_embeds"
+            if "inputs_embeds" in feeds
+            else "hidden_states"
+            if "hidden_states" in feeds
+            else None
+        )
+        # Candidate package metadata also appears on the stateless embedding
+        # graph. Only decoder/tower calls consume the position/cache contract.
+        if self.context_contract == SOURCE_CONTEXT_CONTRACT and context_input is not None:
 
             def shape(value):
                 if isinstance(value, TensorView):
@@ -222,7 +231,7 @@ class BoundSession:
             validate_source_context(
                 feeds["position_ids"],
                 feeds["attention_mask"],
-                shape(feeds["inputs_embeds"]),
+                shape(feeds[context_input]),
                 {
                     name: shape(value)
                     for name, value in feeds.items()

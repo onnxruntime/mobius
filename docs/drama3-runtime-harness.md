@@ -101,6 +101,16 @@ references inside those directories. The consumer hashes every file with
 bounded reads and rejects unlisted files; it does not parse graph protobufs.
 Artifact inventory is reverified after execution.
 
+The native compatible expert mode requires the exact
+`com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]` feature plus matching
+`mobius.weight_loading` provenance: Fish architecture, pinned revision,
+dynamic-FP8 activation quantization, native FP8 storage and mixed block-FP8-128
+format. Generic QMoE availability, an unknown profile, or weight metadata alone
+cannot select this mode. Decoder dtype and exact selected runtime-feature
+metadata are checked independently. Package-level context metadata may appear
+on all components: decoder `inputs_embeds` and tower `hidden_states` calls
+validate positions and caches; the stateless embedding has no such controls.
+
 `files` must include the installed native ORT binding and all loaded ORT
 provider/runtime binaries. `libraries` must equal the actual loaded CUDA
 library inventory (driver, cudart, cuBLAS/Lt, cuDNN sublibraries, NVRTC, and
