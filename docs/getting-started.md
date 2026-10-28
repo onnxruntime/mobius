@@ -149,6 +149,13 @@ hidden-state inputs, the BF16 tower matches bit-for-bit through prefill and thre
 cached calls. The remaining pipeline difference starts in the backbone and
 propagates into the tower.
 
+Identical real BF16 expert-matmul operands isolate one cached discrepancy to
+the CUDA library version: cuBLAS 12.6.4 matches the Torch 2.8+cu126 reference
+exactly, while cuBLAS 13.6.0 changes three output values. Algorithm and workspace
+controls reproduce the same distinction. A separate CUDA 12.6 runtime is being
+built for model replay; merely matching the ORT version does not match the
+loaded cuBLAS implementation.
+
 Recurrent state, nonlinear opmath and RoPE remain FP32. Masks are preserved
 when padding is present; redundant causal masks are omitted on unpadded
 reduced-precision attention to enable the source-compatible fused CUDA path.
@@ -169,8 +176,16 @@ real expert layers pass when supplied identical source inputs and logits.
 The first expert input differs by only `1.192e-7`, but changes one FP8 code;
 those discontinuities amplify across subsequent layers. Qualification against
 the declared Torch 2.8 environment is in progress. Complete native-FP8 source runs
-in BF16 and FP16 each produce 20 finite frames; matching whole-model ONNX
-comparisons are pending. Source-ordered reductions
+in BF16 and FP16 each produce 20 finite frames. A private source-ordered BF16
+candidate on the CUDA 13 runtime fails the full prefill hidden-state gate:
+22817 of 61440 values violate `atol=rtol=1e-2`, with maximum absolute error
+`0.640625`. All 40 native experts execute on CUDA. Its first expert input differs
+in nine BF16 values (maximum `0.000244140625`); later layers amplify the difference.
+An independent source replay reproduces all 20 saved states bit-for-bit.
+The candidate is limited to batch-one short prefill and explicitly bypasses a
+failing symbolic-shape pass, so it is diagnostic, not a production export.
+CUDA-library-aligned BF16 replay and the FP16 whole-model comparison remain
+pending. Source-ordered reductions
 and [a CUDA reciprocal-square-root fast path](https://github.com/microsoft/onnxruntime/pull/33662)
 give bit-exact normalization on real first-layer inputs; source-layout `Gemm`
 also matches all five isolated DeltaNet projections exactly. An artifact-only
