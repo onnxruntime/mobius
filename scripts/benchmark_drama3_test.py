@@ -62,6 +62,27 @@ def test_cpu_benchmark_rejects_untracked_cuda_component_placement(tmp_path):
         benchmark(args)
 
 
+@pytest.mark.parametrize("algorithm", ["EXHAUSTIVE", "HEURISTIC", "DEFAULT"])
+def test_bound_session_forwards_convolution_search(tmp_path, monkeypatch, algorithm):
+    seen = []
+
+    def inference_session(path, options, *, providers):
+        seen.append(providers)
+        return SimpleNamespace(get_outputs=list)
+
+    monkeypatch.setattr(ort, "InferenceSession", inference_session)
+    BoundSession(tmp_path / "model.onnx", device="cuda", cudnn_conv_algo_search=algorithm)
+    assert seen[0][0][0] == "CUDAExecutionProvider"
+    assert seen[0][0][1]["cudnn_conv_algo_search"] == algorithm
+
+
+def test_bound_session_rejects_unknown_convolution_search_before_loading(tmp_path):
+    with pytest.raises(ValueError, match="Unknown cuDNN convolution search"):
+        BoundSession(
+            tmp_path / "missing.onnx", device="cuda", cudnn_conv_algo_search="invalid"
+        )
+
+
 def test_busy_gpu_cannot_be_a_performance_pass():
     busy = {"memory_used_mib": 130000, "utilization_percent": 100}
     with pytest.raises(RuntimeError, match="refusing misleading"):
@@ -271,3 +292,11 @@ def test_benchmark_runs_actual_cached_graphs_without_claiming_full_model_perf(
         assert result["end_to_end_rtf"] is None
     assert result["steady_frames_per_second"] > 0
     assert result["p95_frame_ms"] > 0
+    assert len(result["frame_ms"]) == result["generated_frames"]
+    assert all(value > 0 for value in result["frame_ms"])
+    np.testing.assert_allclose(
+        np.median(result["frame_ms"][1:]), result["p50_frame_ms"], rtol=1e-12
+    )
+    np.testing.assert_allclose(
+        np.percentile(result["frame_ms"][1:], 95), result["p95_frame_ms"], rtol=1e-12
+    )

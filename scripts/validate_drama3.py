@@ -212,7 +212,13 @@ def reference_array(tensor, *, name: str):
     return value
 
 
-def reference(checkpoint, *, native_fp8=False):
+def reference(checkpoint, *, native_fp8=False, max_new_tokens=20):
+    if (
+        isinstance(max_new_tokens, bool)
+        or not isinstance(max_new_tokens, int)
+        or max_new_tokens < 1
+    ):
+        raise ValueError("max_new_tokens must be a positive integer")
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     os.environ["FISH_DRAMA3_FP8_EXPERTS"] = "1" if native_fp8 else "0"
     os.environ["FISH_DRAMA3_CUDA_GRAPH"] = "0"
@@ -310,7 +316,7 @@ def reference(checkpoint, *, native_fp8=False):
         generated, finish = upstream["generate"].generate_drama3(
             model,
             prompt,
-            max_new_tokens=20,
+            max_new_tokens=max_new_tokens,
             temperature=1.0,
             top_k=30,
             top_p=1.0,
@@ -340,7 +346,7 @@ def reference(checkpoint, *, native_fp8=False):
         "prefill_last_top10": top.tolist(),
         "prefill_last_top10_logits": logits[0, -1, top].tolist(),
         "prefill_logits_sha256": hashlib.sha256(logits.tobytes()).hexdigest(),
-        "max_new_tokens": 20,
+        "max_new_tokens": max_new_tokens,
         "do_sample": False,
         "finish_reason": finish,
         "generated_frames": generated.tolist(),
@@ -714,6 +720,12 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", choices=("f32", "f16", "bf16"), default="f32")
     parser.add_argument("--native-fp8", action="store_true")
     parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=20,
+        help="Maximum generated frames for independent reference collection (default: 20)",
+    )
+    parser.add_argument(
         "--task", choices=("fish-omni", "fish-omni-generation"), default="fish-omni"
     )
     parser.add_argument("--execution-provider", choices=("default", "cuda", "onnx-standard"))
@@ -731,6 +743,8 @@ if __name__ == "__main__":
     parser.add_argument("--audio-device", default=1, type=int)
     parser.add_argument("--decoder-device", default=2, type=int)
     args = parser.parse_args()
+    if args.max_new_tokens < 1:
+        parser.error("--max-new-tokens must be positive")
     ROOT = args.work_dir.resolve()
     ROOT.mkdir(parents=True, exist_ok=True)
     REFERENCE_DEVICES = tuple(int(device) for device in args.reference_devices.split(","))
@@ -760,7 +774,11 @@ if __name__ == "__main__":
             native_fp8=args.native_fp8,
         )
     elif args.stage == "reference":
-        reference(checkpoint_path(), native_fp8=args.native_fp8)
+        reference(
+            checkpoint_path(),
+            native_fp8=args.native_fp8,
+            max_new_tokens=args.max_new_tokens,
+        )
     else:
         compare(
             audio_model_name=args.audio_component,

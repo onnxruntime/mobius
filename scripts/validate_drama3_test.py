@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import subprocess
+import sys
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -100,6 +104,101 @@ def test_comparison_rejects_unknown_optimization_level_before_loading(monkeypatc
     monkeypatch.delattr(validate_drama3, "ROOT", raising=False)
     with pytest.raises(ValueError, match="Unknown ORT optimization level"):
         validate_drama3.compare(optimization_level="invalid")
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_reference_rejects_invalid_generation_limit_before_loading(monkeypatch, limit):
+    load = Mock()
+    monkeypatch.setattr(validate_drama3, "load_upstream", load)
+    with pytest.raises(ValueError, match="positive integer"):
+        validate_drama3.reference(None, max_new_tokens=limit)
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_reference_cli_rejects_invalid_limit_before_creating_workspace(
+    tmp_path, monkeypatch, limit
+):
+    root = tmp_path / "not-created"
+    source = str(Path(validate_drama3.__file__).resolve().parents[1] / "src")
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join(filter(None, (source, os.environ.get("PYTHONPATH"))))
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(validate_drama3.__file__)),
+            "reference",
+            "--work-dir",
+            str(root),
+            "--max-new-tokens",
+            limit,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--max-new-tokens must be positive" in result.stderr
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("limit", [None, 100])
+def test_reference_forwards_and_records_generation_limit(tmp_path, monkeypatch, limit):
+    import torch
+
+    backbone = SimpleNamespace(
+        model=SimpleNamespace(layers=[]),
+        forward=lambda hidden, **kwargs: hidden,
+        compute_logits=lambda hidden: torch.ones(1, 2, 16),
+    )
+    tower = SimpleNamespace(
+        device="cpu",
+        config=SimpleNamespace(vq_backbone_codebooks=2, num_codebooks=10),
+        embed_backbone=lambda frames, text: torch.ones(2, 4),
+        embedding_sum=lambda frames, first, end: torch.ones(2, 4),
+        is_semantic=lambda tokens: torch.zeros_like(tokens, dtype=torch.bool),
+        prefill=Mock(),
+        decode_step=Mock(),
+        residual_layers=[],
+        codebook_heads=[],
+    )
+    model = SimpleNamespace(
+        backbone=backbone, audio_decoder=tower, tokenizer=None, config=None
+    )
+    requested = 20 if limit is None else limit
+
+    def generate(model, prompt, **kwargs):
+        assert kwargs["max_new_tokens"] == requested
+        model.audio_decoder.embed_backbone(prompt, None)
+        model.backbone.forward(torch.ones(1, 2, 4), input_pos=torch.arange(2))
+        return np.zeros((requested, 11), dtype=np.int64), "length"
+
+    upstream = {
+        "model": SimpleNamespace(
+            FishOmniModel=SimpleNamespace(from_pretrained=lambda *args, **kwargs: model)
+        ),
+        "tower": SimpleNamespace(sample_top_k_top_p=None),
+        "generate": SimpleNamespace(
+            build_drama3_prompt=lambda *args: torch.zeros(2, 11, dtype=torch.int64),
+            generate_drama3=generate,
+        ),
+        "fp8_moe": SimpleNamespace(triton=SimpleNamespace(__version__="test")),
+    }
+    monkeypatch.setattr(validate_drama3, "ROOT", tmp_path, raising=False)
+    monkeypatch.setattr(validate_drama3, "DTYPE", "f32")
+    monkeypatch.setattr(validate_drama3, "REFERENCE_DEVICES", (0,))
+    monkeypatch.setattr(validate_drama3, "REFERENCE_TOWER_DEVICE", 0)
+    monkeypatch.setattr(validate_drama3, "validate_reference_torch_version", lambda _: None)
+    monkeypatch.setattr(validate_drama3, "load_upstream", lambda: upstream)
+    monkeypatch.setattr(torch, "set_num_threads", Mock())
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    kwargs = {} if limit is None else {"max_new_tokens": limit}
+    validate_drama3.reference(tmp_path, **kwargs)
+    golden = json.loads((tmp_path / "reference" / "golden.json").read_text())
+    assert golden["max_new_tokens"] == requested
+    assert len(golden["generated_frames"]) == requested
 
 
 def test_empty_cache_uses_the_abi_not_symbolic_dimension_names():
