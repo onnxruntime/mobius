@@ -226,14 +226,27 @@ that case's BF16 output exact. This source-compatible mode retains FP8 storage
 and activation quantization but uses FP16 MMA, not native hardware FP8 MMA.
 
 With that mode, native triangular solves, source MEA and runtime source-style
-RoPE in both decoder and tower, a private complete BF16 pipeline now matches
-decoder and teacher-forced tower prefill exactly, followed by 17 exact generated
-frames. It still fails the unchanged hidden-state gate at cached state 17.
-Actual-cache replay isolates the first difference to one BF16 QMoE output in
-layer 12 (`0.000244140625` maximum error), despite exact expert inputs/logits
-and all 30 recurrent caches matching bit-for-bit after prefill and state 16.
-This is not a qualified reduced-precision export: the public admission guards
-remain closed, and native hardware FP8 MMA is separately unqualified.
+RoPE in both decoder and tower, source-faithful top-k routing now gives a complete
+saved/reloaded BF16 pipeline pass: 30-row prefill, every cached vector and all
+20 complete generated frames. A separate raw-bit audit checks all 101 compared
+tensors: **14,469,504 FP32-transport bit patterns, zero differences**. No source
+expert outputs replace runtime computation.
+
+The routing correction follows the pinned Torch CUDA softmax, threshold gather
+and unstable bitonic top-k order. Previously, swapping two equal-logit expert
+slots at cached state 17 changed summation order at a BF16 rounding midpoint:
+one layer-12 output differed despite exact per-expert arithmetic and recurrent
+caches. An arbitrary stable tie-index rule would not reproduce that source
+contract.
+
+This validates a private batch-one/short-prefill configuration, not production
+reduced-precision admission or performance. The source-compatible compute is
+register-local FP16 MMA; native hardware FP8 MMA remains separately unqualified.
+An independent generalized chunk-core probe also matches source output/state
+bits in 32 synthetic cases (batches 1/2, lengths 1/2/30/64/65/128/129/257,
+zero/nonzero state), including the source's row-count-dependent scan tiling.
+Full-model generalization and production wiring remain pending; public admission
+guards stay closed.
 
 Stable `Log(Add(x, 1))` fusion is implemented for CUDA and native WebGPU in
 [this independent ORT change](https://github.com/microsoft/onnxruntime/commit/3c0638c4c402900e42d1a9a0f6ee8d9ea7015460).
