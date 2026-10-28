@@ -218,10 +218,22 @@ With source-output controls for the experts, runtime CUDA RoPE, native triangula
 solves and source MEA reproduce all 80 prefill expert-input/logit vectors and the
 final hidden tensor exactly. This is diagnostic isolation, never whole-model
 qualification. The remaining earliest difference is inside QMoE: matching the
-source sigmoid sequence corrects 301 activation-scale discrepancies, while
-down-projection accumulation is still under investigation. The captured Triton
-down kernel uses register-local FP8-to-FP16 conversion and FP16 MMA; that source
-compute mode is distinct from native FP8 MMA and must be reported as such.
+source sigmoid sequence corrects 301 activation-scale discrepancies. The captured
+Triton down kernel uses register-local FP8-to-FP16 conversion and FP16 MMA;
+matching its fragment order reproduces all 491520 first-case weighted-down
+FP32 values exactly. Matching the source's four-accumulator reduction also makes
+that case's BF16 output exact. This source-compatible mode retains FP8 storage
+and activation quantization but uses FP16 MMA, not native hardware FP8 MMA.
+
+With that mode, native triangular solves, source MEA and runtime source-style
+RoPE in both decoder and tower, a private complete BF16 pipeline now matches
+decoder and teacher-forced tower prefill exactly, followed by 17 exact generated
+frames. It still fails the unchanged hidden-state gate at cached state 17.
+Actual-cache replay isolates the first difference to one BF16 QMoE output in
+layer 12 (`0.000244140625` maximum error), despite exact expert inputs/logits
+and all 30 recurrent caches matching bit-for-bit after prefill and state 16.
+This is not a qualified reduced-precision export: the public admission guards
+remain closed, and native hardware FP8 MMA is separately unqualified.
 
 Stable `Log(Add(x, 1))` fusion is implemented for CUDA and native WebGPU in
 [this independent ORT change](https://github.com/microsoft/onnxruntime/commit/3c0638c4c402900e42d1a9a0f6ee8d9ea7015460).
