@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -275,6 +276,48 @@ def test_native_fp8_reference_cannot_be_compared_as_dense():
     golden["expert_execution"] = "dynamic_fp8"
     with pytest.raises(AssertionError, match="expert_execution"):
         validate_reference_golden(golden)
+
+
+@pytest.mark.parametrize("version", ["2.8.0", "2.8.0+cu126", "2.8.0+cu128"])
+def test_reference_accepts_the_pinned_torch_release(version):
+    validate_drama3.validate_reference_torch_version(version)
+
+
+@pytest.mark.parametrize("version", ["2.7.1", "2.8.0a0", "2.10.0+cu128"])
+def test_reference_rejects_a_different_torch_release(version):
+    with pytest.raises(RuntimeError, match=r"requires torch==2\.8\.0"):
+        validate_drama3.validate_reference_torch_version(version)
+
+
+def test_reference_environment_changes_are_not_silently_compared(tmp_path, monkeypatch):
+    committed = json.loads(GOLDEN.read_text())
+    committed["reference_environment"] = {"torch": "2.8.0+cu126"}
+    path = tmp_path / "golden.json"
+    path.write_text(json.dumps(committed))
+    monkeypatch.setattr(validate_drama3, "GOLDEN", path)
+    actual = copy.deepcopy(committed)
+    actual["reference_environment"]["torch"] = "2.10.0+cu128"
+    with pytest.raises(AssertionError, match="reference_environment"):
+        validate_reference_golden(actual)
+
+
+@pytest.mark.parametrize(
+    ("record_committed", "record_actual"), [(True, True), (True, False), (False, True)]
+)
+def test_reference_environment_preserves_matching_and_legacy_goldens(
+    tmp_path, monkeypatch, record_committed, record_actual
+):
+    committed = json.loads(GOLDEN.read_text())
+    actual = copy.deepcopy(committed)
+    environment = {"torch": "2.8.0+cu126", "torch_cuda": "12.6", "triton": "3.4.0"}
+    if record_committed:
+        committed["reference_environment"] = environment
+    if record_actual:
+        actual["reference_environment"] = environment
+    path = tmp_path / "golden.json"
+    path.write_text(json.dumps(committed))
+    monkeypatch.setattr(validate_drama3, "GOLDEN", path)
+    validate_reference_golden(actual)
 
 
 @pytest.mark.parametrize("native_fp8", [False, True])

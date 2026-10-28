@@ -187,6 +187,14 @@ def export(checkpoint, *, task="fish-omni", execution_provider=None, native_fp8=
     )
 
 
+def validate_reference_torch_version(version: str) -> None:
+    if version.split("+", 1)[0] != "2.8.0":
+        raise RuntimeError(
+            "The pinned Fish Speech reference requires torch==2.8.0; "
+            f"found {version}. Use a separate reference environment."
+        )
+
+
 def reference(checkpoint, *, native_fp8=False):
     os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
     os.environ["FISH_DRAMA3_FP8_EXPERTS"] = "1" if native_fp8 else "0"
@@ -194,6 +202,7 @@ def reference(checkpoint, *, native_fp8=False):
     import numpy as np
     import torch
 
+    validate_reference_torch_version(torch.__version__)
     torch.set_num_threads(8)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -302,6 +311,11 @@ def reference(checkpoint, *, native_fp8=False):
         "source_revision": SOURCE_REVISION,
         "dtype": DTYPE_NAMES[DTYPE],
         "expert_execution": "dynamic_fp8" if native_fp8 else "dense",
+        "reference_environment": {
+            "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "triton": getattr(upstream["fp8_moe"].triton, "__version__", None),
+        },
         "prompt": PROMPT,
         "prompt_rows": len(prompt),
         "prefill_shape": list(logits.shape),
@@ -331,6 +345,10 @@ def validate_reference_golden(golden):
     committed = json.loads(GOLDEN.read_text())
     assert golden.get("expert_execution", "dense") == EXPERT_EXECUTION, "expert_execution"
     assert committed.get("expert_execution", "dense") == EXPERT_EXECUTION, "expert_execution"
+    if "reference_environment" in golden and "reference_environment" in committed:
+        assert golden["reference_environment"] == committed["reference_environment"], (
+            "reference_environment"
+        )
     assert golden["dtype"] == DTYPE_NAMES[DTYPE], "dtype"
     for field in (
         "model_id",
@@ -641,6 +659,7 @@ def compare(*, audio_model_name=None):
         "source_revision": SOURCE_REVISION,
         "dtype": DTYPE_NAMES[DTYPE],
         "expert_execution": EXPERT_EXECUTION,
+        "reference_environment": golden.get("reference_environment"),
         "audio_component": audio_model_name,
         "onnxruntime_version": ort.__version__,
         "provider": "CUDAExecutionProvider",
