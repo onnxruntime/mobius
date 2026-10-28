@@ -907,12 +907,11 @@ def test_ep_dtype_role_gating():
                 stages, _ = _get_optimization_passes(caps, dtype, role)
                 names = {name for name, _ in stages}
                 assert not caps.matmul_nbits_qkv_pack_dtypes
+                assert not caps.qkv_projection_pack_dtypes
                 assert "PackMatMulNBitsQKV" not in names
+                assert "PackQKVProjections" not in names
                 assert ("PackQKV" in names) == (
                     role == "decoder" and dtype in caps.qkv_pack_dtypes
-                )
-                assert ("PackQKVProjections" in names) == (
-                    role != "encoder" and dtype in caps.qkv_pack_dtypes
                 )
 
 
@@ -922,33 +921,65 @@ def test_int4_capability_requires_explicit_opt_in(dtype, role):
     caps = dataclasses.replace(get_ep("cuda"), matmul_nbits_qkv_pack_dtypes=frozenset({dtype}))
     stages, _ = _get_optimization_passes(caps, dtype, role)
     assert ("PackMatMulNBitsQKV" in {name for name, _ in stages}) == (role != "encoder")
+    assert "PackQKVProjections" not in {name for name, _ in stages}
+
+
+@pytest.mark.parametrize("dtype", list(_DTYPES))
+@pytest.mark.parametrize("role", ["decoder", "masked-decoder", "encoder"])
+@pytest.mark.parametrize("legacy_packing", [False, True])
+def test_float_capability_requires_independent_opt_in(dtype, role, legacy_packing):
+    caps = dataclasses.replace(
+        get_ep("cuda"),
+        qkv_pack_dtypes=frozenset({dtype}) if legacy_packing else frozenset(),
+        qkv_projection_pack_dtypes=frozenset({dtype}),
+    )
+    for candidate in _DTYPES:
+        stages, _ = _get_optimization_passes(caps, candidate, role)
+        names = {name for name, _ in stages}
+        assert ("PackQKVProjections" in names) == (role != "encoder" and candidate == dtype)
+        assert ("PackQKV" in names) == (
+            role == "decoder" and legacy_packing and candidate == dtype
+        )
+        assert "PackMatMulNBitsQKV" not in names
 
 
 def test_new_capability_preserves_existing_positional_arguments():
     caps = EpCapabilities("legacy", frozenset(), frozenset(), False)
     assert not caps.supports_fused_rope
     assert not caps.matmul_nbits_qkv_pack_dtypes
-    assert dataclasses.fields(EpCapabilities)[-1].name == "matmul_nbits_qkv_pack_dtypes"
+    assert not caps.qkv_projection_pack_dtypes
+    assert [field.name for field in dataclasses.fields(EpCapabilities)[-2:]] == [
+        "matmul_nbits_qkv_pack_dtypes",
+        "qkv_projection_pack_dtypes",
+    ]
 
 
 @pytest.mark.parametrize("trace", [False, True])
 @pytest.mark.parametrize("opt_in", [False, True])
-def test_generic_pipeline_preserves_arbitrary_mask_contract(monkeypatch, trace, opt_in):
-    model, _, _, _ = _model(quantized=True, deferred=True, dtype=ir.DataType.FLOAT16)
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("dtype", list(_DTYPES))
+def test_generic_pipeline_preserves_arbitrary_mask_contract(
+    monkeypatch, trace, opt_in, quantized, dtype
+):
+    model, _, _, _ = _model(quantized=quantized, deferred=True, dtype=dtype)
     declare_arbitrary_attention_mask(model.graph)
     caps = dataclasses.replace(
         get_ep("cuda"),
         name="projection-test",
-        matmul_nbits_qkv_pack_dtypes=(
-            frozenset({ir.DataType.FLOAT16}) if opt_in else frozenset()
-        ),
+        matmul_nbits_qkv_pack_dtypes=frozenset({dtype})
+        if opt_in and quantized
+        else frozenset(),
+        qkv_projection_pack_dtypes=frozenset({dtype})
+        if opt_in and not quantized
+        else frozenset(),
     )
     monkeypatch.setitem(ep_registry._entries, caps.name, caps)
-    optimize_model(model, ep=caps.name, dtype=ir.DataType.FLOAT16, trace=trace)
+    optimize_model(model, ep=caps.name, dtype=dtype, trace=trace)
     attention = next(node for node in model.graph if node.op_type == "Attention")
     assert attention.inputs[3].name == "mask"
     assert not any(node.op_type == "GroupQueryAttention" for node in model.graph)
-    assert sum(node.op_type == "MatMulNBits" for node in model.graph) == (1 if opt_in else 3)
+    projection_type = "MatMulNBits" if quantized else "MatMul"
+    assert sum(node.op_type == projection_type for node in model.graph) == (1 if opt_in else 3)
 
 
 @pytest.mark.parametrize("quantized", [False, True])

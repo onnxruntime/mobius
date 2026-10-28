@@ -159,7 +159,7 @@ and is not claimed bitwise exact. The learned `router.scale` remains unchanged.
 Incomplete, stale, or shape-incompatible expert sidecars are rejected.
 
 Float projection packing retains version-1
-`mobius.qkv_projection_sources` metadata on the `Split`: original initializer
+`pkg.mobius.qkv_projection_sources` metadata on the `Split`: original initializer
 names and output widths. Keep it through serialization so PEFT attachment can
 restore independent projections after weight folding. INT4 projection packing
 requires homogeneous bits/block size/accuracy level, scale dtype, zero-point
@@ -167,6 +167,9 @@ presence/layout, and a known shape-generic fallback body when one is registered.
 Float groups whose source initializer or logical weight view has outside
 consumers are conservatively left unpacked, preserving existing tied-weight
 adapter attachment rather than inventing multiple-group restoration semantics.
+
+The legacy `mobius.qkv_projection_sources` key is accepted when reading older
+exports; new exports write `pkg.mobius.qkv_projection_sources`.
 
 Restored projections remain lazy slices, not eager copies of a large packed
 checkpoint. Their backing-file ownership is registered with the package save

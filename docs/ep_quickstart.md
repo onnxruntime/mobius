@@ -100,7 +100,8 @@ print(sorted(ep_registry))
 # Inspect an EP's capabilities
 caps = get_ep("cuda")
 print(caps.gqa_dtypes)          # frozenset({FLOAT16, BFLOAT16})
-print(caps.qkv_pack_dtypes)     # frozenset({FLOAT, FLOAT16, BFLOAT16}); both float packing stages
+print(caps.qkv_pack_dtypes)     # frozenset({FLOAT, FLOAT16, BFLOAT16}); legacy GQA-input packing
+print(caps.qkv_projection_pack_dtypes)  # frozenset(); experimental float projection packing is off
 print(caps.matmul_nbits_qkv_pack_dtypes)  # frozenset(); experimental INT4 packing is off
 print(caps.supports_fused_rope) # True
 print(caps.enable_graph_capture) # True
@@ -133,14 +134,12 @@ pkg = mobius.build("meta-llama/Llama-3.2-1B",
 Unrecognised EP names raise `ValueError` during build-time validation, before
 graph construction or optimization starts — safe-fail by default.
 
-Experimental INT4 projection packing requires an explicit
-`matmul_nbits_qkv_pack_dtypes` capability override; no built-in EP enables it.
-The existing float GQA-input `PackQKV` stage is unchanged, but the additional
-`PackQKVProjections` float stage is **new and default-enabled** for decoder
-and masked-decoder roles whenever the dtype is in `qkv_pack_dtypes`, including
-CUDA's existing FLOAT/FP16/BF16 profile. Only INT4 projection packing is
-default-off. Its failed/unwaived numerical gate does not qualify the new float
-stage; float numerical accuracy is not separately qualified by this branch. Read the
+Experimental float `PackQKVProjections` and INT4 projection packing require
+independent `qkv_projection_pack_dtypes` and `matmul_nbits_qkv_pack_dtypes`
+capability overrides, respectively; both are **default-off on every built-in EP**.
+The existing float GQA-input `PackQKV` stage retains its `qkv_pack_dtypes` gate.
+Neither INT4 nor CUDA FP16/BF16 float projection-packing numerical accuracy is
+qualified by this branch. Read the
 [numerical limitations and opt-in example](execution_providers.md#projection-packing-and-numerical-limitations)
 before enabling it; activation/component precision flags do not opt in.
 
