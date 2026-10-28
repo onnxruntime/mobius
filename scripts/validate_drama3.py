@@ -58,29 +58,9 @@ def event(kind, **details):
 
 
 def empty_cache_ports(ports):
-    import ml_dtypes
-    import numpy as np
+    from drama3_runtime import empty_cache_ports as create_caches
 
-    caches = {}
-    for port in ports:
-        if not port.name.startswith("past_key_values."):
-            continue
-        shape = list(port.shape)
-        shape[0] = 1
-        if port.name.endswith((".key", ".value")):
-            assert len(shape) == 4
-            shape[2] = 0
-        assert all(isinstance(dim, int) for dim in shape), (port.name, shape)
-        type_name = getattr(port, "type", "tensor(float)")
-        dtypes = {
-            "tensor(float)": np.float32,
-            "tensor(float16)": np.float16,
-            "tensor(bfloat16)": ml_dtypes.bfloat16,
-        }
-        if type_name not in dtypes:
-            raise ValueError(f"Unsupported cache dtype {type_name}: {port.name}")
-        caches[port.name] = np.zeros(shape, dtype=dtypes[type_name])
-    return caches
+    return create_caches(ports)
 
 
 def download():

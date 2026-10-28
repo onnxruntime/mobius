@@ -11,242 +11,27 @@ RTF separately. A contended or short run is diagnostic, never performance sign-o
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
-import io
 import json
-import os
 import statistics
-import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
-from onnxscript import GraphBuilder
-from validate_drama3 import empty_cache_ports
-
-from mobius._testing.ort_inference import _numpy_to_ort_value, _ort_value_to_numpy
-from mobius.generation._fish_omni_context import (
-    SOURCE_CONTEXT_CONTRACT,
-    SOURCE_CONTEXT_METADATA,
-    validate_source_context,
+from audit_drama3 import request as execute_greedy_request
+from drama3_runtime import (
+    BoundSession,
+    codebook_view,
+    gpu_snapshot,
+    next_cache,
+    require_idle,
+    sequence_view,
 )
-
-
-@dataclass(frozen=True)
-class TensorView:
-    """Keep the owning OrtValue alive while binding a zero-copy contiguous slice."""
-
-    owner: ort.OrtValue
-    shape: tuple[int, ...]
-    offset: int = 0
-
-
-def sequence_view(value, start, length, *, squeeze_time=False):
-    shape = value.shape()
-    if len(shape) != 3 or shape[0] != 1 or not 0 <= start < start + length <= shape[1]:
-        raise ValueError(f"Invalid batch-one contiguous sequence slice: {shape}")
-    itemsize = {1: 4, 10: 2, 16: 2}[value.element_type()]
-    target = (1, shape[2]) if squeeze_time else (1, length, shape[2])
-    if squeeze_time and length != 1:
-        raise ValueError("Only a length-one sequence can lose its time axis")
-    return TensorView(value, target, start * shape[2] * itemsize)
-
-
-def codebook_view(value, index):
-    shape = value.shape()
-    if len(shape) != 4 or shape[:2] != [1, 1] or not 0 <= index < shape[2]:
-        raise ValueError(f"Invalid single-frame codebook view: {shape}, index={index}")
-    itemsize = {1: 4, 10: 2, 16: 2}[value.element_type()]
-    return TensorView(value, (1, shape[3]), index * shape[3] * itemsize)
-
-
-class BoundSession:
-    """Bind caches/hidden states on-device; copy only small policy/audio outputs."""
-
-    def __init__(
-        self,
-        path,
-        *,
-        device,
-        device_id=0,
-        profile=False,
-        profile_directory=None,
-        cudnn_conv1d_pad_to_nc1d=False,
-        cudnn_conv_algo_search="EXHAUSTIVE",
-    ):
-        if cudnn_conv_algo_search not in ("EXHAUSTIVE", "HEURISTIC", "DEFAULT"):
-            raise ValueError(f"Unknown cuDNN convolution search: {cudnn_conv_algo_search!r}")
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 8
-        options.inter_op_num_threads = 1
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.enable_mem_pattern = False
-        options.enable_profiling = profile
-        if profile:
-            profile_directory = profile_directory or Path(tempfile.gettempdir())
-            profile_directory.mkdir(parents=True, exist_ok=True)
-            suffix = hashlib.sha256(str(path).encode()).hexdigest()[:12]
-            options.profile_file_prefix = str(
-                profile_directory / f"{path.parent.name}-{suffix}"
-            )
-        providers = (
-            [
-                (
-                    "CUDAExecutionProvider",
-                    {
-                        "device_id": device_id,
-                        "use_tf32": "0",
-                        "arena_extend_strategy": "kSameAsRequested",
-                        "cudnn_conv1d_pad_to_nc1d": str(int(cudnn_conv1d_pad_to_nc1d)),
-                        "cudnn_conv_algo_search": cudnn_conv_algo_search,
-                    },
-                ),
-                "CPUExecutionProvider",
-            ]
-            if device == "cuda"
-            else ["CPUExecutionProvider"]
-        )
-        self.session = ort.InferenceSession(str(path), options, providers=providers)
-        self.device, self.device_id = device, device_id if device == "cuda" else 0
-        self.outputs = [port.name for port in self.session.get_outputs()]
-        self.context_contract = self.session.get_modelmeta().custom_metadata_map.get(
-            SOURCE_CONTEXT_METADATA
-        )
-        if self.context_contract not in (None, SOURCE_CONTEXT_CONTRACT):
-            raise ValueError(f"Unknown Fish context contract: {self.context_contract}")
-
-    def run(self, feeds, *, fetches=None, cpu_outputs=()):
-        if self.context_contract == SOURCE_CONTEXT_CONTRACT:
-
-            def shape(value):
-                if isinstance(value, TensorView):
-                    return value.shape
-                return value.shape() if isinstance(value, ort.OrtValue) else value.shape
-
-            # Position/mask controls stay on CPU; inspect cache shapes without
-            # device copies or deriving continuation from cached tensor values.
-            if not all(
-                isinstance(feeds[name], np.ndarray)
-                for name in ("position_ids", "attention_mask")
-            ):
-                raise ValueError("Source Fish context controls must be CPU NumPy arrays")
-            validate_source_context(
-                feeds["position_ids"],
-                feeds["attention_mask"],
-                shape(feeds["inputs_embeds"]),
-                {
-                    name: shape(value)
-                    for name, value in feeds.items()
-                    if name.startswith("past_key_values.")
-                },
-            )
-        names = self.outputs if fetches is None else list(fetches)
-        if not set(names) <= set(self.outputs):
-            raise ValueError(f"Unknown output names: {set(names) - set(self.outputs)}")
-        binding = self.session.io_binding()
-        # This local mapping owns every raw-pointer view until execution completes.
-        owners = {}
-        for name, value in feeds.items():
-            if isinstance(value, TensorView):
-                owners[name] = value.owner
-                owner_device = value.owner.device_name()
-                binding.bind_input(
-                    name,
-                    device_type=owner_device,
-                    device_id=self.device_id if owner_device == "cuda" else 0,
-                    element_type=value.owner.element_type(),
-                    shape=value.shape,
-                    buffer_ptr=value.owner.data_ptr() + value.offset,
-                )
-            else:
-                owners[name] = (
-                    value
-                    if isinstance(value, ort.OrtValue)
-                    else _numpy_to_ort_value(
-                        np.ascontiguousarray(value) if value.ndim else value
-                    )
-                )
-                binding.bind_ortvalue_input(name, owners[name])
-        for name in names:
-            target = "cpu" if name in cpu_outputs else self.device
-            binding.bind_output(
-                name, device_type=target, device_id=self.device_id if target == "cuda" else 0
-            )
-        self.session.run_with_iobinding(binding)
-        binding.synchronize_outputs()
-        values = binding.get_outputs()
-        if len(values) != len(names):
-            raise RuntimeError("ORT returned an unexpected bound-output count")
-        return dict(zip(names, values))
-
-    def empty_cache(self):
-        return empty_cache_ports(self.session.get_inputs())
-
-
-def next_cache(outputs, device):
-    result = {
-        name.replace("present.", "past_key_values.", 1): value
-        for name, value in outputs.items()
-        if name.startswith("present.")
-    }
-    if not result or any(value.device_name() != device for value in result.values()):
-        raise RuntimeError("Recurrent/KV state did not remain on the execution device")
-    return result
-
-
-def gpu_snapshot(device_id):
-    text = subprocess.check_output(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,name,uuid,memory.used,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ],
-        text=True,
-    )
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    selected = visible.split(",")[device_id].strip() if visible else str(device_id)
-    processes = subprocess.check_output(
-        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
-        text=True,
-    )
-    for row in csv.reader(io.StringIO(text)):
-        if (selected.isdigit() and int(row[0]) == int(selected)) or (
-            not selected.isdigit() and row[2].strip().startswith(selected)
-        ):
-            return {
-                "device_id": device_id,
-                "physical_index": int(row[0]),
-                "name": row[1].strip(),
-                "memory_used_mib": int(row[3]),
-                "utilization_percent": int(row[4]),
-                "foreign_pids": [
-                    int(process[1])
-                    for process in csv.reader(io.StringIO(processes))
-                    if process
-                    and process[0].strip() == row[2].strip()
-                    and int(process[1]) != os.getpid()
-                ],
-            }
-    raise ValueError(f"CUDA device {device_id} not found")
-
-
-def require_idle(snapshot, allow_contended):
-    busy = (
-        snapshot["utilization_percent"] > 5
-        or snapshot["memory_used_mib"] > 1024
-        or bool(snapshot.get("foreign_pids"))
-    )
-    if busy and not allow_contended:
-        raise RuntimeError(
-            "GPU is occupied; refusing misleading performance measurements. "
-            "Use an idle device, or --allow-contended for an explicitly unqualified diagnostic."
-        )
-    return not busy
+from drama3_runtime import ort_to_numpy as _ort_value_to_numpy
+from onnxscript import GraphBuilder
 
 
 def greedy_model(config, dtype):
@@ -368,6 +153,25 @@ def benchmark(args):
         sessions["greedy"] = BoundSession(greedy_path, **kwargs)
 
         def request(limit):
+            if fast and not args.sample:
+                frames, timing = execute_greedy_request(
+                    {
+                        "embedding": sessions["embedding"],
+                        "decoder": sessions["decoder"],
+                        "audio_generator": sessions[audio_name],
+                        "main_policy": sessions["greedy"],
+                    },
+                    config,
+                    prompt,
+                    limit,
+                )
+                return (
+                    frames,
+                    timing["frame_seconds"],
+                    timing["prefill_seconds"],
+                    timing["first_frame_seconds"],
+                    timing["token_pipeline_seconds"],
+                )
             origin = time.perf_counter()
             decoder_cache = sessions["decoder"].empty_cache()
             tower_cache = sessions[audio_name].empty_cache()

@@ -128,6 +128,7 @@ def test_cpu_views_and_outputs_keep_cpu_device_zero_with_nonzero_cuda_id():
     binding = SimpleNamespace(
         bind_input=lambda name, **kwargs: bind("input", name, **kwargs),
         bind_output=lambda name, **kwargs: bind("output", name, **kwargs),
+        synchronize_inputs=lambda: None,
         synchronize_outputs=lambda: None,
         get_outputs=lambda: [value],
     )
