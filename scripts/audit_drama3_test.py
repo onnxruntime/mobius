@@ -405,6 +405,32 @@ def test_actual_cpu_chain_in_fresh_framework_blocked_process(consumer, tmp_path)
     )
 
 
+def test_diagnostics_record_actual_optimized_graphs_and_executed_opcodes(consumer, tmp_path):
+    completed = execute_consumer(
+        consumer, tmp_path / "diagnostics", "--diagnostics", "--benchmark", "--warmup", "1"
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads((tmp_path / "diagnostics" / "report.json").read_text())
+    assert report["selection"]["disabled_optimizers"] == []
+    assert report["selection"]["optimization"] == "ORT_ENABLE_ALL"
+    assert report["performance"]["instrumented"] is True
+    assert report["performance"]["measurement_qualified"] is False
+    for evidence in report["diagnostics"].values():
+        assert (
+            digest(evidence["optimized_graph"]["path"])
+            == evidence["optimized_graph"]["sha256"]
+        )
+        assert digest(evidence["profile"]["path"]) == evidence["profile"]["sha256"]
+        assert evidence["executed_operators"]
+        for item in evidence["executed_operators"]:
+            assert item["provider"] == "CPUExecutionProvider"
+            assert item["calls"] > 0
+        assert all(
+            Path(item["path"]).is_relative_to(tmp_path / "diagnostics")
+            for item in evidence["files"]
+        )
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16, np.bool_])
 @pytest.mark.parametrize("shape", [(), (0, 2), (1, 0, 3), (2, 2)])
 def test_transport_preserves_rank_empty_dtype_and_bits(dtype, shape):
@@ -585,6 +611,28 @@ def test_raw_first_cached_outlier_is_retained_and_rtf_gate_is_not_trimmed():
     assert result["frame_seconds"][1] == timing["frame_seconds"][1]
     assert result["measurement_qualified"]
     assert result["meets_end_to_end_rtf_target"] is False
+
+
+def test_instrumented_cuda_timing_cannot_qualify_even_below_rtf_gate():
+    timing = {
+        "frame_seconds": [0.001] * 100,
+        "token_pipeline_seconds": 0.11,
+        "prefill_seconds": 0.01,
+        "first_frame_seconds": 0.011,
+    }
+    snapshots = [{"uuid": "GPU-owned", "foreign_pids": []} for _ in range(3)]
+    result = performance_result(
+        timing,
+        0.01,
+        np.zeros((100, 3), np.int64),
+        snapshots,
+        {"device": "cuda", "gpu_uuid": "GPU-owned"},
+        {"raw_bits_required": True},
+        instrumented=True,
+    )
+    assert result["end_to_end_rtf"] < 1.0
+    assert result["measurement_qualified"] is False
+    assert result["meets_end_to_end_rtf_target"] is None
 
 
 def test_missing_weights_fail_explicitly(consumer):

@@ -113,12 +113,29 @@ Private plugin registration is deliberately unsupported.
 
 All components use the same explicit provider/options/session-config/disabled
 optimizer selection. Actual ORT providers/options must match it exactly.
-If source RoPE requires `RotaryEmbeddingFusion` disabled, list it explicitly
-before both audit and measurement, never only in one stage. Native ordered
+The initial active CUDA 13 profile may use the explicit empty
+`disabled_optimizers: []` list. No RoPE fusion exclusion is required or inserted.
+Disabling `RotaryEmbeddingFusion` is an unverified historical candidate, not an
+active CUDA 13 default. Only actual CUDA 13 optimized-operator and rounding
+evidence can justify a recorded per-profile exclusion, applied identically
+before both audit and measurement. Never fall back to BASIC/EXTENDED or insert
+zero/identity barriers to avoid a fusion. Native ordered
 reductions are optional: declare runtime requirements only when the actual
 graph metadata requires them. This harness does not lower/rewrite graphs.
 
 ## Execution and gates
+
+Use `--diagnostics` for a separate, explicitly **unqualified** evidence run.
+ORT saves its actual optimized graph for each component under the new output
+root, and emits execution profiles. The report hashes these graphs and profile
+files with bounded reads, inventories emitted files, and summarizes actual
+provider/opcode call counts from profile JSON without importing IR/protobuf.
+This is a future CUDA 13 fusion/rounding investigation hook, not existing CUDA 13
+evidence or a reason to disable a fusion. The selected ALL/provider/exclusion
+controls are unchanged. Diagnostic instrumentation always makes timing
+unqualified, even when full-vector checks pass and measured RTF is below 1.0.
+Repeat the non-instrumented audit/benchmark with the same recorded selection
+for performance admission.
 
 ```powershell
 python scripts\audit_drama3.py `

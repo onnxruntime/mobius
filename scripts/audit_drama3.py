@@ -12,6 +12,7 @@ diagnostic only. See docs/drama3-runtime-harness.md for the manifest contract.
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import sys
@@ -240,7 +241,7 @@ def runtime_identity(profile, *, check_loaded=True):
     return {"ort_version": ort.__version__, "ort_build": ort.get_build_info()}
 
 
-def load_sessions(profile):
+def load_sessions(profile, *, evidence_root=None):
     sessions = {}
     for name, component in profile["components"].items():
         graph = checked_file(component["graph"])
@@ -255,6 +256,7 @@ def load_sessions(profile):
             device=profile["device"],
             device_id=profile["device_id"],
             selection=profile,
+            evidence_directory=evidence_root / name if evidence_root is not None else None,
         )
         metadata = session.session.get_modelmeta().custom_metadata_map
         if (
@@ -291,6 +293,38 @@ def load_sessions(profile):
     if {port.name for port in sessions["main_policy"].session.get_inputs()} != {"logits"}:
         raise ValueError("Greedy main policy must be the existing saved logits-only graph")
     return sessions
+
+
+def collect_evidence(sessions, root):
+    """Hash ORT-serialized graphs and summarize actual execution profile opcodes."""
+    result = {}
+    for name, session in sessions.items():
+        profile_path = Path(session.session.end_profiling()).resolve(strict=True)
+        directory = (root / name).resolve(strict=True)
+        if profile_path.parent != directory:
+            raise ValueError("ORT profile escaped the explicit evidence directory")
+        counts = collections.Counter()
+        for entry in json.loads(profile_path.read_text()):
+            details = entry.get("args", {})
+            if details.get("provider") and details.get("op_name"):
+                counts[(details["provider"], details["op_name"])] += 1
+        if not counts:
+            raise ValueError(f"No runtime operator evidence for {name}")
+        optimized = directory / "optimized.onnx"
+        result[name] = {
+            "optimized_graph": {"path": str(optimized), "sha256": digest(optimized)},
+            "profile": {"path": str(profile_path), "sha256": digest(profile_path)},
+            "executed_operators": [
+                {"provider": provider, "op_name": opcode, "calls": count}
+                for (provider, opcode), count in sorted(counts.items())
+            ],
+            "files": [
+                {"path": str(path), "sha256": digest(path), "bytes": path.stat().st_size}
+                for path in sorted(directory.rglob("*"))
+                if path.is_file()
+            ],
+        }
+    return result
 
 
 def verify_artifacts(profile):
@@ -597,7 +631,9 @@ def validate_ownership(snapshots, uuid):
         )
 
 
-def performance_result(timing, waveform_seconds, frames, snapshots, profile, audit):
+def performance_result(
+    timing, waveform_seconds, frames, snapshots, profile, audit, *, instrumented=False
+):
     durations = timing["frame_seconds"]
     if len(durations) != len(frames) or not all(
         np.isfinite(value) and value > 0
@@ -617,7 +653,10 @@ def performance_result(timing, waveform_seconds, frames, snapshots, profile, aud
     audio_seconds = len(frames) * 2048 / 44100
     rtf = (timing["token_pipeline_seconds"] + waveform_seconds) / audio_seconds
     qualified = (
-        profile["device"] == "cuda" and len(frames) >= 50 and audit["raw_bits_required"]
+        profile["device"] == "cuda"
+        and len(frames) >= 50
+        and audit["raw_bits_required"]
+        and not instrumented
     )
     return {
         **timing,
@@ -626,6 +665,7 @@ def performance_result(timing, waveform_seconds, frames, snapshots, profile, aud
         "end_to_end_rtf": rtf,
         "end_to_end_rtf_target": 1.0,
         "measurement_qualified": qualified,
+        "instrumented": instrumented,
         "meets_end_to_end_rtf_target": rtf <= 1.0 if qualified else None,
         "gpu_snapshots": snapshots,
     }
@@ -684,7 +724,8 @@ def run(args):
             validate_ownership(snapshots, profile["gpu_uuid"])
             require_idle(snapshots[0], False)
         runtime_identity(profile, check_loaded=False)
-        sessions = load_sessions(profile)
+        evidence_root = output / "evidence" if args.diagnostics else None
+        sessions = load_sessions(profile, evidence_root=evidence_root)
         report["runtime"] = runtime_identity(profile, check_loaded=False)
         audit = ReferenceAudit(request_data, profile["dtype"], raw_bits=args.raw_bits)
         report["audit_progress"] = audit.metrics
@@ -713,12 +754,20 @@ def run(args):
                 snapshots.append(gpu_snapshot(profile["device_id"]))
             np.testing.assert_array_equal(measured, frames)
             report["performance"] = performance_result(
-                timing, codec_seconds, measured, snapshots, profile, report["audit"]
+                timing,
+                codec_seconds,
+                measured,
+                snapshots,
+                profile,
+                report["audit"],
+                instrumented=args.diagnostics,
             )
             report["runtime_after_measurement"] = runtime_identity(profile)
             if report["performance"]["meets_end_to_end_rtf_target"] is False:
                 fail_rtf()
         verify_artifacts(profile)
+        if args.diagnostics:
+            report["diagnostics"] = collect_evidence(sessions, evidence_root)
         report["status"] = "passed"
         report["native_cuda13_acceptance"] = (
             args.benchmark
@@ -750,6 +799,11 @@ def parser():
     result.add_argument("--benchmark", action="store_true")
     result.add_argument("--warmup", type=int, default=2)
     result.add_argument("--lease-uuid")
+    result.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Save optimized graphs and opcode profiles; timing is unqualified",
+    )
     return result
 
 

@@ -135,6 +135,7 @@ class BoundSession:
         cudnn_conv1d_pad_to_nc1d=False,
         cudnn_conv_algo_search="EXHAUSTIVE",
         selection=None,
+        evidence_directory=None,
     ):
         if cudnn_conv_algo_search not in ("EXHAUSTIVE", "HEURISTIC", "DEFAULT"):
             raise ValueError(f"Unknown cuDNN convolution search: {cudnn_conv_algo_search!r}")
@@ -144,6 +145,11 @@ class BoundSession:
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         options.enable_mem_pattern = False
         options.enable_profiling = profile
+        if evidence_directory is not None:
+            evidence_directory.mkdir(parents=True, exist_ok=False)
+            options.optimized_model_filepath = str(evidence_directory / "optimized.onnx")
+            options.enable_profiling = True
+            options.profile_file_prefix = str(evidence_directory / "execution")
         if profile:
             profile_directory = profile_directory or Path(tempfile.gettempdir())
             profile_directory.mkdir(parents=True, exist_ok=True)
