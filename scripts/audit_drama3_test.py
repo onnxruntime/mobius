@@ -22,6 +22,7 @@ from audit_drama3 import (
     CHECKPOINT,
     SOURCE,
     ReferenceAudit,
+    attest_loaded_sessions,
     checked_file,
     compare_waveform,
     digest,
@@ -725,6 +726,14 @@ def test_actual_cpu_chain_in_fresh_framework_blocked_process(consumer, tmp_path)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     report = json.loads((tmp_path / "results" / "report.json").read_text())
     assert report["status"] == "passed"
+    assert report["all_model_sessions_attested_before_first_nn"] is True
+    assert set(report["actual_model_session_profiles_before_first_nn"]) == {
+        "embedding",
+        "decoder",
+        "audio_generator",
+        "main_policy",
+        "codec",
+    }
     assert report["codec_numerical_quality"]["status"] == "UNVERIFIED"
     assert report["codec_numerical_quality"]["independent_waveform_reference"] is None
     assert report["native_cuda13_acceptance"] is False
@@ -886,12 +895,19 @@ def test_selected_profile_controls_are_not_silently_changed(consumer, mutation):
         providers=[
             [
                 "CUDAExecutionProvider",
-                {"device_id": "0", "use_tf32": "0", "enable_cuda_graph": "0"},
+                {
+                    "device_id": "0",
+                    "use_tf32": "0",
+                    "enable_cuda_graph": "0",
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "EXHAUSTIVE",
+                },
             ],
             "CPUExecutionProvider",
         ],
     )
     profile["runtime"].update(cuda_toolkit="13.0.48", cublas="13.0.0.19", cudnn="9.14.0.64")
+    profile["session_config"]["session.disable_prepacking"] = "1"
     if mutation == "notready":
         profile["status"] = "NOT READY / NOT QUALIFIED"
     elif mutation == "extended":
@@ -921,6 +937,7 @@ def test_selected_session_forwards_all_controls_and_rejects_provider_drift(
                 else consumer.profile["actual_providers"]
             ),
             get_provider_options=lambda: {"CPUExecutionProvider": {"unselected": "1"}},
+            get_session_options=lambda: options,
         )
 
     monkeypatch.setattr(ort, "InferenceSession", fake_session)
@@ -1113,6 +1130,78 @@ def test_output_root_is_new_and_never_rewrites_frozen_inputs(consumer):
     assert not (consumer.assets / "forbidden-output").exists()
 
 
+def test_all_actual_model_readbacks_before_first_neural_call_and_failure_stops_it(
+    consumer, tmp_path, monkeypatch
+):
+    import audit_drama3
+    from drama3_session_profile import SessionProfileError
+
+    original_load = audit_drama3.load_sessions
+    original_read = audit_drama3.read_session_profile
+    loaded = []
+    checked = []
+    sessions_by_id = {}
+
+    def load(*args, **kwargs):
+        sessions = original_load(*args, **kwargs)
+        loaded.extend(sessions)
+        sessions_by_id.update({id(value.session): name for name, value in sessions.items()})
+        return sessions
+
+    def read(session, profile, **kwargs):
+        assert set(loaded) == {
+            "embedding",
+            "decoder",
+            "audio_generator",
+            "main_policy",
+            "codec",
+        }
+        name = sessions_by_id[id(session)]
+        actual = original_read(session, profile, **kwargs)
+        checked.append(name)
+        if name == "codec":
+            actual["actual_session_options"]["intra_op_num_threads"] = 1
+            raise SessionProfileError("CPU mock last-model option mismatch", actual)
+        return actual
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("No neural request or codec may start before every actual readback passes")
+
+    monkeypatch.setattr(audit_drama3, "runtime_identity", lambda *a, **k: {"CPU_mock": True})
+    monkeypatch.setattr(audit_drama3, "load_sessions", load)
+    monkeypatch.setattr(audit_drama3, "read_session_profile", read)
+    monkeypatch.setattr(audit_drama3, "request", forbidden)
+    monkeypatch.setattr(audit_drama3, "decode_waveform", forbidden)
+    args = audit_drama3.parser().parse_args(
+        [
+            "--inputs",
+            str(consumer.inputs),
+            "--inputs-sha256",
+            digest(consumer.inputs),
+            "--selection",
+            str(consumer.selection),
+            "--selection-sha256",
+            digest(consumer.selection),
+            "--output",
+            str(tmp_path / "readback-failure"),
+        ]
+    )
+    with pytest.raises(SessionProfileError, match="last-model"):
+        audit_drama3.run(args)
+    report = json.loads((tmp_path / "readback-failure/report.json").read_text())
+    assert report["all_model_sessions_attested_before_first_nn"] is False
+    assert set(checked) == set(loaded)
+    assert report["status"] == "failed"
+    codec = report["actual_model_session_profiles_before_first_nn"]["codec"]
+    assert codec["status"] == "FAILED"
+    assert codec["actual"]["actual_session_options"]["intra_op_num_threads"] == 1
+
+
+def test_incomplete_actual_session_set_cannot_attest(consumer):
+    with pytest.raises(ValueError, match="incomplete"):
+        attest_loaded_sessions({}, consumer.profile)
+
+
 def test_unknown_gpu_snapshot_persists_failed_report_without_model_session(
     consumer, tmp_path, monkeypatch
 ):
@@ -1126,12 +1215,19 @@ def test_unknown_gpu_snapshot_persists_failed_report_without_model_session(
         providers=[
             [
                 "CUDAExecutionProvider",
-                {"device_id": "0", "use_tf32": "0", "enable_cuda_graph": "0"},
+                {
+                    "device_id": "0",
+                    "use_tf32": "0",
+                    "enable_cuda_graph": "0",
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "EXHAUSTIVE",
+                },
             ],
             "CPUExecutionProvider",
         ],
     )
     profile["runtime"].update(cuda_toolkit="13.0.48", cublas="13.0.0.19", cudnn="9.14.0.64")
+    profile["session_config"]["session.disable_prepacking"] = "1"
     consumer.selection.write_text(json.dumps(profile))
     evidence = {
         "status": "UNKNOWN",

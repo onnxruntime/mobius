@@ -32,6 +32,11 @@ from drama3_runtime import (
     require_idle,
     sequence_view,
 )
+from drama3_session_profile import (
+    SessionProfileError,
+    read_session_profile,
+    validate_requested_profile,
+)
 
 CHECKPOINT = "b2b5ee998034b2975720906c815e7fb0e9f007bd"
 SOURCE = "541566932abbaebcb0a40e562a1f846738383f38"
@@ -86,6 +91,7 @@ def validate_profile(profile):
         raise ValueError("disabled_optimizers must be an explicit list of names")
     if len(set(profile["disabled_optimizers"])) != len(profile["disabled_optimizers"]):
         raise ValueError("Duplicate disabled optimizers")
+    validate_requested_profile(profile)
     if profile["device"] == "cuda":
         runtime = profile["runtime"]
         if (
@@ -258,7 +264,7 @@ def runtime_identity(profile, *, check_loaded=True):
     return result
 
 
-def load_sessions(profile, *, evidence_root=None):
+def load_sessions(profile, *, evidence_root=None, profile_evidence=None):
     sessions = {}
     for name, component in profile["components"].items():
         graph = checked_file(component["graph"])
@@ -268,13 +274,23 @@ def load_sessions(profile, *, evidence_root=None):
         # operator is mandatory for a portable graph.
         if not isinstance(component["required_runtime_features"], str):
             raise TypeError("Runtime feature inventory must be explicit")
-        session = BoundSession(
-            graph,
-            device=profile["device"],
-            device_id=profile["device_id"],
-            selection=profile,
-            evidence_directory=evidence_root / name if evidence_root is not None else None,
-        )
+        try:
+            session = BoundSession(
+                graph,
+                device=profile["device"],
+                device_id=profile["device_id"],
+                selection=profile,
+                evidence_directory=evidence_root / name if evidence_root is not None else None,
+            )
+        except SessionProfileError as error:
+            if profile_evidence is not None:
+                profile_evidence[name] = {"status": "FAILED", "actual": error.readback}
+            raise
+        if profile_evidence is not None:
+            profile_evidence[name] = {
+                "status": "READ_BACK",
+                "actual": session.profile_readback,
+            }
         metadata = session.session.get_modelmeta().custom_metadata_map
         if (
             metadata.get("mobius.required_runtime_features", "")
@@ -311,6 +327,25 @@ def load_sessions(profile, *, evidence_root=None):
     if {port.name for port in sessions["main_policy"].session.get_inputs()} != {"logits"}:
         raise ValueError("Greedy main policy must be the existing saved logits-only graph")
     return sessions
+
+
+def attest_loaded_sessions(sessions, profile, *, diagnostics=False, evidence=None):
+    """All five saved model sessions must attest before the first neural call."""
+    if set(sessions) != COMPONENTS:
+        raise ValueError("Cannot attest an incomplete set of actual model sessions")
+    result = evidence if evidence is not None else {}
+    for name, session in sessions.items():
+        try:
+            result[name] = {
+                "status": "ATTESTED",
+                "actual": read_session_profile(
+                    session.session, profile, profiling=diagnostics
+                ),
+            }
+        except SessionProfileError as error:
+            result[name] = {"status": "FAILED", "actual": error.readback}
+            raise
+    return result
 
 
 def expert_execution(features, weight_loading=None):
@@ -894,8 +929,21 @@ def run(args):
             require_idle(snapshots[0], False)
         runtime_identity(profile, check_loaded=False)
         evidence_root = output / "evidence" if args.diagnostics else None
-        sessions = load_sessions(profile, evidence_root=evidence_root)
-        report["runtime"] = runtime_identity(profile, check_loaded=False)
+        report["actual_model_session_profiles_before_first_nn"] = {}
+        report["all_model_sessions_attested_before_first_nn"] = False
+        sessions = load_sessions(
+            profile,
+            evidence_root=evidence_root,
+            profile_evidence=report["actual_model_session_profiles_before_first_nn"],
+        )
+        attest_loaded_sessions(
+            sessions,
+            profile,
+            diagnostics=args.diagnostics,
+            evidence=report["actual_model_session_profiles_before_first_nn"],
+        )
+        report["all_model_sessions_attested_before_first_nn"] = True
+        report["runtime"] = runtime_identity(profile)
         audit = ReferenceAudit(request_data, profile["dtype"], raw_bits=args.raw_bits)
         report["audit_progress"] = audit.metrics
 

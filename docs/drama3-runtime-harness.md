@@ -142,6 +142,23 @@ visible; full-model vector/raw-bit qualification remains unchanged.
 
 All components use the same explicit provider/options/session-config/disabled
 optimizer selection. Actual ORT providers/options must match it exactly.
+`drama3_session_profile.py` is an ORT-only shared constructor/readback helper.
+Every actual saved embedding, decoder, policy, tower and codec session records
+its full `get_provider_options()` map, registered provider order, observed
+`get_session_options()` fields and explicit session-config getters. The loader
+then rechecks **all five actual sessions together before the first neural call**;
+any required semantic, map, option, config or declared-device mismatch aborts.
+Failure reports preserve available readbacks and keep the barrier false.
+CUDA profiles must explicitly preserve TF32 off, capture off, `kSameAsRequested`,
+`EXHAUSTIVE`, and disabled prepacking; no missing control is silently repaired.
+
+A tiny weightless discovery session may bootstrap a candidate expected map only
+under a separately parent-approved grant-time metadata stage. It is not evidence
+for any real model session and must never run inference or load checkpoint
+weights. The actual all-model readbacks above remain mandatory even when tiny
+discovery succeeds. Registered providers are not proof of per-node execution
+placement. ORT has no disabled-optimizer getter: that list is labelled
+source-bound constructor/requested evidence, not fabricated runtime readback.
 The initial active CUDA 13 profile may use the explicit empty
 `disabled_optimizers: []` list. No RoPE fusion exclusion is required or inserted.
 Disabling `RotaryEmbeddingFusion` is an unverified historical candidate, not an

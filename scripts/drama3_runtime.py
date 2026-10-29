@@ -25,6 +25,7 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 import onnxruntime as ort
+from drama3_session_profile import read_session_profile, session_options
 
 # These scripts run from a source checkout. Loading this pure validator directly
 # avoids executing mobius.__init__ (and its builder/framework dependencies).
@@ -141,12 +142,9 @@ class BoundSession:
     ):
         if cudnn_conv_algo_search not in ("EXHAUSTIVE", "HEURISTIC", "DEFAULT"):
             raise ValueError(f"Unknown cuDNN convolution search: {cudnn_conv_algo_search!r}")
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 8
-        options.inter_op_num_threads = 1
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.enable_mem_pattern = False
-        options.enable_profiling = profile
+        options = session_options(
+            selection, profiling=profile or evidence_directory is not None
+        )
         if evidence_directory is not None:
             evidence_directory.mkdir(parents=True, exist_ok=False)
             options.optimized_model_filepath = str(evidence_directory / "optimized.onnx")
@@ -187,8 +185,6 @@ class BoundSession:
                 for item in selection["providers"]
             ]
             disabled = set(selection["disabled_optimizers"])
-            for key, value in selection["session_config"].items():
-                options.add_session_config_entry(key, value)
         self.session = ort.InferenceSession(
             str(path),
             options,
@@ -196,10 +192,9 @@ class BoundSession:
             **({"disabled_optimizers": disabled} if selection is not None else {}),
         )
         if selection is not None:
-            if self.session.get_providers() != selection["actual_providers"]:
-                raise RuntimeError("ORT provider fallback differs from selected profile")
-            if self.session.get_provider_options() != selection["actual_provider_options"]:
-                raise RuntimeError("Actual provider options differ from selected profile")
+            self.profile_readback = read_session_profile(
+                self.session, selection, profiling=evidence_directory is not None
+            )
         self.device, self.device_id = device, device_id if device == "cuda" else 0
         self.outputs = [port.name for port in self.session.get_outputs()]
         self.context_contract = self.session.get_modelmeta().custom_metadata_map.get(
