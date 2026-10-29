@@ -446,6 +446,10 @@ def build_transformers_model(
         from mobius.models.reuse import REUSE_REVISION
 
         detection_revision = REUSE_REVISION
+    if model_id == "fishaudio/drama-3" and revision is None:
+        from mobius._configs.fish_omni import DRAMA3_REVISION
+
+        revision = detection_revision = DRAMA3_REVISION
 
     hf_config, loaded_from_raw_json = _load_transformers_config(
         config_model_id,
@@ -644,6 +648,21 @@ def build_transformers_model(
     if task is None:
         task = _default_task_for_model(model_type)
 
+    if model_type == "fish_omni":
+        from mobius.tasks import FishOmniTask
+
+        if task not in ("fish-omni", "fish-omni-generation") and not isinstance(
+            task, FishOmniTask
+        ):
+            raise ValueError(
+                "Drama 3 requires task='fish-omni' or 'fish-omni-generation'; "
+                "it is not a generic causal LM"
+            )
+        if output_layer_indices is not None or fp8_kv_cache or kv_cache_scales is not None:
+            raise ValueError("Drama 3 does not support hidden-layer capture or FP8 KV caches")
+        if load_weights and config.fp8_experts and keep_quantized:
+            config = dataclasses.replace(config, native_fp8_experts=True)
+
     from mobius.tasks import get_task
 
     resolved_task = get_task(task)
@@ -677,6 +696,7 @@ def build_transformers_model(
     for name, model in package.items():
         model.graph.name = f"{graph_source_name}/{name}"
         if model_type in _QWEN4_MODEL_TYPES | {
+            "fish_omni",
             "vibevoice",
             "vibevoice_streaming",
             "vibevoice_asr",
@@ -693,7 +713,15 @@ def build_transformers_model(
 
     if load_weights:
         _reject_unsupported_affine_qwen4(model_type, config)
-        if is_gptoss_mxfp4_source and keep_quantized:
+        if model_type == "fish_omni":
+            from mobius.integrations.transformers._fish_omni_weights import (
+                stream_fish_omni_safetensors_to_package,
+            )
+
+            stream_fish_omni_safetensors_to_package(
+                package, model_id, config, revision=revision
+            )
+        elif is_gptoss_mxfp4_source and keep_quantized:
             from mobius.integrations.transformers._gptoss_weights import (
                 stream_gptoss_mxfp4_safetensors_to_package,
             )

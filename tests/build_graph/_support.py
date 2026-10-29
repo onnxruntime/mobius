@@ -245,6 +245,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "wav2vec2-conformer",
     "wavlm",
     # Audio/TTS dedicated tests
+    "fish_omni",
     "fun_asr",
     "mms",
     "qwen3_asr",

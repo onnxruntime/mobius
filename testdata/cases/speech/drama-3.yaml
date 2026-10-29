@@ -1,0 +1,11 @@
+model_id: "fishaudio/drama-3"
+model_type: "fish_omni"
+revision: "b2b5ee998034b2975720906c815e7fb0e9f007bd"
+task_type: "text-to-speech"
+dtype: "float32"
+level: "L4+L5"
+inputs:
+  prompts:
+    - "Hello, this is a speech synthesis test."
+skip_reason: "The generic TTS runner does not orchestrate Drama 3 temporal caches and sequential codebooks; dedicated token, ONNX policy and codec tests cover the exported graphs."
+notes: "The original pinned FP32 checkpoint passed H200 CUDA prefill and 20-frame greedy parity (scripts/validate_drama3.py and testdata/golden/speech/drama-3_tokens_generation.json). The separate FP32 ONNX codec matches all 40960 real-reference samples on CPU (max_abs 1.848e-6). FP16 and BF16 production exports are disabled after real-weight reduced fixtures failed the unchanged1e-2 logit gate, despite synthetic prototype20-frame parity. Full-checkpoint reduced precision and native FP8 remain unqualified."

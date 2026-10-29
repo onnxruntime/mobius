@@ -2074,6 +2074,13 @@ def write_ort_genai_config(
             "KV caches, DPM-Solver sampling, and prefilled voice-prompt caches; it "
             "cannot be represented by an ONNX Runtime GenAI configuration."
         )
+    if getattr(config, "model_type", None) == "fish_omni":
+        raise ValueError(
+            "Drama 3 requires orchestration of next-frame codebook sampling and "
+            "temporal audio caches across multiple graphs; an ONNX Runtime GenAI "
+            "speech pipeline configuration is not implemented. Exported sampling "
+            "and codec graphs do not provide that runtime orchestration."
+        )
     os.makedirs(directory, exist_ok=True)
     if set(pkg) in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
         pkg, "gguf_projector_type", None
