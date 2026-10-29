@@ -67,6 +67,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Create virtual environment
+        run: |
+          # The A10 image's system pip is externally managed (PEP 668).
+          "$pythonLocation/bin/python" -m venv "$RUNNER_TEMP/mobius-venv"
+
       - name: Cache HuggingFace models
         uses: actions/cache@v6
         with:
@@ -76,18 +81,27 @@ jobs:
             hf-examples-gpu-
 
       - name: Install PyTorch (CUDA)
-        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+        run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
       - name: Install dependencies
         run: |
-          pip install -r requirements/ci/requirements.txt
-          pip install -e '.[testing,transformers]'
-          pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install -r requirements/ci/requirements.txt
+          python -m pip install -e '.[testing,transformers]'
+          python -m pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           # PyPI's ORT 1.27+ wheel requires CUDA 13, while these runners use CUDA 12.
-          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
-          pip install --no-deps onnxruntime-genai-cuda
+          python -m pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
+          python -m pip install --no-deps onnxruntime-genai-cuda
 
       - name: Run ${{ matrix.name }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: ${{ matrix.command }}
+        run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          ${{ matrix.command }}
+
+      - name: Clean up virtual environment
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/mobius-venv"
