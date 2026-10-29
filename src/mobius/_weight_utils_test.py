@@ -11,6 +11,7 @@ import torch
 from mobius._configs import QuantizationConfig
 from mobius._weight_utils import (
     is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
@@ -28,6 +29,43 @@ from mobius._weight_utils import (
     vlm_embedding_weights,
     vlm_vision_weights,
 )
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("float_head", NotImplementedError, "requires quantize_lm_head=True"),
+        ("different_layout", ValueError, "must use the same quantization layout"),
+        ("missing_scales", ValueError, "missing Olive sidecars"),
+    ],
+)
+def test_split_tied_table_rejects_unsupported_materialization(case, error, message):
+    embedding = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_embeddings=True
+    )
+    head = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_lm_head=True
+    )
+    state_dict = {
+        "embedding.embed_tokens.weight_qweight": torch.zeros(32, 8, dtype=torch.uint8),
+        "embedding.embed_tokens.weight_scales": torch.ones(32, 1),
+    }
+    if case == "float_head":
+        head.quantize_lm_head = False
+    elif case == "different_layout":
+        head.bits = 8
+    else:
+        del state_dict["embedding.embed_tokens.weight_scales"]
+
+    with pytest.raises(error, match=message):
+        materialize_split_tied_olive_lm_head(
+            state_dict,
+            embed_key="embedding.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+            embedding_quantization=embedding,
+            head_quantization=head,
+        )
+    assert "decoder.lm_head.weight_qweight" not in state_dict
 
 
 class TestSplitFusedQKV:
@@ -943,6 +981,43 @@ class TestPreprocessAwqWeights:
 
 class TestPreprocessQuantizedWeights:
     @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
+    def test_defers_ordinary_sidecars_without_changing_float_tying(self, quant_method):
+        quantization = QuantizationConfig(
+            bits=4, group_size=16, quant_method=quant_method, sym=False
+        )
+        if quant_method == "olive":
+            weight_key, scales_key = "layer.weight_qweight", "layer.weight_scales"
+            zeros_key = "layer.weight_qzeros"
+            packed = torch.arange(256).reshape(16, 16).to(torch.uint8)
+            scales = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+            zeros = torch.ones(16, 1, dtype=torch.uint8)
+        else:
+            weight_key, scales_key = "layer.qweight", "layer.scales"
+            zeros_key = "layer.qzeros"
+            shape = (4, 16) if quant_method == "gptq" else (32, 2)
+            packed = torch.arange(64, dtype=torch.int32).reshape(shape)
+            scales = torch.arange(32, dtype=torch.float32).reshape(2, 16)
+            zeros = torch.arange(4, dtype=torch.int32).reshape(2, 2)
+        embedding = torch.ones(8, 32)
+        state_dict = {
+            weight_key: packed,
+            scales_key: scales,
+            zeros_key: zeros,
+            "model.embed_tokens.weight": embedding,
+        }
+
+        result = preprocess_quantized_weights(
+            state_dict, quantization, tie_embeddings=True, defer_non_expert_sidecars=True
+        )
+
+        assert result[weight_key] is packed
+        assert result[scales_key] is scales
+        assert result[zeros_key] is zeros
+        assert result["lm_head.weight"] is embedding
+        assert "layer.weight" not in result
+        assert "lm_head.weight" not in state_dict
+
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
     def test_dispatches_quantization_method(self, quant_method):
         quantization = QuantizationConfig(bits=4, group_size=16, quant_method=quant_method)
         if quant_method == "olive":
@@ -958,7 +1033,8 @@ class TestPreprocessQuantizedWeights:
         "suffix",
         ["_qweight", "_scales", "_qzeros", ".qweight", ".scales", ".qzeros"],
     )
-    def test_rejects_packed_experts_for_unsupported_qmoe_abi(self, suffix):
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_rejects_packed_experts_for_unsupported_qmoe_abi(self, suffix, defer):
         quantization = QuantizationConfig(bits=8, group_size=16, quant_method="olive")
         state_dict = {
             f"decoder.model.layers.0.mlp.experts.gate_up_proj{suffix}": torch.zeros(1)
@@ -969,6 +1045,7 @@ class TestPreprocessQuantizedWeights:
                 state_dict,
                 quantization,
                 qmoe_target_path=".mlp",
+                defer_non_expert_sidecars=defer,
             )
 
     def test_rejects_unsupported_qmoe_quantization_method(self):
@@ -981,7 +1058,8 @@ class TestPreprocessQuantizedWeights:
                 qmoe_quant_methods=("olive",),
             )
 
-    def test_per_expert_gptq_moe_produces_populated_fused_qmoe(self):
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_per_expert_gptq_moe_produces_populated_fused_qmoe(self, defer):
         """Per-expert GPTQ experts stack+pack into non-empty fused QMoE params.
 
         This is the end-to-end guard for the per-expert -> fused-QMoE path:
@@ -1009,7 +1087,10 @@ class TestPreprocessQuantizedWeights:
                 state_dict[f"{prefix}.{e}.{proj}.scales"] = torch.randn(n_groups, n)
 
         result = preprocess_quantized_weights(
-            state_dict, quantization, qmoe_target_path=".mlp"
+            state_dict,
+            quantization,
+            qmoe_target_path=".mlp",
+            defer_non_expert_sidecars=defer,
         )
 
         fc1 = result["model.layers.0.mlp.fc1_experts_weights"]
@@ -1024,7 +1105,8 @@ class TestPreprocessQuantizedWeights:
         assert not any(".experts." in k and ".down_proj" in k for k in result)
 
     @pytest.mark.parametrize("flag", ["quantize_embeddings", "quantize_lm_head"])
-    def test_rejects_quantized_embedding_or_lm_head(self, flag):
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_rejects_quantized_embedding_or_lm_head(self, flag, defer):
         quantization = QuantizationConfig(
             bits=4,
             group_size=16,
@@ -1036,6 +1118,7 @@ class TestPreprocessQuantizedWeights:
                 {},
                 quantization,
                 reject_quantized_embeddings_lm_head=True,
+                defer_non_expert_sidecars=defer,
             )
 
     @pytest.mark.parametrize(

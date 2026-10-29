@@ -71,17 +71,20 @@ def test_component_quantization_routes_hf_namespaces_and_packed_embedding():
             ),
             "model.language_model.model.embed_tokens.weight_qweight": qweight,
             "model.language_model.model.embed_tokens.weight_scales": torch.ones(32, 1),
-            "model.vision_tower.encoder.layers.0.mlp.fc1.weight_qweight": torch.zeros(
+            "model.vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight_qweight": torch.zeros(
                 32, 8, dtype=torch.uint8
             ),
-            "model.vision_tower.encoder.layers.0.mlp.fc1.weight_scales": torch.ones(32, 1),
+            "model.vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight_scales": torch.ones(
+                32, 1
+            ),
         }
     )
 
     assert "decoder.model.layers.0.self_attn.q_proj.weight_qweight" in routed
     assert routed["embedding.embed_tokens.weight_qweight"] is qweight
     assert not any(name.startswith("decoder.model.embed_tokens.") for name in routed)
-    assert "vision_encoder.vision_tower.encoder.layers.0.mlp.up_proj.weight_qweight" in routed
+    vision_projection = "vision_encoder.vision_tower.vision_model.encoder.layers.0.mlp.up_proj"
+    assert f"{vision_projection}.weight_qweight" in routed
 
     result = preprocess_component_quantized_state_dict(
         routed,
@@ -92,7 +95,7 @@ def test_component_quantization_routes_hf_namespaces_and_packed_embedding():
     )
 
     assert result["decoder.model.layers.0.self_attn.q_proj.weight"].shape == (16, 1, 8)
-    assert result["vision_encoder.vision_tower.encoder.layers.0.mlp.up_proj.weight"].shape == (
+    assert result[f"{vision_projection}.weight"].shape == (
         32,
         1,
         8,

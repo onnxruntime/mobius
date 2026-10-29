@@ -472,6 +472,39 @@ class QuantizedEmbedding(nn.Module):
         return result
 
 
+class ScaledQuantizedEmbedding(QuantizedEmbedding):
+    """Block-quantized token lookup followed by a fixed activation scale."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int | None = None,
+        embed_scale: float = 1.0,
+        *,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = True,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            bits=bits,
+            block_size=block_size,
+            has_zero_point=has_zero_point,
+            padding_idx=padding_idx,
+        )
+        self.embed_scale = embed_scale
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
+        embeddings = super().forward(op, input_ids)
+        assert self.scales.dtype is not None
+        scale = op.Constant(
+            value=ir.tensor(np.asarray(self.embed_scale, dtype=self.scales.dtype.numpy()))
+        )
+        return op.Mul(embeddings, scale)
+
+
 class TiedQuantizedLMHead(nn.Module):
     """LM head tied to a :class:`QuantizedEmbedding`, sharing one packed table.
 

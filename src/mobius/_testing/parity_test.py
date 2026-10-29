@@ -11,6 +11,7 @@ import pytest
 from mobius._testing.parity import (
     ParityReport,
     ParityResult,
+    compare_diarization_golden,
     compare_golden,
     compare_synthetic,
 )
@@ -221,3 +222,48 @@ class TestCompareGolden:
             golden_top10_ids=golden_top10,
         )
         assert report.result == ParityResult.FAIL
+
+
+class TestCompareDiarizationGolden:
+    """Tests for L4/L5 diarization golden comparison."""
+
+    def test_identical_probs_pass(self):
+        probs = np.array([[[0.9, 0.1], [0.2, 0.8]]], dtype=np.float32)
+        report = compare_diarization_golden(probs, probs.copy())
+        assert report.result == ParityResult.PASS
+
+    def test_small_diff_within_tolerance_passes(self):
+        golden = np.array([[[0.9, 0.1], [0.2, 0.8]]], dtype=np.float32)
+        onnx = golden + 1e-5
+        report = compare_diarization_golden(onnx, golden)
+        assert report.result == ParityResult.PASS
+
+    def test_secondary_speaker_threshold_crossing_fails(self):
+        """Regression test for the review-flagged AMBIGUOUS-masking bug.
+
+        A single frame's dominant speaker (index 0) is unchanged in both
+        ONNX and golden, but the *secondary* speaker's probability crosses
+        the 0.5 decision threshold (0.6 -> golden considers it active,
+        0.1 -> ONNX does not). This is a real diarization error -- the
+        active-speaker set differs -- and must FAIL, not be downgraded to
+        AMBIGUOUS merely because the dominant-speaker argmax still agrees.
+        """
+        golden = np.array([[[0.9, 0.6]]], dtype=np.float32)
+        onnx = np.array([[[0.9, 0.1]]], dtype=np.float32)
+        report = compare_diarization_golden(onnx, golden, atol=1e-3, rtol=1e-2)
+        assert report.result == ParityResult.FAIL
+        # Diagnostics are still reported even though the result is FAIL.
+        assert report.argmax_match is True
+
+    def test_large_diff_with_dominant_mismatch_fails(self):
+        golden = np.array([[[0.9, 0.1], [0.2, 0.8]]], dtype=np.float32)
+        onnx = np.array([[[0.1, 0.9], [0.8, 0.2]]], dtype=np.float32)
+        report = compare_diarization_golden(onnx, golden)
+        assert report.result == ParityResult.FAIL
+        assert report.argmax_match is False
+
+    def test_shape_mismatch_raises(self):
+        golden = np.zeros((1, 2, 3), dtype=np.float32)
+        onnx = np.zeros((1, 2, 4), dtype=np.float32)
+        with pytest.raises(AssertionError):
+            compare_diarization_golden(onnx, golden)

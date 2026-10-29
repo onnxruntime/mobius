@@ -1177,19 +1177,24 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
         packaged_tokenizer = AutoTokenizer.from_pretrained(output_dir, local_files_only=True)
         assert packaged_tokenizer(case.prompt).input_ids == tokenizer(case.prompt).input_ids
     else:
-        rejected_package = tmp_path / f"{case.name}-runtime"
-        with pytest.raises(ValueError, match="No unique GGUF runtime evidence"):
-            write_gguf_runtime_package(
-                captured[0],
-                gguf_path,
-                rejected_package,
-                runtime="onnx-genai",
-                runtime_version="1.29.0",
-                tokenizer_repository=case.tokenizer_repository,
-                tokenizer_revision=case.tokenizer_revision,
-                local_files_only=True,
-            )
-        assert not rejected_package.exists()
+        runtime_package = tmp_path / f"{case.name}-runtime"
+        write_gguf_runtime_package(
+            captured[0],
+            gguf_path,
+            runtime_package,
+            runtime="onnx-genai",
+            runtime_version="1.29.0",
+            tokenizer_repository=case.tokenizer_repository,
+            tokenizer_revision=case.tokenizer_revision,
+            local_files_only=True,
+        )
+        assert (runtime_package / "model.onnx").is_file()
+        assert (runtime_package / "export_report.json").is_file()
+        compatibility = json.loads(
+            (runtime_package / "runtime_compatibility.json").read_text(encoding="utf-8")
+        )
+        assert compatibility["runtime_validation_status"] == "unvalidated"
+        assert compatibility["runtime_evidence_id"] is None
         source = GGUFTokenizerSource(
             repository=case.tokenizer_repository,
             revision=case.tokenizer_revision,

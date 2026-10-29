@@ -62,6 +62,7 @@ from mobius._configs._base import (
     MoonshineStreamingConfig,
     MuseGlimmerConfig,
     NanoChatConfig,
+    Nemotron3DiarizationConfig,
     NemotronHConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
@@ -112,6 +113,7 @@ from mobius._configs._sub_configs import (
 )
 from mobius._configs._world_model import WorldModelConfig
 from mobius._configs.vibevoice import (
+    VibeVoiceASRStreamingConfig,
     VibeVoiceConfig,
     VibeVoiceDiffusionConfig,
     VibeVoiceStreamingConfig,
@@ -119,6 +121,7 @@ from mobius._configs.vibevoice import (
     VibeVoiceStreamingTokenizerConfig,
     VibeVoiceTokenizerConfig,
 )
+from mobius._configs.vibevoice_asr import VibeVoiceASRConfig
 
 __all__ = [
     "DEFAULT_INT",
@@ -165,6 +168,7 @@ __all__ = [
     "MoonshineStreamingConfig",
     "MuseGlimmerConfig",
     "NanoChatConfig",
+    "Nemotron3DiarizationConfig",
     "NemotronParseConfig",
     "NemotronHConfig",
     "ParakeetCTCConfig",
@@ -183,6 +187,8 @@ __all__ = [
     "TTSConfig",
     "VisionConfig",
     "VisionLanguageConfig",
+    "VibeVoiceASRConfig",
+    "VibeVoiceASRStreamingConfig",
     "VibeVoiceConfig",
     "VibeVoiceDiffusionConfig",
     "VibeVoiceStreamingConfig",

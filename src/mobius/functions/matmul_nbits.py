@@ -30,9 +30,10 @@ weight initializer is loaded and ORT runs constant folding):**
     wf   = DequantizeLinear(w4, scales, zp4, axis=1, block_size=<forwarded>)
     Y    = MatMul(A, Transpose(wf))            # (..., N)
 
-Only the 4-bit form is emitted by mobius's quantized builds (GGUF Q4_K, Olive
-INT4), so this body targets ``bits=4`` with ``zero_points`` present. It is
-verified numerically identical to the native ``MatMulNBits`` op.
+This body targets ``bits=4``. When ``zero_points`` is omitted, the operator
+uses the midpoint zero point, 8. The function registry selects the
+``default_zero_points`` overload for those calls so inlining does not leave
+missing operands in the nibble-unpacking graph.
 
 Attributes:
     block_size (int): Elements per quantization block along K.
@@ -49,8 +50,13 @@ from mobius._constants import OPSET_VERSION
 DOMAIN = "com.microsoft"
 
 
-def matmul_nbits() -> ir.Function:
+def matmul_nbits(*, has_zero_points: bool = True) -> ir.Function:
     """Build an ``ir.Function`` for the 4-bit ``com.microsoft::MatMulNBits`` op.
+
+    Args:
+        has_zero_points: Whether the call supplies packed zero points. When
+            false, use the operator's default zero point and give the function
+            the ``default_zero_points`` overload.
 
     Inputs:
         A:            (..., K) activation.
@@ -91,22 +97,26 @@ def matmul_nbits() -> ir.Function:
         w_2d = op.Reshape(w_blocks, keep_n)
         w4 = op.Cast(w_2d, to=ir.DataType.UINT4)
 
-        # --- Unpack the packed 4-bit zero points to uint4 (N, nb) ---
-        # zero_points: (N, zpacked) -> interleave nibbles on axis 2 -> (N, zpacked, 2)
-        zp_inter = _unpack_nibbles(op, zero_points_input, interleave_axis=2)
-        zp_2d = op.Reshape(zp_inter, keep_n)  # (N, 2*zpacked) >= (N, nb)
-        # Slice to exactly nb columns (nb = scales.shape[1]); handles odd nb.
-        nb_end = op.Slice(
-            op.Shape(scales_input),
-            op.Constant(value=ir.tensor(np.array([1], dtype=np.int64))),
-            op.Constant(value=ir.tensor(np.array([2], dtype=np.int64))),
-        )
-        zp_sliced = op.Slice(
-            zp_2d,
-            op.Constant(value=ir.tensor(np.array([0], dtype=np.int64))),
-            nb_end,
-            op.Constant(value=ir.tensor(np.array([1], dtype=np.int64))),
-        )
+        if has_zero_points:
+            # (N, zpacked) -> (N, 2*zpacked), then trim the padding nibble.
+            zp_inter = _unpack_nibbles(op, zero_points_input, interleave_axis=2)
+            zp_2d = op.Reshape(zp_inter, keep_n)
+            nb_end = op.Slice(
+                op.Shape(scales_input),
+                op.Constant(value=ir.tensor(np.array([1], dtype=np.int64))),
+                op.Constant(value=ir.tensor(np.array([2], dtype=np.int64))),
+            )
+            zp_sliced = op.Slice(
+                zp_2d,
+                op.Constant(value=ir.tensor(np.array([0], dtype=np.int64))),
+                nb_end,
+                op.Constant(value=ir.tensor(np.array([1], dtype=np.int64))),
+            )
+        else:
+            zp_sliced = op.ConstantOfShape(
+                op.Shape(scales_input),
+                value=ir.tensor(np.array([8], dtype=np.uint8)),
+            )
         zp4 = op.Cast(zp_sliced, to=ir.DataType.UINT4)
 
         # --- Blocked dequantize + MatMul ---
@@ -125,7 +135,7 @@ def matmul_nbits() -> ir.Function:
         y.name = "Y"
         return y
 
-    return build_function(
+    function = build_function(
         body,
         [
             ir.Value(name="A"),
@@ -140,3 +150,6 @@ def matmul_nbits() -> ir.Function:
         ],
         opset_imports={"": OPSET_VERSION},
     )
+    if not has_zero_points:
+        function.overload = "default_zero_points"
+    return function

@@ -25,6 +25,7 @@ from build_graph._support import (
     _assert_outputs_have_shapes_and_dtypes,
     _make_params,
     _run_onnx_checker,
+    _with_component_quantization,
 )
 from mobius._builder import DTYPE_MAP, build_from_module
 from mobius._configs import (
@@ -1998,6 +1999,35 @@ class TestBuildVLGraph:
             vision = pkg["vision_encoder"]
             pixel_values = next(i for i in vision.graph.inputs if i.name == "pixel_values")
             assert pixel_values.dtype == ir.DataType.FLOAT
+
+    def test_component_quantization_builds(self, model_type: str, config_overrides: dict):
+        """Every VL task accepts an independent affine layout per component."""
+        config = _base_config(**config_overrides)
+        task = get_task(_default_task_for_model(model_type))
+        config = _with_component_quantization(config, task)
+
+        package = build_from_module(
+            registry.get(model_type)(config),
+            config,
+            task=task,
+        )
+
+        for component, model in package.items():
+            quantization = config.component_quantization.get(component)
+            if quantization is None:
+                continue
+            quantized_nodes = [
+                node
+                for node in model.graph
+                if node.op_type in {"MatMulNBits", "GatherBlockQuantized"}
+            ]
+            if not quantized_nodes:
+                assert not any(node.op_type == "MatMul" for node in model.graph), (
+                    f"{model_type}/{component} kept eligible MatMul projections float"
+                )
+            for node in quantized_nodes:
+                assert node.attributes["bits"].as_int() == quantization.bits
+                assert node.attributes["block_size"].as_int() == quantization.group_size
 
     def test_has_initializers(self, model_type: str, config_overrides: dict):
         """Verify all sub-models have non-empty initializers."""

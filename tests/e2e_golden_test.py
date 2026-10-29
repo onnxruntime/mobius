@@ -51,13 +51,14 @@ from mobius._testing.golden import (
     generation_json_path_for_case,
     golden_path_for_case,
     has_golden,
+    load_diarization_golden,
     load_drafter_inputs,
     load_generation_golden,
     load_golden_ref,
     load_tolerances,
 )
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._testing.parity import ParityResult, compare_golden
+from mobius._testing.parity import ParityResult, compare_diarization_golden, compare_golden
 
 
 @functools.cache
@@ -569,6 +570,13 @@ def _build_model_package(case: GoldenTestCase) -> ModelPackage:
         assert route["preserve_quantization"] == source["preserve_quantization"]
         return package
 
+    if case.reference_loader == "nemo":
+        # NeMo-toolkit reference (e.g. Sortformer): built from a .nemo
+        # archive rather than a HuggingFace transformers checkpoint.
+        from mobius.integrations.nemo import build_from_nemo
+
+        return build_from_nemo(case.model_id, revision=case.revision)
+
     module_class = None
     task = None
     if case.architecture:
@@ -580,6 +588,12 @@ def _build_model_package(case: GoldenTestCase) -> ModelPackage:
         reg = registry.get_registration(case.architecture)
         module_class = reg.module_class
         task = reg.task or getattr(module_class, "default_task", None)
+    elif case.task_type in {"diarization", "diarization-streaming"}:
+        # Diarization checkpoints default to the offline "diarization" task
+        # (registry default_task); the streaming variant must be requested
+        # explicitly since it produces a different ONNX graph contract
+        # (cache-state inputs/outputs) from the same checkpoint.
+        task = case.task_type
     return build(
         case.model_id,
         revision=case.revision,
@@ -2181,6 +2195,167 @@ def _run_qwen35_mtp_prefill(
         session.close()
 
 
+def _run_diarization_offline_prefill(
+    pkg: ModelPackage,
+    golden: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Run the offline diarization ONNX graph and return ``speaker_probs``.
+
+    ``golden["mel"]`` is stored channel-first ``[batch, feat, frames]``,
+    matching the mobius ``DiarizationTask`` input contract directly (no
+    runtime transpose needed).
+    """
+    session = _open_decoder_session(pkg)
+    try:
+        outputs = session.run({"input_features": golden["mel"].astype(np.float32)})
+    finally:
+        session.close()
+    return outputs["speaker_probs"]
+
+
+def _assert_diarization_offline_golden(case: GoldenTestCase, level: str) -> None:
+    """L4 (and offline L5) diarization check: golden vs. real ONNX build.
+
+    Shared by both the offline ``diarization`` task type's L4 test and (for
+    L5-eligible cases such as sortformer, which has no streaming task
+    variant) the additional exact dominant-speaker / active-speaker-set
+    decision checks a downstream consumer would read.
+    """
+    golden = load_diarization_golden(case)
+    if golden is None:
+        pytest.skip(f"Diarization golden missing for {case.case_id}")
+    tolerances = load_tolerances("L4", case.dtype)
+    pkg = _build_model_package(case)
+    probs = _run_diarization_offline_prefill(pkg, golden)
+
+    report = compare_diarization_golden(
+        onnx_probs=probs,
+        golden_probs=golden["probs"],
+        dtype=case.dtype,
+        level=level,
+    )
+    if report.top10_jaccard < tolerances.top10_jaccard_warn:
+        warnings.warn(
+            f"Low active-speaker Jaccard for {case.case_id}: "
+            f"{report.top10_jaccard:.2f} < {tolerances.top10_jaccard_warn}",
+            stacklevel=1,
+        )
+    # compare_diarization_golden() has no AMBIGUOUS downgrade (see its
+    # docstring), so PASS is the only non-FAIL result -- require it
+    # explicitly rather than merely excluding FAIL.
+    assert report.result == ParityResult.PASS, report.message
+
+    if level == "L5":
+        # Downstream diarization decisions: dominant speaker per frame
+        # (argmax) and the binarized active-speaker set (threshold 0.5)
+        # must reproduce the reference exactly over the whole utterance.
+        np.testing.assert_array_equal(probs.argmax(axis=-1), golden["probs"].argmax(axis=-1))
+        np.testing.assert_array_equal(probs > 0.5, golden["probs"] > 0.5)
+
+
+def _run_diarization_streaming_session(
+    case: GoldenTestCase,
+) -> None:
+    """L5: thread a multi-chunk streaming diarization session end to end.
+
+    Feeds each chunk's own AOSC + FIFO cache-state outputs back in as the
+    next chunk's cache inputs (self-consistent chaining through the real
+    exported streaming ONNX graph) and checks every chunk's speaker
+    probabilities and cache state against the independently-computed
+    HuggingFace reference.
+    """
+    golden = load_diarization_golden(case)
+    if golden is None:
+        pytest.skip(f"Diarization golden missing for {case.case_id}")
+    pkg = _build_model_package(case)
+    config = pkg.config
+    assert config is not None
+
+    num_chunks = int(golden["num_chunks"])
+    num_speakers = int(golden["chunk0_probs"].shape[-1])
+    cache_capacity = int(golden["chunk0_cache_embeds"].shape[1])
+    fifo_capacity = int(golden["chunk0_fifo"].shape[1])
+    hidden_size = config.hidden_size
+
+    # Fresh-stream initial state: all-zero cache/FIFO buffers, no occupancy.
+    past_cache_embeds = np.zeros((1, cache_capacity, hidden_size), dtype=np.float32)
+    past_cache_probs = np.zeros((1, cache_capacity, num_speakers), dtype=np.float32)
+    past_fifo = np.zeros((1, fifo_capacity, hidden_size), dtype=np.float32)
+    past_num_cache_frames = np.array(0, dtype=np.int64)
+    past_num_fifo_frames = np.array(0, dtype=np.int64)
+    past_is_compressed = np.array(False, dtype=np.bool_)
+
+    saw_compression = False
+    session = _open_decoder_session(pkg)
+    try:
+        for i in range(num_chunks):
+            mel_cf = golden[f"chunk{i}_mel"].astype(np.float32)
+            feed = {
+                "input_features": mel_cf,
+                "num_lookahead_frames": golden[f"chunk{i}_lookahead"],
+                "past_cache_embeds": past_cache_embeds,
+                "past_cache_probs": past_cache_probs,
+                "past_fifo": past_fifo,
+                "past_num_cache_frames": past_num_cache_frames,
+                "past_num_fifo_frames": past_num_fifo_frames,
+                "past_is_compressed": past_is_compressed,
+            }
+            out = session.run(feed)
+
+            report = compare_diarization_golden(
+                onnx_probs=out["speaker_probs"],
+                golden_probs=golden[f"chunk{i}_probs"],
+                dtype=case.dtype,
+                level="L5",
+            )
+            # No AMBIGUOUS downgrade for diarization -- require PASS.
+            assert report.result == ParityResult.PASS, f"chunk {i}: {report.message}"
+
+            num_cache = int(out["present_num_cache_frames"])
+            num_fifo = int(out["present_num_fifo_frames"])
+            is_compressed = bool(out["present_is_compressed"])
+            assert num_cache == int(golden[f"chunk{i}_num_cache_frames"])
+            assert num_fifo == int(golden[f"chunk{i}_num_fifo_frames"])
+            assert is_compressed == bool(golden[f"chunk{i}_is_compressed"])
+            saw_compression = saw_compression or is_compressed
+
+            np.testing.assert_allclose(
+                out["present_cache_embeds"][:, :num_cache],
+                golden[f"chunk{i}_cache_embeds"][:, :num_cache],
+                atol=1e-3,
+                err_msg=f"chunk {i} cache_embeds",
+            )
+            np.testing.assert_allclose(
+                out["present_cache_probs"][:, :num_cache],
+                golden[f"chunk{i}_cache_probs"][:, :num_cache],
+                atol=1e-4,
+                err_msg=f"chunk {i} cache_probs",
+            )
+            np.testing.assert_allclose(
+                out["present_fifo"][:, :num_fifo],
+                golden[f"chunk{i}_fifo"][:, :num_fifo],
+                atol=1e-3,
+                err_msg=f"chunk {i} fifo",
+            )
+
+            # Feed this step's own outputs back in as the next call's cache
+            # state (self-consistent chaining through the real graph).
+            past_cache_embeds = out["present_cache_embeds"]
+            past_cache_probs = out["present_cache_probs"]
+            past_fifo = out["present_fifo"]
+            past_num_cache_frames = out["present_num_cache_frames"]
+            past_num_fifo_frames = out["present_num_fifo_frames"]
+            past_is_compressed = out["present_is_compressed"]
+    finally:
+        session.close()
+
+    # The golden's chosen chunk/cache sizes are expected to force at least
+    # one AOSC compression event; fail loudly if a future config/golden
+    # change stops exercising that path so this test doesn't silently lose
+    # coverage.
+    assert saw_compression, "expected the streaming session to trigger AOSC compression"
+
+
 # ---------------------------------------------------------------------------
 # L4 Tests: Checkpoint Verified
 # ---------------------------------------------------------------------------
@@ -2202,6 +2377,13 @@ class TestL4CheckpointVerified:
                 "Continuous-token TTS uses tests/vibevoice_golden_test.py "
                 "(control logits, latent frames, and waveform semantics)."
             )
+        if case.task_type == "diarization":
+            # Diarization emits continuous per-frame per-speaker
+            # probabilities, not a vocab logit vector, so it is compared
+            # with compare_diarization_golden() instead of the
+            # argmax/top-K-gated compare_golden() used below.
+            _assert_diarization_offline_golden(case, level="L4")
+            return
         golden_path = golden_path_for_case(case)
         golden = load_golden_ref(golden_path)
         if golden is None:
@@ -3148,3 +3330,41 @@ class TestL5GenerationE2E:
             f"  Got      ({actual_len} tokens): "
             f"{new_tokens.tolist()}"
         )
+
+
+# ---------------------------------------------------------------------------
+# L5 Tests: Diarization Session
+# ---------------------------------------------------------------------------
+
+# Diarization has no autoregressive token loop (OnnxGenerator does not apply):
+# offline cases replay a single forward pass and check the downstream
+# per-frame decisions exactly; streaming cases thread a multi-chunk AOSC +
+# FIFO cache-state session through the real exported graph. Both share the
+# continuous-probability golden format loaded via load_diarization_golden()
+# and the compare_diarization_golden() comparator (see _assert_diarization_
+# offline_golden / _run_diarization_streaming_session above).
+_DIARIZATION_L5_TASKS = frozenset({"diarization", "diarization-streaming"})
+
+
+@pytest.mark.generation
+@pytest.mark.integration
+class TestL5DiarizationSession:
+    """L5: diarization decision / streaming-session parity.
+
+    Gate: compare_diarization_golden()'s allclose gate, plus (offline)
+    exact dominant-speaker and active-speaker-set decision equality, or
+    (streaming) exact per-chunk cache-state equality across the whole
+    multi-chunk session.
+    """
+
+    @pytest.mark.parametrize("case", _L5_CASES)
+    def test_diarization_session_matches_golden(self, case: GoldenTestCase) -> None:
+        if case.task_type not in _DIARIZATION_L5_TASKS:
+            pytest.skip(
+                f"Not a diarization task_type ({case.task_type!r}); "
+                "covered by TestL5GenerationE2E instead."
+            )
+        if case.task_type == "diarization-streaming":
+            _run_diarization_streaming_session(case)
+        else:
+            _assert_diarization_offline_golden(case, level="L5")

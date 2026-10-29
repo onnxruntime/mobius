@@ -162,6 +162,42 @@ class TestCLIBuild:
         assert build_model.call_args.kwargs["dtype"] == ir.DataType.FLOAT
         save_package.assert_called_once()
 
+    def test_official_vibevoice_build_keeps_the_requested_model_identity(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ) as pipeline_probe,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(["build", "--model", "microsoft/VibeVoice-1.5B", tmpdir, "--no-weights"])
+
+        assert build_model.call_args.args == ("microsoft/VibeVoice-1.5B",)
+        assert (
+            build_model.call_args.kwargs["revision"]
+            == "c00898d257e6b46004e3e2866a47534085fb685a"
+        )
+        assert build_model.call_args.kwargs["load_weights"] is False
+        assert pipeline_probe.call_args.kwargs["revision"] == (
+            "c00898d257e6b46004e3e2866a47534085fb685a"
+        )
+
+    def test_runtime_assets_use_vibevoice_processor_source(self):
+        from mobius.__main__ import _runtime_asset_source
+        from mobius._model_package import ModelPackage
+
+        model = ir.Model(ir.Graph([], [], nodes=[], name="vibevoice"), ir_version=11)
+        model.metadata_props["mobius.source_revision"] = "official-revision"
+        model.metadata_props["mobius.processor_source"] = "vibevoice/processor@native-revision"
+
+        assert _runtime_asset_source(
+            ModelPackage({"model": model}),
+            "microsoft/VibeVoice-1.5B",
+            "official-revision",
+        ) == ("vibevoice/processor", "native-revision")
+
     def test_local_personaplex_config_bypasses_transformers(self):
         with (
             tempfile.TemporaryDirectory() as checkpoint,

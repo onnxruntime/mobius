@@ -90,6 +90,7 @@ class TestMakeProviderOptions:
         caps = ep_registry.get("openvino")
         assert caps is not None
         assert caps.supports_skip_layer_norm is False
+        assert caps.layered_per_layer_inputs is True
 
 
 class TestMakeSlidingWindowConfig:

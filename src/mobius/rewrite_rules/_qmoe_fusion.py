@@ -311,6 +311,16 @@ def _qmoe_abi_supported(bits: int, block_size: int) -> bool:
     return block_size >= 16 and (block_size & (block_size - 1)) == 0
 
 
+def _has_uniform_expert_geometry(layer: _DenseMoELayer) -> bool:
+    """Whether every gate/up/down projection uses one legacy INT4 layout."""
+    geometries = {
+        _expert_geometry(node)
+        for projections in layer.experts.values()
+        for node in (projections.gate, projections.up, projections.down)
+    }
+    return len(geometries) == 1
+
+
 def _pack_projection(nodes: list[ir.Node], slot: int) -> np.ndarray:
     """Stack ``flatten(-2)`` of one ``MatMulNBits`` weight input across experts."""
     stacked = [
@@ -483,6 +493,13 @@ def fuse_dense_moe_to_qmoe(model: ir.Model) -> int:
         if not layer.is_valid:
             logger.warning(
                 "skipping MoE layer at %s: unrecognised dense-fallback structure",
+                layer.topk.name,
+            )
+            continue
+        if not _has_uniform_expert_geometry(layer):
+            logger.warning(
+                "skipping MoE layer at %s: mixed expert projection layouts are "
+                "not supported by dense-MoE rewrite fusion",
                 layer.topk.name,
             )
             continue

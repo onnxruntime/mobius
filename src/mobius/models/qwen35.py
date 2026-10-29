@@ -8,10 +8,12 @@ from typing import ClassVar
 
 import onnx_ir as ir
 import torch
+from onnx_ir import tensor_adapters
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._weight_utils import (
+    WeightTransform,
     preprocess_quantized_weights,
     supported_qmoe_quantization,
 )
@@ -44,6 +46,14 @@ from mobius.models.qwen_vl import (
 # ---------------------------------------------------------------------------
 
 
+def _decoder_quantization(
+    config: ArchitectureConfig,
+) -> QuantizationConfig | None:
+    if config.component_quantization is not None:
+        return config.quantization_for("decoder")
+    return config.quantization
+
+
 def _linear_factory(config: ArchitectureConfig) -> type | None:
     """Build a quantized-linear factory from ``config.quantization``, or None.
 
@@ -55,7 +65,7 @@ def _linear_factory(config: ArchitectureConfig) -> type | None:
     A few modules opt out of this factory for specific quantizers — see
     :data:`_FLOAT_MODULE_QUANT_METHODS`.
     """
-    quantization = config.quantization
+    quantization = _decoder_quantization(config)
     if quantization is None or quantization.quant_method == "none":
         return None
     zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
@@ -88,20 +98,34 @@ _FLOAT_MODULE_QUANT_METHODS = frozenset({"olive"})
 def _decoder_component_config(
     config: ArchitectureConfig,
     source_paths: tuple[str, ...],
+    *,
+    preserve_module_plan: bool = False,
 ) -> ArchitectureConfig:
     """Use the effective decoder layout while constructing its expert parameters."""
     if config.component_quantization is None:
         return config
-    quantization = config.quantization_for_source_paths("decoder", source_paths)
-    return dataclasses.replace(config, quantization=quantization)
+    quantization = (
+        config.quantization_for("decoder")
+        if preserve_module_plan
+        else config.quantization_for_source_paths("decoder", source_paths)
+    )
+    return dataclasses.replace(config, quantization=quantization, component_quantization=None)
 
 
 def _keeps_modules_float(config: ArchitectureConfig) -> bool:
     """True when the checkpoint's quantizer leaves the opt-out modules float."""
-    quantization = config.quantization
+    quantization = _decoder_quantization(config)
     return (
         quantization is not None and quantization.quant_method in _FLOAT_MODULE_QUANT_METHODS
     )
+
+
+class Qwen35GatedDeltaNet(GatedDeltaNet):
+    """DeltaNet with the Qwen3.5 reference's per-head L2 normalization epsilon."""
+
+    def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
+        super().__init__(config, linear_class=linear_class)
+        self._qk_l2norm_eps = 1e-6
 
 
 class Qwen35DecoderLayer(nn.Module):
@@ -139,7 +163,7 @@ class Qwen35DecoderLayer(nn.Module):
         linear_class = _linear_factory(config)
 
         if self.layer_type == "linear_attention":
-            self.linear_attn = GatedDeltaNet(
+            self.linear_attn = Qwen35GatedDeltaNet(
                 config, linear_class=self._linear_attn_class(config, linear_class)
             )
             self.linear_attn.component_quantization_excluded_methods = (
@@ -165,7 +189,7 @@ class Qwen35DecoderLayer(nn.Module):
         ``MatMulNBits`` initializers the checkpoint never contains); otherwise
         the same factory used for the rest of the layer.
         """
-        quantization = config.quantization
+        quantization = _decoder_quantization(config)
         method = quantization.quant_method if quantization is not None else None
         if method in cls.float_linear_attn_quant_methods:
             return None
@@ -185,7 +209,9 @@ class Qwen35DecoderLayer(nn.Module):
         if self.layer_type == "linear_attention":
             # DeltaNet states are passed through past_key_value as
             # (conv_state, recurrent_state), same tuple pattern as KV cache
-            conv_state, recurrent_state = past_key_value
+            conv_state, recurrent_state = (
+                past_key_value if past_key_value is not None else (None, None)
+            )
 
             attn_output, new_conv_state, new_recurrent_state = self.linear_attn(
                 op, hidden_states, conv_state, recurrent_state
@@ -413,7 +439,14 @@ class Qwen35MoEDecoderLayer(Qwen35DecoderLayer):
 
     def __init__(self, config: ArchitectureConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        self.mlp = Qwen35MoEBlock(config, linear_class=_linear_factory(config))
+        layer_config = dataclasses.replace(
+            config,
+            qmoe_source_paths=(f"model.language_model.layers.{layer_idx}.mlp",),
+        )
+        self.mlp = Qwen35MoEBlock(
+            layer_config,
+            linear_class=_linear_factory(config),
+        )
 
 
 class Qwen35MoETextModel(nn.Module):
@@ -500,7 +533,10 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         self._replace_text_model(Qwen35MoETextModel(config))
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Preprocess HuggingFace state dict for Qwen3.5-MoE.
 
@@ -523,7 +559,8 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         # fused expert-major tensors and route them through the QMoE repacker
         # instead of un-fusing into per-expert MLPs. Uses the same predicate
         # as MoELayer so the weights and the emitted graph never disagree.
-        use_qmoe = supported_qmoe_quantization(self.config.quantization) is not None
+        quantization = _decoder_quantization(self.config)
+        use_qmoe = supported_qmoe_quantization(quantization) is not None
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):
@@ -573,10 +610,27 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
         return preprocess_quantized_weights(
             cleaned,
-            self.config.quantization,
+            quantization,
             tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=".mlp",
             qmoe_quant_methods=("gptq", "awq", "olive"),
+            qmoe_num_experts=self.config.num_local_experts,
+            qmoe_hidden_size=self.config.hidden_size,
+            qmoe_intermediate_size=self.config.moe_intermediate_size,
+            qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
+            weight_transforms=weight_transforms,
+            qmoe_expected_moe_paths=tuple(
+                f"model.layers.{layer_idx}.mlp"
+                for layer_idx in range(self.config.num_hidden_layers)
+            ),
+            qmoe_source_moe_paths=tuple(
+                f"model.language_model.layers.{layer_idx}.mlp"
+                for layer_idx in range(self.config.num_hidden_layers)
+            ),
+            defer_non_expert_sidecars=(
+                self.config.component_quantization is not None
+                or (quantization is not None and quantization.has_module_plan)
+            ),
         )
 
 
@@ -614,6 +668,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "decoder": (
+            "model.language_model",
             "model.language_model.layers",
             "model.language_model.norm",
             "model.language_model.rotary_emb",
@@ -681,7 +736,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             elif stripped.startswith("language_model."):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
-        quantization = self.config.quantization
+        quantization = _decoder_quantization(self.config)
         tie = effective_tie_word_embeddings(self.config)
         # Preserve the old VL partial-state-dict behavior: tying is a no-op
         # when neither decoder table is present. Production builds pass the
@@ -709,6 +764,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=None,
                 reject_quantized_embeddings_lm_head=True,
+                defer_non_expert_sidecars=True,
             )
             result.update(other_weights)
         else:
@@ -868,6 +924,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
         "decoder": (
+            "model.language_model",
             "model.language_model.layers",
             "model.language_model.norm",
             "model.language_model.rotary_emb",
@@ -883,6 +940,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         decoder_config = _decoder_component_config(
             config,
             self.HF_COMPONENT_SOURCES["decoder"],
+            preserve_module_plan=True,
         )
         self.decoder = Qwen35MoEVLDecoderModel(decoder_config)
         self.vision_encoder = Qwen3VLVisionEncoderModel(config)
@@ -895,7 +953,10 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         )
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Route HF weights to the three sub-model ONNX initializer names.
 
@@ -911,10 +972,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         """
         quantization = self.config.quantization
         decoder_quantization = (
-            self.config.quantization_for_source_paths(
-                "decoder",
-                self.HF_COMPONENT_SOURCES["decoder"],
-            )
+            self.config.quantization_for("decoder")
             if self.config.component_quantization is not None
             else quantization
         )
@@ -990,7 +1048,21 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=".mlp",
                 qmoe_quant_methods=("olive",),
+                qmoe_num_experts=self.config.num_local_experts,
+                qmoe_hidden_size=self.config.hidden_size,
+                qmoe_intermediate_size=self.config.moe_intermediate_size,
+                qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
+                weight_transforms=weight_transforms,
+                qmoe_expected_moe_paths=tuple(
+                    f"decoder.model.layers.{layer_idx}.mlp"
+                    for layer_idx in range(self.config.num_hidden_layers)
+                ),
+                qmoe_source_moe_paths=tuple(
+                    f"model.language_model.layers.{layer_idx}.mlp"
+                    for layer_idx in range(self.config.num_hidden_layers)
+                ),
                 reject_quantized_embeddings_lm_head=True,
+                defer_non_expert_sidecars=True,
             )
             result.update(other_weights)
         else:
@@ -1002,6 +1074,19 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=".mlp",
                 qmoe_quant_methods=("olive",),
+                qmoe_num_experts=self.config.num_local_experts,
+                qmoe_hidden_size=self.config.hidden_size,
+                qmoe_intermediate_size=self.config.moe_intermediate_size,
+                qmoe_activation_dtype=tensor_adapters.to_torch_dtype(self.config.dtype),
+                weight_transforms=weight_transforms,
+                qmoe_expected_moe_paths=tuple(
+                    f"decoder.model.layers.{layer_idx}.mlp"
+                    for layer_idx in range(self.config.num_hidden_layers)
+                ),
+                qmoe_source_moe_paths=tuple(
+                    f"model.language_model.layers.{layer_idx}.mlp"
+                    for layer_idx in range(self.config.num_hidden_layers)
+                ),
                 reject_quantized_embeddings_lm_head=True,
             )
         if tie:

@@ -32,6 +32,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than the `TensorScatter` one from about 1k tokens of context; on Blackwell
   the two are the same.
 
+### Qwen3.8-27B standard-only multimodal qualification
+
+#### Added
+
+- Corrected-RGB native ORT GenAI CUDA first-200 AI2D execution completes at
+  174/200, versus frozen HF 175/200 and raw ORT 174/200 references. Native
+  smart-resize tie rounding differs from HF for 28 examples; task accuracy
+  and token agreement do not establish preprocessing or logit parity.
+- Offline tiny standard VLM CLI tests cover ordinary and existing
+  `--runtime ort-genai` packaging, sparse global cache indices, and FP16
+  convolution/FP32 recurrent state. A separate opt-in native hybrid probe
+  checks state-dependent tokens and fresh-generator reset; a metadata-only
+  qualification example selects CUDA through `og.Config`, without a new
+  Mobius CLI flag or rebuilding existing ONNX weights.
+- Dense Qwen3.5-family composites, including Qwen3.8-27B, support text-only
+  export through the public Transformers builder. Offline tests cover the
+  pinned full-size text and complete VLM graphs, plus reduced random-weight
+  CUDA FP32/FP16 text/image/video/mixed-media prefill/decode parity, not the
+  official 27B checkpoint weights.
+
+#### Fixed
+
+- Native Qwen image processor metadata no longer swaps red/blue after RGB
+  decode. Ordinary normalization preserves checkpoint mean/std, while
+  `PatchImage` retains patch packing. Static contracts and an opt-in toy native
+  before-prefill RGB regression cover the correction; existing metadata must
+  be regenerated. Real-image resize and numerical parity remain unqualified.
+- ORT-GenAI processor generation uses local `--config` HF assets instead of
+  silently retaining CLIP defaults. Unwrapped `qwen3_5_text` VLM packages
+  retain Qwen patch preprocessing and vision metadata.
+- Explicit `mamba_ssm_dtype` is retained in DeltaNet computation and exported
+  recurrent-state inputs/outputs. Re-exported FP16/BF16 hybrid models whose
+  config requests FP32 state now expose FP32 recurrent slots; callers must
+  allocate state from graph input/output types, not the model weight dtype.
+  Existing saved models are unchanged. Missing or `auto` policies preserve
+  the previous model-dtype state behavior.
+- Shared Qwen3.5 dense/MoE/VL DeltaNet layers use the HF reference's fixed
+  `1e-6` Q/K L2 normalization epsilon. Native GenAI and other variants'
+  official-checkpoint qualification remain separate.
+- Shared Qwen3/Qwen3.5 split vision graphs cast processor FLOAT32 pixels to
+  model dtype before reduced-precision convolution.
+- Shared Qwen3/Qwen3.5 split embedding graphs recognize both image and video
+  placeholders and use feature offsets across the entire batch. Their
+  existing `image_features` input carries visual rows in flattened
+  batch/token placeholder order; no new graph input is required.
+- Learned offset RMS normalization keeps normalization and `1 + weight`
+  scaling in FP32 until the final model-dtype cast, avoiding premature
+  rounding of small trained offsets.
+
+#### Qualification status
+
+- Installed GenAI `0.16.0-dev` passed native sparse hybrid state progression
+  and fresh-generator reset with FP16 convolution/FP32 recurrent state and
+  non-shared caches. The unchanged real standard graphs then passed bounded
+  native text/reset and single-/two-image four-token generation. The CUDA
+  qualification overlay sets matching providers on all three sessions before
+  the required `og.Config` execution override: explicit CPU auxiliary sessions
+  did not follow that override and segfaulted during prefill. This is bounded
+  execution evidence, not numerical parity or full-checkpoint accuracy.
+- The complete real-weight FP16 vision/embedding/hybrid-decoder package was
+  exported, saved and reloaded with standard ONNX operators only. Official
+  image vision and text prefill comparisons still exceed the unchanged
+  FP16 tolerance; this is not a full-checkpoint accuracy or numerical-parity pass.
+
 ### GPT-OSS MXFP4 export
 
 #### Added
@@ -44,25 +108,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MXFP4 reconstruction eagerly loads and converts the checkpoint and can
   require substantial host memory; native streaming remains the default.
 
-### Independent quantization for multi-component packages
+### Per-component quantized checkpoint loading
 
 #### Added
 
-- HuggingFace composite checkpoints can declare a `component_quantization`
-  mapping (or `quantization_config.components`) whose keys match
-  `ModelPackage` component names such as `decoder`, `encoder`,
-  `vision_encoder`, `audio_encoder`, and `embedding`. Nested
-  `vision_config.quantization_config` and `audio_config.quantization_config`
-  values are also recognized.
-- `build_from_module` now configures every component independently. Existing
-  quantized decoder modules are retargeted to the component's bit width and
-  group size, float encoder/vision/audio projections are converted to
-  `MatMulNBits`, quantized embeddings use `GatherBlockQuantized`, and components
-  omitted from the mapping remain floating point.
-- Olive mixed-precision component-wide `modules_to_not_convert` and `overrides`
-  are collapsed into component layouts. Partial module rules and genuinely
-  mixed layouts inside one ONNX component fail with an actionable error instead
-  of loading packed weights with the wrong configuration.
+- Multi-component checkpoints may declare an authoritative
+  `component_quantization` mapping with independent affine layouts for decoder,
+  encoder, vision, audio, and embedding components. Exact and regex
+  `modules_to_not_convert` rules are evaluated for each component-local module
+  against its HuggingFace source name, so selected projections remain floating
+  point while the rest of the component binds existing packed weights.
+- Mobius validates and normalizes existing Olive, GPTQ, and AWQ sidecars per
+  component. It does not quantize floating-point checkpoint weights.
+- Gemma4, Qwen3.5/QMoE, and T5 adapters preserve their architecture-specific
+  rename, tied-weight, and expert-packing semantics while handing independently
+  routed component sidecars to the generic codec and binding validator.
+- OpenVINO Gemma4 exports keep the layer and projection dimensions separate in
+  `per_layer_inputs` between the embedding and decoder components. Other
+  execution providers retain the existing flattened layout.
+
+#### Fixed
+
+- Local `--config` builds use the shared Transformers builder rather than a
+  duplicate model/weight loader, preserving per-component normalization,
+  GPT-OSS MXFP4 policies, and `--dequantize`/`--no-weights` behavior.
+- Component rewrites preserve learned positional embeddings and deliberately
+  floating-point shared-expert gates. Input token-table selection respects
+  source aliases rather than quantizing every embedding module.
+- Ordinary decoder sidecars, including Qwen3.5 text, MoE, and VL weights, remain
+  raw until per-projection overrides are resolved. QMoE expert packing and
+  float table tying remain in the shared compatibility preprocessor.
+- Graph construction and normalization agree on legacy module rules for any
+  single-component manifest, not only packages using the `model` key.
+- The binding gate also covers model-wide affine configurations. Orphan packed
+  sidecars are rejected without rejecting complete canonical affine or QMoE groups.
+- Dynamic component source resolvers use the available HuggingFace model type
+  instead of receiving an empty identifier. Configs without a model type retain
+  static component metadata and config-based aliases, including T5 layer mappings.
+- Split tied tables already materialized by a model adapter load into their
+  quantized embedding and LM-head targets instead of being rejected solely
+  because the checkpoint declares tied weights.
+- Literal quantization exclusions and overrides respect module-path boundaries
+  rather than accidentally matching similarly named layers or unrelated paths.
+- The compatibility weight normalizer requires an explicit task and reports a
+  clear error if it is missing.
+- Raw GPTQ/AWQ scales are no longer mistaken for already-normalized parameters.
+  Canonical detection requires a complete group with the target layout, and
+  zero-point requirements follow each projection's effective symmetry.
+- Independently quantized embedding tables retain the two-dimensional
+  `GatherBlockQuantized` layout instead of being packed as linear projections.
+- Graph construction and loading honor model-declared float exclusions and
+  output heads, including Qwen3.5-MoE and Whisper. Legacy global module rules
+  no longer fail when the component mapping is absent.
+- Gemma4 preserves raw component sidecars until per-projection normalization,
+  and T5 maps local projections back to their HuggingFace names, so component
+  and projection overrides select the same layout for graph and weights.
+- Sparse per-layer configuration dictionaries preserve the default attention
+  head dimension and KV-head count instead of replacing them with overrides
+  declared for only a subset of layers.
 
 ### Packed fused MoE experts (Olive/GPTQ/AWQ) survive HF weight renaming
 

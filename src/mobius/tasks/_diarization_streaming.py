@@ -1,0 +1,155 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Streaming (per-chunk, stateful) speaker-diarization task.
+
+Builds a single ONNX graph that processes one audio chunk per call, carrying
+the Arrival-Order Speaker Cache (AOSC) + FIFO queue state across calls as
+fixed-size cache buffers plus scalar occupancy counters — the same "static
+cache" convention used for KV caches elsewhere in mobius (see
+``tasks/_cache_utils.py``).
+"""
+
+from __future__ import annotations
+
+from typing import ClassVar
+
+import onnx_ir as ir
+
+from mobius._configs import Nemotron3DiarizationConfig
+from mobius._model_package import ModelPackage
+from mobius.tasks._base import ModelTask, _make_graph, _make_model
+
+
+class DiarizationStreamingTask(ModelTask):
+    """Build an incremental, per-chunk ONNX graph for streaming speaker diarization.
+
+    Input:
+        ``input_features`` — ``[batch, feat, chunk_window_frames]`` raw
+            (pre-subsampling) mel-spectrogram window: the chunk plus its
+            look-ahead frames, at ``config.subsampling_factor`` frames per
+            encoder frame. ``chunk_window_frames`` is a symbolic (dynamic)
+            axis — it defaults to ``(chunk_length + chunk_right_context) *
+            subsampling_factor`` but callers may pass a shorter window (with
+            ``num_lookahead_frames=0``) for a recording's final, partial
+            chunk; there is no padding/validity contract, so every frame in
+            the window must be real audio.
+        ``num_lookahead_frames`` — scalar ``int64``: how many trailing encoder
+            frames of the window are look-ahead only (attended to, but not
+            emitted or pushed to the FIFO). ``0`` for the last chunk of a
+            recording. Contract: ``0 <= num_lookahead_frames < num_new_embeds``
+            (the number of encoder frames the window embeds to, i.e.
+            ``chunk_window_frames // subsampling_factor``, rounded up); the
+            graph clamps out-of-range values into this range defensively
+            (see ``forward_streaming``) rather than failing, but callers
+            should not rely on the clamped result being meaningful.
+        ``past_cache_embeds`` / ``past_cache_probs`` / ``past_fifo`` — fixed
+            capacity AOSC + FIFO state buffers from the previous call (all
+            zeros for the first chunk of a stream).
+        ``past_num_cache_frames`` / ``past_num_fifo_frames`` — scalar
+            ``int64`` occupancy counters for the two buffers above.
+        ``past_is_compressed`` — scalar ``bool``: whether the AOSC has ever
+            been compressed (governs how cached-frame probabilities are
+            re-estimated on the next call).
+
+    Output:
+        ``speaker_probs`` — ``[batch, frames, num_spks]`` sigmoid
+        probabilities for this chunk only. ``frames`` equals
+        ``min(chunk_window_frames, (num_new_embeds - num_lookahead_frames) *
+        subsampling_factor)`` — i.e. it excludes the look-ahead frames and is
+        capped to the actual raw window length (matching HuggingFace's
+        reference ``logits[:, :num_frames]`` trim exactly). This is always
+        exactly the number of frames committed to the FIFO/cache this call
+        (``num_chunk_frames * subsampling_factor``), so the output length
+        never desyncs from cache growth — including for a non-final chunk
+        whose window isn't a multiple of ``subsampling_factor``, where the
+        cap only ever activates on a final (``num_lookahead_frames == 0``)
+        chunk with a padding-derived trailing frame.
+        ``present_cache_embeds`` / ``present_cache_probs`` / ``present_fifo``
+        / ``present_num_cache_frames`` / ``present_num_fifo_frames`` /
+        ``present_is_compressed`` — updated state, fed back as the ``past_*``
+        inputs of the next call.
+    """
+
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
+
+    def build(
+        self,
+        module,
+        config: Nemotron3DiarizationConfig,
+    ) -> ModelPackage:
+        graph, builder = _make_graph(name="nemotron3_diarization_streaming")
+        op = builder.op
+
+        cache_capacity = config.streaming_speaker_cache_length
+        fifo_capacity = config.streaming_fifo_length
+
+        # The time axis is symbolic (not the default full-window
+        # ``chunk_length + chunk_right_context`` frame count): HuggingFace's
+        # streaming API allows a shorter final chunk (with
+        # ``num_lookahead_frames=0``, no padding contract). ``forward_streaming``
+        # already derives every frame count it needs from this input's actual
+        # shape (``raw_num_frames = op.Shape(...)``), so no other graph logic
+        # assumes the default window length.
+        input_features = builder.input(
+            "input_features",
+            dtype=config.dtype,
+            shape=["batch", config.feat_in, "chunk_window_frames"],
+        )
+        num_lookahead_frames = builder.input(
+            "num_lookahead_frames", dtype=ir.DataType.INT64, shape=[]
+        )
+        past_cache_embeds = builder.input(
+            "past_cache_embeds",
+            dtype=config.dtype,
+            shape=["batch", cache_capacity, config.hidden_size],
+        )
+        past_cache_probs = builder.input(
+            "past_cache_probs",
+            dtype=config.dtype,
+            shape=["batch", cache_capacity, config.num_speakers],
+        )
+        past_fifo = builder.input(
+            "past_fifo",
+            dtype=config.dtype,
+            shape=["batch", fifo_capacity, config.hidden_size],
+        )
+        past_num_cache_frames = builder.input(
+            "past_num_cache_frames", dtype=ir.DataType.INT64, shape=[]
+        )
+        past_num_fifo_frames = builder.input(
+            "past_num_fifo_frames", dtype=ir.DataType.INT64, shape=[]
+        )
+        past_is_compressed = builder.input(
+            "past_is_compressed", dtype=ir.DataType.BOOL, shape=[]
+        )
+
+        (
+            speaker_probs,
+            present_cache_embeds,
+            present_cache_probs,
+            present_fifo,
+            present_num_cache_frames,
+            present_num_fifo_frames,
+            present_is_compressed,
+        ) = module.forward_streaming(
+            op,
+            input_features,
+            num_lookahead_frames,
+            past_cache_embeds,
+            past_cache_probs,
+            past_fifo,
+            past_num_cache_frames,
+            past_num_fifo_frames,
+            past_is_compressed,
+        )
+
+        builder.add_output(speaker_probs, "speaker_probs")
+        builder.add_output(present_cache_embeds, "present_cache_embeds")
+        builder.add_output(present_cache_probs, "present_cache_probs")
+        builder.add_output(present_fifo, "present_fifo")
+        builder.add_output(present_num_cache_frames, "present_num_cache_frames")
+        builder.add_output(present_num_fifo_frames, "present_num_fifo_frames")
+        builder.add_output(present_is_compressed, "present_is_compressed")
+
+        return ModelPackage({"model": _make_model(graph)}, config=config)

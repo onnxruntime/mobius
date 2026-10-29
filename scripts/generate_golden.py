@@ -46,11 +46,37 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import torch
+
     from mobius._testing.golden import GoldenTestCase as TestCase
 
 import numpy as np
 
 _MISSING_ATTRIBUTE = object()
+
+
+def _best_effort_package_commit(package_name: str) -> str | None:
+    """Best-effort immutable VCS commit for a pip-installed package.
+
+    When a dependency is installed from a git URL (``pip install
+    git+https://...@<ref>``) -- the only way to get pre-release/unreleased
+    HuggingFace model code such as Nemotron3Diarization's -- pip records the
+    resolved commit SHA in the package's ``direct_url.json`` metadata. This
+    lets golden-data provenance capture an immutable source identity instead
+    of just a mutable, potentially ambiguous ``X.Y.Z.devN`` version string.
+    Returns ``None`` (rather than raising) for a normal PyPI install, or if
+    the metadata is missing/malformed, since this is diagnostic-only.
+    """
+    try:
+        import json
+        from importlib.metadata import distribution
+
+        direct_url = json.loads(
+            distribution(package_name).read_text("direct_url.json") or "{}"
+        )
+        return direct_url.get("vcs_info", {}).get("commit_id")
+    except Exception:
+        return None
 
 
 @contextlib.contextmanager
@@ -241,6 +267,40 @@ def _get_model_device(model: object, device: str):
 # transformers) are deferred to avoid import cost when --dry-run.
 
 
+def _reference_dtype(name: str) -> torch.dtype:
+    """Resolve the selected execution precision without a silent FP32 fallback."""
+    import torch
+
+    dtypes = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if name not in dtypes:
+        raise ValueError(f"Unsupported reference dtype: {name!r}")
+    return dtypes[name]
+
+
+def _prepare_reference_inputs(processed, device, dtype):
+    """Move processor tensors, casting floating media but not IDs or masks."""
+    import torch
+
+    def move_input(value):
+        if isinstance(value, torch.Tensor):
+            return (
+                value.to(device=device, dtype=dtype)
+                if value.is_floating_point()
+                else value.to(device=device)
+            )
+        if isinstance(value, list):
+            return [move_input(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move_input(item) for item in value)
+        return value
+
+    return {name: move_input(value) for name, value in processed.items()}
+
+
 def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a causal-lm (text-generation) model."""
     from mobius._testing.golden import save_generation_json, save_golden_ref
@@ -254,20 +314,16 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     if uses_multimodal_reference:
         import torch
 
-        dtype_map = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-        }
         model, tokenizer, _ = load_torch_multimodal_model(
             case.model_id,
-            dtype=dtype_map[case.dtype],
+            dtype=_reference_dtype(case.dtype),
             device=device,
             revision=case.revision,
         )
     else:
         model, tokenizer = load_torch_model(
             case.model_id,
+            dtype=_reference_dtype(case.dtype),
             device=device,
             trust_remote_code=case.trust_remote_code,
             revision=case.revision,
@@ -367,7 +423,9 @@ def _generate_encoder(case: TestCase, json_path: Path, device: str) -> None:
         torch_encoder_forward,
     )
 
-    model, tokenizer = load_torch_encoder_model(case.model_id, device=device)
+    model, tokenizer = load_torch_encoder_model(
+        case.model_id, dtype=_reference_dtype(case.dtype), device=device
+    )
 
     # CLIP-like multimodal models wrap a text sub-model that can be
     # called with text-only inputs (pixel_values not required).
@@ -409,7 +467,9 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
         load_torch_seq2seq_model,
     )
 
-    model, tokenizer = load_torch_seq2seq_model(case.model_id, device=device)
+    model, tokenizer = load_torch_seq2seq_model(
+        case.model_id, dtype=_reference_dtype(case.dtype), device=device
+    )
 
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]
@@ -478,12 +538,7 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         load_torch_multimodal_model,
     )
 
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    torch_dtype = dtype_map.get(case.dtype, torch.float32)
+    torch_dtype = _reference_dtype(case.dtype)
     model, _tokenizer, processor = load_torch_multimodal_model(
         case.model_id,
         dtype=torch_dtype,
@@ -549,7 +604,7 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # Accelerate during model loading, but `.to("auto")` is not valid for
     # BatchEncoding or Tensor objects.
     model_device = _get_model_device(model, device)
-    processed = processed.to(model_device)
+    processed = _prepare_reference_inputs(processed, model_device, torch_dtype)
 
     # L4: single forward pass
     with torch.no_grad():
@@ -608,15 +663,11 @@ def _generate_image_to_text(case: TestCase, json_path: Path, device: str) -> Non
 
     from mobius._testing.golden import save_generation_json, save_golden_ref
 
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
+    torch_dtype = _reference_dtype(case.dtype)
     model = AutoModel.from_pretrained(
         case.model_id,
         revision=case.revision,
-        torch_dtype=dtype_map[case.dtype],
+        torch_dtype=torch_dtype,
         trust_remote_code=case.trust_remote_code,
     ).to(device)
     model.eval()
@@ -633,7 +684,8 @@ def _generate_image_to_text(case: TestCase, json_path: Path, device: str) -> Non
         text=case.decoder_prompt,
         return_tensors="pt",
         add_special_tokens=False,
-    ).to(device)
+    )
+    processed = _prepare_reference_inputs(processed, device, torch_dtype)
     decoder_input_ids = processed["input_ids"]
 
     with torch.no_grad():
@@ -723,6 +775,7 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
 
     model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
         case.model_id,
+        dtype=_reference_dtype(case.dtype),
         revision=case.revision,
         device_map=device,
         trust_remote_code=case.trust_remote_code,
@@ -738,8 +791,10 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     audio_path = Path("testdata") / case.audio[0]
     audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
     model_device = _get_model_device(model, device)
-    processed = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt").to(
-        model_device
+    processed = _prepare_reference_inputs(
+        processor(audio_array, sampling_rate=sample_rate, return_tensors="pt"),
+        model_device,
+        _reference_dtype(case.dtype),
     )
     # L4: single decoder step with forced decoder start token
     decoder_start_id = (
@@ -897,7 +952,6 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
     *forward_model* is the module whose ``forward()`` produces logits
     (may differ from *model* for nested architectures like Qwen3-ASR).
     """
-    import torch
     import transformers
 
     # Try to register qwen3_asr classes before loading config,
@@ -921,14 +975,14 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
             model = Qwen3ASRForConditionalGeneration.from_pretrained(
                 case.model_id,
                 revision=case.revision,
-                torch_dtype=torch.float32,
+                torch_dtype=_reference_dtype(case.dtype),
                 device_map=device,
             )
         else:
             model = Qwen3ASRForConditionalGeneration.from_pretrained(
                 case.model_id,
                 revision=case.revision,
-                torch_dtype=torch.float32,
+                torch_dtype=_reference_dtype(case.dtype),
             )
             model = model.to(device)
         model.eval()
@@ -940,17 +994,10 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
         # Qwen3-ASR wraps a thinker; the thinker produces logits.
         forward_model = model.thinker
     elif model_type == "glmasr":
-        dtype = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }.get(case.dtype, torch.float32)
-        if device == "cpu" and dtype != torch.float32:
-            dtype = torch.float32
         model = transformers.GlmAsrForConditionalGeneration.from_pretrained(
             case.model_id,
             revision=case.revision,
-            dtype=dtype,
+            dtype=_reference_dtype(case.dtype),
         )
         if device == "auto":
             model = model.cuda()
@@ -971,6 +1018,7 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
 
         model, _tokenizer, processor = load_torch_multimodal_model(
             case.model_id,
+            dtype=_reference_dtype(case.dtype),
             device=device,
             revision=case.revision,
         )
@@ -1004,7 +1052,10 @@ def _prepare_speech_language_inputs(
             audio_array,
             prompt=case.prompts[0] if case.prompts else None,
             return_tensors="pt",
-        ).to(model_device, dtype=model.dtype)
+        )
+        processed = _prepare_reference_inputs(
+            processed, model_device, _reference_dtype(case.dtype)
+        )
         prompt_for_golden = case.prompts[0] if case.prompts else str(audio_path)
     elif is_qwen3_asr:
         # Qwen3-ASR prompt: system + user with audio placeholder
@@ -1029,7 +1080,10 @@ def _prepare_speech_language_inputs(
             text=text_prompt,
             audio=[audio_array],
             return_tensors="pt",
-        ).to(model_device)
+        )
+        processed = _prepare_reference_inputs(
+            processed, model_device, _reference_dtype(case.dtype)
+        )
         prompt_for_golden = force_prefix or str(audio_path)
     else:
         # Gemma4-style: text prompt + audio
@@ -1052,7 +1106,10 @@ def _prepare_speech_language_inputs(
             text=prompt_text,
             audio=[audio_array],
             return_tensors="pt",
-        ).to(model_device)
+        )
+        processed = _prepare_reference_inputs(
+            processed, model_device, _reference_dtype(case.dtype)
+        )
         prompt_for_golden = case.prompts[0]
 
     return processed, prompt_for_golden
@@ -1073,7 +1130,10 @@ def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: 
     )
 
     model, processor = load_torch_audio_model(
-        case.model_id, device=device, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        dtype=_reference_dtype(case.dtype),
+        device=device,
+        trust_remote_code=case.trust_remote_code,
     )
 
     # Load and preprocess audio
@@ -1132,7 +1192,7 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
     }
     model_kwargs: dict[str, object] = {
         "revision": case.revision,
-        "torch_dtype": torch.float32,
+        "torch_dtype": _reference_dtype(case.dtype),
         "device_map": device,
         "trust_remote_code": case.trust_remote_code,
     }
@@ -1155,8 +1215,10 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
 
     audio_path = Path("testdata") / case.audio[0]
     audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
-    processed = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt").to(
-        next(model.parameters()).device
+    processed = _prepare_reference_inputs(
+        processor(audio_array, sampling_rate=sample_rate, return_tensors="pt"),
+        next(model.parameters()).device,
+        _reference_dtype(case.dtype),
     )
 
     with torch.no_grad():
@@ -1164,7 +1226,7 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
 
     # CTC logits: (batch, num_frames, vocab_size). Use last frame for top-K.
     logits = outputs.logits[0]  # (num_frames, vocab_size)
-    last_logits = logits[-1].cpu().numpy()
+    last_logits = logits[-1].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
 
     save_golden_ref(
@@ -1209,7 +1271,10 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
     )
 
     model, processor = load_torch_vision_model(
-        case.model_id, device=device, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        dtype=_reference_dtype(case.dtype),
+        device=device,
+        trust_remote_code=case.trust_remote_code,
     )
 
     # Load and preprocess image
@@ -1291,7 +1356,7 @@ def _generate_object_detection(case: TestCase, json_path: Path, device: str) -> 
     )
     model = transformers.AutoModelForObjectDetection.from_pretrained(
         case.model_id,
-        torch_dtype=torch.float32,
+        torch_dtype=_reference_dtype(case.dtype),
         device_map=device,
         trust_remote_code=case.trust_remote_code,
     ).eval()
@@ -1302,12 +1367,14 @@ def _generate_object_detection(case: TestCase, json_path: Path, device: str) -> 
     if forced_size is not None:
         proc_kwargs["size"] = forced_size
     processed = processor(**proc_kwargs)
-    pixel_values = processed["pixel_values"].to(device)
+    pixel_values = processed["pixel_values"].to(
+        device=_get_model_device(model, device), dtype=_reference_dtype(case.dtype)
+    )
 
     with torch.no_grad():
         outputs = model(pixel_values=pixel_values)
     # logits: [batch, num_queries, num_labels + 1] -> last query's class vector
-    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
 
     save_golden_ref(
@@ -1907,6 +1974,207 @@ def _generate_dflash_draft(case: TestCase, json_path: Path, device: str) -> None
     save_drafter_inputs(drafter_inputs_path_for_case(case), arrays)
 
 
+def _generate_diarization_offline(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for offline speaker diarization.
+
+    Diarization models emit continuous per-frame per-speaker sigmoid
+    probabilities, not a vocab logit vector, so the reference is stored via
+    ``save_diarization_golden()`` (full-precision ``probs`` array in a
+    companion ``.npz``) and compared with ``compare_diarization_golden()``
+    instead of the argmax-gated ``save_golden_ref()``/``compare_golden()``
+    used elsewhere in this file.
+
+    Two reference implementations are dispatched by ``case.model_type``:
+
+    * ``sortformer`` (NeMo Sortformer): built from a ``.nemo`` archive via
+      ``nemo_toolkit`` (not a mobius runtime dependency) --
+      ``frontend_encoder`` (mel -> embeddings) then ``forward_infer``
+      (embeddings -> per-frame speaker sigmoids). ``mel`` is generated
+      already channel-first ``[batch, feat, frames]`` -- NeMo's own input
+      contract -- matching the mobius ``DiarizationTask`` graph directly.
+    * otherwise (e.g. ``nemotron3_diarization``): a HuggingFace
+      ``AutoModelForAudioFrameClassification`` checkpoint. HuggingFace's
+      ``input_features`` are channel-last ``[batch, frames, feat]``; they
+      are transposed to channel-first before saving so the golden matches
+      the mobius task's input contract with no runtime transpose needed.
+    """
+    import numpy as np
+    import torch
+
+    from mobius._testing.golden import save_diarization_golden
+
+    seed = int(case.generation_params.get("seed", 0))
+    torch.manual_seed(seed)
+
+    if case.model_type == "sortformer":
+        import nemo  # type: ignore[import-not-found]
+        from huggingface_hub import hf_hub_download
+        from nemo.collections.asr.models import (  # type: ignore[import-not-found]
+            SortformerEncLabelModel,
+        )
+
+        filename = case.generation_params.get(
+            "nemo_filename", "diar_streaming_sortformer_4spk-v2.1.nemo"
+        )
+        nemo_path = hf_hub_download(
+            repo_id=case.model_id, filename=filename, revision=case.revision
+        )
+        model = SortformerEncLabelModel.restore_from(nemo_path, map_location=device)
+        model.eval()
+        model.streaming_mode = False  # offline: full-context attention.
+
+        num_frames = int(case.generation_params.get("num_frames", 400))
+        feat_dim = int(model.cfg.encoder.feat_in)
+        mel = torch.randn(1, feat_dim, num_frames, device=device)
+        mel_len = torch.tensor([num_frames], dtype=torch.long, device=device)
+        with torch.no_grad():
+            emb_seq, emb_len = model.frontend_encoder(
+                processed_signal=mel, processed_signal_length=mel_len
+            )
+            preds = model.forward_infer(emb_seq, emb_len)
+
+        arrays = {
+            "mel": mel.cpu().numpy().astype(np.float32),
+            "emb_seq": emb_seq.cpu().numpy().astype(np.float32),
+            "emb_len": emb_len.cpu().numpy().astype(np.int64),
+            "probs": preds.cpu().numpy().astype(np.float32),
+        }
+        provenance = {
+            "model_id": case.model_id,
+            "revision": case.revision,
+            "nemo_version": nemo.__version__,
+            "nemo_commit": _best_effort_package_commit("nemo_toolkit"),
+            "seed": seed,
+            "feat_dim": feat_dim,
+            "num_frames": num_frames,
+            "num_speakers": int(preds.shape[-1]),
+        }
+    else:
+        import transformers
+        from transformers import AutoModelForAudioFrameClassification
+
+        model = AutoModelForAudioFrameClassification.from_pretrained(
+            case.model_id, revision=case.revision, dtype=torch.float32
+        )
+        model = model.to(device)
+        model.eval()
+
+        mel_dim = model.config.audio_config.num_mel_bins
+        # Below chunk_length * subsampling_factor so HuggingFace's own
+        # offline forward does not internally re-chunk.
+        num_frames = int(case.generation_params.get("num_frames", 2000))
+        mel = torch.randn(1, num_frames, mel_dim, device=device)
+        with torch.no_grad():
+            out = model(input_features=mel)
+
+        arrays = {
+            "mel": np.transpose(mel.cpu().numpy(), (0, 2, 1)).astype(np.float32),
+            "probs": out.logits.sigmoid().cpu().numpy().astype(np.float32),
+        }
+        provenance = {
+            "model_id": case.model_id,
+            "revision": case.revision,
+            "transformers_version": transformers.__version__,
+            "transformers_commit": _best_effort_package_commit("transformers"),
+            "torch_version": torch.__version__,
+            "seed": seed,
+            "num_speakers": int(model.config.head_config.num_speakers),
+            "mel_dim": mel_dim,
+        }
+
+    save_diarization_golden(json_path, arrays=arrays, provenance=provenance)
+
+
+def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str) -> None:
+    """Generate golden data for a multi-chunk streaming diarization session.
+
+    Runs the real HuggingFace ``Nemotron3DiarizationForAudioFrameClassification``
+    checkpoint (the ground-truth reference implementation) chunk by chunk,
+    threading the HuggingFace ``Nemotron3DiarizationSpeakerCache`` (Arrival-
+    Order Speaker Cache + FIFO queue) across chunks. Each chunk is a full
+    ``chunk_length + chunk_right_context`` window (matching the mobius
+    ``DiarizationStreamingTask`` ONNX graph's fixed input shape).
+
+    NOTE: the HF cache's ``.embeds``/``.probs``/``.fifo`` buffers are mutable
+    and updated in place via ``index_copy_`` across chunks -- ``.numpy()``
+    returns a *view*, so every per-chunk snapshot below is explicitly copied.
+    Without this, all per-chunk arrays would silently alias the final
+    chunk's values once ``np.savez`` serializes them (a real bug caught while
+    first authoring this golden -- see git history for
+    ``scripts/generate_nemotron3_diarization_golden.py``).
+    """
+    import numpy as np
+    import torch
+    import transformers
+    from transformers import AutoModelForAudioFrameClassification
+
+    from mobius._testing.golden import save_diarization_golden
+
+    seed = int(case.generation_params.get("seed", 0))
+    num_chunks = int(case.generation_params.get("num_chunks", 3))
+
+    model = AutoModelForAudioFrameClassification.from_pretrained(
+        case.model_id, revision=case.revision, dtype=torch.float32
+    )
+    model = model.to(device)
+    model.eval()
+
+    mel_dim = model.config.audio_config.num_mel_bins
+    chunk_length = model.config.chunk_length
+    chunk_right_context = model.config.chunk_right_context
+    subsampling = model.config.audio_config.subsampling_factor
+    raw_window = (chunk_length + chunk_right_context) * subsampling
+
+    arrays: dict[str, np.ndarray] = {"num_chunks": np.array(num_chunks, dtype=np.int64)}
+    cache = None
+    for i in range(num_chunks):
+        torch.manual_seed(seed + 100 + i)
+        mel = torch.randn(1, raw_window, mel_dim, device=device)
+        is_last = i == num_chunks - 1
+        lookahead = 0 if is_last else chunk_right_context
+        with torch.no_grad():
+            out = model(
+                input_features=mel, speaker_cache=cache, num_lookahead_frames=lookahead
+            )
+        cache = out.speaker_cache
+        # HF's input_features are channel-last; transpose to the mobius
+        # DiarizationStreamingTask's channel-first contract.
+        arrays[f"chunk{i}_mel"] = (
+            np.transpose(mel.cpu().numpy(), (0, 2, 1)).astype(np.float32).copy()
+        )
+        arrays[f"chunk{i}_lookahead"] = np.array(lookahead, dtype=np.int64)
+        arrays[f"chunk{i}_probs"] = out.logits.sigmoid().cpu().numpy().copy()
+        arrays[f"chunk{i}_cache_embeds"] = cache.embeds.cpu().numpy().copy()
+        arrays[f"chunk{i}_cache_probs"] = cache.probs.cpu().numpy().copy()
+        arrays[f"chunk{i}_fifo"] = cache.fifo.cpu().numpy().copy()
+        arrays[f"chunk{i}_num_cache_frames"] = np.array(cache.num_cache_frames, dtype=np.int64)
+        arrays[f"chunk{i}_num_fifo_frames"] = np.array(cache.num_fifo_frames, dtype=np.int64)
+        arrays[f"chunk{i}_is_compressed"] = np.array(cache.is_compressed, dtype=np.bool_)
+
+    provenance = {
+        "model_id": case.model_id,
+        "revision": case.revision,
+        "transformers_version": transformers.__version__,
+        "transformers_commit": _best_effort_package_commit("transformers"),
+        "torch_version": torch.__version__,
+        "seed": seed,
+        "num_speakers": int(model.config.head_config.num_speakers),
+        "mel_dim": mel_dim,
+        "chunk_length": int(chunk_length),
+        "chunk_right_context": int(chunk_right_context),
+        "subsampling_factor": int(subsampling),
+        "streaming_fifo_length": int(model.config.streaming_config.fifo_length),
+        "streaming_speaker_cache_length": int(
+            model.config.streaming_config.speaker_cache_length
+        ),
+        "streaming_speaker_cache_update_period": int(
+            model.config.streaming_config.speaker_cache_update_period
+        ),
+        "num_stream_chunks": num_chunks,
+    }
+    save_diarization_golden(json_path, arrays=arrays, provenance=provenance)
+
+
 # ---- Dispatcher ----
 
 # Map task_type strings to generator functions.
@@ -1930,6 +2198,8 @@ _GENERATORS = {
     "phi4mm-multimodal": _generate_phi4mm_multimodal,
     "gemma4-assistant": _generate_gemma4_assistant,
     "dflash-draft": _generate_dflash_draft,
+    "diarization": _generate_diarization_offline,
+    "diarization-streaming": _generate_diarization_streaming,
 }
 
 

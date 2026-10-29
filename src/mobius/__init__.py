@@ -21,7 +21,15 @@ __all__ = [
     "BaseModelConfig",
     "CausalLMConfig",
     "CausalLMTask",
+    "CLMModel",
+    "CLMProjectionHead",
+    "CLMTask",
+    "ComponentConfig",
+    "ComponentRole",
+    "ComponentSpec",
     "ComponentInfo",
+    "SharedWeightEndpoint",
+    "SharedWeightInfo",
     "ComponentExportDisposition",
     "ComponentExportReport",
     "DepthAnythingConfig",
@@ -40,6 +48,10 @@ __all__ = [
     "ModelRegistration",
     "ModelRegistry",
     "ModelTask",
+    "MultiComponentModelTask",
+    "KevModel",
+    "KevPointerHead",
+    "KevTask",
     "MLPWorldModel",
     "MMSConfig",
     "OPSET_VERSION",
@@ -56,11 +68,16 @@ __all__ = [
     "adapter_source_from_onnx_adapter",
     "attach_peft_adapter",
     "build",
+    "build_clm_package",
     "build_context",
     "build_diffusers_pipeline",
     "build_from_gguf",
     "build_from_module",
     "build_from_nemo",
+    "build_kev_package",
+    "KEV_08_PROVENANCE",
+    "KEV_VARIANTS",
+    "KevVariant",
     "compose_adapter_deltas",
     "components",
     "ep_capabilities",
@@ -113,7 +130,12 @@ from mobius._configs import (
 from mobius._constants import OPSET_VERSION
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
 from mobius._export_report import ComponentExportDisposition, ComponentExportReport
-from mobius._inspect import ComponentInfo, inspect_components
+from mobius._inspect import (
+    ComponentInfo,
+    SharedWeightEndpoint,
+    SharedWeightInfo,
+    inspect_components,
+)
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._registry import (
@@ -147,5 +169,26 @@ from mobius.integrations.diffusers import build_diffusers_pipeline
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo
 from mobius.integrations.transformers import build
-from mobius.models import MLPWorldModel
-from mobius.tasks import CausalLMTask, ModelTask, WorldModelTask
+from mobius.models import (
+    KEV_08_PROVENANCE,
+    KEV_VARIANTS,
+    CLMModel,
+    CLMProjectionHead,
+    KevModel,
+    KevPointerHead,
+    KevVariant,
+    MLPWorldModel,
+    build_clm_package,
+    build_kev_package,
+)
+from mobius.tasks import (
+    CausalLMTask,
+    CLMTask,
+    ComponentConfig,
+    ComponentRole,
+    ComponentSpec,
+    KevTask,
+    ModelTask,
+    MultiComponentModelTask,
+    WorldModelTask,
+)

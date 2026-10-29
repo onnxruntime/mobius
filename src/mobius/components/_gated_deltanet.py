@@ -123,7 +123,7 @@ class GatedDeltaNet(nn.Module):
             linear_class = Linear
         self.hidden_size = config.hidden_size
         self._dtype = config.dtype
-        self._stash_type = getattr(config, "mamba_ssm_dtype", config.dtype)
+        self._stash_type = getattr(config, "mamba_ssm_dtype", None) or config.dtype
         self._qk_l2norm_eps = getattr(config, "linear_qk_l2norm_eps", 0.0)
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
@@ -164,8 +164,8 @@ class GatedDeltaNet(nn.Module):
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        conv_state: ir.Value,
-        recurrent_state: ir.Value,
+        conv_state: ir.Value | None,
+        recurrent_state: ir.Value | None,
     ):
         """Forward pass for the Gated DeltaNet layer.
 
@@ -184,6 +184,38 @@ class GatedDeltaNet(nn.Module):
             new_recurrent_state: (batch, num_v_heads, k_dim, v_dim)
         """
         batch_dim = op.Shape(hidden_states, start=0, end=1)
+        if conv_state is None:
+            conv_state = op.Expand(
+                op.CastLike(op.Constant(value_float=0.0), hidden_states),
+                op.Concat(
+                    batch_dim,
+                    op.Constant(
+                        value_ints=[
+                            self.conv_dim,
+                            self.conv_kernel_size - 1,
+                        ]
+                    ),
+                    axis=0,
+                ),
+            )
+        if recurrent_state is None:
+            recurrent_state = op.Expand(
+                op.Cast(
+                    op.Constant(value_float=0.0),
+                    to=self._stash_type,
+                ),
+                op.Concat(
+                    batch_dim,
+                    op.Constant(
+                        value_ints=[
+                            self.num_v_heads,
+                            self.head_k_dim,
+                            self.head_v_dim,
+                        ]
+                    ),
+                    axis=0,
+                ),
+            )
 
         # === Projections ===
         mixed_qkv = self.in_proj_qkv(op, hidden_states)
@@ -290,6 +322,9 @@ class GatedDeltaNet(nn.Module):
             _domain="com.microsoft",
             _outputs=2,
         )
+        # The contrib op lacks a standard schema for builder type propagation.
+        output_3d.type = ir.TensorType(self._stash_type)
+        new_recurrent_state.type = ir.TensorType(self._stash_type)
         # output_3d: (B, T, num_v_heads * d_v) — already 3D
         if self._stash_type != self._dtype:
             output_3d = op.CastLike(output_3d, hidden_states)

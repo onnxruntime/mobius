@@ -512,7 +512,9 @@ class Gemma4Task(ModelTask):
         When ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B), the decoder
         accepts precomputed ``per_layer_inputs`` from the embedding model instead
         of ``input_ids``.  This moves the per-layer embedding computation to the
-        embedding model, simplifying the decoder graph.
+        embedding model, simplifying the decoder graph. The execution provider
+        determines whether the layer and projection dimensions remain separate
+        or are flattened together.
 
         Exception: When the EP's ``max_buffer_size`` is set and the fused table
         would exceed it, split per-layer tables are used in the decoder instead,
@@ -567,11 +569,16 @@ class Gemma4Task(ModelTask):
         per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         if per_layer_dim and not config.split_per_layer_embedding:
-            total_per_layer = config.num_hidden_layers * per_layer_dim
+            caps = ep_capabilities()
+            per_layer_shape = (
+                [batch, seq_len, config.num_hidden_layers, per_layer_dim]
+                if caps.layered_per_layer_inputs
+                else [batch, seq_len, config.num_hidden_layers * per_layer_dim]
+            )
             per_layer_inputs_val = builder.input(
                 "per_layer_inputs",
                 dtype=config.dtype,
-                shape=[batch, seq_len, total_per_layer],
+                shape=per_layer_shape,
             )
 
         # Vision-block bidirectional attention: the decoder receives the raw

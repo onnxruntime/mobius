@@ -390,7 +390,6 @@ def _parse_component_quantization_mapping(
     *,
     expert_dtype: object | None,
 ) -> dict[str, QuantizationConfig]:
-    """Parse an explicit component-name to quantization-config mapping."""
     if not isinstance(value, Mapping):
         raise TypeError(
             "component_quantization must be a mapping of component names to "
@@ -421,14 +420,12 @@ def _extract_component_quantization(
     parent_config: object | None,
     decoder_quantization: QuantizationConfig | None,
 ) -> dict[str, QuantizationConfig] | None:
-    """Extract explicit or nested per-component quantization metadata."""
+    """Extract authoritative explicit or nested component configurations."""
     sources = []
     for source in (parent_config, config):
         if source is not None and all(id(source) != id(item) for item in sources):
             sources.append(source)
 
-    # Explicit mapping is authoritative. Accept a top-level field or a
-    # ``components`` mapping nested in the traditional quantization_config.
     for source in sources:
         declaration = _get_config_value(source, "component_quantization")
         if declaration is None:
@@ -445,8 +442,6 @@ def _extract_component_quantization(
                 expert_dtype=_get_config_value(source, "expert_dtype"),
             )
 
-    # Composite checkpoints may instead put independent quantization_config
-    # dictionaries directly on their vision/audio sub-configs.
     composite = parent_config or config
     nested: dict[str, QuantizationConfig] = {}
     found_nested_declaration = False
@@ -500,8 +495,8 @@ class BaseModelConfig:
     # Model dtype (from HF config dtype)
     dtype: ir.DataType = ir.DataType.FLOAT
     quantization: QuantizationConfig | None = None
-    # ``None`` preserves the legacy model-wide quantization behavior. A mapping
-    # is authoritative: omitted components remain floating point.
+    # ``None`` keeps legacy model-wide behavior. A mapping is authoritative:
+    # omitted components remain floating point.
     component_quantization: dict[str, QuantizationConfig] | None = None
 
     # HuggingFace identity and token metadata used by package persistence.
@@ -512,7 +507,7 @@ class BaseModelConfig:
     diffusion_shift_logits: bool = False
 
     def quantization_for(self, component: str) -> QuantizationConfig | None:
-        """Return the effective quantization config for one package component."""
+        """Return the effective quantization plan for one package component."""
         if self.component_quantization is None:
             return self.quantization
         candidates = {
@@ -574,6 +569,8 @@ class ArchitectureConfig(BaseModelConfig):
     linear_num_value_heads: int | None = None
     linear_gate_lower_bound: float | None = None
     linear_use_full_rank_gate: bool = False
+    # None preserves model-dtype state for checkpoints without an explicit policy.
+    mamba_ssm_dtype: ir.DataType | None = None
 
     # Double-gated short-convolution config (LFM2-style hybrid layers).
     short_conv_kernel: int = 3
@@ -656,6 +653,8 @@ class ArchitectureConfig(BaseModelConfig):
     num_experts_per_tok: int | None = None
     moe_intermediate_size: int | None = None
     shared_expert_intermediate_size: int | None = None
+    # Internal HF path aliases used to resolve routed-expert module overrides.
+    qmoe_source_paths: tuple[str, ...] = ()
     norm_topk_prob: bool = True
     # When True, the decoder layer uses post-norm style (FlexOLMo): norms are applied
     # to sub-layer outputs instead of inputs, with an extra post_feedforward_layernorm.
@@ -895,6 +894,15 @@ class ArchitectureConfig(BaseModelConfig):
         model_type = config.model_type
         rope_config = _extract_rope_config(config)
         mrope_fields = _extract_mrope_fields(config)
+        raw_ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
+        ssm_dtype = _resolve_dtype_value(raw_ssm_dtype)
+        if raw_ssm_dtype not in (None, "auto") and ssm_dtype not in {
+            ir.DataType.FLOAT,
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+            ir.DataType.DOUBLE,
+        }:
+            raise ValueError(f"Unrecognized mamba_ssm_dtype: {raw_ssm_dtype!r}")
 
         # Models that use RoPE but don't expose rope_scaling/rope_parameters
         # in their HF config (e.g. loaded without trust_remote_code, or
@@ -950,6 +958,11 @@ class ArchitectureConfig(BaseModelConfig):
                 if isinstance(per_layer_config, dict)
                 else per_layer_config
             )
+        has_sparse_per_layer_config = (
+            isinstance(per_layer_config, dict)
+            and num_hidden_layers
+            and len(layer_configs) < num_hidden_layers
+        )
 
         def _per_layer_value(attribute: str) -> int | None:
             values = set()
@@ -981,10 +994,12 @@ class ArchitectureConfig(BaseModelConfig):
                 )
             return next(iter(values_by_layer_type["sliding_attention"]))
 
-        head_dim = _per_layer_value("head_dim")
+        head_dim = None if has_sparse_per_layer_config else _per_layer_value("head_dim")
         if head_dim is None:
             head_dim = getattr(config, "head_dim", None)
-        num_key_value_heads = _per_layer_value("num_key_value_heads")
+        num_key_value_heads = (
+            None if has_sparse_per_layer_config else _per_layer_value("num_key_value_heads")
+        )
         if num_key_value_heads is None:
             num_key_value_heads = getattr(config, "num_key_value_heads", None)
 
@@ -1039,6 +1054,7 @@ class ArchitectureConfig(BaseModelConfig):
             linear_value_head_dim=(getattr(config, "linear_value_head_dim", None)),
             linear_num_key_heads=(getattr(config, "linear_num_key_heads", None)),
             linear_num_value_heads=(getattr(config, "linear_num_value_heads", None)),
+            mamba_ssm_dtype=ssm_dtype,
             short_conv_kernel=getattr(config, "conv_L_cache", 3),
             short_conv_bias=getattr(config, "conv_bias", False),
             pad_token_id=(getattr(config, "pad_token_id", 0)),
@@ -4982,4 +4998,93 @@ class ParakeetCTCConfig(ArchitectureConfig):
             convolution_bias=getattr(encoder, "convolution_bias", True),
             scale_input=getattr(encoder, "scale_input", True),
             layer_norm_eps=getattr(encoder, "layer_norm_eps", 1e-5),
+        )
+
+
+@dataclasses.dataclass
+class Nemotron3DiarizationConfig(ArchitectureConfig):
+    """Configuration for HuggingFace ``Nemotron3DiarizationForAudioFrameClassification``.
+
+    Extracted from the nested ``audio_config`` (a bidirectional, partial-RoPE
+    Transformer encoder — its fields populate the base :class:`ArchitectureConfig`
+    fields directly), ``head_config`` (the speaker-classification head that
+    projects, upsamples, and classifies the encoder output), and
+    ``    streaming_config`` (the Arrival-Order Speaker Cache / FIFO policy shared by
+    both the offline and streaming forwards' cache-update logic, see
+    ``models/nemotron3_diarization.py`` for both the offline (chunked
+    internally via an ONNX ``Loop``, not a single full-sequence pass) and
+    streaming (one chunk per call, stateful across calls) exports).
+    """
+
+    feat_in: int = 128
+    subsampling_factor: int = 8
+    head_hidden_size: int = 192
+    num_speakers: int = 8
+
+    # Offline chunking (also used as the default streaming step window).
+    chunk_length: int = 340
+    chunk_right_context: int = 40
+
+    # Offline-only AOSC/FIFO policy, from the top-level ``config`` (distinct
+    # from ``streaming_config``'s values below): the offline forward reuses
+    # ``streaming_speaker_cache_length`` (AOSC capacity) but has its own
+    # ``fifo_length``/``speaker_cache_update_period``.
+    offline_fifo_length: int = 40
+    offline_speaker_cache_update_period: int = 300
+
+    # Arrival-Order Speaker Cache (AOSC) + FIFO queue policy, from
+    # ``config.streaming_config``. Shared by both the offline and streaming
+    # forwards (via ``_run_chunk_and_update_cache``'s cache-update/compression
+    # logic) — only ``fifo_length``/``speaker_cache_update_period`` differ
+    # per mode (offline uses its own ``offline_*`` pair above instead).
+    streaming_fifo_length: int = 264
+    streaming_speaker_cache_length: int = 264
+    streaming_speaker_cache_update_period: int = 222
+    streaming_silence_frames_per_speaker: int = 1
+    streaming_prediction_score_threshold: float = 0.25
+    streaming_latest_frames_score_boost: float = 0.05
+    streaming_min_positive_scores_rate: float = 0.5
+    streaming_strong_boost_rate: float = 0.75
+    streaming_weak_boost_rate: float = 1.5
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Nemotron3DiarizationConfig:
+        """Extract the nested Nemotron3Diarization audio, head, and streaming configs."""
+        audio = config.audio_config
+        head = config.head_config
+        streaming = getattr(config, "streaming_config", None)
+        base = ArchitectureConfig.from_transformers(audio, parent_config=config)
+        fields = _shallow_fields(base)
+        fields.update(model_type=getattr(config, "model_type", fields["model_type"]))
+        return cls(
+            **fields,
+            feat_in=getattr(audio, "num_mel_bins", 128),
+            subsampling_factor=getattr(audio, "subsampling_factor", 8),
+            head_hidden_size=getattr(head, "hidden_size", 192),
+            num_speakers=getattr(head, "num_speakers", 8),
+            chunk_length=getattr(config, "chunk_length", 340),
+            chunk_right_context=getattr(config, "chunk_right_context", 40),
+            offline_fifo_length=getattr(config, "fifo_length", 40),
+            offline_speaker_cache_update_period=getattr(
+                config, "speaker_cache_update_period", 300
+            ),
+            streaming_fifo_length=getattr(streaming, "fifo_length", 264),
+            streaming_speaker_cache_length=getattr(streaming, "speaker_cache_length", 264),
+            streaming_speaker_cache_update_period=getattr(
+                streaming, "speaker_cache_update_period", 222
+            ),
+            streaming_silence_frames_per_speaker=getattr(
+                streaming, "speaker_cache_silence_frames_per_speaker", 1
+            ),
+            streaming_prediction_score_threshold=getattr(
+                streaming, "prediction_score_threshold", 0.25
+            ),
+            streaming_latest_frames_score_boost=getattr(
+                streaming, "latest_frames_score_boost", 0.05
+            ),
+            streaming_min_positive_scores_rate=getattr(
+                streaming, "min_positive_scores_rate", 0.5
+            ),
+            streaming_strong_boost_rate=getattr(streaming, "strong_boost_rate", 0.75),
+            streaming_weak_boost_rate=getattr(streaming, "weak_boost_rate", 1.5),
         )

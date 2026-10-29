@@ -502,12 +502,16 @@ class CausalLMModel(nn.Module):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Preprocess the state_dict to match the model's expected keys."""
-        qc = getattr(self.config, "quantization", None)
+        qc = self.config.quantization_for("model")
         return preprocess_quantized_weights(
             state_dict,
             qc,
             tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=None,
+            defer_non_expert_sidecars=(
+                self.config.component_quantization is not None
+                or (qc is not None and qc.has_module_plan)
+            ),
         )
 
 

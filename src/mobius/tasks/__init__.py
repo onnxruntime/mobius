@@ -23,11 +23,14 @@ __all__ = [
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
     "CausalLMTask",
+    "CLMTask",
     "SmallThinkerGGUFCausalLMTask",
     "CTCAsrTask",
     "FeatureCTCAsrTask",
     "RNNTTask",
     "CodecTask",
+    "ComponentConfig",
+    "ComponentRole",
     "ComponentSpec",
     "ControlNetTask",
     "DeepSeekV4Task",
@@ -39,6 +42,7 @@ __all__ = [
     "Qwen4ExpVisionLanguageTask",
     "DenoisingTask",
     "DiarizationTask",
+    "DiarizationStreamingTask",
     "FeatureExtractionTask",
     "GGUFEncoderFeatureExtractionTask",
     "GGUFAudioProjectorModel",
@@ -68,8 +72,10 @@ __all__ = [
     "ImageClassificationTask",
     "KimiK3CausalLMTask",
     "KimiLinearCausalLMTask",
+    "KevTask",
     "Lfm2VlTask",
     "ModelTask",
+    "MultiComponentModelTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
     "Mistral4GGUFCausalLMTask",
@@ -106,6 +112,8 @@ __all__ = [
     "TTSTask",
     "VibeVoiceTask",
     "VibeVoiceStreamingTask",
+    "VibeVoiceASRTask",
+    "VibeVoiceASRStreamingTask",
     "T5TextEncoderTask",
     "VAETask",
     "VideoDenoisingTask",
@@ -123,8 +131,11 @@ from mobius.tasks._adapter import AdapterTask
 from mobius.tasks._audio_ctc import AudioCTCTask
 from mobius.tasks._audio_feature_extraction import AudioFeatureExtractionTask
 from mobius.tasks._base import (
+    ComponentConfig,
+    ComponentRole,
     ComponentSpec,
     ModelTask,
+    MultiComponentModelTask,
     build_decoder_from_embeds,
     build_embedding_from_features,
 )
@@ -136,10 +147,12 @@ from mobius.tasks._causal_lm import (
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._ctc_asr import CTCAsrTask, FeatureCTCAsrTask
+from mobius.tasks._decision import CLMTask, KevTask
 from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._diarization import DiarizationTask
+from mobius.tasks._diarization_streaming import DiarizationStreamingTask
 from mobius.tasks._draft_target import DraftTargetCausalLMTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._falcon_h1 import FalconH1CausalLMTask
@@ -207,6 +220,7 @@ from mobius.tasks._t5_text_encoder import T5TextEncoderTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._vibevoice import VibeVoiceTask
+from mobius.tasks._vibevoice_asr import VibeVoiceASRStreamingTask, VibeVoiceASRTask
 from mobius.tasks._vibevoice_streaming import VibeVoiceStreamingTask
 from mobius.tasks._video_denoising import VideoDenoisingTask
 from mobius.tasks._video_vae import VideoVAETask
@@ -240,9 +254,11 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "ctc-asr": CTCAsrTask,
     "feature-ctc-asr": FeatureCTCAsrTask,
     "codec": CodecTask,
+    "clm-scoring": CLMTask,
     "controlnet": ControlNetTask,
     "denoising": DenoisingTask,
     "diarization": DiarizationTask,
+    "diarization-streaming": DiarizationStreamingTask,
     "feature-extraction": FeatureExtractionTask,
     "gguf-encoder-feature-extraction": GGUFEncoderFeatureExtractionTask,
     "gguf-embedding-feature-extraction": GGUFEmbeddingFeatureExtractionTask,
@@ -266,6 +282,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "hy-v3-mtp": HyV3MtpTask,
     "kimi-k3-text-generation": KimiK3CausalLMTask,
     "kimi-linear-text-generation": KimiLinearCausalLMTask,
+    "kev-scoring": KevTask,
     "falcon-h1-text-generation": FalconH1CausalLMTask,
     "plamo-text-generation": PlamoCausalLMTask,
     "plamo2-text-generation": Plamo2CausalLMTask,
@@ -315,6 +332,8 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "tts": TTSTask,
     "vibevoice-tts": VibeVoiceTask,
     "vibevoice-streaming-tts": VibeVoiceStreamingTask,
+    "vibevoice-asr": VibeVoiceASRTask,
+    "vibevoice-asr-streaming": VibeVoiceASRStreamingTask,
     "video-denoising": VideoDenoisingTask,
     "video-vae": VideoVAETask,
     "world-model": WorldModelTask,

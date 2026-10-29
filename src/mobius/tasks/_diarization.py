@@ -22,7 +22,11 @@ class DiarizationTask(ModelTask):
 
     Input:  ``input_features`` — ``[batch, feat, time]`` mel spectrogram.
     Output: ``speaker_probs`` — ``[batch, frames, num_spks]`` sigmoid
-    probabilities (``frames = time / subsampling_factor``).
+    probabilities. The ``time`` -> ``frames`` relationship is model-defined
+    (e.g. Sortformer downsamples by ``subsampling_factor``, so
+    ``frames = time / subsampling_factor``; Nemotron3 upsamples its encoder
+    output back to per-mel-frame resolution, so ``frames == time``) --
+    consult the specific model class's own docstring for its exact formula.
     """
 
     model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}

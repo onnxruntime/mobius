@@ -23,6 +23,12 @@ __all__ = [
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
     "CodeShellCausalLMModel",
+    "CLMModel",
+    "CLMProjectionHead",
+    "CLM_PROVENANCE",
+    "CheckpointContractError",
+    "ModelProvenance",
+    "Qwen3EncoderModel",
     "AutoencoderKLCogVideoXModel",
     "CogVideoXTransformer3DModel",
     "CogVideoXVAEConfig",
@@ -102,6 +108,34 @@ __all__ = [
     "JetMoeCausalLMModel",
     "KimiK3CausalLMModel",
     "KimiLinearCausalLMModel",
+    "KevModel",
+    "KevPointerHead",
+    "KEV_PROVENANCE",
+    "KEV_08_PROVENANCE",
+    "KEV_VARIANTS",
+    "KevVariant",
+    "Qwen35EncoderModel",
+    "batch_kev_rows",
+    "build_clm_package",
+    "build_kev_package",
+    "clm_answer",
+    "clm_candidates",
+    "clm_last_token_indices",
+    "clm_pairs",
+    "clm_state_text",
+    "encode_kev_rows",
+    "grouped_softmax",
+    "kev_answer",
+    "map_clm_checkpoint",
+    "map_kev_checkpoint",
+    "rank_probabilities",
+    "render_clm",
+    "render_kev",
+    "synthetic_clm_checkpoint",
+    "synthetic_kev_checkpoint",
+    "validate_temperature",
+    "validate_clm_checkpoint",
+    "validate_kev_checkpoint",
     "Llama4CausalLMModel",
     "LlamaEmbedGGUFModel",
     "DreamModel",
@@ -181,6 +215,7 @@ __all__ = [
     "SEMambaSpeechEnhancementModel",
     "SortformerConfig",
     "SortformerDiarizationModel",
+    "Nemotron3DiarizationModel",
     "Qwen3TTSCodePredictorModel",
     "Qwen3TTSCodecDecoderModel",
     "Qwen3TTSCodecEncoderModel",
@@ -212,6 +247,8 @@ __all__ = [
     "VideoAutoencoderModel",
     "VibeVoiceForConditionalGeneration",
     "VibeVoiceStreamingForConditionalGeneration",
+    "VibeVoiceASRForConditionalGeneration",
+    "VibeVoiceASRStreamingForConditionalGeneration",
     "Wav2Vec2ForCTCModel",
     "Wav2Vec2Model",
     "WhisperForConditionalGeneration",
@@ -250,6 +287,42 @@ from mobius.models.controlnet import ControlNetModel
 from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel
 from mobius.models.cosmos3_omni import Cosmos3OmniReasonerModel
 from mobius.models.ctrl import CTRLCausalLMModel
+from mobius.models.decision import (
+    CLM_PROVENANCE,
+    KEV_08_PROVENANCE,
+    KEV_PROVENANCE,
+    KEV_VARIANTS,
+    CheckpointContractError,
+    CLMModel,
+    CLMProjectionHead,
+    KevModel,
+    KevPointerHead,
+    KevVariant,
+    ModelProvenance,
+    Qwen3EncoderModel,
+    Qwen35EncoderModel,
+    batch_kev_rows,
+    build_clm_package,
+    build_kev_package,
+    clm_answer,
+    clm_candidates,
+    clm_last_token_indices,
+    clm_pairs,
+    clm_state_text,
+    encode_kev_rows,
+    grouped_softmax,
+    kev_answer,
+    map_clm_checkpoint,
+    map_kev_checkpoint,
+    rank_probabilities,
+    render_clm,
+    render_kev,
+    synthetic_clm_checkpoint,
+    synthetic_kev_checkpoint,
+    validate_clm_checkpoint,
+    validate_kev_checkpoint,
+    validate_temperature,
+)
 from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.deepseek_ocr2 import DeepSeekOCR2CausalLMModel
 from mobius.models.deepseek_v4 import DeepSeekV4CausalLMModel
@@ -369,6 +442,7 @@ from mobius.models.muse_glimmer import (
 from mobius.models.nanochat import NanoChatCausalLMModel
 from mobius.models.nemo_rnnt import EncDecRNNTModel
 from mobius.models.nemotron import NemotronCausalLMModel
+from mobius.models.nemotron3_diarization import Nemotron3DiarizationModel
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.nemotron_parse import NemotronParseForConditionalGeneration
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
@@ -454,7 +528,11 @@ from mobius.models.unet import (
     remap_diffusers_unet_lora,
 )
 from mobius.models.vae import AutoencoderKLModel
-from mobius.models.vibevoice import VibeVoiceForConditionalGeneration
+from mobius.models.vibevoice import (
+    VibeVoiceASRStreamingForConditionalGeneration,
+    VibeVoiceForConditionalGeneration,
+)
+from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from mobius.models.vibevoice_streaming import VibeVoiceStreamingForConditionalGeneration
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel

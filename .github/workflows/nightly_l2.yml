@@ -51,8 +51,9 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements/ci/requirements.txt
-          pip install -e '.[testing]'
+          pip install -e '.[testing]' -r requirements/ci/transformers.txt
           pip install --force-reinstall --no-deps -r requirements/ci/vibevoice.txt
+          python -c "from transformers import AutoConfig"
 
       # Run sequentially (-p no:xdist) to stay under 2GB RAM
       - name: Run L2 architecture validation tests
