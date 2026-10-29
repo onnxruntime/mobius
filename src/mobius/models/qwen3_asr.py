@@ -492,11 +492,16 @@ class Qwen3ASRDecoderModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(op, position_ids)
 
-        attention_bias = create_attention_bias(
-            op,
-            input_ids=inputs_embeds,
-            attention_mask=attention_mask,
-            dtype=self._dtype,
+        # Static cache (attention_mask is None) masks causally inside Attention.
+        attention_bias = (
+            create_attention_bias(
+                op,
+                input_ids=inputs_embeds,
+                attention_mask=attention_mask,
+                dtype=self._dtype,
+            )
+            if attention_mask is not None
+            else None
         )
 
         present_key_values = []

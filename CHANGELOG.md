@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Static KV cache for speech-language decoders
+
+#### Added
+
+- Speech-language decoders (Qwen3-ASR) accept `--features static-cache`:
+  `build_decoder_from_embeds` and `SpeechLanguageTask` take pre-allocated
+  `key_cache.{i}` / `value_cache.{i}` buffers with `write_indices` and
+  `nonpad_kv_seqlen` instead of growing `past_key_values` and
+  `attention_mask`, keeping the `audio_encoder` / `embedding` / `decoder`
+  split. Every decode step then has fixed shapes, so it can be captured in a
+  CUDA graph. Hybrid and deepstack decoders reject it.
+
 ### Qwen3.8-27B standard-only multimodal qualification
 
 #### Added
