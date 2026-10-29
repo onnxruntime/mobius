@@ -1,0 +1,1406 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""CPU-only consumer contracts, including fresh-process framework isolation."""
+
+from __future__ import annotations
+
+import copy
+import json
+import os
+import struct
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import ml_dtypes
+import numpy as np
+import onnx_ir as ir
+import onnxruntime as ort
+import pytest
+from audit_drama3 import (
+    CHECKPOINT,
+    SOURCE,
+    ReferenceAudit,
+    attest_loaded_sessions,
+    checked_file,
+    compare_waveform,
+    digest,
+    expert_execution,
+    finish_acceptance,
+    load_inputs,
+    load_sessions,
+    load_waveform_reference,
+    performance_result,
+    validate_ownership,
+    validate_profile,
+    verify_artifacts,
+)
+from benchmark_drama3 import greedy_model
+from drama3_runtime import (
+    SOURCE_CONTEXT_CONTRACT,
+    SOURCE_CONTEXT_METADATA,
+    BoundSession,
+    numpy_to_ort,
+    ort_to_numpy,
+)
+from onnxscript import GraphBuilder
+
+
+def descriptor(path):
+    return {"path": str(path), "sha256": digest(path), "bytes": path.stat().st_size}
+
+
+@pytest.mark.parametrize(
+    "features,expected",
+    [
+        ("", "dense"),
+        ("com.microsoft::QMoE", "dense"),
+        ("activation_quantization=dynamic_fp8", "dynamic_fp8"),
+        (
+            (
+                "CUDA13.0; SM90; com.microsoft::CausalRightAttention; "
+                "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]; "
+                "com.microsoft::UnitLowerTriangularSolve"
+            ),
+            "dynamic_fp8",
+        ),
+        ("unrelated_activation_quantization=dynamic_fp8", "dense"),
+    ],
+)
+def test_expert_execution_recognizes_exact_candidate_and_legacy_contracts(features, expected):
+    assert expert_execution(features, json.dumps(candidate_loading())) == expected
+
+
+def candidate_loading():
+    return {
+        "format": "mobius.weight-loading-report.v1",
+        "architecture": "fish_omni",
+        "activation_quantization": "dynamic_fp8",
+        "native_fp8": True,
+        "output_weight_format": "mixed-block-fp8-128",
+        "revision": CHECKPOINT,
+    }
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "format",
+        "architecture",
+        "activation_quantization",
+        "native_fp8",
+        "output_weight_format",
+        "revision",
+        "missing",
+    ],
+)
+def test_compatible_qmoe_rejects_missing_or_wrong_weight_loading(field):
+    loading = candidate_loading()
+    if field != "missing":
+        loading[field] = "incorrect"
+    with pytest.raises(ValueError, match="weight-loading"):
+        expert_execution(
+            "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]",
+            None if field == "missing" else json.dumps(loading),
+        )
+
+
+@pytest.mark.parametrize(
+    "features",
+    ["", "com.microsoft::QMoE"],
+)
+def test_weight_report_alone_cannot_select_dynamic_fp8(features):
+    assert expert_execution(features, json.dumps(candidate_loading())) == "dense"
+
+
+@pytest.mark.parametrize("loading", [None, "valid"])
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "",
+        ";activation_quantization=dynamic_fp8",
+        ";com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]",
+    ],
+)
+@pytest.mark.parametrize("profile", ["unknown", "native"])
+def test_unsupported_qmoe_profile_never_falls_through_to_legacy(profile, suffix, loading):
+    features = f"com.microsoft::QMoE[fp8_execution_profile={profile}]{suffix}"
+    with pytest.raises(ValueError, match="Unsupported or conflicting QMoE profile"):
+        expert_execution(features, json.dumps(candidate_loading()) if loading else None)
+
+
+def test_legacy_exact_dynamic_fp8_contract_remains_supported_without_candidate_profile():
+    assert expert_execution("activation_quantization=dynamic_fp8") == "dynamic_fp8"
+
+
+@pytest.mark.parametrize(
+    "variant", ["compatible", "weight-only", "wrong-profile", "wrong-dtype"]
+)
+def test_load_sessions_requires_compatible_profile_weights_and_actual_dtype(
+    consumer, monkeypatch, variant
+):
+    profile = copy.deepcopy(consumer.profile)
+    profile["expert_execution"] = "dynamic_fp8"
+    feature = "com.microsoft::QMoE[fp8_execution_profile=fp16_compatible]"
+    if variant == "weight-only":
+        feature = ""
+    elif variant == "wrong-profile":
+        feature = "com.microsoft::QMoE[fp8_execution_profile=unknown]"
+    profile["components"]["decoder"]["required_runtime_features"] = feature
+
+    def metadata_session(path, **kwargs):
+        name = path.parent.name
+        meta = {}
+        if name == "decoder":
+            meta = {
+                "mobius.required_runtime_features": feature,
+                "mobius.weight_loading": json.dumps(candidate_loading()),
+            }
+        elif name == "codec":
+            meta = {"sample_rate": "44100", "samples_per_frame": "2048"}
+        dtype = "tensor(float16)" if variant == "wrong-dtype" else "tensor(float)"
+        return SimpleNamespace(
+            session=SimpleNamespace(
+                get_modelmeta=lambda: SimpleNamespace(custom_metadata_map=meta),
+                get_outputs=lambda: [
+                    SimpleNamespace(type=dtype if name == "decoder" else "tensor(float)")
+                ],
+                get_inputs=lambda: (
+                    [SimpleNamespace(name="logits", type="tensor(float)")]
+                    if name == "main_policy"
+                    else []
+                ),
+            )
+        )
+
+    monkeypatch.setattr("audit_drama3.BoundSession", metadata_session)
+    if variant == "compatible":
+        assert set(load_sessions(profile)) == set(profile["components"])
+    else:
+        with pytest.raises(ValueError, match=r"dtype|expert execution|QMoE profile"):
+            load_sessions(profile)
+
+
+def save_graph(path, inputs, build, *, metadata=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    graph = ir.Graph([], [], nodes=[], opset_imports={"": 24})
+    builder = GraphBuilder(graph)
+    values = {name: builder.input(name, dtype, shape) for name, dtype, shape in inputs}
+    for name, value, dtype, shape in build(builder.op, values):
+        value.type, value.shape = ir.TensorType(dtype), ir.Shape(shape)
+        builder.add_output(value, name)
+    model = ir.Model(graph, ir_version=12)
+    if metadata:
+        model.graph.metadata_props.update(metadata)
+        model.metadata_props.update(metadata)
+    ir.save(model, path)
+
+
+@pytest.fixture
+def consumer(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    config = {
+        "text_config": {"vocab_size": 8, "max_position_embeddings": 256},
+        "audio_decoder_config": {"num_codebooks": 2, "vocab_size": 16},
+        "semantic_start_token_id": 2,
+        "semantic_end_token_id": 4,
+        "eos_token_id": 7,
+    }
+    config_path = assets / "config.json"
+    config_path.write_text(json.dumps(config))
+    f32, i64, boolean = ir.DataType.FLOAT, ir.DataType.INT64, ir.DataType.BOOL
+    t = "time"
+    paths = {
+        name: assets / name / "model.onnx"
+        for name in ("embedding", "decoder", "audio_generator", "main_policy", "codec")
+    }
+
+    def embedding(op, x):
+        value = op.Cast(x["frames"], to=f32)
+        return [
+            ("inputs_embeds", value, f32, [1, t, 3]),
+            ("shared_input", op.Identity(value), f32, [1, t, 3]),
+        ]
+
+    save_graph(
+        paths["embedding"],
+        [("frames", i64, [1, t, 3])],
+        embedding,
+        metadata={SOURCE_CONTEXT_METADATA: SOURCE_CONTEXT_CONTRACT},
+    )
+    cache_inputs = [
+        ("past_key_values.0.key", f32, [1, 1, "past", 1]),
+        ("past_key_values.0.value", f32, [1, 1, "past", 1]),
+        ("past_key_values.1.conv_state", f32, [1, 3, 2]),
+        ("past_key_values.1.recurrent_state", f32, [1, 1, 1, 1]),
+    ]
+
+    def caches(op, x, hidden):
+        current = op.Unsqueeze(op.ReduceSum(hidden, [-1], keepdims=1), [1])
+        return [
+            (
+                "present." + name.removeprefix("past_key_values."),
+                op.Concat(value, current, axis=2)
+                if name.endswith((".key", ".value"))
+                else op.Add(value, 1.0),
+                f32,
+                [1, 1, "total", 1]
+                if name.endswith((".key", ".value"))
+                else ([1, 3, 2] if name.endswith("conv_state") else [1, 1, 1, 1]),
+            )
+            for name, value in x.items()
+            if name.startswith("past_key_values.")
+        ]
+
+    def decoder(op, x):
+        carry = op.Add(
+            op.ReduceSum(x["past_key_values.1.recurrent_state"], keepdims=0),
+            op.ReduceSum(x["past_key_values.1.conv_state"], keepdims=0),
+        )
+        hidden = op.Add(op.Add(x["inputs_embeds"], 1.0), carry)
+        logits = op.Add(
+            op.Pad(hidden, [0, 0, 0, 0, 0, 5]),
+            op.Constant(value_floats=[0.0, 0.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        )
+        return [
+            ("hidden_states", hidden, f32, [1, t, 3]),
+            ("logits", logits, f32, [1, t, 8]),
+            *caches(op, x, hidden),
+        ]
+
+    save_graph(
+        paths["decoder"],
+        [
+            ("inputs_embeds", f32, [1, t, 3]),
+            ("position_ids", i64, [1, t]),
+            ("attention_mask", i64, [1, "total"]),
+            *cache_inputs,
+        ],
+        decoder,
+        metadata={SOURCE_CONTEXT_METADATA: SOURCE_CONTEXT_CONTRACT},
+    )
+
+    def tower(op, x):
+        hidden = op.Add(x["hidden_states"], x["shared_input"])
+        code = op.Mod(op.Cast(op.ReduceSum(hidden, [-1], keepdims=1), to=i64), 16)
+        codes = op.Concat(op.Slice(x["codes"], [0], [1], [2]), code, axis=-1)
+        return [
+            ("codebook_logits", op.Unsqueeze(hidden, [2]), f32, [1, t, 1, 3]),
+            ("frame_codes", codes, i64, [1, t, 2]),
+            ("valid", op.Constant(value_ints=[1]), i64, [1]),
+            ("next_counter", op.Identity(x["counter"]), i64, [1]),
+            *caches(op, x, hidden),
+        ]
+
+    save_graph(
+        paths["audio_generator"],
+        [
+            ("hidden_states", f32, [1, t, 3]),
+            ("shared_input", f32, [1, t, 3]),
+            ("codes", i64, [1, t, 2]),
+            ("semantic_mask", boolean, [1, t]),
+            ("position_ids", i64, [1, t]),
+            ("attention_mask", i64, [1, "total"]),
+            ("generate", boolean, []),
+            ("do_sample", boolean, []),
+            ("temperature", f32, [1]),
+            ("top_k", i64, [1]),
+            ("top_p", f32, [1]),
+            ("seed", i64, [1]),
+            ("counter", i64, [1]),
+            *cache_inputs,
+        ],
+        tower,
+        metadata={SOURCE_CONTEXT_METADATA: SOURCE_CONTEXT_CONTRACT},
+    )
+    paths["main_policy"].parent.mkdir()
+    ir.save(greedy_model(config, f32), paths["main_policy"])
+
+    def codec(op, x):
+        audio = op.Cast(op.ReduceSum(x["codes"], [1], keepdims=1), to=f32)
+        samples = op.Tile(op.Unsqueeze(audio, [-1]), [1, 1, 1, 2048])
+        return [("waveform", op.Reshape(samples, [1, 1, -1]), f32, [1, 1, "samples"])]
+
+    save_graph(
+        paths["codec"],
+        [("codes", i64, [1, 2, t])],
+        codec,
+        metadata={
+            "sample_rate": "44100",
+            "samples_per_frame": "2048",
+            "codec_revision": CHECKPOINT,
+        },
+    )
+    # Independent NumPy expectations: no output/cache from a target session is
+    # used to build the fixture. The second prompt/frame differs from the first.
+    prompt = np.array([[1, 0, 1], [2, 1, 2]], np.int64)
+    current = prompt
+    states, frames = [], []
+    for step in range(3):
+        embedded = current.astype(np.float32)[None]
+        hidden = embedded + 1 + 7 * step
+        logits = np.pad(hidden, ((0, 0), (0, 0), (0, 5)))
+        logits[..., 2] += 100
+        tower_logits = (hidden[:, -1:] + embedded[:, -1:])[:, :, None]
+        code = int(tower_logits.sum()) % 16
+        frame = np.array([[2, 0, code]], np.int64)
+        state = {
+            "input_frames": current,
+            "inputs_embeds": embedded,
+            "shared_input": embedded.copy(),
+            "hidden_states": hidden,
+            "logits": logits,
+            "position_ids": np.arange(2, dtype=np.int64)[None]
+            if not step
+            else np.array([[1 + step]], np.int64),
+            "tower_logits": tower_logits,
+            "sampled_frame": frame,
+        }
+        if not step:
+            state["prefill_tower_logits"] = (hidden[:, :-1] + embedded[:, :-1])[:, :, None]
+        path = assets / f"state-{step:02}.npz"
+        np.savez(path, **state)
+        states.append({"index": step, **descriptor(path), "fields": sorted(state)})
+        frames.append(frame[0].tolist())
+        current = frame
+    golden = {
+        "model_id": "fishaudio/drama-3",
+        "revision": CHECKPOINT,
+        "source_revision": SOURCE,
+        "dtype": "float32",
+        "expert_execution": "dense",
+        "do_sample": False,
+        "reference_environment": {"fixture": "independent synthetic NumPy"},
+        "attempted_frames": 3,
+        "max_new_tokens": 3,
+        "prompt_rows": 2,
+        "generated_frames": frames,
+    }
+    golden_path = assets / "golden.json"
+    golden_path.write_text(json.dumps(golden))
+    import hashlib
+
+    request_data = {
+        **{
+            key: golden[key]
+            for key in (
+                "do_sample",
+                "reference_environment",
+                "attempted_frames",
+                "max_new_tokens",
+                "prompt_rows",
+            )
+        },
+        "golden_path": str(golden_path),
+        "golden_sha256": digest(golden_path),
+        "states": states,
+        "initial_input_frames_shape": list(prompt.shape),
+        "initial_input_frames_sha256": hashlib.sha256(prompt.tobytes()).hexdigest(),
+        "expected_generated_frames_shape": [3, 3],
+        "expected_generated_frames_sha256": hashlib.sha256(
+            np.asarray(frames, np.int64).tobytes()
+        ).hexdigest(),
+    }
+    inputs = {
+        "schema_version": 1,
+        "checkpoint_revision": CHECKPOINT,
+        "source_revision": SOURCE,
+        "requests": {"f32": request_data},
+    }
+    inputs_path = assets / "inputs.json"
+    inputs_path.write_text(json.dumps(inputs))
+    import onnxruntime.capi.onnxruntime_pybind11_state as native
+
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    session = ort.InferenceSession(
+        str(paths["decoder"]), options, providers=["CPUExecutionProvider"]
+    )
+    profile = {
+        "schema_version": 1,
+        "status": "ready",
+        "dtype": "f32",
+        "expert_execution": "dense",
+        "checkpoint_revision": CHECKPOINT,
+        "source_revision": SOURCE,
+        "inputs_sha256": digest(inputs_path),
+        "max_total_length": 256,
+        "device": "cpu",
+        "device_id": 0,
+        "optimization": "ORT_ENABLE_ALL",
+        "providers": ["CPUExecutionProvider"],
+        "actual_providers": session.get_providers(),
+        "actual_provider_options": session.get_provider_options(),
+        "disabled_optimizers": [],
+        "session_config": {},
+        "policy": "saved-greedy-main-v1",
+        "config": descriptor(config_path),
+        "runtime": {
+            "ort_version": ort.__version__,
+            "ort_build": ort.get_build_info(),
+            "files": [descriptor(Path(native.__file__))],
+        },
+        "components": {
+            name: {
+                "graph": descriptor(path),
+                "external_data": [],
+                "required_runtime_features": "",
+                "dtype": "int64" if name == "main_policy" else "f32",
+            }
+            for name, path in paths.items()
+        },
+    }
+    selection = assets / "selection.json"
+    selection.write_text(json.dumps(profile))
+    return SimpleNamespace(
+        assets=assets,
+        inputs=inputs_path,
+        selection=selection,
+        profile=profile,
+        data=inputs,
+        request=request_data,
+        golden=golden,
+        paths=paths,
+        prompt=prompt,
+    )
+
+
+def subprocess_run(code, *arguments):
+    environment = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": "-1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(Path(__file__).parent),
+    }
+    block_frameworks = """
+import importlib.abc
+import sys
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'torch', 'mobius', 'onnxscript', 'onnx_ir'}:
+            raise ImportError('blocked target dependency: ' + fullname)
+sys.meta_path.insert(0, Block())
+"""
+    return subprocess.run(
+        [sys.executable, "-c", block_frameworks + code, *map(str, arguments)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+
+
+def test_fresh_process_import_and_cli_isolation():
+    completed = subprocess_run("""
+import audit_drama3
+import drama3_runtime
+assert not any(k.split('.')[0] in {'torch', 'mobius'} for k in sys.modules)
+audit_drama3.parser().parse_args(['--help'])
+""")
+    assert completed.returncode == 0, completed.stderr
+    assert "--selection-sha256" in completed.stdout
+
+
+def execute_consumer(consumer, output, *extra):
+    return subprocess_run(
+        """
+import audit_drama3
+args = audit_drama3.parser().parse_args(sys.argv[1:])
+result = audit_drama3.run(args)
+assert not any(k.split('.')[0] in {'torch', 'mobius'} for k in sys.modules)
+assert result['native_cuda13_acceptance'] is False
+""",
+        "--inputs",
+        consumer.inputs,
+        "--inputs-sha256",
+        digest(consumer.inputs),
+        "--selection",
+        consumer.selection,
+        "--selection-sha256",
+        digest(consumer.selection),
+        "--output",
+        output,
+        "--raw-bits",
+        *extra,
+    )
+
+
+@pytest.fixture
+def waveform_reference(consumer):
+    import hashlib
+
+    frames = np.asarray(consumer.golden["generated_frames"], np.int64)
+    expected = np.repeat(frames[:, 1:].sum(-1).astype(np.float32), 2048)[None, None]
+    reference = consumer.assets / "independent-waveform.npz"
+    np.savez(reference, waveform=expected)
+    collector = consumer.assets / "synthetic-collector.py"
+    collector.write_text("# Synthetic CPU fixture provenance; never executed by consumer.\n")
+    provenance = {
+        "schema_version": 1,
+        "checkpoint_revision": CHECKPOINT,
+        "source_revision": SOURCE,
+        "codec_revision": CHECKPOINT,
+        "collector": descriptor(collector),
+        "source_device": "cpu",
+        "independent_source_invocation": True,
+        "source_command": ["python", str(collector), "--cpu"],
+        "frames_sha256": hashlib.sha256(frames.tobytes()).hexdigest(),
+        "frames_shape": list(frames.shape),
+        "frames_dtype": "int64",
+        "dtype": "float32",
+        "sample_rate": 44100,
+        "samples_per_frame": 2048,
+        "waveform": descriptor(reference),
+    }
+    manifest = consumer.assets / "independent-waveform-provenance.json"
+    manifest.write_text(json.dumps(provenance))
+    consumer.profile["waveform_reference"] = descriptor(manifest)
+    consumer.selection.write_text(json.dumps(consumer.profile))
+    return SimpleNamespace(
+        consumer=consumer,
+        manifest=manifest,
+        provenance=provenance,
+        frames=frames,
+        expected=expected,
+        reference=reference,
+        collector=collector,
+    )
+
+
+def test_independent_waveform_reference_is_read_only_expectation_in_blocked_process(
+    waveform_reference, tmp_path
+):
+    fixture = waveform_reference
+    before = {
+        path: digest(path) for path in (fixture.manifest, fixture.reference, fixture.collector)
+    }
+    completed = execute_consumer(
+        fixture.consumer, tmp_path / "with-waveform", "--benchmark", "--warmup", "1"
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads((tmp_path / "with-waveform" / "report.json").read_text())
+    assert report["codec_numerical_quality"]["status"] == "VERIFIED"
+    assert report["measured_codec_numerical_quality"]["status"] == "VERIFIED"
+    assert report["codec_numerical_quality"]["snr_db"] == "infinity"
+    assert report["blocked_acceptance_gates"] == []
+    assert report["native_cuda13_acceptance"] is False  # CPU cannot qualify native gates.
+    assert {path: digest(path) for path in before} == before
+    np.testing.assert_array_equal(
+        np.load(tmp_path / "with-waveform" / "waveform.npy"), fixture.expected
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "source",
+        "codec",
+        "checkpoint",
+        "collector-hash",
+        "waveform-hash",
+        "source-device",
+        "independence",
+        "command",
+        "sample-rate",
+        "hop",
+        "dtype",
+        "frames-dtype",
+    ],
+)
+def test_waveform_provenance_rejects_missing_or_inconsistent_pins(
+    waveform_reference, mutation
+):
+    fixture = waveform_reference
+    value = copy.deepcopy(fixture.provenance)
+    if mutation == "missing":
+        del value["collector"]
+    elif mutation in ("source", "codec", "checkpoint"):
+        value[mutation + "_revision"] = "0" * 40
+    elif mutation in ("collector-hash", "waveform-hash"):
+        value[mutation.split("-")[0]]["sha256"] = "0" * 64
+    else:
+        key, invalid = {
+            "source-device": ("source_device", "cuda"),
+            "independence": ("independent_source_invocation", False),
+            "command": ("source_command", []),
+            "sample-rate": ("sample_rate", 24000),
+            "hop": ("samples_per_frame", 512),
+            "dtype": ("dtype", "float16"),
+            "frames-dtype": ("frames_dtype", "int32"),
+        }[mutation]
+        value[key] = invalid
+    fixture.manifest.write_text(json.dumps(value))
+    fixture.consumer.profile["waveform_reference"] = descriptor(fixture.manifest)
+    with pytest.raises(ValueError):
+        load_waveform_reference(fixture.consumer.profile)
+
+
+def test_waveform_provenance_manifest_hash_is_verified(waveform_reference):
+    fixture = waveform_reference
+    fixture.manifest.write_text("{}")
+    with pytest.raises(ValueError, match="SHA256"):
+        load_waveform_reference(fixture.consumer.profile)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["frames", "codec", "shape", "dtype", "nan", "rms", "numerical", "npz-key"]
+)
+def test_independent_waveform_comparison_rejects_wrong_expected_data(
+    waveform_reference, mutation
+):
+    fixture = waveform_reference
+    provenance = copy.deepcopy(fixture.provenance)
+    expected = fixture.expected.copy()
+    codec_revision = CHECKPOINT
+    if mutation == "frames":
+        provenance["frames_sha256"] = "0" * 64
+    elif mutation == "codec":
+        codec_revision = "0" * 40
+    elif mutation == "shape":
+        expected = expected[..., :-1]
+    elif mutation == "dtype":
+        expected = expected.astype(np.float64)
+    elif mutation == "nan":
+        expected.flat[0] = np.nan
+    elif mutation == "rms":
+        expected.fill(0)
+    elif mutation == "numerical":
+        expected += 1
+    np.savez(
+        fixture.reference,
+        **{"incorrect" if mutation == "npz-key" else "waveform": expected},
+    )
+    provenance["waveform"] = descriptor(fixture.reference)
+    with pytest.raises((ValueError, AssertionError)):
+        compare_waveform(
+            fixture.expected,
+            fixture.frames,
+            provenance,
+            fixture.consumer.profile["waveform_reference"],
+            codec_revision=codec_revision,
+        )
+
+
+def test_failed_waveform_gate_does_not_replace_target_audio(waveform_reference, tmp_path):
+    fixture = waveform_reference
+    # Wrong but non-silent independent expectation; neural/frame expectations are unchanged.
+    np.savez(fixture.reference, waveform=fixture.expected + 1)
+    fixture.provenance["waveform"] = descriptor(fixture.reference)
+    fixture.manifest.write_text(json.dumps(fixture.provenance))
+    fixture.consumer.profile["waveform_reference"] = descriptor(fixture.manifest)
+    fixture.consumer.selection.write_text(json.dumps(fixture.consumer.profile))
+    completed = execute_consumer(fixture.consumer, tmp_path / "bad-waveform")
+    assert completed.returncode != 0
+    report = json.loads((tmp_path / "bad-waveform" / "report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["codec_numerical_quality"]["status"] == "FAILED"
+    assert report["native_cuda13_acceptance"] is False
+    assert "AssertionError" in report["error"]
+
+
+def test_waveform_metrics_use_only_existing_allclose_gate(waveform_reference):
+    fixture = waveform_reference
+    actual = fixture.expected + np.float32(0.00005)
+    result = compare_waveform(
+        actual,
+        fixture.frames,
+        fixture.provenance,
+        fixture.consumer.profile["waveform_reference"],
+        codec_revision=CHECKPOINT,
+    )
+    assert result["status"] == "VERIFIED"
+    assert result["rmse"] > 0
+    assert np.isfinite(result["snr_db"])
+    assert result["atol"] == pytest.approx(1e-4)
+    assert result["rtol"] == pytest.approx(1e-3)
+
+
+def test_actual_cpu_chain_in_fresh_framework_blocked_process(consumer, tmp_path):
+    completed = execute_consumer(
+        consumer, tmp_path / "results", "--benchmark", "--warmup", "1"
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads((tmp_path / "results" / "report.json").read_text())
+    assert report["status"] == "passed"
+    assert report["all_model_sessions_attested_before_first_nn"] is True
+    assert set(report["actual_model_session_profiles_before_first_nn"]) == {
+        "embedding",
+        "decoder",
+        "audio_generator",
+        "main_policy",
+        "codec",
+    }
+    assert report["codec_numerical_quality"]["status"] == "UNVERIFIED"
+    assert report["codec_numerical_quality"]["independent_waveform_reference"] is None
+    assert report["native_cuda13_acceptance"] is False
+    assert report["blocked_acceptance_gates"] == [
+        "independent_fp32_codec_waveform_numerical_quality"
+    ]
+    assert report["audit"]["source_fields"] == 25
+    assert report["audit"]["float_tensors"] == 16
+    assert report["audit"]["f32_patterns"] == 80
+    assert report["performance"]["measurement_qualified"] is False
+    assert report["performance"]["meets_end_to_end_rtf_target"] is None
+    assert len(report["performance"]["frame_seconds"]) == 3
+    np.testing.assert_array_equal(
+        np.load(tmp_path / "results" / "generated-frames.npy"),
+        consumer.golden["generated_frames"],
+    )
+    expected_samples = np.asarray(consumer.golden["generated_frames"])[:, 1:].sum(-1)
+    np.testing.assert_array_equal(
+        np.load(tmp_path / "results" / "waveform.npy")[0, 0],
+        np.repeat(expected_samples.astype(np.float32), 2048),
+    )
+
+
+def test_diagnostics_record_actual_optimized_graphs_and_executed_opcodes(consumer, tmp_path):
+    completed = execute_consumer(
+        consumer, tmp_path / "diagnostics", "--diagnostics", "--benchmark", "--warmup", "1"
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    report = json.loads((tmp_path / "diagnostics" / "report.json").read_text())
+    assert report["selection"]["disabled_optimizers"] == []
+    assert report["selection"]["optimization"] == "ORT_ENABLE_ALL"
+    assert report["performance"]["instrumented"] is True
+    assert report["performance"]["measurement_qualified"] is False
+    for evidence in report["diagnostics"].values():
+        assert (
+            digest(evidence["optimized_graph"]["path"])
+            == evidence["optimized_graph"]["sha256"]
+        )
+        assert digest(evidence["profile"]["path"]) == evidence["profile"]["sha256"]
+        assert evidence["executed_operators"]
+        for item in evidence["executed_operators"]:
+            assert item["provider"] == "CPUExecutionProvider"
+            assert item["calls"] > 0
+        assert all(
+            Path(item["path"]).is_relative_to(tmp_path / "diagnostics")
+            for item in evidence["files"]
+        )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16, np.bool_])
+@pytest.mark.parametrize("shape", [(), (0, 2), (1, 0, 3), (2, 2)])
+def test_transport_preserves_rank_empty_dtype_and_bits(dtype, shape):
+    array = np.zeros(shape, dtype=dtype)
+    if array.size and dtype != np.bool_:
+        array.flat[0] = -0.0
+    value = numpy_to_ort(array)
+    actual = ort_to_numpy(value)
+    assert actual.shape == shape and actual.dtype == array.dtype
+    assert actual.tobytes() == array.tobytes()
+
+
+def test_bf16_gpu_pointer_is_never_dereferenced():
+    value = SimpleNamespace(data_type=lambda: "tensor(bfloat16)", device_name=lambda: "cuda")
+    with pytest.raises(ValueError, match="CPU-bound"):
+        ort_to_numpy(value)
+
+
+def test_tower_package_context_metadata_rejects_mixed_positions_before_binding():
+    session = BoundSession.__new__(BoundSession)
+    session.context_contract = SOURCE_CONTEXT_CONTRACT
+    with pytest.raises(ValueError, match="shared contiguous"):
+        session.run(
+            {
+                "hidden_states": np.zeros((2, 1, 32), np.float32),
+                "position_ids": np.array([[3], [4]], np.int64),
+                "attention_mask": np.ones((2, 4), np.int64),
+                "past_key_values.0.key": np.zeros((2, 1, 3, 4), np.float32),
+                "past_key_values.0.value": np.zeros((2, 1, 3, 4), np.float32),
+            }
+        )
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_bound_identity_runs_low_dtype_without_framework(consumer, tmp_path, dtype):
+    path = consumer.assets / "identity.onnx"
+    save_graph(
+        path,
+        [("x", dtype, [2])],
+        lambda op, x: [("y", op.Identity(x["x"]), dtype, [2])],
+    )
+    completed = subprocess_run(
+        """
+import numpy as np
+import ml_dtypes
+from drama3_runtime import BoundSession, ort_to_numpy
+dtype = np.float16 if sys.argv[2] == '10' else ml_dtypes.bfloat16
+x = np.array([-0.0, 0.75], dtype=dtype)
+y = ort_to_numpy(BoundSession(__import__('pathlib').Path(sys.argv[1]),
+    device='cpu').run({'x': x})['y'])
+assert x.tobytes() == y.tobytes()
+""",
+        path,
+        int(dtype),
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("mutation", ["hash", "fields", "index", "source", "frames"])
+def test_input_manifest_rejects_mutations(consumer, mutation):
+    inputs = copy.deepcopy(consumer.data)
+    request_data = inputs["requests"]["f32"]
+    if mutation == "hash":
+        request_data["states"][1]["sha256"] = "0" * 64
+    elif mutation == "fields":
+        request_data["states"][0]["fields"].remove("logits")
+    elif mutation == "index":
+        request_data["states"][1]["index"] = 0
+    elif mutation == "source":
+        inputs["source_revision"] = "0" * 40
+    else:
+        request_data["expected_generated_frames_sha256"] = "0" * 64
+    consumer.inputs.write_text(json.dumps(inputs))
+    with pytest.raises(ValueError):
+        load_inputs(consumer.inputs, digest(consumer.inputs), "f32")
+
+
+@pytest.mark.parametrize("field", ["inputs_embeds", "hidden_states", "tower_logits"])
+def test_matching_frame_hash_cannot_bypass_full_vector_gate(consumer, tmp_path, field):
+    state = consumer.assets / "state-01.npz"
+    with np.load(state) as saved:
+        values = {name: saved[name] for name in saved.files}
+    values[field] = values[field] + 1
+    np.savez(state, **values)
+    consumer.data["requests"]["f32"]["states"][1].update(descriptor(state))
+    consumer.inputs.write_text(json.dumps(consumer.data))
+    consumer.profile["inputs_sha256"] = digest(consumer.inputs)
+    consumer.selection.write_text(json.dumps(consumer.profile))
+    completed = execute_consumer(consumer, tmp_path / "failed")
+    assert completed.returncode != 0
+    report = json.loads((tmp_path / "failed" / "report.json").read_text())
+    assert report["status"] == "failed"
+    assert field in report["error"]
+    assert "generated_frames_sha256" not in report
+
+
+def test_raw_bit_gate_preserves_signed_zero(consumer):
+    audit = ReferenceAudit(consumer.request, "f32", raw_bits=True)
+    audit.state = {"inputs_embeds": np.array([-0.0], np.float32)}
+    with pytest.raises(AssertionError):
+        audit.check(0, "inputs_embeds", np.array([0.0], np.float32))
+
+
+@pytest.mark.parametrize("mutation", ["notready", "extended", "capture", "tf32", "cuda12"])
+def test_selected_profile_controls_are_not_silently_changed(consumer, mutation):
+    profile = copy.deepcopy(consumer.profile)
+    profile.update(
+        device="cuda",
+        gpu_uuid="GPU-owned",
+        providers=[
+            [
+                "CUDAExecutionProvider",
+                {
+                    "device_id": "0",
+                    "use_tf32": "0",
+                    "enable_cuda_graph": "0",
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "EXHAUSTIVE",
+                },
+            ],
+            "CPUExecutionProvider",
+        ],
+    )
+    profile["runtime"].update(cuda_toolkit="13.0.48", cublas="13.0.0.19", cudnn="9.14.0.64")
+    profile["session_config"]["session.disable_prepacking"] = "1"
+    if mutation == "notready":
+        profile["status"] = "NOT READY / NOT QUALIFIED"
+    elif mutation == "extended":
+        profile["optimization"] = "ORT_ENABLE_EXTENDED"
+    elif mutation == "capture":
+        profile["providers"][0][1]["enable_cuda_graph"] = "1"
+    elif mutation == "tf32":
+        profile["providers"][0][1]["use_tf32"] = "1"
+    else:
+        profile["runtime"]["cuda_toolkit"] = "12.8"
+    with pytest.raises(ValueError):
+        validate_profile(profile)
+
+
+@pytest.mark.parametrize("drift", ["provider", "options"])
+def test_selected_session_forwards_all_controls_and_rejects_provider_drift(
+    consumer, monkeypatch, drift
+):
+    seen = []
+
+    def fake_session(path, options, *, providers, disabled_optimizers):
+        seen.append((options, providers, disabled_optimizers))
+        return SimpleNamespace(
+            get_providers=lambda: (
+                ["UnexpectedExecutionProvider"]
+                if drift == "provider"
+                else consumer.profile["actual_providers"]
+            ),
+            get_provider_options=lambda: {"CPUExecutionProvider": {"unselected": "1"}},
+            get_session_options=lambda: options,
+        )
+
+    monkeypatch.setattr(ort, "InferenceSession", fake_session)
+    profile = copy.deepcopy(consumer.profile)
+    profile["disabled_optimizers"] = ["RotaryEmbeddingFusion"]
+    profile["session_config"] = {"session.disable_prepacking": "1"}
+    with pytest.raises(RuntimeError, match="provider"):
+        BoundSession(consumer.paths["decoder"], device="cpu", selection=profile)
+    options, providers, disabled = seen[0]
+    assert options.graph_optimization_level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    assert options.get_session_config_entry("session.disable_prepacking") == "1"
+    assert disabled == {"RotaryEmbeddingFusion"}
+    assert providers == ["CPUExecutionProvider"]
+
+
+@pytest.mark.parametrize("phase", [0, 1, 2])
+def test_foreign_process_at_any_phase_invalidates_measurement(phase):
+    snapshots = [{"uuid": "GPU-owned", "foreign_pids": []} for _ in range(3)]
+    snapshots[phase]["foreign_pids"] = [1234]
+    with pytest.raises(RuntimeError, match="foreign process"):
+        validate_ownership(snapshots, "GPU-owned")
+
+
+def test_uuid_drift_invalidates_measurement():
+    with pytest.raises(RuntimeError, match="UUID"):
+        validate_ownership([{"uuid": "GPU-other", "foreign_pids": []}], "GPU-owned")
+
+
+def test_raw_first_cached_outlier_is_retained_and_rtf_gate_is_not_trimmed():
+    timing = {
+        "frame_seconds": [0.01, 4.0, *([0.01] * 98)],
+        "token_pipeline_seconds": 5.2,
+        "prefill_seconds": 0.2,
+        "first_frame_seconds": 0.21,
+    }
+    profile = {"device": "cuda", "gpu_uuid": "GPU-owned"}
+    snapshots = [{"uuid": "GPU-owned", "foreign_pids": []} for _ in range(3)]
+    result = performance_result(
+        timing,
+        0.1,
+        np.zeros((100, 3), np.int64),
+        snapshots,
+        profile,
+        {"raw_bits_required": True},
+    )
+    assert result["frame_seconds"][1] == timing["frame_seconds"][1]
+    assert result["measurement_qualified"]
+    assert result["meets_end_to_end_rtf_target"] is False
+
+
+def test_instrumented_cuda_timing_cannot_qualify_even_below_rtf_gate():
+    timing = {
+        "frame_seconds": [0.001] * 100,
+        "token_pipeline_seconds": 0.11,
+        "prefill_seconds": 0.01,
+        "first_frame_seconds": 0.011,
+    }
+    snapshots = [{"uuid": "GPU-owned", "foreign_pids": []} for _ in range(3)]
+    result = performance_result(
+        timing,
+        0.01,
+        np.zeros((100, 3), np.int64),
+        snapshots,
+        {"device": "cuda", "gpu_uuid": "GPU-owned"},
+        {"raw_bits_required": True},
+        instrumented=True,
+    )
+    assert result["end_to_end_rtf"] < 1.0
+    assert result["measurement_qualified"] is False
+    assert result["meets_end_to_end_rtf_target"] is None
+
+
+def test_passing_neural_and_performance_gates_cannot_qualify_missing_codec_oracle():
+    report = {
+        "performance": {
+            "measurement_qualified": True,
+            "meets_end_to_end_rtf_target": True,
+        },
+        "codec_numerical_quality": {
+            "status": "UNVERIFIED",
+            "independent_waveform_reference": None,
+        },
+    }
+    finish_acceptance(report, benchmark=True)
+    assert report["native_cuda13_neural_and_performance_gates_passed"] is True
+    assert report["native_cuda13_acceptance"] is False
+    assert report["blocked_acceptance_gates"] == [
+        "independent_fp32_codec_waveform_numerical_quality"
+    ]
+
+
+@pytest.mark.parametrize("neural_performance", [False, True])
+@pytest.mark.parametrize("codec", ["UNVERIFIED", "VERIFIED"])
+@pytest.mark.parametrize("measured_codec", ["UNVERIFIED", "VERIFIED"])
+def test_root_acceptance_requires_both_waveform_comparisons_and_all_native_gates(
+    neural_performance, codec, measured_codec
+):
+    report = {
+        "performance": {
+            "measurement_qualified": neural_performance,
+            "meets_end_to_end_rtf_target": neural_performance,
+        },
+        "codec_numerical_quality": {"status": codec},
+        "measured_codec_numerical_quality": {"status": measured_codec},
+    }
+    finish_acceptance(report, benchmark=True)
+    assert report["native_cuda13_acceptance"] is (
+        neural_performance and codec == "VERIFIED" and measured_codec == "VERIFIED"
+    )
+
+
+@pytest.mark.parametrize("gate", ["all", "cpu", "short", "not-raw", "instrumented", "slow"])
+def test_verified_codec_does_not_bypass_native_performance_controls(gate):
+    count = 49 if gate == "short" else 100
+    timing = {
+        "frame_seconds": [0.001] * count,
+        "token_pipeline_seconds": 10.0 if gate == "slow" else 0.11,
+        "prefill_seconds": 0.01,
+        "first_frame_seconds": 0.011,
+    }
+    performance = performance_result(
+        timing,
+        0.01,
+        np.zeros((count, 3), np.int64),
+        [{"uuid": "GPU-owned", "foreign_pids": []} for _ in range(3)],
+        {"device": "cpu" if gate == "cpu" else "cuda", "gpu_uuid": "GPU-owned"},
+        {"raw_bits_required": gate != "not-raw"},
+        instrumented=gate == "instrumented",
+    )
+    report = {
+        "performance": performance,
+        "codec_numerical_quality": {"status": "VERIFIED"},
+        "measured_codec_numerical_quality": {"status": "VERIFIED"},
+    }
+    finish_acceptance(report, benchmark=True)
+    assert report["native_cuda13_acceptance"] is (gate == "all")
+
+
+def test_missing_weights_fail_explicitly(consumer):
+    path = consumer.assets / "weights.bin"
+    path.write_bytes(b"weights")
+    item = descriptor(path)
+    path.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="SHA256"):
+        checked_file(item)
+
+
+def test_unlisted_external_data_is_not_a_complete_weight_inventory(consumer):
+    (consumer.paths["decoder"].parent / "weights.bin").write_bytes(b"unlisted")
+    with pytest.raises(ValueError, match="external-data inventory"):
+        verify_artifacts(consumer.profile)
+
+
+def test_positions_are_expectations_not_execution_controls(consumer, tmp_path):
+    path = consumer.assets / "state-01.npz"
+    with np.load(path) as arrays:
+        values = {name: arrays[name] for name in arrays.files}
+    values["position_ids"] += 1
+    np.savez(path, **values)
+    consumer.data["requests"]["f32"]["states"][1].update(descriptor(path))
+    consumer.inputs.write_text(json.dumps(consumer.data))
+    consumer.profile["inputs_sha256"] = digest(consumer.inputs)
+    consumer.selection.write_text(json.dumps(consumer.profile))
+    completed = execute_consumer(consumer, tmp_path / "position-failure")
+    assert completed.returncode != 0
+    report = json.loads((tmp_path / "position-failure" / "report.json").read_text())
+    assert "position_ids" in report["error"]
+
+
+@pytest.mark.parametrize("mutation", ["runtime", "request", "dtype"])
+def test_provenance_drift_fails_before_target_execution(consumer, tmp_path, mutation):
+    if mutation == "runtime":
+        consumer.profile["runtime"]["ort_build"] = "a different binary"
+    elif mutation == "request":
+        consumer.profile["inputs_sha256"] = "0" * 64
+    else:
+        consumer.profile["components"]["embedding"]["dtype"] = "bf16"
+    consumer.selection.write_text(json.dumps(consumer.profile))
+    completed = execute_consumer(consumer, tmp_path / "provenance-failure")
+    assert completed.returncode != 0
+    assert "generated-frames.npy" not in {
+        item.name for item in (tmp_path / "provenance-failure").glob("*")
+    }
+
+
+def test_output_root_is_new_and_never_rewrites_frozen_inputs(consumer):
+    completed = execute_consumer(consumer, consumer.assets / "forbidden-output")
+    assert completed.returncode != 0
+    assert "read-only input" in completed.stderr
+    assert not (consumer.assets / "forbidden-output").exists()
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "options_getter", "config_getter"])
+def test_all_actual_model_readbacks_before_first_neural_call_and_failure_stops_it(
+    consumer, tmp_path, monkeypatch, failure
+):
+    import audit_drama3
+    from drama3_session_profile import SessionProfileError
+
+    original_load = audit_drama3.load_sessions
+    original_read = audit_drama3.read_session_profile
+    loaded = []
+    checked = []
+    sessions_by_id = {}
+
+    def load(*args, **kwargs):
+        sessions = original_load(*args, **kwargs)
+        loaded.extend(sessions)
+        sessions_by_id.update({id(value.session): name for name, value in sessions.items()})
+        return sessions
+
+    def read(session, profile, **kwargs):
+        assert set(loaded) == {
+            "embedding",
+            "decoder",
+            "audio_generator",
+            "main_policy",
+            "codec",
+        }
+        name = sessions_by_id[id(session)]
+        checked.append(name)
+        if name == "codec" and failure != "mismatch":
+
+            def unavailable():
+                raise RuntimeError("CPU mock getter unavailable")
+
+            options = session.get_session_options()
+            wrapped = SimpleNamespace(
+                get_providers=session.get_providers,
+                get_provider_options=session.get_provider_options,
+                get_session_options=unavailable
+                if failure == "options_getter"
+                else lambda: SimpleNamespace(
+                    graph_optimization_level=options.graph_optimization_level,
+                    intra_op_num_threads=8,
+                    inter_op_num_threads=1,
+                    enable_mem_pattern=False,
+                    enable_profiling=False,
+                    get_session_config_entry=lambda _key: unavailable(),
+                ),
+            )
+            # CPU config is empty; require an explicit entry only for this
+            # injected getter-failure attestation, without mutating model sessions.
+            required = (
+                {**profile, "session_config": {"CPU_test_required_entry": "1"}}
+                if failure == "config_getter"
+                else profile
+            )
+            return original_read(wrapped, required, **kwargs)
+        actual = original_read(session, profile, **kwargs)
+        if name == "codec":
+            actual["actual_session_options"]["intra_op_num_threads"] = 1
+            raise SessionProfileError("CPU mock last-model option mismatch", actual)
+        return actual
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("No neural request or codec may start before every actual readback passes")
+
+    monkeypatch.setattr(audit_drama3, "runtime_identity", lambda *a, **k: {"CPU_mock": True})
+    monkeypatch.setattr(audit_drama3, "load_sessions", load)
+    monkeypatch.setattr(audit_drama3, "read_session_profile", read)
+    monkeypatch.setattr(audit_drama3, "request", forbidden)
+    monkeypatch.setattr(audit_drama3, "decode_waveform", forbidden)
+    args = audit_drama3.parser().parse_args(
+        [
+            "--inputs",
+            str(consumer.inputs),
+            "--inputs-sha256",
+            digest(consumer.inputs),
+            "--selection",
+            str(consumer.selection),
+            "--selection-sha256",
+            digest(consumer.selection),
+            "--output",
+            str(tmp_path / "readback-failure"),
+        ]
+    )
+    with pytest.raises(SessionProfileError, match=r"last-model|getter failed"):
+        audit_drama3.run(args)
+    report = json.loads((tmp_path / "readback-failure/report.json").read_text())
+    assert report["all_model_sessions_attested_before_first_nn"] is False
+    assert set(checked) == set(loaded)
+    assert report["status"] == "failed"
+    codec = report["actual_model_session_profiles_before_first_nn"]["codec"]
+    assert codec["status"] == "FAILED"
+    if failure == "mismatch":
+        assert codec["actual"]["actual_session_options"]["intra_op_num_threads"] == 1
+    else:
+        assert (
+            codec["actual"]["actual_provider_options"]
+            == consumer.profile["actual_provider_options"]
+        )
+        assert codec["actual"]["getter_errors"][0]["error_type"] == "RuntimeError"
+
+
+def test_incomplete_actual_session_set_cannot_attest(consumer):
+    with pytest.raises(ValueError, match="incomplete"):
+        attest_loaded_sessions({}, consumer.profile)
+
+
+def test_unknown_gpu_snapshot_persists_failed_report_without_model_session(
+    consumer, tmp_path, monkeypatch
+):
+    import audit_drama3
+    from drama3_runtime import GpuSnapshotError
+
+    profile = consumer.profile
+    profile.update(
+        device="cuda",
+        gpu_uuid="GPU-owned",
+        providers=[
+            [
+                "CUDAExecutionProvider",
+                {
+                    "device_id": "0",
+                    "use_tf32": "0",
+                    "enable_cuda_graph": "0",
+                    "arena_extend_strategy": "kSameAsRequested",
+                    "cudnn_conv_algo_search": "EXHAUSTIVE",
+                },
+            ],
+            "CPUExecutionProvider",
+        ],
+    )
+    profile["runtime"].update(cuda_toolkit="13.0.48", cublas="13.0.0.19", cudnn="9.14.0.64")
+    profile["session_config"]["session.disable_prepacking"] = "1"
+    consumer.selection.write_text(json.dumps(profile))
+    evidence = {
+        "status": "UNKNOWN",
+        "failed_query": {"owned_pid": 123456, "reaped": False, "stderr": "NVML timeout"},
+    }
+
+    def unknown(_device):
+        raise GpuSnapshotError("health UNKNOWN", evidence)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("No model/runtime session may start after unknown health")
+
+    monkeypatch.setattr(audit_drama3, "gpu_snapshot", unknown)
+    monkeypatch.setattr(audit_drama3, "load_sessions", forbidden)
+    args = audit_drama3.parser().parse_args(
+        [
+            "--inputs",
+            str(consumer.inputs),
+            "--inputs-sha256",
+            digest(consumer.inputs),
+            "--selection",
+            str(consumer.selection),
+            "--selection-sha256",
+            digest(consumer.selection),
+            "--output",
+            str(tmp_path / "unknown-gpu"),
+            "--lease-uuid",
+            "GPU-owned",
+        ]
+    )
+    with pytest.raises(GpuSnapshotError, match="UNKNOWN"):
+        audit_drama3.run(args)
+    report = json.loads((tmp_path / "unknown-gpu" / "report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["gpu_snapshot_error"] == evidence
+    assert report["native_cuda13_acceptance"] is False
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "ok",
+        "allowed-unloaded",
+        "foreign-cuda",
+        "selected-cuda12",
+        "torch",
+        "unhashed-provider",
+    ],
+)
+def test_loaded_library_attestation_without_loading_cuda(consumer, mode):
+    profile = copy.deepcopy(consumer.profile)
+    profile["device"] = "cuda"
+    paths = {}
+    for name in (
+        "libcudart.so.13",
+        "libcublas.so.13",
+        "libonnxruntime_providers_cuda.so",
+        "libcudart.so.12",
+        "libtorch_cuda.so",
+        "libcudnn_cnn.so.9",
+    ):
+        path = consumer.assets / name
+        header = bytearray(64)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<H", header, 16, 3)
+        struct.pack_into("<H", header, 18, 62)
+        struct.pack_into("<I", header, 20, 1)
+        struct.pack_into("<H", header, 52, 64)
+        path.write_bytes(header)
+        paths["/mock/" + name] = str(path)
+    profile["runtime"]["wheel"] = descriptor(consumer.paths["decoder"])
+    profile["runtime"]["libraries"] = [
+        descriptor(Path(path)) for key, path in paths.items() if key.endswith(".13")
+    ]
+    if mode == "selected-cuda12":
+        profile["runtime"]["libraries"].append(
+            descriptor(Path(paths["/mock/libcudart.so.12"]))
+        )
+    if mode == "allowed-unloaded":
+        profile["runtime"]["libraries"].append(
+            descriptor(Path(paths["/mock/libcudnn_cnn.so.9"]))
+        )
+    if mode != "unhashed-provider":
+        profile["runtime"]["files"].append(
+            descriptor(Path(paths["/mock/libonnxruntime_providers_cuda.so"]))
+        )
+    consumer.selection.write_text(json.dumps(profile))
+    completed = subprocess_run(
+        """
+import json
+from pathlib import Path
+import audit_drama3
+profile = json.loads(Path(sys.argv[1]).read_text())
+paths = json.loads(sys.argv[2])
+mode = sys.argv[3]
+names = ['libcudart.so.13', 'libcublas.so.13', 'libonnxruntime_providers_cuda.so']
+if mode in ('foreign-cuda', 'selected-cuda12'):
+    names.append('libcudart.so.12')
+if mode == 'torch':
+    names.append('libtorch_cuda.so')
+class Maps:
+    def is_file(self):
+        return True
+    def read_text(self):
+        return '\\n'.join('1-2 r-xp 0 0 0 /mock/' + name for name in names)
+def mapped_path(value):
+    if str(value) == '/proc/self/maps':
+        return Maps()
+    return Path(paths.get(str(value), value))
+audit_drama3.Path = mapped_path
+import drama3_library_identity
+drama3_library_identity._resolve = lambda value: mapped_path(value).resolve()
+result = audit_drama3.runtime_identity(profile)
+assert result['loaded_library_check'] == 'passed'
+actual = {Path(item['path']).name for item in result['actual_loaded_cuda_libraries']}
+assert actual == {'libcudart.so.13', 'libcublas.so.13'}
+if mode == 'allowed-unloaded':
+    assert [Path(item['path']).name for item in result['allowed_cuda_libraries_not_loaded']] == [
+        'libcudnn_cnn.so.9']
+else:
+    assert result['allowed_cuda_libraries_not_loaded'] == []
+class NoMaps:
+    def __init__(self, value):
+        assert str(value) != '/proc/self/maps', 'Pre-op check must not read GPU library maps'
+        self.path = Path(value)
+    def __getattr__(self, name):
+        return getattr(self.path, name)
+audit_drama3.Path = NoMaps
+assert audit_drama3.runtime_identity(profile, check_loaded=False)['loaded_library_check'] == 'not_requested'
+""",
+        consumer.selection,
+        json.dumps(paths),
+        mode,
+    )
+    if mode in ("ok", "allowed-unloaded"):
+        assert completed.returncode == 0, completed.stderr
+    else:
+        assert completed.returncode != 0
+        assert "LibraryIdentityError" in completed.stderr
