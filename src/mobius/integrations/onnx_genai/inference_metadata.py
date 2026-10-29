@@ -813,7 +813,15 @@ def _static_cache_io(
     decoder_inputs: list[_Port],
     decoder_outputs: list[_Port],
 ) -> dict[str, Any] | None:
-    """Return the explicit TensorScatter static-cache ABI from exported ports."""
+    """Return the explicit static-cache ABI from the exported ports.
+
+    Two shapes of static cache reach here. The ``TensorScatter`` one carries a
+    ``write_indices`` input naming where the new key/value goes; the
+    ``GroupQueryAttention`` one has the op derive that itself, so the input is
+    absent and ``write_indices_input`` is ``None``. Everything else -- the
+    per-layer buffers, their ``updated_`` outputs and the KV length -- is the
+    same, which is why the two differ by one key rather than by a second ABI.
+    """
     inputs: dict[tuple[int, str], str] = {}
     outputs: dict[tuple[int, str], str] = {}
     for port in decoder_inputs:
@@ -836,16 +844,18 @@ def _static_cache_io(
         if (layer, role) not in ports
     ]
     input_names = {port.name for port in decoder_inputs}
-    for control in (STATIC_CACHE_WRITE_INDICES, STATIC_CACHE_KV_SEQUENCE_LENGTH):
-        if control not in input_names:
-            missing.append(f"input.{control}")
+    # GroupQueryAttention appends to the cache itself, so a GQA export has no
+    # write_indices; the KV length is required either way.
+    scatters = STATIC_CACHE_WRITE_INDICES in input_names
+    if STATIC_CACHE_KV_SEQUENCE_LENGTH not in input_names:
+        missing.append(f"input.{STATIC_CACHE_KV_SEQUENCE_LENGTH}")
     if missing:
         raise ValueError(
             "Cannot describe the static-cache ABI because the exported "
-            f"TensorScatter ports are incomplete: {missing}"
+            f"ports are incomplete: {missing}"
         )
     return {
-        "write_indices_input": STATIC_CACHE_WRITE_INDICES,
+        "write_indices_input": STATIC_CACHE_WRITE_INDICES if scatters else None,
         "kv_sequence_length_input": STATIC_CACHE_KV_SEQUENCE_LENGTH,
         "key_cache_inputs": [inputs[(layer, "key")] for layer in layers],
         "value_cache_inputs": [inputs[(layer, "value")] for layer in layers],
@@ -1013,8 +1023,14 @@ def _decoder_io(
         io["static_cache"] = static_cache
     static_names = (
         {
-            static_cache["write_indices_input"],
-            static_cache["kv_sequence_length_input"],
+            name
+            for name in (
+                static_cache["write_indices_input"],
+                static_cache["kv_sequence_length_input"],
+            )
+            if name is not None
+        }
+        | {
             *static_cache["key_cache_inputs"],
             *static_cache["value_cache_inputs"],
             *static_cache["key_cache_outputs"],
@@ -1187,10 +1203,11 @@ def _input_source_map(
         }
     static_cache = decoder_io.get("static_cache")
     if static_cache is not None:
-        sources[f"{decoder_name}.{static_cache['write_indices_input']}"] = {
-            "kind": "generated",
-            "generator": "static_cache_write_indices",
-        }
+        if static_cache["write_indices_input"] is not None:
+            sources[f"{decoder_name}.{static_cache['write_indices_input']}"] = {
+                "kind": "generated",
+                "generator": "static_cache_write_indices",
+            }
         sources[f"{decoder_name}.{static_cache['kv_sequence_length_input']}"] = {
             "kind": "generated",
             "generator": "kv_sequence_length",
