@@ -164,6 +164,15 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 static_cache=True,
                 max_seq_len=args.max_seq_len,
             )
+        from mobius._registry import registry
+
+        if (
+            model_type in registry
+            and registry.get_registration(model_type).task == "speech-language"
+        ):
+            from mobius.tasks import SpeechLanguageTask
+
+            return SpeechLanguageTask(static_cache=True, max_seq_len=args.max_seq_len)
         return CausalLMTask(static_cache=True, max_seq_len=args.max_seq_len)
 
     # Fold --features into the boolean build-mode attributes before any
