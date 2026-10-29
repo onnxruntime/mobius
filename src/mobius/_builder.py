@@ -139,6 +139,7 @@ def build_from_module(
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
     component_manifest: ComponentManifest | None = None,
+    transposed_matmul: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
 
@@ -154,6 +155,10 @@ def build_from_module(
         kv_cache_scales: Optional per-layer FP8 key/value scales.
         prune_prefill_prefix: Retain only the final sequence position before
             the LM head for supported causal generation tasks.
+        component_manifest: Optional component descriptors.
+        transposed_matmul: Feed decoder projections the checkpoint's
+            ``[out, in]`` weight through ``com.microsoft::FusedMatMul`` with
+            ``transB=1`` on EPs that support it (CUDA).
 
     Returns:
         The built :class:`ModelPackage`.
@@ -188,6 +193,7 @@ def build_from_module(
             trace=trace_optimization,
             fp8_kv_cache=fp8_kv_cache,
             kv_cache_scales=kv_cache_scales,
+            transposed_matmul=transposed_matmul,
         )
 
     _maybe_apply_opset_lowering(package, execution_provider)

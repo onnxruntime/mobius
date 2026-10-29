@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Transposed-weight decoder projections
+
+#### Added
+
+- `--features transposed-matmul` (`build(..., transposed_matmul=True)`)
+  rewrites each decoder `MatMul(x, Transpose(weight))` into
+  `com.microsoft::FusedMatMul(x, weight, transB=1)`, so the projections
+  (the packed Q/K/V, `o_proj`, the MLP and the LM head) keep the
+  checkpoint's `[out, in]` weight instead of a pre-transposed `[in, out]`
+  one; cuBLAS is faster on that layout at batch 1. The rewrite runs after
+  GQA fusion and Q/K/V packing, which still match the plain `MatMul`, and
+  before weights are loaded. CUDA only (`supports_transposed_matmul`);
+  other EPs warn and ignore the request.
+
 ### Qwen3.8-27B standard-only multimodal qualification
 
 #### Added
