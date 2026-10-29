@@ -1368,6 +1368,8 @@ def mapped_path(value):
         return Maps()
     return Path(paths.get(str(value), value))
 audit_drama3.Path = mapped_path
+import drama3_library_identity
+drama3_library_identity._resolve = lambda value: mapped_path(value).resolve()
 result = audit_drama3.runtime_identity(profile)
 assert result['loaded_library_check'] == 'passed'
 actual = {Path(item['path']).name for item in result['actual_loaded_cuda_libraries']}

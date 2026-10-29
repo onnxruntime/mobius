@@ -133,6 +133,15 @@ wheel/build identify the runtime; version labels alone are not acceptance.
 The runtime owner supplies exact source/toolkit provenance for that shared build.
 Private plugin registration is deliberately unsupported.
 
+Library failures retain progressive evidence through the standard-library-only
+`drama3_library_identity.py` helper: all relevant observed map rows, original
+and resolved paths, basenames, independently read file hashes, expected source
+keys and explicit match/rejection decisions. Collection finishes before an
+identity rejection is raised. Expected hashes are never labelled actual-loaded
+observations; an unapproved path fails even if its file matches an allowed hash.
+Missing/deleted files and unavailable maps remain explicit errors. These reports
+cannot reconstruct mappings from an already-ended process.
+
 Parent activation must preserve native-component qualification scopes. QMoE,
 attention and TRSM operator PASS evidence is mandatory, alongside the full-model
 gates. A pinned standard-primitives report that records the historical real

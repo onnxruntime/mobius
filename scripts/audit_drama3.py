@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+from drama3_library_identity import LibraryIdentityError, observe_loaded_libraries
 from drama3_runtime import (
     SOURCE_CONTEXT_CONTRACT,
     SOURCE_CONTEXT_METADATA,
@@ -213,53 +214,37 @@ def runtime_identity(profile, *, check_loaded=True):
             raise ValueError("CUDA library inventory is required")
     if profile["device"] == "cuda" and check_loaded:
         maps_path = Path("/proc/self/maps")
-        if not maps_path.is_file():
-            raise RuntimeError(
-                "CUDA loaded-library attestation currently requires Linux procfs"
-            )
-        loaded = set()
-        loaded_ort = set()
-        for line in maps_path.read_text().splitlines():
-            fields = line.split(maxsplit=5)
-            if len(fields) == 6 and fields[5].startswith("/"):
-                library = Path(fields[5]).resolve()
-                name = library.name.lower()
-                if "onnxruntime" in name:
-                    loaded_ort.add(library)
-                if any(
-                    marker in name
-                    for marker in ("libcuda", "libcublas", "libcudnn", "libnvrtc", "libnvjit")
-                ):
-                    loaded.add(library)
-                    if (
-                        name.startswith(
-                            (
-                                "libcudart.",
-                                "libcublas.",
-                                "libcublaslt.",
-                                "libnvrtc",
-                                "libnvjitlink.",
-                            )
-                        )
-                        and ".so.13" not in name
-                    ):
-                        raise RuntimeError(f"Pre-CUDA13 library loaded: {library}")
-                if "libtorch" in name or name.startswith("libc10"):
-                    raise RuntimeError("Torch native library loaded in the target process")
-        if not loaded <= selected or not any("libcudart" in item.name for item in loaded):
-            raise RuntimeError("Loaded CUDA library inventory differs from selected runtime")
-        if not loaded_ort <= set(files):
-            raise RuntimeError("Loaded ORT provider/runtime binary is not fingerprinted")
+        observed = observe_loaded_libraries(
+            runtime["libraries"], runtime["files"], maps_path=maps_path
+        )
+        loaded = {
+            Path(item["resolved_path"])
+            for item in observed["observed_mappings"]
+            if item["kind"] == "cuda"
+        }
+        loaded_ort = {
+            item["resolved_path"]
+            for item in observed["observed_mappings"]
+            if item["kind"] == "ort"
+        }
+        actual_cuda = {
+            item["resolved_path"]: item["observed_sha256"]
+            for item in observed["observed_mappings"]
+            if item["kind"] == "cuda"
+        }
         descriptors = {
             str(Path(item["path"]).resolve()): item for item in runtime["libraries"]
         }
         result.update(
             loaded_library_check="passed",
-            actual_loaded_cuda_libraries=[descriptors[str(path)] for path in sorted(loaded)],
+            loaded_library_evidence=observed,
+            actual_loaded_cuda_libraries=[
+                {"path": path, "sha256": actual_cuda[path]} for path in sorted(actual_cuda)
+            ],
             allowed_cuda_libraries_not_loaded=[
                 descriptors[str(path)] for path in sorted(selected - loaded)
             ],
-            actual_loaded_ort_files=[str(path) for path in sorted(loaded_ort)],
+            actual_loaded_ort_files=sorted(loaded_ort),
         )
     return result
 
@@ -1020,6 +1005,8 @@ def run(args):
         report["error"] = f"{type(error).__name__}: {error}"
         if isinstance(error, GpuSnapshotError):
             report["gpu_snapshot_error"] = error.evidence
+        if isinstance(error, LibraryIdentityError):
+            report["loaded_library_identity_error"] = error.evidence
         if report["codec_numerical_quality"]["status"] == "PENDING":
             report["codec_numerical_quality"]["status"] = "FAILED"
         raise
