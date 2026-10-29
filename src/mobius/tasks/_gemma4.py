@@ -436,10 +436,12 @@ class Gemma4Task(ModelTask):
     Each sub-model uses a different strategy for variable-size inputs:
 
     **Vision** — padded patches with sentinel position IDs.
-        All images are patchified to a fixed ``max_soft_tokens`` (280)
-        slots.  Images smaller than the maximum get ``(-1, -1)`` in their
+        A 280-soft-token capacity corresponds to 2520 patch slots with 3x3
+        pooling. Images smaller than the maximum get ``(-1, -1)`` in their
         ``pixel_position_ids`` for unused patch slots, which the encoder
-        ignores.  No explicit mask is needed.
+        ignores. By default vision emits only valid pooled features for one
+        image. ``vision_patch_capacity`` opts into padded fixed-size outputs
+        and supports ``vision_batch_size``. No explicit input mask is needed.
 
     **Audio** — explicit contiguous bool mask.
         Audio clips of different lengths are padded to equal time
@@ -644,7 +646,7 @@ class Gemma4Task(ModelTask):
 
         Inputs:
         - ``pixel_values [1, N, 3*P^2]``: one pre-patchified image with ``N``
-          patches (padded to ``max_soft_tokens``, typically 280).
+          patch slots (2520 slots for a 280-soft-token capacity with 3x3 pooling).
         - ``pixel_position_ids [1, N, 2]``: (x, y) patch coordinates.
           Unused patch slots (from images smaller than the maximum) use
           ``(-1, -1)`` as a sentinel value — no explicit mask is needed.
@@ -652,12 +654,28 @@ class Gemma4Task(ModelTask):
         Output:
         - ``image_features [N_pooled, text_hidden_size]``: projected vision features
 
-        The position-based pooler emits a variable token count determined by one
+        By default, the position-based pooler emits a variable token count determined by one
         image's valid coordinate extent. Its scalar OneHot depth cannot represent
         different pooled counts per batch row, so the graph contract is explicitly
         single-image rather than advertising false dynamic-batch support.
+
+        ``config.vision_patch_capacity`` opts into fixed patch/output capacities.
+        ``config.vision_batch_size`` then selects a fixed or symbolic batch.
+        Output remains rank 2, ``[batch * output_capacity, text_hidden_size]``,
+        in image-major order, with a valid prefix and padded tail per image.
+        Callers must pack valid prefixes before passing multiple images to embedding.
         """
-        num_patches = ir.SymbolicDim("num_patches")
+        if config.vision_patch_capacity is None:
+            num_patches: int | ir.SymbolicDim = ir.SymbolicDim("num_patches")
+            batch: int | ir.SymbolicDim = 1
+        else:
+            config.validate()
+            num_patches = config.vision_patch_capacity
+            batch = (
+                config.vision_batch_size
+                if config.vision_batch_size is not None
+                else ir.SymbolicDim("image_batch")
+            )
         patch_size = config.vision.patch_size or 16 if config.vision else 16
         pixel_dim = 3 * patch_size * patch_size
 
@@ -667,12 +685,12 @@ class Gemma4Task(ModelTask):
         pixel_values = builder.input(
             "pixel_values",
             dtype=config.dtype,
-            shape=[1, num_patches, pixel_dim],
+            shape=[batch, num_patches, pixel_dim],
         )
         pixel_position_ids = builder.input(
             "pixel_position_ids",
             dtype=ir.DataType.INT64,
-            shape=[1, num_patches, 2],
+            shape=[batch, num_patches, 2],
         )
 
         image_features = vision(
