@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### GroupQueryAttention-owned static KV cache
+
+#### Added
+
+- Speech-language decoders (Qwen3-ASR) accept `--features static-cache`:
+  `build_decoder_from_embeds` and `SpeechLanguageTask` take pre-allocated
+  `key_cache.{i}` / `value_cache.{i}` buffers with `write_indices` and
+  `nonpad_kv_seqlen` instead of growing `past_key_values` and
+  `attention_mask`, keeping the `audio_encoder` / `embedding` / `decoder`
+  split. Hybrid and deepstack decoders reject it.
+- `--features static-cache,gqa-cache` (`CausalLMTask(gqa_cache=True)`,
+  `SpeechLanguageTask(gqa_cache=True)`) hands the static cache to
+  `com.microsoft::GroupQueryAttention` instead of `TensorScatter` +
+  `Attention`. The op appends the new key/value itself, so the buffers
+  become `[batch, kv_heads, max_seq_len, head_dim]` and `write_indices`
+  disappears; `nonpad_kv_seqlen` stays, and GQA's `seqlens_k` is derived
+  from it inside the graph. `total_sequence_length` is the buffer capacity,
+  a constant, so the decode step has no device-to-host copy and can be
+  captured in a CUDA graph. Only models whose decoder layers use the shared
+  `Attention` qualify; sliding-window and softcapped models, and Gemma 4,
+  are refused. The ONNX GenAI metadata describes a static cache without
+  `write_indices`. On an A100 the GQA cache is 5-10% faster per decode step
+  than the `TensorScatter` one from about 1k tokens of context; on Blackwell
+  the two are the same.
+
 ### GPT-OSS MXFP4 export
 
 #### Added

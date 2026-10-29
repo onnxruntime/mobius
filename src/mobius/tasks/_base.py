@@ -224,6 +224,9 @@ def build_decoder_from_embeds(
     mrope: bool = False,
     hybrid: bool = False,
     deepstack: bool = False,
+    static_cache: bool = False,
+    max_seq_len: int | None = None,
+    gqa_cache: bool = False,
 ) -> ir.Model:
     """Build an ``inputs_embeds → logits + KV cache`` decoder ONNX graph.
 
@@ -244,6 +247,23 @@ def build_decoder_from_embeds(
             ``deepstack_visual_indexes``), adds a ``per_layer_inputs`` input
             ``[batch, seq_len, D * hidden_size]`` that the decoder reshapes and
             injects into its first ``D`` layers.
+        static_cache: If ``True``, replace the growing ``past_key_values`` /
+            ``present`` tensors and ``attention_mask`` with pre-allocated
+            ``key_cache.{i}`` / ``value_cache.{i}`` buffers, plus
+            ``write_indices`` and ``nonpad_kv_seqlen``
+            (same contract as :class:`CausalLMTask` static cache). Every
+            decode step then has fixed input/output shapes, which is what
+            CUDA graph capture requires.
+        gqa_cache: With ``static_cache``, let
+            ``com.microsoft::GroupQueryAttention`` own the cache instead of
+            ``TensorScatter`` + ``Attention``. The buffers become 4-D
+            ``[B, kv_heads, max_seq_len, head_dim]`` and ``write_indices``
+            disappears, so this changes the exported model's I/O. Worth it
+            where the static-cache attention path scales badly with context
+            (A100, Qwen3-8B: 0.43 us per token against GQA's 0.09); on
+            Blackwell the two measure the same.
+        max_seq_len: Static cache length. Defaults to
+            ``config.max_position_embeddings``.
 
     Returns:
         A built :class:`ir.Model` for the decoder.
@@ -263,16 +283,40 @@ def build_decoder_from_embeds(
     seq_len = ir.SymbolicDim("sequence_len")
     past_seq_len = ir.SymbolicDim("past_sequence_len")
 
+    if gqa_cache and not static_cache:
+        raise ValueError("gqa_cache requires static_cache=True.")
+    if static_cache:
+        from mobius.tasks._causal_lm import (
+            _validate_gqa_cache_support,
+            _validate_static_cache_support,
+        )
+
+        if hybrid or deepstack:
+            raise NotImplementedError(
+                "static_cache is not supported together with hybrid or deepstack decoders"
+            )
+        if max_seq_len is None:
+            max_seq_len = getattr(config, "max_position_embeddings", None)
+        if max_seq_len is None or max_seq_len <= 0:
+            raise ValueError("max_seq_len must be a positive integer for static cache.")
+        _validate_static_cache_support(decoder)
+        if gqa_cache:
+            _validate_gqa_cache_support(decoder, config)
+
     graph, builder = _make_graph()
     inputs_embeds = builder.input(
         "inputs_embeds",
         dtype=config.dtype,
         shape=[batch, seq_len, config.hidden_size],
     )
-    attention_mask = builder.input(
-        "attention_mask",
-        dtype=ir.DataType.INT64,
-        shape=[batch, "past_seq_len + seq_len"],
+    attention_mask = (
+        None
+        if static_cache
+        else builder.input(
+            "attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[batch, "past_seq_len + seq_len"],
+        )
     )
     # MRoPE: 3D position IDs (temporal, height, width) — shape [3, batch, seq_len]
     # Standard: shape [batch, seq_len]
@@ -294,7 +338,20 @@ def build_decoder_from_embeds(
             shape=[batch, seq_len, num_deepstack * config.hidden_size],
         )
 
-    if hybrid:
+    if static_cache:
+        from mobius.tasks._causal_lm import _make_static_cache_inputs
+
+        past_key_values = _make_static_cache_inputs(
+            builder,
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.dtype,
+            batch,
+            max_seq_len,
+            gqa=gqa_cache,
+        )
+    elif hybrid:
         past_key_values = _make_hybrid_cache_inputs(
             builder,
             config,
@@ -328,6 +385,11 @@ def build_decoder_from_embeds(
 
     builder.add_output(logits, "logits")
 
+    if static_cache:
+        from mobius.tasks._causal_lm import _register_static_cache_outputs
+
+        _register_static_cache_outputs(builder, present_key_values)
+        return _make_model(graph)
     if hybrid:
         _register_hybrid_cache_outputs(
             builder,

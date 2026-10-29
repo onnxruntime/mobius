@@ -40,6 +40,12 @@ class SpeechLanguageTask(ModelTask):
     - ``decoder``: text decoder taking ``inputs_embeds`` with KV cache
 
     Each sub-module is wired into its own ONNX graph.
+
+    Args:
+        static_cache: Build the decoder with pre-allocated KV cache buffers
+            (see :func:`~mobius.tasks._base.build_decoder_from_embeds`).
+        max_seq_len: Static cache length; defaults to
+            ``config.max_position_embeddings``.
     """
 
     model_roles: ClassVar[dict[str, str]] = {
@@ -52,6 +58,17 @@ class SpeechLanguageTask(ModelTask):
         embedding="embedding",
         decoder="decoder",
     )
+
+    def __init__(
+        self,
+        *,
+        static_cache: bool = False,
+        max_seq_len: int | None = None,
+        gqa_cache: bool = False,
+    ):
+        self._static_cache = static_cache
+        self._max_seq_len = max_seq_len
+        self._gqa_cache = gqa_cache
 
     def build(
         self,
@@ -69,7 +86,14 @@ class SpeechLanguageTask(ModelTask):
             feature_dim=output_dim,
         )
         # MRoPE 3D position_ids (temporal, height, width)
-        models["decoder"] = build_decoder_from_embeds(module.decoder, config, mrope=True)
+        models["decoder"] = build_decoder_from_embeds(
+            module.decoder,
+            config,
+            mrope=True,
+            static_cache=self._static_cache,
+            max_seq_len=self._max_seq_len,
+            gqa_cache=self._gqa_cache,
+        )
         return ModelPackage(models, config=config)
 
     def _build_audio_encoder(

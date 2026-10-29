@@ -954,3 +954,152 @@ class TestLongRopeAliasExtraction:
         assert _canonical_rope_type("yarn") == "yarn"
         assert _canonical_rope_type("default") == "default"
         assert _canonical_rope_type(None) is None
+
+
+class TestBuildGQAStaticCacheGraph:
+    """``CausalLMTask(static_cache=True, gqa_cache=True)``.
+
+    GroupQueryAttention owns the pre-allocated buffers, so the graph has no
+    ``TensorScatter`` and no ``write_indices``, and the buffers are 4-D. The
+    numbers it computes must match the TensorScatter static cache's.
+    """
+
+    MAX_SEQ_LEN = 32
+
+    def _build(self, model_type: str, *, gqa_cache: bool, **config_overrides):
+        from mobius.tasks import CausalLMTask
+
+        config = _base_config(**config_overrides)
+        module = registry.get(model_type)(config)
+        task = CausalLMTask(
+            static_cache=True, max_seq_len=self.MAX_SEQ_LEN, gqa_cache=gqa_cache
+        )
+        return task.build(module, config)["model"], config
+
+    @pytest.mark.parametrize("model_type", ["llama", "qwen3"])
+    def test_gqa_owns_the_cache(self, model_type):
+        model, config = self._build(model_type, gqa_cache=True)
+        input_names = {i.name for i in model.graph.inputs}
+        op_types = [n.op_type for n in model.graph.all_nodes()]
+
+        assert "write_indices" not in input_names
+        assert "nonpad_kv_seqlen" in input_names
+        assert "TensorScatter" not in op_types
+        assert op_types.count("GroupQueryAttention") == config.num_hidden_layers
+        key_cache = next(i for i in model.graph.inputs if i.name == "key_cache.0")
+        assert [d if isinstance(d, int) else None for d in key_cache.shape] == [
+            None,
+            config.num_key_value_heads,
+            self.MAX_SEQ_LEN,
+            config.head_dim,
+        ]
+
+    @pytest.mark.parametrize("model_type", ["llama", "qwen3"])
+    def test_gqa_matches_tensorscatter(self, model_type):
+        """Prefill then three decode steps agree with the TensorScatter cache."""
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        models = {}
+        for name, gqa_cache in (("scatter", False), ("gqa", True)):
+            model, config = self._build(model_type, gqa_cache=gqa_cache)
+            # Same names in both graphs, so the same seed gives the same weights.
+            rng = np.random.default_rng(0)
+            for init in sorted(model.graph.initializers.values(), key=lambda v: v.name):
+                if init.const_value is None:
+                    shape = [int(d) for d in init.shape]
+                    init.const_value = ir.Tensor(
+                        (rng.standard_normal(shape) * 0.1).astype(np.float32)
+                    )
+            models[name] = model
+
+        kv_heads, head_dim = config.num_key_value_heads, config.head_dim
+        layers = range(config.num_hidden_layers)
+        caches = {
+            "scatter": {
+                f"{kind}_cache.{i}": np.zeros(
+                    (1, self.MAX_SEQ_LEN, kv_heads * head_dim), np.float32
+                )
+                for i in layers
+                for kind in ("key", "value")
+            },
+            "gqa": {
+                f"{kind}_cache.{i}": np.zeros(
+                    (1, kv_heads, self.MAX_SEQ_LEN, head_dim), np.float32
+                )
+                for i in layers
+                for kind in ("key", "value")
+            },
+        }
+        sessions = {name: OnnxModelSession(model) for name, model in models.items()}
+        try:
+            rng = np.random.default_rng(1)
+            steps = [rng.integers(1, config.vocab_size, (1, 5))] + [
+                rng.integers(1, config.vocab_size, (1, 1)) for _ in range(3)
+            ]
+            past_len = 0
+            for input_ids in steps:
+                seq = input_ids.shape[1]
+                shared = {
+                    "input_ids": input_ids.astype(np.int64),
+                    "position_ids": np.arange(past_len, past_len + seq, dtype=np.int64)[None],
+                    "nonpad_kv_seqlen": np.array([past_len + seq], np.int64),
+                }
+                scatter_out = sessions["scatter"].run(
+                    {
+                        **shared,
+                        "write_indices": np.array([past_len], np.int64),
+                        **caches["scatter"],
+                    }
+                )
+                gqa_out = sessions["gqa"].run({**shared, **caches["gqa"]})
+                np.testing.assert_allclose(
+                    gqa_out["logits"], scatter_out["logits"], rtol=1e-4, atol=1e-4
+                )
+                for name, out in (("scatter", scatter_out), ("gqa", gqa_out)):
+                    caches[name] = {n: out[f"updated_{n}"] for n in caches[name]}
+                past_len += seq
+        finally:
+            for session in sessions.values():
+                session.close()
+
+    def test_requires_static_cache(self):
+        from mobius.tasks import CausalLMTask
+
+        with pytest.raises(ValueError, match="requires static_cache"):
+            CausalLMTask(gqa_cache=True)
+
+    def test_rejects_sliding_window(self):
+        with pytest.raises(ValueError, match="sliding-window"):
+            self._build("mistral", gqa_cache=True, sliding_window=8)
+
+    def test_rejects_softcapping(self):
+        from mobius.tasks._causal_lm import _validate_gqa_cache_support
+
+        config = _base_config()
+        config.attn_logit_softcapping = 50.0
+        with pytest.raises(ValueError, match="softcapping"):
+            _validate_gqa_cache_support(registry.get("llama")(config), config)
+
+    def test_rejects_custom_attention(self):
+        """A layer that writes the cache itself would get no write_indices."""
+        from onnxscript import nn
+
+        from mobius.components import Attention
+        from mobius.tasks._causal_lm import _validate_gqa_cache_support
+
+        class _OwnAttention(Attention):
+            pass
+
+        class _Layer(nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.self_attn = _OwnAttention(config)
+
+        class _Model(nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.layers = nn.ModuleList([_Layer(config)])
+
+        config = _base_config()
+        with pytest.raises(TypeError, match="_OwnAttention"):
+            _validate_gqa_cache_support(_Model(config), config)
