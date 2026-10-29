@@ -170,6 +170,17 @@ L5 (Generation)      → e2e_golden_test.py -m generation (checkpoint-verified g
 - `pip-smoke-*`, `pip-parity-*`, `pip-gpu-*`, `pip-nightly-l2-*` — pip package cache
 - `hf-gpu-*`, `hf-l2-configs-*` — HuggingFace model/config cache
 
+### A10 runner Python isolation
+
+Fast integration, L4/L5, GPU examples, and golden regeneration create a temporary
+virtual environment using the interpreter selected by `actions/setup-python`.
+Ubuntu 24.04 A10 images can otherwise route bare `pip` to an externally managed
+system Python and fail with PEP 668, even after the setup action succeeds.
+Each dependency-install and Python-consumer step activates the environment;
+installs use `python -m pip` and tests use `python -m pytest`. Golden regeneration
+uses the same isolation for both CPU and CUDA. An `always()` cleanup step removes
+the environment after success or failure without changing the system Python.
+
 ---
 
 ## 5. PYTEST CONFIGURATION

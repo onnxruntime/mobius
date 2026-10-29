@@ -61,6 +61,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Create virtual environment
+        run: |
+          # The A10 image's system pip is externally managed (PEP 668).
+          "$pythonLocation/bin/python" -m venv "$RUNNER_TEMP/mobius-venv"
+
       - name: Cache HuggingFace models
         uses: actions/cache@v6
         with:
@@ -68,18 +73,21 @@ jobs:
           key: hf-gpu-${{ hashFiles('testdata/cases/**/*.yaml') }}
 
       - name: Install PyTorch (CUDA)
-        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+        run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
       - name: Install dependencies
         run: |
-          pip install -r requirements/ci/requirements.txt
-          pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
-          pip install -e '.[testing,transformers]' -r requirements/ci/transformers.txt
-          pip install --force-reinstall --no-deps -r requirements/ci/vibevoice.txt
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install -r requirements/ci/requirements.txt
+          python -m pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
+          python -m pip install -e '.[testing,transformers]' -r requirements/ci/transformers.txt
+          python -m pip install --force-reinstall --no-deps -r requirements/ci/vibevoice.txt
           python -c "from transformers import AutoConfig"
           # PyPI's ORT 1.27+ wheel requires CUDA 13, while these runners use CUDA 12.
-          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
-          pip install --no-deps onnxruntime-genai-cuda
+          python -m pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
+          python -m pip install --no-deps onnxruntime-genai-cuda
 
       - name: Run L5 generation E2E tests
         env:
@@ -88,11 +96,12 @@ jobs:
           AFFECTED_MODELS: ${{ inputs.affected_models }}
           AFFECTED_CASES: ${{ inputs.affected_cases }}
         run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
           AFFECTED="$AFFECTED_MODELS"
           CASES="$AFFECTED_CASES"
           run_vibevoice_l5() {
             if [ "$1" = all ]; then
-              pytest tests/vibevoice_golden_test.py \
+              python -m pytest tests/vibevoice_golden_test.py \
                 -m generation \
                 -v \
                 --timeout=300 \
@@ -100,7 +109,7 @@ jobs:
                 --cov=src --cov-append --cov-report=xml --cov-branch \
                 --tb=short
             else
-              MOBIUS_VIBEVOICE_GOLDEN_CASES="$1" pytest tests/vibevoice_golden_test.py \
+              MOBIUS_VIBEVOICE_GOLDEN_CASES="$1" python -m pytest tests/vibevoice_golden_test.py \
                 -m generation \
                 -v \
                 --timeout=300 \
@@ -113,7 +122,7 @@ jobs:
           if { [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; } && \
              { [ -z "$CASES" ] || [ "$CASES" = "[]" ]; }; then
             echo "Running all L5 generation E2E tests"
-            pytest tests/e2e_golden_test.py \
+            python -m pytest tests/e2e_golden_test.py \
               -m generation \
               -v \
               --timeout=300 \
@@ -127,7 +136,7 @@ jobs:
               # Convert JSON array to comma-separated list for --models
               MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
               if [ -n "$MODELS" ]; then
-                pytest tests/e2e_golden_test.py \
+                python -m pytest tests/e2e_golden_test.py \
                   -m generation \
                   -v \
                   --models "$MODELS" \
@@ -143,7 +152,7 @@ jobs:
             fi
             if [ -n "$CASES" ] && [ "$CASES" != "[]" ]; then
               echo "Running L5 generation tests for exact cases: $CASES"
-              MOBIUS_GOLDEN_CASES="$CASES" pytest tests/e2e_golden_test.py \
+              MOBIUS_GOLDEN_CASES="$CASES" python -m pytest tests/e2e_golden_test.py \
                 -m generation \
                 -v \
                 --timeout=300 \
@@ -179,3 +188,7 @@ jobs:
           name: gpu-l5-test-results
           path: junit-l5*.xml
           retention-days: 30
+
+      - name: Clean up virtual environment
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/mobius-venv"
