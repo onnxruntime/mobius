@@ -220,17 +220,17 @@ def runtime_identity(profile, *, check_loaded=True):
         loaded = {
             Path(item["resolved_path"])
             for item in observed["observed_mappings"]
-            if item["kind"] == "cuda"
+            if item["kind"] == "cuda" and item["match_decision"] == "MATCH"
         }
         loaded_ort = {
             item["resolved_path"]
             for item in observed["observed_mappings"]
-            if item["kind"] == "ort"
+            if item["kind"] == "ort" and item["match_decision"] == "MATCH"
         }
         actual_cuda = {
             item["resolved_path"]: item["observed_sha256"]
             for item in observed["observed_mappings"]
-            if item["kind"] == "cuda"
+            if item["kind"] == "cuda" and item["match_decision"] == "MATCH"
         }
         descriptors = {
             str(Path(item["path"]).resolve()): item for item in runtime["libraries"]

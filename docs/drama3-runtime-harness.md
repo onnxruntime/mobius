@@ -142,6 +142,22 @@ observations; an unapproved path fails even if its file matches an allowed hash.
 Missing/deleted files and unavailable maps remain explicit errors. These reports
 cannot reconstruct mappings from an already-ended process.
 
+Native classification groups all segments of each file-backed object before
+deciding, so a non-executable segment cannot hide a later executable segment.
+Within the ORT/CUDA scope (expected canonical paths, installation roots and
+relevant raw/resolved names), bounded observed ELF headers, shared-library names
+and executable segments distinguish native candidates from readable non-ELF
+data. Relevant data with neither executable segments nor a shared-library name
+is retained as `EXCLUDED_NON_NATIVE_DATA`, not added to a native allowlist.
+Unknown native candidates, deleted/unreadable files and ambiguous/short headers
+still fail. File headers and hashes describe resolved file bytes, not resident
+memory or the headers of an ended process.
+
+This is **scoped ORT/CUDA attestation**, not a full-process native-code or general
+adversarial-renaming closure guarantee. Unrelated Python, system and NumPy
+objects are labelled `OUTSIDE_ATTESTED_SCOPE`, not validated or called non-native;
+they do not require new native allowlist entries.
+
 Parent activation must preserve native-component qualification scopes. QMoE,
 attention and TRSM operator PASS evidence is mandatory, alongside the full-model
 gates. A pinned standard-primitives report that records the historical real

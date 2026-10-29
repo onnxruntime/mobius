@@ -8,6 +8,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import struct
 import subprocess
 import sys
 import time
@@ -19,14 +20,28 @@ import drama3_library_identity as identity
 import pytest
 
 
-def binary(root, name, data=b"CPU fixture, not an ELF"):
+def elf_header():
+    data = bytearray(64)
+    data[:7] = b"\x7fELF\x02\x01\x01"
+    struct.pack_into("<H", data, 16, 3)
+    struct.pack_into("<H", data, 18, 62)
+    struct.pack_into("<I", data, 20, 1)
+    struct.pack_into("<H", data, 52, 64)
+    return bytes(data)
+
+
+def binary(root, name, data=None):
+    if data is None:
+        data = elf_header()
     path = root / name
     path.write_bytes(data)
     return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def rows(*files):
-    return "\n".join(f"1-2 r-xp 00000000 00:00 0 {proc_path(item['path'])}" for item in files)
+def rows(*files, permissions="r-xp", inode=0):
+    return "\n".join(
+        f"1-2 {permissions} 00000000 00:00 {inode} {proc_path(item['path'])}" for item in files
+    )
 
 
 def proc_path(value):
@@ -209,6 +224,174 @@ def test_maps_getter_failure_preserves_expected_sources(inventory):
     assert result["violations"][0]["reason"] == "MAPS_UNAVAILABLE"
 
 
+@pytest.mark.parametrize(
+    "name", ["onnxruntime.db-shm", "onnxruntime_other_data", "neutral_data"]
+)
+def test_readable_nonexec_nonelf_data_excluded_by_type_not_a_cache_path_rule(
+    tmp_path,
+    inventory,
+    name,
+):
+    cuda, ort = inventory
+    data = binary(tmp_path, name, b"CPU synthetic mapped data".ljust(128, b"\0"))
+    result = identity.observe_loaded_libraries(
+        [cuda],
+        [ort],
+        maps_text=rows(cuda, ort) + "\n" + rows(data, permissions="rw-s"),
+    )
+    record = result["observed_mappings"][-1]
+    assert record["match_decision"] == "EXCLUDED_NON_NATIVE_DATA"
+    assert record["reasons"] == ["EXCLUDED_NON_NATIVE_DATA"]
+    assert record["observed_header"]["file_type"] == "NON_ELF"
+    assert record["observed_header"]["bytes_read"] == 64
+    assert record["object_has_executable_segment"] is False
+    assert record["native_candidate"] is False
+    assert record["observed_sha256"] == data["sha256"]
+    assert result["expected_sources"]["ort"][0]["expected_sha256"] == ort["sha256"]
+
+
+@pytest.mark.parametrize("execute_first", [False, True])
+def test_segment_grouping_never_excludes_nonexec_row_before_exec_row(
+    tmp_path,
+    inventory,
+    execute_first,
+):
+    cuda, ort = inventory
+    data = binary(tmp_path, "onnxruntime_disguised_data", b"CPU data".ljust(128, b"\0"))
+    nonexec = rows(data, permissions="rw-s")
+    execute = rows(data, permissions="r-xp")
+    segments = [execute, nonexec] if execute_first else [nonexec, execute]
+    with pytest.raises(identity.LibraryIdentityError) as caught:
+        identity.observe_loaded_libraries(
+            [cuda],
+            [ort],
+            maps_text=rows(cuda, ort) + "\n" + "\n".join(segments),
+        )
+    record = caught.value.evidence["observed_mappings"][-1]
+    assert record["object_has_executable_segment"] is True
+    assert len(record["map_lines"]) == 2
+    assert record["match_decision"] == "REJECT"
+    assert "NON_ELF_NATIVE_CANDIDATE" in record["reasons"]
+
+
+def test_device_inode_groups_differently_named_segments_before_classification(
+    tmp_path,
+    inventory,
+):
+    cuda, ort = inventory
+    first = binary(tmp_path, "onnxruntime_data", b"CPU data".ljust(128, b"\0"))
+    second = binary(tmp_path, "neutral_alias", b"CPU data".ljust(128, b"\0"))
+    with pytest.raises(identity.LibraryIdentityError) as caught:
+        identity.observe_loaded_libraries(
+            [cuda],
+            [ort],
+            maps_text=rows(cuda, ort)
+            + "\n"
+            + rows(first, permissions="rw-s", inode=987)
+            + "\n"
+            + rows(second, permissions="r-xp", inode=987),
+        )
+    first_record, second_record = caught.value.evidence["observed_mappings"][-2:]
+    assert first_record["object_id"] == second_record["object_id"]
+    assert first_record["object_has_executable_segment"] is True
+    assert first_record["match_decision"] == second_record["match_decision"] == "REJECT"
+
+
+@pytest.mark.parametrize(
+    "name,contents,permissions",
+    [
+        ("neutral_extension.cache", None, "r--p"),
+        ("onnxruntime.db-shm", None, "rw-s"),
+        ("onnxruntime_candidate.so.42", b"CPU not ELF".ljust(128, b"\0"), "r--p"),
+    ],
+)
+def test_disguised_elf_and_versioned_shared_library_candidates_still_reject(
+    tmp_path,
+    inventory,
+    name,
+    contents,
+    permissions,
+):
+    cuda, ort = inventory
+    unknown = binary(tmp_path, name, contents)
+    with pytest.raises(identity.LibraryIdentityError) as caught:
+        identity.observe_loaded_libraries(
+            [cuda],
+            [ort],
+            maps_text=rows(cuda, ort) + "\n" + rows(unknown, permissions=permissions),
+        )
+    record = caught.value.evidence["observed_mappings"][-1]
+    assert record["native_candidate"] is True
+    assert record["match_decision"] == "REJECT"
+    assert "UNAPPROVED_RESOLVED_PATH" in record["reasons"]
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "deleted", "short", "malformed-elf"])
+def test_ambiguous_relevant_data_fails_instead_of_being_excluded(
+    tmp_path,
+    inventory,
+    monkeypatch,
+    failure,
+):
+    cuda, ort = inventory
+    data = binary(tmp_path, "onnxruntime.data", b"CPU data".ljust(128, b"\0"))
+    if failure == "unreadable":
+        original = identity._header
+
+        def denied(path):
+            if str(path) == data["path"]:
+                raise PermissionError("CPU mock unreadable header")
+            return original(path)
+
+        monkeypatch.setattr(identity, "_header", denied)
+    elif failure == "deleted":
+        data["path"] += " (deleted)"
+    elif failure == "short":
+        Path(data["path"]).write_bytes(b"short")
+    else:
+        Path(data["path"]).write_bytes(b"\x7fELF\xff".ljust(64, b"\0"))
+    with pytest.raises(identity.LibraryIdentityError) as caught:
+        identity.observe_loaded_libraries(
+            [cuda],
+            [ort],
+            maps_text=rows(cuda, ort) + "\n" + rows(data, permissions="rw-s"),
+        )
+    record = caught.value.evidence["observed_mappings"][-1]
+    assert record["match_decision"] == "REJECT"
+    assert not any(reason == "EXCLUDED_NON_NATIVE_DATA" for reason in record["reasons"])
+    if failure in ("deleted", "unreadable"):
+        assert "observed_header" not in record
+
+
+def test_unrelated_native_objects_are_outside_scope_not_validated_or_non_native(
+    tmp_path,
+    monkeypatch,
+):
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "unrelated"
+    allowed.mkdir()
+    outside.mkdir()
+    cuda = binary(allowed, "libcudart.so.13")
+    ort = binary(allowed, "onnxruntime_pybind11_state.so")
+    unrelated = binary(outside, "libpython.so")
+    original = identity._header
+
+    def scoped_header(path):
+        assert path != Path(unrelated["path"]), "Must not invent full-process closure"
+        return original(path)
+
+    monkeypatch.setattr(identity, "_header", scoped_header)
+    result = identity.observe_loaded_libraries(
+        [cuda],
+        [ort],
+        maps_text=rows(cuda, ort, unrelated),
+    )
+    assert len(result["observed_mappings"]) == 2
+    record = result["outside_attested_scope"][0]
+    assert record["match_decision"] == "OUTSIDE_ATTESTED_SCOPE"
+    assert "observed_sha256" not in record and "observed_header" not in record
+
+
 def test_fresh_process_import_and_mock_mapping_with_frameworks_blocked(tmp_path):
     script = r"""
 import importlib.abc, pathlib, sys
@@ -225,12 +408,18 @@ import drama3_library_identity as identity
 if sys.platform == 'win32':
     original = identity._resolve
     identity._resolve = lambda value: original(str(value)[1:] if str(value).startswith('/C:') else value)
-import hashlib
+import hashlib, struct
 root = pathlib.Path(sys.argv[2])
 items = []
 for name in ['libcudart.so.13', 'onnxruntime_pybind11_state.so']:
     path = root / name
-    path.write_bytes(b'CPU fixture only')
+    header = bytearray(64)
+    header[:7] = b'\x7fELF\x02\x01\x01'
+    struct.pack_into('<H', header, 16, 3)
+    struct.pack_into('<H', header, 18, 62)
+    struct.pack_into('<I', header, 20, 1)
+    struct.pack_into('<H', header, 52, 64)
+    path.write_bytes(header)
     items.append({'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
 maps = '\n'.join('1-2 r-xp 0 0 0 ' + ('' if item['path'].startswith('/') else '/') + item['path'] for item in items)
 assert observe_loaded_libraries(items[:1], items[1:], maps_text=maps)['status'] == 'PASSED'
@@ -362,7 +551,7 @@ def test_actual_consumer_error_writer_retains_maps_and_all_five_profiles_without
     assert calls == []
 
 
-@pytest.mark.parametrize("unknown", [False, True])
+@pytest.mark.parametrize("unknown", [False, True, "data"])
 def test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import(
     tmp_path,
     monkeypatch,
@@ -371,9 +560,12 @@ def test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import
 ):
     cuda, native_pin = inventory
     files = [cuda, native_pin]
-    if unknown:
+    if unknown is True:
         files.insert(0, binary(tmp_path, "libonnxruntime_unpinned_provider.so"))
     text = rows(*files)
+    if unknown == "data":
+        data = binary(tmp_path, "onnxruntime.db-shm", b"CPU data".ljust(128, b"\0"))
+        text += "\n" + rows(data, permissions="rw-s")
     fake_ort = types.ModuleType("onnxruntime")
     fake_ort.__path__ = []
     fake_ort.__version__ = "CPU-MOCK"
@@ -426,7 +618,7 @@ def test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import
         ),
         scope,
     )
-    if unknown:
+    if unknown is True:
         with pytest.raises(identity.LibraryIdentityError) as caught:
             scope["runtime_identity"](profile)
         records = caught.value.evidence["observed_mappings"]
@@ -438,3 +630,9 @@ def test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import
         assert actual["actual_loaded_cuda_libraries"] == [
             {"path": str(Path(cuda["path"]).resolve()), "sha256": cuda["sha256"]}
         ]
+        if unknown == "data":
+            assert str(Path(data["path"]).resolve()) not in actual["actual_loaded_ort_files"]
+            assert (
+                actual["loaded_library_evidence"]["observed_mappings"][-1]["match_decision"]
+                == "EXCLUDED_NON_NATIVE_DATA"
+            )

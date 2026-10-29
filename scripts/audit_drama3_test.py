@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -1326,7 +1327,13 @@ def test_loaded_library_attestation_without_loading_cuda(consumer, mode):
         "libcudnn_cnn.so.9",
     ):
         path = consumer.assets / name
-        path.write_bytes(b"synthetic mapping, not a loaded library")
+        header = bytearray(64)
+        header[:7] = b"\x7fELF\x02\x01\x01"
+        struct.pack_into("<H", header, 16, 3)
+        struct.pack_into("<H", header, 18, 62)
+        struct.pack_into("<I", header, 20, 1)
+        struct.pack_into("<H", header, 52, 64)
+        path.write_bytes(header)
         paths["/mock/" + name] = str(path)
     profile["runtime"]["wheel"] = descriptor(consumer.paths["decoder"])
     profile["runtime"]["libraries"] = [
@@ -1396,4 +1403,4 @@ assert audit_drama3.runtime_identity(profile, check_loaded=False)['loaded_librar
         assert completed.returncode == 0, completed.stderr
     else:
         assert completed.returncode != 0
-        assert "RuntimeError" in completed.stderr
+        assert "LibraryIdentityError" in completed.stderr
