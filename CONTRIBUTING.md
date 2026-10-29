@@ -26,6 +26,60 @@ pytest tests/build_graph -k "phi4mm"
 pytest tests/integration/text_test.py -m integration -k "qwen2.5-0.5b"
 ```
 
+## Publishing releases
+
+`mobius-onnx` is published to PyPI through ESRP using Azure DevOps and the
+1ES Official pipeline templates. GitHub Actions no longer publishes to PyPI.
+The structure follows
+[ONNX Script's official pipelines](https://github.com/microsoft/onnxscript/tree/main/.azure-pipelines);
+Olive's current OneBranch release YAML is not in its public repository.
+
+### One-time Azure DevOps setup
+
+1. Create a pipeline named **`mobius-release`** pointing to
+   [`.azure-pipelines/release.yml`](.azure-pipelines/release.yml), with `main`
+   as its default branch. The publish pipeline references this exact name.
+2. Create a pipeline named **`mobius-publish`** pointing to
+   [`.azure-pipelines/publish.yml`](.azure-pipelines/publish.yml), also with
+   `main` as its default branch.
+3. Authorize the GitHub repository connection, the
+   `1ESPipelineTemplates/1ESPipelineTemplates` repository, and the
+   `onnxruntime-Ubuntu2204-AMD-CPU` and `onnxruntime-Win-CPU-2022` pools.
+   These pool names follow ONNX Script's configuration; if your Azure DevOps
+   project uses different pools, update the YAML before running it.
+4. Create the **`mobius-release`** environment and configure its production
+   approval checks and pipeline permissions. Authorize `mobius-publish` to
+   consume artifacts from `mobius-release`.
+5. Authorize the **`ESRPCodeSign` ARM service connection** for the publish
+   pipeline. Confirm its managed identity can use `ortbuildkeyvault` and
+   the `esrpcodesign` certificate, and that ESRP authorizes the configured
+   client, `AIFrameworks` publisher, and `mobius-onnx` PyPI package.
+   ESRP's configured owners/approvers do not replace Azure DevOps
+   environment approval checks.
+6. Confirm the ESRP publishing identity has access to the existing
+   `mobius-onnx` project on PyPI. Remove the obsolete GitHub
+   `publish.yml` trusted publisher from the PyPI project after cutover.
+
+### Release procedure
+
+Set `mobius.__version__` in `src/mobius/__init__.py` to the intended release
+version, merge the release commit, and push a matching `v<version>` tag.
+The release pipeline builds the wheel and sdist, checks their metadata and
+wheel installation, and publishes them as official build artifacts.
+
+Each successful release-pipeline run triggers `mobius-publish`, which
+downloads that run's `drop` artifact and submits it to `EsrpRelease@9`
+after the environment checks pass. Only the downloaded distribution
+directory is submitted, rather than the whole pipeline workspace.
+The ESRP task waits for release completion.
+
+For a manual release, run `mobius-release` against the intended release
+tag or commit; a successful manual build also triggers publication.
+When manually running `mobius-publish`, explicitly select the intended
+`mobius-release` resource run rather than relying on the latest build.
+Never reuse a version already published to PyPI. Verify the published
+version and installation from PyPI after the release completes.
+
 ## Coding conventions
 
 ### Imports

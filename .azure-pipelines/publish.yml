@@ -1,0 +1,67 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: mobius-publish.$(Date:yyyyMMdd).$(Rev:r)
+
+trigger: none
+pr: none
+
+resources:
+  repositories:
+    - repository: 1esPipelines
+      type: git
+      name: 1ESPipelineTemplates/1ESPipelineTemplates
+      ref: refs/tags/release
+  pipelines:
+    - pipeline: mobius-release
+      source: mobius-release
+      trigger: true
+
+extends:
+  template: v1/1ES.Official.PipelineTemplate.yml@1esPipelines
+  parameters:
+    stages:
+      - stage: Release
+        displayName: Publish to PyPI
+        dependsOn: []
+        jobs:
+          - deployment: PublishDistribution
+            templateContext:
+              type: releaseJob
+              isProduction: true
+              inputs:
+                # The Official template consolidates build outputs into drop.
+                - input: pipelineArtifact
+                  artifactName: drop
+                  pipeline: mobius-release
+                  targetPath: "$(Pipeline.Workspace)/dist"
+            environment:
+              name: mobius-release
+            pool:
+              name: onnxruntime-Win-CPU-2022
+            workspace:
+              clean: all
+            strategy:
+              runOnce:
+                deploy:
+                  steps:
+                    - checkout: none
+                    - download: none
+                    - task: EsrpRelease@9
+                      displayName: ESRP Release
+                      inputs:
+                        connectedservicename: ESRPCodeSign
+                        keyvaultname: ortbuildkeyvault
+                        signcertname: esrpcodesign
+                        clientid: "53d54d02-978d-4305-8572-583cf6711c4f"
+                        intent: packagedistribution
+                        usemanagedidentity: true
+                        contenttype: PyPi
+                        contentsource: Folder
+                        folderlocation: "$(Pipeline.Workspace)/dist"
+                        waitforreleasecompletion: true
+                        owners: "devpatel@microsoft.com,justinchu@microsoft.com"
+                        approvers: "devpatel@microsoft.com,justinchu@microsoft.com,jambaykinley@microsoft.com,xiaoyuzhang@microsoft.com"
+                        serviceendpointurl: "https://api.esrp.microsoft.com"
+                        mainpublisher: AIFrameworks
+                        domaintenantid: "975f013f-7f24-47e8-a7d3-abc4752bf346"
