@@ -200,9 +200,9 @@ _NEMOTRON_H_MOE_30B_IQ2_XXS = GGUFRuntimeBlockerEvidence(
     expert_count=128,
     experts_per_token=6,
     layer_counts=(("full_attention", 6), ("mamba2", 23), ("moe", 23)),
-    pre_optimization_graph_node_count=40_167,
-    graph_node_count=37_142,
-    graph_initializer_count=6_255,
+    pre_optimization_graph_node_count=43_272,
+    graph_node_count=40_222,
+    graph_initializer_count=6_257,
     graph_matmul_count=6_028,
     state_slots=(
         ("attention.key", 6),
@@ -222,9 +222,12 @@ _NEMOTRON_H_MOE_30B_IQ2_XXS = GGUFRuntimeBlockerEvidence(
             "float16/float32 weights require 63,155,880,576/126,311,761,152 bytes."
         ),
         (
-            "The normal optimized CPU export has 37,142 nodes (40,167 before Mobius "
+            "The normal optimized CPU export has 40,222 nodes (43,272 before Mobius "
             "optimization) and 6,028 MatMul nodes because its truthful ReLU2 routed "
-            "experts remain an ONNX loop. ORT 1.29 MoE/QMoE exposes ReLU but not ReLU2. "
+            "experts remain an ONNX loop with FP32 routing/accumulation. "
+            "This graph-only census was refreshed locally with ORT 1.30.0 installed; "
+            "the pinned ORT 1.29 runtime inspection below is historical, not a new "
+            "runtime result. ORT 1.29 MoE/QMoE exposes ReLU but not ReLU2. "
             "QMoE has separate router_probs/router_weights for correction-biased "
             "selection with unbiased sigmoid mixing, while shared experts and optional "
             "latent projections can surround it; those are not fused-op blockers. The "

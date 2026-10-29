@@ -362,7 +362,7 @@ def _make_hybrid_cache_inputs(
             )
             ssm_state = builder.input(
                 f"{prefix}.{i}.ssm_state",
-                dtype=dtype,
+                dtype=getattr(config, "mamba_ssm_dtype", None) or dtype,
                 shape=[batch, mamba2_n_heads, mamba2_d_state, mamba2_d_head],
             )
             pairs.append((conv_state, ssm_state))
