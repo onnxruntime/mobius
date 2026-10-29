@@ -62,31 +62,43 @@ def read_session_profile(session, selection, *, profiling=False, compare_observe
     separately, rather than mislabelling it an observed runtime attribute.
     """
     validate_requested_profile(selection)
-    actual_providers = session.get_providers()
-    actual_map = session.get_provider_options()
-    options = session.get_session_options()
-    observed = {
-        "graph_optimization_level": str(options.graph_optimization_level).split(".")[-1],
-        "intra_op_num_threads": options.intra_op_num_threads,
-        "inter_op_num_threads": options.inter_op_num_threads,
-        "enable_mem_pattern": options.enable_mem_pattern,
-        "enable_profiling": options.enable_profiling,
-    }
-    config = {
-        key: options.get_session_config_entry(key) for key in selection["session_config"]
-    }
     readback = {
-        "actual_providers": actual_providers,
-        "registered_provider_order_not_node_placement": actual_providers,
         "runtime_node_placement_attested": False,
-        "actual_provider_options": actual_map,
-        "actual_session_options": observed,
-        "actual_session_config": config,
+        "getter_errors": [],
         "disabled_optimizers_requested_not_runtime_readback": selection["disabled_optimizers"],
         "requested_device": selection["device"],
         "requested_device_id": selection["device_id"],
         "requested_providers": selection["providers"],
     }
+    actual_providers = _observe(readback, "get_providers", session.get_providers)
+    readback["actual_providers"] = actual_providers
+    readback["registered_provider_order_not_node_placement"] = actual_providers
+    actual_map = _observe(readback, "get_provider_options", session.get_provider_options)
+    readback["actual_provider_options"] = actual_map
+    options = _observe(readback, "get_session_options", session.get_session_options)
+    observed = {}
+    readback["actual_session_options"] = observed
+    for key in (
+        "graph_optimization_level",
+        "intra_op_num_threads",
+        "inter_op_num_threads",
+        "enable_mem_pattern",
+        "enable_profiling",
+    ):
+        value = _observe(
+            readback, f"SessionOptions.{key}", lambda key=key: getattr(options, key)
+        )
+        observed[key] = (
+            str(value).split(".")[-1] if key == "graph_optimization_level" else value
+        )
+    config = {}
+    readback["actual_session_config"] = config
+    for key in selection["session_config"]:
+        config[key] = _observe(
+            readback,
+            f"get_session_config_entry({key})",
+            lambda key=key: options.get_session_config_entry(key),
+        )
     expected_names = [
         item[0] if isinstance(item, (list, tuple)) else item for item in selection["providers"]
     ]
@@ -127,3 +139,19 @@ def read_session_profile(session, selection, *, profiling=False, compare_observe
             "Actual session config differs from selected profile", readback
         )
     return readback
+
+
+def _observe(readback, getter, operation):
+    try:
+        return operation()
+    except Exception as error:
+        readback["getter_errors"].append(
+            {
+                "getter": getter,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+        )
+        raise SessionProfileError(
+            f"Actual session profile getter failed: {getter}", readback
+        ) from error

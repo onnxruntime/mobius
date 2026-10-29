@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import onnxruntime as ort
 import pytest
-from drama3_session_profile import read_session_profile, session_options
+from drama3_session_profile import SessionProfileError, read_session_profile, session_options
 
 
 @pytest.fixture
@@ -100,6 +100,42 @@ def test_session_config_readback_drift_fails(selected):
     actual.add_session_config_entry("session.disable_prepacking", "0")
     with pytest.raises(RuntimeError, match="Actual session config"):
         read_session_profile(actual_session(selected, actual), selected)
+
+
+@pytest.mark.parametrize("failure", ["options", "config"])
+def test_getter_exception_preserves_only_available_observations(selected, failure):
+    actual = actual_session(selected)
+    if failure == "options":
+
+        def fail_options():
+            raise RuntimeError("actual SessionOptions getter unavailable")
+
+        actual.get_session_options = fail_options
+    else:
+        options = session_options(selected)
+        actual.get_session_options = lambda: SimpleNamespace(
+            graph_optimization_level=options.graph_optimization_level,
+            intra_op_num_threads=8,
+            inter_op_num_threads=1,
+            enable_mem_pattern=False,
+            enable_profiling=False,
+            get_session_config_entry=lambda _key: (_ for _ in ()).throw(
+                RuntimeError("actual config key missing")
+            ),
+        )
+    with pytest.raises(SessionProfileError, match="getter failed") as caught:
+        read_session_profile(actual, selected)
+    readback = caught.value.readback
+    assert readback["actual_provider_options"] == selected["actual_provider_options"]
+    assert readback["actual_providers"] == selected["actual_providers"]
+    assert readback["getter_errors"][0]["error_type"] == "RuntimeError"
+    if failure == "options":
+        assert "actual_session_options" not in readback
+        assert "actual_session_config" not in readback
+    else:
+        assert readback["actual_session_options"]["intra_op_num_threads"] == 8
+        assert readback["actual_session_config"] == {}
+        assert "session.disable_prepacking" not in readback["actual_session_config"]
 
 
 def test_declared_diagnostics_profiling_is_explicit_not_a_performance_profile(selected):

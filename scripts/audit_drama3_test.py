@@ -1130,8 +1130,9 @@ def test_output_root_is_new_and_never_rewrites_frozen_inputs(consumer):
     assert not (consumer.assets / "forbidden-output").exists()
 
 
+@pytest.mark.parametrize("failure", ["mismatch", "options_getter", "config_getter"])
 def test_all_actual_model_readbacks_before_first_neural_call_and_failure_stops_it(
-    consumer, tmp_path, monkeypatch
+    consumer, tmp_path, monkeypatch, failure
 ):
     import audit_drama3
     from drama3_session_profile import SessionProfileError
@@ -1157,8 +1158,36 @@ def test_all_actual_model_readbacks_before_first_neural_call_and_failure_stops_i
             "codec",
         }
         name = sessions_by_id[id(session)]
-        actual = original_read(session, profile, **kwargs)
         checked.append(name)
+        if name == "codec" and failure != "mismatch":
+
+            def unavailable():
+                raise RuntimeError("CPU mock getter unavailable")
+
+            options = session.get_session_options()
+            wrapped = SimpleNamespace(
+                get_providers=session.get_providers,
+                get_provider_options=session.get_provider_options,
+                get_session_options=unavailable
+                if failure == "options_getter"
+                else lambda: SimpleNamespace(
+                    graph_optimization_level=options.graph_optimization_level,
+                    intra_op_num_threads=8,
+                    inter_op_num_threads=1,
+                    enable_mem_pattern=False,
+                    enable_profiling=False,
+                    get_session_config_entry=lambda _key: unavailable(),
+                ),
+            )
+            # CPU config is empty; require an explicit entry only for this
+            # injected getter-failure attestation, without mutating model sessions.
+            required = (
+                {**profile, "session_config": {"CPU_test_required_entry": "1"}}
+                if failure == "config_getter"
+                else profile
+            )
+            return original_read(wrapped, required, **kwargs)
+        actual = original_read(session, profile, **kwargs)
         if name == "codec":
             actual["actual_session_options"]["intra_op_num_threads"] = 1
             raise SessionProfileError("CPU mock last-model option mismatch", actual)
@@ -1186,7 +1215,7 @@ def test_all_actual_model_readbacks_before_first_neural_call_and_failure_stops_i
             str(tmp_path / "readback-failure"),
         ]
     )
-    with pytest.raises(SessionProfileError, match="last-model"):
+    with pytest.raises(SessionProfileError, match=r"last-model|getter failed"):
         audit_drama3.run(args)
     report = json.loads((tmp_path / "readback-failure/report.json").read_text())
     assert report["all_model_sessions_attested_before_first_nn"] is False
@@ -1194,7 +1223,14 @@ def test_all_actual_model_readbacks_before_first_neural_call_and_failure_stops_i
     assert report["status"] == "failed"
     codec = report["actual_model_session_profiles_before_first_nn"]["codec"]
     assert codec["status"] == "FAILED"
-    assert codec["actual"]["actual_session_options"]["intra_op_num_threads"] == 1
+    if failure == "mismatch":
+        assert codec["actual"]["actual_session_options"]["intra_op_num_threads"] == 1
+    else:
+        assert (
+            codec["actual"]["actual_provider_options"]
+            == consumer.profile["actual_provider_options"]
+        )
+        assert codec["actual"]["getter_errors"][0]["error_type"] == "RuntimeError"
 
 
 def test_incomplete_actual_session_set_cannot_attest(consumer):

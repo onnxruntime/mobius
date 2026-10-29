@@ -149,6 +149,9 @@ its full `get_provider_options()` map, registered provider order, observed
 then rechecks **all five actual sessions together before the first neural call**;
 any required semantic, map, option, config or declared-device mismatch aborts.
 Failure reports preserve available readbacks and keep the barrier false.
+Getter exceptions retain observations incrementally: a missing config entry or
+failed SessionOptions getter records its explicit error without discarding the
+already observed full provider map, and without inventing unavailable defaults.
 CUDA profiles must explicitly preserve TF32 off, capture off, `kSameAsRequested`,
 `EXHAUSTIVE`, and disabled prepacking; no missing control is silently repaired.
 
