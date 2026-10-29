@@ -695,6 +695,45 @@ class TestCLIBuild:
         task = mock_build.call_args.kwargs["task"]
         assert isinstance(task, Gemma4TextCausalLMTask)
 
+    def _resolved_static_task(self, model_type, features):
+        hf_config = mock.MagicMock()
+        hf_config.model_type = model_type
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    features,
+                ]
+            )
+        return mock_build.call_args.kwargs["task"]
+
+    def test_gqa_cache_resolves_causal_lm_task(self):
+        """``static-cache,gqa-cache`` hands the cache to GroupQueryAttention."""
+        from mobius.tasks import CausalLMTask
+
+        task = self._resolved_static_task("llama", "static-cache,gqa-cache")
+        assert isinstance(task, CausalLMTask)
+        assert task._static_cache
+        assert task._gqa_cache
+
+    def test_gqa_cache_requires_static_cache(self):
+        with pytest.raises(SystemExit, match="static-cache,gqa-cache"):
+            self._resolved_static_task("llama", "gqa-cache")
+
+    def test_gqa_cache_rejects_gemma4(self):
+        with pytest.raises(ValueError, match="Gemma 4"):
+            self._resolved_static_task("gemma4_text", "static-cache,gqa-cache")
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
