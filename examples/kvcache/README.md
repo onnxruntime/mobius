@@ -1,12 +1,268 @@
-# Experimental ONNX KV-cache example
+# End-to-end walkthrough: logical KV caches, runtime-owned storage
 
 This example exports pretrained Mobius decoder graphs, converts each layer's
 tensor K/V plumbing to the experimental ONNX `kv_cache` type and
 `AttentionWithCache` operator, then compares the original and converted graphs
-on CPU. The cache backend is selected when creating the runtime value; it is not
-encoded in the graph. This is a prototype, not a production serving stack.
+on CPU. **The model defines logical attention and history; the runtime chooses
+physical storage.** Switching contiguous, paged, or ring storage does not change
+the serialized converted model.
 
-## Models and artifacts
+This page follows the change through the model, ONNX Runtime (ORT), and the
+application, with real implementation excerpts and measured pretrained results.
+The [reproduction appendix](#appendix-c-dependencies-and-builds) contains the
+source pins, local wheel locations, build prerequisites, and commands. This is a
+CPU float32 correctness prototype, not a production serving stack or an adopted
+ONNX standard: its dedicated type requires experimental IR 15 and opset 29.
+
+```mermaid
+flowchart LR
+    A["Mobius tensor-cache model"] --> B["Converter: one logical kv_cache per layer"]
+    B --> C["Same converted ONNX model"]
+    D["Application creates cache OrtValues"] --> E["ORT: contiguous / paged / ring"]
+    C --> F["AttentionWithCache"]
+    E --> F
+    F --> G["Logits + next immutable cache values"]
+    G --> D
+```
+
+## 1. Change the model contract, not the learned computation
+
+The original model accepts separate past-key and past-value tensors for every
+layer and returns their extended tensors. The converted model instead accepts
+one dedicated `TypeProto.kv_cache_type` value per layer and returns its successor.
+This abstract, runtime-owned value is not a tensor encoding of a page table,
+and it is not the unrelated `TypeProto.opaque_type`.
+
+| Per-layer contract | Inputs to attention | Outputs |
+| --- | --- | --- |
+| Before | Q, K-new, V-new, mask, past-key tensor, past-value tensor | Y, present-key tensor, present-value tensor |
+| After | Q, K-new, V-new, cache value, mask, absolute positions | Y, next cache value |
+
+[The converter](convert_to_kv_cache.py) retains projections, Qwen3's Q/K
+normalization, RoPE, head mapping, masks, and causal semantics. It reshapes the
+original flat Q/K/V into BNSD for `AttentionWithCache`. Cache type metadata
+describes logical batch/head geometry, element type, and sliding window, not
+physical pages or ring slots. Qwen has 28 full-attention layers; Gemma has
+15 local layers with a 512-token window and 3 full-attention layers.
+
+The input mask still describes the complete logical token history. Positions
+continue increasing even when a ring drops physical entries. For example, a
+Gemma local layer at computed end 524 retains positions `[12,524)`, not
+positions relabeled as `[0,512)`. Its full-attention layers retain from 0.
+The [graph appendix](#appendix-b-graph-transformation-details) lists exact
+graph signatures and node inventories.
+
+## 2. What changes inside ONNX Runtime?
+
+The following are real excerpts from executable code commit
+`11a522b835ee41b53c6d293a35c7c7135e2dfd5d`, not proposed APIs or pseudocode.
+Links include immutable commit IDs and line ranges; `// ...` marks omitted
+source where an excerpt is abbreviated. They are included here so the runtime
+change can be understood without separately reading another repository.
+
+### A storage-independent interface and value lifetime
+
+The runtime exposes logical `Begin()`/`End()` positions and visits borrowed
+blocks with absolute positions and head strides. Attention need not know
+whether those blocks come from one contiguous allocation, immutable pages, or
+a wrapped ring. From
+[`kv_cache.h`, lines 38-57](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/include/onnxruntime/core/framework/kv_cache.h#L38-L57):
+
+```cpp
+class KVCache {
+ public:
+  virtual ~KVCache() = default;
+  virtual const KVCacheOptions& Options() const noexcept = 0;
+  virtual int64_t End() const noexcept = 0;
+  virtual int64_t Begin() const noexcept = 0;
+  virtual void Visit(const std::function<void(const KVCacheBlock&)>& visitor) const = 0;
+
+  // Append returns a private, untrimmed version: all queries in a chunk can still
+  // see their required history. Seal performs retention only after attention.
+  virtual std::shared_ptr<const KVCache> Append(gsl::span<const float> keys,
+                                                gsl::span<const float> values,
+                                                int64_t tokens) const = 0;
+  virtual std::shared_ptr<const KVCache> Seal() const = 0;
+};
+
+// OrtValues share immutable backing, never mutable per-layer published state.
+struct KVCacheValue {
+  std::shared_ptr<const KVCache> cache;
+};
+```
+
+An `OrtValue` owns this shared immutable payload. `Append` creates private
+staging state instead of mutating the caller's cache. Paged append shares
+unchanged committed pages; a committed ring owns exactly the window's slots
+per head, addressed by absolute position modulo window size. The entire new
+chunk is staged before retention so its earliest queries do not lose required
+history when a chunk crosses the window boundary.
+
+| Backend selected by the application | Physical implementation | Logical behavior |
+| --- | --- | --- |
+| `contiguous` | Contiguous retained K/V rebuilt on append | Full history or configured sliding window |
+| `paged` | Shared immutable committed pages plus new pages | Same logical history/window |
+| `ring` | Bounded committed window bank; private chunk staging | Sliding-window layers only |
+
+Bounded committed ring storage does not mean zero temporary allocation.
+This demo makes no measured memory or throughput claim.
+
+### Attention streams over storage; it does not gather dense KV
+
+The CPU kernel calls `staged->Visit(...)` and reads keys/values directly from
+each block. It uses absolute positions for causal/window filtering and mask
+lookup, grouped-query head mapping for K/V heads, and the original scale and
+softcap semantics. Within that visitor, the online softmax update is
+[`attention_with_cache.cc`, lines 149-157](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/providers/cpu/llm/attention_with_cache.cc#L149-L157):
+
+```cpp
+              const double next_maximum = std::max(maximum, score);
+              const double correction = std::exp(maximum - next_maximum);
+              const double weight = std::exp(score - next_maximum);
+              normalizer = normalizer * correction + weight;
+              for (int64_t d = 0; d < o.value_head_size; ++d) {
+                accumulator[static_cast<size_t>(d)] =
+                    accumulator[static_cast<size_t>(d)] * correction + weight * value[d];
+              }
+              maximum = next_maximum;
+```
+
+This keeps a running maximum, normalizer, and weighted-value accumulator
+instead of materializing a dense KV gather or a full attention-score matrix.
+The [surrounding loop, lines 126-169](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/providers/cpu/llm/attention_with_cache.cc#L126-L169)
+shows block visitation, masks, window checks, and final normalization. Only
+after attention finishes does the kernel seal retention and publish its output
+([lines 167-168](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/providers/cpu/llm/attention_with_cache.cc#L167-L168)):
+
+```cpp
+    auto next = staged->Seal();
+    ctx->Output<KVCacheValue>(1)->cache = std::move(next);
+```
+
+This is functional old-state safety: if this node or a later node fails, the
+caller's input caches remain unchanged. The application advances its cache
+references only after a successful run. ORT also rejects preallocated cache
+fetch objects, preventing output reuse from overwriting caller-owned state.
+
+### Registration, validation, and Python are part of the change
+
+The prototype is not just a new kernel. ORT registers `KVCacheValue` as a
+dedicated non-tensor type, recognizes its geometry in graph type handling,
+validates cache feeds against the graph contract, and registers the
+opset-29 CPU attention/create/describe/export kernels. The Python factory
+constructs the same native value rather than a Python-side tensor substitute.
+From
+[`onnxruntime_pybind_ortvalue.cc`, lines 23-28](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/python/onnxruntime_pybind_ortvalue.cc#L23-L28):
+
+```cpp
+std::unique_ptr<OrtValue> CreatePythonKVCache(int64_t batch, int64_t heads, int64_t key_width, int64_t value_width,
+                                            const std::string& backend, int64_t page_size, int64_t window) {
+  auto value = std::make_unique<OrtValue>();
+  CreateKVCacheOrtValue({batch, heads, key_width, value_width, ParseKVCacheStorage(backend), page_size, window}, *value);
+  return value;
+}
+```
+
+The exact implementation map is below; these links are optional deeper reading,
+not prerequisites for following the walkthrough.
+
+| ORT surface | Immutable source and purpose |
+| --- | --- |
+| Cache abstraction and lifetime | [`kv_cache.h:29-57`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/include/onnxruntime/core/framework/kv_cache.h#L29-L57): borrowed blocks, interface, immutable payload |
+| Storage | [`kv_cache.cc:118-179`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/framework/kv_cache.cc#L118-L179): paged sharing, retention, ring layout |
+| Type registry | [`data_types.cc`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/framework/data_types.cc): dedicated `KVCacheType`, not the opaque-type fallback |
+| Graph typing | [`graph.cc`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/graph/graph.cc): cache type propagation/compatibility |
+| Session validation | [`inference_session.cc:3441-3445`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/session/inference_session.cc#L3441-L3445) and [`3537-3542`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/session/inference_session.cc#L3537-L3542): reject preallocated cache fetches; validate feed geometry |
+| CPU attention and registrations | [`attention_with_cache.cc`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/core/providers/cpu/llm/attention_with_cache.cc): streaming kernel and CPU registrations |
+| Native Python methods | [`onnxruntime_pybind_ortvalue.cc:128-132`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/python/onnxruntime_pybind_ortvalue.cc#L128-L132): factory/inspection binding |
+| Public Python wrapper | [`onnxruntime_inference_collection.py:1299-1324`](https://github.com/microsoft/onnxruntime/blob/11a522b835ee41b53c6d293a35c7c7135e2dfd5d/onnxruntime/python/onnxruntime_inference_collection.py#L1299-L1324): `OrtValue.kv_cache` and inspection |
+
+## 3. Application: create, feed, fetch, repeat
+
+[The runnable driver](run_example.py) creates one cache value per layer,
+choosing the backend at allocation time. Its real creation code is:
+
+```python
+            ort.OrtValue.kv_cache(
+                1,
+                num_kv_heads,
+                head_dim,
+                head_dim,
+                backend=_cache_backend(backend, window),
+                page_size=_PAGE_SIZE,
+                sliding_window=window,
+            )
+```
+
+For `mixed`, `_cache_backend` selects `paged` for full-attention layers and
+`ring` for sliding layers. After preparing token/mask/absolute-position tensor
+feeds, the driver's `_run_kv_cache` uses the ordinary OrtValue run path:
+
+```python
+    feeds.update({_KV_CACHE_INPUT.format(layer=i): cache for i, cache in enumerate(caches)})
+    output_names = ["logits"] + [_KV_CACHE_OUTPUT.format(layer=i) for i in range(len(caches))]
+    outputs = session.run_with_ort_values(output_names, feeds)
+    return outputs[0].numpy(), outputs[1:]
+```
+
+Only logits are converted to NumPy. Cache outputs stay native OrtValues and
+become the next invocation's inputs. At each step the driver compares all
+logits against the original tensor-cache model, checks the next greedy token,
+and checks both old and new caches' computed/retained positions. This tests
+functional transitions, not merely constructor success. After installing the
+matching builds and generating artifacts as described in the appendices, run:
+
+```powershell
+python examples\kvcache\run_example.py --model Qwen/Qwen3-0.6B --model-dir C:\models\qwen3-0.6b
+python examples\kvcache\run_example.py --model google/gemma-3-270m --model-dir C:\models\gemma-3-270m --prefill-chunks 500,24,3
+```
+
+## 4. Observed pretrained results: same graph, different storage
+
+All rows compare full logits with the original tensor-cache graph at
+`atol=rtol=1e-4`; all next-token greedy checks matched. These are CPU float32
+correctness measurements, not throughput or peak-memory benchmarks.
+
+| Checkpoint | Runtime storage | Prefill + decode | Maximum absolute logit error | Generated token IDs |
+| --- | --- | --- | --- | --- |
+| Qwen3-0.6B | contiguous | 8 + 3 single-token steps | `9.6321106e-5` | `[5562,13,576]` |
+| Qwen3-0.6B | paged | Same | `9.6321106e-5` | Same |
+| Gemma 3-270M | contiguous | 500,24,3 + 3 single-token steps | `5.531311e-5` | `[506,31770,4799]` |
+| Gemma 3-270M | paged | Same | `5.531311e-5` | Same |
+| Gemma 3-270M | mixed: paged full / ring local | Same | `5.531311e-5` | Same |
+
+Each checkpoint uses one converted file, loaded by the same session for all
+its backends, with these SHA256 hashes from the persisted reports:
+
+| Converted model | Backends sharing this exact graph | SHA256 |
+| --- | --- | --- |
+| Qwen3-0.6B | contiguous, paged | `b638538806455dedcc653a1c28405169f6874558f066fcfd8a22e82abc0bfc63` |
+| Gemma 3-270M | contiguous, paged, mixed | `30a252f32b5c434fb2bd88ac5c59955abe94131e3cd910dbb7500556a18679df` |
+
+The Gemma mixed run crosses the sliding boundary inside the second chunk:
+
+| Chunk | Computed end (all layers) | Local ring retained range | Full-attention retained range |
+| --- | --- | --- | --- |
+| 500 tokens | 500 | `[0,500)` | `[0,500)` |
+| 24 tokens | 524 | `[12,524)` | `[0,524)` |
+| 3 tokens | 527 | `[15,527)` | `[0,527)` |
+
+Three decode steps then advance the end to 530, with local retained begin 18
+and full retained begin 0. Qwen's end advances 8,9,10,11 with retained begin 0;
+Qwen multi-chunk prefill was not tested. Generated text is ` dog. The` for
+Qwen and ` the lazy dog` for Gemma. Report paths, per-step errors, and
+reproducibility details follow.
+
+## Appendix A: models and artifact access
+
+Source branches are published, but the verified wheels, model binaries, and
+reports listed here are local artifacts, not hosted downloads. A reader needs
+access to those files or must build the pinned forks and export the checkpoints.
+Checkpoint access is subject to Hugging Face permissions/license terms; normal
+authentication is required if access is gated. The scripts reuse the local
+Hugging Face cache rather than intentionally downloading duplicate weights.
+Commands assume Windows and a suitable Python development environment; there
+is no one-command-from-the-internet setup.
 
 | Model | Hugging Face revision | Attention layout |
 | --- | --- | --- |
@@ -42,7 +298,7 @@ python examples\kvcache\build_model.py --model Qwen/Qwen3-0.6B --output-dir C:\m
 python examples\kvcache\build_model.py --model google/gemma-3-270m --output-dir C:\models\gemma-3-270m
 ```
 
-## Graph transformation
+## Appendix B: graph transformation details
 
 The baseline graphs use ONNX `Attention` (default-domain opset 24) with flat
 `BS(H*D)` Q/K/V inputs. Qwen3 has 28 Attention nodes and Gemma 3 has 18. Their
@@ -93,7 +349,7 @@ lost. The protobuf-level rewrite is isolated in `convert_to_kv_cache.py`
 because the experimental cache type is not yet representable through the
 stable ONNX IR API.
 
-## Runtime and comparison
+## Appendix C: dependencies and builds
 
 The graph conversion requires the experimental ONNX API from
 `gramalingam/onnx` commit
@@ -212,6 +468,8 @@ default. It records model/runtime/ONNX pins and hashes, prompt and all input
 token IDs, exact run arguments, tolerance, per-backend/per-step logit errors
 and cache states, and generated tokens. Override the report location with
 `--report <path>`.
+
+## Appendix D: detailed pretrained evidence
 
 ### Pretrained Qwen result
 
