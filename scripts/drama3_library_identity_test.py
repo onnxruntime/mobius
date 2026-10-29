@@ -49,8 +49,7 @@ def proc_path(value):
     return value if value.startswith("/") else "/" + value
 
 
-@pytest.fixture(autouse=True)
-def synthetic_linux_paths_on_windows(monkeypatch):
+def _synthetic_linux_paths_on_windows(monkeypatch):
     if sys.platform == "win32":
         original = identity._resolve
         monkeypatch.setattr(
@@ -58,6 +57,11 @@ def synthetic_linux_paths_on_windows(monkeypatch):
             "_resolve",
             lambda value: original(str(value)[1:] if str(value).startswith("/C:") else value),
         )
+
+
+@pytest.fixture(autouse=True)
+def synthetic_linux_paths_on_windows(monkeypatch):
+    _synthetic_linux_paths_on_windows(monkeypatch)
 
 
 @pytest.fixture
@@ -551,12 +555,12 @@ def test_actual_consumer_error_writer_retains_maps_and_all_five_profiles_without
     assert calls == []
 
 
-@pytest.mark.parametrize("unknown", [False, True, "data"])
-def test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import(
+def _check_actual_runtime_identity_ast(
     tmp_path,
     monkeypatch,
     inventory,
     unknown,
+    forbidden_module=None,
 ):
     cuda, native_pin = inventory
     files = [cuda, native_pin]
@@ -618,7 +622,11 @@ def test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import
         ),
         scope,
     )
-    if unknown is True:
+    if forbidden_module is not None:
+        monkeypatch.setitem(sys.modules, forbidden_module, types.ModuleType(forbidden_module))
+        with pytest.raises(RuntimeError, match="Target process imported Torch"):
+            scope["runtime_identity"](profile)
+    elif unknown is True:
         with pytest.raises(identity.LibraryIdentityError) as caught:
             scope["runtime_identity"](profile)
         records = caught.value.evidence["observed_mappings"]
@@ -636,3 +644,91 @@ def test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import
                 actual["loaded_library_evidence"]["observed_mappings"][-1]["match_decision"]
                 == "EXCLUDED_NON_NATIVE_DATA"
             )
+
+
+def _run_runtime_identity_ast(tmp_path, inventory, unknown, forbidden_module=None):
+    script = r"""
+import importlib.abc, json, pathlib, sys
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {
+            'torch', 'mobius', 'onnxruntime', 'onnxscript', 'onnx_ir', 'numpy'
+        }:
+            raise ImportError('Blocked identity fixture dependency: ' + fullname)
+sys.meta_path.insert(0, Block())
+sys.path.insert(0, sys.argv[1])
+import drama3_library_identity_test as tests
+assert not any(name.split('.')[0] in {'torch', 'mobius', 'onnxruntime'} for name in sys.modules)
+with tests.pytest.MonkeyPatch.context() as monkeypatch:
+    tests._synthetic_linux_paths_on_windows(monkeypatch)
+    tests._check_actual_runtime_identity_ast(
+        pathlib.Path(sys.argv[2]), monkeypatch, json.loads(sys.argv[3]),
+        json.loads(sys.argv[4]), json.loads(sys.argv[5]),
+    )
+"""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(Path(__file__).parent),
+            str(tmp_path),
+            json.dumps(inventory),
+            json.dumps(unknown),
+            json.dumps(forbidden_module),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("unknown", [False, True, "data"])
+def test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import(
+    tmp_path, inventory, unknown
+):
+    _run_runtime_identity_ast(tmp_path, inventory, unknown)
+
+
+@pytest.mark.parametrize("forbidden_module", ["torch", "mobius._builder"])
+def test_actual_runtime_identity_ast_rejects_framework_contamination(
+    tmp_path, inventory, forbidden_module
+):
+    _run_runtime_identity_ast(tmp_path, inventory, False, forbidden_module)
+
+
+def test_runtime_identity_cases_survive_framework_import_during_pytest_collection(tmp_path):
+    collected = tmp_path / "builder_collection_test.py"
+    collected.write_text(
+        "import sys\n"
+        "import torch\n"
+        "import mobius\n"
+        "assert 'torch' in sys.modules and 'mobius' in sys.modules\n"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-m",
+            "pytest",
+            "-c",
+            str(Path(__file__).resolve().parents[1] / "pyproject.toml"),
+            str(collected),
+            str(Path(__file__).resolve()),
+            "-q",
+            "--tb=short",
+            "-k",
+            "test_actual_runtime_identity_ast_uses_shared_observations_without_ort_import",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "3 passed" in completed.stdout
