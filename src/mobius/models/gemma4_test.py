@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import dataclasses
 
+import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 import torch
 
@@ -56,6 +58,178 @@ def _tiny_gemma4_config(**overrides) -> Gemma4Config:
     )
     defaults.update(overrides)
     return Gemma4Config(**defaults)
+
+
+class TestGemma4FixedVision:
+    @staticmethod
+    def _build(config: Gemma4Config) -> ir.Model:
+        from mobius._builder import _cast_module_dtype
+        from mobius._optimizations import optimize_model
+        from mobius.models.gemma4 import _Gemma4VisionEncoderModel
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        module = _Gemma4VisionEncoderModel(config)
+        _cast_module_dtype(module, config.dtype)
+        model = Gemma4Task()._build_vision(module, config)
+        optimize_model(model, ep="default", dtype=config.dtype, model_role="encoder")
+        return model
+
+    @pytest.mark.parametrize(
+        "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+    )
+    @pytest.mark.parametrize("batch_size", [1, 2, None])
+    def test_fixed_shapes(self, batch_size, dtype):
+        config = _tiny_gemma4_config(
+            vision_patch_capacity=2520, vision_batch_size=batch_size, dtype=dtype
+        )
+        model = self._build(config)
+
+        assert list(model.graph.inputs[0].shape[1:]) == [2520, 48]
+        assert list(model.graph.inputs[1].shape[1:]) == [2520, 2]
+        if batch_size is not None:
+            assert model.graph.inputs[0].shape[0] == batch_size
+            assert list(model.graph.outputs[0].shape) == [batch_size * 280, 64]
+        else:
+            assert model.graph.inputs[0].shape[0] == ir.SymbolicDim("image_batch")
+        assert not any(node.op_type == "Compress" for node in model.graph)
+
+    def test_package_preserves_embedding_contract(self):
+        from mobius import build_from_module
+        from mobius.tasks import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False, vision_patch_capacity=2520, vision_batch_size=2
+        )
+        package = build_from_module(Gemma4Model(config), config, task=Gemma4Task())
+        assert list(package["vision_encoder"].graph.outputs[0].shape) == [560, 64]
+        image_features = next(
+            value
+            for value in package["embedding"].graph.inputs
+            if value.name == "image_features"
+        )
+        assert image_features.shape[0] == ir.SymbolicDim("num_image_tokens")
+        assert image_features.shape[1] == config.hidden_size
+
+    def test_default_vision_retains_dynamic_output(self):
+        model = self._build(_tiny_gemma4_config())
+        assert list(model.graph.inputs[0].shape) == [
+            1,
+            ir.SymbolicDim("num_patches"),
+            48,
+        ]
+        assert model.graph.outputs[0].shape[0] != 280
+
+    @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+    @pytest.mark.parametrize("batch_size", [2, None])
+    def test_valid_prefixes_match_dynamic_vision(self, tmp_path, dtype, batch_size):
+        """Padded batched inference retains each image's unpadded reference features."""
+        config = _tiny_gemma4_config(dtype=dtype)
+        config.vision.use_clipped_linears = True
+        baseline = self._build(config)
+        fixed = self._build(
+            dataclasses.replace(config, vision_patch_capacity=72, vision_batch_size=batch_size)
+        )
+        sessions = []
+        for name, model in (("baseline", baseline), ("fixed", fixed)):
+            rng = np.random.default_rng(42)
+            for key, value in sorted(model.graph.initializers.items()):
+                if value.const_value is not None:
+                    continue
+                shape = tuple(value.shape)
+                if key.endswith(("_min", "_max")):
+                    array = np.full(shape, -5 if key.endswith("_min") else 5)
+                elif "norm" in key and key.endswith(".weight"):
+                    array = np.ones(shape)
+                else:
+                    array = rng.normal(0, 0.1, size=shape)
+                value.const_value = ir.tensor(array.astype(dtype.numpy()))
+            path = tmp_path / f"{name}.onnx"
+            ir.save(model, path)
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 1
+            sessions.append(
+                ort.InferenceSession(
+                    str(path), sess_options=options, providers=["CPUExecutionProvider"]
+                )
+            )
+        reference_session, fixed_session = sessions
+        rng = np.random.default_rng(17)
+        pixels = rng.random((2, 72, 48)).astype(dtype.numpy())
+        positions = np.full((2, 72, 2), -1, dtype=np.int64)
+        for image, (width, height) in enumerate(((6, 6), (9, 6))):
+            y, x = np.indices((height, width))
+            positions[image, : width * height] = np.stack((x.ravel(), y.ravel()), axis=-1)
+        actual = fixed_session.run(
+            None, {"pixel_values": pixels, "pixel_position_ids": positions}
+        )[0].reshape(2, 8, 64)
+        for image, patches in enumerate((36, 54)):
+            expected = reference_session.run(
+                None,
+                {
+                    "pixel_values": pixels[image : image + 1, :patches],
+                    "pixel_position_ids": positions[image : image + 1, :patches],
+                },
+            )[0]
+            count = patches // 9
+            np.testing.assert_allclose(actual[image, :count], expected, rtol=2e-3, atol=2e-3)
+            np.testing.assert_array_equal(actual[image, count:], 0)
+        if batch_size is None:
+            single = fixed_session.run(
+                None,
+                {"pixel_values": pixels[:1], "pixel_position_ids": positions[:1]},
+            )[0]
+            np.testing.assert_allclose(single, actual[0], rtol=2e-3, atol=2e-3)
+
+    def test_spatial_pooling_has_no_holes(self, tmp_path):
+        """Production-capacity pooling matches spatial, not consecutive-slot, means."""
+        from mobius.models.gemma4 import Gemma4FixedVisionPooler
+        from mobius.tasks._base import _make_graph, _make_model
+
+        graph, builder = _make_graph()
+        features = builder.input("features", dtype=ir.DataType.FLOAT, shape=[3, 2520, 4])
+        positions = builder.input("positions", dtype=ir.DataType.INT64, shape=[3, 2520, 2])
+        pooled = Gemma4FixedVisionPooler(4, 3, 280)(builder.op, features, positions)
+        builder.add_output(pooled, "pooled")
+        path = tmp_path / "pooler.onnx"
+        ir.save(_make_model(graph), path)
+        session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        rng = np.random.default_rng(29)
+        values = rng.normal(size=(3, 2520, 4)).astype(np.float32)
+        coords = np.full((3, 2520, 2), -1, dtype=np.int64)
+        grids = ((57, 42), (42, 42), (60, 42))
+        for image, (width, height) in enumerate(grids):
+            y, x = np.indices((height, width))
+            coords[image, : width * height] = np.stack((x.ravel(), y.ravel()), axis=-1)
+        actual = session.run(None, {"features": values, "positions": coords})[0]
+        assert actual.shape == (3, 280, 4)
+        for image, (width, height) in enumerate(grids):
+            count = width * height // 9
+            expected = (
+                values[image, : width * height]
+                .reshape(height // 3, 3, width // 3, 3, 4)
+                .mean(axis=(1, 3))
+                .reshape(count, 4)
+                * 2
+            )
+            np.testing.assert_allclose(actual[image, :count], expected, atol=1e-6)
+            np.testing.assert_array_equal(actual[image, count:], 0)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"vision_patch_capacity": 0},
+            {"vision_patch_capacity": -9},
+            {"vision_patch_capacity": 10},
+            {"vision_batch_size": 2},
+            {"vision_patch_capacity": 72, "vision_batch_size": 0},
+            {"vision_patch_capacity": 72, "vision_batch_size": -1},
+            {"vision_patch_capacity": 72, "vision": None},
+            {"vision_patch_capacity": 72, "model_type": "gemma4_unified"},
+        ],
+    )
+    def test_invalid_export_contract(self, overrides):
+        with pytest.raises(ValueError, match="vision_"):
+            _tiny_gemma4_config(**overrides).validate()
 
 
 class TestGemma4CausalLMPreprocessWeights:

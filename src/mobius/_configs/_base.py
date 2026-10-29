@@ -3129,6 +3129,45 @@ class Gemma4Config(VisionLanguageConfig):
     # it into L separate [V, D] tables that each fit within the EP's buffer limit.
     split_per_layer_embedding: bool = False
 
+    vision_patch_capacity: int | None = None
+    """Opt-in fixed patch slots for standard Gemma4 vision exports.
+
+    Must be positive and divisible by the spatial pooling kernel area.
+    Output capacity is ``vision_patch_capacity // pooling_kernel_size**2``,
+    with valid features first and padding at the end of each image.
+    """
+
+    vision_batch_size: int | None = 1
+    """Vision batch size in fixed-capacity mode; ``None`` allows dynamic batch.
+
+    Dynamic-output vision exports retain their single-image contract.
+    This does not enable batching of independent prompts in the embedding model.
+    """
+
+    def validate(self) -> None:
+        super().validate()
+        if self.vision_patch_capacity is None:
+            if self.vision_batch_size != 1:
+                raise ValueError("vision_batch_size requires vision_patch_capacity")
+            return
+        if self.vision is None:
+            raise ValueError("vision_patch_capacity requires a vision config")
+        if self.model_type == "gemma4_unified":
+            raise ValueError(
+                "vision_patch_capacity is only supported for standard Gemma4 vision"
+            )
+        kernel = self.vision.pooling_kernel_size or 3
+        if (
+            kernel <= 0
+            or self.vision_patch_capacity <= 0
+            or self.vision_patch_capacity % (kernel * kernel)
+        ):
+            raise ValueError(
+                "vision_patch_capacity must be positive and divisible by the pooling kernel area"
+            )
+        if self.vision_batch_size is not None and self.vision_batch_size <= 0:
+            raise ValueError("vision_batch_size must be positive or None")
+
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Gemma4Config:
         base = ArchitectureConfig.from_transformers(config, parent_config)
