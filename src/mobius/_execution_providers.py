@@ -99,6 +99,14 @@ class EpCapabilities:
             FP8 GQA kernel, so this defaults to ``False`` for every other EP —
             ``--features fp8-kv-cache`` is ignored (with a warning) on EPs that
             cannot run an FP8 KV cache, preventing invalid/unloadable models.
+        supports_transposed_matmul: ``True`` allows
+            :class:`~mobius._passes.TransposedWeightMatMulPass` to hand a
+            projection the checkpoint's ``[out, in]`` weight through
+            ``com.microsoft::FusedMatMul`` with ``transB=1``, instead of a
+            ``MatMul`` against a pre-transposed ``[in, out]`` initializer.  At
+            batch 1 cuBLAS is faster on the transposed layout.  Only CUDA sets
+            it; ``--features transposed-matmul`` is ignored (with a warning)
+            elsewhere.
         supports_matmul_nbits: ``False`` converts ``com.microsoft::MatMulNBits``
             (blockwise-INT4 weight) into a standard ``DequantizeLinear`` +
             ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
@@ -163,6 +171,7 @@ class EpCapabilities:
     supports_tensor_scatter: bool = True
     supports_range: bool = True
     supports_fp8_kv_cache: bool = False
+    supports_transposed_matmul: bool = False
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
@@ -325,6 +334,7 @@ def _register_builtins() -> None:
             # Only CUDA ships the FP8 (E4M3) GroupQueryAttention KV-cache kernel
             # (SM89+ Ada/Hopper/Blackwell).
             supports_fp8_kv_cache=True,
+            supports_transposed_matmul=True,
         ),
         EpCapabilities(
             name="dml",

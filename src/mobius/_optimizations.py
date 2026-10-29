@@ -65,6 +65,7 @@ from mobius._passes import (
     FoldTransposedInitializerPass,
     Fp8KvCachePass,
     RemoveDeadGraphInputsPass,
+    TransposedWeightMatMulPass,
 )
 from mobius._pipeline_contract import requires_arbitrary_attention_mask
 from mobius.functions import register_function_bodies
@@ -518,6 +519,7 @@ def optimize_model(
     trace: bool = False,
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
+    transposed_matmul: bool = False,
 ) -> None:
     """Apply EP-aware optimization passes to *model* in-place.
 
@@ -553,6 +555,15 @@ def optimize_model(
             per-tensor FP8 scales (from offline calibration). Only used when
             ``fp8_kv_cache`` is ``True``; layers absent from the map use a unit
             scale of ``1.0``.
+        transposed_matmul: When ``True``, rewrite decoder projections into
+            ``com.microsoft::FusedMatMul`` with ``transB=1`` via
+            :class:`~mobius._passes.TransposedWeightMatMulPass`, so their
+            weights keep the checkpoint's ``[out, in]`` layout. Runs after the
+            fusion and lowering stages, so GQA fusion and Q/K/V packing match
+            the ``MatMul`` nodes first. Only applied when
+            ``caps.supports_transposed_matmul`` (currently CUDA only);
+            otherwise a warning is emitted and the request is ignored. Other
+            roles (encoders, embeddings) are left alone.
 
     Raises:
         ValueError: If *ep* is not a registered execution provider.
@@ -682,6 +693,21 @@ def optimize_model(
 
         for _, ir_pass in lower_ir_passes:
             ir_pass(model)
+
+    # Transposed-weight projections: after fusion and lowering, so the GQA
+    # and PackQKV rewrites have matched the plain MatMul nodes, and before
+    # weights are loaded, so FoldTransposedInitializerPass finds no Transpose
+    # left to fold for the rewritten projections.
+    if transposed_matmul and model_role == "decoder":
+        if caps.supports_transposed_matmul:
+            TransposedWeightMatMulPass()(model)
+        else:
+            warnings.warn(
+                f"transposed_matmul=True was requested but ep={ep!r} does not "
+                f"enable transposed-weight projections (currently only "
+                f"--execution-provider cuda). Ignoring the request.",
+                stacklevel=4,
+            )
 
     # Stage 4: Final dead-node removal, constant folding, and dead input
     # cleanup after rewrites.
