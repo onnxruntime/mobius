@@ -125,11 +125,13 @@ def test_compatibility_normalizer_uses_existing_packer():
 
 
 @pytest.mark.parametrize(("method", "bits"), [("gptq", 4), ("gptq", 8), ("awq", 4)])
-def test_dotted_affine_embedding_normalizes_to_gather_bytes(method, bits):
+@pytest.mark.parametrize("group_size", [-1, 16])
+@pytest.mark.parametrize("kind", ["linear", "embedding"])
+def test_dotted_affine_weights_normalize_to_component_layout(method, bits, group_size, kind):
     component = ComponentDescriptor("embedding", "embedding", "embedding")
     config = QuantizationConfig(
         bits=bits,
-        group_size=16,
+        group_size=group_size,
         quant_method=method,
         sym=True,
         quantize_embeddings=True,
@@ -137,7 +139,9 @@ def test_dotted_affine_embedding_normalizes_to_gather_bytes(method, bits):
     qweight = (
         torch.arange(bits * 8, dtype=torch.int32).reshape(bits, 8) * 0x010203 + 0x12345678
     )
-    scales = torch.linspace(0.125, 1.125, 16).reshape(2, 8)
+    block_size = 32 if group_size == -1 else group_size
+    groups = 32 // block_size
+    scales = torch.linspace(0.125, 1.125, groups * 8).reshape(groups, 8)
     codec = codec_registry.get(method)
     record = codec.group(
         component,
@@ -145,7 +149,7 @@ def test_dotted_affine_embedding_normalizes_to_gather_bytes(method, bits):
         config,
     )["embedding.tokens.weight"]
 
-    normalized = codec.normalize(record, config, kind="embedding")
+    normalized = codec.normalize(record, config, kind=kind)
 
     expected = (
         torch.stack([(qweight >> shift) & 255 for shift in (0, 8, 16, 24)], dim=-1)
@@ -153,9 +157,14 @@ def test_dotted_affine_embedding_normalizes_to_gather_bytes(method, bits):
         .reshape(8, 32 * bits // 8)
         .to(torch.uint8)
     )
-    assert set(normalized) == {"embedding.tokens.qweight", "embedding.tokens.scales"}
-    assert normalized["embedding.tokens.qweight"].dtype == torch.uint8
-    torch.testing.assert_close(normalized["embedding.tokens.qweight"], expected)
+    weight_key = (
+        "embedding.tokens.qweight" if kind == "embedding" else "embedding.tokens.weight"
+    )
+    if kind == "linear":
+        expected = expected.reshape(8, groups, block_size * bits // 8)
+    assert set(normalized) == {weight_key, "embedding.tokens.scales"}
+    assert normalized[weight_key].dtype == torch.uint8
+    torch.testing.assert_close(normalized[weight_key], expected)
     torch.testing.assert_close(normalized["embedding.tokens.scales"], scales.T)
 
 

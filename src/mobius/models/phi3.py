@@ -32,6 +32,9 @@ class Phi3CausalLMModel(FusedGateUpCausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = super().preprocess_weights(state_dict)
+        raw_projection_stems = {
+            key.removesuffix(".qweight") for key in state_dict if key.endswith(".qweight")
+        }
         for key in list(state_dict.keys()):
             if "qkv_proj" in key:
                 q, k, v = split_fused_qkv(
@@ -39,6 +42,8 @@ class Phi3CausalLMModel(FusedGateUpCausalLMModel):
                     self.config.num_attention_heads,
                     self.config.num_key_value_heads,
                     self.config.head_dim,
+                    # Deferred sidecars retain [packed K or groups, N] orientation.
+                    dim=-1 if key.rsplit(".", 1)[0] in raw_projection_stems else 0,
                 )
                 state_dict[key.replace("qkv_proj", "q_proj")] = q
                 state_dict[key.replace("qkv_proj", "k_proj")] = k

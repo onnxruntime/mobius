@@ -11,7 +11,7 @@ the Qualcomm Hexagon HTP (QNN EP), whose partitioner otherwise rejects every
 ``MatMulNBits`` node and forces the quantized MatMuls onto CPU.
 
 **Op semantics (4-bit):** the weight ``B`` is stored packed as
-``(N, n_blocks, block_size/2)`` ``uint8`` — two 4-bit values per byte, low
+``(N, n_blocks, ceil(block_size/2))`` ``uint8`` — two 4-bit values per byte, low
 nibble first. ``scales`` is ``(N, n_blocks)`` and the optional ``zero_points``
 is ``(N, ceil(n_blocks/2))`` ``uint8`` (also 4-bit packed along the block axis).
 Element ``(n, k)`` dequantizes as ``(w[n,k] - zp[n, k//block]) * scale[n, k//block]``
@@ -60,7 +60,7 @@ def matmul_nbits(*, has_zero_points: bool = True) -> ir.Function:
 
     Inputs:
         A:            (..., K) activation.
-        B:            (N, n_blocks, block_size/2) uint8 packed 4-bit weight.
+        B:            (N, n_blocks, ceil(block_size/2)) uint8 packed 4-bit weight.
         scales:       (N, n_blocks) dequant scales.
         zero_points:  (N, ceil(n_blocks/2)) uint8 packed 4-bit zero points.
 
@@ -95,6 +95,14 @@ def matmul_nbits(*, has_zero_points: bool = True) -> ir.Function:
         keep_n = op.Constant(value=ir.tensor(np.array([0, -1], dtype=np.int64)))
         w_blocks = op.Reshape(w_inter, keep_n_nb)
         w_2d = op.Reshape(w_blocks, keep_n)
+        # The last storage block can extend past K (including per-channel
+        # blocks). Discard padding before dequantization and the matmul.
+        w_2d = op.Slice(
+            w_2d,
+            op.Constant(value=ir.tensor(np.array([0], dtype=np.int64))),
+            op.Shape(a_input, start=-1),
+            op.Constant(value=ir.tensor(np.array([1], dtype=np.int64))),
+        )
         w4 = op.Cast(w_2d, to=ir.DataType.UINT4)
 
         if has_zero_points:

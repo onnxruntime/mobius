@@ -15,7 +15,8 @@ class ChatGLMCausalLMModel(CausalLMModel):
     GLM-4's original ChatGLM checkpoint layout nests decoder weights below
     ``transformer.encoder`` and stores QKV and gate/up projections fused.
     Canonicalize those names before generic GPTQ preprocessing, then split the
-    converted QKV and gate/up tensors along their output dimension. Splitting
+    QKV and gate/up tensors along their output dimension, including raw
+    sidecars deferred for leaf-aware normalization. Splitting
     the repacked gate/up tensors is lossless and avoids a runtime activation
     Split between captured CUDA graph segments.
     """
@@ -37,6 +38,9 @@ class ChatGLMCausalLMModel(CausalLMModel):
             renamed[key] = value
 
         state_dict = super().preprocess_weights(renamed)
+        raw_projection_stems = {
+            key.removesuffix(".qweight") for key in state_dict if key.endswith(".qweight")
+        }
 
         quantization = getattr(self.config, "quantization", None)
         if quantization is not None and quantization.sym:
@@ -54,6 +58,7 @@ class ChatGLMCausalLMModel(CausalLMModel):
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
                 self.config.head_dim,
+                dim=-1 if key.rsplit(".", 1)[0] in raw_projection_stems else 0,
             )
             state_dict[key.replace("qkv_proj", "q_proj")] = q
             state_dict[key.replace("qkv_proj", "k_proj")] = k
@@ -65,6 +70,7 @@ class ChatGLMCausalLMModel(CausalLMModel):
             gate, up = split_gate_up_proj(
                 state_dict.pop(key),
                 self.config.intermediate_size,
+                dim=-1 if key.rsplit(".", 1)[0] in raw_projection_stems else 0,
             )
             state_dict[key.replace("gate_up_proj", "gate_proj")] = gate
             state_dict[key.replace("gate_up_proj", "up_proj")] = up

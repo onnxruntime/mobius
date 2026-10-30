@@ -721,6 +721,19 @@ class TestBuildDiffusersPipelineSuccess:
         model = ir.Model(graph, ir_version=10)
         mock_build_from_module.return_value = ModelPackage({"model": model})
 
+    @pytest.mark.parametrize("level", [None, 0, 4])
+    @patch("mobius.integrations.diffusers._builder.build_from_module")
+    @patch("mobius.integrations.diffusers._builder._load_diffusers_component_config")
+    @patch("mobius.integrations.diffusers._builder._load_diffusers_pipeline_index")
+    def test_forwards_accuracy_override(
+        self, mock_load_index, mock_load_config, mock_build_from_module, level
+    ):
+        self._mock_build_for_vae(mock_load_index, mock_load_config, mock_build_from_module)
+        build_diffusers_pipeline(
+            "fake/vae-model", load_weights=False, matmul_nbits_accuracy_level=level
+        )
+        assert mock_build_from_module.call_args.kwargs["matmul_nbits_accuracy_level"] == level
+
     @patch("mobius.integrations.diffusers._builder.build_from_module")
     @patch(
         "mobius.integrations.diffusers._builder._load_diffusers_component_config",

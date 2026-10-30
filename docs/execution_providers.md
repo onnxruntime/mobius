@@ -62,6 +62,19 @@ pkg = build_from_module(
 > **Note:** Passing an unknown EP name raises `ValueError` during
 > optimization. Use `ep_registry` from `mobius` to query registered EPs.
 
+For per-channel quantization (`group_size=-1`), `MatMulNBits` uses one block
+equal to each projection's input width. An explicit `"cpu"` build rejects
+blocks that are not powers of two >= 16 before export, rather than producing
+a model the native CPU kernel cannot load. Weights are not reblocked or
+requantized. Additional native-kernel restrictions can depend on the runtime
+version and weight format.
+
+The target-neutral `"default"` mode does not validate CPU compatibility.
+Select `"cpu"` when targeting that backend. For 4-bit layouts unsupported by
+the native kernel, `"onnx-standard"` expands `MatMulNBits` to standard ONNX
+dequantization and matrix multiplication; `"qnn"` retains its existing QDQ
+lowering behavior.
+
 The `onnx-standard` validator accepts official core ONNX operators (`""` /
 `ai.onnx`) and ONNX-ML operators (`ai.onnx.ml`), checking each domain's declared
 opset against its own schemas. ML operators require an explicit `ai.onnx.ml`
