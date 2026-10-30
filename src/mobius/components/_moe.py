@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
@@ -446,6 +447,8 @@ class MoELayer(nn.Module):
     and compatibility path, not the grouped-expert performance representation.
     """
 
+    _qmoe_activation_type: ClassVar[str] = "swiglu"
+
     def __init__(
         self,
         config: ArchitectureConfig,
@@ -637,7 +640,7 @@ class MoELayer(nn.Module):
             self.fc2_experts_zero_points,
             None,
             router_weights,
-            activation_type="swiglu",
+            activation_type=self._qmoe_activation_type,
             normalize_routing_weights=int(normalize),
             k=self.top_k,
             # A uniform override can use the global attribute directly.

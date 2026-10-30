@@ -100,6 +100,73 @@ ops to fused equivalents:
 
 These are applied during **Stage 2: Fusion** of the optimization pipeline.
 
+#### Projection packing and numerical limitations
+
+`PackQKVProjections` combines compatible projections into one GEMM and splits
+the result **before normalization, RoPE, attention, or caches**, without changing
+their contracts. It supports Q/K/V and Q/K with raw K reused for V.
+
+| Stage | Roles | Enablement |
+|---|---|---|
+| Existing float `PackQKV` GQA-input fusion | `decoder` | Unchanged |
+| Additional float `PackQKVProjections` | `decoder`, `masked-decoder` | **Experimental; disabled on every built-in EP**; explicit `qkv_projection_pack_dtypes` opt-in |
+| INT4 projection packing | `decoder`, `masked-decoder` | **Experimental; disabled on every built-in EP**, including CUDA FP16/BF16 |
+
+Experimental float and INT4 projection packing use independent process-local
+capabilities. Stock `--ep cuda` enables neither new stage; the existing
+`qkv_pack_dtypes`-gated GQA-input packing is unchanged. Set only the capabilities
+you intend to evaluate (the example opts into both):
+
+```python
+import dataclasses
+
+import onnx_ir as ir
+from mobius import get_ep, register_ep
+
+register_ep(
+    dataclasses.replace(
+        get_ep("cuda"),
+        qkv_projection_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
+        matmul_nbits_qkv_pack_dtypes=frozenset({ir.DataType.FLOAT16}),
+    ),
+    overwrite=True,
+)
+```
+
+Both opt-ins are independent of legacy float packing, activation/storage dtype,
+component precision, and FP8 KV caches. Neither byte-exact payload tests nor
+CPU FLOAT execution tests qualify CUDA FP16/BF16 numerical parity. Packing never
+dequantizes, requantizes, or promotes weights.
+`_qkv_projection_packing.py` implements both float and INT4.
+
+Packing requires static, non-overridable, compatible parameters and opset >= 13;
+ambiguous or overlapping groups and weights with outside consumers are skipped.
+INT4 additionally requires a shared rank-3 activation, matching attributes except
+output width, canonical UINT8 blocked weights, same-dtype scales, and consistently
+absent or packed UINT8 zero points. Flat/row-major sidecars are supported;
+block size must be a power of two >= 16 and `accuracy_level` omitted or zero.
+Mixed bit widths, extra operands, and caller-owned function bodies are skipped.
+
+Parameter Concats retain checkpoint names until binding, then initializer
+Concats and matrix Transposes fold lazily without changing dtype. Missing leaves
+are checked even with `fold_constants=False`. Generic Reshape/Transpose layout
+folding is not part of this pipeline; those transformations remain explicit.
+Overridable inputs remain untouched.
+
+**The INT4 numerical gate remains failed and unwaived:** large-dimension CUDA
+prefill/cached-decode logits exceeded `rtol=atol=1e-2`. Changing GEMM width can
+change floating-point results despite byte-exact weights. MMLU/generation results
+do not clear that gate; float projection packing has no separate numerical
+qualification here. No production accuracy or speed improvement is claimed.
+
+For `ORT_FPA_INTB_GEMM=1`, keep exporter or ORT constant folding enabled so
+parameter Concats do not block runtime prepacking; behavior is runtime-dependent.
+Packed float weights retain adapter-restoration metadata and lazy backing-file
+ownership after pruning. `ModelPackage.save()` rejects known same-path, hardlink,
+or symlink aliases to backing files across model, shard, policy, adapter, metadata,
+and MTP destinations. This is **not full TOCTOU protection**; save to a separate
+output directory.
+
 ### Tier 3 — EP-specific constraints (required, correctness)
 
 Some EPs cannot execute certain ops. These are handled by **lowering rules**
@@ -126,7 +193,8 @@ Every EP is fully described by a single `EpCapabilities` entry in the
 class EpCapabilities:
     name: str
     gqa_dtypes: frozenset[ir.DataType]               # dtypes where GQA fusion fires
-    qkv_pack_dtypes: frozenset[ir.DataType]          # dtypes where PackQKV fusion fires
+    qkv_pack_dtypes: frozenset[ir.DataType]          # legacy GQA-input packing only
+    qkv_projection_pack_dtypes: frozenset[ir.DataType]  # experimental float; default empty
     supports_fused_rope: bool = True                 # False → SeparateRoPE + UnpackQKV
     supports_skip_layer_norm: bool = True            # False → InlinePass expansion
     supports_fused_matmul: bool = True               # False → Transpose + MatMul via InlinePass
