@@ -1,0 +1,67 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+name: mobius-release.$(Date:yyyyMMdd).$(Rev:r)
+
+trigger:
+  branches:
+    exclude:
+      - "*"
+  tags:
+    include:
+      - "v*"
+pr: none
+
+resources:
+  repositories:
+    - repository: 1esPipelines
+      type: git
+      name: 1ESPipelineTemplates/1ESPipelineTemplates
+      ref: refs/tags/release
+
+extends:
+  template: v1/1ES.Official.PipelineTemplate.yml@1esPipelines
+  parameters:
+    sdl:
+      sourceAnalysisPool:
+        name: onnxruntime-Win-CPU-2022
+        os: windows
+    pool:
+      name: onnxruntime-Ubuntu2204-AMD-CPU
+      os: linux
+    stages:
+      - stage: Build
+        displayName: Build distribution
+        jobs:
+          - job: BuildDistribution
+            workspace:
+              clean: all
+            steps:
+              - checkout: self
+                clean: true
+                persistCredentials: false
+              - task: UsePythonVersion@0
+                displayName: Set up Python
+                inputs:
+                  versionSpec: "3.12"
+              - script: python -m pip install build twine
+                displayName: Install build dependencies
+              - script: python -m build
+                displayName: Build sdist and wheel
+              - script: python -m twine check dist/*
+                displayName: Verify distribution metadata
+              - script: python -m pip install --no-deps dist/*.whl
+                displayName: Verify wheel installation
+              - task: CopyFiles@2
+                displayName: Stage distributions
+                inputs:
+                  SourceFolder: "$(Build.SourcesDirectory)/dist"
+                  Contents: |
+                    *.whl
+                    *.tar.gz
+                  TargetFolder: "$(Build.ArtifactStagingDirectory)"
+              - task: 1ES.PublishPipelineArtifact@1
+                displayName: Publish distributions
+                inputs:
+                  artifactName: mobius
+                  targetPath: "$(Build.ArtifactStagingDirectory)"

@@ -6701,6 +6701,9 @@ _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
 def _graph_config_fields_for_fingerprint(config, gguf_arch: str) -> dict[str, object]:
     """Serialize only fields consumed by an architecture's imported graph."""
     fields = asdict(config)
+    if fields.get("mamba_ssm_dtype") is None:
+        # Inherited model-dtype state preserves the pre-policy fingerprint.
+        fields.pop("mamba_ssm_dtype", None)
     if not fields.get("qmoe_source_paths"):
         # This field postdates pinned GGUF routes; its empty default must preserve their hashes.
         fields.pop("qmoe_source_paths", None)

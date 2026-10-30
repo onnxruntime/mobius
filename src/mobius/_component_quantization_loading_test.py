@@ -28,8 +28,10 @@ from mobius._configs import (
 from mobius._testing import make_config
 from mobius.components import Linear, QuantizedLinear
 from mobius.models import CausalLMModel
+from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.gemma4 import Gemma4Model
 from mobius.models.moe import Qwen2MoECausalLMModel
+from mobius.models.phi3 import Phi3CausalLMModel
 from mobius.models.qwen3_next import Qwen3NextCausalLMModel
 from mobius.models.qwen35 import (
     Qwen35CausalLMModel,
@@ -253,6 +255,87 @@ def test_global_per_channel_loading_uses_each_projection_logical_width(method, b
         _assert_bound(package, "model", f"{name}.weight", weight)
         _assert_bound(package, "model", f"{name}.scales", scales)
         _assert_bound(package, "model", f"{name}.zero_points", zeros)
+
+
+@pytest.mark.parametrize("model_class", [Phi3CausalLMModel, ChatGLMCausalLMModel])
+@pytest.mark.parametrize("method", ["gptq", "awq"])
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_per_channel_fused_projection_loading(model_class, method, bits, symmetric):
+    quantization = _quantization(quant_method=method, bits=bits, group_size=-1, sym=symmetric)
+    config = make_config(
+        model_type="chatglm" if model_class is ChatGLMCausalLMModel else "phi3",
+        num_hidden_layers=1,
+        hidden_size=32,
+        intermediate_size=33,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        quantization=quantization,
+    )
+    module = model_class(config)
+    package = _build(module)
+    state_dict = {}
+    expected = {}
+    for projection, k, sizes, targets in (
+        ("self_attn.qkv_proj", 32, (32, 16, 16), ("q_proj", "k_proj", "v_proj")),
+        (
+            "mlp.gate_up_proj",
+            32,
+            (33, 33) if model_class is ChatGLMCausalLMModel else (66,),
+            ("gate_proj", "up_proj")
+            if model_class is ChatGLMCausalLMModel
+            else ("gate_up_proj",),
+        ),
+        ("mlp.down_proj", 33, (32,), ("down_proj",)),
+    ):
+        n = sum(sizes)
+        name = f"model.layers.0.{projection}"
+        packed = torch.arange(math.ceil(k * bits / 32) * n, dtype=torch.int32).reshape(-1, n)
+        scales = _floats(1, n)
+        state_dict.update(
+            {
+                f"{name}.qweight": packed,
+                f"{name}.scales": scales,
+                f"{name}.qzeros": torch.full((1, n), 0x55555555, dtype=torch.int32),
+            }
+        )
+        blob_size = math.ceil(k * bits / 8)
+        weight = (
+            torch.stack([(packed >> shift) & 255 for shift in (0, 8, 16, 24)], dim=-1)
+            .transpose(0, 1)
+            .reshape(n, -1)[:, :blob_size]
+            .to(torch.uint8)
+            .reshape(n, 1, blob_size)
+        )
+        zero = 0x44 if method == "awq" and bits == 4 else (0x54 if method == "awq" else 0x55)
+        offset = 0
+        for size, target in zip(sizes, targets):
+            target_name = f"model.layers.0.{projection.rsplit('.', 1)[0]}.{target}"
+            expected[target_name] = (
+                k,
+                weight[offset : offset + size],
+                scales.T[offset : offset + size],
+                torch.full((size, 1), zero, dtype=torch.uint8),
+            )
+            offset += size
+    if model_class is ChatGLMCausalLMModel:
+        state_dict = {
+            key.replace("model.layers.", "transformer.encoder.layers.")
+            .replace(".self_attn.qkv_proj.", ".self_attention.query_key_value.")
+            .replace(".mlp.gate_up_proj.", ".mlp.dense_h_to_4h.")
+            .replace(".mlp.down_proj.", ".mlp.dense_4h_to_h."): value
+            for key, value in state_dict.items()
+        }
+
+    _load(module, package, state_dict)
+
+    for name, (k, weight, scales, zeros) in expected.items():
+        _assert_layout(package, "model", f"{name}.weight", bits, k)
+        _assert_bound(package, "model", f"{name}.weight", weight)
+        _assert_bound(package, "model", f"{name}.scales", scales)
+        if not symmetric:
+            _assert_bound(package, "model", f"{name}.zero_points", zeros)
 
 
 @pytest.mark.parametrize(("method", "bits"), [("gptq", 8), ("awq", 4)])

@@ -12,6 +12,7 @@ __all__ = [
 ]
 
 import dataclasses
+import inspect
 from collections.abc import Mapping
 from typing import Any, Protocol
 
@@ -20,7 +21,7 @@ from onnxscript import nn
 
 from mobius._component_manifest import ComponentManifest
 from mobius._configs import BaseModelConfig
-from mobius._weight_utils import materialize_split_tied_olive_lm_head
+from mobius._weight_utils import WeightTransform, materialize_split_tied_olive_lm_head
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,8 +82,14 @@ def adapt_model_weights(
     *,
     config: BaseModelConfig,
     manifest: ComponentManifest,
+    weight_transforms: dict[str, WeightTransform] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Run an explicit adapter or the legacy ``preprocess_weights`` hook."""
+    """Run an explicit adapter or the legacy ``preprocess_weights`` hook.
+
+    Supporting hooks fill ``weight_transforms`` in place with keys in their
+    returned dictionary. Explicit adapters and older hooks retain their existing
+    behavior and do not populate this mapping.
+    """
     context = WeightAdapterContext(config=config, manifest=manifest)
     state_dict = dict(state_dict)
     _materialize_shared_quantized_weights(state_dict, context)
@@ -93,7 +100,14 @@ def adapt_model_weights(
     preprocess = getattr(module, "preprocess_weights", None)
     if preprocess is None:
         return state_dict
-    result: Any = preprocess(state_dict)
+    result: Any
+    if (
+        weight_transforms is not None
+        and "weight_transforms" in inspect.signature(preprocess).parameters
+    ):
+        result = preprocess(state_dict, weight_transforms=weight_transforms)
+    else:
+        result = preprocess(state_dict)
     if not isinstance(result, dict):
         raise TypeError(
             f"{type(module).__name__}.preprocess_weights must return a dict, "

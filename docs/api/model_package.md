@@ -53,6 +53,12 @@ def save(
 | `include_policy_components` | `bool` | `True` | Save attached generation-policy models under `policies/`. |
 | `include_adapter_artifacts` | `bool` | `True` | Save attached parameter-adapter bundles under `adapters/`. |
 
+With `onnx-ir >= 1.1`, parallel ONNX writes can materialize multiple deferred
+weight-transform outputs at once. The outputs are not cached, but their lifetimes
+may overlap until their writes finish. Use `max_workers=1` when transformed
+tensors must be materialized one at a time; older `onnx-ir` versions fall back to
+serial writes.
+
 For packages whose weight-loading report sets `streaming_external_data=True`,
 and for qualifying packages with an export report, `save()` publishes
 transactionally to a destination that must not already exist. Models and
@@ -113,6 +119,35 @@ pkg.save("output/llama/", external_data="safetensors")
 # Bound serializer concurrency
 pkg.save("output/llama-serial/", max_workers=1)
 ```
+
+### Generic backbone-and-head packages
+
+Use `MultiComponentModelTask` when one non-generative package contains exactly
+one backbone or encoder and one or more named head graphs:
+
+```python
+from mobius import (
+    ComponentConfig,
+    ComponentRole,
+    ComponentSpec,
+    MultiComponentModelTask,
+)
+
+
+class EncoderWithHeadsTask(MultiComponentModelTask):
+    components = ComponentSpec(
+        encoder=ComponentConfig("encoder", ComponentRole.ENCODER),
+        classifier=ComponentConfig("heads.classifier", ComponentRole.HEAD),
+    )
+
+    def build_component(self, name, component, module, config):
+        ...
+```
+
+The component names become `ModelPackage` keys. Roles are also exposed through
+`model_roles`, so existing inspection and optimization code treats head graphs
+as heads rather than decoder models. Dotted module paths allow components such
+as `heads.classifier` to be resolved from the root module.
 
 ## Output Layout
 

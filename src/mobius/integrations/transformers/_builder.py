@@ -23,6 +23,7 @@ from mobius._component_quantization import (
 from mobius._configs import QuantizedWeightFormat
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
+from mobius._weight_utils import WeightTransform
 from mobius.integrations._weight_loading import (
     _download_weights,
     stream_preprocessed_safetensors_to_model,
@@ -770,6 +771,7 @@ def build_transformers_model(
                 keep_quantized=keep_quantized,
             )
         else:
+            weight_transforms: dict[str, WeightTransform] = {}
             if dequantize_gptoss_mxfp4:
                 logger.warning(
                     "Explicit dense GPT-OSS MXFP4 reconstruction eagerly loads and "
@@ -792,6 +794,7 @@ def build_transformers_model(
                     state_dict,
                     config=config,
                     manifest=component_manifest,
+                    weight_transforms=weight_transforms,
                 )
             state_dict = normalize_component_quantized_weights(
                 state_dict,
@@ -804,8 +807,14 @@ def build_transformers_model(
             package.apply_weights(
                 state_dict,
                 prefix_map=getattr(model_module, "weight_prefix_map", None),
+                weight_transforms=weight_transforms,
             )
         validate_quantized_component_bindings(package, config)
+    if execution_provider == "onnx-standard":
+        from mobius._optimizations import validate_standard_onnx
+
+        for name, model in package.items():
+            validate_standard_onnx(model, component=name)
     return package
 
 
