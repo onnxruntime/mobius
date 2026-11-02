@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-name: mobius-release.$(Date:yyyyMMdd).$(Rev:r)
+name: mobius-build.$(Date:yyyyMMdd).$(Rev:r)
 
 trigger:
   branches:
@@ -40,6 +40,11 @@ extends:
               - checkout: self
                 clean: true
                 persistCredentials: false
+              # Python's downloaded setup script upgrades pip before returning.
+              - task: PipAuthenticate@1
+                displayName: Authenticate package feed
+                inputs:
+                  artifactFeeds: Lotus
               - task: UsePythonVersion@0
                 displayName: Set up Python
                 inputs:
