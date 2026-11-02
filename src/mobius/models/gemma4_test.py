@@ -578,6 +578,42 @@ class TestGemma4PerComponentQuantization:
         assert self._layouts(package["audio_encoder"].graph) == {(2, 16)}
         assert self._layouts(package["embedding"].graph) == {(8, 16)}
 
+    def test_decoder_per_channel_keeps_other_component_layouts(self):
+        from mobius import build_from_module
+
+        config = self._config()
+        decoder = dataclasses.replace(
+            config.component_quantization["decoder"],
+            group_size=-1,
+            quantize_lm_head=True,
+            overrides={"lm_head": QuantizationOverride(bits=8)},
+        )
+        config = dataclasses.replace(
+            config,
+            hidden_size=96,
+            intermediate_size=192,
+            quantization=decoder,
+            component_quantization={**config.component_quantization, "decoder": decoder},
+        )
+
+        package = build_from_module(Gemma4Model(config), config, task="gemma4")
+
+        projections = [
+            node for node in package["decoder"].graph if node.op_type == "MatMulNBits"
+        ]
+        assert projections
+        assert sum(node.attributes["bits"].as_int() == 8 for node in projections) == 1
+        for node in projections:
+            k = node.attributes["K"].as_int()
+            n = node.attributes["N"].as_int()
+            assert node.attributes["block_size"].as_int() == k
+            bits = node.attributes["bits"].as_int()
+            assert list(node.inputs[1].shape) == [n, 1, (k * bits + 7) // 8]
+            assert list(node.inputs[2].shape) == [n, 1]
+        assert self._layouts(package["vision_encoder"].graph) == {(8, 32)}
+        assert self._layouts(package["audio_encoder"].graph) == {(2, 16)}
+        assert self._layouts(package["embedding"].graph) == {(8, 16)}
+
     def test_preprocess_preserves_raw_component_sidecars(self):
         model = Gemma4Model(self._config())
         state_dict = {

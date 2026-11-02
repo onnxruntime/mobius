@@ -555,7 +555,8 @@ def optimize_model(
             scale of ``1.0``.
 
     Raises:
-        ValueError: If *ep* is not a registered execution provider.
+        ValueError: If *ep* is not a registered execution provider or a native
+            ``MatMulNBits`` block size is incompatible with its capabilities.
     """
     # Stage 1: Base cleanup (EP-agnostic — always applied).
     if trace:
@@ -585,6 +586,20 @@ def optimize_model(
         raise ValueError(
             f"Unknown execution provider {ep!r}. Supported: {sorted(ep_registry)}"
         )
+
+    if caps.supports_matmul_nbits and caps.requires_power_of_two_matmul_nbits_blocks:
+        for node in model.graph.all_nodes():
+            if node.domain != "com.microsoft" or node.op_type != "MatMulNBits":
+                continue
+            block_size = node.attributes.get_int("block_size", 128)
+            if block_size < 16 or block_size & (block_size - 1):
+                raise ValueError(
+                    f"MatMulNBits node {node.name!r} with block_size={block_size} "
+                    f"is incompatible with execution provider {caps.name!r}: "
+                    "native blocks must be a power of two >= 16. "
+                    "Choose a compatible EP or quantization layout; "
+                    "weights are not automatically reblocked."
+                )
 
     gqa_allowed = model_role == "decoder" and not requires_arbitrary_attention_mask(
         model.graph

@@ -19,6 +19,7 @@ The critical invariants:
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 from pathlib import Path
 
@@ -60,18 +61,19 @@ def _build_matmulnbits_model(
     has_zero_points: bool = True,
     keep_empty_slot: bool = False,
     dtype: ir.DataType = ir.DataType.FLOAT,
+    bits: int = 4,
 ) -> tuple[ir.Model, dict, np.ndarray, np.ndarray, np.ndarray]:
-    """Build a single-node MatMulNBits model with random 4-bit weights.
+    """Build a single-node MatMulNBits model with random packed weights.
 
     Returns ``(model, feeds, packed_weight, scales, packed_zero_points)``.
     """
-    nb = k_in // block
-    blob = block // 2  # 4-bit → 2 values per byte
+    nb = math.ceil(k_in / block)
+    blob = math.ceil(block * bits / 8)
     rng = np.random.default_rng(seed)
     numpy_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
     packed = rng.integers(0, 256, (n_out, nb, blob), dtype=np.uint8)
     scales = (rng.random((n_out, nb)).astype(np.float32) * 0.1 + 0.01).astype(numpy_dtype)
-    zero_points = rng.integers(0, 256, (n_out, (nb + 1) // 2), dtype=np.uint8)
+    zero_points = rng.integers(0, 256, (n_out, math.ceil(nb * bits / 8)), dtype=np.uint8)
     a = rng.standard_normal((2, 3, k_in)).astype(numpy_dtype)
 
     a_val = ir.Value(name="A", shape=ir.Shape([2, 3, k_in]), type=ir.TensorType(dtype))
@@ -79,7 +81,7 @@ def _build_matmulnbits_model(
     sc_c = _const("scales", scales)
     zp_c = _const("zero_points", zero_points)
     y = ir.Value(name="Y")
-    attributes = {"K": k_in, "N": n_out, "bits": 4, "block_size": block}
+    attributes = {"K": k_in, "N": n_out, "bits": bits, "block_size": block}
     if accuracy_level is not None:
         attributes["accuracy_level"] = accuracy_level
     inputs = [a_val, b_c, sc_c]
@@ -205,6 +207,74 @@ class TestMatMulNBitsInlineParity:
         got = _run(inlined, feeds2)
         np.testing.assert_allclose(got, reference, rtol=0, atol=0)
 
+    @pytest.mark.parametrize(
+        ("k", "block"),
+        [(7, 7), (33, 33), (96, 96), (1536, 1536), (7, 16), (33, 64), (65, 32)],
+    )
+    @pytest.mark.parametrize("has_zero_points", [False, True])
+    def test_inline_trims_single_block_padding(self, k, block, has_zero_points):
+        kwargs = {
+            "n_out": 8,
+            "k_in": k,
+            "block": block,
+            "has_zero_points": has_zero_points,
+        }
+        inlined, feeds, packed, scales, packed_zeros = _build_matmulnbits_model(**kwargs)
+        nb = math.ceil(k / block)
+        codes = np.empty((8, nb, packed.shape[-1] * 2), dtype=np.float32)
+        codes[..., 0::2] = packed & 0x0F
+        codes[..., 1::2] = packed >> 4
+        zeros = np.full((8, nb), 8, dtype=np.float32)
+        if has_zero_points:
+            zeros[:, 0::2] = packed_zeros & 0x0F
+            zeros[:, 1::2] = (packed_zeros >> 4)[:, : nb // 2]
+        weights = ((codes - zeros[..., None]) * scales[..., None]).reshape(8, -1)[:, :k]
+
+        self._inline(inlined)
+
+        matmul = next(node for node in inlined.graph if node.op_type == "MatMul")
+        output = inlined.graph.outputs[0]
+        inlined.graph.outputs.clear()
+        inlined.graph.outputs.append(matmul.inputs[1])
+        np.testing.assert_array_equal(_run(inlined, feeds), weights.T)
+        inlined.graph.outputs.clear()
+        inlined.graph.outputs.append(output)
+
+        # A runtime RHS matches the DQ path: constant-weight prepacking and NumPy
+        # BLAS can accumulate differently, especially for long, cancelling sums.
+        a = ir.Value(
+            name="A", shape=ir.Shape(feeds["A"].shape), type=ir.TensorType(ir.DataType.FLOAT)
+        )
+        w = ir.Value(
+            name="weights",
+            shape=ir.Shape(weights.shape),
+            type=ir.TensorType(ir.DataType.FLOAT),
+        )
+        transposed = ir.Value(name="weights_transposed")
+        y = ir.Value(name="Y")
+        reference_model = ir.Model(
+            ir.Graph(
+                inputs=[a, w],
+                outputs=[y],
+                nodes=[
+                    ir.Node(
+                        "",
+                        "Transpose",
+                        inputs=[w],
+                        outputs=[transposed],
+                        attributes={"perm": ir.AttrInt64s("perm", [1, 0])},
+                    ),
+                    ir.Node("", "MatMul", inputs=[a, transposed], outputs=[y]),
+                ],
+                opset_imports={"": 24},
+                name="dequantized_matmul",
+            ),
+            ir_version=10,
+        )
+        reference = _run(reference_model, {**feeds, "weights": weights})
+
+        np.testing.assert_array_equal(_run(inlined, feeds), reference)
+
     @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
     @pytest.mark.parametrize("keep_empty_slot", [False, True])
     @pytest.mark.parametrize("num_blocks", [1, 2, 3])
@@ -329,7 +399,52 @@ class TestMatMulNBitsInlineParity:
 class TestMatMulNBitsEpGating:
     """EPs without native MatMulNBits support lower blockwise INT4 to QDQ."""
 
-    def _build(self, ep: str, *, sym: bool = False):
+    @pytest.mark.parametrize("k", [7, 96, 1536])
+    @pytest.mark.parametrize("bits", [2, 4, 8])
+    def test_cpu_rejects_unsupported_full_channel_blocks(self, k, bits):
+        from mobius._optimizations import optimize_model
+
+        model, *_ = _build_matmulnbits_model(n_out=8, k_in=k, block=k, bits=bits)
+
+        with pytest.raises(ValueError, match=rf"block_size={k}.*'cpu'.*power of two >= 16"):
+            optimize_model(model, ep="cpu")
+
+    @pytest.mark.parametrize("block", [16, 32, 64, 128, 256])
+    def test_cpu_keeps_supported_native_blocks(self, block):
+        from mobius._optimizations import optimize_model
+
+        model, feeds, *_ = _build_matmulnbits_model(n_out=8, k_in=block, block=block)
+        reference = _run(model, feeds)
+
+        optimize_model(model, ep="cpu")
+
+        assert any(
+            node.domain == "com.microsoft" and node.op_type == "MatMulNBits"
+            for node in model.graph
+        )
+        np.testing.assert_array_equal(_run(model, feeds), reference)
+
+    @pytest.mark.parametrize("k", [7, 96, 1536])
+    @pytest.mark.parametrize(
+        "ep", ["default", "cuda", "openvino", "onnx-standard", "qnn", "trt-rtx"]
+    )
+    def test_other_eps_preserve_full_channel_export(self, ep, k):
+        from mobius._optimizations import optimize_model
+
+        model, *_ = _build_matmulnbits_model(n_out=8, k_in=k, block=k)
+
+        optimize_model(model, ep=ep)
+
+        ops = {node.op_type for node in model.graph}
+        if ep in {"default", "cuda", "openvino"}:
+            assert "MatMulNBits" in ops
+        else:
+            assert "MatMulNBits" not in ops
+            assert "DequantizeLinear" in ops
+
+    def _build(
+        self, ep: str, *, sym: bool = False, hidden_size: int = 64, group_size: int = 32
+    ):
         import dataclasses
         from collections import Counter
 
@@ -342,11 +457,11 @@ class TestMatMulNBitsEpGating:
 
         cfg = CausalLMConfig(
             num_hidden_layers=2,
-            hidden_size=64,
+            hidden_size=hidden_size,
             intermediate_size=128,
             num_attention_heads=4,
             num_key_value_heads=2,
-            head_dim=16,
+            head_dim=hidden_size // 4,
             vocab_size=256,
             max_position_embeddings=64,
             hidden_act="silu",
@@ -359,7 +474,7 @@ class TestMatMulNBitsEpGating:
         cfg = dataclasses.replace(
             cfg,
             quantization=QuantizationConfig(
-                bits=4, group_size=32, quant_method="gguf", sym=sym
+                bits=4, group_size=group_size, quant_method="gguf", sym=sym
             ),
         )
         module = registry.get("qwen2")(cfg)
@@ -375,6 +490,10 @@ class TestMatMulNBitsEpGating:
         ops = self._build("cpu")
         assert ops.get("MatMulNBits", 0) > 0
         assert ops.get("DequantizeLinear", 0) == 0
+
+    def test_cpu_build_rejects_unsupported_per_channel_layout(self):
+        with pytest.raises(ValueError, match=r"block_size=96.*'cpu'"):
+            self._build("cpu", hidden_size=96, group_size=-1)
 
     def test_qnn_lowers_to_qdq(self):
         ops = self._build("qnn")

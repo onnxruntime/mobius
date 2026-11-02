@@ -22,6 +22,41 @@ from mobius._builder import (
 from mobius._model_package import ModelPackage
 
 
+@pytest.mark.parametrize("level", [None, 0, 4])
+@pytest.mark.parametrize("bits", [4, 8])
+def test_build_from_module_applies_accuracy_override(level, bits):
+    from mobius._builder import build_from_module
+    from mobius._configs import QuantizationConfig
+    from mobius._testing import make_config
+    from mobius.models import CausalLMModel
+
+    config = make_config(
+        quantization=QuantizationConfig(
+            quant_method="olive", bits=bits, group_size=32, sym=True
+        )
+    )
+    package = build_from_module(
+        CausalLMModel(config),
+        config,
+        execution_provider="cpu",
+        matmul_nbits_accuracy_level=level,
+    )
+    nodes = [
+        node
+        for model in package.values()
+        for node in ir.traversal.RecursiveGraphIterator(model.graph)
+        if node.op_type == "MatMulNBits"
+    ]
+    assert len(nodes) > 1
+    expected = level if level is not None else (4 if bits == 4 else None)
+    for node in nodes:
+        if expected is None:
+            assert "accuracy_level" not in node.attributes
+        else:
+            assert node.attributes["accuracy_level"].value == expected
+        assert node.attributes["bits"].value == bits
+
+
 def _make_value(name: str) -> ir.Value:
     return ir.Value(name=name)
 

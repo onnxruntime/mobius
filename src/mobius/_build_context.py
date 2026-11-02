@@ -35,8 +35,10 @@ __all__ = [
     "build_context",
     "ep_capabilities",
     "get_build_dtype",
+    "get_matmul_nbits_accuracy_level",
     "is_prefill_prefix_pruning_enabled",
     "prefill_prefix_pruning",
+    "validate_matmul_nbits_accuracy_level",
 ]
 
 _DEFAULT_CAPABILITIES = EpCapabilities(name="default")
@@ -47,6 +49,9 @@ _current_ep: contextvars.ContextVar[EpCapabilities] = contextvars.ContextVar(
 _current_dtype: contextvars.ContextVar[ir.DataType] = contextvars.ContextVar(
     "mobius_build_dtype", default=ir.DataType.FLOAT
 )
+_matmul_nbits_accuracy_level: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "mobius_matmul_nbits_accuracy_level", default=None
+)
 _prune_prefill_prefix: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "mobius_prune_prefill_prefix", default=False
 )
@@ -56,6 +61,8 @@ _prune_prefill_prefix: contextvars.ContextVar[bool] = contextvars.ContextVar(
 def build_context(
     capabilities: EpCapabilities,
     dtype: ir.DataType = ir.DataType.FLOAT,
+    *,
+    matmul_nbits_accuracy_level: int | None = None,
 ) -> Iterator[None]:
     """Activate EP capabilities for the duration of graph construction.
 
@@ -66,6 +73,9 @@ def build_context(
         capabilities: EP capability descriptor to activate. Typically obtained
             via ``ep_registry.require(execution_provider)``.
         dtype: Active build dtype. Defaults to ``ir.DataType.FLOAT``.
+        matmul_nbits_accuracy_level: Override every emitted ``MatMulNBits``
+            accuracy level (0 through 4), regardless of weight bit width.
+            ``None`` preserves the EP-specific defaults.
 
     Example::
 
@@ -76,13 +86,27 @@ def build_context(
         with build_context(capabilities, ir.DataType.FLOAT16):
             pkg = task.build(module, config)
     """
+    validate_matmul_nbits_accuracy_level(matmul_nbits_accuracy_level)
     capabilities_token = _current_ep.set(capabilities)
     dtype_token = _current_dtype.set(dtype)
+    accuracy_token = _matmul_nbits_accuracy_level.set(matmul_nbits_accuracy_level)
     try:
         yield
     finally:
         _current_ep.reset(capabilities_token)
         _current_dtype.reset(dtype_token)
+        _matmul_nbits_accuracy_level.reset(accuracy_token)
+
+
+def validate_matmul_nbits_accuracy_level(level: int | None) -> None:
+    """Reject values outside the ORT ``MatMulNBits`` accuracy-level domain."""
+    if level is not None and (type(level) is not int or not 0 <= level <= 4):
+        raise ValueError("matmul_nbits_accuracy_level must be an integer from 0 to 4 or None")
+
+
+def get_matmul_nbits_accuracy_level() -> int | None:
+    """Return the explicit override, or ``None`` to preserve EP defaults."""
+    return _matmul_nbits_accuracy_level.get()
 
 
 def ep_capabilities() -> EpCapabilities:

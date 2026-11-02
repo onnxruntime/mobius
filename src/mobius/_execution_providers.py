@@ -104,6 +104,10 @@ class EpCapabilities:
             ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
             contrib op unchanged.  Set ``False`` only for runtimes that lack a
             ``MatMulNBits`` kernel but can consume QDQ weights (QNN HTP).
+        requires_power_of_two_matmul_nbits_blocks: Reject native ``MatMulNBits``
+            blocks that are not powers of two >= 16 during optimization.
+            Enabled for CPU; target-neutral ``default`` exports leave native
+            layout compatibility to the selected runtime.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -171,6 +175,7 @@ class EpCapabilities:
     max_buffer_size: int | None = None
     layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
+    requires_power_of_two_matmul_nbits_blocks: bool = False
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -309,6 +314,7 @@ def _register_builtins() -> None:
             qkv_pack_dtypes=frozenset({ir.DataType.FLOAT}),
             default_int4_accuracy_level=4,
             supports_past_present_share_buffer=True,
+            requires_power_of_two_matmul_nbits_blocks=True,
         ),
         EpCapabilities(
             name="cuda",
