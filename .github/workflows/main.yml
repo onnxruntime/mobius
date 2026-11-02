@@ -290,6 +290,10 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Create virtual environment
+        run: |
+          # The A10 image's system pip is externally managed (PEP 668).
+          "$pythonLocation/bin/python" -m venv "$RUNNER_TEMP/mobius-venv"
       - name: Cache HuggingFace models
         uses: actions/cache@v6
         with:
@@ -298,20 +302,24 @@ jobs:
           restore-keys: |
             hf-integration-fast-
       - name: Install PyTorch CUDA
-        run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+        run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
       - name: Install dependencies
         run: |
-          pip install -r requirements/ci/requirements.txt
-          pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
-          pip install -e '.[testing]'
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install -r requirements/ci/requirements.txt
+          python -m pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
+          python -m pip install -e '.[testing]'
           # PyPI's ORT 1.27+ wheel requires CUDA 13, while these runners use CUDA 12.
-          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
-          pip install --no-deps onnxruntime-genai-cuda
+          python -m pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
+          python -m pip install --no-deps onnxruntime-genai-cuda
       - name: Run fast integration tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          pytest tests/integration/text_test.py tests/integration/generation_test.py \
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pytest tests/integration/text_test.py tests/integration/generation_test.py \
             tests/integration/encoder_media_seq2seq_test.py \
             tests/integration/architectures_test.py \
             tests/integration/qwen3_5_vl_test.py \
@@ -332,6 +340,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: integration
           report-type: test_results
+      - name: Clean up virtual environment
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/mobius-venv"
 
   build:
     name: Build
