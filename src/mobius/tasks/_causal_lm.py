@@ -419,6 +419,17 @@ class HybridCausalLMTask(ModelTask):
 
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
+        if config.model_type == "lfm3":
+            model.metadata_props["mobius.input_contract"] = (
+                "Unpacked sequences only: position_ids must not restart within a "
+                "document or a reused cache. Sliding KV caches grow in global slot order."
+            )
+        if getattr(module, "preserve_standard_attention", False):
+            for node in model.graph:
+                if node.op_type == "Attention":
+                    # CUDA GQA cannot reuse past context for multi-token chunks
+                    # with batch > 1. Preserve the exported cache contract.
+                    node.metadata_props["mobius.attention.preserve_standard"] = "true"
         if config.model_type in {"jamba", "nemotron_h"}:
             model.metadata_props["mobius.runtime_support"] = (
                 "Deferred: ORT GenAI 0.15.2 discovers sparse KV and conv/recurrent slots, "

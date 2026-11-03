@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import onnx_ir as ir
 import pytest
 
 from mobius._testing import count_op_type, create_test_builder, create_test_input
 from mobius.components._activations import (
     ACT2FN,
+    Float32SiLU,
     gelu,
     get_activation,
     linear,
@@ -21,6 +23,16 @@ from mobius.components._activations import (
 
 
 class TestActivations:
+    def test_float32_silu_rounds_only_final_activation(self):
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [2, 3, 64], dtype=ir.DataType.BFLOAT16)
+        result = Float32SiLU()(op, x)
+        builder._adapt_outputs([result], "")
+        swish = next(node for node in graph if node.op_type == "Swish")
+        assert swish.inputs[0].producer().attributes.get_int("to") == ir.DataType.FLOAT
+        assert result.producer().op_type == "CastLike"
+        assert result.producer().inputs[1] is x
+
     def _run_activation(self, act_fn):
         builder, op, _graph = create_test_builder()
         x = create_test_input(builder, "x", [2, 3, 64])

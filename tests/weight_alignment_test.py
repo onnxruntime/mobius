@@ -50,6 +50,53 @@ from mobius.tasks import get_task
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("sandwich,conv_bias", [(True, False), (False, True)])
+def test_lfm3_upstream_weight_names_align_without_renaming(sandwich, conv_bias):
+    from mobius.models.lfm3_test import tiny_lfm3_config
+
+    config = tiny_lfm3_config(use_sandwich_norm=sandwich, short_conv_bias=conv_bias)
+    module = registry.get("lfm3")(config)
+    pkg = get_task("hybrid-text-generation").build(module, config)
+    names = _collect_parameter_names(pkg)
+    expected = {"model.embed_tokens.weight", "model.embedding_norm.weight"}
+    for i, kind in enumerate(config.layer_types):
+        prefix = f"model.layers.{i}."
+        expected.update(
+            prefix + f"feed_forward.{projection}.weight" for projection in ["w1", "w2", "w3"]
+        )
+        norms = ["operator_norm", "ffn_norm"]
+        if sandwich:
+            norms += ["post_operator_norm", "post_ffn_norm"]
+        expected.update(prefix + name + ".weight" for name in norms)
+        if kind == "conv":
+            expected.update(
+                prefix + f"conv.{name}.weight" for name in ["in_proj", "conv", "out_proj"]
+            )
+            if conv_bias:
+                expected.update(
+                    prefix + f"conv.{name}.bias" for name in ["in_proj", "conv", "out_proj"]
+                )
+        else:
+            expected.update(
+                prefix + f"self_attn.{name}.weight"
+                for name in [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "q_norm",
+                    "k_norm",
+                    "gate_proj",
+                ]
+            )
+    assert names == expected
+    source = _build_identity_state_dict(pkg, expected)
+    processed = module.preprocess_weights(source)
+    assert expected <= processed.keys()
+    assert all(processed[name] is source[name] for name in expected)
+    assert processed["lm_head.weight"] is source["model.embed_tokens.weight"]
+
+
 def _collect_parameter_names(pkg: dict) -> set[str]:
     """Return ONNX initializer names that represent model parameters.
 

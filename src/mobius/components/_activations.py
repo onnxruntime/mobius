@@ -4,12 +4,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 from onnxscript import OpBuilder, nn
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 def silu(op: OpBuilder, x):
@@ -120,3 +117,15 @@ class SiLU(nn.Module):
 
     def forward(self, op: OpBuilder, x: ir.Value):
         return silu(op, x)
+
+
+class Float32SiLU(SiLU):
+    """Single-round SiLU: evaluate in fp32 before returning the activation dtype.
+
+    Reduced-precision Swish kernels may round sigmoid before multiplying by x.
+    PyTorch SiLU rounds only the final result, which matters before output norms.
+    """
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        output = super().forward(op, op.Cast(x, to=ir.DataType.FLOAT))
+        return op.CastLike(output, x)

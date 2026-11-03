@@ -740,7 +740,11 @@ def optimize_model(
     # Fusion assertion: warn if GQA was expected but no GQA nodes produced.
     if gqa_allowed and dtype in caps.gqa_dtypes:
         gqa_count = _count_ops(model, "GroupQueryAttention")
-        attn_count = _count_ops(model, "Attention")
+        attn_count = sum(
+            node.op_type == "Attention"
+            and node.metadata_props.get("mobius.attention.preserve_standard") != "true"
+            for node in model.graph.all_nodes()
+        )
         if gqa_count == 0 and attn_count > 0:
             warnings.warn(
                 f"GQA fusion expected for ep={ep!r}/dtype={dtype} but found "

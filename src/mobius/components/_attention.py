@@ -326,7 +326,9 @@ class Attention(nn.Module):
         position_embeddings: tuple | None = None,
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
+        output_gate: ir.Value | None = None,
     ):
+        """Apply attention and optional broadcastable gating before the output projection."""
         query_states, key_states, value_states = self._project_qkv(op, hidden_states)
         if not math.isclose(self._key_multiplier, 1.0):
             key_states = op.Mul(key_states, self._key_multiplier)
@@ -354,6 +356,7 @@ class Attention(nn.Module):
                 value_states,
                 attention_bias,
                 past_key_value,
+                output_gate,
             )
 
         # Apply rotary position embeddings (skip when not provided)
@@ -369,21 +372,11 @@ class Attention(nn.Module):
                 attn_scale = position_embeddings[2]
                 query_states = op.Mul(query_states, attn_scale)
 
-            query_states = apply_rotary_pos_emb(
-                op,
-                x=query_states,
-                position_embeddings=position_embeddings,
-                num_heads=self.num_attention_heads,
-                rotary_embedding_dim=self.rotary_embedding_dim,
-                interleaved=self._rope_interleave,
+            query_states = self._apply_rotary(
+                op, query_states, position_embeddings, self.num_attention_heads
             )
-            key_states = apply_rotary_pos_emb(
-                op,
-                x=key_states,
-                position_embeddings=position_embeddings,
-                num_heads=self.num_key_value_heads,
-                rotary_embedding_dim=self.rotary_embedding_dim,
-                interleaved=self._rope_interleave,
+            key_states = self._apply_rotary(
+                op, key_states, position_embeddings, self.num_key_value_heads
             )
 
         attn_output, present_key, present_value = _apply_attention(
@@ -401,8 +394,23 @@ class Attention(nn.Module):
             static_cache=static_cache,
         )
 
+        if output_gate is not None:
+            attn_output = op.Mul(attn_output, output_gate)
         attn_output = self._project_output(op, attn_output)
         return attn_output, (present_key, present_value)
+
+    def _apply_rotary(
+        self, op: OpBuilder, x: ir.Value, position_embeddings: tuple, num_heads: int
+    ) -> ir.Value:
+        """Apply positional rotation; subclasses may preserve different precision/layout."""
+        return apply_rotary_pos_emb(
+            op,
+            x=x,
+            position_embeddings=position_embeddings,
+            num_heads=num_heads,
+            rotary_embedding_dim=self.rotary_embedding_dim,
+            interleaved=self._rope_interleave,
+        )
 
     def _project_qkv(
         self, op: OpBuilder, hidden_states: ir.Value
@@ -426,6 +434,7 @@ class Attention(nn.Module):
         value_states: ir.Value,
         gqa_ctx: GQAContext,
         past_key_value: tuple | None,
+        output_gate: ir.Value | None = None,
     ):
         """Emit ``com.microsoft::GroupQueryAttention`` directly.
 
@@ -474,6 +483,8 @@ class Attention(nn.Module):
             **gqa_attrs,
         )
 
+        if output_gate is not None:
+            attn_out = op.Mul(attn_out, output_gate)
         attn_out = self._project_output(op, attn_out)
         return attn_out, (present_key, present_value)
 
