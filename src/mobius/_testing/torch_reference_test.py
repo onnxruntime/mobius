@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -237,10 +238,11 @@ def test_bfloat16_media_decoder_logits_and_kv_reuse(wrapper):
     torch.testing.assert_close(reused.layers[0].values, value)
 
 
-def test_load_torch_model_pins_every_huggingface_resource() -> None:
+@pytest.mark.parametrize("model_type", ["llama", "lfm3"])
+def test_load_torch_model_pins_every_huggingface_resource(model_type) -> None:
     revision = "a" * 40
     tokenizer = SimpleNamespace(pad_token="<pad>", eos_token="</s>")
-    config = SimpleNamespace(model_type="llama")
+    config = SimpleNamespace(model_type=model_type)
     model = mock.Mock()
 
     with (
@@ -289,3 +291,36 @@ def test_load_torch_model_pins_every_huggingface_resource() -> None:
     )
     fix_weights.assert_called_once_with(model, "owner/model", revision)
     model.eval.assert_called_once_with()
+
+
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_lfm3_optional_kernel_registration_is_scoped(monkeypatch, raise_inside):
+    import transformers.integrations as integrations
+
+    name = "use_kernel_func_from_hub_with_fallback"
+    monkeypatch.delattr(integrations, name, raising=False)
+
+    def function(value):
+        return value + 1
+
+    with contextlib.ExitStack() as stack:
+        if raise_inside:
+            stack.enter_context(pytest.raises(RuntimeError, match="reference failure"))
+        with torch_reference.lfm3_reference_compatibility():
+            decorated = getattr(integrations, name)("unused-kernel")(function)
+            assert decorated is function
+            assert decorated(3) == 4
+            if raise_inside:
+                raise RuntimeError("reference failure")
+    assert not hasattr(integrations, name)
+
+
+def test_lfm3_preserves_available_kernel_registration(monkeypatch):
+    import transformers.integrations as integrations
+
+    sentinel = object()
+    name = "use_kernel_func_from_hub_with_fallback"
+    monkeypatch.setattr(integrations, name, sentinel, raising=False)
+    with torch_reference.lfm3_reference_compatibility():
+        assert getattr(integrations, name) is sentinel
+    assert getattr(integrations, name) is sentinel

@@ -406,6 +406,11 @@
           "type": "boolean",
           "description": "Whether to use sampling. false = greedy decoding (required for reproducible golden tests)."
         },
+        "repetition_penalty": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Sign-aware penalty for previously seen token IDs. Set explicitly when the checkpoint uses a non-default penalty."
+        },
         "num_diffusion_steps": {
           "type": "integer",
           "minimum": 1,

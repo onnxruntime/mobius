@@ -152,7 +152,6 @@ __all__ = [
     "YouTuVLVisionEncoder",
     "apply_rms_norm",
     "ProportionalRope",
-    "Float32SiLU",
     "apply_rotary_pos_emb",
     "build_packed_token_offset",
     "create_attention_bias",
@@ -167,7 +166,7 @@ __all__ = [
     "siglip2_naflex_attention_mask",
 ]
 
-from mobius.components._activations import Float32SiLU, SiLU, get_activation
+from mobius.components._activations import SiLU, get_activation
 from mobius.components._attention import (
     Attention,
     FusedQKVAttention,

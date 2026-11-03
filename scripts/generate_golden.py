@@ -360,9 +360,17 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         model_device = _get_model_device(model, device)
         gen_ids = torch.from_numpy(input_ids).to(model_device)
         max_new = case.generation_params.get("max_new_tokens", 20)
+        generation_kwargs: dict[str, object] = {
+            "max_new_tokens": max_new,
+            "do_sample": False,
+        }
+        if "repetition_penalty" in case.generation_params:
+            generation_kwargs["repetition_penalty"] = case.generation_params[
+                "repetition_penalty"
+            ]
         with torch.no_grad():
             try:
-                gen_output = model.generate(gen_ids, max_new_tokens=max_new, do_sample=False)
+                gen_output = model.generate(gen_ids, **generation_kwargs)
             except ValueError as e:
                 # All-attention GraniteMoeHybrid variants (e.g. granite-4.0-1b)
                 # trip transformers' hybrid Mamba/attention generation cache,
@@ -372,19 +380,14 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
                 # the (slower) cache-free path.
                 if "has_previous_state" not in str(e):
                     raise
-                gen_output = model.generate(
-                    gen_ids, max_new_tokens=max_new, do_sample=False, use_cache=False
-                )
+                gen_output = model.generate(gen_ids, **generation_kwargs, use_cache=False)
         generated_ids = gen_output[0, seq_len:].cpu().numpy()
 
-    provenance = (
-        {
-            "reference": {"repository": case.model_id, "revision": case.revision},
-            "gguf": case.gguf_source,
-        }
-        if case.gguf_source is not None
-        else None
-    )
+    provenance: dict[str, object] = {
+        "reference": {"repository": case.model_id, "revision": case.revision},
+    }
+    if case.gguf_source is not None:
+        provenance["gguf"] = case.gguf_source
     save_golden_ref(
         json_path,
         top1_id=golden["top1_id"],

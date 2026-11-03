@@ -14,14 +14,19 @@ from mobius._configs import ArchitectureConfig, Lfm3Config
 from mobius.components import (
     Attention,
     Embedding,
-    Float32SiLU,
     GatedShortConv,
     Linear,
     ProportionalRope,
     RMSNorm,
+    SiLU,
     create_padding_mask,
 )
 from mobius.models.base import CausalLMModel
+
+_FLOAT32_ONLY = (
+    "LFM3 currently supports float32 compute only. Float16 and bfloat16 "
+    "full-checkpoint numerical parity is not verified; export with dtype='f32'."
+)
 
 
 class Lfm3RMSNorm(RMSNorm):
@@ -99,7 +104,7 @@ class Lfm3MLP(nn.Module):
         self.w1 = Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.w3 = Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.w2 = Linear(config.intermediate_size, config.hidden_size, bias=False)
-        self.activation = Float32SiLU()
+        self.activation = SiLU()
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         return self.w2(op, op.Mul(self.activation(op, self.w1(op, x)), self.w3(op, x)))
@@ -110,7 +115,9 @@ class Lfm3DecoderLayer(nn.Module):
 
     def __init__(self, config: Lfm3Config, layer_idx: int):
         super().__init__()
-        self.layer_type = config.layer_types[layer_idx]
+        layer_types = config.layer_types
+        assert layer_types is not None
+        self.layer_type = layer_types[layer_idx]
         if self.layer_type == "conv":
             self.conv = GatedShortConv(
                 config.hidden_size, config.short_conv_kernel, bias=config.short_conv_bias
@@ -195,9 +202,12 @@ class Lfm3TextModel(nn.Module):
         self.layers = nn.ModuleList(
             [Lfm3DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
+        layer_types = config.layer_types
+        rope_parameters = config.rope_parameters
+        assert layer_types is not None and rope_parameters is not None
         ropes = {}
-        for kind in set(config.layer_types) - {"conv"}:
-            params = config.rope_parameters[kind]
+        for kind in set(layer_types) - {"conv"}:
+            params = rope_parameters[kind]
             ropes[kind] = ProportionalRope(
                 dataclasses.replace(
                     config,
@@ -218,6 +228,8 @@ class Lfm3TextModel(nn.Module):
         past_key_values: list,
     ):
         hidden_states = self.embed_tokens(op, input_ids)
+        if hidden_states.dtype != ir.DataType.FLOAT:
+            raise ValueError(_FLOAT32_ONLY)
         embeddings = {
             kind: rope(op, position_ids)
             for kind, rope in zip(self._rope_types, self.rotary_emb, strict=True)
@@ -228,17 +240,19 @@ class Lfm3TextModel(nn.Module):
                 op, input_ids=input_ids, attention_mask=attention_mask
             )
         if "sliding_attention" in embeddings:
-            masks["sliding_attention"] = _sliding_mask(
-                op, input_ids, attention_mask, self.config.sliding_window
-            )
+            window = self.config.sliding_window
+            assert window is not None
+            masks["sliding_attention"] = _sliding_mask(op, input_ids, attention_mask, window)
         total = op.Shape(attention_mask, start=1, end=2)
         current_mask = op.Slice(
             attention_mask, op.Sub(total, op.Shape(input_ids, start=1, end=2)), total, [1]
         )
         present = []
         intermediates = []
+        layer_types = self.config.layer_types
+        assert layer_types is not None
         for i, (layer, past) in enumerate(zip(self.layers, past_key_values, strict=True)):
-            kind = layer.layer_type
+            kind = layer_types[i]
             hidden_states, states = layer(
                 op,
                 hidden_states,
@@ -263,7 +277,7 @@ class Lfm3TextModel(nn.Module):
 
 
 class Lfm3CausalLMModel(CausalLMModel):
-    """LiquidAI LFM3 causal LM with gated convolutions and full/sliding attention.
+    """LiquidAI LFM3 float32 causal LM with gated convolution and full/sliding attention.
 
     Replicates HuggingFace Lfm3ForCausalLM with head gating and sandwich RMSNorm.
 
@@ -284,6 +298,8 @@ class Lfm3CausalLMModel(CausalLMModel):
                     for field in dataclasses.fields(config)
                 }
             )
+        if config.dtype != ir.DataType.FLOAT:
+            raise ValueError(_FLOAT32_ONLY)
         config = dataclasses.replace(config)
         super().__init__(config)
         self._replace_text_model(Lfm3TextModel(config))

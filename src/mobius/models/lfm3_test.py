@@ -126,7 +126,7 @@ def test_lfm3_config_none_defaults_and_optional_norm_bias():
 
 
 def test_lfm3_attention_contract_is_independent_of_config_label():
-    config = tiny_lfm3_config(model_type="synthetic", dtype=ir.DataType.FLOAT16)
+    config = tiny_lfm3_config(model_type="synthetic")
     module = Lfm3CausalLMModel(config)
     model = build_from_module(
         module, config, task="hybrid-text-generation", execution_provider="cuda"
@@ -203,8 +203,7 @@ def test_lfm3_rotary_layout_splits_full_head_and_uses_fp32():
     [
         ("default", ir.DataType.FLOAT),
         ("onnx-standard", ir.DataType.FLOAT),
-        ("cuda", ir.DataType.FLOAT16),
-        ("cuda", ir.DataType.BFLOAT16),
+        ("cuda", ir.DataType.FLOAT),
     ],
 )
 def test_lfm3_portable_cuda_cache_graph(ep, dtype):
@@ -248,6 +247,21 @@ def test_lfm3_graph_derived_genai_metadata(tmp_path):
     assert decoder["outputs"]["present_key_names"] == "present.%d.key"
     assert decoder["inputs"]["position_ids"] == "position_ids"
     assert decoder["head_size"] == 16
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_lfm3_rejects_unverified_reduced_precision(dtype):
+    with pytest.raises(ValueError, match="float32 compute only"):
+        Lfm3CausalLMModel(tiny_lfm3_config(dtype=dtype))
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_lfm3_rejects_dtype_changed_after_module_construction(dtype):
+    config = tiny_lfm3_config()
+    module = Lfm3CausalLMModel(config)
+    config.dtype = dtype
+    with pytest.raises(ValueError, match="float32 compute only"):
+        build_from_module(module, config, task="hybrid-text-generation")
 
 
 def test_lfm3_sandwich_norm_parameter_names_and_tied_embeddings():

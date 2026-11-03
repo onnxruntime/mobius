@@ -629,7 +629,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
     "lfm2": ModelRegistration(Lfm2CausalLMModel, config_class=Lfm2Config),
-    "lfm3": ModelRegistration(Lfm3CausalLMModel, config_class=Lfm3Config),
+    "lfm3": ModelRegistration(
+        Lfm3CausalLMModel,
+        config_class=Lfm3Config,
+        test_revision="875094441ea6517efc0f44a5685f05e381b72b14",
+    ),
     "lfm2_moe": ModelRegistration(Lfm2MoECausalLMModel, config_class=Lfm2MoeConfig),
     "dream": ModelRegistration(DreamModel, task="masked-diffusion"),
     "Dream": ModelRegistration(DreamModel, task="masked-diffusion"),

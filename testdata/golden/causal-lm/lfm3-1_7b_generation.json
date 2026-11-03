@@ -1,0 +1,33 @@
+{
+  "model_id": "LiquidAI/LFM3-1.7B",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    496,
+    49,
+    782,
+    267,
+    63572,
+    20,
+    358,
+    52345,
+    1125,
+    278,
+    4414,
+    920,
+    229,
+    3376,
+    24042,
+    296,
+    1226,
+    3214,
+    309,
+    6404
+  ],
+  "generated_text": " \"I am a traveler, I wander through the night,\n  With dreams in my heart and hope",
+  "provenance": {
+    "reference": {
+      "repository": "LiquidAI/LFM3-1.7B",
+      "revision": "875094441ea6517efc0f44a5685f05e381b72b14"
+    }
+  }
+}

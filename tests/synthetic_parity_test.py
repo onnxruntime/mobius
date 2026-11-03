@@ -51,20 +51,11 @@ _LFM3_REVISION = "875094441ea6517efc0f44a5685f05e381b72b14"
 
 def _lfm3_reference_classes():
     """Load immutable upstream math; disable only an unavailable kernel decorator."""
-    import transformers.integrations as integrations
     from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
-    with pytest.MonkeyPatch.context() as patch:
-        if not hasattr(integrations, "use_kernel_func_from_hub_with_fallback"):
-            # Transformers 5.14 removed this optional kernel-registration API.
-            # Its decorated functions already contain independent PyTorch fallbacks;
-            # no graph/model math is replaced, and no Hub kernel is used in L3.
-            patch.setattr(
-                integrations,
-                "use_kernel_func_from_hub_with_fallback",
-                lambda *args, **kwargs: lambda function: function,
-                raising=False,
-            )
+    from mobius._testing.torch_reference import lfm3_reference_compatibility
+
+    with lfm3_reference_compatibility():
         config_class = get_class_from_dynamic_module(
             "configuration_lfm3.Lfm3Config", _LFM3_MODEL_ID, revision=_LFM3_REVISION
         )
@@ -1392,8 +1383,6 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
     [
         ("cpu", ir.DataType.FLOAT),
         ("cuda", ir.DataType.FLOAT),
-        ("cuda", ir.DataType.FLOAT16),
-        ("cuda", ir.DataType.BFLOAT16),
     ],
 )
 @pytest.mark.parametrize("sandwich,conv_bias", [(True, False), (False, True)])
