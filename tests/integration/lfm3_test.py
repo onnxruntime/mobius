@@ -107,12 +107,16 @@ def test_lfm3_full_logits_and_twenty_cached_decode_steps(lfm3_artifacts):
         prompt_ids, max_new_tokens=20, repetition_penalty=1.1
     )
     with torch.no_grad():
-        expected_ids = reference.generate(
-            torch.from_numpy(prompt_ids).to(reference.device),
-            max_new_tokens=20,
-            do_sample=False,
-            repetition_penalty=1.1,
-        ).cpu().numpy()
+        expected_ids = (
+            reference.generate(
+                torch.from_numpy(prompt_ids).to(reference.device),
+                max_new_tokens=20,
+                do_sample=False,
+                repetition_penalty=1.1,
+            )
+            .cpu()
+            .numpy()
+        )
     assert generated_ids.shape == expected_ids.shape == (1, prompt_ids.shape[1] + 20)
     np.testing.assert_array_equal(generated_ids, expected_ids)
     golden = json.loads((_GOLDEN_DIR / "lfm3-1_7b_generation.json").read_text())
