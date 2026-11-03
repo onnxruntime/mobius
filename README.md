@@ -136,6 +136,30 @@ pkg = build("meta-llama/Llama-3.2-1B", task=task)
 pkg.save("output/llama-3.2-1b-static/")
 ```
 
+**Fixed-capacity Gemma4 vision** (opt-in) exports fixed-size patch inputs and
+padded feature outputs without changing the decoder, embedding, or audio graphs:
+
+```python
+pkg = build(
+    "google/gemma-4-E2B-it",
+    dtype="f32",
+    extra_options={"vision_patch_capacity": 2520, "vision_batch_size": 1},
+)
+pkg.save("output/gemma4-fixed/")
+```
+
+The equivalent CLI options are
+`--extra-options vision_patch_capacity=2520 vision_batch_size=1`
+(`--extra_options` is also accepted). With Gemma4's
+3-by-3 pooling, this gives 2520 patch slots and 280 feature rows per image.
+Valid features come first, followed by padding; the runtime must use the valid
+image-token counts to exclude that padding. Without this option, vision shapes
+remain dynamic. `vision_batch_size` can be a positive integer or `None`
+(`vision_batch_size=null` on the CLI) for dynamic batch. Non-default batch
+sizes require a patch capacity and do not enable batching independent
+embedding prompts. These are currently the only supported `extra_options`
+keys; unknown keys and invalid values are rejected.
+
 **EP-aware optimization** generates graphs tuned for a specific runtime execution
 provider. Pass `execution_provider` to target CUDA, DirectML, WebGPU, and more —
 each with the right set of fused kernels and lowering passes applied automatically:

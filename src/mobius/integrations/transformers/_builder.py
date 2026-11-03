@@ -20,7 +20,7 @@ from mobius._component_quantization import (
     normalize_component_quantized_weights,
     validate_quantized_component_bindings,
 )
-from mobius._configs import QuantizedWeightFormat
+from mobius._configs import Gemma4Config, QuantizedWeightFormat
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius._weight_utils import WeightTransform
@@ -347,6 +347,7 @@ def build_transformers_model(
     export_paged_attention: bool = False,
     input_sampling_rate: int | None = None,
     bwe_sampling_rate: int | None = None,
+    extra_options: dict[str, Any] | None = None,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
@@ -368,10 +369,26 @@ def build_transformers_model(
     width. ``None`` preserves existing EP defaults. It does not affect
     ``GatherBlockQuantized`` or requantize weights. PersonaPlex and RE-USE
     bespoke builders do not support this option.
+
+    ``extra_options`` supplies model-specific settings. Currently supported
+    keys are standard Gemma4's ``vision_patch_capacity`` and
+    ``vision_batch_size``. Capacity must be positive and divisible by the
+    spatial pooling kernel area. Batch size must be positive or ``None`` for
+    dynamic batch, and requires a capacity unless it is the default of 1.
+    Omitting these settings retains dynamic patch and feature counts.
     """
     validate_matmul_nbits_accuracy_level(matmul_nbits_accuracy_level)
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
+    extra_options = dict(extra_options or {})
+    unknown_options = extra_options.keys() - {"vision_patch_capacity", "vision_batch_size"}
+    if unknown_options:
+        raise ValueError("Unsupported extra_options: " + ", ".join(sorted(unknown_options)))
+    for name, value in extra_options.items():
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive integer or None")
 
     from mobius.integrations._moshi import (
         _build_personaplex,
@@ -395,6 +412,7 @@ def build_transformers_model(
             "export_paged_attention": export_paged_attention,
             "input_sampling_rate": input_sampling_rate is not None,
             "bwe_sampling_rate": bwe_sampling_rate is not None,
+            "extra_options": bool(extra_options),
         }
         selected = sorted(name for name, enabled in unsupported.items() if enabled)
         if selected:
@@ -481,6 +499,7 @@ def build_transformers_model(
                 "prune_prefill_prefix": prune_prefill_prefix,
                 "glm_full_attention": glm_full_attention,
                 "export_paged_attention": export_paged_attention,
+                "extra_options": bool(extra_options),
             }
             selected = sorted(name for name, enabled in unsupported.items() if enabled)
             if selected:
@@ -513,6 +532,10 @@ def build_transformers_model(
                 f"glm_full_attention=True is not supported for '{model_id}': it "
                 "does not resolve to a registered 'glm_moe_dsa' model_type (it "
                 "looks like a diffusers pipeline or an unsupported config)."
+            )
+        if extra_options:
+            raise ValueError(
+                "These extra_options are only supported for standard Gemma4 vision"
             )
         return build_diffusers_pipeline(
             model_id,
@@ -608,6 +631,17 @@ def build_transformers_model(
             model_type,
             decoder_source_paths=decoder_source_paths,
         )
+    if extra_options:
+        if (
+            not isinstance(config, Gemma4Config)
+            or config.model_type not in {"gemma4", "gemma4_text"}
+            or config.vision is None
+        ):
+            raise ValueError(
+                "These extra_options are only supported for standard Gemma4 vision"
+            )
+        config = dataclasses.replace(config, **extra_options)
+        config.validate()
     is_gptoss_mxfp4_source = _is_native_gptoss_mxfp4(config)
     if dtype is not None:
         config = dataclasses.replace(config, dtype=resolve_dtype(dtype))

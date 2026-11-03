@@ -112,6 +112,49 @@ def _native_gptoss_config(*, dtype=ir.DataType.FLOAT16):
     )
 
 
+@pytest.mark.parametrize("name", ["vision_patch_capacity", "vision_batch_size"])
+@pytest.mark.parametrize("capacity", [0, -9, True, 9.0])
+def test_fixed_vision_rejects_invalid_options_before_loading(monkeypatch, name, capacity):
+    load = mock.Mock(side_effect=AssertionError("must validate before loading"))
+    monkeypatch.setattr(transformers_builder, "_load_transformers_config", load)
+    with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
+        transformers_builder.build_transformers_model(
+            "unused/model", extra_options={name: capacity}
+        )
+    load.assert_not_called()
+
+
+def test_extra_options_rejects_unknown_keys_before_loading(monkeypatch):
+    load = mock.Mock(side_effect=AssertionError("must validate before loading"))
+    monkeypatch.setattr(transformers_builder, "_load_transformers_config", load)
+    with pytest.raises(ValueError, match="Unsupported extra_options: vision_patch_capcity"):
+        transformers_builder.build_transformers_model(
+            "unused/model", extra_options={"vision_patch_capcity": 2520}
+        )
+    load.assert_not_called()
+
+
+def test_fixed_vision_rejects_other_model_types(monkeypatch):
+    hf_config = SimpleNamespace(model_type="qwen2")
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "text-generation", "qwen2"),
+    )
+    monkeypatch.setattr(
+        _config_resolver, "_config_from_hf", lambda *args, **kwargs: make_config()
+    )
+    with pytest.raises(ValueError, match="only supported for standard Gemma4 vision"):
+        transformers_builder.build_transformers_model(
+            "unused/model", load_weights=False, extra_options={"vision_patch_capacity": 2520}
+        )
+
+
 @pytest.mark.parametrize("local_checkpoint", [False, True], ids=["model-id", "local-config"])
 def test_native_gptoss_selects_streaming_before_eager_loader(
     monkeypatch, tmp_path, local_checkpoint

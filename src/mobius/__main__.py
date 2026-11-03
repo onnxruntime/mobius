@@ -228,6 +228,18 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
 
     load_weights = not args.no_weights
+    extra_options = {}
+    for option in getattr(args, "extra_options", None) or []:
+        key, separator, value = option.partition("=")
+        if not separator or not key or not value:
+            raise SystemExit(f"Error: --extra-options expects KEY=VALUE, got {option!r}.")
+        if key in extra_options:
+            raise SystemExit(f"Error: duplicate --extra-options key {key!r}.")
+        try:
+            extra_options[key] = json.loads(value)
+        except json.JSONDecodeError:
+            extra_options[key] = value
+    extra_kwargs = {"extra_options": extra_options} if extra_options else {}
     keep_quantized = not getattr(args, "dequantize", False)
     task: str | ModelTask | None = args.task
 
@@ -303,11 +315,15 @@ def _cmd_build(args: argparse.Namespace) -> None:
     component_filter = args.component
     execution_provider = args.execution_provider
 
-    # Auto-detect diffusers pipelines. Skipped when the text-only feature is set:
-    # that flag only applies to transformers decoder exports, so we let the
-    # central build() validation reject a diffusers/unsupported repo rather
-    # than silently exporting a diffusion pipeline and ignoring the flag.
-    if args.model and not args.config and not args.text_only and not is_personaplex:
+    # Let the central builder reject Transformers-only options rather than
+    # silently ignoring them while exporting a diffusion pipeline.
+    if (
+        args.model
+        and not args.config
+        and not args.text_only
+        and not is_personaplex
+        and not extra_options
+    ):
         pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
             if input_sampling_rate is not None or bwe_sampling_rate is not None:
@@ -342,6 +358,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # 'owner/repo:model.nemo'). Routes to the NeMo import path; reuses the
     # standard build args (--dtype, --ep, --external-data) and save logic.
     if args.model and args.model.endswith(".nemo"):
+        if extra_options:
+            raise SystemExit(
+                "Error: these --extra-options are only supported for standard Gemma4 vision."
+            )
         from mobius.integrations.nemo import build_from_nemo
 
         print(f"Detected NeMo archive: {args.model}")
@@ -381,6 +401,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 keep_quantized=keep_quantized,
                 input_sampling_rate=input_sampling_rate,
                 bwe_sampling_rate=bwe_sampling_rate,
+                **extra_kwargs,
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
@@ -388,6 +409,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
         if _is_reuse_checkpoint(config_path):
+            if extra_options:
+                raise SystemExit(
+                    "Error: these --extra-options are only supported for standard Gemma4 vision."
+                )
             if task not in (None, "speech-enhancement"):
                 from mobius.tasks import SpeechEnhancementTask
 
@@ -447,6 +472,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,
+            **extra_kwargs,
         )
     else:
         model_id_or_path = args.model
@@ -482,6 +508,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,
+            **extra_kwargs,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -1372,6 +1399,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum sequence length for static cache buffers. "
         "Only used with --features static-cache. "
         "Defaults to max_position_embeddings from config.",
+    )
+    build_parser.add_argument(
+        "--extra-options",
+        "--extra_options",
+        nargs="+",
+        action="extend",
+        default=None,
+        metavar="KEY=VALUE",
+        help=(
+            "Model-specific build settings. Currently supports standard Gemma4 "
+            "vision_patch_capacity and vision_batch_size, e.g. "
+            "--extra-options vision_patch_capacity=2520 vision_batch_size=1. "
+            "Use null for dynamic batch. Values use JSON scalar types; "
+            "unknown keys are rejected."
+        ),
     )
     build_parser.add_argument(
         "--runtime",

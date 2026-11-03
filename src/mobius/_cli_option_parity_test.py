@@ -131,7 +131,7 @@ class TestKeepQuantizedRemoved:
 
 class TestLocalCompressedCheckpointRouting:
     @staticmethod
-    def _run(monkeypatch, tmp_path, *extra_args):
+    def _run(monkeypatch, tmp_path, *extra_args, source="--config"):
         from mobius import __main__ as cli
         from mobius.integrations.transformers import _builder as transformers_builder
 
@@ -148,7 +148,7 @@ class TestLocalCompressedCheckpointRouting:
         args = build_parser().parse_args(
             [
                 "build",
-                "--config",
+                source,
                 str(tmp_path),
                 "--output",
                 str(tmp_path / "output"),
@@ -171,6 +171,54 @@ class TestLocalCompressedCheckpointRouting:
         assert build.call_args.args == (str(tmp_path),)
         assert build.call_args.kwargs["keep_quantized"] is True
         assert build.call_args.kwargs["load_weights"] is True
+        assert "extra_options" not in build.call_args.kwargs
+
+    @pytest.mark.parametrize("flag", ["--extra-options", "--extra_options"])
+    @pytest.mark.parametrize("source", ["--config", "--model"])
+    def test_extra_options_are_forwarded(self, monkeypatch, tmp_path, source, flag):
+        build = self._run(
+            monkeypatch,
+            tmp_path,
+            flag,
+            "vision_patch_capacity=2520",
+            "vision_batch_size=1",
+            source=source,
+        )
+        assert build.call_args.kwargs["extra_options"] == {
+            "vision_patch_capacity": 2520,
+            "vision_batch_size": 1,
+        }
+
+    def test_repeated_extra_options_support_dynamic_batch(self, monkeypatch, tmp_path):
+        build = self._run(
+            monkeypatch,
+            tmp_path,
+            "--extra-options",
+            "vision_patch_capacity=2520",
+            "--extra-options",
+            "vision_batch_size=null",
+        )
+        assert build.call_args.kwargs["extra_options"] == {
+            "vision_patch_capacity": 2520,
+            "vision_batch_size": None,
+        }
+
+    @pytest.mark.parametrize(
+        "option", ["vision_patch_capacity", "=2520", "vision_batch_size="]
+    )
+    def test_malformed_extra_options_are_rejected(self, monkeypatch, tmp_path, option):
+        with pytest.raises(SystemExit, match="expects KEY=VALUE"):
+            self._run(monkeypatch, tmp_path, "--extra-options", option)
+
+    def test_duplicate_extra_options_are_rejected(self, monkeypatch, tmp_path):
+        with pytest.raises(SystemExit, match="duplicate --extra-options key"):
+            self._run(
+                monkeypatch,
+                tmp_path,
+                "--extra-options",
+                "vision_patch_capacity=2520",
+                "vision_patch_capacity=72",
+            )
 
     def test_dequantize_is_forwarded_to_shared_builder(self, monkeypatch, tmp_path):
         build = self._run(

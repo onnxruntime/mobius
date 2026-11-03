@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import numpy as np
 import onnx_ir as ir
@@ -61,6 +62,73 @@ def _tiny_gemma4_config(**overrides) -> Gemma4Config:
 
 
 class TestGemma4FixedVision:
+    @pytest.mark.parametrize("model_type", ["gemma4", "gemma4_text"])
+    @pytest.mark.parametrize(
+        "capacity,batch_size",
+        [(None, 1), (None, 2), (71, 1), (72, 1), (72, 2), (72, None)],
+    )
+    def test_public_builder_exports_requested_shapes(
+        self, monkeypatch, tmp_path, capacity, batch_size, model_type
+    ):
+        from types import SimpleNamespace
+
+        from mobius import build
+        from mobius.integrations.ort_genai import write_ort_genai_config
+        from mobius.integrations.transformers import _builder, _config_resolver
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False, image_token_id=255, model_type=model_type
+        )
+        monkeypatch.setattr(
+            _builder,
+            "_load_transformers_config",
+            lambda *args, **kwargs: (SimpleNamespace(model_type="gemma4"), False),
+        )
+        monkeypatch.setattr(
+            _config_resolver, "_config_from_hf", lambda *args, **kwargs: config
+        )
+        options = (
+            {"vision_patch_capacity": capacity, "vision_batch_size": batch_size}
+            if capacity is not None or batch_size != 1
+            else None
+        )
+        if capacity == 71 or (capacity is None and batch_size != 1):
+            with pytest.raises(ValueError, match=r"divisible|requires vision_patch_capacity"):
+                build("unused/gemma4", load_weights=False, extra_options=options)
+            return
+        package = build("unused/gemma4", load_weights=False, extra_options=options)
+        vision = package["vision_encoder"].graph
+        if capacity is None:
+            assert vision.inputs[0].shape[1] == ir.SymbolicDim("num_patches")
+            assert not isinstance(vision.outputs[0].shape[0], int)
+        elif batch_size is not None:
+            assert list(vision.inputs[0].shape) == [batch_size, 72, 48]
+            assert list(vision.inputs[1].shape) == [batch_size, 72, 2]
+            assert list(vision.outputs[0].shape) == [batch_size * 8, 64]
+        else:
+            assert not isinstance(vision.inputs[0].shape[0], int)
+            assert list(vision.inputs[0].shape[1:]) == [72, 48]
+            assert not isinstance(vision.outputs[0].shape[0], int)
+        assert config.vision_patch_capacity is None
+        assert config.vision_batch_size == 1
+        package.save(str(tmp_path), external_data="onnx", check_weights=False)
+        artifacts = write_ort_genai_config(package, str(tmp_path), ep="cpu")
+        with open(artifacts["genai_config"], encoding="utf-8") as file:
+            genai_config = json.load(file)
+        vision_path = tmp_path / genai_config["model"]["vision"]["filename"]
+        saved = ir.load(vision_path)
+        if capacity is None:
+            assert not isinstance(saved.graph.inputs[0].shape[1], int)
+            assert not isinstance(saved.graph.outputs[0].shape[0], int)
+        elif batch_size is not None:
+            assert list(saved.graph.inputs[0].shape) == [batch_size, 72, 48]
+            assert list(saved.graph.outputs[0].shape) == [batch_size * 8, 64]
+        else:
+            assert not isinstance(saved.graph.inputs[0].shape[0], int)
+            assert list(saved.graph.inputs[0].shape[1:]) == [72, 48]
+            assert not isinstance(saved.graph.outputs[0].shape[0], int)
+        assert (tmp_path / "image_processor.json").is_file()
+
     @staticmethod
     def _build(config: Gemma4Config) -> ir.Model:
         from mobius._builder import _cast_module_dtype
