@@ -7,6 +7,22 @@ image/video projector, and an 88-layer Puzzle decoder with heterogeneous
 experts: 40 Mamba, 40 MoE and 8 attention blocks. It is not a Lightning
 checkpoint alias and has no built-in MTP sidecar.
 
+## November 4 release refresh
+
+PR #779 is refreshed linearly onto main
+`c0d6a2084bb796c6f89ab6f37cfbf244775ca362`, preserving Omni task registration
+alongside main's multi-component tasks. Offline CPU graph/config/weight/metadata
+selections pass (151 tests; 14 skips), as do focused precision/chunk tests
+(187 tests; 157 skips, including CUDA/native-operator cases). The initialized
+CI formatter and linter pass. No GPU or full-checkpoint rerun is claimed.
+
+Release readiness remains **blocked** on independent full-model numerical and
+cached-state parity, complete generation, and portable/long-context runtime
+qualification. Historical accuracy, throughput, or isolated GGUF/native
+adaptation parity does not qualify this exporter head. Known numerical failures
+are not waived. The readiness deadline is November 9, ahead of the November 10
+ORT cut.
+
 ## Export
 
 ```bash
