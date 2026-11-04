@@ -56,7 +56,9 @@ reason — before the PR is merged.
 ### 3. L2 — Config compatible
 
 - [ ] YAML test case created at `testdata/cases/<category>/<model>.yaml`
-- [ ] `test_model_id` field set to a real HuggingFace model ID
+- [ ] Registry `test_model_id` and immutable `test_revision` set; do not place
+      these registry-only fields in golden YAML
+- [ ] `python -m pytest tests/arch_validation_test.py -k "<model_type>"` passes
 - [ ] Revision/trust flags are pinned and forwarded through config, processor,
       weights, golden generation, and CLI build
 - [ ] Schema validates: `python -m pytest tests/yaml_schema_test.py`
@@ -86,6 +88,8 @@ reason — before the PR is merged.
 - [ ] YAML test case has `level: "L5"` or `"L4+L5"`
 - [ ] `generation.max_new_tokens` set (≥ 20 recommended)
 - [ ] `generation.do_sample: false` (deterministic greedy decode)
+- [ ] Checkpoint logits processors (for example repetition penalty) are explicit
+      and identical in reference generation and ONNX replay
 - [ ] Generation golden file generated:
       `python scripts/generate_golden.py --level L5 --filter '<model>*'`
 - [ ] Generation golden file committed to
@@ -117,6 +121,8 @@ reason — before the PR is merged.
       architecture-appropriate tokens, frame IDs, transcript, or image output
 - [ ] A dtype that executes inaccurately is rejected explicitly and is not the
       default; never silently downgrade
+- [ ] Dtype limits are checked at construction and actual graph creation;
+      tiny-model success is not a substitute for full-checkpoint evidence
 
 Use the example `--compare-hf --dtype f16/bf16` flag if a comparison script
 exists:
@@ -275,7 +281,8 @@ python -m pytest tests/build_graph -k "<model_type>"
 # L1 – weight alignment
 python -m pytest tests/weight_alignment_test.py -k "<model_type>"
 
-# L2 – YAML schema
+# L2 – registry-driven full config and golden schema
+python -m pytest tests/arch_validation_test.py -k "<model_type>"
 python -m pytest tests/yaml_schema_test.py
 
 # L3 – synthetic parity
