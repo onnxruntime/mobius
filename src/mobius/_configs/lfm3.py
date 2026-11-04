@@ -48,6 +48,11 @@ class Lfm3Config(CausalLMConfig):
                 else "conv"
                 for i in range(self.num_hidden_layers)
             ]
+        # Newer Transformers remaps custom-code "conv" to "linear_attention".
+        # LFM3 still uses the checkpoint's gated short-convolution operator.
+        self.layer_types = [
+            "conv" if kind == "linear_attention" else kind for kind in self.layer_types
+        ]
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError("LFM3 layer_types must contain exactly num_hidden_layers entries")
         unknown = sorted(

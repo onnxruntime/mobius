@@ -228,6 +228,9 @@ def _build_graph(model_type: str, model_id: str, *, revision: str | None = None)
         parent_config=parent_config,
         module_class=registration.module_class,
     )
+    if model_type == "lfm3":
+        # L2 validates a supported export dtype, not the checkpoint storage dtype.
+        config.dtype = ir.DataType.FLOAT
 
     module = registration.module_class(config)
     task_name = registration.task or _default_task_for_model(model_type)

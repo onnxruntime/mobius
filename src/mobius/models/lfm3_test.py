@@ -125,6 +125,18 @@ def test_lfm3_config_none_defaults_and_optional_norm_bias():
     assert module.model.layers[0].conv.in_proj.bias is not None
 
 
+def test_lfm3_config_restores_transformers_custom_code_conv_alias():
+    config = tiny_lfm3_config(
+        layer_types=["linear_attention", "full_attention", "sliding_attention"]
+    )
+    assert config.layer_types == ["conv", "full_attention", "sliding_attention"]
+    graph = build_from_module(
+        Lfm3CausalLMModel(config), config, task="hybrid-text-generation"
+    )["model"].graph
+    assert "past_key_values.0.conv_state" in {value.name for value in graph.inputs}
+    assert not any("recurrent_state" in value.name for value in graph.inputs)
+
+
 def test_lfm3_attention_contract_is_independent_of_config_label():
     config = tiny_lfm3_config(model_type="synthetic")
     module = Lfm3CausalLMModel(config)

@@ -37,6 +37,14 @@ def lfm3_reference_compatibility():
         yield
 
 
+def restore_lfm3_reference_layer_types(config) -> None:
+    """Undo generic HF vocabulary remapping for the pinned upstream LFM3 model."""
+    if getattr(config, "model_type", None) == "lfm3":
+        config.layer_types = [
+            "conv" if kind == "linear_attention" else kind for kind in config.layer_types
+        ]
+
+
 def _tensor_to_numpy(value: torch.Tensor) -> np.ndarray:
     """Preserve tensor storage dtype, including BF16, at the NumPy boundary."""
     value = value.detach().cpu().contiguous()
@@ -273,6 +281,7 @@ def load_torch_model(
     config = transformers.AutoConfig.from_pretrained(
         model_id, revision=revision, trust_remote_code=trust_remote_code
     )
+    restore_lfm3_reference_layer_types(config)
     if getattr(config, "model_type", None) == "nemotron_h":
         config.rescale_prenorm_residual = False
 

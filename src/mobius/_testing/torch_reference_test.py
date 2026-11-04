@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import contextlib
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import ml_dtypes
@@ -242,7 +243,10 @@ def test_bfloat16_media_decoder_logits_and_kv_reuse(wrapper):
 def test_load_torch_model_pins_every_huggingface_resource(model_type) -> None:
     revision = "a" * 40
     tokenizer = SimpleNamespace(pad_token="<pad>", eos_token="</s>")
-    config = SimpleNamespace(model_type=model_type)
+    config = SimpleNamespace(
+        model_type=model_type,
+        layer_types=["linear_attention", "full_attention", "sliding_attention"],
+    )
     model = mock.Mock()
 
     with (
@@ -291,14 +295,20 @@ def test_load_torch_model_pins_every_huggingface_resource(model_type) -> None:
     )
     fix_weights.assert_called_once_with(model, "owner/model", revision)
     model.eval.assert_called_once_with()
+    assert config.layer_types == [
+        "conv" if model_type == "lfm3" else "linear_attention",
+        "full_attention",
+        "sliding_attention",
+    ]
 
 
 @pytest.mark.parametrize("raise_inside", [False, True])
 def test_lfm3_optional_kernel_registration_is_scoped(monkeypatch, raise_inside):
-    import transformers.integrations as integrations
-
+    # A real lazy module can re-import a deleted attribute through __getattr__.
+    integrations = ModuleType("transformers.integrations")
+    monkeypatch.setitem(sys.modules, "transformers.integrations", integrations)
+    monkeypatch.setattr(transformers, "integrations", integrations)
     name = "use_kernel_func_from_hub_with_fallback"
-    monkeypatch.delattr(integrations, name, raising=False)
 
     def function(value):
         return value + 1

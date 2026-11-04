@@ -847,7 +847,10 @@ def _create_hf_model(model_type: str, hf_config, seed: int):
 
     torch.manual_seed(seed)
     if model_type == "lfm3":
+        from mobius._testing.torch_reference import restore_lfm3_reference_layer_types
+
         _, model_class = _lfm3_reference_classes()
+        restore_lfm3_reference_layer_types(hf_config)
         hf_config._attn_implementation = "eager"
         return model_class(hf_config).float().eval()
     try:
@@ -1392,6 +1395,7 @@ def test_lfm3_synthetic_cached_chunked_parity(device, dtype, sandwich, conv_bias
     from mobius import build_from_module
     from mobius._configs import Lfm3Config
     from mobius._testing.ort_inference import OnnxModelSession
+    from mobius._testing.torch_reference import restore_lfm3_reference_layer_types
     from mobius.models.lfm3 import Lfm3CausalLMModel
 
     if device == "cuda":
@@ -1422,6 +1426,7 @@ def test_lfm3_synthetic_cached_chunked_parity(device, dtype, sandwich, conv_bias
         use_sandwich_norm=sandwich,
     )
     hf_config._attn_implementation = "eager"
+    restore_lfm3_reference_layer_types(hf_config)
     config = Lfm3Config.from_transformers(hf_config)
     config.dtype = dtype
     torch_dtype = {
