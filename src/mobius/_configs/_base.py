@@ -4306,6 +4306,7 @@ class NemotronHConfig(ArchitectureConfig):
                 "hidden_act",
                 "moe_latent_size",
                 "shared_expert_intermediate_size",
+                "mamba_ssm_dtype",
             )
         }
 

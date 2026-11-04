@@ -10,6 +10,21 @@ with complete named reporting. A separate explicit `nemotron-h-mtp` task now
 exports target and draft graphs with strict MTP coverage and tiny independent
 CPU parity. This is **graph support**, not a speculative-generation runtime.
 
+### November 4 release refresh
+
+PR #761 is refreshed linearly onto main
+`c0d6a2084bb796c6f89ab6f37cfbf244775ca362`. The refresh preserves the explicit
+SSM cache dtype override when copying base config fields; supplying that field
+twice otherwise breaks real Lightning config extraction and target/MTP builds.
+The offline CPU graph, weight reconstruction, metadata, synthetic parity and
+normalization selections pass (179 tests; 12 resource/runtime skips).
+The initialized CI formatter and linter also pass.
+
+This is not full-model release qualification. Existing decoder numerical/cache
+failures below remain blockers, not waivers. Fresh CUDA, full-checkpoint L4/L5,
+multi-dtype and speculative-runtime validation are not established on this head.
+The readiness deadline is November 9, ahead of the November 10 ORT cut.
+
 ### Grouped Mamba normalization correction and H100 gate
 
 User-supplied H100 evidence for export commit `897a0e05` reports exact source
