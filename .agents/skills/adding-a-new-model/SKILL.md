@@ -39,6 +39,8 @@ Read these when you need deeper detail on a specific topic:
   parity data, or goldens
 - Before a long run, smoke-test the pinned upstream loader in the exact task
   interpreter. Record its dependency versions and the selected CUDA provider.
+- Use the repository's pinned CI reference dependencies. Compare raw JSON and
+  trusted configs: dependency validators can silently remap layer vocabulary.
 
 ## Step-by-step
 
