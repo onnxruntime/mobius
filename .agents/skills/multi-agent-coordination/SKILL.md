@@ -70,6 +70,9 @@ Checks at each stage prevent problems from compounding across agents.
 - Check for uncommitted changes left by previous agents in your worktree.
 - Verify `inspect.getfile(mobius)` points into the agent's worktree; editable
   installs from another worktree invalidate all test evidence.
+- Pass the exact Python executable, `PYTHONPATH`, Hub/temp cache locations, and
+  `CUDA_VISIBLE_DEVICES` to every agent, including reviewers. Check these before
+  treating a missing dependency as a branch failure.
 
 ### After each commit
 - Run the affected tests immediately (don't batch; catch regressions early).
@@ -206,6 +209,9 @@ Before sending a task, verify your prompt includes all of the following:
 5. ☐ **Commit message format** — so the history is readable
 6. ☐ **Push reminder** — explicit instruction to push after committing
 7. ☐ **Definition of done** — what "finished" looks like (tests passing, specific output, etc.)
+8. ☐ **Recovery handoff** — report blockers, exact test results, and corrections
+   beyond the initial prompt. Persist a coherent checkpoint before a long run;
+   never report a cancelled agent's unfinished work as verified.
 
 **Example delegation prompt**:
 ```

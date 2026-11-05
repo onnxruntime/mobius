@@ -45,7 +45,7 @@ without passing L2, or have L4 golden data without passing L3.
 | Level | Name | What it verifies | Data source |
 |-------|------|-----------------|-------------|
 | **L1** | Graph builds | ONNX graph builds from a tiny synthetic config | `tests/_test_configs.py` + `tests/build_graph` |
-| **L2** | Config compatible | Full-size HF config produces a valid graph | `test_model_id` in YAML test case (`testdata/cases/`) |
+| **L2** | Config compatible | Full-size HF config produces a valid graph | Registry `test_model_id` / `test_revision` + `tests/arch_validation_test.py` |
 | **L3** | Synthetic parity | Random-weight forward pass matches HF numerically | `tests/synthetic_parity_test.py` and focused integration suites |
 | **L4** | Golden match | Real-weight prefill logits match pre-computed reference | `testdata/golden/<cat>/<model>.json` |
 | **L5** | Generation verified | Full multi-token generation matches golden output | `testdata/golden/<cat>/<model>_generation.json` |
@@ -106,7 +106,7 @@ tests/
 └── arch_validation_test.py   # L2: full HF config graph build
 
 testdata/
-├── cases/                    # YAML test case definitions (L2, L4, L5)
+├── cases/                    # Schema-validated L4/L5 case definitions
 └── golden/                   # Pre-computed reference outputs
 ```
 
@@ -169,9 +169,10 @@ Place rewrite rule tests **next to** the source file:
 
 ## L2: Config compatibility
 
-Detected from the `test_model_id` field in YAML test cases. To add L2:
-create `testdata/cases/<category>/my-model.yaml` with `test_model_id`
-set to a real HF model ID.
+L2 cases come from registry `ModelRegistration.test_model_id` (including
+`_TEST_MODEL_IDS`) and `test_revision`. Set both, then run
+`python -m pytest tests/arch_validation_test.py -k "<model_type>"`.
+Do not add `test_model_id` to golden YAML: the schema rejects it.
 
 ---
 
@@ -259,6 +260,8 @@ integration test alongside any new custom function or Scan op.**
   ordering, and sampled frame positions from nonzero image/video/audio data
 - **Batch and decode edges** — use two rows with distinguishable media
   features, mixed modality order, and a decode step with zero new media
+- **Hybrid caches** — include left-padded batch > 1, cached multi-token chunks
+  crossing a sliding-window boundary, and full logits at every reused-state step.
 
 ### Golden tests must be reproducible and exact
 
@@ -271,8 +274,13 @@ integration test alongside any new custom function or Scan op.**
 - On hosted runners, isolate and eagerly delete each test's Hub, assets, and
   Xet caches. Patching `HF_HOME` after `huggingface_hub` import is insufficient;
   patch its imported cache constants too.
-- Run the exact L2 discovery path: YAML schema, `test_model_id`, revision, and
-  trust flags can be missed by model-local tests.
+- Run registry-driven L2 and YAML schema validation separately; pin the registry
+  revision as well as the golden case revision.
+- Inspect checkpoint generation settings before collecting L5 data. Sampling
+  disabled does not disable repetition penalties; reference and ONNX replay
+  must apply the same processors to the same token history.
+- Tiny parity does not qualify a dtype for the full checkpoint. Diagnose the
+  first divergent stage; reject unverified dtypes rather than weaken gates.
 - Run affected-model detection on the full diff before GPU CI. A new model
   should select its targeted L4/L5 cases; distinguish all-model timeout or
   runner termination from a model assertion failure.
