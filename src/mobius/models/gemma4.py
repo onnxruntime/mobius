@@ -47,9 +47,11 @@ from mobius.components import (
     Embedding,
     LayerNorm,
     Linear,
+    QuantizedEmbedding,
     RMSNorm,
     ScaledQuantizedEmbedding,
     ScaleFreeRMSNorm,
+    TiedQuantizedLMHead,
     create_attention_bias,
     initialize_rope,
     make_clippable_quantized_linear_factory,
@@ -58,7 +60,11 @@ from mobius.components import (
 from mobius.components._activations import get_activation
 from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._mlp import GatedMLP
-from mobius.models.base import CausalLMModel, _retain_last_sequence_token
+from mobius.models.base import (
+    CausalLMModel,
+    _retain_last_sequence_token,
+    effective_tie_word_embeddings,
+)
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
 if TYPE_CHECKING:
@@ -2621,6 +2627,22 @@ class Gemma4CausalLMModel(CausalLMModel):
         self.config = config
         self.model = Gemma4TextModel(config)
         self.lm_head = _make_lm_head(config)
+        if (
+            effective_tie_word_embeddings(config)
+            and _text_lm_head_quantized(config)
+            and isinstance(self.model.embed_tokens, QuantizedEmbedding)
+            and _table_quantization_config(
+                config,
+                "decoder",
+                source_module_names=("model.language_model.embed_tokens",),
+            )
+            == _component_quantization_config(config, "decoder")
+        ):
+            # Unlike the split multimodal graphs, text-only decoding can reuse
+            # the embedding's packed table without loading a second output tensor.
+            self.lm_head = TiedQuantizedLMHead(
+                self.model.embed_tokens, config.hidden_size, config.vocab_size
+            )
         # Speculative folded-carry seed: when requested, additionally emit the
         # post-final-norm hidden state (the lm_head input, == HF
         # ``output_hidden_states[-1]``) as ``hidden_states.{idx}``. Gemma4 exposes

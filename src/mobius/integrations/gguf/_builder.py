@@ -69,6 +69,7 @@ else:
     _HUB_PREFLIGHT_TRANSPORT_ERRORS += (_HttpxHTTPError,)
 
 if TYPE_CHECKING:
+    from mobius._configs import ArchitectureConfig
     from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
@@ -7348,13 +7349,17 @@ def build_from_gguf(
         if resolved is not None:
             config = dataclasses.replace(config, dtype=resolved)
 
+    name_mapper = _config_tensor_name_mapper(gguf_arch, config)
+
     # 3. Quantized path: detect dominant type and set config
     if preserve_quantization:
         from mobius._configs import QuantizationConfig
         from mobius._flags import flags
         from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
 
-        bits, block_size, is_sym = _detect_quant_params(gguf_model, gguf_arch)
+        bits, block_size, is_sym = _detect_quant_params(
+            gguf_model, gguf_arch, name_mapper=name_mapper
+        )
         # Float zero-point only when actually using Tencent's native 2-bit form.
         float_zp = is_tencent_q1_0_layout(gguf_model) and flags.tencent_q1_0_use_native_2bit
         quantize_embeddings = _can_quantize_embedding(
@@ -7483,8 +7488,9 @@ def build_from_gguf(
             gguf_arch,
             preserve_quantization=True,
             dequantize_float_linear_types=float_linear_dequantization_types,
+            name_mapper=name_mapper,
         )
-        _replace_native_block_linears(module, gguf_model, gguf_arch)
+        _replace_native_block_linears(module, gguf_model, gguf_arch, name_mapper=name_mapper)
         # The sparse-MoE honesty gate runs post-export on the final graph state
         # (see step 9b): routed native-block experts are first collapsed into a
         # sparse top-k pkg.nxrt::BlockQuantizedMoE by fuse_block_quantized_moe,
@@ -7500,6 +7506,7 @@ def build_from_gguf(
         target_bits=(config.quantization.bits if preserve_quantization else None),
         target_block_size=(config.quantization.group_size if preserve_quantization else None),
         execution_provider=execution_provider,
+        name_mapper=name_mapper,
         dequantize_float_linear_types=float_linear_dequantization_types,
         emit_warning=not emit_mtp_head,
         include_tensor=(
@@ -7563,6 +7570,7 @@ def build_from_gguf(
             gguf_arch,
             module,
             config,
+            name_mapper=name_mapper,
             reuse_candidates=reuse_candidates_by_id,
             dequantize_float_linear_types=float_linear_dequantization_types,
         )
@@ -7570,6 +7578,7 @@ def build_from_gguf(
         state_dict = _load_dequantized_state_dict(
             gguf_model,
             gguf_arch,
+            name_mapper=name_mapper,
             reuse_candidates=reuse_candidates_by_id,
         )
 
@@ -8705,6 +8714,36 @@ def _uses_explicit_float_route(
     )
 
 
+def _config_tensor_name_mapper(
+    gguf_arch: str,
+    config: ArchitectureConfig,
+) -> Callable[[str, str], str | None]:
+    """Exclude only checkpoint tensors unused by the configured architecture."""
+    from mobius._configs import Gemma4Config
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    if gguf_arch != "gemma4" or not isinstance(config, Gemma4Config):
+        return map_gguf_to_hf_names
+
+    first_shared_layer = config.num_hidden_layers - config.num_kv_shared_layers
+    num_layers = config.num_hidden_layers
+
+    def map_name(name: str, architecture: str) -> str | None:
+        # HF Gemma4TextModel ignores these unexpected weights on shared layers:
+        # their K/V and normalized keys come from the last owning layer of each type.
+        match = re.fullmatch(r"blk\.(\d+)\.(?:attn_[kv]|attn_k_norm)\.weight", name)
+        if (
+            architecture == "gemma4"
+            and match is not None
+            and 0 < first_shared_layer <= int(match.group(1)) < num_layers
+        ):
+            logger.debug("Skipping unused Gemma4 shared-KV tensor: %s", name)
+            return None
+        return map_gguf_to_hf_names(name, architecture)
+
+    return map_name
+
+
 def _reject_unsupported_quantization_preservation(
     gguf_model,
     gguf_arch: str,
@@ -8714,6 +8753,7 @@ def _reject_unsupported_quantization_preservation(
     allow_quantized_embeddings: bool = True,
     allow_quantized_lm_head: bool = True,
     dequantize_float_linear_types: Mapping[str, Collection[str]] | None = None,
+    name_mapper: Callable[[str, str], str | None] | None = None,
 ) -> None:
     """Reject architectures that cannot preserve all compatible quantized weights.
 
@@ -8749,6 +8789,9 @@ def _reject_unsupported_quantization_preservation(
     )
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
+    if name_mapper is None:
+        name_mapper = map_gguf_to_hf_names
+
     float_type_ids = float_storage_type_ids()
     metadata = getattr(gguf_model, "metadata", {})
     block_count = int(metadata.get(f"{gguf_arch}.block_count", 0))
@@ -8759,7 +8802,9 @@ def _reject_unsupported_quantization_preservation(
         type_name = getattr(qtype, "name", str(qtype))
         if not tensor_name.endswith(".weight") or type_id in float_type_ids:
             continue
-        hf_name = map_gguf_to_hf_names(tensor_name, gguf_arch)
+        hf_name = name_mapper(tensor_name, gguf_arch)
+        if hf_name is None and map_gguf_to_hf_names(tensor_name, gguf_arch) is not None:
+            continue
         module_stem = (
             hf_name[: -len(".weight")]
             if hf_name is not None and hf_name.endswith(".weight")
@@ -8828,7 +8873,12 @@ def _reject_unsupported_quantization_preservation(
         )
 
 
-def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
+def _detect_quant_params(
+    gguf_model,
+    gguf_arch: str,
+    *,
+    name_mapper: Callable[[str, str], str | None] | None = None,
+) -> tuple[int, int, bool]:
     """Detect the common MatMulNBits target for GGUF projection weights.
 
     Q4_K-containing mixed presets target 4-bit, block-32 asymmetric
@@ -8853,10 +8903,13 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
         map_gguf_to_hf_names,
     )
 
+    if name_mapper is None:
+        name_mapper = map_gguf_to_hf_names
+
     counts: Counter = Counter()
     float_type_ids = float_storage_type_ids()
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
-        hf_name = map_gguf_to_hf_names(name, gguf_arch)
+        hf_name = name_mapper(name, gguf_arch)
         if hf_name is None or not hf_name.endswith(".weight"):
             continue
         if _uses_explicit_float_route(gguf_arch, name):
