@@ -115,6 +115,7 @@ __all__ = [
     "MoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
+    "packed_row_tiles",
     "PatchEmbedding",
     "ParakeetFastConformerEncoder",
     "PaddleOCRProjector",
@@ -370,6 +371,7 @@ from mobius.components._ocr_projectors import (
     PaddleOCRProjector,
     YouTuVLProjector,
 )
+from mobius.components._packed_cuda import packed_row_tiles
 from mobius.components._paged_mla import (
     PagedCacheState as PagedCacheState,
 )

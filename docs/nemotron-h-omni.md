@@ -56,6 +56,42 @@ stock runtimes. This is package/operator evidence, not full-model readiness.
 
 ## Required native operator contracts
 
+### Opt-in compact CUDA graph
+
+Set `MOBIUS_BOLT_PACKED_CUDA=1` before the export command above, using a fresh
+output directory. The default exporter is unchanged. This option requires
+BF16, explicit CUDA, loaded native quantized weights, and an ORT build containing
+the packed projection and MoE kernels from
+[PR #33897](https://github.com/microsoft/onnxruntime/pull/33897) and
+[PR #33899](https://github.com/microsoft/onnxruntime/pull/33899), in addition to
+the original native operators below. It does not work with stock ORT.
+
+The compact variant replaces each supported routed expert bank with
+`MoEPackedIQ2XXS`, instead of expanding every expert. Eligible projections use
+`MatMulPackedIQ2XXS`, `MatMulPackedQ8`, and `MatMulPackedNVFP4`.
+Longer inputs are tiled with `Scan`; projection tiles contain at most eight
+rows, and MoE tiles also respect the 128 selected-pair limit. Source IQ2
+and Q8 FP16 scale bits are retained, Q8 signed bytes are translated exactly
+to the packed ABI, and NVFP4 payloads/scales are unchanged. No dense expert
+reconstruction or auxiliary runtime weight file is introduced.
+
+Mamba, routing, attention, masks, cache interfaces, and the media models are
+preserved. This is intentionally **not** identical to the separate Bolt
+benchmark graph: its verification-snapshot Mamba interface is not a drop-in
+replacement for ordinary prefill/cached decoding. Expert accumulation order
+and projection reduction schedules differ from the default native graph.
+The decoder carries `mobius.bolt.packed_cuda=1` metadata and the weight report
+records node/operator counts. Graph reduction is not full-model numerical
+acceptance, a throughput claim, or evidence of lower runtime memory. The
+readiness gates below must be rerun independently for this graph variant.
+
+On the pinned 88-layer production configuration, the structure-only check
+reduces total decoder nodes from **156,423 to 11,263**, counting nested
+`Scan`/`If` bodies (top-level: 156,423 to 7,128). This check does not load
+checkpoint weights, execute the full model, or measure exported file size.
+
+### Original native kernels
+
 The mixed-format decoder requires CUDA operators from
 [ORT PR #33400](https://github.com/microsoft/onnxruntime/pull/33400).
 Stock ORT builds without those operators cannot execute this package.

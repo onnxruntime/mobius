@@ -198,6 +198,17 @@ class _Flags:
     is **not** a performance path and makes no throughput claim.
     """
 
+    bolt_packed_cuda: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_BOLT_PACKED_CUDA", False)
+    )
+    """Opt in to the compact BF16 Bolt CUDA backend after native weight loading.
+
+    Requires a custom ORT build with MatMulPacked* and MoEPackedIQ2XXS kernels.
+    Expert reduction and projection schedules differ from the general backend;
+    this is a separately qualified graph variant, not full-model acceptance.
+    Mamba, routing, attention masks and cache interfaces remain unchanged.
+    """
+
 
 # Global singleton — import and use this directly.
 flags = _Flags()

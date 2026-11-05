@@ -19,6 +19,7 @@ from mobius._configs import (
     QuantizationOverride,
     QuantizedWeightFormat,
 )
+from mobius._flags import override_flags
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.integrations._block_quant import BlockQuantScheme
@@ -36,6 +37,44 @@ class _DummyModule(nn.Module):
 class _DummyFp8Module(_DummyModule):
     def build_fp8_streaming_plan(self, *_args):
         raise AssertionError("mock streaming function should own planning")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"execution_provider": "cpu"},
+        {"dtype": "f16"},
+        {"load_weights": False},
+        {"keep_quantized": False},
+    ],
+)
+def test_packed_bolt_rejects_incompatible_exports_before_build_or_weight_io(
+    monkeypatch, options
+):
+    from mobius._configs import NemotronHOmniConfig
+    from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
+
+    config = NemotronHOmniConfig.from_transformers(_omni_config())
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *a, **k: (SimpleNamespace(model_type="nemotron_h_omni"), False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *a, **k: (_DummyModule, "nemotron-h-omni", "nemotron_h_omni"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *a, **k: config)
+    core = mock.Mock(side_effect=AssertionError("must fail before graph/weight construction"))
+    monkeypatch.setattr(transformers_builder, "build_from_module", core)
+    kwargs = {"dtype": "bf16", "execution_provider": "cuda", **options}
+    with (
+        override_flags(bolt_packed_cuda=True),
+        pytest.raises((ValueError, NotImplementedError), match=r"CUDA|BF16|dequantize"),
+    ):
+        transformers_builder.build_transformers_model("local-model", **kwargs)
+    core.assert_not_called()
 
 
 @pytest.mark.parametrize("level", [None, 0, 4])
@@ -114,12 +153,14 @@ def _native_gptoss_config(*, dtype=ir.DataType.FLOAT16):
 
 @pytest.mark.parametrize("local_checkpoint", [False, True])
 @pytest.mark.parametrize("revision", [None, "explicit-revision"])
+@pytest.mark.parametrize("packed", [False, True])
 def test_native_omni_pins_detection_and_streams_before_eager(
-    monkeypatch, tmp_path, local_checkpoint, revision
+    monkeypatch, tmp_path, local_checkpoint, revision, packed
 ) -> None:
     from mobius._configs import NemotronHOmniConfig
     from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
     from mobius.integrations.transformers import _nemotron_h_omni_weights
+    from mobius.models import _nemotron_h_omni_packed
     from mobius.models.nemotron_h_omni import BOLT_REVISION
 
     model_id = (
@@ -153,15 +194,19 @@ def test_native_omni_pins_detection_and_streams_before_eager(
     monkeypatch.setattr(
         _nemotron_h_omni_weights, "stream_nemotron_h_omni_safetensors_to_package", stream
     )
-    result = transformers_builder.build_transformers_model(
-        model_id, revision=revision, dtype="bf16", execution_provider="cuda"
-    )
+    optimize = mock.Mock(return_value=package)
+    monkeypatch.setattr(_nemotron_h_omni_packed, "optimize_nemotron_h_omni_cuda", optimize)
+    with override_flags(bolt_packed_cuda=packed):
+        result = transformers_builder.build_transformers_model(
+            model_id, revision=revision, dtype="bf16", execution_provider="cuda"
+        )
     assert result is package
     probe.assert_called_once_with(
         model_id, revision=expected_revision, trust_remote_code=False
     )
     eager.assert_not_called()
     assert stream.call_count == 1
+    assert optimize.call_count == int(packed)
     args, kwargs = stream.call_args
     assert args[:2] == (package, model_id)
     assert isinstance(args[2], NemotronHOmniConfig)

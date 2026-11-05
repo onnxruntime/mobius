@@ -21,6 +21,7 @@ from mobius._component_quantization import (
     validate_quantized_component_bindings,
 )
 from mobius._configs import NemotronHOmniConfig, QuantizedWeightFormat
+from mobius._flags import flags
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius._weight_utils import WeightTransform
@@ -646,6 +647,19 @@ def build_transformers_model(
             item.quant_algo == "W4A16_NVFP4" for item in config.quantized_projections.values()
         ) and config.dtype not in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
             raise ValueError("Native Omni NVFP4 requires dtype='bf16' or dtype='f16'")
+    if flags.bolt_packed_cuda and (
+        model_type != "nemotron_h_omni"
+        or not isinstance(config, NemotronHOmniConfig)
+        or not config.quantized_projections
+        or execution_provider != "cuda"
+        or config.dtype != ir.DataType.BFLOAT16
+        or not load_weights
+        or not keep_quantized
+    ):
+        raise ValueError(
+            "MOBIUS_BOLT_PACKED_CUDA requires native BF16 Nemotron-H Omni, "
+            "explicit CUDA and loaded quantized weights"
+        )
     config, dequantize_gptoss_mxfp4 = _apply_gptoss_mxfp4_source_policy(
         config,
         is_gptoss_mxfp4_source=is_gptoss_mxfp4_source,
@@ -843,6 +857,10 @@ def build_transformers_model(
                 weight_transforms=weight_transforms,
             )
         validate_quantized_component_bindings(package, config)
+    if flags.bolt_packed_cuda:
+        from mobius.models._nemotron_h_omni_packed import optimize_nemotron_h_omni_cuda
+
+        package = optimize_nemotron_h_omni_cuda(package)
     if execution_provider == "onnx-standard":
         from mobius._optimizations import validate_standard_onnx
 
