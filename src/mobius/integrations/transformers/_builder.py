@@ -343,6 +343,7 @@ def build_transformers_model(
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
+    transposed_matmul: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
     input_sampling_rate: int | None = None,
@@ -390,6 +391,7 @@ def build_transformers_model(
             "text_only": text_only,
             "fp8_kv_cache": fp8_kv_cache,
             "kv_cache_scales": kv_cache_scales is not None,
+            "transposed_matmul": transposed_matmul,
             "prune_prefill_prefix": prune_prefill_prefix,
             "glm_full_attention": glm_full_attention,
             "export_paged_attention": export_paged_attention,
@@ -478,6 +480,7 @@ def build_transformers_model(
                 "text_only": text_only,
                 "fp8_kv_cache": fp8_kv_cache,
                 "kv_cache_scales": kv_cache_scales is not None,
+                "transposed_matmul": transposed_matmul,
                 "prune_prefill_prefix": prune_prefill_prefix,
                 "glm_full_attention": glm_full_attention,
                 "export_paged_attention": export_paged_attention,
@@ -683,6 +686,7 @@ def build_transformers_model(
         kv_cache_scales=kv_cache_scales,
         prune_prefill_prefix=prune_prefill_prefix,
         component_manifest=component_manifest,
+        transposed_matmul=transposed_matmul,
     )
     graph_source_name = (
         model_type if is_gptoss_mxfp4_source and pathlib.Path(model_id).is_dir() else model_id

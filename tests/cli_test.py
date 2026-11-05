@@ -796,6 +796,31 @@ class TestCLIBuild:
             )
         assert mock_build.call_args.kwargs.get("fp8_kv_cache") is True
 
+    def test_features_transposed_matmul_passed_through(self):
+        """--features transposed-matmul sets transposed_matmul on the build() call."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "transposed-matmul",
+                ]
+            )
+        assert mock_build.call_args.kwargs.get("transposed_matmul") is True
+        assert mock_build.call_args.kwargs.get("fp8_kv_cache") is False
+
     def test_features_prune_prefill_prefix_passed_through(self):
         """--features prune-prefill-prefix sets the build option."""
         with (

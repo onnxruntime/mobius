@@ -263,6 +263,7 @@ Available features:
 |---------|--------|
 | `static-cache` | Pre-allocate fixed-size KV cache buffers using `TensorScatter` (pair with `--max-seq-len N`). Requires `DecoderLayer` / `MoEDecoderLayer` models. Cannot combine with `--task`. |
 | `fp8-kv-cache` | Store the `GroupQueryAttention` KV cache as `FLOAT8E4M3FN` (per-tensor E4M3), halving KV-cache memory. Requires a GQA build (e.g. `--ep cuda --dtype f16`) and an ORT runtime with the FP8 KV-cache kernel (SM89+). Pair with `--kv-cache-scale-file` for calibrated scales. |
+| `transposed-matmul` | Feed decoder projections (the packed Q/K/V, `o_proj`, the MLP and the LM head) the checkpoint's `[out, in]` weight through `com.microsoft::FusedMatMul` with `transB=1`, instead of a `MatMul` against a pre-transposed `[in, out]` weight. cuBLAS is faster on that layout at batch 1. CUDA only (`--ep cuda`); ignored with a warning elsewhere. |
 | `prune-prefill-prefix` | Emit logits shaped `[B, 1, vocab]` by selecting the final token before the LM head. Gemma 4 also prunes its KV-sharing layer suffix and per-layer inputs to reduce prefill compute. |
 | `text-only` | Export the text backbone of a multimodal checkpoint as a standalone decoder-only LLM (see below). |
 

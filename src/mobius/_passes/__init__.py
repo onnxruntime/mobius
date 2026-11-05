@@ -35,6 +35,12 @@ Available passes
     Folds ``Concat(init_0, init_1, ...)`` patterns (where every input is a
     graph initializer) into a single pre-concatenated initializer.  Used to
     pre-pack QKV weight matrices after weight loading.
+
+:class:`TransposedWeightMatMulPass`
+    Rewrites ``MatMul(x, Transpose(weight))`` into ``com.microsoft::FusedMatMul``
+    with ``transB=1`` so the weight keeps the checkpoint's ``[out, in]`` layout.
+    Structural; runs before weights are loaded, behind
+    ``--features transposed-matmul``.
 """
 
 from __future__ import annotations
@@ -44,9 +50,11 @@ __all__ = [
     "FoldConcatInitializersPass",
     "Fp8KvCachePass",
     "RemoveDeadGraphInputsPass",
+    "TransposedWeightMatMulPass",
 ]
 
 from mobius._passes._fold_concat import FoldConcatInitializersPass
 from mobius._passes._fold_transpose import FoldTransposedInitializerPass
 from mobius._passes._fp8_kv_cache import Fp8KvCachePass
 from mobius._passes._remove_dead_inputs import RemoveDeadGraphInputsPass
+from mobius._passes._transposed_matmul import TransposedWeightMatMulPass
