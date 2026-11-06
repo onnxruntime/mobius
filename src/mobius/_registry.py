@@ -42,6 +42,8 @@ from mobius._configs import (
     MoonshineConfig,
     MoonshineStreamingConfig,
     MuseGlimmerConfig,
+    NemotronHOmniConfig,
+    NemotronHPuzzleConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
     Plamo2Config,
@@ -220,7 +222,8 @@ from mobius.models.muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
     MuseGlimmerTextCausalLMModel,
 )
-from mobius.models.nemotron_h import NemotronHCausalLMModel
+from mobius.models.nemotron_h import NemotronHCausalLMModel, NemotronHPuzzleCausalLMModel
+from mobius.models.nemotron_h_omni import NemotronHOmniModel
 from mobius.models.opt import OPTCausalLMModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
@@ -793,6 +796,16 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "bamba": ModelRegistration(BambaCausalLMModel),
     "jamba": ModelRegistration(JambaCausalLMModel),
     "nemotron_h": ModelRegistration(NemotronHCausalLMModel),
+    "nemotron_h_puzzle": ModelRegistration(
+        NemotronHPuzzleCausalLMModel, config_class=NemotronHPuzzleConfig
+    ),
+    "nemotron_h_omni": ModelRegistration(
+        NemotronHOmniModel,
+        task="nemotron-h-omni",
+        config_class=NemotronHOmniConfig,
+        test_model_id="nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
+        test_revision="c6cc2e8ffa353403213d6b9b18aaf8eb684d705a",
+    ),
     "nemotron_parse": ModelRegistration(
         NemotronParseForConditionalGeneration,
         task="vision-encoder-decoder",

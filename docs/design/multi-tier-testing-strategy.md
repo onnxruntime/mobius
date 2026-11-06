@@ -385,6 +385,12 @@ Rather than a single `atol`/`rtol` check, comparisons use a
 
 ## 4. CI Integration
 
+On GitHub Actions, the shared `tests/conftest.py` prints and flushes failed
+setup, call, and teardown tracebacks as their reports arrive. This preserves
+earlier diagnostics if a later test or the job times out, including in L4/L5
+runs. Normal final summaries, captured output, JUnit reports, and exit statuses
+are unchanged; local runs retain pytest's default deferred reporting.
+
 ### Execution cadence
 
 | Trigger | What runs | Time budget | Purpose |

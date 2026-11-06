@@ -75,3 +75,40 @@ class TestCausalConvNdWithState:
     def test_function_domain(self):
         func = causal_conv_nd_with_state(kernel_size=4, channels=8, ndim=1)
         assert func.domain == "com.microsoft"
+
+
+@pytest.mark.parametrize("ndim", [1, 2, 3])
+@pytest.mark.parametrize("state_width", [0, 3])
+def test_prepare_causal_conv_state_preserves_original_values(tmp_path, ndim, state_width):
+    import numpy as np
+    import onnx_ir as ir
+    import onnxruntime as ort
+
+    from mobius._testing import create_test_builder, create_test_input
+    from mobius.functions.causal_conv import prepare_causal_conv_state
+
+    spatial = [2] * (ndim - 1)
+    input_shape, state_shape = [1, 2, *spatial, 4], [1, 2, *spatial, state_width]
+    inputs = np.arange(np.prod(input_shape), dtype=np.float32).reshape(input_shape)
+    state = -np.arange(np.prod(state_shape), dtype=np.float32).reshape(state_shape)
+    expected = np.concatenate((state, inputs), axis=-1)
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "input", input_shape)
+    carry = create_test_input(builder, "state", state_shape)
+    combined, present = prepare_causal_conv_state(
+        op, x, carry, state_width=state_width, temporal_axis=ndim + 1
+    )
+    for value, name, shape in (
+        (combined, "combined", list(expected.shape)),
+        (present, "present", state_shape),
+    ):
+        value.name, value.dtype, value.shape = name, ir.DataType.FLOAT, ir.Shape(shape)
+        graph.outputs.append(value)
+    path = tmp_path / "state.onnx"
+    ir.save(ir.Model(graph, ir_version=11), path)
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    actual, new_state = session.run(None, {"input": inputs, "state": state})
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(
+        new_state, expected[..., -state_width:] if state_width else expected[..., :0]
+    )
