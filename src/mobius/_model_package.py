@@ -41,6 +41,7 @@ import rfc8785
 import torch
 import tqdm
 
+from mobius._constants import LAZY_SOURCE_FILES_META_KEY
 from mobius._export_report import ComponentExportReport
 from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_utils import WeightTransform
@@ -202,6 +203,8 @@ def _validate_streaming_safetensors_destination(
     *,
     external_data: str,
     component_layout: _ComponentSaveLayout,
+    include_policy_components: bool = True,
+    include_adapter_artifacts: bool = True,
 ) -> None:
     """Defensively reject known aliases to files read by a streaming package.
 
@@ -263,13 +266,46 @@ def _validate_streaming_safetensors_destination(
                 _QUANTIZATION_REPORT,
                 _EXPORT_REPORT,
                 _WEIGHT_LOADING_REPORT,
+                "draft_manifest.json",
+                "gguf-reuse.json",
             )
         )
+        if include_policy_components:
+            output_files.update(
+                current_directory / "policies" / f"{name}.onnx"
+                for name in current_package.policy_components
+            )
+        if include_adapter_artifacts:
+            output_files.update(
+                _adapter_artifact_destinations(current_package, current_directory)
+            )
 
         source_directories.update(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_directories", ())
         )
+        # Derived lazy slices may own an external source that is no longer an
+        # initializer after graph cleanup (e.g. restored packed projections).
+        # Register that ownership before any output can be opened/truncated.
+        models = chain(
+            current_package.values(),
+            (
+                component.model
+                for component in current_package.policy_components.values()
+                if include_policy_components
+            ),
+        )
+        for model in models:
+            current_package.register_lazy_source_artifacts(
+                files=model.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+            )
+            for graph in model.graphs():
+                for initializer in graph.initializers.values():
+                    tensor = initializer.const_value
+                    if isinstance(tensor, ir.LazyTensor):
+                        current_package.register_lazy_source_artifacts(
+                            files=tensor.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+                        )
         source_files.update(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_files", ())
@@ -307,6 +343,21 @@ def _validate_streaming_safetensors_destination(
                     f"{str(source_file)!r} through the same path, a hard link, or "
                     "a symlink. Remove the alias or choose a separate output path."
                 )
+
+
+def _adapter_artifact_destinations(package: ModelPackage, directory: Path) -> Iterator[Path]:
+    """Inventory the actual files emitted by save_adapter_artifacts, without writes."""
+    options = package.adapter_service_options
+    for alias, artifact in package.adapter_artifacts.items():
+        root = directory / "adapters" / alias
+        if options.portable_fallback:
+            yield root / "adapter.json"
+        if options.preserve_source_format:
+            if artifact.source.format == "onnx_adapter":
+                yield root / "adapter.onnx_adapter"
+            elif artifact.source.format == "peft_safetensors":
+                yield root / "adapter_model.safetensors"
+                yield root / "adapter_config.json"
 
 
 def _validate_output_directory(
@@ -742,6 +793,8 @@ class ModelPackage(UserDict[str, ir.Model]):
             directory,
             external_data=external_data,
             component_layout=component_layout,
+            include_policy_components=include_policy_components,
+            include_adapter_artifacts=include_adapter_artifacts,
         )
         _validate_mtp_save_paths(
             self,

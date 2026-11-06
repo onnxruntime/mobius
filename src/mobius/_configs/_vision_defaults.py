@@ -97,6 +97,7 @@ def apply_vision_defaults(config, parent_config, model_type: str, fields: dict) 
             hidden_act=getattr(vc, "hidden_act", None),
             use_clipped_linears=getattr(vc, "use_clipped_linears", False),
             position_embedding_size=getattr(vc, "position_embedding_size", None),
+            standardize=getattr(vc, "standardize", False),
         )
     # This runs before per-model hooks, so plain assignment is safe — any
     # per-model hook may overwrite later via fields.update(...).
