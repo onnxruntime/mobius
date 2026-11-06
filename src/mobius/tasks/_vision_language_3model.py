@@ -16,6 +16,7 @@ from typing import ClassVar
 import onnx_ir as ir
 from onnxscript import nn
 
+from mobius._build_context import prefill_prefix_pruning
 from mobius._configs import ArchitectureConfig, MllamaConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
@@ -197,17 +198,38 @@ class QwenVLTask(VisionLanguageTask):
     MRoPE 3D position_ids for the decoder.
     """
 
+    def __init__(
+        self,
+        *,
+        prune_prefill_prefix: bool = False,
+        runtime_last_token_indices: bool = False,
+    ):
+        if runtime_last_token_indices and not prune_prefill_prefix:
+            raise ValueError("runtime_last_token_indices requires prune_prefill_prefix=True")
+        self._prune_prefill_prefix = prune_prefill_prefix
+        self._runtime_last_token_indices = runtime_last_token_indices
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
         self._validate_components(module)
+        if self._prune_prefill_prefix and config.model_type not in {
+            "qwen3_vl",
+            "qwen3_vl_text",
+        }:
+            raise ValueError("Qwen VL prefill-prefix pruning currently requires Qwen3-VL")
         deepstack = bool(getattr(config, "deepstack_visual_indexes", None))
         models: dict[str, ir.Model] = {}
-        models["decoder"] = build_decoder_from_embeds(
-            module.decoder, config, mrope=True, deepstack=deepstack
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            models["decoder"] = build_decoder_from_embeds(
+                module.decoder,
+                config,
+                mrope=True,
+                deepstack=deepstack,
+                runtime_last_token_indices=self._runtime_last_token_indices,
+            )
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,

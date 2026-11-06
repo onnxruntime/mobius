@@ -11,6 +11,7 @@ exercised by the parametrized tests there.
 
 from __future__ import annotations
 
+import numpy as np
 import onnx_ir as ir
 import pytest
 import torch
@@ -24,9 +25,61 @@ from mobius._registry import (
 )
 from mobius._testing import make_config
 from mobius.components import LayerNorm, Linear, QuantizedLinear, RMSNormBias
-from mobius.models.base import CausalLMModel, TextModel
+from mobius.models.base import CausalLMModel, TextModel, _retain_last_sequence_token
 from mobius.models.moe import Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
 from mobius.tasks import CausalLMTask
+from mobius.tasks._base import _make_graph
+
+
+@pytest.mark.parametrize("sequence_length,positions", [(5, [1, 4, 2]), (1, [0, 0])])
+def test_runtime_last_token_indices_select_each_batch_row(sequence_length, positions):
+    ort = pytest.importorskip("onnxruntime")
+    graph, builder = _make_graph()
+    hidden = builder.input(
+        "hidden_states", dtype=ir.DataType.FLOAT, shape=["batch", "sequence", 4]
+    )
+    indices = builder.input(
+        "last_token_indices", dtype=ir.DataType.INT32, shape=["batch", 1, 1]
+    )
+    selected = _retain_last_sequence_token(builder.op, hidden, indices)
+    selected.name = "selected"
+    selected.type = ir.TensorType(ir.DataType.FLOAT)
+    selected.shape = ir.Shape(["batch", 1, 4])
+    graph.outputs.append(selected)
+    model = ir.Model(graph, ir_version=10)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    session = ort.InferenceSession(
+        ir.serde.serialize_model(model).SerializeToString(),
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
+    )
+    values = np.arange(len(positions) * sequence_length * 4, dtype=np.float32).reshape(
+        len(positions), sequence_length, 4
+    )
+    actual = session.run(
+        None,
+        {
+            "hidden_states": values,
+            "last_token_indices": np.asarray(positions, dtype=np.int32).reshape(-1, 1, 1),
+        },
+    )[0]
+    np.testing.assert_array_equal(
+        actual, values[np.arange(len(positions)), positions][:, None, :]
+    )
+
+
+@pytest.mark.parametrize("prune", [False, True])
+def test_runtime_last_token_indices_reject_invalid_causal_tasks(prune):
+    config = make_config()
+    with pytest.raises(ValueError, match="runtime_last_token_indices"):
+        build_from_module(
+            CausalLMModel(config),
+            config,
+            task="text-generation",
+            prune_prefill_prefix=prune,
+            runtime_last_token_indices=True,
+        )
 
 
 class TestTextModel:

@@ -101,7 +101,7 @@ def test_prefill_prefix_pruning_error_lists_supported_tasks() -> None:
     with pytest.raises(
         ValueError,
         match=(
-            "text-generation, hybrid-text-generation, gemma4-text-generation, and gemma4 tasks"
+            "text-generation, hybrid-text-generation, gemma4-text-generation, gemma4, and qwen-vl tasks"
         ),
     ):
         _enable_prefill_prefix_pruning_task("feature-extraction")

@@ -343,6 +343,8 @@ def build_transformers_model(
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
+    runtime_last_token_indices: bool = False,
+    disable_deepstack: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
     input_sampling_rate: int | None = None,
@@ -368,8 +370,15 @@ def build_transformers_model(
     width. ``None`` preserves existing EP defaults. It does not affect
     ``GatherBlockQuantized`` or requantize weights. PersonaPlex and RE-USE
     bespoke builders do not support this option.
+
+    ``runtime_last_token_indices`` adds an INT32 ``[batch, 1, 1]`` input for
+    Qwen3-VL exports with ``prune_prefill_prefix=True``. ``disable_deepstack``
+    explicitly omits intermediate vision injection for runtimes or existing
+    recipes that use only the final vision features; the default is unchanged.
     """
     validate_matmul_nbits_accuracy_level(matmul_nbits_accuracy_level)
+    if runtime_last_token_indices and not prune_prefill_prefix:
+        raise ValueError("runtime_last_token_indices requires prune_prefill_prefix=True")
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 
@@ -391,6 +400,8 @@ def build_transformers_model(
             "fp8_kv_cache": fp8_kv_cache,
             "kv_cache_scales": kv_cache_scales is not None,
             "prune_prefill_prefix": prune_prefill_prefix,
+            "runtime_last_token_indices": runtime_last_token_indices,
+            "disable_deepstack": disable_deepstack,
             "glm_full_attention": glm_full_attention,
             "export_paged_attention": export_paged_attention,
             "input_sampling_rate": input_sampling_rate is not None,
@@ -479,6 +490,8 @@ def build_transformers_model(
                 "fp8_kv_cache": fp8_kv_cache,
                 "kv_cache_scales": kv_cache_scales is not None,
                 "prune_prefill_prefix": prune_prefill_prefix,
+                "runtime_last_token_indices": runtime_last_token_indices,
+                "disable_deepstack": disable_deepstack,
                 "glm_full_attention": glm_full_attention,
                 "export_paged_attention": export_paged_attention,
             }
@@ -501,6 +514,12 @@ def build_transformers_model(
             raise ValueError(
                 "input_sampling_rate and bwe_sampling_rate are only supported "
                 "for RE-USE speech-enhancement checkpoints"
+            )
+        if runtime_last_token_indices:
+            raise ValueError("runtime_last_token_indices currently requires the qwen-vl task")
+        if disable_deepstack:
+            raise ValueError(
+                "disable_deepstack requires a checkpoint with DeepStack vision features"
             )
         if text_only:
             raise ValueError(
@@ -586,6 +605,12 @@ def build_transformers_model(
                 f"Missing layers: {missing}; unexpected layers: {extra}."
             )
 
+    if disable_deepstack:
+        if not getattr(config, "deepstack_visual_indexes", None):
+            raise ValueError(
+                "disable_deepstack requires a checkpoint with DeepStack vision features"
+            )
+        config = dataclasses.replace(config, deepstack_visual_indexes=None)
     if text_only:
         decoder_source_paths: tuple[str, ...] = ()
         if source_module_class is not None:
@@ -682,6 +707,7 @@ def build_transformers_model(
         fp8_kv_cache=fp8_kv_cache,
         kv_cache_scales=kv_cache_scales,
         prune_prefill_prefix=prune_prefill_prefix,
+        runtime_last_token_indices=runtime_last_token_indices,
         component_manifest=component_manifest,
     )
     graph_source_name = (

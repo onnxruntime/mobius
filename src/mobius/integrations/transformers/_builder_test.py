@@ -18,6 +18,7 @@ from mobius._configs import (
     QuantizationConfig,
     QuantizationOverride,
     QuantizedWeightFormat,
+    VisionConfig,
 )
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
@@ -73,6 +74,72 @@ def test_build_rejects_invalid_accuracy_override_before_loading(monkeypatch, lev
             "local-model", matmul_nbits_accuracy_level=level
         )
     loader.assert_not_called()
+
+
+@pytest.mark.parametrize("disable_deepstack", [False, True])
+def test_qwen_prefill_options_preserve_or_explicitly_disable_deepstack(
+    monkeypatch, disable_deepstack
+):
+    config = make_config(
+        model_type="qwen3_vl",
+        deepstack_visual_indexes=[0],
+        vision=VisionConfig(hidden_size=32, num_hidden_layers=1, num_attention_heads=4),
+    )
+    hf_config = SimpleNamespace(model_type="qwen3_vl")
+    package = ModelPackage(
+        {"decoder": ir.Model(ir.Graph([], [], nodes=[], name="decoder"), ir_version=10)}
+    )
+    core_build = mock.Mock(return_value=package)
+    monkeypatch.setattr(
+        transformers_builder, "_load_transformers_config", lambda *a, **k: (hf_config, False)
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *a, **k: (_DummyModule, "qwen-vl", "qwen3_vl"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *a, **k: config)
+    monkeypatch.setattr(transformers_builder, "build_from_module", core_build)
+
+    result = transformers_builder.build_transformers_model(
+        "local-qwen",
+        load_weights=False,
+        prune_prefill_prefix=True,
+        runtime_last_token_indices=True,
+        disable_deepstack=disable_deepstack,
+    )
+
+    assert result is package
+    built_config = core_build.call_args.args[1]
+    assert built_config.deepstack_visual_indexes == (None if disable_deepstack else [0])
+    assert config.deepstack_visual_indexes == [0]
+    assert core_build.call_args.kwargs["prune_prefill_prefix"] is True
+    assert core_build.call_args.kwargs["runtime_last_token_indices"] is True
+
+
+def test_runtime_last_token_indices_requires_pruning_before_loading(monkeypatch):
+    loader = mock.Mock(side_effect=AssertionError("must validate before model loading"))
+    monkeypatch.setattr(transformers_builder, "_load_transformers_config", loader)
+    with pytest.raises(ValueError, match="requires prune_prefill_prefix=True"):
+        transformers_builder.build_transformers_model(
+            "local-model", runtime_last_token_indices=True
+        )
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"disable_deepstack": True},
+        {"prune_prefill_prefix": True, "runtime_last_token_indices": True},
+    ],
+)
+def test_personaplex_rejects_qwen_compatibility_options(monkeypatch, options):
+    from mobius.integrations import _moshi
+
+    monkeypatch.setattr(_moshi, "_is_personaplex_checkpoint", lambda *a, **k: True)
+    with pytest.raises(ValueError, match=r"disable_deepstack|runtime_last_token_indices"):
+        transformers_builder.build_transformers_model("local-personaplex", **options)
 
 
 @pytest.mark.parametrize("level", [0, 4])
@@ -1424,6 +1491,30 @@ def test_glm_full_attention_rejects_non_glm_model_type(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="glm_full_attention=True is not supported"):
         transformers_builder.build_transformers_model("fake/model", glm_full_attention=True)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"prune_prefill_prefix": True, "runtime_last_token_indices": True},
+        {"disable_deepstack": True},
+    ],
+)
+def test_diffusers_fallback_rejects_qwen_compatibility_options(monkeypatch, options):
+    pipeline = mock.Mock(side_effect=AssertionError("unsupported flags must not be ignored"))
+    monkeypatch.setattr(
+        transformers_builder, "_load_transformers_config", lambda *a, **k: (None, False)
+    )
+    monkeypatch.setattr(
+        transformers_builder, "_resolve_module_class", lambda *a, **k: (None, None, None)
+    )
+    monkeypatch.setattr(_config_resolver, "_try_load_config_json", lambda *a, **k: None)
+    monkeypatch.setattr(diffusers_builder, "build_diffusers_pipeline", pipeline)
+    with pytest.raises(ValueError, match=r"runtime_last_token_indices|disable_deepstack"):
+        transformers_builder.build_transformers_model(
+            "fake/diffusers", load_weights=False, **options
+        )
+    pipeline.assert_not_called()
 
 
 @pytest.mark.parametrize("accuracy_level", [None, 0, 4])

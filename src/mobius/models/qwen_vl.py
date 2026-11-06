@@ -24,7 +24,7 @@ from mobius.components._common import (
 from mobius.components._decoder import DecoderLayer
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._rotary_embedding import initialize_rope
-from mobius.models.base import CausalLMModel, TextModel
+from mobius.models.base import CausalLMModel, TextModel, _retain_last_sequence_token
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -942,6 +942,7 @@ class Qwen3VLDecoderModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         per_layer_inputs: ir.Value | None = None,
+        last_token_indices: ir.Value | None = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -952,6 +953,7 @@ class Qwen3VLDecoderModel(nn.Module):
             inputs_embeds=inputs_embeds,
             deepstack_embeds=split_per_layer_inputs(op, per_layer_inputs, self.config),
         )
+        hidden_states = _retain_last_sequence_token(op, hidden_states, last_token_indices)
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
 
