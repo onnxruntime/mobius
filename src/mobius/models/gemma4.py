@@ -780,7 +780,7 @@ class Gemma4VisionPooler(nn.Module):
 
     Unlike using ``T // k²`` as the output length, using ``w_out * h_out``
     avoids creating empty trailing pool bins that HF strips after pooling.
-    For a 57x42 image (2520 patches, k=3): ``valid_depth = 19x14 = 266``
+    For a 57x42 grid padded to 2520 slots (k=3): ``valid_depth = 19x14 = 266``
     rather than ``2520 // 9 = 280``.
     """
 
@@ -788,6 +788,10 @@ class Gemma4VisionPooler(nn.Module):
         super().__init__()
         self._kernel_size = kernel_size
         self._pooler_scale = float(hidden_size**0.5)
+
+    def _output_depth(self, op: OpBuilder, w_out: ir.Value, h_out: ir.Value) -> ir.Value:
+        valid_depth_2d = op.Mul(w_out, h_out)  # [B, 1]
+        return op.Squeeze(valid_depth_2d, op.Constant(value_ints=[0, 1]))
 
     def forward(
         self,
@@ -832,14 +836,12 @@ class Gemma4VisionPooler(nn.Module):
         # --- 3. valid_depth = w_out * h_out (only occupied pool bins) --------
         # HF strips empty trailing pool bins; using w_out*h_out as the OneHot
         # depth avoids creating those empty bins in the first place.
-        # For a 57x42 image with k=3: w_out=19, h_out=14, valid_depth=266
+        # For a 57x42 grid padded to 2520 slots: w_out=19, h_out=14, valid_depth=266
         # (vs T//k²=280 which includes 14 empty bins that would need stripping).
         k_c = op.Constant(value_ints=[k])
         w_out = op.Div(max_x, k_c)  # [B, 1]  pooled width
         h_out = op.Div(max_y, k_c)  # [B, 1]  pooled height
-        # Squeeze batch dim (B=1 for inference) to get scalar valid_depth
-        valid_depth_2d = op.Mul(w_out, h_out)  # [B, 1]
-        valid_depth = op.Squeeze(valid_depth_2d, op.Constant(value_ints=[0, 1]))  # scalar
+        valid_depth = self._output_depth(op, w_out, h_out)
 
         # --- 4. Kernel bucket index per patch --------------------------------
         # floor(x/k) + w_out * floor(y/k)  in range [0, valid_depth)
@@ -864,6 +866,24 @@ class Gemma4VisionPooler(nn.Module):
         # --- 7. Scale by sqrt(hidden_size) matching HF VisionPooler ----------
         scale = op.CastLike(op.Constant(value_float=self._pooler_scale), output)
         return op.Mul(output, scale)
+
+
+class Gemma4FixedVisionPooler(Gemma4VisionPooler):
+    """Spatial pooling with fixed capacity and a valid prefix per image.
+
+    Complete rectangular patch grids must be aligned to ``kernel_size`` and fit
+    within ``output_capacity`` pooled cells. Actual per-image widths still number
+    the buckets, so padding occupies only trailing rows even across aspect ratios.
+    """
+
+    def __init__(self, hidden_size: int, kernel_size: int, output_capacity: int):
+        super().__init__(hidden_size, kernel_size)
+        if output_capacity <= 0:
+            raise ValueError("Gemma4 vision output capacity must be positive")
+        self._output_capacity = output_capacity
+
+    def _output_depth(self, op: OpBuilder, w_out: ir.Value, h_out: ir.Value) -> ir.Value:
+        return op.Constant(value_int=self._output_capacity)
 
 
 class _Gemma4VisionPatchEmbedder(nn.Module):
@@ -2797,7 +2817,14 @@ class _Gemma4VisionEncoderModel(nn.Module):
         self.encoder = _Gemma4VisionEncoderCore(config)
         # Gemma4VisionPooler: 3x3 spatial average pooling + sqrt(hidden) scaling.
         # Reduces N patches to N/9 before projection.
-        self.pooler = Gemma4VisionPooler(vc.hidden_size, vc.pooling_kernel_size or 3)
+        kernel = vc.pooling_kernel_size or 3
+        if config.vision_patch_capacity is None:
+            self.pooler = Gemma4VisionPooler(vc.hidden_size, kernel)
+        else:
+            config.validate()
+            self.pooler = Gemma4FixedVisionPooler(
+                vc.hidden_size, kernel, config.vision_patch_capacity // (kernel * kernel)
+            )
         self.projector_norm = ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
         linear_class, _ = _vision_linear_classes(config)
         self.projector = linear_class(vc.hidden_size, config.hidden_size, bias=False)
