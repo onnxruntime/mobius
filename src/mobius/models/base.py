@@ -515,8 +515,16 @@ class CausalLMModel(nn.Module):
         )
 
 
-def _retain_last_sequence_token(op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+def _retain_last_sequence_token(
+    op: OpBuilder,
+    hidden_states: ir.Value,
+    last_token_indices: ir.Value | None = None,
+) -> ir.Value:
     """Retain only the final sequence position when prefill-prefix pruning is active."""
+    if last_token_indices is not None:
+        return op.GatherND(
+            hidden_states, op.Cast(last_token_indices, to=ir.DataType.INT64), batch_dims=1
+        )
     if not is_prefill_prefix_pruning_enabled():
         return hidden_states
     last_hidden = op.Gather(hidden_states, op.Constant(value_int=-1), axis=1)

@@ -125,6 +125,28 @@ pkg = build("meta-llama/Llama-3.2-1B")
 pkg.save("output/llama-3.2-1b/")
 ```
 
+For Qwen3-VL, runtime-indexed last-token projection retains full prompt attention
+and KV processing while returning logits shaped `[batch, 1, vocab]`:
+
+```python
+pkg = build(
+    "Qwen/Qwen3-VL-2B-Instruct",
+    prune_prefill_prefix=True,
+    runtime_last_token_indices=True,
+)
+```
+
+The additional `last_token_indices` input is INT32 `[batch, 1, 1]`, including
+right-padded batches. It requires a runtime that supplies this input.
+ORT GenAI detects it by its reserved graph-input name, not a JSON input mapping.
+DeepStack remains enabled by default. Set `disable_deepstack=True` only to match
+an existing final-vision-feature-only recipe or runtime; this changes multimodal
+semantics and must be applied before constructing the model.
+
+Pruning is supported by the standard Qwen3-VL `QwenVLTask` decoder path.
+Specialized hybrid, multimedia, Muse Glimmer, and Qwen4-Exp task builds reject
+enabled pruning options rather than silently exporting unpruned logits.
+
 **Static cache** (opt-in) pre-allocates fixed-size KV cache buffers, which is
 useful when you know the maximum sequence length up front:
 

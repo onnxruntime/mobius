@@ -1560,6 +1560,9 @@ def _write_genai_config(
         decoder_inputs = _introspect_inputs(pkg, decoder_key)
         decoder_outputs = None
         if decoder_inputs is not None:
+            # ORT GenAI supplies this reserved graph input automatically; it is
+            # not a configurable decoder-input field in genai_config.json.
+            decoder_inputs.pop("last_token_indices", None)
             # Multimodal runtime types retain their architecture-specific cache contract.
             decoder_inputs["past_key_names"] = "past_key_values.%d.key"
             decoder_inputs["past_value_names"] = "past_key_values.%d.value"
