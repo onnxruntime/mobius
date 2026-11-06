@@ -96,17 +96,23 @@ if (torch_e8m0_dtype := getattr(torch, "float8_e8m0fnu", None)) is not None:
 
 @dataclasses.dataclass(frozen=True)
 class StreamingWeightSource:
-    """One checkpoint tensor bound to one dense ONNX initializer."""
+    """One checkpoint tensor, reconstructed or explicitly byte-preserved as FP8."""
 
     source_name: str
-    mode: Literal["direct", "fp8_scalar", "fp8_block_128"] = "direct"
+    mode: Literal["direct", "fp8_scalar", "fp8_block_128", "fp8_native"] = "direct"
     scale_name: str | None = None
     expected_scale: float | None = None
+    # Existing checkpoint adapters reconstruct through BF16. Architectures
+    # whose reference loader reconstructs directly in the compute dtype can
+    # opt in without changing the existing adapters' rounding semantics.
+    reconstruction_dtype: torch.dtype = torch.bfloat16
+    # Opt-in source-loader saturation; other precisions/adapters are unchanged.
+    saturate_float16: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
 class StreamingExpertBankSource:
-    """Per-expert source matrices packed into one dense rank-3 initializer."""
+    """Per-expert source matrices packed into one typed rank-3 initializer."""
 
     experts: tuple[tuple[StreamingWeightSource, ...], ...]
 
@@ -491,6 +497,17 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
     return {k: v for k, v in result.items() if not any(k.endswith(s) for s in aux_suffixes)}
 
 
+def _lazy_safetensors_source_parent_aliases(paths: list[str]) -> frozenset[pathlib.Path]:
+    """Return both directory identities from which lazy shards may be read."""
+    # HF snapshots can contain shard symlinks into the blob cache. Resolving
+    # the parent preserves the snapshot directory, while resolving the whole
+    # shard path follows the symlink and identifies the blob directory.
+    return frozenset(
+        {pathlib.Path(path).parent.resolve() for path in paths}
+        | {pathlib.Path(path).resolve().parent for path in paths}
+    )
+
+
 def _resolve_shard_paths(model_id: str, revision: str | None = None) -> list[str]:
     """Resolve local safetensors shard paths for the streaming loader.
 
@@ -700,6 +717,29 @@ def _load_indexed_tensor(
     return tensor
 
 
+def _cast_preprocessed_source(
+    tensor: torch.Tensor, source: StreamingWeightSource, target_dtype: torch.dtype
+) -> torch.Tensor:
+    if source.saturate_float16 and target_dtype == torch.float16:
+        # Compare the scalar maximum in Python: BF16 cannot represent 65504,
+        # so a BF16 tensor comparison/clamp would round that bound to 65536.
+        maximum = float(tensor.abs().max().item()) if tensor.numel() else 0.0
+        if not math.isfinite(maximum):
+            raise ValueError(f"Nonfinite streaming weight '{source.source_name}'")
+        limit = torch.finfo(torch.float16).max
+        if maximum > limit:
+            wide = tensor.to(torch.float32)
+            overflow = int((wide.abs() > limit).sum().item())
+            logger.warning(
+                "Clamping %d values outside the FP16 range in '%s'",
+                overflow,
+                source.source_name,
+            )
+            # Never modify caller-owned/memory-mapped checkpoint storage.
+            tensor = wide.clamp(-limit, limit)
+    return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
+
+
 def _materialize_preprocessed_source(
     source: StreamingWeightSource,
     key_index: Mapping[str, tuple[str, list[int], str]],
@@ -708,6 +748,12 @@ def _materialize_preprocessed_source(
     """Read and reconstruct one classified source tensor."""
     source_dtype = key_index[source.source_name][2]
     tensor = _load_indexed_tensor(source.source_name, key_index)
+    if source.mode == "fp8_native":
+        if not source_dtype.startswith("F8") or tensor.dtype != target_dtype:
+            raise ValueError(
+                f"Native FP8 source '{source.source_name}' must preserve its FP8 dtype"
+            )
+        return tensor
     if source.mode == "fp8_block_128":
         assert source.scale_name is not None
         scale = _load_indexed_tensor(source.scale_name, key_index)
@@ -715,9 +761,9 @@ def _materialize_preprocessed_source(
             tensor,
             scale,
             name=source.source_name,
-            target_dtype=torch.bfloat16,
+            target_dtype=source.reconstruction_dtype,
         )
-        return tensor if target_dtype == torch.bfloat16 else tensor.to(target_dtype)
+        return _cast_preprocessed_source(tensor, source, target_dtype)
     if source.mode == "fp8_scalar":
         if not source_dtype.startswith("F8"):
             raise ValueError(
@@ -734,14 +780,14 @@ def _materialize_preprocessed_source(
             )
         tensor = tensor.to(torch.bfloat16)
         tensor.mul_(scale.to(torch.bfloat16))
-        return tensor if target_dtype == torch.bfloat16 else tensor.to(target_dtype)
+        return _cast_preprocessed_source(tensor, source, target_dtype)
     if source.mode == "direct":
         if source_dtype.startswith("F8"):
             raise ValueError(
                 f"Streaming source '{source.source_name}' is FP8 but was not explicitly "
                 "classified as scaled FP8"
             )
-        return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
+        return _cast_preprocessed_source(tensor, source, target_dtype)
     raise AssertionError(f"Unknown streaming weight mode: {source.mode}")
 
 
@@ -847,7 +893,7 @@ def _assign_lazy_expert_bank(
     key_index: Mapping[str, tuple[str, list[int], str]],
     target_name: str,
 ) -> None:
-    """Pack independently scaled expert matrices into one dense rank-3 bank."""
+    """Pack reconstructed or byte-preserved expert matrices into one rank-3 bank."""
     onnx_dtype = initializer.dtype
     assert onnx_dtype is not None
     assert initializer.shape is not None
@@ -893,12 +939,13 @@ def stream_preprocessed_safetensors_to_model(
     revision: str | None = None,
     _resolved_paths: list[str] | None = None,
 ) -> dict[str, object]:
-    """Stream a fully classified transformed checkpoint into a dense ONNX graph.
+    """Stream a fully classified checkpoint into typed ONNX initializers.
 
     The planner must classify every source tensor as a target, a consumed scale,
     a validated deterministic constant, or an explicitly ignored sidecar tensor.
     Any unclassified key, missing target, malformed FP8 grid, or changed constant
-    fails before serialization. The resulting package is dense; this path never
+    fails before serialization. FP8 bytes require an explicit native classification;
+    direct sources cannot silently reinterpret FP8 storage. This path never
     claims native FP8 preservation.
     """
     paths = (
@@ -926,10 +973,24 @@ def stream_preprocessed_safetensors_to_model(
 
     def validate_source(
         source: StreamingWeightSource,
+        target_dtype: ir.DataType,
     ) -> tuple[list[int], int, int]:
         if source.source_name not in key_index:
             raise ValueError(f"Streaming source '{source.source_name}' does not exist")
         _source_path, source_shape, source_dtype = key_index[source.source_name]
+        if source.mode == "fp8_native":
+            target_torch_dtype = tensor_adapters.to_torch_dtype(target_dtype)
+            if (
+                source_dtype not in {"F8_E4M3", "F8_E5M2"}
+                or _TORCH_TO_SAFETENSORS_DTYPE.get(target_torch_dtype) != source_dtype
+                or source.scale_name is not None
+                or source.expected_scale is not None
+                or source.saturate_float16
+            ):
+                raise ValueError(
+                    f"Native FP8 source '{source.source_name}' requires identical FP8 "
+                    "storage dtype and independently bound scales; no conversion is allowed"
+                )
         if source.mode in {"fp8_block_128", "fp8_scalar"}:
             if source_dtype not in {"F8_E4M3", "F8_E5M2"}:
                 raise ValueError(
@@ -1042,19 +1103,45 @@ def stream_preprocessed_safetensors_to_model(
                 source_bytes + target_bytes + source.scratch_bytes,
             )
         elif isinstance(source, StreamingWeightSource):
-            source_shape, source_bytes, scale_bytes = validate_source(source)
+            source_shape, source_bytes, scale_bytes = validate_source(
+                source, initializer.dtype
+            )
             if expected_shape != source_shape:
                 raise ValueError(
                     f"Weight shape mismatch for '{target_name}': model expects "
                     f"{expected_shape}, checkpoint source '{source.source_name}' has "
                     f"{source_shape}"
                 )
-            bf16_bytes = math.prod(source_shape) * 2
-            cast_bytes = target_bytes if initializer.dtype != ir.DataType.BFLOAT16 else 0
+            reconstruction_dtype = (
+                source.reconstruction_dtype
+                if source.mode == "fp8_block_128"
+                else tensor_adapters.to_torch_dtype(initializer.dtype)
+                if source.mode == "fp8_native"
+                else torch.bfloat16
+            )
+            reconstruction_bytes = (
+                math.prod(source_shape)
+                * torch.empty((), dtype=reconstruction_dtype).element_size()
+            )
+            cast_bytes = (
+                target_bytes
+                if tensor_adapters.to_torch_dtype(initializer.dtype) != reconstruction_dtype
+                else 0
+            )
+            # Conservative bound: two FP32 temporaries plus the overflow mask.
+            saturation_bytes = (
+                math.prod(source_shape) * 9
+                if source.saturate_float16 and initializer.dtype == ir.DataType.FLOAT16
+                else 0
+            )
             largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
             largest_reconstruction_working_set_bytes = max(
                 largest_reconstruction_working_set_bytes,
-                source_bytes + bf16_bytes + cast_bytes + scale_bytes,
+                source_bytes
+                + reconstruction_bytes
+                + cast_bytes
+                + scale_bytes
+                + saturation_bytes,
             )
         else:
             if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:
@@ -1066,7 +1153,9 @@ def stream_preprocessed_safetensors_to_model(
             for expert_index, projections in enumerate(source.experts):
                 rows = 0
                 for projection in projections:
-                    source_shape, source_bytes, scale_bytes = validate_source(projection)
+                    source_shape, source_bytes, scale_bytes = validate_source(
+                        projection, initializer.dtype
+                    )
                     if len(source_shape) != 2 or source_shape[1] != expected_shape[2]:
                         raise ValueError(
                             f"Expert source '{projection.source_name}' has shape "
@@ -1076,10 +1165,27 @@ def stream_preprocessed_safetensors_to_model(
                     dense_projection_bytes = (
                         math.prod(source_shape) * initializer.dtype.bitwidth + 7
                     ) // 8
-                    bf16_projection_bytes = math.prod(source_shape) * 2
+                    reconstruction_dtype = (
+                        projection.reconstruction_dtype
+                        if projection.mode == "fp8_block_128"
+                        else tensor_adapters.to_torch_dtype(initializer.dtype)
+                        if projection.mode == "fp8_native"
+                        else torch.bfloat16
+                    )
+                    reconstruction_bytes = (
+                        math.prod(source_shape)
+                        * torch.empty((), dtype=reconstruction_dtype).element_size()
+                    )
                     cast_projection_bytes = (
                         dense_projection_bytes
-                        if initializer.dtype != ir.DataType.BFLOAT16
+                        if tensor_adapters.to_torch_dtype(initializer.dtype)
+                        != reconstruction_dtype
+                        else 0
+                    )
+                    saturation_bytes = (
+                        math.prod(source_shape) * 9
+                        if projection.saturate_float16
+                        and initializer.dtype == ir.DataType.FLOAT16
                         else 0
                     )
                     largest_source_tensor_bytes = max(
@@ -1089,9 +1195,10 @@ def stream_preprocessed_safetensors_to_model(
                     max_transient_bytes = max(
                         max_transient_bytes,
                         source_bytes
-                        + bf16_projection_bytes
+                        + reconstruction_bytes
                         + cast_projection_bytes
-                        + scale_bytes,
+                        + scale_bytes
+                        + saturation_bytes,
                     )
                 if rows != expected_shape[1]:
                     raise ValueError(

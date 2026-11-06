@@ -1056,6 +1056,17 @@ def write_onnx_genai_config(
             "runtime configuration is claimed."
         )
         return _write_advisory_component_contract(pkg, output_dir, warning=warning)
+    if "fish_omni" in config_types:
+        return _write_advisory_component_contract(
+            pkg,
+            output_dir,
+            warning=(
+                "Drama 3 exports token graphs, not a complete speech runtime. "
+                "Next-frame codebook sampling, temporal audio-decoder cache orchestration, "
+                "prompt formatting and waveform codec execution are host-owned. "
+                "Only graph-derived advisory component contracts are exported."
+            ),
+        )
     if _looks_like_vibevoice_streaming_asr(pkg):
         if kv_native_dtype is not None:
             raise ValueError(

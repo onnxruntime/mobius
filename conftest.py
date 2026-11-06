@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Root conftest: ensure the local worktree src/ is on sys.path first."""
+"""Root conftest: resolve the worktree package and shared test configs locally."""
 
 from __future__ import annotations
 
@@ -14,6 +14,9 @@ import sys
 _src = os.path.join(os.path.dirname(__file__), "src")
 if _src not in sys.path:
     sys.path.insert(0, _src)
+_tests = os.path.join(os.path.dirname(__file__), "tests")
+if _tests not in sys.path:
+    sys.path.insert(1, _tests)
 
 # Force reload of mobius modules if they were loaded from a different location
 # (e.g., from the main repo's editable install rather than this worktree).

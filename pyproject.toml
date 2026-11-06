@@ -34,6 +34,7 @@ transformers = ["transformers", "safetensors"]
 gguf = ["gguf>=0.10.0"]
 testing = [
     "accelerate",
+    "loguru",  # Pinned Fish Speech reference implementation in Drama 3 parity tests.
     "diffusers",
     "onnxruntime-easy>=0.1.1",
     # onnxruntime>=1.28 is required for the fused Attention kernel to apply
