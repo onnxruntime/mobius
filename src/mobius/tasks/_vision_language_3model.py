@@ -198,6 +198,8 @@ class QwenVLTask(VisionLanguageTask):
     MRoPE 3D position_ids for the decoder.
     """
 
+    _supports_prefill_prefix_pruning: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
@@ -206,6 +208,11 @@ class QwenVLTask(VisionLanguageTask):
     ):
         if runtime_last_token_indices and not prune_prefill_prefix:
             raise ValueError("runtime_last_token_indices requires prune_prefill_prefix=True")
+        if prune_prefill_prefix and not self._supports_prefill_prefix_pruning:
+            raise ValueError(
+                f"{type(self).__name__} does not support prune_prefill_prefix "
+                "or runtime_last_token_indices"
+            )
         self._prune_prefill_prefix = prune_prefill_prefix
         self._runtime_last_token_indices = runtime_last_token_indices
 
@@ -294,6 +301,8 @@ class QwenVLTask(VisionLanguageTask):
 
 class Qwen2VLMultimediaTask(QwenVLTask):
     """Qwen2/Qwen2.5 task preserving independent image and video streams."""
+
+    _supports_prefill_prefix_pruning = False
 
     def build(
         self,
@@ -388,6 +397,8 @@ class GlmOcrVLTask(QwenVLTask):
 class MuseGlimmerVLTask(QwenVLTask):
     """Muse Glimmer packed vision pipeline with standard 1D text RoPE."""
 
+    _supports_prefill_prefix_pruning = False
+
     def build(
         self,
         module: nn.Module,
@@ -454,6 +465,8 @@ class HybridQwenVLTask(QwenVLTask):
     models are identical to :class:`QwenVLTask`; only the decoder
     uses hybrid cache inputs/outputs.
     """
+
+    _supports_prefill_prefix_pruning = False
 
     def build(
         self,

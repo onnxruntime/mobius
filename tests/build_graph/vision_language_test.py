@@ -38,7 +38,13 @@ from mobius.integrations.transformers._config_resolver import _default_task_for_
 from mobius.tasks import (
     Phi4MMMultiModalTask,
     Qwen3VLVisionLanguageTask,
+    Qwen4ExpVisionLanguageTask,
     get_task,
+)
+from mobius.tasks._vision_language_3model import (
+    HybridQwenVLTask,
+    MuseGlimmerVLTask,
+    Qwen2VLMultimediaTask,
 )
 
 _VL_MODEL_PARAMS = _make_params(VL_CONFIGS)
@@ -48,6 +54,23 @@ _VL_TWO_MODEL_TASKS = {"vision-encoder-decoder"}
 
 class TestBuildGraphVisionLanguage:
     """Verify multimodal models build correctly."""
+
+    @pytest.mark.parametrize(
+        "task_class",
+        [
+            HybridQwenVLTask,
+            Qwen2VLMultimediaTask,
+            MuseGlimmerVLTask,
+            Qwen4ExpVisionLanguageTask,
+        ],
+    )
+    @pytest.mark.parametrize("runtime_indices", [False, True])
+    def test_qwen_vl_subclasses_reject_pruning(self, task_class, runtime_indices):
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            task_class(
+                prune_prefill_prefix=True,
+                runtime_last_token_indices=runtime_indices,
+            )
 
     @pytest.mark.parametrize(
         "prune,runtime_indices", [(False, False), (True, False), (True, True)]

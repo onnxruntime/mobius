@@ -143,6 +143,10 @@ DeepStack remains enabled by default. Set `disable_deepstack=True` only to match
 an existing final-vision-feature-only recipe or runtime; this changes multimodal
 semantics and must be applied before constructing the model.
 
+Pruning is supported by the standard Qwen3-VL `QwenVLTask` decoder path.
+Specialized hybrid, multimedia, Muse Glimmer, and Qwen4-Exp task builds reject
+enabled pruning options rather than silently exporting unpruned logits.
+
 **Static cache** (opt-in) pre-allocates fixed-size KV cache buffers, which is
 useful when you know the maximum sequence length up front:
 
