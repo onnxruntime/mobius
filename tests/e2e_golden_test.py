@@ -2576,6 +2576,7 @@ def _run_causal_lm_generation(
             input_ids,
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
+            repetition_penalty=case.generation_params.get("repetition_penalty", 1.0),
         )
     finally:
         session.close()

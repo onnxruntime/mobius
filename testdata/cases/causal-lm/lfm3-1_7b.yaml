@@ -1,0 +1,19 @@
+model_id: "LiquidAI/LFM3-1.7B"
+model_type: "lfm3"
+revision: "875094441ea6517efc0f44a5685f05e381b72b14"
+trust_remote_code: true
+task_type: "text-generation"
+dtype: "float32"
+level: "L4+L5"
+min_token_match_ratio: 1.0
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  repetition_penalty: 1.1
+
+notes: "Full LFM3 1.7B checkpoint. Gated convolution, full/sliding gated GQA, zero-tail partial RoPE, and sandwich RMSNorm."

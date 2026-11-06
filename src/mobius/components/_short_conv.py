@@ -68,6 +68,7 @@ class GatedShortConv(nn.Module):
         hidden_states: ir.Value,
         conv_state: ir.Value,
         attention_mask: ir.Value | None = None,
+        projected_input_mask: ir.Value | None = None,
     ) -> tuple[ir.Value, ir.Value]:
         """Apply the gated convolution and return output plus updated state.
 
@@ -77,6 +78,8 @@ class GatedShortConv(nn.Module):
                 ``(batch, hidden, kernel_size - 1)``.
             attention_mask: Optional padding mask shaped
                 ``(batch, past_seq + seq)``.
+            projected_input_mask: Optional current-span mask ``(batch, seq)``,
+                reapplied after the input projection and first gate.
         """
         if attention_mask is not None:
             # Recurrent layers only consume the mask for the current token span.
@@ -94,6 +97,10 @@ class GatedShortConv(nn.Module):
         projected = op.Transpose(self.in_proj(op, hidden_states), perm=[0, 2, 1])
         gate_b, gate_c, conv_input = op.Split(projected, num_outputs=3, axis=1, _outputs=3)
         conv_input = op.Mul(gate_b, conv_input)  # (B, H, T)
+        if projected_input_mask is not None:
+            # A biased input projection can reintroduce nonzero padding values.
+            mask = op.Unsqueeze(projected_input_mask, [1])
+            conv_input = op.Mul(conv_input, op.CastLike(mask, conv_input))
         conv_output, present_state = self.conv(op, conv_input, conv_state)
         output = op.Mul(gate_c, conv_output)  # (B, H, T)
         output = self.out_proj(op, op.Transpose(output, perm=[0, 2, 1]))

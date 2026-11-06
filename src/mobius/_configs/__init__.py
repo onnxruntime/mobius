@@ -112,6 +112,7 @@ from mobius._configs._sub_configs import (
     VisionConfig,
 )
 from mobius._configs._world_model import WorldModelConfig
+from mobius._configs.lfm3 import Lfm3Config
 from mobius._configs.vibevoice import (
     VibeVoiceASRStreamingConfig,
     VibeVoiceConfig,
@@ -158,6 +159,7 @@ __all__ = [
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",
+    "Lfm3Config",
     "LongcatFlashConfig",
     "Mamba2Config",
     "MambaConfig",
