@@ -871,6 +871,94 @@ class TestBuildGraphQwen3ASR:
         assert logits.shape[0] == 1
         assert logits.shape[1] == seq_len
 
+    def test_static_cache_decoder_matches_dynamic(self):
+        """The static-cache decoder matches the dynamic one.
+
+        Prefill then three decode steps over random ``inputs_embeds``: the
+        logits agree with the growing-``past_key_values`` decoder built from
+        the same weights.
+        """
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.qwen3_asr import Qwen3ASRForConditionalGeneration
+        from mobius.tasks import SpeechLanguageTask
+
+        max_seq_len = 32
+        config = self._asr_config()
+        decoders = {}
+        for name, task in (
+            ("dynamic", SpeechLanguageTask()),
+            (
+                "static",
+                SpeechLanguageTask(static_cache=True, max_seq_len=max_seq_len),
+            ),
+        ):
+            module = Qwen3ASRForConditionalGeneration(config)
+            decoder = build_from_module(module, config, task=task)["decoder"]
+            # Same names in both graphs, so the same seed gives the same weights.
+            rng = np.random.default_rng(0)
+            for init in sorted(decoder.graph.initializers.values(), key=lambda v: v.name):
+                if init.const_value is None:
+                    shape = [int(d) for d in init.shape]
+                    init.const_value = ir.Tensor(
+                        (rng.standard_normal(shape) * 0.1).astype(np.float32)
+                    )
+            decoders[name] = decoder
+
+        op_types = [n.op_type for n in decoders["static"].graph.all_nodes()]
+        assert "TensorScatter" in op_types
+
+        kv_heads, head_dim = config.num_key_value_heads, config.head_dim
+        layers = range(config.num_hidden_layers)
+        cache_shape = (1, max_seq_len, kv_heads * head_dim)
+        static_cache = {
+            f"{kind}_cache.{i}": np.zeros(cache_shape, np.float32)
+            for i in layers
+            for kind in ("key", "value")
+        }
+        past = {
+            f"past_key_values.{i}.{kind}": np.zeros((1, kv_heads, 0, head_dim), np.float32)
+            for i in layers
+            for kind in ("key", "value")
+        }
+        sessions = {name: OnnxModelSession(model) for name, model in decoders.items()}
+        try:
+            rng = np.random.default_rng(1)
+            steps = [rng.standard_normal((1, 5, config.hidden_size))] + [
+                rng.standard_normal((1, 1, config.hidden_size)) for _ in range(3)
+            ]
+            past_len = 0
+            for embeds in steps:
+                seq = embeds.shape[1]
+                pos = np.arange(past_len, past_len + seq, dtype=np.int64)
+                shared = {
+                    "inputs_embeds": embeds.astype(np.float32),
+                    "position_ids": np.stack([pos, pos, pos])[:, None, :],
+                }
+                dynamic_out = sessions["dynamic"].run(
+                    {
+                        **shared,
+                        "attention_mask": np.ones((1, past_len + seq), np.int64),
+                        **past,
+                    }
+                )
+                static_out = sessions["static"].run(
+                    {
+                        **shared,
+                        "write_indices": np.array([past_len], np.int64),
+                        "nonpad_kv_seqlen": np.array([past_len + seq], np.int64),
+                        **static_cache,
+                    }
+                )
+                np.testing.assert_allclose(
+                    static_out["logits"], dynamic_out["logits"], rtol=1e-4, atol=1e-4
+                )
+                static_cache = {n: static_out[f"updated_{n}"] for n in static_cache}
+                past = {n: dynamic_out[n.replace("past_key_values", "present")] for n in past}
+                past_len += seq
+        finally:
+            for session in sessions.values():
+                session.close()
+
 
 class TestBuildGraphFunASR:
     """Verify Fun-ASR-Nano 3-model split with FunASRSpeechLanguageTask."""
