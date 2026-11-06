@@ -32,7 +32,9 @@ from mobius.tasks._base import _make_graph
 
 
 @pytest.mark.parametrize("sequence_length,positions", [(5, [1, 4, 2]), (1, [0, 0])])
-def test_runtime_last_token_indices_select_each_batch_row(sequence_length, positions):
+def test_runtime_last_token_indices_select_each_batch_row(
+    sequence_length, positions, tmp_path
+):
     ort = pytest.importorskip("onnxruntime")
     graph, builder = _make_graph()
     hidden = builder.input(
@@ -47,10 +49,12 @@ def test_runtime_last_token_indices_select_each_batch_row(sequence_length, posit
     selected.shape = ir.Shape(["batch", 1, 4])
     graph.outputs.append(selected)
     model = ir.Model(graph, ir_version=10)
+    model_path = tmp_path / "last-token-indices.onnx"
+    ir.save(model, model_path)
     options = ort.SessionOptions()
     options.intra_op_num_threads = 1
     session = ort.InferenceSession(
-        ir.serde.serialize_model(model).SerializeToString(),
+        str(model_path),
         sess_options=options,
         providers=["CPUExecutionProvider"],
     )
