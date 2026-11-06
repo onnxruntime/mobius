@@ -61,17 +61,36 @@ class StaticCacheState(NamedTuple):
     and the full cache is passed to the Attention op with
     ``nonpad_kv_seqlen`` to indicate valid token counts.
 
+    ``seqlens_k`` selects a second emission instead, where
+    ``com.microsoft::GroupQueryAttention`` owns the cache: it appends the new
+    key/value itself, so there is no ``TensorScatter`` and no
+    ``write_indices``, and the buffers are 4-D ``[B, kv_heads, max_seq_len,
+    head_dim]`` because that is the layout the op requires. On an A100 this
+    keeps attention from growing with the context -- for Qwen3-8B the
+    ``TensorScatter`` + ``Attention`` pair costs 0.43 us per token of context
+    against GQA's 0.09 -- while on Blackwell the two measure the same.
+
     Fields:
-        key_cache: Pre-allocated key cache [B, max_seq_len, kv_hidden] 3D.
-        value_cache: Pre-allocated value cache [B, max_seq_len, kv_hidden] 3D.
-        write_indices: Position to write new tokens [B] int64.
+        key_cache: Pre-allocated key cache. ``[B, max_seq_len, kv_hidden]``
+            3-D for the TensorScatter path, ``[B, kv_heads, max_seq_len,
+            head_dim]`` 4-D for the GQA path.
+        value_cache: Pre-allocated value cache, shaped like ``key_cache``.
+        write_indices: Position to write new tokens [B] int64. ``None`` on the
+            GQA path, which derives the write position itself.
         nonpad_kv_seqlen: Valid KV length per batch entry [B] int64.
+        seqlens_k: Last valid KV index per batch entry [B] int32, i.e.
+            ``nonpad_kv_seqlen - 1``. Present only on the GQA path, and what
+            selects it.
+        total_seq_len: Scalar int32 total KV length. GQA takes it alongside
+            ``seqlens_k``; present only on the GQA path.
     """
 
     key_cache: ir.Value
     value_cache: ir.Value
-    write_indices: ir.Value
+    write_indices: ir.Value | None
     nonpad_kv_seqlen: ir.Value
+    seqlens_k: ir.Value | None = None
+    total_seq_len: ir.Value | None = None
 
 
 def _apply_attention(
@@ -135,6 +154,34 @@ def _apply_attention(
         In static cache mode, RoPE must be applied to key *before*
         calling this function so that cached entries have RoPE baked in.
     """
+    if static_cache is not None and static_cache.seqlens_k is not None:
+        # GQA owns the cache: it appends key/value at the position
+        # ``seqlens_k`` implies inside the kernel and returns the same buffer,
+        # so no TensorScatter and no write_indices. ``do_rotary=0`` keeps RoPE
+        # outside, which is required for the 3-D MRoPE models and harmless for
+        # the rest -- the caller has already applied it to query/key.
+        if softcap:
+            raise ValueError(
+                "static-cache GroupQueryAttention does not pass softcap; "
+                "this model needs the TensorScatter + Attention path"
+            )
+        attn_output, present_key, present_value = op.GroupQueryAttention(  # type: ignore[attr-defined]
+            query,
+            key,
+            value,
+            static_cache.key_cache,  # [B, kv_heads, max_seq_len, head_dim]
+            static_cache.value_cache,
+            static_cache.seqlens_k,  # [B] int32
+            static_cache.total_seq_len,  # scalar int32
+            num_heads=num_attention_heads,
+            kv_num_heads=num_key_value_heads,
+            scale=scale,
+            do_rotary=0,
+            _domain="com.microsoft",
+            _outputs=3,
+        )
+        return attn_output, present_key, present_value
+
     if static_cache is not None:
         # Scatter new K/V into the pre-allocated cache at write_indices.
         # write_indices [B] is a START POSITION per batch item, not

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### GroupQueryAttention-owned static KV cache
+
+#### Added
+
+- `--features static-cache,gqa-cache` (`CausalLMTask(gqa_cache=True)`)
+  hands the static cache to `com.microsoft::GroupQueryAttention` instead of
+  `TensorScatter` + `Attention`. The op appends the new key/value itself, so
+  the buffers become `[batch, kv_heads, max_seq_len, head_dim]` and
+  `write_indices` disappears; `nonpad_kv_seqlen` stays, and GQA's
+  `seqlens_k` is derived from it inside the graph. `total_sequence_length`
+  is the buffer capacity, a constant, so the decode step has no
+  device-to-host copy and can be captured in a CUDA graph. Only models whose
+  decoder layers use the shared `Attention` qualify; sliding-window and
+  softcapped models, and Gemma 4, are refused. The ONNX GenAI metadata
+  describes a static cache without `write_indices`. On an A100 the GQA cache
+  is 5-10% faster per decode step than the `TensorScatter` one from about 1k
+  tokens of context; on Blackwell the two are the same.
+
 ### Qwen3.8-27B standard-only multimodal qualification
 
 #### Added
