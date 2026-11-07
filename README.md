@@ -25,6 +25,10 @@ multi-component export for pipelines.
 
 ## Highlighted Models
 
+**Text ranking:** [CLM-v0.1-8B projection-head-only export](docs/clm.md) scores
+candidate actions from external Qwen3-8B embeddings; it is not text generation
+and does not include the frozen encoder.
+
 | Category | Examples |
 |---|---|
 | **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3/3.5/3.6, Phi-3/3.5, Gemma 1/2/3/4, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
