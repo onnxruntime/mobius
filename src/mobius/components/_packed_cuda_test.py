@@ -41,10 +41,11 @@ def test_packed_row_tiles_preserves_order_tail_and_rank(tmp_path, shape):
 @pytest.mark.integration
 @pytest.mark.skipif(
     os.environ.get("MOBIUS_TEST_PACKED_CUDA") != "1",
-    reason="Requires an explicitly selected CUDA ORT build containing MatMulPackedQ8",
+    reason="Requires an explicitly selected CUDA ORT build containing the chosen packed ABI",
 )
 @pytest.mark.parametrize("rows", [1, 8, 9, 17])
-def test_packed_row_tiles_executes_cuda_projection(tmp_path, rows):
+@pytest.mark.parametrize("native_blocks", [False, True])
+def test_packed_row_tiles_executes_cuda_projection(tmp_path, rows, native_blocks):
     graph = ir.Graph([], [], nodes=[], opset_imports={"": OPSET_VERSION, "com.microsoft": 1})
     builder = GraphBuilder(graph)
     n, k = 19, 256
@@ -53,11 +54,18 @@ def test_packed_row_tiles_executes_cuda_projection(tmp_path, rows):
     data[np.arange(rows), positions] = 1
     codes = np.arange(n * k, dtype=np.uint8).reshape(n, k)
     scales = np.full((n, k // 32), 0.001003, np.float16)
-    initializers = []
-    for name, array in (
+    storage = (
         ("payload", (codes ^ np.uint8(128)).reshape(n, k // 32, 32)),
         ("scales", scales),
-    ):
+    )
+    if native_blocks:
+        native = np.concatenate(
+            (scales.view(np.uint8).reshape(n, k // 32, 2), codes.reshape(n, k // 32, 32)),
+            axis=-1,
+        ).reshape(n, -1)
+        storage = (("native", native),)
+    initializers = []
+    for name, array in storage:
         value = ir.Value(
             name=name,
             type=ir.TensorType(ir.DataType.from_numpy(array.dtype)),
@@ -70,7 +78,12 @@ def test_packed_row_tiles_executes_cuda_projection(tmp_path, rows):
     x = builder.op.Cast(x, to=ir.DataType.BFLOAT16)
 
     def project(op, tile):
-        result = op.MatMulPackedQ8(tile, *initializers, _domain="com.microsoft")
+        if native_blocks:
+            result = op.MatMulPacked(
+                tile, *initializers, K=k, N=n, quant_type="q8_0", _domain="com.microsoft"
+            )
+        else:
+            result = op.MatMulPackedQ8(tile, *initializers, _domain="com.microsoft")
         result.dtype = ir.DataType.BFLOAT16
         result.shape = ir.Shape([None, n])
         return result

@@ -48,8 +48,9 @@ class _DummyFp8Module(_DummyModule):
         {"keep_quantized": False},
     ],
 )
+@pytest.mark.parametrize("abi", ["split", "native", "both"])
 def test_packed_bolt_rejects_incompatible_exports_before_build_or_weight_io(
-    monkeypatch, options
+    monkeypatch, options, abi
 ):
     from mobius._configs import NemotronHOmniConfig
     from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
@@ -70,7 +71,9 @@ def test_packed_bolt_rejects_incompatible_exports_before_build_or_weight_io(
     monkeypatch.setattr(transformers_builder, "build_from_module", core)
     kwargs = {"dtype": "bf16", "execution_provider": "cuda", **options}
     with (
-        override_flags(bolt_packed_cuda=True),
+        override_flags(
+            bolt_packed_cuda=abi != "native", bolt_native_packed_cuda=abi != "split"
+        ),
         pytest.raises((ValueError, NotImplementedError), match=r"CUDA|BF16|dequantize"),
     ):
         transformers_builder.build_transformers_model("local-model", **kwargs)
@@ -153,7 +156,7 @@ def _native_gptoss_config(*, dtype=ir.DataType.FLOAT16):
 
 @pytest.mark.parametrize("local_checkpoint", [False, True])
 @pytest.mark.parametrize("revision", [None, "explicit-revision"])
-@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("packed", ["none", "split", "native"])
 def test_native_omni_pins_detection_and_streams_before_eager(
     monkeypatch, tmp_path, local_checkpoint, revision, packed
 ) -> None:
@@ -196,7 +199,9 @@ def test_native_omni_pins_detection_and_streams_before_eager(
     )
     optimize = mock.Mock(return_value=package)
     monkeypatch.setattr(_nemotron_h_omni_packed, "optimize_nemotron_h_omni_cuda", optimize)
-    with override_flags(bolt_packed_cuda=packed):
+    with override_flags(
+        bolt_packed_cuda=packed == "split", bolt_native_packed_cuda=packed == "native"
+    ):
         result = transformers_builder.build_transformers_model(
             model_id, revision=revision, dtype="bf16", execution_provider="cuda"
         )
@@ -206,7 +211,9 @@ def test_native_omni_pins_detection_and_streams_before_eager(
     )
     eager.assert_not_called()
     assert stream.call_count == 1
-    assert optimize.call_count == int(packed)
+    assert optimize.call_count == int(packed != "none")
+    if packed != "none":
+        optimize.assert_called_once_with(package, native_blocks=packed == "native")
     args, kwargs = stream.call_args
     assert args[:2] == (package, model_id)
     assert isinstance(args[2], NemotronHOmniConfig)

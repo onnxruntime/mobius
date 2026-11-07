@@ -85,6 +85,25 @@ records node/operator counts. Graph reduction is not full-model numerical
 acceptance, a throughput claim, or evidence of lower runtime memory. The
 readiness gates below must be rerun independently for this graph variant.
 
+For the separate native-block ABI, use `MOBIUS_BOLT_NATIVE_PACKED_CUDA=1`
+instead, with another fresh output directory. The two packed flags are mutually
+exclusive; the default and original split-storage route remain unchanged.
+This variant requires `com.microsoft.MatMulPacked` and `MoEPacked` version 1
+from the separate native-operator changes, not the original packed kernels.
+It emits `quant_type="iq2_xxs"`, `"q8_0"`, or `"nvfp4"` on projections and
+`quant_type="iq2_xxs"` on MoE, using the same bounded row tiling and original
+preselected routing inputs.
+
+IQ2 and Q8 retain their raw GGML block bytes and embedded FP16 scales; expert
+blocks are assembled lazily into expert-major banks. NVFP4 uses an integer-only
+nibble permutation and scale interleaving, retaining its separate FP32 global
+multiplier. Signed or nonfinite source E4M3 scales are rejected rather than
+silently reinterpreted. No dense dequantization, scale downcast, or GenAI source
+change is needed. Decoder metadata includes `mobius.bolt.native_packed_cuda=1`,
+and the weight report labels storage as `native_blocks`. This identifies the
+graph variant; it does not establish original-file GGUF identity, full decoder
+parity, generation, speculative integration, throughput, or release readiness.
+
 On the pinned 88-layer production configuration, the structure-only check
 reduces total decoder nodes from **156,423 to 11,263**, counting nested
 `Scan`/`If` bodies (top-level: 156,423 to 7,128). This check does not load

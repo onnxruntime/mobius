@@ -92,6 +92,107 @@ def _packed_initializer(
     return value
 
 
+def _native_ggml_initializer(
+    graph: ir.Graph, name: str, sources: Sequence[ir.Value], *, iq2: bool, bank: bool
+) -> ir.Value:
+    first = sources[0]
+    if first.shape is None or len(first.shape) != 3:
+        raise ValueError(f"Missing native GGML weight shape: {first.name}")
+    n, blocks, block_bytes = first.shape
+    if (
+        block_bytes != (66 if iq2 else 34)
+        or not isinstance(n, int)
+        or not isinstance(blocks, int)
+        or n <= 0
+        or blocks <= 0
+    ):
+        raise ValueError(f"Unexpected native GGML block layout: {first.name}")
+    tensors = []
+    for source in sources:
+        if (
+            source.dtype != ir.DataType.UINT8
+            or source.shape != first.shape
+            or source.const_value is None
+        ):
+            raise ValueError(
+                f"Native CUDA requires loaded, uniform GGML sources: {source.name}"
+            )
+        tensors.append(source.const_value)
+    if name in graph.initializers:
+        raise ValueError(f"Native initializer name already exists: {name}")
+    shape: list[int] = [n, blocks * (66 if iq2 else 34)]
+    if bank:
+        shape.insert(0, len(sources))
+
+    def materialize() -> ir.TensorProtocol:
+        # Retain every FP16 scale and record byte; only flatten the block axis.
+        if not bank:
+            return ir.tensor(tensors[0].numpy().reshape(shape))
+        result = np.empty(shape, dtype=np.uint8)
+        for index, tensor in enumerate(tensors):
+            result[index] = tensor.numpy().reshape(shape[1:])
+        return ir.tensor(result)
+
+    packed_shape = ir.Shape(shape)
+    value = ir.Value(
+        name=name,
+        type=ir.TensorType(ir.DataType.UINT8),
+        shape=packed_shape,
+        const_value=ir.LazyTensor(
+            materialize, dtype=ir.DataType.UINT8, shape=packed_shape, cache=False
+        ),
+    )
+    graph.initializers[name] = value
+    return value
+
+
+def _native_nvfp4_initializer(
+    graph: ir.Graph, weights: ir.Value, scales: ir.Value, *, n: int, k: int
+) -> ir.Value:
+    if (
+        weights.dtype != ir.DataType.UINT8
+        or scales.dtype != ir.DataType.UINT8
+        or weights.shape != ir.Shape([n, k // 2])
+        or scales.shape != ir.Shape([n, k // 16])
+        or weights.const_value is None
+        or scales.const_value is None
+    ):
+        raise ValueError("Native NVFP4 requires loaded byte weights and per-16 byte scales")
+    if weights.name is None or scales.name is None:
+        raise ValueError("Native NVFP4 weights and scales must be named")
+    name = weights.name + ".native_nvfp4." + scales.name
+    if name in graph.initializers:
+        raise ValueError(f"Native initializer name already exists: {name}")
+    weight_tensor, scale_tensor = weights.const_value, scales.const_value
+    shape = ir.Shape([n, (k // 64) * 36])
+
+    def materialize() -> ir.TensorProtocol:
+        scale_bytes = scale_tensor.numpy()
+        if np.any(scale_bytes & np.uint8(128)) or np.any(scale_bytes == 127):
+            raise ValueError("Native NVFP4 requires nonnegative finite E4M3 scales")
+        packed = weight_tensor.numpy().reshape(n, k // 16, 8)
+        elements = np.empty((n, k // 16, 16), dtype=np.uint8)
+        elements[..., 0::2] = packed & np.uint8(15)
+        elements[..., 1::2] = packed >> 4
+        # GGUF pairs element i with i+8, unlike the source's adjacent pairs.
+        codes = elements[..., :8] | (elements[..., 8:] << 4)
+        result = np.empty((n, k // 64, 36), dtype=np.uint8)
+        result[..., :4] = scale_bytes.reshape(n, k // 64, 4)
+        result[..., 4:] = codes.reshape(n, k // 64, 32)
+        return ir.tensor(result.reshape(n, -1))
+
+    value = ir.Value(
+        name=name,
+        type=ir.TensorType(ir.DataType.UINT8),
+        shape=shape,
+        const_value=ir.LazyTensor(
+            materialize, dtype=ir.DataType.UINT8, shape=shape, cache=False
+        ),
+    )
+    graph.initializers[name] = value
+    return value
+
+
 def _input(node: ir.Node, index: int) -> ir.Value:
     value = node.inputs[index]
     if value is None:
@@ -228,7 +329,9 @@ def _replace(graph: ir.Graph, anchor: ir.Node, emit: Callable[[OpBuilder], ir.Va
     graph.opset_imports["com.microsoft"] = 1
 
 
-def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
+def _pack_moe(
+    graph: ir.Graph, config: NemotronHOmniConfig, index: int, *, native_blocks: bool = False
+):
     layer = config.for_layer(index)
     experts, topk, intermediate = (
         layer.num_local_experts,
@@ -260,6 +363,13 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
             graph.initializers[f"{root}.experts.{e}.{projection}.weight"]
             for e in range(experts)
         ]
+        if native_blocks:
+            banks.append(
+                _native_ggml_initializer(
+                    graph, f"{root}.native_{projection}_weight", sources, iq2=True, bank=True
+                )
+            )
+            continue
         for scales in (False, True):
             banks.append(
                 _packed_initializer(
@@ -271,9 +381,17 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
                     bank=True,
                 )
             )
-    if banks[0].shape != ir.Shape([experts, intermediate, 32, 8]) or banks[
-        2
-    ].shape != ir.Shape([experts, 1024, intermediate // 32, 8]):
+    up_shape = (
+        [experts, intermediate, 264] if native_blocks else [experts, intermediate, 32, 8]
+    )
+    down_shape = (
+        [experts, 1024, (intermediate // 256) * 66]
+        if native_blocks
+        else [experts, 1024, intermediate // 32, 8]
+    )
+    if banks[0].shape != ir.Shape(up_shape) or banks[
+        1 if native_blocks else 2
+    ].shape != ir.Shape(down_shape):
         raise ValueError(f"Packed expert dimensions disagree with configuration: {root}")
 
     def emit(op):
@@ -307,6 +425,13 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
         ]
 
         def body(body_op, x, ids, mix):
+            if native_blocks:
+                result = body_op.MoEPacked(
+                    x, *banks, ids, mix, k=topk, quant_type="iq2_xxs", _domain="com.microsoft"
+                )
+                result.dtype = ir.DataType.BFLOAT16
+                result.shape = ir.Shape([None, 1024])
+                return result
             result, hidden, expert_output, metadata = body_op.MoEPackedIQ2XXS(
                 x, ids, mix, *banks, topk=topk, _domain="com.microsoft", _outputs=4
             )
@@ -333,7 +458,9 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
 def _pack_projection(
     graph: ir.Graph,
     node: ir.Node,
-    packed_weights: dict[ir.Value, list[ir.Value]] | None = None,
+    packed_weights: dict[tuple[ir.Value, ...], list[ir.Value]] | None = None,
+    *,
+    native_blocks: bool = False,
 ) -> bool:
     x, source = _input(node, 0), _input(node, 1)
     if source.shape is None or not source.is_initializer() or x.dtype != ir.DataType.BFLOAT16:
@@ -348,23 +475,36 @@ def _pack_projection(
             return False
         if source.name is None:
             raise ValueError("Packed projection weights must be named")
-        if packed_weights is not None and source in packed_weights:
-            inputs = packed_weights[source]
+        key: tuple[ir.Value, ...] = (source,)
+        if packed_weights is not None and key in packed_weights:
+            inputs = packed_weights[key]
         else:
-            inputs = [
-                _packed_initializer(
-                    graph,
-                    source.name + (".packed_scales" if scale else ".packed_weight"),
-                    [source],
-                    iq2=iq2,
-                    scales=scale,
-                    bank=False,
-                )
-                for scale in (False, True)
-            ]
+            if native_blocks:
+                inputs = [
+                    _native_ggml_initializer(
+                        graph, source.name + ".native_weight", [source], iq2=iq2, bank=False
+                    )
+                ]
+            else:
+                inputs = [
+                    _packed_initializer(
+                        graph,
+                        source.name + (".packed_scales" if scale else ".packed_weight"),
+                        [source],
+                        iq2=iq2,
+                        scales=scale,
+                        bank=False,
+                    )
+                    for scale in (False, True)
+                ]
             if packed_weights is not None:
-                packed_weights[source] = inputs
-        opname = "MatMulPackedIQ2XXS" if iq2 else "MatMulPackedQ8"
+                packed_weights[key] = inputs
+        opname = (
+            "MatMulPacked"
+            if native_blocks
+            else ("MatMulPackedIQ2XXS" if iq2 else "MatMulPackedQ8")
+        )
+        quant_type = "iq2_xxs" if iq2 else "q8_0"
         bias = node.inputs[2] if len(node.inputs) > 2 else None
     elif node.op_type == "MatMulNVFP4A16":
         n, half_k = source.shape
@@ -375,13 +515,34 @@ def _pack_projection(
         if k not in {4096, 8192}:
             return False
         inputs = [_input(node, index) for index in range(1, 4)]
-        opname, bias = "MatMulPackedNVFP4", None
+        if native_blocks:
+            if inputs[2].dtype != ir.DataType.FLOAT or inputs[2].shape not in (
+                ir.Shape([]),
+                ir.Shape([1]),
+            ):
+                raise ValueError("Native NVFP4 requires a scalar FP32 global scale")
+            if (
+                inputs[2].const_value is None
+                or not np.isfinite(inputs[2].const_value.numpy()).all()
+            ):
+                raise ValueError("Native NVFP4 requires a loaded finite global scale")
+            key = (source, inputs[1])
+            if packed_weights is not None and key in packed_weights:
+                native = packed_weights[key][0]
+            else:
+                native = _native_nvfp4_initializer(graph, inputs[0], inputs[1], n=n, k=k)
+                if packed_weights is not None:
+                    packed_weights[key] = [native]
+            inputs = [native, inputs[2]]
+        opname, bias = ("MatMulPacked" if native_blocks else "MatMulPackedNVFP4"), None
+        quant_type = "nvfp4"
     else:
         return False
 
     def emit(op):
         def project(body_op, rows):
-            result = getattr(body_op, opname)(rows, *inputs, _domain="com.microsoft")
+            attrs = {"K": k, "N": n, "quant_type": quant_type} if native_blocks else {}
+            result = getattr(body_op, opname)(rows, *inputs, _domain="com.microsoft", **attrs)
             result.dtype = ir.DataType.BFLOAT16
             result.shape = ir.Shape([rows.shape[0], n]) if rows.shape is not None else None
             return result
@@ -395,12 +556,16 @@ def _pack_projection(
     return True
 
 
-def optimize_nemotron_h_omni_cuda(package: ModelPackage) -> ModelPackage:
+def optimize_nemotron_h_omni_cuda(
+    package: ModelPackage, *, native_blocks: bool = False
+) -> ModelPackage:
     """Return a compact decoder, leaving the source package and media untouched.
 
     Must run after the native source-accounted loader. Payload/scales are split
     lazily at serialization; no checkpoint reads or dense reconstruction occur.
-    Requires a custom ORT build containing the packed projection and MoE ops.
+    ``native_blocks=True`` selects MatMulPacked/MoEPacked with native block
+    bytes and embedded FP16 scales. The default preserves the original ABI.
+    Requires a corresponding custom ORT build; neither variant implies parity.
     """
     config = package.config
     if not isinstance(config, NemotronHOmniConfig) or config.dtype != ir.DataType.BFLOAT16:
@@ -409,6 +574,10 @@ def optimize_nemotron_h_omni_cuda(package: ModelPackage) -> ModelPackage:
         raise ValueError("Packed Bolt CUDA export requires a native split decoder")
     source = package["decoder"]
     if source.metadata_props.get("mobius.bolt.packed_cuda") == "1":
+        if native_blocks != (
+            source.metadata_props.get("mobius.bolt.native_packed_cuda") == "1"
+        ):
+            raise ValueError("Packed ABI changes require the original source package")
         return package
     for value in source.graph.initializers.values():
         if value.const_value is None:
@@ -419,23 +588,26 @@ def optimize_nemotron_h_omni_cuda(package: ModelPackage) -> ModelPackage:
     if not layers:
         raise ValueError("Packed Bolt CUDA export requires routed expert layers")
     for index in layers:
-        _pack_moe(graph, config, index)
+        _pack_moe(graph, config, index, native_blocks=native_blocks)
     common_passes.RemoveUnusedNodesPass()(compact)
-    packed_weights: dict[ir.Value, list[ir.Value]] = {}
+    packed_weights: dict[tuple[ir.Value, ...], list[ir.Value]] = {}
     projections = sum(
-        _pack_projection(graph, node, packed_weights)
+        _pack_projection(graph, node, packed_weights, native_blocks=native_blocks)
         for node in list(graph)
         if node.domain == "com.microsoft"
         and node.op_type in {"MatMulGGMLIQ2XXS", "MatMulGGMLQ8_0", "MatMulNVFP4A16"}
     )
     common_passes.RemoveUnusedNodesPass()(compact)
     compact.metadata_props["mobius.bolt.packed_cuda"] = "1"
+    if native_blocks:
+        compact.metadata_props["mobius.bolt.native_packed_cuda"] = "1"
     compact.metadata_props["mobius.bolt.mamba_backend"] = "unchanged"
     compact.metadata_props["mobius.bolt.routing_backend"] = "unchanged"
     result = ModelPackage({**package, "decoder": compact}, config=config)
     result.weight_loading_report = {
         **(package.weight_loading_report or {}),
         "packed_cuda": {
+            "storage": "native_blocks" if native_blocks else "split_payload_scales",
             "mamba": "unchanged",
             "routing": "unchanged",
             "full_checkpoint_dequantization": False,

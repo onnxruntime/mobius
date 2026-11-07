@@ -209,6 +209,16 @@ class _Flags:
     Mamba, routing, attention masks and cache interfaces remain unchanged.
     """
 
+    bolt_native_packed_cuda: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_BOLT_NATIVE_PACKED_CUDA", False)
+    )
+    """Opt in to MatMulPacked/MoEPacked with native GGUF block storage.
+
+    Requires the new CUDA contrib ABI and loaded native BF16 Bolt weights.
+    Mutually exclusive with bolt_packed_cuda; the original split-storage
+    export stays unchanged. No full-model or performance acceptance is implied.
+    """
+
 
 # Global singleton — import and use this directly.
 flags = _Flags()
