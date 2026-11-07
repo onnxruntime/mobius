@@ -111,8 +111,22 @@ def test_compact_decoder_preserves_interfaces_media_and_source_graph(tmp_path, n
     moe_nodes = [n for n in after.graph.all_nodes() if n.op_type == moe_op]
     assert len(moe_nodes) == 2
     if native_blocks:
-        assert all(n.attributes["quant_type"].as_string() == "iq2_xxs" for n in moe_nodes)
-        assert all(len(n.inputs) == 5 and len(n.outputs) == 1 for n in moe_nodes)
+        assert all(
+            n.attributes["activation_type"].as_string() == "relu_squared"
+            and n.attributes["gate_type"].as_int() == 16
+            and n.attributes["down_type"].as_int() == 16
+            and n.attributes["normalize_routing_weights"].as_int() == 0
+            for n in moe_nodes
+        )
+        assert all(
+            len(n.inputs) == 7
+            and n.inputs[1] is None
+            and n.inputs[3] is None
+            and n.inputs[5].dtype == ir.DataType.INT32
+            and n.inputs[6].dtype == ir.DataType.FLOAT
+            and len(n.outputs) == 1
+            for n in moe_nodes
+        )
         assert not any(n.op_type.startswith("MatMulPackedQ") for n in after.graph.all_nodes())
         assert compact.weight_loading_report["packed_cuda"]["storage"] == "native_blocks"
     assert not any(".experts." in name for name in after.graph.initializers)
@@ -288,7 +302,8 @@ def test_native_nvfp4_graph_preserves_global_scale_and_reuses_block_storage():
     assert len({node.inputs[1] for node in projections}) == 1
     assert all(node.inputs[2] is inputs[2] for node in projections)
     assert all(
-        node.attributes["quant_type"].as_string() == "nvfp4"
+        node.attributes["packed_type"].as_int() == 40
+        and node.attributes["dequantize_to_activation_dtype"].as_int() == 1
         and node.attributes["K"].as_int() == k
         and node.attributes["N"].as_int() == n
         for node in projections
@@ -298,3 +313,10 @@ def test_native_nvfp4_graph_preserves_global_scale_and_reuses_block_storage():
     )
     assert graph.initializers["global"].const_value is inputs[2].const_value
     assert [value.name for value in graph.outputs] == ["y", "shared_y"]
+
+
+def test_native_packed_legacy_artifacts_require_original_source():
+    compact = optimize_nemotron_h_omni_cuda(_fixture(), native_blocks=True)
+    del compact["decoder"].metadata_props["mobius.bolt.native_packed_cuda_abi"]
+    with pytest.raises(ValueError, match="original source package"):
+        optimize_nemotron_h_omni_cuda(compact, native_blocks=True)

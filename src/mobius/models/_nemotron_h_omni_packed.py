@@ -427,7 +427,19 @@ def _pack_moe(
         def body(body_op, x, ids, mix):
             if native_blocks:
                 result = body_op.MoEPacked(
-                    x, *banks, ids, mix, k=topk, quant_type="iq2_xxs", _domain="com.microsoft"
+                    x,
+                    None,
+                    banks[0],
+                    None,
+                    banks[1],
+                    ids,
+                    mix,
+                    k=topk,
+                    activation_type="relu_squared",
+                    gate_type=16,
+                    down_type=16,
+                    normalize_routing_weights=0,
+                    _domain="com.microsoft",
                 )
                 result.dtype = ir.DataType.BFLOAT16
                 result.shape = ir.Shape([None, 1024])
@@ -541,7 +553,16 @@ def _pack_projection(
 
     def emit(op):
         def project(body_op, rows):
-            attrs = {"K": k, "N": n, "quant_type": quant_type} if native_blocks else {}
+            attrs = (
+                {
+                    "K": k,
+                    "N": n,
+                    "packed_type": {"q8_0": 8, "iq2_xxs": 16, "nvfp4": 40}[quant_type],
+                    "dequantize_to_activation_dtype": 1,
+                }
+                if native_blocks
+                else {}
+            )
             result = getattr(body_op, opname)(rows, *inputs, _domain="com.microsoft", **attrs)
             result.dtype = ir.DataType.BFLOAT16
             result.shape = ir.Shape([rows.shape[0], n]) if rows.shape is not None else None
@@ -564,7 +585,8 @@ def optimize_nemotron_h_omni_cuda(
     Must run after the native source-accounted loader. Payload/scales are split
     lazily at serialization; no checkpoint reads or dense reconstruction occur.
     ``native_blocks=True`` selects MatMulPacked/MoEPacked with native block
-    bytes and embedded FP16 scales. The default preserves the original ABI.
+    bytes and embedded FP16 scales, using ORT's integer ``packed_type`` ABI.
+    The default preserves the original split-payload ABI.
     Requires a corresponding custom ORT build; neither variant implies parity.
     """
     config = package.config
@@ -574,6 +596,12 @@ def optimize_nemotron_h_omni_cuda(
         raise ValueError("Packed Bolt CUDA export requires a native split decoder")
     source = package["decoder"]
     if source.metadata_props.get("mobius.bolt.packed_cuda") == "1":
+        if (
+            native_blocks
+            and source.metadata_props.get("mobius.bolt.native_packed_cuda_abi")
+            != "packed_type_v1"
+        ):
+            raise ValueError("Packed ABI changes require the original source package")
         if native_blocks != (
             source.metadata_props.get("mobius.bolt.native_packed_cuda") == "1"
         ):
@@ -601,6 +629,7 @@ def optimize_nemotron_h_omni_cuda(
     compact.metadata_props["mobius.bolt.packed_cuda"] = "1"
     if native_blocks:
         compact.metadata_props["mobius.bolt.native_packed_cuda"] = "1"
+        compact.metadata_props["mobius.bolt.native_packed_cuda_abi"] = "packed_type_v1"
     compact.metadata_props["mobius.bolt.mamba_backend"] = "unchanged"
     compact.metadata_props["mobius.bolt.routing_backend"] = "unchanged"
     result = ModelPackage({**package, "decoder": compact}, config=config)
