@@ -80,7 +80,13 @@ def test_packed_row_tiles_executes_cuda_projection(tmp_path, rows, native_blocks
     def project(op, tile):
         if native_blocks:
             result = op.MatMulPacked(
-                tile, *initializers, K=k, N=n, quant_type="q8_0", _domain="com.microsoft"
+                tile,
+                *initializers,
+                K=k,
+                N=n,
+                packed_type=8,
+                dequantize_to_activation_dtype=1,
+                _domain="com.microsoft",
             )
         else:
             result = op.MatMulPackedQ8(tile, *initializers, _domain="com.microsoft")
