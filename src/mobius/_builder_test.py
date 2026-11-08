@@ -20,6 +20,7 @@ from mobius._builder import (
     flags,
 )
 from mobius._model_package import ModelPackage
+from mobius.tasks import QwenVLTask
 
 
 @pytest.mark.parametrize("level", [None, 0, 4])
@@ -105,6 +106,33 @@ def test_prefill_prefix_pruning_error_lists_supported_tasks() -> None:
         ),
     ):
         _enable_prefill_prefix_pruning_task("feature-extraction")
+
+
+@pytest.mark.parametrize("task_runtime", [False, True])
+@pytest.mark.parametrize("build_runtime", [False, True])
+def test_prefill_prefix_pruning_preserves_qwen_runtime_indices(
+    task_runtime: bool, build_runtime: bool
+) -> None:
+    task = QwenVLTask(prune_prefill_prefix=True, runtime_last_token_indices=task_runtime)
+    selected = _enable_prefill_prefix_pruning_task(
+        task, runtime_last_token_indices=build_runtime
+    )
+    assert isinstance(selected, QwenVLTask)
+    assert selected._prune_prefill_prefix is True
+    assert selected._runtime_last_token_indices is (task_runtime or build_runtime)
+    assert task._runtime_last_token_indices is task_runtime
+
+
+@pytest.mark.parametrize("runtime_indices", [False, True])
+def test_prefill_prefix_pruning_qwen_task_name_runtime_indices(
+    runtime_indices: bool,
+) -> None:
+    selected = _enable_prefill_prefix_pruning_task(
+        "qwen-vl", runtime_last_token_indices=runtime_indices
+    )
+    assert isinstance(selected, QwenVLTask)
+    assert selected._prune_prefill_prefix is True
+    assert selected._runtime_last_token_indices is runtime_indices
 
 
 def test_graph_requires_opset24_tensor_scatter() -> None:

@@ -87,7 +87,8 @@ def _enable_prefill_prefix_pruning_task(
     if task == "qwen-vl" or type(task) is QwenVLTask:
         return QwenVLTask(
             prune_prefill_prefix=True,
-            runtime_last_token_indices=runtime_last_token_indices,
+            runtime_last_token_indices=runtime_last_token_indices
+            or getattr(task, "_runtime_last_token_indices", False),
         )
     if runtime_last_token_indices:
         raise ValueError("runtime_last_token_indices currently requires the qwen-vl task")
@@ -173,7 +174,8 @@ def build_from_module(
         prune_prefill_prefix: Retain only the final sequence position before
             the LM head for supported causal generation tasks.
         runtime_last_token_indices: Use runtime-provided final-token indices
-            for Qwen3-VL pruning, including right-padded batches.
+            for Qwen3-VL pruning, including right-padded batches. An enabled
+            setting on a supplied QwenVLTask is preserved when pruning is enabled.
 
     Returns:
         The built :class:`ModelPackage`.

@@ -26,6 +26,7 @@ from mobius.models.qwen_vl import (
     Qwen25VLDecoderModel,
 )
 from mobius.rewrite_rules._testing_utils import fill_random_weights
+from mobius.tasks import QwenVLTask
 
 # Tiny config for weight preprocessing tests (no graph build needed)
 _BASE_CONFIG = ArchitectureConfig(
@@ -53,7 +54,8 @@ _BASE_CONFIG = ArchitectureConfig(
 
 @pytest.mark.parametrize("runtime_indices", [False, True])
 @pytest.mark.parametrize("deepstack", [False, True])
-def test_qwen3_vl_pruned_decoder_shared_weight_parity(runtime_indices, deepstack):
+@pytest.mark.parametrize("task_object", [False, True])
+def test_qwen3_vl_pruned_decoder_shared_weight_parity(runtime_indices, deepstack, task_object):
     config = dataclasses.replace(
         _BASE_CONFIG,
         model_type="qwen3_vl",
@@ -76,11 +78,28 @@ def test_qwen3_vl_pruned_decoder_shared_weight_parity(runtime_indices, deepstack
     pruned = build_from_module(
         Qwen3VL3ModelCausalLMModel(config),
         config,
-        task="qwen-vl",
+        task=(
+            QwenVLTask(
+                prune_prefill_prefix=True,
+                runtime_last_token_indices=runtime_indices,
+            )
+            if task_object
+            else "qwen-vl"
+        ),
         execution_provider="cpu",
         prune_prefill_prefix=True,
-        runtime_last_token_indices=runtime_indices,
+        runtime_last_token_indices=runtime_indices and not task_object,
     )["decoder"]
+    indices_input = next(
+        (value for value in pruned.graph.inputs if value.name == "last_token_indices"),
+        None,
+    )
+    assert (indices_input is not None) is runtime_indices
+    if indices_input is not None:
+        assert indices_input.dtype == ir.DataType.INT32
+        assert indices_input.shape is not None
+        assert len(indices_input.shape) == 3
+        assert indices_input.shape[1] == indices_input.shape[2] == 1
     full_weights = {
         name: value
         for name, value in full.graph.initializers.items()
