@@ -172,6 +172,7 @@ def _lower(node: ir.Node, c: _Config, prefix: str) -> tuple[list[ir.Node], ir.Va
     assert x is not None and router is not None and w1 is not None and w2 is not None
     half = x.dtype == ir.DataType.FLOAT16
 
+    # Arithmetic and scalar constants are FLOAT; half storage is modeled explicitly.
     def compute(value: ir.Value) -> ir.Value:
         return e.op("Cast", value, to=ir.DataType.FLOAT) if half else value
 

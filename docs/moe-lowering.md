@@ -19,11 +19,11 @@ MoELayer dispatch/fallbacks, configuration, or checkpoint loading.
 
 This replaces `com.microsoft::MoE` with two standard `GroupedMatMul-29` calls,
 targeting the pinned **CPU reference**, not all execution providers. It requires
-ONNX opset-29 schemas and a qualified runtime. ORT 1.31.1 cannot execute these
+ONNX opset-29 schemas and a runtime implementing them. ORT 1.31.1 cannot execute these
 graphs directly; tests expand GroupedMatMul on a test copy at opset 24. There is
 no production expansion or performance/memory-use promise.
 
-## Qualified ABI
+## Supported ABI
 
 * Input 0: FLOAT or FLOAT16 hidden states `[T,H]` or `[B,S,H]`, positive static
   H. Dynamic token axes and empty token dimensions are supported; `T=B*S`.
@@ -79,7 +79,19 @@ from QMoE's FLOAT-through-both-GEMMs behavior. CPU thread/expert accumulation
 order and math-library implementations may differ; bitwise equality is not
 claimed.
 
-### Native runtime qualification
+This defines a FLOAT-accumulation reference, not parity with every
+platform-specific MLAS half-GEMM kernel. Near a top-k boundary, different Softmax
+implementations may round probabilities differently and select different experts.
+The higher-ID tie rule applies to equal probabilities produced by the graph.
+
+The first GMM maps `[T,H]` to `[T,k,N]`; activation produces `[T,k,I]`.
+The second GMM consumes `[T*k,I]` and expert indices `[T*k,1]`, then reshapes
+to `[T,k,H]`. After optional bias2, route weighting, and reduction, the result
+is restored using `Shape(X)` with `allowzero=1`, including empty rank-3 axes.
+Original initializer names and input/output names, shape/type, documentation,
+and output metadata are preserved.
+
+## Native runtime qualification
 
 The tested ORT **1.31.1** wheel reports build commit
 `6af1a932e2286d5c58166085d24c68783033edee`. Its CPU MoE kernel registration
@@ -104,18 +116,11 @@ instead correctly copies whenever input and output buffers alias.
 Native parity tests inspect the CPU kernel's **actual T dtype constraint**
 and explicitly skip unsupported dtypes, rather than accepting automatic
 FLOAT fallback or marking discrepancies as expected failures. FLOAT native
-comparisons remain active. FLOAT16 qualification in this environment rests on
+comparisons remain active. FLOAT16 verification here is reference-based, using
 the pinned CPU source and independent rounded-stage NumPy reference, with
 test-copy GroupedMatMul expansion; every independent FLOAT16 test remains
 active, including the proof that intermediate half rounding is observable.
 This is not a claim of native-half parity against the 1.31.1 wheel.
-
-The first GMM maps `[T,H]` to `[T,k,N]`; activation produces `[T,k,I]`.
-The second GMM consumes `[T*k,I]` and expert indices `[T*k,1]`, then reshapes
-to `[T,k,H]`. After optional bias2, route weighting, and reduction, the result
-is restored using `Shape(X)` with `allowzero=1`, including empty rank-3 axes.
-Original initializer names and input/output names, shape/type, documentation,
-and output metadata are preserved.
 
 ## Atomicity and import alignment
 
