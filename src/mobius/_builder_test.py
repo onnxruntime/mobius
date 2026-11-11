@@ -218,3 +218,11 @@ def test_maybe_apply_opset_lowering_skipped_when_flag_disabled(
     _maybe_apply_opset_lowering(pkg, execution_provider="cuda")
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
+
+
+@pytest.mark.parametrize("opset", [23, 25, 29])
+def test_maybe_apply_opset_lowering_only_processes_exactly24(monkeypatch, opset):
+    monkeypatch.setattr(flags, "ort_lower_opset_for_ep", True)
+    pkg = ModelPackage({"model": _model_with(_standard_nodes(), opset=opset)})
+    _maybe_apply_opset_lowering(pkg, execution_provider="cuda")
+    assert pkg["model"].graph.opset_imports[""] == opset

@@ -45,6 +45,7 @@ from mobius.functions.matmul_nbits import (
 from mobius.functions.packed_multi_head_attention import (
     packed_multi_head_attention,
 )
+from mobius.functions.qmoe import lower_qmoe
 from mobius.functions.skip_layer_normalization import (
     skip_layer_normalization,
     skip_simplified_layer_normalization,
@@ -153,6 +154,7 @@ __all__ = [
     "causal_conv_nd_with_state",
     "get_function",
     "linear_attention",
+    "lower_qmoe",
     "matmul_block_quantized_fp4_weight",
     "matmul_nbits",
     "packed_multi_head_attention",

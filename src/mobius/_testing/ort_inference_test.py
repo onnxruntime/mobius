@@ -104,10 +104,11 @@ def test_flag_disabled_never_lowers(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _should_lower_opset(model, device="cuda") is False
 
 
-def test_opset_at_or_below_max_not_lowered(lowering_enabled: None) -> None:
-    # Already at the EP-max opset: nothing to lower.
+@pytest.mark.parametrize("opset", [_MAX_EP_OPSET - 1, _MAX_EP_OPSET, 25, 29])
+def test_opset_other_than24_not_lowered(lowering_enabled: None, opset: int) -> None:
+    # Only the audited 24→23 subset may be relabeled; preserve newer operators.
     node = ir.Node("", "Reshape", inputs=[_make_value("x"), _make_value("shape")])
-    model = _model_with(_graph_with([node], opset=_MAX_EP_OPSET))
+    model = _model_with(_graph_with([node], opset=opset))
 
     assert _should_lower_opset(model, device="cuda") is False
 

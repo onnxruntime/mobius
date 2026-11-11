@@ -93,9 +93,9 @@ def _numpy_to_ort_value(value: np.ndarray) -> ort.OrtValue:
 
 
 # Maximum default-domain ONNX opset that ORT ≤1.24.x CUDA/TRT EPs
-# register kernels for.  Models built with a higher opset can be
-# loaded after lowering the declared import — the op semantics have
-# not changed, only the version label.
+# register kernels for. Only the audited opset-24 subset may use this
+# label-only workaround; newer imports (including GroupedMatMul-29)
+# must retain their version.
 _MAX_EP_OPSET = 23
 
 
@@ -104,8 +104,8 @@ def _should_lower_opset(model: ir.Model, device: str) -> bool:
 
     Lowering is only attempted when
     :attr:`~mobius._flags._Flags.ort_lower_opset_for_ep` is enabled and the
-    target device is non-CPU with a default-domain opset exceeding
-    ``_MAX_EP_OPSET``.
+    target device is non-CPU with a default-domain opset of exactly 24.
+    Other versions, including explicit QMoE lowering's opset 29, are untouched.
 
     Lowering is *not* safe when the graph uses opset-24-only semantics that
     have no opset 23 equivalent — a ``TensorScatter`` node, or an ``Attention``
@@ -120,7 +120,7 @@ def _should_lower_opset(model: ir.Model, device: str) -> bool:
     if device == "cpu":
         return False
     current_opset = model.opset_imports.get("", 0)
-    if current_opset <= _MAX_EP_OPSET:
+    if current_opset != 24:
         return False
 
     if _graph_requires_opset24(model.graph):
@@ -158,8 +158,9 @@ class OnnxModelSession:
 
         # Workaround: ORT ≤1.24.x CUDA/TRT EPs don't register kernels
         # for ONNX opset 24 standard ops (Squeeze, Reshape, etc.).  The
-        # op semantics are identical to opset 23, so lowering the import
-        # declaration lets the EP find its existing kernels.  The model
+        # audited opset-24 subset has identical opset-23 semantics, so
+        # lowering its import lets the EP find existing kernels. Newer
+        # imports are never relabeled by this workaround. The model
         # object is restored to its original opset after saving.
         device = load_kwargs.get("device", "cpu")
         lower_opset = _should_lower_opset(model, device)
