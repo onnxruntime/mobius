@@ -3,13 +3,14 @@
 
 """Explicit compact CUDA lowering for a source-accounted Bolt decoder.
 
-The packed backend uses selected-route rather than expert-ID reduction order.
+The packed backend uses full FP32 routing and selected-route expert reduction.
 It is a separately qualified graph variant, not a numerically transparent
 fusion. Mamba, attention, masks, media and cache interfaces remain unchanged.
 """
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from collections.abc import Callable, Sequence
 
@@ -23,24 +24,12 @@ from mobius._model_package import ModelPackage
 from mobius.components import packed_row_tiles
 
 
-def _ggml_parts(tensor: ir.TensorProtocol, *, iq2: bool) -> tuple[np.ndarray, np.ndarray]:
-    raw = tensor.numpy()
-    payload = np.ascontiguousarray(raw[..., 2:])
-    if not iq2:
-        # GGML stores signed Q8 bytes; the packed CUDA ABI decodes byte - 128.
-        payload = np.bitwise_xor(payload, np.uint8(128))
-    payload = payload.reshape(raw.shape[0], -1, 8 if iq2 else 32)
-    scales = np.ascontiguousarray(raw[..., :2]).view(np.float16).reshape(raw.shape[:2])
-    return payload, scales
-
-
 def _packed_initializer(
     graph: ir.Graph,
     name: str,
     sources: Sequence[ir.Value],
     *,
     iq2: bool,
-    scales: bool,
     bank: bool,
 ) -> ir.Value:
     first = sources[0]
@@ -56,7 +45,7 @@ def _packed_initializer(
         or blocks <= 0
     ):
         raise ValueError(f"Unexpected GGML block layout: {first.name}")
-    shape = [n, blocks] if scales else [n, blocks * (8 if iq2 else 1), 8 if iq2 else 32]
+    shape = [n, blocks * expected_bytes]
     if bank:
         shape.insert(0, len(sources))
     tensors = []
@@ -74,15 +63,15 @@ def _packed_initializer(
         raise ValueError(f"Packed initializer name already exists: {name}")
 
     def materialize() -> ir.TensorProtocol:
-        # One packed expert bank at a time; never reconstruct dense weights.
+        # Preserve complete GGML blocks, including FP16 scales and signed Q8 bytes.
         if not bank:
-            return ir.tensor(_ggml_parts(tensors[0], iq2=iq2)[int(scales)])
-        result = np.empty(shape, dtype=np.float16 if scales else np.uint8)
+            return ir.tensor(np.ascontiguousarray(tensors[0].numpy()).reshape(shape))
+        result = np.empty(shape, dtype=np.uint8)
         for index, tensor in enumerate(tensors):
-            result[index] = _ggml_parts(tensor, iq2=iq2)[int(scales)]
+            result[index] = tensor.numpy().reshape(n, blocks * expected_bytes)
         return ir.tensor(result)
 
-    dtype = ir.DataType.FLOAT16 if scales else ir.DataType.UINT8
+    dtype = ir.DataType.UINT8
     packed_shape = ir.Shape(shape)
     value = ir.Value(name=name, type=ir.TensorType(dtype), shape=packed_shape)
     value.const_value = ir.LazyTensor(
@@ -191,6 +180,9 @@ def _moe_boundary(graph: ir.Graph, root: str, experts: int):
                 collect(inp)
 
     collect(_input(anchor, 0))
+    for value in (routing, selected):
+        if value in graph.outputs:
+            raise ValueError("Packed Bolt cannot remove observed routing intermediates")
     for node in internal:
         for value in node.outputs:
             if value in graph.outputs or any(
@@ -217,7 +209,8 @@ def _replace(graph: ir.Graph, anchor: ir.Node, emit: Callable[[OpBuilder], ir.Va
     for index, node in enumerate(temporary.all_nodes()):
         node.name = f"{prefix}.node_{index}"
         for output_index, value in enumerate(node.outputs):
-            value.name = f"{prefix}.value_{index}_{output_index}"
+            if value.name != "":
+                value.name = f"{prefix}.value_{index}_{output_index}"
     result.name, original.name = original.name, original_name + ".unpacked"
     result.type, result.shape = original.type, original.shape
     # The temporary graph only supplies a tape; captured values retain identity.
@@ -252,79 +245,110 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
     anchor, latent, routing, selected = _moe_boundary(graph, root, experts)
     topk_node = _producer(selected, "TopK")
     k = _input(topk_node, 1).const_value
-    if k is None or k.numpy().item() != topk or selected is not topk_node.outputs[1]:
+    if (
+        k is None
+        or k.numpy().item() != topk
+        or selected is not topk_node.outputs[1]
+        or topk_node.attributes.get_int("axis", -1) != -1
+        or topk_node.attributes.get_int("largest", 1) != 1
+        or topk_node.attributes.get_int("sorted", 1) != 1
+    ):
         raise ValueError(f"Packed Bolt routing disagrees with configured top-k: {root}")
+    choice = _producer(topk_node.inputs[0], "Add")
+    sigmoid = _producer(choice.inputs[0], "Sigmoid")
+    probs, bias = sigmoid.outputs[0], _input(choice, 1)
+    if (
+        probs.dtype != ir.DataType.FLOAT
+        or bias.dtype != ir.DataType.FLOAT
+        or bias is not graph.initializers.get(root + ".gate.e_score_correction_bias")
+        or not math.isfinite(layer.routed_scaling_factor)
+    ):
+        raise ValueError(f"Unsupported packed Bolt full-score routing: {root}")
+    # Validate the selected-weight expression before moving selection into MoEPacked.
+    weights = routing
+    if layer.routed_scaling_factor != 1.0:  # noqa: RUF069
+        scaled = _producer(weights, "Mul")
+        factor = _input(scaled, 1).const_value
+        if factor is None or factor.numpy().item() != np.float32(layer.routed_scaling_factor):
+            raise ValueError(f"Packed Bolt routing scale disagrees with configuration: {root}")
+        weights = _input(scaled, 0)
+    if layer.norm_topk_prob:
+        normalized = _producer(weights, "Div")
+        denominator = _producer(normalized.inputs[1], "Add")
+        total = _producer(denominator.inputs[0], "ReduceSum")
+        epsilon, axes = _input(denominator, 1).const_value, _input(total, 1).const_value
+        weights = _input(normalized, 0)
+        if (
+            total.inputs[0] is not weights
+            or total.attributes.get_int("keepdims", 1) != 1
+            or axes is None
+            or axes.numpy().tolist() != [-1]
+            or epsilon is None
+            or epsilon.numpy().item() != np.float32(1e-20)
+        ):
+            raise ValueError(f"Unsupported packed Bolt routing normalization: {root}")
+    gather = _producer(weights, "GatherElements")
+    if (
+        gather.inputs[0] is not probs
+        or gather.inputs[1] is not selected
+        or gather.attributes.get_int("axis", 0) != -1
+    ):
+        raise ValueError(f"Packed Bolt mixing must gather unbiased sigmoid values: {root}")
     banks = []
     for projection in ("up_proj", "down_proj"):
         sources = [
             graph.initializers[f"{root}.experts.{e}.{projection}.weight"]
             for e in range(experts)
         ]
-        for scales in (False, True):
-            banks.append(
-                _packed_initializer(
-                    graph,
-                    f"{root}.packed_{projection}_{'scales' if scales else 'weight'}",
-                    sources,
-                    iq2=True,
-                    scales=scales,
-                    bank=True,
-                )
+        banks.append(
+            _packed_initializer(
+                graph,
+                f"{root}.packed_{projection}_weight",
+                sources,
+                iq2=True,
+                bank=True,
             )
-    if banks[0].shape != ir.Shape([experts, intermediate, 32, 8]) or banks[
-        2
-    ].shape != ir.Shape([experts, 1024, intermediate // 32, 8]):
+        )
+    if banks[0].shape != ir.Shape([experts, intermediate, 4 * 66]) or banks[
+        1
+    ].shape != ir.Shape([experts, 1024, intermediate // 256 * 66]):
         raise ValueError(f"Packed expert dimensions disagree with configuration: {root}")
 
     def emit(op):
-        # Route with the original gate; only expert dispatch/mixing is replaced.
-        flat = op.Reshape(latent, [-1, 1024])
-        indices = op.Reshape(op.Cast(selected, to=ir.DataType.INT32), [-1, topk])
-        weights = op.Reshape(routing, [-1, topk])
-        tile_rows = min(8, 128 // topk)
-        rows = op.Shape(flat, start=0, end=1)
-        # A single-token decode must not dispatch eight copies of its experts.
-        tile_size = op.Min(rows, [tile_rows])
-        padding = op.Mod(op.Neg(rows), tile_size, fmod=0)
-        # Repeat whole valid rows, including unique IDs, then discard their outputs.
-        row_indices = op.Min(
-            op.Range(0, op.Squeeze(op.Add(rows, padding), [0]), 1), op.Sub(rows, [1])
+        # Keep the original FP32 router projection; expose full scores without narrowing.
+        logits = op.Reshape(_input(sigmoid, 0), [-1, experts])
+        legacy, ids, coefficients, scores, mixing = op.MoEGroupRouter(
+            logits,
+            bias,
+            top_k=topk,
+            _domain="com.microsoft",
+            _outputs=["", "", "", "selection_scores", "router_weights"],
         )
-        inputs = [
-            op.Reshape(
-                op.Gather(value, row_indices, axis=0),
-                op.Concat([-1], tile_size, [width], axis=0),
-            )
-            for value, width in ((flat, 1024), (indices, topk), (weights, topk))
-        ]
-        scan_inputs = [
-            ir.Value(name=name, type=ir.TensorType(dtype), shape=ir.Shape([None, width]))
-            for name, dtype, width in (
-                ("expert_x", ir.DataType.BFLOAT16, 1024),
-                ("expert_indices", ir.DataType.INT32, topk),
-                ("expert_weights", ir.DataType.FLOAT, topk),
-            )
-        ]
-
-        def body(body_op, x, ids, mix):
-            result, hidden, expert_output, metadata = body_op.MoEPackedIQ2XXS(
-                x, ids, mix, *banks, topk=topk, _domain="com.microsoft", _outputs=4
-            )
-            result.dtype = hidden.dtype = ir.DataType.BFLOAT16
-            expert_output.dtype, metadata.dtype = ir.DataType.FLOAT, ir.DataType.INT32
-            result.shape = ir.Shape([None, 1024])
-            return result
-
-        body_graph = op.builder.subgraph(
-            body,
-            inputs=scan_inputs,
-            outputs=[ir.Value(name="expert_result")],
-            name=f"packed_experts_{index}",
+        for omitted in (legacy, ids, coefficients):
+            omitted.name = ""
+        scores.dtype = mixing.dtype = ir.DataType.FLOAT
+        scores.shape = mixing.shape = ir.Shape([None, experts])
+        result = op.MoEPacked(
+            latent,
+            scores,
+            banks[0],
+            None,
+            banks[1],
+            mixing,
+            k=topk,
+            normalize_routing_weights=int(layer.norm_topk_prob),
+            activation_type="relu2",
+            gate_type=16,
+            down_type=16,
+            _domain="com.microsoft",
         )
-        result = op.Scan(*inputs, body=body_graph, num_scan_inputs=3)
-        result = op.Slice(op.Reshape(result, [-1, 1024]), [0], rows, [0])
-        result = op.Reshape(result, op.Shape(latent))
         result.dtype, result.shape = ir.DataType.BFLOAT16, latent.shape
+        if layer.routed_scaling_factor != 1.0:  # noqa: RUF069
+            # The shared API leaves model-specific scaling outside the expert operator.
+            result = op.Cast(
+                op.Mul(op.Cast(result, to=ir.DataType.FLOAT), layer.routed_scaling_factor),
+                to=ir.DataType.BFLOAT16,
+            )
         return result
 
     _replace(graph, anchor, emit)
@@ -354,34 +378,24 @@ def _pack_projection(
             inputs = [
                 _packed_initializer(
                     graph,
-                    source.name + (".packed_scales" if scale else ".packed_weight"),
+                    source.name + ".packed_weight",
                     [source],
                     iq2=iq2,
-                    scales=scale,
                     bank=False,
                 )
-                for scale in (False, True)
             ]
             if packed_weights is not None:
                 packed_weights[source] = inputs
-        opname = "MatMulPackedIQ2XXS" if iq2 else "MatMulPackedQ8"
         bias = node.inputs[2] if len(node.inputs) > 2 else None
-    elif node.op_type == "MatMulNVFP4A16":
-        n, half_k = source.shape
-        if not isinstance(n, int) or not isinstance(half_k, int):
-            return False
-        k = half_k * 2
-        # The kernel's single-row NVFP4 specialization supports only these K.
-        if k not in {4096, 8192}:
-            return False
-        inputs = [_input(node, index) for index in range(1, 4)]
-        opname, bias = "MatMulPackedNVFP4", None
     else:
+        # NVFP4 uses a different nibble/scale layout; retain its existing native op.
         return False
 
     def emit(op):
         def project(body_op, rows):
-            result = getattr(body_op, opname)(rows, *inputs, _domain="com.microsoft")
+            result = body_op.MatMulPacked(
+                rows, *inputs, K=k, N=n, packed_type=16 if iq2 else 8, _domain="com.microsoft"
+            )
             result.dtype = ir.DataType.BFLOAT16
             result.shape = ir.Shape([rows.shape[0], n]) if rows.shape is not None else None
             return result
@@ -398,8 +412,8 @@ def _pack_projection(
 def optimize_nemotron_h_omni_cuda(package: ModelPackage) -> ModelPackage:
     """Return a compact decoder, leaving the source package and media untouched.
 
-    Must run after the native source-accounted loader. Payload/scales are split
-    lazily at serialization; no checkpoint reads or dense reconstruction occur.
+    Must run after the native source-accounted loader. Complete packed blocks
+    are concatenated lazily; no checkpoint reads or dense reconstruction occur.
     Requires a custom ORT build containing the packed projection and MoE ops.
     """
     config = package.config
@@ -408,8 +422,10 @@ def optimize_nemotron_h_omni_cuda(package: ModelPackage) -> ModelPackage:
     if "decoder" not in package or not config.quantized_projections:
         raise ValueError("Packed Bolt CUDA export requires a native split decoder")
     source = package["decoder"]
-    if source.metadata_props.get("mobius.bolt.packed_cuda") == "1":
+    if source.metadata_props.get("mobius.bolt.packed_cuda") == "2":
         return package
+    if source.metadata_props.get("mobius.bolt.packed_cuda"):
+        raise ValueError("Older packed CUDA API: re-export from the source-accounted package")
     for value in source.graph.initializers.values():
         if value.const_value is None:
             raise ValueError(f"Packed Bolt CUDA export requires loaded weights: {value.name}")
@@ -429,15 +445,15 @@ def optimize_nemotron_h_omni_cuda(package: ModelPackage) -> ModelPackage:
         and node.op_type in {"MatMulGGMLIQ2XXS", "MatMulGGMLQ8_0", "MatMulNVFP4A16"}
     )
     common_passes.RemoveUnusedNodesPass()(compact)
-    compact.metadata_props["mobius.bolt.packed_cuda"] = "1"
+    compact.metadata_props["mobius.bolt.packed_cuda"] = "2"
     compact.metadata_props["mobius.bolt.mamba_backend"] = "unchanged"
-    compact.metadata_props["mobius.bolt.routing_backend"] = "unchanged"
+    compact.metadata_props["mobius.bolt.routing_backend"] = "full_score_fp32"
     result = ModelPackage({**package, "decoder": compact}, config=config)
     result.weight_loading_report = {
         **(package.weight_loading_report or {}),
         "packed_cuda": {
             "mamba": "unchanged",
-            "routing": "unchanged",
+            "routing": "full_score_fp32",
             "full_checkpoint_dequantization": False,
             "moe_layers": len(layers),
             "projections": projections,

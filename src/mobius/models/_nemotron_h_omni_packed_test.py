@@ -17,17 +17,19 @@ from mobius._configs import NemotronHOmniConfig
 from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
 from mobius.models import NemotronHOmniModel
 from mobius.models._nemotron_h_omni_packed import (
-    _ggml_parts,
+    _packed_initializer,
     optimize_nemotron_h_omni_cuda,
 )
 
 
-def _fixture(*, loaded=True, topk=1, experts=4):
+def _fixture(*, loaded=True, topk=1, experts=4, normalize=True, scale=1.0):
     source = _omni_config()
     source["llm_config"]["hidden_size"] = 256
     source["llm_config"]["moe_latent_size"] = 1024
     source["llm_config"]["block_configs"][1]["num_experts_per_tok"] = topk
     source["llm_config"]["block_configs"][1]["n_routed_experts"] = experts
+    source["llm_config"]["norm_topk_prob"] = normalize
+    source["llm_config"]["routed_scaling_factor"] = scale
     plan = source["quantization_config"]["quantized_layers"]
     for layer in (1, 3):
         block = source["llm_config"]["block_configs"][layer]
@@ -69,15 +71,20 @@ def _fixture(*, loaded=True, topk=1, experts=4):
 
 
 @pytest.mark.parametrize("iq2", [False, True])
-def test_split_ggml_storage_preserves_fp16_scale_bits_and_signed_codes(iq2):
+def test_packed_ggml_storage_preserves_complete_source_blocks(iq2):
     block_size = 66 if iq2 else 34
     raw = np.arange(2 * 4 * block_size, dtype=np.uint8).reshape(2, 4, block_size)
     scale_bits = np.array([0x3C01, 0x8000, 0x0001, 0x7BFF], np.uint16)
     raw[..., :2] = scale_bits.view(np.uint8).reshape(4, 2)
-    payload, scales = _ggml_parts(ir.tensor(raw), iq2=iq2)
-    np.testing.assert_array_equal(scales.view(np.uint16), np.broadcast_to(scale_bits, (2, 4)))
-    expected = raw[..., 2:] if iq2 else raw[..., 2:] ^ np.uint8(128)
-    np.testing.assert_array_equal(payload.reshape(expected.shape), expected)
+    graph = ir.Graph([], [], nodes=[], opset_imports={"": 24})
+    source = ir.Value(
+        name="source",
+        type=ir.TensorType(ir.DataType.UINT8),
+        shape=ir.Shape(raw.shape),
+        const_value=ir.tensor(raw),
+    )
+    packed = _packed_initializer(graph, "packed", [source], iq2=iq2, bank=False)
+    np.testing.assert_array_equal(packed.const_value.numpy(), raw.reshape(2, -1))
 
 
 def test_compact_decoder_preserves_interfaces_media_and_source_graph(tmp_path):
@@ -103,7 +110,8 @@ def test_compact_decoder_preserves_interfaces_media_and_source_graph(tmp_path):
     assert list(before.graph) == source_nodes
     assert dict(before.graph.initializers) == source_initializers
     assert len(after.graph) < len(before.graph)
-    assert sum(n.op_type == "MoEPackedIQ2XXS" for n in after.graph.all_nodes()) == 2
+    assert sum(n.op_type == "MoEPacked" for n in after.graph.all_nodes()) == 2
+    assert after.metadata_props["mobius.bolt.packed_cuda"] == "2"
     assert not any(".experts." in name for name in after.graph.initializers)
     for name in after.graph.initializers:
         if name in before.graph.initializers:
@@ -120,21 +128,21 @@ def test_compact_decoder_preserves_interfaces_media_and_source_graph(tmp_path):
     for layer, experts in ((1, 4), (3, 3)):
         root = f"decoder.model.layers.{layer}.moe"
         for projection in ("up_proj", "down_proj"):
-            payload = reloaded.graph.initializers[
+            packed = reloaded.graph.initializers[
                 root + f".packed_{projection}_weight"
-            ].const_value.numpy()
-            scales = reloaded.graph.initializers[
-                root + f".packed_{projection}_scales"
             ].const_value.numpy()
             for expert in range(experts):
                 source = before.graph.initializers[
                     root + f".experts.{expert}.{projection}.weight"
                 ].const_value
-                expected_payload, expected_scales = _ggml_parts(source, iq2=True)
-                np.testing.assert_array_equal(payload[expert], expected_payload)
                 np.testing.assert_array_equal(
-                    scales[expert].view(np.uint16), expected_scales.view(np.uint16)
+                    packed[expert],
+                    source.numpy().reshape(256, -1)
+                    if projection == "up_proj"
+                    else source.numpy().reshape(1024, -1),
                 )
+    for router in (n for n in reloaded.graph if n.op_type == "MoEGroupRouter"):
+        assert [v.name for v in router.outputs[:3]] == ["", "", ""]
 
 
 def test_compact_decoder_reuses_shared_projection_storage():
@@ -162,3 +170,81 @@ def test_compact_decoder_rejects_unloaded_or_observed_experts_without_mutation()
     with pytest.raises(ValueError, match="observed expert"):
         optimize_nemotron_h_omni_cuda(package)
     assert list(package["decoder"].graph) == before
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("scale", [1.0, 2.5])
+def test_compact_decoder_wires_full_fp32_routing_without_compact_ids(normalize, scale):
+    original = _fixture(topk=2, normalize=normalize, scale=scale)
+    graph = optimize_nemotron_h_omni_cuda(original)["decoder"].graph
+    routers = [node for node in graph if node.op_type == "MoEGroupRouter"]
+    consumers = [node for node in graph if node.op_type == "MoEPacked"]
+    assert len(routers) == len(consumers) == 2
+    for router, consumer in zip(routers, consumers):
+        assert [v.name for v in router.outputs[:3]] == ["", "", ""]
+        assert router.inputs[0].dtype == ir.DataType.FLOAT
+        assert router.inputs[1].dtype == ir.DataType.FLOAT
+        assert consumer.inputs[1] is router.outputs[3]
+        assert consumer.inputs[5] is router.outputs[4]
+        assert consumer.inputs[1].dtype == consumer.inputs[5].dtype == ir.DataType.FLOAT
+        assert consumer.inputs[0].dtype == consumer.outputs[0].dtype == ir.DataType.BFLOAT16
+        assert consumer.inputs[3] is None
+        assert consumer.attributes.get_int("k") == router.attributes.get_int("top_k")
+        assert consumer.attributes.get_int("normalize_routing_weights") == int(normalize)
+        assert (
+            consumer.attributes.get_int("gate_type")
+            == consumer.attributes.get_int("down_type")
+            == 16
+        )
+        if scale != 1.0:  # noqa: RUF069
+            promoted = next(iter(consumer.outputs[0].uses())).node
+            assert promoted.op_type == "Cast"
+            assert promoted.outputs[0].dtype == ir.DataType.FLOAT
+            scaled = next(iter(promoted.outputs[0].uses())).node
+            assert scaled.op_type == "Mul"
+            assert scaled.inputs[1].const_value.numpy().item() == np.float32(scale)
+    assert not any(node.op_type == "TopK" for node in graph)
+    assert not any(
+        node.op_type in {"MoEPackedIQ2XXS", "MatMulPackedIQ2XXS", "MatMulPackedQ8"}
+        for node in graph.all_nodes()
+    )
+    head = next(node for node in graph.all_nodes() if node.op_type == "MatMulPacked")
+    assert head.attributes.get_int("packed_type") == 8
+    source = next(
+        node for node in original["decoder"].graph if node.op_type == "MatMulGGMLQ8_0"
+    )
+    np.testing.assert_array_equal(
+        head.inputs[1].const_value.numpy(),
+        source.inputs[1].const_value.numpy().reshape(32, -1),
+    )
+
+
+def test_compact_decoder_rejects_observed_routes_and_old_packed_abi():
+    package = _fixture()
+    graph = package["decoder"].graph
+    topk = next(node for node in graph if node.op_type == "TopK")
+    graph.outputs.append(topk.outputs[1])
+    with pytest.raises(ValueError, match="observed routing"):
+        optimize_nemotron_h_omni_cuda(package)
+    graph.outputs.pop()
+    package["decoder"].metadata_props["mobius.bolt.packed_cuda"] = "1"
+    with pytest.raises(ValueError, match="Older packed CUDA API"):
+        optimize_nemotron_h_omni_cuda(package)
+
+
+@pytest.mark.parametrize("changed", ["biased_mixing", "ascending_topk"])
+def test_compact_decoder_rejects_changed_routing_without_mutating_source(changed):
+    package = _fixture()
+    graph = package["decoder"].graph
+    topk = next(node for node in graph if node.op_type == "TopK")
+    if changed == "ascending_topk":
+        topk.attributes["largest"] = ir.AttrInt64("largest", 0)
+    else:
+        gather = next(
+            use.node for use in topk.outputs[1].uses() if use.node.op_type == "GatherElements"
+        )
+        gather.replace_input_with(0, topk.inputs[0])
+    before = list(graph)
+    with pytest.raises(ValueError, match=r"configured top-k|unbiased sigmoid"):
+        optimize_nemotron_h_omni_cuda(package)
+    assert list(graph) == before

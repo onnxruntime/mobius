@@ -61,34 +61,53 @@ stock runtimes. This is package/operator evidence, not full-model readiness.
 Set `MOBIUS_BOLT_PACKED_CUDA=1` before the export command above, using a fresh
 output directory. The default exporter is unchanged. This option requires
 BF16, explicit CUDA, loaded native quantized weights, and an ORT build containing
-the packed projection and MoE kernels from
-[PR #33897](https://github.com/microsoft/onnxruntime/pull/33897) and
-[PR #33899](https://github.com/microsoft/onnxruntime/pull/33899), in addition to
-the original native operators below. It does not work with stock ORT.
+`MatMulPacked`, the full-score `MoEGroupRouter` API from
+[PR #33994](https://github.com/microsoft/onnxruntime/pull/33994), and the
+independent-FP32-routing `MoEPacked` consumer changes being prepared for
+[PR #33963](https://github.com/microsoft/onnxruntime/pull/33963), in addition to
+the original native operators below. The consumer changes must be present;
+an earlier PR head or stock ORT is not sufficient.
 
 The compact variant replaces each supported routed expert bank with
-`MoEPackedIQ2XXS`, instead of expanding every expert. Eligible projections use
-`MatMulPackedIQ2XXS`, `MatMulPackedQ8`, and `MatMulPackedNVFP4`.
-Longer inputs are tiled with `Scan`; projection tiles contain at most eight
-rows, and MoE tiles also respect the 128 selected-pair limit. Source IQ2
-and Q8 FP16 scale bits are retained, Q8 signed bytes are translated exactly
-to the packed ABI, and NVFP4 payloads/scales are unchanged. No dense expert
-reconstruction or auxiliary runtime weight file is introduced.
+`MoEPacked`, instead of expanding every expert. IQ2 and Q8 projections use
+`MatMulPacked` with stable format IDs 16 and 8. Complete source GGML blocks,
+including FP16 scale bits and signed Q8 bytes, are preserved without
+requantization or signed-byte translation. Projection tiles contain at most
+eight rows; `MoEPacked` handles the token rows directly, without MoE padding
+or a selected-pair `Scan`. NVFP4 retains `MatMulNVFP4A16`: its existing
+payload/scale ABI must not be reinterpreted as packed format 40.
+No dense expert reconstruction or auxiliary runtime weight file is introduced.
 
-Mamba, routing, attention, masks, cache interfaces, and the media models are
+The original FP32 router projection is retained. `MoEGroupRouter` omits
+outputs 0-2 and emits full FP32 biased selection scores at output 3 and
+unbiased sigmoid mixing values at output 4, both `[rows, experts]`.
+These connect directly to `MoEPacked` inputs 1 and 5, with no narrowing
+casts or public selected IDs. `MoEPacked` receives `k` and
+`normalize_routing_weights` from the model configuration. IQ2 expert banks
+occupy inputs 2 and 4; input 3 is omitted for `activation_type="relu2"`.
+Model-specific routed scaling is applied outside the expert operator in
+FP32, followed by a BF16 cast.
+
+Mamba, attention, masks, cache interfaces, and the media models are
 preserved. This is intentionally **not** identical to the separate Bolt
 benchmark graph: its verification-snapshot Mamba interface is not a drop-in
 replacement for ordinary prefill/cached decoding. Expert accumulation order
 and projection reduction schedules differ from the default native graph.
-The decoder carries `mobius.bolt.packed_cuda=1` metadata and the weight report
-records node/operator counts. Graph reduction is not full-model numerical
+The full-score API uses reciprocal normalization with a zero-sum guard,
+not the source graph's `sum + 1e-20` division. Moving scaling outside the
+native-dtype expert output also introduces a rounding boundary. Consequently,
+this variant is not promised to be bitwise equivalent to the source graph.
+The decoder carries `mobius.bolt.packed_cuda=2` and
+`mobius.bolt.routing_backend=full_score_fp32` metadata; older packed
+packages must be re-exported from their source-accounted package.
+The weight report records node/operator counts. Graph reduction is not full-model numerical
 acceptance, a throughput claim, or evidence of lower runtime memory. The
 readiness gates below must be rerun independently for this graph variant.
 
-On the pinned 88-layer production configuration, the structure-only check
-reduces total decoder nodes from **156,423 to 11,263**, counting nested
-`Scan`/`If` bodies (top-level: 156,423 to 7,128). This check does not load
-checkpoint weights, execute the full model, or measure exported file size.
+The earlier structure-only node counts describe the retired split-scale,
+compact-ID API, not this full-score graph. Graph tests cover public interfaces,
+FP32 routing connections, optional-output serialization, and source-byte
+preservation; they do not establish full-decoder or generation acceptance.
 
 ### Original native kernels
 
