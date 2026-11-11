@@ -15,8 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import onnx_ir as ir
 
-from mobius._flags import flags
-from mobius.functions._qmoe_opset import plan_opset29
+from mobius.functions._lowering import Emitter, lower_nodes
 
 
 @dataclass(frozen=True)
@@ -190,32 +189,7 @@ def _validate(node: ir.Node) -> _Config:
     )
 
 
-class _Emitter:
-    """Build detached nodes, using graph-local unique names supplied by the pass."""
-
-    def __init__(self, prefix: str):
-        self.prefix = prefix
-        self.nodes: list[ir.Node] = []
-
-    def op(self, op_type: str, *inputs: ir.Value, **attributes) -> ir.Value:
-        value = ir.Value(name=f"{self.prefix}_{len(self.nodes)}")
-        self.nodes.append(
-            ir.Node(
-                "",
-                op_type,
-                inputs=inputs,
-                outputs=[value],
-                attributes=ir.convenience.convert_attributes(attributes),
-            )
-        )
-        return value
-
-    def ints(self, values: list[int]) -> ir.Value:
-        return self.op("Constant", value=ir.tensor(np.array(values, dtype=np.int64)))
-
-    def scalar(self, value: float) -> ir.Value:
-        return self.op("Constant", value=ir.tensor(np.float32(value)))
-
+class _Emitter(Emitter):
     def unpack(self, packed: ir.Value, shape: list[int]) -> ir.Value:
         mask = self.op("Constant", value=ir.tensor(np.uint8(15)))
         shift = self.op("Constant", value=ir.tensor(np.uint8(4)))
@@ -348,61 +322,4 @@ def lower_qmoe(model: ir.Model) -> ir.Model:
     automatically or imply runtime kernel support.
     Requires a runtime supporting GroupedMatMul-29 (or function expansion).
     """
-    roots = [model.graph, *(function.graph for function in model.functions.values())]
-    plans = []
-    for root in roots:
-        for node in root.all_nodes():
-            if node.domain == "com.microsoft" and node.op_type == "QMoE":
-                if not flags.experimental_opset29:
-                    raise _error(
-                        "opset 29 is experimental; set MOBIUS_EXPERIMENTAL_OPSET29=1 "
-                        "before importing mobius or use "
-                        "override_flags(experimental_opset29=True). "
-                        "This opt-in does not imply runtime kernel support."
-                    )
-                if node.op_identifier() in model.functions:
-                    raise _error("caller-defined QMoE functions cannot be overridden")
-                plans.append((node, _validate(node)))
-    if not plans:
-        return model
-    aligned_graphs, aligned_nodes = plan_opset29(roots)
-    # Generate every detached replacement before inserting any of them.
-    names = {
-        value.name
-        for root in roots
-        for graph in (root, *root.subgraphs())
-        for value in (
-            *graph.inputs,
-            *graph.initializers.values(),
-            *(out for node in graph for out in node.outputs),
-        )
-    }
-    replacements = []
-    for index, (node, config) in enumerate(plans):
-        prefix = f"qmoe29_{index}"
-        while any(name and name.startswith(prefix) for name in names):
-            prefix += "_"
-        nodes, result = _lower(node, config, prefix)
-        replacements.append((node, nodes, result))
-    for node, nodes, result in replacements:
-        graph = node.graph
-        assert graph is not None
-        graph.insert_before(node, nodes)
-        output = node.outputs[0]
-        if output.type is not None:
-            result.type = output.type
-        if output.shape is not None:
-            result.shape = output.shape
-        result.doc_string = output.doc_string
-        result.metadata_props.update(output.metadata_props)
-        result.meta.update(output.meta)
-        output.replace_all_uses_with(result, replace_graph_outputs=True)
-        graph.remove(node, safe=True)
-        result.name = output.name
-    for graph in aligned_graphs:
-        graph.opset_imports.pop("ai.onnx", None)
-        graph.opset_imports[""] = 29
-    for node in aligned_nodes:
-        if node.version is not None:
-            node.version = 29
-    return model
+    return lower_nodes(model, op_type="QMoE", validate=_validate, generate=_lower)

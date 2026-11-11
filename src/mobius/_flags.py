@@ -146,8 +146,9 @@ class _Flags:
 
     Set ``MOBIUS_EXPERIMENTAL_OPSET29=1`` before importing mobius, or use
     ``override_flags(experimental_opset29=True)``, to allow
-    :func:`~mobius.functions.lower_qmoe` to produce an opset-29 graph.
-    Without this opt-in, an attempted QMoE conversion raises before mutation.
+    :func:`~mobius.functions.lower_qmoe` or :func:`~mobius.functions.lower_moe`
+    to produce an opset-29 graph. Without this opt-in, an attempted QMoE or MoE
+    conversion raises before mutation.
 
     This flag does not automatically upgrade models, change native exports,
     or imply ORT/EP kernel support. Opset 29 is experimental and may require

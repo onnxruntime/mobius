@@ -42,6 +42,7 @@ from mobius.functions.matmul_nbits import (
     FUNCTION_BODY_METADATA_VALUE,
     matmul_nbits,
 )
+from mobius.functions.moe import lower_moe
 from mobius.functions.packed_multi_head_attention import (
     packed_multi_head_attention,
 )
@@ -154,6 +155,7 @@ __all__ = [
     "causal_conv_nd_with_state",
     "get_function",
     "linear_attention",
+    "lower_moe",
     "lower_qmoe",
     "matmul_block_quantized_fp4_weight",
     "matmul_nbits",

@@ -11,12 +11,13 @@ import numpy as np
 import onnx
 import onnx_ir as ir
 import pytest
-from onnx_ir.passes.common import InlinePass, RemoveUnusedFunctionsPass
-from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
 from mobius._flags import override_flags
 from mobius.functions import lower_qmoe, register_function_bodies
+from mobius.functions._lowering_test_utils import (
+    expand_grouped_matmul as _expand_grouped_matmul,
+)
 
 ort = pytest.importorskip("onnxruntime")
 _requires_opset29 = pytest.mark.skipif(
@@ -218,49 +219,6 @@ def _reference(model, feeds):
                 middle[row] = gate / (1 + np.exp(-alpha * gate)) * (up + beta)
             result[token] += route_weight * (fc2[expert] @ middle)
     return result.reshape(feeds["x"].shape).astype(feeds["x"].dtype)
-
-
-def _expand_grouped_matmul(model):
-    """Expand the official transB=1 function algorithm, on an IR test copy.
-
-    Source: onnx/defs/math/defs.cc at
-    82721c0908fa965dd84e674c006147791313f3e1.
-    Only the FLOAT transB=1/no-bias variant emitted by this pass is needed.
-    """
-
-    def body(op, x, weights, indices):
-        m = op.Shape(x, start=0, end=1)
-        width = op.Shape(x, start=1, end=2)
-        n = op.Shape(weights, start=1, end=2)
-        selections = op.Shape(indices, start=1, end=2)
-        one = op.Constant(value_ints=[1])
-        ms = op.Mul(m, selections)
-        flat_indices = op.Reshape(indices, ms)
-        chosen = op.Transpose(op.Gather(weights, flat_indices, axis=0), perm=[0, 2, 1])
-        expanded = op.Expand(op.Unsqueeze(x, one), op.Concat(m, selections, width, axis=0))
-        lhs = op.Reshape(expanded, op.Concat(ms, one, width, axis=0))
-        return op.Reshape(op.MatMul(lhs, chosen), op.Concat(m, selections, n, axis=0))
-
-    fn = build_function(
-        body,
-        [ir.Value(name=n) for n in ("x", "weights", "indices")],
-        domain="test.qmoe",
-        name="GroupedMatMul",
-        opset_imports={"": 29},
-    )
-    model.functions[fn.identifier()] = fn
-    model.graph.opset_imports["test.qmoe"] = 1
-    for node in model.graph:
-        if node.op_type == "GroupedMatMul":
-            assert node.attributes.get_int("transB") == 1
-            node.domain = "test.qmoe"
-            node.attributes.clear()
-    InlinePass()(model)
-    RemoveUnusedFunctionsPass()(model)
-    # This test expansion removes the only opset-29 operators. All remaining
-    # emitted operators have the same used semantics at opset 24.
-    model.graph.opset_imports[""] = 24
-    return model
 
 
 def _run(model, feeds, path):
