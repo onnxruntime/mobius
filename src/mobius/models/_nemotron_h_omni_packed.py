@@ -328,6 +328,19 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
             omitted.name = ""
         scores.dtype = mixing.dtype = ir.DataType.FLOAT
         scores.shape = mixing.shape = ir.Shape([None, experts])
+        normalize = int(layer.norm_topk_prob)
+        if layer.routed_scaling_factor != 1.0:  # noqa: RUF069
+            # Scale FP32 coefficients before the consumer's BF16 output store.
+            # The shared API has no pre-store scale attribute. For normalized
+            # routing, prepare a row denominator from the same full selection
+            # scores; MoEPacked still selects and gathers its own expert routes.
+            if normalize:
+                _, chosen = op.TopK(scores, [topk], axis=-1, largest=1, sorted=1, _outputs=2)
+                chosen_weights = op.GatherElements(mixing, chosen, axis=-1)
+                total = op.ReduceSum(chosen_weights, [-1], keepdims=1)
+                mixing = op.Div(mixing, op.Add(total, 1e-20))
+            mixing = op.Mul(mixing, layer.routed_scaling_factor)
+            normalize = 0
         result = op.MoEPacked(
             latent,
             scores,
@@ -336,19 +349,13 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
             banks[1],
             mixing,
             k=topk,
-            normalize_routing_weights=int(layer.norm_topk_prob),
+            normalize_routing_weights=normalize,
             activation_type="relu2",
             gate_type=16,
             down_type=16,
             _domain="com.microsoft",
         )
         result.dtype, result.shape = ir.DataType.BFLOAT16, latent.shape
-        if layer.routed_scaling_factor != 1.0:  # noqa: RUF069
-            # The shared API leaves model-specific scaling outside the expert operator.
-            result = op.Cast(
-                op.Mul(op.Cast(result, to=ir.DataType.FLOAT), layer.routed_scaling_factor),
-                to=ir.DataType.BFLOAT16,
-            )
         return result
 
     _replace(graph, anchor, emit)

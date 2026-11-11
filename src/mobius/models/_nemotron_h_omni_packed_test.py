@@ -10,6 +10,7 @@ import dataclasses
 import numpy as np
 import onnx
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 
 from mobius import build_from_module
@@ -185,25 +186,28 @@ def test_compact_decoder_wires_full_fp32_routing_without_compact_ids(normalize, 
         assert router.inputs[0].dtype == ir.DataType.FLOAT
         assert router.inputs[1].dtype == ir.DataType.FLOAT
         assert consumer.inputs[1] is router.outputs[3]
-        assert consumer.inputs[5] is router.outputs[4]
+        if scale == 1.0:  # noqa: RUF069
+            assert consumer.inputs[5] is router.outputs[4]
         assert consumer.inputs[1].dtype == consumer.inputs[5].dtype == ir.DataType.FLOAT
         assert consumer.inputs[0].dtype == consumer.outputs[0].dtype == ir.DataType.BFLOAT16
         assert consumer.inputs[3] is None
         assert consumer.attributes.get_int("k") == router.attributes.get_int("top_k")
-        assert consumer.attributes.get_int("normalize_routing_weights") == int(normalize)
+        assert consumer.attributes.get_int("normalize_routing_weights") == int(
+            normalize and scale == 1.0  # noqa: RUF069
+        )
         assert (
             consumer.attributes.get_int("gate_type")
             == consumer.attributes.get_int("down_type")
             == 16
         )
         if scale != 1.0:  # noqa: RUF069
-            promoted = next(iter(consumer.outputs[0].uses())).node
-            assert promoted.op_type == "Cast"
-            assert promoted.outputs[0].dtype == ir.DataType.FLOAT
-            scaled = next(iter(promoted.outputs[0].uses())).node
+            scaled = consumer.inputs[5].producer()
             assert scaled.op_type == "Mul"
             assert scaled.inputs[1].const_value.numpy().item() == np.float32(scale)
-    assert not any(node.op_type == "TopK" for node in graph)
+            assert next(iter(consumer.outputs[0].uses())).node.op_type != "Cast"
+    assert sum(node.op_type == "TopK" for node in graph) == (
+        len(consumers) if normalize and scale != 1.0 else 0  # noqa: RUF069
+    )
     assert not any(
         node.op_type in {"MoEPackedIQ2XXS", "MatMulPackedIQ2XXS", "MatMulPackedQ8"}
         for node in graph.all_nodes()
@@ -217,6 +221,35 @@ def test_compact_decoder_wires_full_fp32_routing_without_compact_ids(normalize, 
         head.inputs[1].const_value.numpy(),
         source.inputs[1].const_value.numpy().reshape(32, -1),
     )
+
+
+@pytest.mark.parametrize("topk", [1, 2])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_compact_decoder_prescales_selected_mixing_in_fp32(tmp_path, topk, normalize):
+    graph = optimize_nemotron_h_omni_cuda(_fixture(topk=topk, normalize=normalize, scale=5.0))[
+        "decoder"
+    ].graph
+    router = next(node for node in graph if node.op_type == "MoEGroupRouter")
+    consumer = next(node for node in graph if node.op_type == "MoEPacked")
+    preparation = ir.convenience.extract(
+        graph, inputs=list(router.outputs[3:]), outputs=[consumer.inputs[5]]
+    )
+    path = tmp_path / "mixing.onnx"
+    ir.save(ir.Model(preparation, ir_version=10), path)
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    scores = np.array([[0.7, 0.9, 0.9, 0.6], [0.2, 0.5, 0.1, 0.4]], np.float32)
+    mixing = np.array([[0.8, 0.2, 0.6, 0.9], [0, 0, 0, 0]], np.float32)
+    actual = session.run(
+        None, dict(zip([value.name for value in preparation.inputs], [scores, mixing]))
+    )[0]
+    chosen = np.argsort(-scores, axis=-1, kind="stable")[:, :topk]
+    expected = np.take_along_axis(mixing, chosen, axis=-1)
+    if normalize:
+        expected = expected / (expected.sum(axis=-1, keepdims=True) + np.float32(1e-20))
+    expected = expected * np.float32(5.0)
+    np.testing.assert_array_equal(np.take_along_axis(actual, chosen, axis=-1), expected)
+    assert actual.dtype == np.float32
+    assert np.isfinite(actual).all()
 
 
 def test_compact_decoder_rejects_observed_routes_and_old_packed_abi():
