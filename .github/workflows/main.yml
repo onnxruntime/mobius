@@ -27,6 +27,41 @@ jobs:
     - name: Lint with lintrunner
       uses: justinchuby/lintrunner-action@main
 
+  opset29-lowering:
+    name: Experimental opset 29 lowering
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      MAX_JOBS: "2"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install PyTorch CPU
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install released dependencies
+        run: |
+          pip install -e . pytest onnxruntime==1.31.1 onnxruntime-easy==0.1.2 \
+            onnxscript==0.7.2 onnx_ir==1.1.0
+      - name: Test with released ONNX schemas
+        run: |
+          python -m pytest src/mobius/functions/moe_test.py \
+            src/mobius/functions/qmoe_test.py src/mobius/_flags_test.py -q -rs
+      - name: Install pinned opset-29 schemas
+        run: |
+          pip install --no-cache-dir --no-deps --force-reinstall \
+            https://github.com/onnx/onnx/archive/82721c0908fa965dd84e674c006147791313f3e1.tar.gz
+          python -c "import onnx; assert onnx.defs.has('GroupedMatMul', 29)"
+      - name: Test with pinned opset-29 schemas
+        run: |
+          python -m pytest src/mobius/functions/moe_test.py \
+            src/mobius/functions/qmoe_test.py src/mobius/_flags_test.py -q -rs
+
   detect-affected:
     name: Detect affected models
     runs-on: ubuntu-latest

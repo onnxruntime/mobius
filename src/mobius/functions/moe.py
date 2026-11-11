@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import onnx_ir as ir
 
-from mobius.functions._lowering import Emitter, lower_nodes
+from mobius.functions._lowering import Emitter, lower_nodes, validate_output_metadata
 
 
 @dataclass(frozen=True)
@@ -146,21 +146,7 @@ def _validate(node: ir.Node) -> _Config:
     if all(isinstance(d, int) for d in xs[:-1]) and isinstance(rs[0], int):
         if math.prod(xs[:-1]) != rs[0]:
             raise _error("router_probs token dimension does not match input")
-    output = node.outputs[0]
-    # Native custom-op intermediates may be untyped/unshaped (a following
-    # CastLike restores the public output type). Infer absent metadata from X,
-    # but never overwrite known contradictions supplied by the caller.
-    if output.type is not None and (
-        not isinstance(output.type, ir.TensorType) or output.dtype != x.dtype
-    ):
-        raise _error("output metadata must match input shape and dtype")
-    if output.shape is not None:
-        ys = tuple(output.shape)
-        if len(ys) != len(xs) or any(
-            isinstance(b, int) and (b < 0 or (isinstance(a, int) and a != b))
-            for a, b in zip(xs, ys, strict=False)
-        ):
-            raise _error("output metadata must match input shape and dtype")
+    validate_output_metadata(node, x, caller="lower_moe")
     return _Config(
         experts, hidden, intermediate, k, activation, bool(normalize), alpha, beta, limit
     )

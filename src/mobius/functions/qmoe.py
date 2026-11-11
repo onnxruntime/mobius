@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import onnx_ir as ir
 
-from mobius.functions._lowering import Emitter, lower_nodes
+from mobius.functions._lowering import Emitter, lower_nodes, validate_output_metadata
 
 
 @dataclass(frozen=True)
@@ -165,8 +165,21 @@ def _validate(node: ir.Node) -> _Config:
         if math.prod(xs[:-1]) != rs[0]:
             raise _error("router_probs token dimension does not match input")
     rw = _input(node, 14)
-    if rw is not None and _shape(rw, "router_weights") != rs:
-        raise _error("router_weights must have the same shape as router_probs")
+    if rw is not None:
+        rws = _shape(rw, "router_weights")
+        # Symbol names are annotations, not proof of unequal runtime counts.
+        # Feeds must have equal token counts even when metadata cannot prove it.
+        if (
+            len(rws) != 2
+            or rws[1] != experts
+            or (isinstance(rws[0], int) and isinstance(rs[0], int) and rws[0] != rs[0])
+            or (
+                isinstance(rws[0], int)
+                and all(isinstance(d, int) for d in xs[:-1])
+                and math.prod(xs[:-1]) != rws[0]
+            )
+        ):
+            raise _error("router_weights must have the same shape as router_probs")
     for weight_index, scale_index, zp_index, n, width in (
         (2, 3, 11, 2 * intermediate, hidden),
         (5, 6, 12, hidden, intermediate),
@@ -184,6 +197,7 @@ def _validate(node: ir.Node) -> _Config:
             or _shape(zp, f"input {zp_index} zero points") != (experts, n, (blocks + 1) // 2)
         ):
             raise _error(f"input {zp_index} zero points must be UINT8 [E,N,ceil(nblocks/2)]")
+    validate_output_metadata(node, x, caller="lower_qmoe")
     return _Config(
         experts, hidden, intermediate, block, k, bool(normalize), alpha, beta, limit
     )
@@ -316,6 +330,9 @@ def lower_qmoe(model: ir.Model) -> ir.Model:
 
     Supports FLOAT/FLOAT16 inputs with CPU-reference FLOAT compute, raw UINT8
     INT4 weights, blocked scales, interleaved SwiGLU, and rank-2/3 hidden input.
+    Router logits and optional input-14 weights must have equal runtime token
+    counts; distinct symbolic annotations or symbolic/static refinements are
+    accepted when no known static counts contradict each other.
     See ``docs/qmoe-lowering.md``.
     Requires ``experimental_opset29=True``; otherwise a QMoE conversion raises
     ``ValueError`` before mutation. Enabling the flag does not trigger lowering

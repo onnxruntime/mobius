@@ -146,20 +146,17 @@ def plan_opset29(
     graphs: list[ir.Graph] = []
     nodes: list[ir.Node] = []
     for root in roots:
-        inherited = root.opset_imports.get("", root.opset_imports.get("ai.onnx"))
+        # GraphProto has no imports: every descendant serializes under its
+        # enclosing ModelProto/FunctionProto root, regardless of IR-local hints.
+        version = root.opset_imports.get("", root.opset_imports.get("ai.onnx"))
+        if version is not None and not 1 <= version <= 29:
+            raise ValueError(f"{caller}: cannot align default-domain opset {version} to 29")
+        if (
+            "ai.onnx" in root.opset_imports
+            and root.opset_imports.get("", version) != root.opset_imports["ai.onnx"]
+        ):
+            raise ValueError(f"{caller}: conflicting default-domain opset imports")
         for graph in (root, *root.subgraphs()):
-            version = graph.opset_imports.get(
-                "", graph.opset_imports.get("ai.onnx", inherited)
-            )
-            if version is not None and not 1 <= version <= 29:
-                raise ValueError(
-                    f"{caller}: cannot align default-domain opset {version} to 29"
-                )
-            if (
-                "ai.onnx" in graph.opset_imports
-                and graph.opset_imports.get("", version) != graph.opset_imports["ai.onnx"]
-            ):
-                raise ValueError(f"{caller}: conflicting default-domain opset imports")
             for node in graph:
                 if node.domain:
                     continue

@@ -16,7 +16,7 @@ from mobius.functions import get_function, lower_moe, lower_qmoe, register_funct
 from mobius.functions._lowering_test_utils import expand_grouped_matmul
 
 ort = pytest.importorskip("onnxruntime")
-pytestmark = pytest.mark.skipif(
+_requires_opset29 = pytest.mark.skipif(
     not onnx.defs.has("GroupedMatMul", 29),
     reason="Official ONNX opset-29 GroupedMatMul schema is required (ONNX >=1.24)",
 )
@@ -218,6 +218,7 @@ def _assert_close(actual, expected):
 
 @pytest.mark.parametrize("activation", ["relu", "gelu", "silu", "identity", "swiglu"])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+@_requires_opset29
 def test_scalar_reference_and_schema_roundtrip(tmp_path, activation, dtype):
     native = _model(activation=activation, dtype=dtype, rank=3, clipped=activation == "swiglu")
     feeds = _feeds(
@@ -260,10 +261,12 @@ def _compare_native_cpu(tmp_path, activation, dtype, normalize):
 
 @pytest.mark.parametrize("activation", ["relu", "gelu", "silu", "identity", "swiglu"])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+@_requires_opset29
 def test_native_cpu_parity(tmp_path, activation, dtype):
     _compare_native_cpu(tmp_path, activation, dtype, normalize=0)
 
 
+@_requires_opset29
 def test_normalized_float_native_cpu_parity(tmp_path):
     _compare_native_cpu(tmp_path, "swiglu", ir.DataType.FLOAT, normalize=1)
 
@@ -272,6 +275,7 @@ def test_normalized_float_native_cpu_parity(tmp_path):
     "biases", [(False, False), (False, True), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("k,normalize", [(1, 0), (1, 1), (3, 0), (3, 1)])
+@_requires_opset29
 def test_optional_biases_routing_modes_and_all_experts(tmp_path, biases, k, normalize):
     native = _model(biases=biases, k=k, normalize=normalize, activation="identity")
     feeds = _feeds()
@@ -283,6 +287,7 @@ def test_optional_biases_routing_modes_and_all_experts(tmp_path, biases, k, norm
 
 @pytest.mark.parametrize("shape", [(0, 4), (2, 0, 4), (0, 3, 4), (0, 0, 4)])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+@_requires_opset29
 def test_empty_tokens(tmp_path, shape, dtype):
     model = lower_moe(_model(rank=len(shape), dtype=dtype))
     path = tmp_path / "empty.onnx"
@@ -299,6 +304,7 @@ def test_empty_tokens(tmp_path, shape, dtype):
     "case", ["ties", "rounded_ties", "tiny", "extreme", "masked", "underflow"]
 )
 @pytest.mark.parametrize("normalize", [0, 1])
+@_requires_opset29
 def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
     _require_native_cpu(ir.DataType.FLOAT)
     native = _model(k=1 if "ties" in case else 3, normalize=normalize)
@@ -310,6 +316,7 @@ def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
         _assert_close(actual, _run(native, feeds, tmp_path / f"native_{count}.onnx"))
 
 
+@_requires_opset29
 def test_higher_expert_id_on_probability_rounding_tie(tmp_path):
     native = _model(activation="identity", k=1, biases=(False, True))
     node = next(iter(native.graph))
@@ -321,6 +328,7 @@ def test_higher_expert_id_on_probability_rounding_tie(tmp_path):
     np.testing.assert_allclose(actual, np.ones((1, 4), np.float32), rtol=1e-6)
 
 
+@_requires_opset29
 def test_tiny_positive_routes_are_not_qmoe_thresholded(tmp_path):
     native = _model(activation="identity", k=3, biases=(False, True))
     node = next(iter(native.graph))
@@ -335,6 +343,7 @@ def test_tiny_positive_routes_are_not_qmoe_thresholded(tmp_path):
     _assert_close(actual, expected)
 
 
+@_requires_opset29
 def test_inactive_overflowing_expert_is_masked(tmp_path):
     native = _model(activation="identity", k=3, biases=(False, False))
     node = next(iter(native.graph))
@@ -352,6 +361,7 @@ def test_inactive_overflowing_expert_is_masked(tmp_path):
     assert np.all(np.isfinite(actual))
 
 
+@_requires_opset29
 def test_half_rounding_boundaries_are_observable(tmp_path):
     native = _model(dtype=ir.DataType.FLOAT16)
     feeds = _feeds(dtype=np.float16)
@@ -462,6 +472,7 @@ def test_missing_required_input(tmp_path, index):
     _assert_atomic(model, tmp_path, f"required MoE input {index}")
 
 
+@_requires_opset29
 def test_truncated_optional_slots(tmp_path):
     model = _model(biases=(False, False))
     feeds = _feeds()
@@ -530,6 +541,7 @@ def test_token_count_output_and_overload_validation(tmp_path):
 
 
 @pytest.mark.parametrize("activation", ["identity", "swiglu"])
+@_requires_opset29
 def test_square_modern_weights_are_qualified(tmp_path, activation):
     native = _model(hidden=4, inter=4, activation=activation)
     feeds = _feeds()
@@ -539,6 +551,7 @@ def test_square_modern_weights_are_qualified(tmp_path, activation):
 
 
 @pytest.mark.parametrize("limit", [0.0, np.inf])
+@_requires_opset29
 def test_swiglu_limit_boundaries_and_default_normalization(tmp_path, limit):
     native = _model()
     node = next(iter(native.graph))
@@ -597,6 +610,7 @@ def test_no_moe_is_byte_preserving(tmp_path, enabled, qmoe_only):
     assert (tmp_path / "before.onnx").read_bytes() == (tmp_path / "after.onnx").read_bytes()
 
 
+@_requires_opset29
 def test_output_metadata_name_collision_and_idempotence(tmp_path):
     model = _model()
     original = model.graph.outputs[0]
@@ -624,6 +638,7 @@ def test_output_metadata_name_collision_and_idempotence(tmp_path):
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
 @pytest.mark.parametrize("consumer", ["CastLike", "Identity"])
+@_requires_opset29
 def test_untyped_unshaped_native_intermediate(tmp_path, dtype, consumer):
     model = _model(dtype=dtype)
     feeds = _feeds(dtype=np.float16 if dtype == ir.DataType.FLOAT16 else np.float32)
@@ -654,6 +669,7 @@ def test_untyped_unshaped_native_intermediate(tmp_path, dtype, consumer):
 @pytest.mark.parametrize(
     "case", ["old_softmax", "future", "alias", "node_version", "unknown", "shift"]
 )
+@_requires_opset29
 def test_import_audit_is_atomic_and_uses_moe_diagnostics(tmp_path, case):
     model = _model()
     x = ir.Value(name="audit_x", shape=ir.Shape([2, 3]), type=ir.TensorType(ir.DataType.FLOAT))
@@ -689,6 +705,7 @@ def test_import_audit_is_atomic_and_uses_moe_diagnostics(tmp_path, case):
     _assert_atomic(model, tmp_path, "lower_moe:")
 
 
+@_requires_opset29
 def test_function_scope_and_registry_import_alignment(tmp_path):
     inner = _model().graph
     inner.inputs.extend(inner.initializers.values())
@@ -709,6 +726,7 @@ def test_function_scope_and_registry_import_alignment(tmp_path):
     onnx.checker.check_model(str(path), full_check=True)
 
 
+@_requires_opset29
 def test_default_domain_alias_and_explicit_version_are_aligned(tmp_path):
     model = _model()
     model.graph.opset_imports.pop("")
@@ -736,6 +754,7 @@ def test_caller_owned_moe_function_rejected(tmp_path):
     _assert_atomic(model, tmp_path, "caller-defined MoE")
 
 
+@_requires_opset29
 def test_nested_subgraphs_are_lowered_and_aligned(tmp_path):
     then_graph, else_graph = _model().graph, _model().graph
     outer_inputs = list(then_graph.inputs)
@@ -778,6 +797,7 @@ def test_nested_subgraphs_are_lowered_and_aligned(tmp_path):
 
 
 @pytest.mark.parametrize("moe_first", [False, True])
+@_requires_opset29
 def test_moe_qmoe_passes_compose(tmp_path, moe_first):
     from mobius.functions.qmoe_test import _model as qmodel
 

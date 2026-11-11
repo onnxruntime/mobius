@@ -31,7 +31,6 @@ _requires_native_cpu_qmoe = pytest.mark.skipif(
     ),
     reason="ORT CPU QMoE kernel is required for native parity",
 )
-pytestmark = _requires_opset29
 
 
 @pytest.fixture(autouse=True)
@@ -237,6 +236,7 @@ def _run(model, feeds, path):
     ),
 )
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+@_requires_opset29
 def test_numerical_reference(
     tmp_path, rank, k, zero_points, router_weights, normalize, clipped, dtype
 ):
@@ -273,6 +273,7 @@ def test_numerical_reference(
 
 @pytest.mark.parametrize("shape", [(0, 32), (2, 0, 32), (0, 3, 32), (0, 0, 32)])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+@_requires_opset29
 def test_empty_token_dimensions_survive_roundtrip(tmp_path, shape, dtype):
     model = lower_qmoe(_model(rank=len(shape), dtype=dtype))
     path = tmp_path / "empty.onnx"
@@ -293,6 +294,7 @@ def test_empty_token_dimensions_survive_roundtrip(tmp_path, shape, dtype):
 @pytest.mark.parametrize("case", ["ties", "zero", "negative", "cancellation", "masked"])
 @pytest.mark.parametrize("normalize", [0, 1])
 @_requires_native_cpu_qmoe
+@_requires_opset29
 def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
     native = _model(normalize=normalize)
     lowered = lower_qmoe(native.clone())
@@ -311,6 +313,7 @@ def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
 )
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
 @_requires_native_cpu_qmoe
+@_requires_opset29
 def test_native_cpu_parity(tmp_path, router_weights, normalize, clipped, dtype):
     native = _model(
         router_weights=router_weights, normalize=normalize, clipped=clipped, dtype=dtype
@@ -456,6 +459,7 @@ def test_native_serialization_no_automatic_opset29(tmp_path):
     assert path.read_bytes() == before
 
 
+@_requires_opset29
 def test_output_annotations_survive_roundtrip(tmp_path):
     model = _model()
     original = model.graph.outputs[0]
@@ -481,6 +485,7 @@ def test_output_annotations_survive_roundtrip(tmp_path):
     assert restored.metadata_props["test.qmoe.annotation"] == "preserved"
 
 
+@_requires_opset29
 def test_unrelated_model_noop_and_idempotence(tmp_path):
     model = _model()
     lower_qmoe(model)
@@ -511,6 +516,7 @@ def test_opset29_checker_and_shape_inference(tmp_path, dtype):
 
 
 @pytest.mark.parametrize("zp1,zp2", list(itertools.product((False, True), repeat=2)))
+@_requires_opset29
 def test_independent_optional_zero_points_and_all_experts(tmp_path, zp1, zp2):
     native = _model(k=3, router_weights=False)
     node = next(iter(native.graph))
@@ -525,6 +531,7 @@ def test_independent_optional_zero_points_and_all_experts(tmp_path, zp1, zp2):
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
+@_requires_opset29
 def test_truncated_optional_slots(tmp_path):
     original = _model(zero_points=False, router_weights=False)
     feeds = _feeds(router_weights=False)
@@ -644,6 +651,7 @@ def _caller_function(op_type="Identity", *, opset=24, constant_shift=None):
         ("Identity", 30, None, "cannot align default-domain opset"),
     ],
 )
+@_requires_opset29
 def test_unprovable_function_import_rejected_atomically(
     tmp_path, op_type, opset, constant_shift, message
 ):
@@ -663,6 +671,7 @@ def test_unprovable_function_import_rejected_atomically(
     assert tuple(qmoe.inputs[0].uses()) == uses_before
 
 
+@_requires_opset29
 def test_compatible_caller_function_preserved_and_aligned(tmp_path):
     model = _model()
     function = _caller_function()
@@ -708,6 +717,258 @@ def test_no_qmoe_does_not_align_or_reject_caller_functions(tmp_path, enabled):
     ir.save(model, after)
     assert before.read_bytes() == after.read_bytes()
     assert function.opset_imports[""] == 11
+
+
+def _family_model(op_type):
+    if op_type == "MoE":
+        from mobius.functions import lower_moe
+        from mobius.functions.moe_test import _model as float_model
+
+        return float_model(), lower_moe
+    return _model(), lower_qmoe
+
+
+def _assert_atomic_error(model, lower, tmp_path, message):
+    before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
+    nodes = tuple(model.graph.all_nodes())
+    uses = [(value, tuple(value.uses())) for value in model.graph.inputs]
+    ir.save(model, before)
+    with pytest.raises(ValueError, match=message):
+        lower(model)
+    ir.save(model, after)
+    assert before.read_bytes() == after.read_bytes()
+    assert tuple(model.graph.all_nodes()) == nodes
+    assert all(tuple(value.uses()) == previous for value, previous in uses)
+
+
+def _add_audited_branch(
+    model, *, op_type, local_version, in_function, conflicting_alias=False
+):
+    dtype = ir.DataType.UINT8 if op_type == "BitShift" else ir.DataType.FLOAT
+    x = ir.Value(name="branch_x", shape=ir.Shape([2, 3]), type=ir.TensorType(dtype))
+    condition = ir.Value(
+        name="branch_condition", shape=ir.Shape([]), type=ir.TensorType(ir.DataType.BOOL)
+    )
+    inputs = [condition, x]
+    branch_inputs = [x]
+    attrs = []
+    if op_type == "BitShift":
+        shift = ir.Value(name="branch_shift", shape=x.shape, type=x.type)
+        inputs.append(shift)
+        branch_inputs.append(shift)
+        attrs = [ir.AttrString("direction", "RIGHT")]
+    then_output = ir.Value(name="then_output", shape=x.shape, type=x.type)
+    then_node = ir.Node(
+        "", op_type, inputs=branch_inputs, outputs=[then_output], attributes=attrs
+    )
+    then_graph = ir.Graph(
+        [], [then_output], nodes=[then_node], opset_imports={"": local_version}, name="then"
+    )
+    if conflicting_alias:
+        # Neither stale nor conflicting descendant hints serialize as imports.
+        then_graph.opset_imports["ai.onnx"] = local_version - 1
+    else_output = ir.Value(name="else_output", shape=x.shape, type=x.type)
+    else_graph = ir.Graph(
+        [],
+        [else_output],
+        nodes=[ir.Node("", "Identity", inputs=[x], outputs=[else_output])],
+        opset_imports={"": 24},
+        name="else",
+    )
+    output = ir.Value(name="branch_output", shape=x.shape, type=x.type)
+    branch = ir.Node(
+        "",
+        "If",
+        inputs=[condition],
+        outputs=[output],
+        attributes=[
+            ir.AttrGraph("then_branch", then_graph),
+            ir.AttrGraph("else_branch", else_graph),
+        ],
+    )
+    if in_function:
+        # A local function has its own serialized import, distinct from the
+        # model root. In particular its BitShift-24 still needs the old proof.
+        model.graph.opset_imports[""] = 29
+        root = ir.Graph(inputs, [output], nodes=[branch], opset_imports={"": 24}, name="root")
+        function = ir.Function("caller", "Branch", graph=root, attributes=[])
+        model.functions[function.identifier()] = function
+    else:
+        model.graph.inputs.extend(inputs)
+        model.graph.append(branch)
+        model.graph.outputs.append(output)
+    return then_graph
+
+
+@_requires_opset29
+@pytest.mark.parametrize("op_type", ["MoE", "QMoE"])
+@pytest.mark.parametrize("in_function", [False, True])
+def test_descendant_import_cannot_bypass_root_bitshift_audit(tmp_path, op_type, in_function):
+    model, lower = _family_model(op_type)
+    _add_audited_branch(model, op_type="BitShift", local_version=29, in_function=in_function)
+    _assert_atomic_error(model, lower, tmp_path, "constant unsigned shift")
+
+
+@_requires_opset29
+@pytest.mark.parametrize("op_type", ["MoE", "QMoE"])
+@pytest.mark.parametrize("in_function", [False, True])
+@pytest.mark.parametrize("conflicting_alias", [False, True])
+def test_stale_descendant_import_does_not_reject_root_swish(
+    tmp_path, op_type, in_function, conflicting_alias
+):
+    model, lower = _family_model(op_type)
+    branch = _add_audited_branch(
+        model,
+        op_type="Swish",
+        local_version=23,
+        in_function=in_function,
+        conflicting_alias=conflicting_alias,
+    )
+    lower(model)
+    assert branch.opset_imports == {"": 29}
+    path = tmp_path / "stale_branch.onnx"
+    ir.save(model, path)
+    onnx.checker.check_model(str(path), full_check=True)
+
+
+@pytest.mark.parametrize(
+    "dtype,shape",
+    [
+        (ir.DataType.FLOAT16, [4, 32]),
+        (ir.DataType.FLOAT, [5, 32]),
+        (ir.DataType.FLOAT, [4, 33]),
+        (ir.DataType.FLOAT, [4, 1, 32]),
+    ],
+)
+def test_qmoe_contradictory_output_metadata_is_atomic(tmp_path, dtype, shape):
+    model = _model()
+    first = next(iter(model.graph))
+    first.inputs[0].shape = ir.Shape([4, 32])
+    model.graph.append(
+        ir.Node(
+            first.domain,
+            first.op_type,
+            inputs=first.inputs,
+            attributes=first.attributes,
+            outputs=[
+                ir.Value(name="bad_output", shape=ir.Shape(shape), type=ir.TensorType(dtype))
+            ],
+        )
+    )
+    _assert_atomic_error(model, lower_qmoe, tmp_path, "output metadata")
+
+
+@_requires_opset29
+@pytest.mark.parametrize(
+    "input_shape,output_shape,typed",
+    [
+        (["tokens", 32], None, False),
+        (["tokens", 32], ["result_tokens", 32], True),
+        (["tokens", 32], [4, 32], True),
+        ([4, 32], ["result_tokens", 32], True),
+    ],
+)
+def test_qmoe_compatible_output_annotations(tmp_path, input_shape, output_shape, typed):
+    model = _model()
+    x, output = model.graph.inputs[0], model.graph.outputs[0]
+    x.shape = ir.Shape(input_shape)
+    output.shape = None if output_shape is None else ir.Shape(output_shape)
+    output.type = x.type if typed else None
+    output.doc_string = "Compatible QMoE annotation."
+    output.metadata_props["annotation"] = "preserved"
+    marker = object()
+    output.meta["marker"] = marker
+    feeds = _feeds()
+    expected = _reference(model, feeds)
+    lower_qmoe(model)
+    result = model.graph.outputs[0]
+    assert result.shape == (x.shape if output_shape is None else ir.Shape(output_shape))
+    assert result.type == x.type and result.meta["marker"] is marker
+    path = tmp_path / "compatible_output.onnx"
+    ir.save(model, path)
+    onnx.checker.check_model(str(path), full_check=True)
+    restored = ir.load(path)
+    assert restored.graph.outputs[0].doc_string == output.doc_string
+    assert restored.graph.outputs[0].metadata_props == output.metadata_props
+    actual = _run(_expand_grouped_matmul(restored), feeds, tmp_path / "expanded.onnx")
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+@_requires_opset29
+@pytest.mark.parametrize(
+    "router_tokens,weight_tokens",
+    [
+        ("selection_tokens", "weight_tokens"),
+        (4, "weight_tokens"),
+        ("selection_tokens", 4),
+    ],
+)
+def test_router_weight_token_annotations_are_not_runtime_mismatches(
+    tmp_path, router_tokens, weight_tokens
+):
+    model = _model()
+    node = next(iter(model.graph))
+    node.inputs[1].shape = ir.Shape([router_tokens, 3])
+    node.inputs[14].shape = ir.Shape([weight_tokens, 3])
+    feeds = _feeds()
+    expected = _reference(model, feeds)
+    lower_qmoe(model)
+    path = tmp_path / "refined_router.onnx"
+    ir.save(model, path)
+    onnx.checker.check_model(str(path), full_check=True)
+    actual = _run(_expand_grouped_matmul(ir.load(path)), feeds, tmp_path / "expanded.onnx")
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("static_input", [False, True])
+def test_static_router_weight_token_mismatch_is_atomic(tmp_path, static_input):
+    model = _model()
+    node = next(iter(model.graph))
+    if static_input:
+        node.inputs[0].shape = ir.Shape([4, 32])
+    else:
+        node.inputs[1].shape = ir.Shape([4, 3])
+    node.inputs[14].shape = ir.Shape([5, 3])
+    _assert_atomic_error(model, lower_qmoe, tmp_path, "router_weights")
+
+
+@pytest.mark.parametrize("op_type", ["MoE", "QMoE"])
+def test_schema_absent_flag_noop_and_abi_validation(tmp_path, op_type):
+    # Remove the actual schema, not just a capability predicate. This also runs
+    # unchanged on released ONNX installations that never registered schema 29.
+    schema = (
+        onnx.defs.get_schema("GroupedMatMul", 29)
+        if onnx.defs.has("GroupedMatMul", 29)
+        else None
+    )
+    if schema is not None:
+        onnx.defs.deregister_schema("GroupedMatMul", 29, "")
+    try:
+        assert not onnx.defs.has("GroupedMatMul", 29)
+        model, lower = _family_model(op_type)
+        with override_flags(experimental_opset29=False):
+            _assert_atomic_error(model, lower, tmp_path, "experimental")
+        next(iter(model.graph)).attributes["k"] = ir.AttrInt64("k", 0)
+        _assert_atomic_error(model, lower, tmp_path, "k must")
+        model, lower = _family_model(op_type)
+        _assert_atomic_error(model, lower, tmp_path, "opset-29 schemas are required")
+        # Preserve old unaudited bodies on no-target.
+        function = _caller_function("Softmax", opset=11)
+        unrelated = ir.Model(
+            ir.Graph([], [], nodes=[], opset_imports={"": 24}),
+            functions=[function],
+            ir_version=10,
+        )
+        before, after = tmp_path / "noop_before.onnx", tmp_path / "noop_after.onnx"
+        ir.save(unrelated, before)
+        for enabled in (False, True):
+            with override_flags(experimental_opset29=enabled):
+                assert lower(unrelated) is unrelated
+            ir.save(unrelated, after)
+            assert before.read_bytes() == after.read_bytes()
+    finally:
+        if schema is not None:
+            onnx.defs.register_schema(schema)
 
 
 @_requires_opset29
@@ -786,6 +1047,7 @@ def test_direct_grouped_matmul29_runtime(tmp_path, monkeypatch, rank, dtype):
 
 @pytest.mark.parametrize("symmetric", [False, True])
 @_requires_native_cpu_qmoe
+@_requires_opset29
 def test_real_mobius_moe_layer_lowering(tmp_path, symmetric):
     from onnx_shape_inference import infer_symbolic_shapes
 
