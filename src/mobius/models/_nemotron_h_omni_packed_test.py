@@ -112,7 +112,7 @@ def test_compact_decoder_preserves_interfaces_media_and_source_graph(tmp_path):
     assert dict(before.graph.initializers) == source_initializers
     assert len(after.graph) < len(before.graph)
     assert sum(n.op_type == "MoEPacked" for n in after.graph.all_nodes()) == 2
-    assert after.metadata_props["mobius.bolt.packed_cuda"] == "2"
+    assert after.metadata_props["mobius.bolt.packed_cuda"] == "3"
     assert not any(".experts." in name for name in after.graph.initializers)
     for name in after.graph.initializers:
         if name in before.graph.initializers:
@@ -143,7 +143,8 @@ def test_compact_decoder_preserves_interfaces_media_and_source_graph(tmp_path):
                     else source.numpy().reshape(1024, -1),
                 )
     for router in (n for n in reloaded.graph if n.op_type == "MoEGroupRouter"):
-        assert [v.name for v in router.outputs[:3]] == ["", "", ""]
+        assert len(router.outputs) == 3
+        assert router.outputs[0].name == ""
 
 
 def test_compact_decoder_reuses_shared_projection_storage():
@@ -182,12 +183,13 @@ def test_compact_decoder_wires_full_fp32_routing_without_compact_ids(normalize, 
     consumers = [node for node in graph if node.op_type == "MoEPacked"]
     assert len(routers) == len(consumers) == 2
     for router, consumer in zip(routers, consumers):
-        assert [v.name for v in router.outputs[:3]] == ["", "", ""]
+        assert len(router.outputs) == 3
+        assert router.outputs[0].name == ""
         assert router.inputs[0].dtype == ir.DataType.FLOAT
         assert router.inputs[1].dtype == ir.DataType.FLOAT
-        assert consumer.inputs[1] is router.outputs[3]
+        assert consumer.inputs[1] is router.outputs[1]
         if scale == 1.0:  # noqa: RUF069
-            assert consumer.inputs[5] is router.outputs[4]
+            assert consumer.inputs[5] is router.outputs[2]
         assert consumer.inputs[1].dtype == consumer.inputs[5].dtype == ir.DataType.FLOAT
         assert consumer.inputs[0].dtype == consumer.outputs[0].dtype == ir.DataType.BFLOAT16
         assert consumer.inputs[3] is None
@@ -232,7 +234,7 @@ def test_compact_decoder_prescales_selected_mixing_in_fp32(tmp_path, topk, norma
     router = next(node for node in graph if node.op_type == "MoEGroupRouter")
     consumer = next(node for node in graph if node.op_type == "MoEPacked")
     preparation = ir.convenience.extract(
-        graph, inputs=list(router.outputs[3:]), outputs=[consumer.inputs[5]]
+        graph, inputs=list(router.outputs[1:]), outputs=[consumer.inputs[5]]
     )
     path = tmp_path / "mixing.onnx"
     ir.save(ir.Model(preparation, ir_version=10), path)
@@ -252,7 +254,8 @@ def test_compact_decoder_prescales_selected_mixing_in_fp32(tmp_path, topk, norma
     assert np.isfinite(actual).all()
 
 
-def test_compact_decoder_rejects_observed_routes_and_old_packed_abi():
+@pytest.mark.parametrize("old_api", ["1", "2"])
+def test_compact_decoder_rejects_observed_routes_and_old_packed_abi(old_api):
     package = _fixture()
     graph = package["decoder"].graph
     topk = next(node for node in graph if node.op_type == "TopK")
@@ -260,7 +263,7 @@ def test_compact_decoder_rejects_observed_routes_and_old_packed_abi():
     with pytest.raises(ValueError, match="observed routing"):
         optimize_nemotron_h_omni_cuda(package)
     graph.outputs.pop()
-    package["decoder"].metadata_props["mobius.bolt.packed_cuda"] = "1"
+    package["decoder"].metadata_props["mobius.bolt.packed_cuda"] = old_api
     with pytest.raises(ValueError, match="Older packed CUDA API"):
         optimize_nemotron_h_omni_cuda(package)
 

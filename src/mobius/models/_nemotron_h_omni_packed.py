@@ -317,15 +317,14 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
     def emit(op):
         # Keep the original FP32 router projection; expose full scores without narrowing.
         logits = op.Reshape(_input(sigmoid, 0), [-1, experts])
-        legacy, ids, coefficients, scores, mixing = op.MoEGroupRouter(
+        legacy, scores, mixing = op.MoEGroupRouter(
             logits,
             bias,
             top_k=topk,
             _domain="com.microsoft",
-            _outputs=["", "", "", "selection_scores", "router_weights"],
+            _outputs=["", "selection_scores", "router_weights"],
         )
-        for omitted in (legacy, ids, coefficients):
-            omitted.name = ""
+        legacy.name = ""
         scores.dtype = mixing.dtype = ir.DataType.FLOAT
         scores.shape = mixing.shape = ir.Shape([None, experts])
         normalize = int(layer.norm_topk_prob)
@@ -429,7 +428,7 @@ def optimize_nemotron_h_omni_cuda(package: ModelPackage) -> ModelPackage:
     if "decoder" not in package or not config.quantized_projections:
         raise ValueError("Packed Bolt CUDA export requires a native split decoder")
     source = package["decoder"]
-    if source.metadata_props.get("mobius.bolt.packed_cuda") == "2":
+    if source.metadata_props.get("mobius.bolt.packed_cuda") == "3":
         return package
     if source.metadata_props.get("mobius.bolt.packed_cuda"):
         raise ValueError("Older packed CUDA API: re-export from the source-accounted package")
@@ -452,7 +451,7 @@ def optimize_nemotron_h_omni_cuda(package: ModelPackage) -> ModelPackage:
         and node.op_type in {"MatMulGGMLIQ2XXS", "MatMulGGMLQ8_0", "MatMulNVFP4A16"}
     )
     common_passes.RemoveUnusedNodesPass()(compact)
-    compact.metadata_props["mobius.bolt.packed_cuda"] = "2"
+    compact.metadata_props["mobius.bolt.packed_cuda"] = "3"
     compact.metadata_props["mobius.bolt.mamba_backend"] = "unchanged"
     compact.metadata_props["mobius.bolt.routing_backend"] = "full_score_fp32"
     result = ModelPackage({**package, "decoder": compact}, config=config)
