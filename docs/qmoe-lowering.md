@@ -2,12 +2,24 @@
 
 ```python
 import onnx_ir as ir
+from mobius._flags import override_flags
 from mobius.functions import lower_qmoe
 
 model = ir.load("native.onnx")
-lower_qmoe(model)  # in-place, also returns model
+with override_flags(experimental_opset29=True):
+    lower_qmoe(model)  # in-place, also returns model
 ir.save(model, "standard.onnx")
 ```
+
+**Experimental, disabled by default.** Enable `experimental_opset29` explicitly,
+or set `MOBIUS_EXPERIMENTAL_OPSET29=1` before importing mobius. A QMoE conversion
+without this opt-in raises `ValueError` before changing the model. Models without
+QMoE remain unchanged, regardless of the flag.
+
+The flag permits experimental lowering; it does not automatically upgrade models
+or imply ORT/EP kernel support. Schema/checker support alone does not establish
+runtime execution support. In particular, the tested ORT 1.31.1 cannot execute
+these opset-29 graphs directly.
 
 This opt-in pass replaces `com.microsoft::QMoE` with standard ONNX blocked
 `DequantizeLinear` and two `GroupedMatMul-29` calls. When at least one node is

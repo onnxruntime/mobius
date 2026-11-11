@@ -22,6 +22,10 @@ class TestDefaultValues:
         monkeypatch.delenv("MOBIUS_GEMMA4_CUSTOM_GEGLU", raising=False)
         assert _flags._Flags().gemma4_custom_geglu is False
 
+    def test_experimental_opset29_default_off(self, monkeypatch):
+        monkeypatch.delenv("MOBIUS_EXPERIMENTAL_OPSET29", raising=False)
+        assert _flags._Flags().experimental_opset29 is False
+
 
 class TestEnvVarOverride:
     """Flags are read from environment variables at construction time."""
@@ -49,6 +53,13 @@ class TestEnvVarOverride:
     def test_gemma4_custom_geglu_opt_in(self, monkeypatch, value, expected):
         monkeypatch.setenv("MOBIUS_GEMMA4_CUSTOM_GEGLU", value)
         assert _flags._Flags().gemma4_custom_geglu is expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [("1", True), ("true", True), ("0", False), ("maybe", False)]
+    )
+    def test_experimental_opset29_opt_in(self, monkeypatch, value, expected):
+        monkeypatch.setenv("MOBIUS_EXPERIMENTAL_OPSET29", value)
+        assert _flags._Flags().experimental_opset29 is expected
 
 
 class TestProgrammaticOverride:

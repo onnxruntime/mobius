@@ -15,6 +15,7 @@ from onnx_ir.passes.common import InlinePass, RemoveUnusedFunctionsPass
 from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
+from mobius._flags import override_flags
 from mobius.functions import lower_qmoe, register_function_bodies
 
 ort = pytest.importorskip("onnxruntime")
@@ -30,6 +31,12 @@ _requires_native_cpu_qmoe = pytest.mark.skipif(
     reason="ORT CPU QMoE kernel is required for native parity",
 )
 pytestmark = _requires_opset29
+
+
+@pytest.fixture(autouse=True)
+def _enable_experimental_opset29():
+    with override_flags(experimental_opset29=True):
+        yield
 
 
 def _value(name, array):
@@ -457,6 +464,22 @@ def test_reject_shapes_and_types(index, shape, dtype, message):
     assert model.graph.opset_imports[""] == 24
 
 
+def test_lowering_requires_experimental_opset29_before_mutation(tmp_path):
+    model = _model()
+    register_function_bodies(model)
+    before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
+    ir.save(model, before)
+
+    with (
+        override_flags(experimental_opset29=False),
+        pytest.raises(ValueError, match="MOBIUS_EXPERIMENTAL_OPSET29=1"),
+    ):
+        lower_qmoe(model)
+
+    ir.save(model, after)
+    assert before.read_bytes() == after.read_bytes()
+
+
 def test_native_serialization_no_automatic_opset29(tmp_path):
     model = _model()
     path = tmp_path / "native.onnx"
@@ -715,13 +738,15 @@ def test_compatible_caller_function_preserved_and_aligned(tmp_path):
     np.testing.assert_array_equal(actual, feeds["caller_feed"])
 
 
-def test_no_qmoe_does_not_align_or_reject_caller_functions(tmp_path):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_no_qmoe_does_not_align_or_reject_caller_functions(tmp_path, enabled):
     function = _caller_function("Softmax", opset=11)
     graph = ir.Graph([], [], nodes=[], name="no_qmoe", opset_imports={"": 24})
     model = ir.Model(graph, ir_version=10, functions=[function])
     before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
     ir.save(model, before)
-    lower_qmoe(model)
+    with override_flags(experimental_opset29=enabled):
+        lower_qmoe(model)
     ir.save(model, after)
     assert before.read_bytes() == after.read_bytes()
     assert function.opset_imports[""] == 11

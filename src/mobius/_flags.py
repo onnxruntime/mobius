@@ -84,6 +84,11 @@ class _Flags:
          - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
            (ORT <=1.24.x workaround). Disabled by default.
+       * - ``experimental_opset29``
+         - ``MOBIUS_EXPERIMENTAL_OPSET29``
+         - ``False``
+         - Permit explicit experimental opset-29 lowering.
+           Does not imply runtime kernel support or upgrade ordinary exports.
        * - ``tencent_q1_0_use_native_2bit``
          - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
          - ``False``
@@ -132,6 +137,21 @@ class _Flags:
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`` to re-enable if running on
     an older ORT build without opset 24 kernel registration.
+    """
+
+    experimental_opset29: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_EXPERIMENTAL_OPSET29", False)
+    )
+    """Permit explicit experimental opset-29 lowering, disabled by default.
+
+    Set ``MOBIUS_EXPERIMENTAL_OPSET29=1`` before importing mobius, or use
+    ``override_flags(experimental_opset29=True)``, to allow
+    :func:`~mobius.functions.lower_qmoe` to produce an opset-29 graph.
+    Without this opt-in, an attempted QMoE conversion raises before mutation.
+
+    This flag does not automatically upgrade models, change native exports,
+    or imply ORT/EP kernel support. Opset 29 is experimental and may require
+    source-built ONNX schemas and a separately qualified runtime.
     """
 
     tencent_q1_0_use_native_2bit: bool = dataclasses.field(

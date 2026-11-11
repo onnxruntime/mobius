@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import onnx_ir as ir
 
+from mobius._flags import flags
 from mobius.functions._qmoe_opset import plan_opset29
 
 
@@ -342,6 +343,9 @@ def lower_qmoe(model: ir.Model) -> ir.Model:
     Supports FLOAT/FLOAT16 inputs with CPU-reference FLOAT compute, raw UINT8
     INT4 weights, blocked scales, interleaved SwiGLU, and rank-2/3 hidden input.
     See ``docs/qmoe-lowering.md``.
+    Requires ``experimental_opset29=True``; otherwise a QMoE conversion raises
+    ``ValueError`` before mutation. Enabling the flag does not trigger lowering
+    automatically or imply runtime kernel support.
     Requires a runtime supporting GroupedMatMul-29 (or function expansion).
     """
     roots = [model.graph, *(function.graph for function in model.functions.values())]
@@ -349,6 +353,13 @@ def lower_qmoe(model: ir.Model) -> ir.Model:
     for root in roots:
         for node in root.all_nodes():
             if node.domain == "com.microsoft" and node.op_type == "QMoE":
+                if not flags.experimental_opset29:
+                    raise _error(
+                        "opset 29 is experimental; set MOBIUS_EXPERIMENTAL_OPSET29=1 "
+                        "before importing mobius or use "
+                        "override_flags(experimental_opset29=True). "
+                        "This opt-in does not imply runtime kernel support."
+                    )
                 if node.op_identifier() in model.functions:
                     raise _error("caller-defined QMoE functions cannot be overridden")
                 plans.append((node, _validate(node)))
