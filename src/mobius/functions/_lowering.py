@@ -45,7 +45,7 @@ class Emitter:
 
 
 def validate_output_metadata(node: ir.Node, x: ir.Value, *, caller: str) -> None:
-    """Allow absent/refined output annotations, rejecting known contradictions."""
+    """Check output annotations after the caller validates X's type and shape."""
     output = node.outputs[0]
     message = f"{caller}: output metadata must match input shape and dtype"
     # Native custom-op intermediates can be untyped/unshaped; generation infers

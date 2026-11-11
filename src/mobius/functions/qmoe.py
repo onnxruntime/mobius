@@ -179,7 +179,9 @@ def _validate(node: ir.Node) -> _Config:
                 and math.prod(xs[:-1]) != rws[0]
             )
         ):
-            raise _error("router_weights must have the same shape as router_probs")
+            raise _error(
+                "router_weights must be rank 2 with E experts and compatible token counts"
+            )
     for weight_index, scale_index, zp_index, n, width in (
         (2, 3, 11, 2 * intermediate, hidden),
         (5, 6, 12, hidden, intermediate),
