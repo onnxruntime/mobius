@@ -207,12 +207,19 @@ def _load_transformers_config(
         kwargs = {"trust_remote_code": trust_remote_code}
         if revision is not None:
             kwargs["revision"] = revision
-        return transformers.AutoConfig.from_pretrained(model_id, **kwargs), False
+        config = transformers.AutoConfig.from_pretrained(model_id, **kwargs)
     except (ValueError, KeyError, OSError, strict_validation_error):
         # Legacy VibeVoice-ASR reused the TTS model type and needs an inference-
         # native conversion. The supported HF release has model_type
         # ``vibevoice_asr`` and never reaches this compatibility fallback.
         return _try_load_config_json(model_id, revision=revision), True
+    if (
+        getattr(config, "model_type", None) == "nemotron_h_omni"
+        and getattr(config, "llm_config", None) is None
+    ):
+        # Newer native Omni classes reuse the model type for a different layout.
+        return _try_load_config_json(model_id, revision=revision), True
+    return config, False
 
 
 def _select_primary_config(hf_config):

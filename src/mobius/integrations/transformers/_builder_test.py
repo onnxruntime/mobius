@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 from types import SimpleNamespace
 from unittest import mock
 
@@ -871,6 +872,35 @@ def test_transformers_config_accepts_hub_without_strict_validation_error(monkeyp
         revision=None,
         trust_remote_code=False,
     ) == (config, False)
+
+
+def test_transformers_config_preserves_puzzle_omni_with_newer_native_layout(
+    monkeypatch, tmp_path
+) -> None:
+    import transformers
+
+    from mobius._configs import NemotronHOmniConfig
+    from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
+
+    source = _omni_config()
+    (tmp_path / "config.json").write_text(json.dumps(source))
+    native = SimpleNamespace(
+        model_type="nemotron_h_omni",
+        text_config=SimpleNamespace(model_type="nemotron_h"),
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: native
+    )
+
+    config, raw_json = transformers_builder._load_transformers_config(
+        str(tmp_path), revision="pinned-revision", trust_remote_code=False
+    )
+    actual = NemotronHOmniConfig.from_transformers(config)
+    expected = NemotronHOmniConfig.from_transformers(source)
+
+    assert raw_json
+    assert actual.layer_types == expected.layer_types
+    assert actual.quantized_projections == expected.quantized_projections
 
 
 def test_transformers_config_accepts_hub_without_errors_module(monkeypatch) -> None:
