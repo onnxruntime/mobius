@@ -323,7 +323,7 @@ def _lower(node: ir.Node, c: _Config, prefix: str) -> tuple[list[ir.Node], ir.Va
     # Where, rather than only multiplying by zero, masks inactive expert NaNs.
     weighted = e.op("Where", e.op("Unsqueeze", active, e.ints([2])), weighted, e.scalar(0))
     result = e.op("ReduceSum", weighted, e.ints([1]), keepdims=0)
-    result = e.op("Reshape", result, e.op("Shape", x))
+    result = e.op("Reshape", result, e.op("Shape", x), allowzero=1)
     if x.dtype == ir.DataType.FLOAT16:
         result = e.op("Cast", result, to=ir.DataType.FLOAT16)
     result.type, result.shape = x.type, x.shape

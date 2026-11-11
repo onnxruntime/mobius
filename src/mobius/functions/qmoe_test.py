@@ -306,6 +306,25 @@ def test_numerical_reference(
         np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
+@pytest.mark.parametrize("shape", [(0, 32), (2, 0, 32), (0, 3, 32), (0, 0, 32)])
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+def test_empty_token_dimensions_survive_roundtrip(tmp_path, shape, dtype):
+    model = lower_qmoe(_model(rank=len(shape), dtype=dtype))
+    path = tmp_path / "empty.onnx"
+    ir.save(model, path)
+    onnx.checker.check_model(str(path), full_check=True)
+    executable = _expand_grouped_matmul(ir.load(path))
+    numpy_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
+    feeds = _feeds(count=0, dtype=numpy_dtype)
+    feeds["x"] = np.empty(shape, dtype=numpy_dtype)
+
+    actual = _run(executable, feeds, tmp_path / "empty_executable.onnx")
+
+    assert actual.shape == shape
+    assert actual.dtype == numpy_dtype
+    assert actual.size == 0
+
+
 @pytest.mark.parametrize("case", ["ties", "zero", "negative", "cancellation", "masked"])
 @pytest.mark.parametrize("normalize", [0, 1])
 @_requires_native_cpu_qmoe
