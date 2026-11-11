@@ -1,32 +1,28 @@
-# Explicit INT4 QMoE lowering (opset 29)
+# INT4 QMoE function fallback (experimental opset 29)
 
 ```python
-import onnx_ir as ir
+from mobius import build_from_module
 from mobius._flags import override_flags
-from mobius.functions import lower_qmoe
 
-model = ir.load("native.onnx")
+# module/config use the normal mobius model and configuration APIs.
 with override_flags(experimental_opset29=True):
-    lower_qmoe(model)  # in-place, also returns model
-ir.save(model, "standard.onnx")
+    package = build_from_module(module, config, execution_provider="onnx-standard")
+model = package["model"]
 ```
 
 **Experimental, disabled by default.** Enable `experimental_opset29` explicitly,
-or set `MOBIUS_EXPERIMENTAL_OPSET29=1` before importing mobius. A QMoE conversion
-without this opt-in raises `ValueError` before changing the model. Models without
-QMoE remain unchanged, regardless of the flag.
+or set `MOBIUS_EXPERIMENTAL_OPSET29=1` before importing mobius. With this flag,
+EPs without fused MoE support build new graphs and ordinary functions at opset
+29. The existing factory → `register_function_bodies` → EP-controlled `InlinePass`
+route expands native QMoE calls into blocked `DequantizeLinear` and two
+`GroupedMatMul-29` calls. There is no separate `lower_qmoe` API or import auditor.
 
-The flag permits experimental lowering; it does not automatically upgrade models
-or imply ORT/EP kernel support. Schema/checker support alone does not establish
-runtime execution support. In particular, the tested ORT 1.31.1 cannot execute
-these opset-29 graphs directly.
-
-This opt-in pass replaces `com.microsoft::QMoE` with standard ONNX blocked
-`DequantizeLinear` and two `GroupedMatMul-29` calls. When at least one node is
-lowered, it upgrades the model and compatible existing function/subgraph imports
-to 29 after a non-mutating compatibility audit. It is not automatically run during
-export. Native fused defaults, the global opset 24, float MoE, initializer names,
-and checkpoint loading are unchanged. Repeated calls are harmless.
+Flag-off builds stay unchanged. Native-capable EPs keep opset 24/native calls
+without running the restricted fallback validator. The global opset remains 24;
+generic dense MoE dispatch, gate algebra, checkpoint loading, and packed native
+input lists are unchanged. The flag does not imply runtime support:
+schema/checker support alone cannot qualify execution, and the tested ORT
+1.31.1 cannot execute these opset-29 graphs directly.
 
 ## Initial qualified ABI
 
@@ -82,42 +78,39 @@ the down projection uses `[T*k,I]` and `[T*k,1]` selected expert indices.
 Its `[T,k,H]` result is weighted and summed before restoring the original shape.
 This keeps per-route intermediate vectors separate when k>1.
 
-## Import alignment
+## Registration and import scopes
 
-The ONNX checker requires compatible standard-operator schemas across the
-model and its local functions. Lowering a QMoE inside a function therefore also
-upgrades the model to 29. Conversely, lowering a top-level QMoE aligns existing
-registry and caller function imports rather than leaving them at 24.
-Function identities, bodies, attributes, and custom-domain imports are preserved.
+Advanced callers may use `register_function_bodies(model, moe_fallback=True)`
+under the flag on an existing **opset-29** model. An opset-24 model fails with
+**“rebuild under experimental opset29”**. No imported model or caller function
+is converted or relabeled. Containing function roots must import 29 even when
+lexical child graph hints say 29. IR's normal inliner rejects both import-mismatch
+directions between functions and models.
 
-Before any mutation, every existing standard node in every scope must either
-resolve to the same schema at 29 or have one of these narrowly audited changes:
+All native calls in the graph, lexical subgraphs, and local functions are
+validated and all specializations built before target overload/function mutation.
+`qmoe(QMoEFunctionConfig(...))` creates a fresh `ir.Function` with **15 native
+positional formals**; router weights remain **input 14**. Optional zero-point and
+router-weight masks are part of the frozen config along with dtype, dimensions,
+and attributes. Configs contain no token counts, names, or tensor data.
+Native input lists, weights, and attributes are preserved.
 
-* Type extensions only: Cast 24→28, CastLike 24→25, Constant/ConstantOfShape,
-  Identity, If, Reshape, Shape, Squeeze, Transpose, Unsqueeze 24→25, and
-  DequantizeLinear 24→28. Known types must obey the original schema; untyped
-  function parameters retain the original valid-type contract.
-* Attention 24→25 adds window attributes whose defaults are unbounded; neither
-  new attribute may be supplied by an old-schema node.
-* Range 11→27 adds half/bfloat inputs and their accumulation attribute; the
-  original input types and behavior are unchanged.
-* BitShift 11→28 adds signed/out-of-range behavior. Alignment requires an
-  unsigned constant shift in `[0,7]`, where every original valid type agrees.
-
-These are audited against the pinned
-[official ONNX definitions](https://github.com/onnx/onnx/tree/82721c0908fa965dd84e674c006147791313f3e1/onnx/defs).
-Other schema changes (for example Softmax-11's changed default-axis semantics),
-unknown operators, future imports, or unprovable shifts raise `ValueError`
-**before** lowering any node or changing any import. Caller-owned functions are
-not trusted merely because of their name or registry metadata. A model without
-QMoE is a byte-preserving no-op, even when it contains older functions.
+Deterministic full-config hash overloads, stable infinity encoding, and existing
+function-body ownership metadata provide idempotence and model isolation.
+Caller-owned source or destination functions cannot be overwritten or
+specialized; unrelated user overloads remain unchanged. Output metadata may be
+absent; known dtype/rank/static-shape contradictions fail before specialization,
+while compatible symbolic/static refinements are preserved. The existing inline
+boundary preserves output names, annotations, docs, and metadata. No-target
+registration uses normal ordinary-function registration, not a byte-preserving
+no-op. See also [the float MoE boundary](moe-lowering.md).
 
 ## Runtime and validation
 
 The output requires ONNX schemas and a runtime implementing **opset 29**.
 Older ORT releases cannot directly load it. Tests expand the official
 GroupedMatMul function algorithm on a *test copy* to run on prior kernels;
-that expansion is not part of the public pass. Packed weights stay under their
+that expansion is test-only, not a production fallback. Packed weights stay under their
 original names and are dequantized in the graph; this is a portable reference
 lowering, not a promise of fused-kernel memory use or speed. Native kernels may
 use approximate/integer-activation GEMMs; numerical comparisons use the FLOAT
@@ -133,8 +126,8 @@ capability limitation explicitly; numerical coverage uses the test-copy
 expansion plus independent references and native CPU QMoE comparisons.
 Lowering tests require schema availability, and native parity tests depend
 on the presence of the CPU QMoE kernel, so older environments can still run the
-existing non-opset-29 tests. The public pass reports a clear error if the schemas
-needed for its compatibility audit are unavailable.
+existing non-opset-29 tests. Registration reports a clear error if the
+GroupedMatMul-29 schemas needed to construct the body are unavailable.
 
 Authoritative sources (pinned ORT revision
 `bbedf7b115be0077a2f4b76fd927fa94a82d0d1a`):

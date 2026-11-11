@@ -14,10 +14,11 @@ import pytest
 
 from mobius._constants import OPSET_VERSION
 from mobius._flags import override_flags
-from mobius.functions import lower_qmoe, register_function_bodies
+from mobius.functions import register_function_bodies
 from mobius.functions._lowering_test_utils import (
     expand_grouped_matmul as _expand_grouped_matmul,
 )
+from mobius.functions._moe_test_utils import inline_native_calls
 
 ort = pytest.importorskip("onnxruntime")
 _requires_opset29 = pytest.mark.skipif(
@@ -64,6 +65,7 @@ def _model(
     normalize=1,
     clipped=False,
     dtype=ir.DataType.FLOAT,
+    opset=29,
 ):
     rng = np.random.default_rng(42)
     experts, hidden, inter, block = 3, 32, 48, 16  # odd down-projection block count
@@ -134,7 +136,7 @@ def _model(
         outputs=[y],
         nodes=[node],
         initializers=initializers,
-        opset_imports={"": 24, "com.microsoft": 1},
+        opset_imports={"": opset, "com.microsoft": 1},
         name="qmoe",
     )
     return ir.Model(graph, ir_version=10)
@@ -253,7 +255,7 @@ def test_numerical_reference(
     feeds = _feeds(rank=rank, router_weights=router_weights, dtype=numpy_dtype)
     expected = _reference(model, feeds)
     names = tuple(model.graph.initializers)
-    assert lower_qmoe(model) is model
+    assert inline_native_calls(model) is model
     assert model.graph.opset_imports[""] == 29
     assert tuple(model.graph.initializers) == names
     assert sum(n.op_type == "GroupedMatMul" for n in model.graph) == 2
@@ -275,7 +277,7 @@ def test_numerical_reference(
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
 @_requires_opset29
 def test_empty_token_dimensions_survive_roundtrip(tmp_path, shape, dtype):
-    model = lower_qmoe(_model(rank=len(shape), dtype=dtype))
+    model = inline_native_calls(_model(rank=len(shape), dtype=dtype))
     path = tmp_path / "empty.onnx"
     ir.save(model, path)
     onnx.checker.check_model(str(path), full_check=True)
@@ -297,13 +299,14 @@ def test_empty_token_dimensions_survive_roundtrip(tmp_path, shape, dtype):
 @_requires_opset29
 def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
     native = _model(normalize=normalize)
-    lowered = lower_qmoe(native.clone())
+    lowered = inline_native_calls(native.clone())
     expanded = _expand_grouped_matmul(lowered)
     for count in (1, 5):
         feeds = _feeds(count=count, case=case)
         actual = _run(expanded, feeds, tmp_path / f"dynamic_{count}.onnx")
         np.testing.assert_allclose(actual, _reference(native, feeds), rtol=2e-5, atol=2e-6)
-        native_result = _run(native, feeds, tmp_path / f"native_dynamic_{count}.onnx")
+        native24 = _model(normalize=normalize, opset=24)
+        native_result = _run(native24, feeds, tmp_path / f"native_dynamic_{count}.onnx")
         np.testing.assert_allclose(actual, native_result, rtol=3e-5, atol=3e-6)
 
 
@@ -321,10 +324,17 @@ def test_native_cpu_parity(tmp_path, router_weights, normalize, clipped, dtype):
     numpy_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
     feeds = _feeds(router_weights=router_weights, dtype=numpy_dtype)
     rtol, atol = (2e-3, 2e-4) if dtype == ir.DataType.FLOAT16 else (3e-5, 3e-6)
-    expected = _run(native, feeds, tmp_path / "native.onnx")
+    native24 = _model(
+        router_weights=router_weights,
+        normalize=normalize,
+        clipped=clipped,
+        dtype=dtype,
+        opset=24,
+    )
+    expected = _run(native24, feeds, tmp_path / "native.onnx")
     np.testing.assert_allclose(expected, _reference(native, feeds), rtol=rtol, atol=atol)
     actual = _run(
-        _expand_grouped_matmul(lower_qmoe(native.clone())),
+        _expand_grouped_matmul(inline_native_calls(native.clone())),
         feeds,
         tmp_path / "lowered.onnx",
     )
@@ -373,7 +383,7 @@ def test_reject_attributes_before_any_mutation(tmp_path, attributes, message):
     after = tmp_path / "after.onnx"
     ir.save(model, before)
     with pytest.raises(ValueError, match=message):
-        lower_qmoe(model)
+        inline_native_calls(model)
     ir.save(model, after)
     assert before.read_bytes() == after.read_bytes()
 
@@ -395,8 +405,8 @@ def test_reject_unsupported_optional_inputs(index):
     else:
         node.replace_input_with(index, node.inputs[0])
     with pytest.raises(ValueError, match=f"unsupported QMoE input {index}"):
-        lower_qmoe(model)
-    assert model.graph.opset_imports[""] == 24
+        inline_native_calls(model)
+    assert model.graph.opset_imports[""] == 29
 
 
 @pytest.mark.parametrize(
@@ -421,8 +431,8 @@ def test_reject_shapes_and_types(index, shape, dtype, message):
     value.shape = ir.Shape(shape)
     value.dtype = dtype
     with pytest.raises(ValueError, match=message):
-        lower_qmoe(model)
-    assert model.graph.opset_imports[""] == 24
+        inline_native_calls(model)
+    assert model.graph.opset_imports[""] == 29
 
 
 def test_lowering_requires_experimental_opset29_before_mutation(tmp_path):
@@ -433,16 +443,16 @@ def test_lowering_requires_experimental_opset29_before_mutation(tmp_path):
 
     with (
         override_flags(experimental_opset29=False),
-        pytest.raises(ValueError, match="MOBIUS_EXPERIMENTAL_OPSET29=1"),
+        pytest.raises(ValueError, match="experimental_opset29"),
     ):
-        lower_qmoe(model)
+        inline_native_calls(model)
 
     ir.save(model, after)
     assert before.read_bytes() == after.read_bytes()
 
 
 def test_native_serialization_no_automatic_opset29(tmp_path):
-    model = _model()
+    model = _model(opset=24)
     path = tmp_path / "native.onnx"
     ir.save(model, path)
     before = path.read_bytes()
@@ -469,7 +479,7 @@ def test_output_annotations_survive_roundtrip(tmp_path):
     marker = object()
     original.meta["test.qmoe.marker"] = marker
 
-    lower_qmoe(model)
+    inline_native_calls(model)
 
     output = model.graph.outputs[0]
     assert output.type == original.type
@@ -488,23 +498,23 @@ def test_output_annotations_survive_roundtrip(tmp_path):
 @_requires_opset29
 def test_unrelated_model_noop_and_idempotence(tmp_path):
     model = _model()
-    lower_qmoe(model)
+    inline_native_calls(model)
     ir.save(model, tmp_path / "once.onnx")
-    lower_qmoe(model)
+    inline_native_calls(model)
     ir.save(model, tmp_path / "twice.onnx")
     assert (tmp_path / "once.onnx").read_bytes() == (tmp_path / "twice.onnx").read_bytes()
-    graph = ir.Graph([], [], nodes=[], opset_imports={"": 24})
+    graph = ir.Graph([], [], nodes=[], opset_imports={"": 29})
     unrelated = ir.Model(graph, ir_version=10)
-    assert lower_qmoe(unrelated) is unrelated
-    assert graph.opset_imports[""] == 24
-    assert not unrelated.functions
+    assert inline_native_calls(unrelated) is unrelated
+    assert graph.opset_imports[""] == 29
+    assert unrelated.functions
 
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
 @_requires_opset29
 def test_opset29_checker_and_shape_inference(tmp_path, dtype):
     """Use file APIs, never protobuf construction or serialization helpers."""
-    model = lower_qmoe(_model(rank=3, dtype=dtype))
+    model = inline_native_calls(_model(rank=3, dtype=dtype))
     path = tmp_path / "standard.onnx"
     ir.save(model, path)
     onnx.checker.check_model(str(path), full_check=True)
@@ -526,7 +536,9 @@ def test_independent_optional_zero_points_and_all_experts(tmp_path, zp1, zp2):
     feeds = _feeds(router_weights=False)
     expected = _reference(native, feeds)
     actual = _run(
-        _expand_grouped_matmul(lower_qmoe(native.clone())), feeds, tmp_path / "optional.onnx"
+        _expand_grouped_matmul(inline_native_calls(native.clone())),
+        feeds,
+        tmp_path / "optional.onnx",
     )
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
@@ -550,7 +562,9 @@ def test_truncated_optional_slots(tmp_path):
     output_before.replace_all_uses_with(output, replace_graph_outputs=True)
     original.graph.remove(node, safe=True)
     model = original
-    actual = _run(_expand_grouped_matmul(lower_qmoe(model)), feeds, tmp_path / "short.onnx")
+    actual = _run(
+        _expand_grouped_matmul(inline_native_calls(model)), feeds, tmp_path / "short.onnx"
+    )
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
@@ -560,29 +574,29 @@ def test_missing_required_inputs_are_rejected(index):
     node = next(iter(model.graph))
     node.replace_input_with(index, None)
     with pytest.raises(ValueError, match=f"required QMoE input {index}"):
-        lower_qmoe(model)
-    assert model.graph.opset_imports[""] == 24
+        inline_native_calls(model)
+    assert model.graph.opset_imports[""] == 29
 
 
 def test_missing_shape_metadata_is_rejected():
     model = _model()
     next(iter(model.graph)).inputs[0].shape = None
     with pytest.raises(ValueError, match="shape metadata"):
-        lower_qmoe(model)
+        inline_native_calls(model)
 
 
 def test_prepacked_default_is_not_assumed_raw():
     model = _model()
     del next(iter(model.graph)).attributes["weights_prepacked"]
     with pytest.raises(ValueError, match="weights_prepacked must be 0"):
-        lower_qmoe(model)
+        inline_native_calls(model)
 
 
 @_requires_opset29
 def test_name_collisions_are_avoided(tmp_path):
     model = _model()
     model.graph.inputs[0].name = "qmoe29_0_0"
-    lower_qmoe(model)
+    inline_native_calls(model)
     names = (
         [v.name for n in model.graph for v in n.outputs]
         + [v.name for v in model.graph.inputs]
@@ -595,14 +609,14 @@ def test_name_collisions_are_avoided(tmp_path):
 
 
 @_requires_opset29
-def test_function_scope_lowering_also_aligns_model29(tmp_path):
+def test_function_scope_registration_uses_existing29(tmp_path):
     graph = _model().graph
     graph.inputs.extend(graph.initializers.values())
     graph.initializers.clear()
     function = ir.Function("test.qmoe", "Experts", graph=graph, attributes=[])
-    outer = ir.Graph([], [], nodes=[], opset_imports={"": 24, "test.qmoe": 1}, name="outer")
+    outer = ir.Graph([], [], nodes=[], opset_imports={"": 29, "test.qmoe": 1}, name="outer")
     model = ir.Model(outer, ir_version=10, functions=[function])
-    lower_qmoe(model)
+    inline_native_calls(model)
     assert model.graph.opset_imports[""] == 29
     assert function.opset_imports[""] == 29
     path = tmp_path / "function.onnx"
@@ -613,68 +627,42 @@ def test_function_scope_lowering_also_aligns_model29(tmp_path):
     onnx.checker.check_model(str(path))
 
 
-def _caller_function(op_type="Identity", *, opset=24, constant_shift=None):
-    dtype = ir.DataType.UINT8 if op_type == "BitShift" else ir.DataType.FLOAT
-    x = ir.Value(name="caller_x", shape=ir.Shape([2, 3]), type=ir.TensorType(dtype))
+def _caller_function(op_type="Identity", *, opset=24):
+    x = ir.Value(
+        name="caller_x", shape=ir.Shape([2, 3]), type=ir.TensorType(ir.DataType.FLOAT)
+    )
     y = ir.Value(name="caller_y", shape=x.shape, type=x.type)
     inputs = [x]
-    if op_type == "BitShift":
-        inputs.append(ir.Value(name="caller_shift", shape=x.shape, type=x.type))
-    attrs = [ir.AttrString("direction", "RIGHT")] if op_type == "BitShift" else []
-    node = ir.Node("", op_type, inputs=inputs, outputs=[y], attributes=attrs)
+    node = ir.Node("", op_type, inputs=inputs, outputs=[y])
     graph = ir.Graph(
         inputs, [y], nodes=[node], opset_imports={"": opset}, name="caller_function"
     )
-    if constant_shift is not None:
-        shift = ir.Value(
-            name="literal_shift", shape=ir.Shape([]), type=ir.TensorType(ir.DataType.UINT8)
-        )
-        constant = ir.Node(
-            "",
-            "Constant",
-            inputs=[],
-            outputs=[shift],
-            attributes=[ir.AttrTensor("value", ir.tensor(np.uint8(constant_shift)))],
-        )
-        graph.insert_before(node, constant)
-        node.replace_input_with(1, shift)
     return ir.Function("caller", "PreserveMe", graph=graph, attributes=[])
 
 
-@pytest.mark.parametrize(
-    "op_type,opset,constant_shift,message",
-    [
-        ("Softmax", 11, None, "unaudited schema transition"),
-        ("BitShift", 24, None, "constant unsigned shift"),
-        ("BitShift", 24, 8, "constant unsigned shift"),
-        ("UnknownOperator", 24, None, "schema unavailable"),
-        ("Identity", 30, None, "cannot align default-domain opset"),
-    ],
-)
 @_requires_opset29
-def test_unprovable_function_import_rejected_atomically(
-    tmp_path, op_type, opset, constant_shift, message
-):
+def test_unrelated_function_import_is_not_audited(tmp_path):
     model = _model()
     register_function_bodies(model)
-    function = _caller_function(op_type, opset=opset, constant_shift=constant_shift)
+    function = _caller_function("Softmax", opset=11)
     model.functions[function.identifier()] = function
     qmoe = next(iter(model.graph))
     assert qmoe.inputs[0] is not None
     uses_before = tuple(qmoe.inputs[0].uses())
     before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
     ir.save(model, before)
-    with pytest.raises(ValueError, match=message):
-        lower_qmoe(model)
+    original_imports = dict(function.opset_imports)
+    register_function_bodies(model, moe_fallback=True)
     ir.save(model, after)
-    assert after.read_bytes() == before.read_bytes()
+    assert dict(function.opset_imports) == original_imports
+    assert model.functions[function.identifier()] is function
     assert tuple(qmoe.inputs[0].uses()) == uses_before
 
 
 @_requires_opset29
-def test_compatible_caller_function_preserved_and_aligned(tmp_path):
+def test_caller_function_preserved_without_relabeling(tmp_path):
     model = _model()
-    function = _caller_function()
+    function = _caller_function(opset=29)
     model.functions[function.identifier()] = function
     caller_input = ir.Value(
         name="caller_feed", shape=ir.Shape([2, 3]), type=ir.TensorType(ir.DataType.FLOAT)
@@ -690,10 +678,11 @@ def test_compatible_caller_function_preserved_and_aligned(tmp_path):
     model.graph.outputs.insert(0, caller_output)
     model.graph.opset_imports[function.domain] = 1
     original_nodes = tuple(function)
-    lower_qmoe(model)
+    inline_native_calls(model)
     assert model.functions[function.identifier()] is function
     assert tuple(function) == original_nodes
-    assert function.opset_imports[""] == model.graph.opset_imports[""] == 29
+    assert function.opset_imports[""] == 29
+    assert model.graph.opset_imports[""] == 29
     path = tmp_path / "compatible.onnx"
     ir.save(model, path)
     onnx.checker.check_model(str(path), full_check=True)
@@ -708,24 +697,26 @@ def test_compatible_caller_function_preserved_and_aligned(tmp_path):
 @pytest.mark.parametrize("enabled", [False, True])
 def test_no_qmoe_does_not_align_or_reject_caller_functions(tmp_path, enabled):
     function = _caller_function("Softmax", opset=11)
-    graph = ir.Graph([], [], nodes=[], name="no_qmoe", opset_imports={"": 24})
+    graph = ir.Graph(
+        [], [], nodes=[], name="no_qmoe", opset_imports={"": 29 if enabled else 24}
+    )
     model = ir.Model(graph, ir_version=10, functions=[function])
     before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
     ir.save(model, before)
     with override_flags(experimental_opset29=enabled):
-        lower_qmoe(model)
+        register_function_bodies(model, moe_fallback=enabled)
     ir.save(model, after)
-    assert before.read_bytes() == after.read_bytes()
+    assert model.functions[function.identifier()] is function
+    assert len(model.functions) > 1
     assert function.opset_imports[""] == 11
 
 
 def _family_model(op_type):
     if op_type == "MoE":
-        from mobius.functions import lower_moe
         from mobius.functions.moe_test import _model as float_model
 
-        return float_model(), lower_moe
-    return _model(), lower_qmoe
+        return float_model(), inline_native_calls
+    return _model(), inline_native_calls
 
 
 def _assert_atomic_error(model, lower, tmp_path, message):
@@ -739,96 +730,6 @@ def _assert_atomic_error(model, lower, tmp_path, message):
     assert before.read_bytes() == after.read_bytes()
     assert tuple(model.graph.all_nodes()) == nodes
     assert all(tuple(value.uses()) == previous for value, previous in uses)
-
-
-def _add_audited_branch(
-    model, *, op_type, local_version, in_function, conflicting_alias=False
-):
-    dtype = ir.DataType.UINT8 if op_type == "BitShift" else ir.DataType.FLOAT
-    x = ir.Value(name="branch_x", shape=ir.Shape([2, 3]), type=ir.TensorType(dtype))
-    condition = ir.Value(
-        name="branch_condition", shape=ir.Shape([]), type=ir.TensorType(ir.DataType.BOOL)
-    )
-    inputs = [condition, x]
-    branch_inputs = [x]
-    attrs = []
-    if op_type == "BitShift":
-        shift = ir.Value(name="branch_shift", shape=x.shape, type=x.type)
-        inputs.append(shift)
-        branch_inputs.append(shift)
-        attrs = [ir.AttrString("direction", "RIGHT")]
-    then_output = ir.Value(name="then_output", shape=x.shape, type=x.type)
-    then_node = ir.Node(
-        "", op_type, inputs=branch_inputs, outputs=[then_output], attributes=attrs
-    )
-    then_graph = ir.Graph(
-        [], [then_output], nodes=[then_node], opset_imports={"": local_version}, name="then"
-    )
-    if conflicting_alias:
-        # Neither stale nor conflicting descendant hints serialize as imports.
-        then_graph.opset_imports["ai.onnx"] = local_version - 1
-    else_output = ir.Value(name="else_output", shape=x.shape, type=x.type)
-    else_graph = ir.Graph(
-        [],
-        [else_output],
-        nodes=[ir.Node("", "Identity", inputs=[x], outputs=[else_output])],
-        opset_imports={"": 24},
-        name="else",
-    )
-    output = ir.Value(name="branch_output", shape=x.shape, type=x.type)
-    branch = ir.Node(
-        "",
-        "If",
-        inputs=[condition],
-        outputs=[output],
-        attributes=[
-            ir.AttrGraph("then_branch", then_graph),
-            ir.AttrGraph("else_branch", else_graph),
-        ],
-    )
-    if in_function:
-        # A local function has its own serialized import, distinct from the
-        # model root. In particular its BitShift-24 still needs the old proof.
-        model.graph.opset_imports[""] = 29
-        root = ir.Graph(inputs, [output], nodes=[branch], opset_imports={"": 24}, name="root")
-        function = ir.Function("caller", "Branch", graph=root, attributes=[])
-        model.functions[function.identifier()] = function
-    else:
-        model.graph.inputs.extend(inputs)
-        model.graph.append(branch)
-        model.graph.outputs.append(output)
-    return then_graph
-
-
-@_requires_opset29
-@pytest.mark.parametrize("op_type", ["MoE", "QMoE"])
-@pytest.mark.parametrize("in_function", [False, True])
-def test_descendant_import_cannot_bypass_root_bitshift_audit(tmp_path, op_type, in_function):
-    model, lower = _family_model(op_type)
-    _add_audited_branch(model, op_type="BitShift", local_version=29, in_function=in_function)
-    _assert_atomic_error(model, lower, tmp_path, "constant unsigned shift")
-
-
-@_requires_opset29
-@pytest.mark.parametrize("op_type", ["MoE", "QMoE"])
-@pytest.mark.parametrize("in_function", [False, True])
-@pytest.mark.parametrize("conflicting_alias", [False, True])
-def test_stale_descendant_import_does_not_reject_root_swish(
-    tmp_path, op_type, in_function, conflicting_alias
-):
-    model, lower = _family_model(op_type)
-    branch = _add_audited_branch(
-        model,
-        op_type="Swish",
-        local_version=23,
-        in_function=in_function,
-        conflicting_alias=conflicting_alias,
-    )
-    lower(model)
-    assert branch.opset_imports == {"": 29}
-    path = tmp_path / "stale_branch.onnx"
-    ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
 
 
 @pytest.mark.parametrize(
@@ -855,7 +756,7 @@ def test_qmoe_contradictory_output_metadata_is_atomic(tmp_path, dtype, shape):
             ],
         )
     )
-    _assert_atomic_error(model, lower_qmoe, tmp_path, "output metadata")
+    _assert_atomic_error(model, inline_native_calls, tmp_path, "output metadata")
 
 
 @_requires_opset29
@@ -880,7 +781,7 @@ def test_qmoe_compatible_output_annotations(tmp_path, input_shape, output_shape,
     output.meta["marker"] = marker
     feeds = _feeds()
     expected = _reference(model, feeds)
-    lower_qmoe(model)
+    inline_native_calls(model)
     result = model.graph.outputs[0]
     assert result.shape == (x.shape if output_shape is None else ir.Shape(output_shape))
     assert result.type == x.type and result.meta["marker"] is marker
@@ -912,7 +813,7 @@ def test_router_weight_token_annotations_are_not_runtime_mismatches(
     node.inputs[14].shape = ir.Shape([weight_tokens, 3])
     feeds = _feeds()
     expected = _reference(model, feeds)
-    lower_qmoe(model)
+    inline_native_calls(model)
     path = tmp_path / "refined_router.onnx"
     ir.save(model, path)
     onnx.checker.check_model(str(path), full_check=True)
@@ -929,7 +830,7 @@ def test_static_router_weight_token_mismatch_is_atomic(tmp_path, static_input):
     else:
         node.inputs[1].shape = ir.Shape([4, 3])
     node.inputs[14].shape = ir.Shape([5, 3])
-    _assert_atomic_error(model, lower_qmoe, tmp_path, "router_weights")
+    _assert_atomic_error(model, inline_native_calls, tmp_path, "router_weights")
 
 
 @pytest.mark.parametrize("op_type", ["MoE", "QMoE"])
@@ -951,11 +852,11 @@ def test_schema_absent_flag_noop_and_abi_validation(tmp_path, op_type):
         next(iter(model.graph)).attributes["k"] = ir.AttrInt64("k", 0)
         _assert_atomic_error(model, lower, tmp_path, "k must")
         model, lower = _family_model(op_type)
-        _assert_atomic_error(model, lower, tmp_path, "opset-29 schemas are required")
+        _assert_atomic_error(model, lower, tmp_path, "opset-29 GroupedMatMul schemas")
         # Preserve old unaudited bodies on no-target.
         function = _caller_function("Softmax", opset=11)
         unrelated = ir.Model(
-            ir.Graph([], [], nodes=[], opset_imports={"": 24}),
+            ir.Graph([], [], nodes=[], opset_imports={"": 29}),
             functions=[function],
             ir_version=10,
         )
@@ -963,9 +864,10 @@ def test_schema_absent_flag_noop_and_abi_validation(tmp_path, op_type):
         ir.save(unrelated, before)
         for enabled in (False, True):
             with override_flags(experimental_opset29=enabled):
-                assert lower(unrelated) is unrelated
+                register_function_bodies(unrelated, moe_fallback=enabled)
             ir.save(unrelated, after)
-            assert before.read_bytes() == after.read_bytes()
+            assert unrelated.functions[function.identifier()] is function
+            assert function.opset_imports[""] == 11
     finally:
         if schema is not None:
             onnx.defs.register_schema(schema)
@@ -1001,12 +903,12 @@ def test_nested_qmoe_updates_containing_imports(tmp_path):
             [condition, *outer_inputs],
             [result],
             nodes=[branch],
-            opset_imports={"": 24, "com.microsoft": 1},
+            opset_imports={"": 29, "com.microsoft": 1},
             name="outer",
         ),
         ir_version=10,
     )
-    lower_qmoe(model)
+    inline_native_calls(model)
     assert model.graph.opset_imports[""] == 29
     assert then_graph.opset_imports[""] == 29
     assert else_graph.opset_imports[""] == 29
@@ -1025,7 +927,7 @@ def test_direct_grouped_matmul29_runtime(tmp_path, monkeypatch, rank, dtype):
     numpy_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
     feeds = _feeds(rank=rank, dtype=numpy_dtype)
     expected = _reference(native, feeds)
-    model = lower_qmoe(native)
+    model = inline_native_calls(native)
     path = tmp_path / "direct29.onnx"
     ir.save(model, path)
     onnx.checker.check_model(str(path), full_check=True)
@@ -1051,9 +953,13 @@ def test_direct_grouped_matmul29_runtime(tmp_path, monkeypatch, rank, dtype):
 def test_real_mobius_moe_layer_lowering(tmp_path, symmetric):
     from onnx_shape_inference import infer_symbolic_shapes
 
+    from mobius._build_context import build_context
     from mobius._configs import QuantizationConfig
-    from mobius._testing import create_test_builder, create_test_input, make_config
+    from mobius._execution_providers import ep_registry
+    from mobius._optimizations import optimize_model
+    from mobius._testing import create_test_input, make_config
     from mobius.components import MoELayer
+    from mobius.tasks._base import _make_graph
 
     config = make_config(
         hidden_size=64,
@@ -1065,41 +971,50 @@ def test_real_mobius_moe_layer_lowering(tmp_path, symmetric):
             bits=4, group_size=32, quant_method="olive", sym=symmetric
         ),
     )
-    builder, op, graph = create_test_builder()
-    hidden = create_test_input(builder, "hidden", [2, "sequence", 64])
-    output = MoELayer(config)(op, hidden)
-    builder._adapt_outputs([output], "")
-    graph.outputs.append(output)
-    graph.opset_imports["com.microsoft"] = 1
-    model = ir.Model(graph, ir_version=10)
-    rng = np.random.default_rng(108)
-    for value in graph.initializers.values():
-        shape = tuple(value.shape)
-        if value.dtype == ir.DataType.UINT8:
-            array = rng.integers(0, 256, shape, dtype=np.uint8)
-        elif "scales" in value.name:
-            array = rng.uniform(0.005, 0.03, shape).astype(np.float32)
-        else:
-            array = rng.normal(0, 0.1, shape).astype(np.float32)
-        value.const_value = ir.tensor(array)
-    infer_symbolic_shapes(model)
+
+    def build(ep):
+        with build_context(ep_registry.require(ep)):
+            graph, builder = _make_graph()
+            hidden = create_test_input(builder, "hidden", [2, "sequence", 64])
+            output = MoELayer(config)(builder.op, hidden)
+            builder._adapt_outputs([output], "")
+            graph.outputs.append(output)
+        model = ir.Model(graph, ir_version=10)
+        rng = np.random.default_rng(108)
+        for value in graph.initializers.values():
+            shape = tuple(value.shape)
+            if value.dtype == ir.DataType.UINT8:
+                array = rng.integers(0, 256, shape, dtype=np.uint8)
+            elif "scales" in value.name:
+                array = rng.uniform(0.005, 0.03, shape).astype(np.float32)
+            else:
+                array = rng.normal(0, 0.1, shape).astype(np.float32)
+            value.const_value = ir.tensor(array)
+        infer_symbolic_shapes(model)
+        return model
+
+    model = build("onnx-standard")
+    native = build("cpu")
+    graph = model.graph
+    assert graph.opset_imports[""] == 29
+    assert native.graph.opset_imports[""] == 24
     register_function_bodies(model)
     qmoe = next(n for n in graph if n.op_type == "QMoE")
     assert qmoe.attributes.get_string("activation_type") == "swiglu"
     assert qmoe.attributes.get_int("swiglu_fusion") == 1
     original_names = tuple(graph.initializers)
-    original_functions = dict(model.functions)
-    native = model.clone()
-    lower_qmoe(model)
+    register_function_bodies(model, moe_fallback=True)
     assert tuple(graph.initializers) == original_names
+    optimize_model(model, ep="onnx-standard")
     assert not any(n.op_type == "QMoE" for n in graph)
     assert graph.opset_imports[""] == 29
-    assert dict(model.functions) == original_functions
+    assert all(fn.name not in {"MoE", "QMoE"} for fn in model.functions.values())
     assert all(function.opset_imports[""] == 29 for function in model.functions.values())
     path = tmp_path / "real_registered29.onnx"
     ir.save(model, path)
     onnx.checker.check_model(str(path), full_check=True)
     executable = _expand_grouped_matmul(model)
+    rng = np.random.default_rng(109)
     for count in (1, 4):
         feeds = {"hidden": rng.normal(size=(2, count, 64)).astype(np.float32)}
         expected = _run(native, feeds, tmp_path / f"real_native_{count}.onnx")

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import onnx_ir as ir
 from onnxscript import GraphBuilder
 
-from mobius._constants import OPSET_VERSION
+from mobius._build_context import get_build_opset_version
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -25,6 +25,8 @@ def create_body_graph(
     state_inputs: Sequence[ir.Value],
     scan_inputs: Sequence[ir.Value],
     name: str = "scan_body",
+    *,
+    opset_version: int | None = None,
 ) -> tuple[ir.Graph, GraphBuilder]:
     """Create a Scan body graph and its builder.
 
@@ -43,7 +45,9 @@ def create_body_graph(
         [],
         nodes=[],
         name=name,
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={
+            "": get_build_opset_version() if opset_version is None else opset_version
+        },
     )
     body_builder = GraphBuilder(body_graph)
     return body_graph, body_builder

@@ -1,11 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Explicit opset-29 lowering of the raw, blockwise INT4 CPU QMoE ABI.
-
-See ``docs/qmoe-lowering.md`` for the supported contract and reference sources.
-This is deliberately not part of the automatic function-body registry.
-"""
+"""Opset-29 reference function for the raw, blockwise INT4 CPU QMoE ABI."""
 
 from __future__ import annotations
 
@@ -14,12 +10,14 @@ from dataclasses import dataclass
 
 import numpy as np
 import onnx_ir as ir
+from onnxscript import OpBuilder
+from onnxscript._internal.builder import build_function
 
-from mobius.functions._lowering import Emitter, lower_nodes, validate_output_metadata
+from mobius.functions._moe_utils import validate_output_metadata
 
 
 @dataclass(frozen=True)
-class _Config:
+class QMoEFunctionConfig:
     experts: int
     hidden: int
     intermediate: int
@@ -29,6 +27,10 @@ class _Config:
     alpha: float
     beta: float
     limit: float
+    dtype: ir.DataType = ir.DataType.FLOAT
+    zero_points1: bool = False
+    zero_points2: bool = False
+    router_weights: bool = False
 
 
 def _input(node: ir.Node, index: int) -> ir.Value | None:
@@ -36,7 +38,7 @@ def _input(node: ir.Node, index: int) -> ir.Value | None:
 
 
 def _error(message: str) -> ValueError:
-    return ValueError(f"lower_qmoe: {message}")
+    return ValueError(f"QMoE fallback: {message}")
 
 
 def _shape(value: ir.Value, name: str) -> tuple[int | ir.SymbolicDim, ...]:
@@ -45,10 +47,8 @@ def _shape(value: ir.Value, name: str) -> tuple[int | ir.SymbolicDim, ...]:
     return tuple(value.shape)
 
 
-def _validate(node: ir.Node) -> _Config:
+def validate_call(node: ir.Node) -> QMoEFunctionConfig:
     """Validate the entire supported ABI without creating or changing any nodes."""
-    if node.overload:
-        raise _error("QMoE overloads are not supported")
     allowed = {
         "k",
         "activation_type",
@@ -109,10 +109,12 @@ def _validate(node: ir.Node) -> _Config:
         raise _error("activation alpha/beta must be finite and swiglu_limit nonnegative")
     if len(node.outputs) != 1:
         raise _error("QMoE must have exactly one output")
+    if len(node.inputs) > 15:
+        raise _error("unsupported QMoE input 15 (extended ABI)")
     for index in (0, 1, 2, 3, 5, 6):
         if _input(node, index) is None:
             raise _error(f"required QMoE input {index} is absent")
-    for index in (4, 7, 8, 9, 10, 13, *range(15, len(node.inputs))):
+    for index in (4, 7, 8, 9, 10, 13):
         if _input(node, index) is not None:
             raise _error(f"unsupported QMoE input {index} (bias, fc3, or extended ABI)")
 
@@ -199,146 +201,149 @@ def _validate(node: ir.Node) -> _Config:
             or _shape(zp, f"input {zp_index} zero points") != (experts, n, (blocks + 1) // 2)
         ):
             raise _error(f"input {zp_index} zero points must be UINT8 [E,N,ceil(nblocks/2)]")
-    validate_output_metadata(node, x, caller="lower_qmoe")
-    return _Config(
-        experts, hidden, intermediate, block, k, bool(normalize), alpha, beta, limit
+    validate_output_metadata(node, x, caller="QMoE fallback")
+    return QMoEFunctionConfig(
+        experts,
+        hidden,
+        intermediate,
+        block,
+        k,
+        bool(normalize),
+        alpha,
+        beta,
+        limit,
+        x.dtype,
+        _input(node, 11) is not None,
+        _input(node, 12) is not None,
+        rw is not None,
     )
 
 
-class _Emitter(Emitter):
-    def unpack(self, packed: ir.Value, shape: list[int]) -> ir.Value:
-        mask = self.op("Constant", value=ir.tensor(np.uint8(15)))
-        shift = self.op("Constant", value=ir.tensor(np.uint8(4)))
-        low = self.op("BitwiseAnd", packed, mask)
-        high = self.op("BitShift", packed, shift, direction="RIGHT")
-        axis = self.ints([-1])
-        pairs = self.op(
-            "Concat",
-            self.op("Unsqueeze", low, axis),
-            self.op("Unsqueeze", high, axis),
-            axis=-1,
-        )
-        return self.op("Reshape", pairs, self.ints(shape))
+def qmoe(config: QMoEFunctionConfig) -> ir.Function:
+    """Create a fresh opset-29 body retaining all fifteen native positional slots."""
+    c = config
+    if c.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16):
+        raise _error("only FLOAT and FLOAT16 are supported")
 
-    def dequantize(
-        self,
-        packed: ir.Value,
-        scale: ir.Value,
-        zp: ir.Value | None,
-        c: _Config,
-        n: int,
-        width: int,
-    ) -> ir.Value:
-        weights = self.op(
-            "Cast", self.unpack(packed, [c.experts, n, width]), to=ir.DataType.UINT4
-        )
-        blocks = width // c.block
-        if zp is None:
-            zeros = self.op(
-                "ConstantOfShape",
-                self.op("Shape", scale),
-                value=ir.tensor(np.array([8], dtype=np.uint8)),
+    def body(
+        op: OpBuilder,
+        x,
+        router,
+        w1,
+        scale1,
+        bias1,
+        w2,
+        scale2,
+        bias2,
+        w3,
+        scale3,
+        bias3,
+        zp1,
+        zp2,
+        zp3,
+        rw,
+    ):
+        half = c.dtype == ir.DataType.FLOAT16
+
+        def ints(values: list[int]):
+            return op.Constant(value_ints=values)
+
+        def scalar(value: float):
+            return op.Constant(value_float=float(value))
+
+        def compute(value):
+            return op.Cast(value, to=ir.DataType.FLOAT) if half else value
+
+        def unpack(packed, shape: list[int]):
+            mask = op.Constant(value=ir.tensor(np.uint8(15)))
+            shift = op.Constant(value=ir.tensor(np.uint8(4)))
+            low = op.BitwiseAnd(packed, mask)
+            high = op.BitShift(packed, shift, direction="RIGHT")
+            pairs = op.Concat(
+                op.Unsqueeze(low, ints([-1])), op.Unsqueeze(high, ints([-1])), axis=-1
             )
+            return op.Reshape(pairs, ints(shape))
+
+        def dequantize(packed, scale, zp, has_zp: bool, n: int, width: int):
+            weights = op.Cast(unpack(packed, [c.experts, n, width]), to=ir.DataType.UINT4)
+            blocks = width // c.block
+            if has_zp:
+                zeros = unpack(zp, [c.experts, n, -1])
+                zeros = op.Slice(zeros, ints([0]), ints([blocks]), ints([2]))
+            else:
+                zeros = op.ConstantOfShape(
+                    op.Shape(scale), value=ir.tensor(np.array([8], dtype=np.uint8))
+                )
+            zeros = op.Cast(zeros, to=ir.DataType.UINT4)
+            return op.DequantizeLinear(weights, scale, zeros, axis=2, block_size=c.block)
+
+        router, scale1, scale2 = compute(router), compute(scale1), compute(scale2)
+        # QMoE selects logits first, with descending expert-ID ties.
+        reversed_router = op.Gather(router, ints(list(range(c.experts - 1, -1, -1))), axis=1)
+        logits, indices = op.TopK(reversed_router, ints([c.k]), axis=1, sorted=1, _outputs=2)
+        selected = op.Sub(ints([c.experts - 1]), indices)
+        if c.router_weights:
+            routing = op.GatherElements(compute(rw), selected, axis=1)
+            if c.normalize:
+                total = op.ReduceSum(routing, ints([1]), keepdims=1)
+                zero = op.Equal(total, scalar(0))
+                safe_total = op.Where(zero, scalar(1), total)
+                routing = op.Where(zero, scalar(0), op.Div(routing, safe_total))
         else:
-            zeros = self.unpack(zp, [c.experts, n, -1])
-            zeros = self.op(
-                "Slice", zeros, self.ints([0]), self.ints([blocks]), self.ints([2])
+            routing = op.Softmax(logits, axis=1)
+        # CPU does not enqueue routes <=1e-8, including negative scales.
+        active = op.Greater(routing, scalar(1e-8))
+        routing = op.Where(active, routing, scalar(0))
+        first_weights = dequantize(
+            w1, scale1, zp1, c.zero_points1, 2 * c.intermediate, c.hidden
+        )
+        down_weights = dequantize(w2, scale2, zp2, c.zero_points2, c.hidden, c.intermediate)
+        flat = op.Reshape(compute(x), ints([-1, c.hidden]))
+        first = op.GroupedMatMul(flat, first_weights, selected, transB=1)  # [T,k,2I]
+        gate = op.Gather(first, ints(list(range(0, 2 * c.intermediate, 2))), axis=2)
+        up = op.Gather(first, ints(list(range(1, 2 * c.intermediate, 2))), axis=2)
+        if math.isfinite(c.limit):
+            gate = op.Min(gate, scalar(c.limit))
+            up = op.Clip(up, scalar(-c.limit), scalar(c.limit))
+        sigmoid = op.Sigmoid(op.Mul(gate, scalar(c.alpha)))
+        activated = op.Mul(op.Mul(gate, sigmoid), op.Add(up, scalar(c.beta)))
+        down = op.GroupedMatMul(
+            op.Reshape(activated, ints([-1, c.intermediate])),
+            down_weights,
+            op.Reshape(selected, ints([-1, 1])),
+            transB=1,
+        )
+        down = op.Reshape(down, ints([-1, c.k, c.hidden]))
+        weighted = op.Mul(down, op.Unsqueeze(routing, ints([2])))
+        # Where also masks NaNs from inactive expert computation.
+        weighted = op.Where(op.Unsqueeze(active, ints([2])), weighted, scalar(0))
+        result = op.ReduceSum(weighted, ints([1]), keepdims=0)
+        result = op.Reshape(result, op.Shape(x), allowzero=1)
+        return op.Cast(result, to=ir.DataType.FLOAT16) if half else result
+
+    return build_function(
+        body,
+        [
+            ir.Value(name=name)
+            for name in (
+                "input",
+                "router_probs",
+                "fc1_experts_weights",
+                "fc1_scales",
+                "fc1_bias",
+                "fc2_experts_weights",
+                "fc2_scales",
+                "fc2_bias",
+                "fc3_experts_weights",
+                "fc3_scales",
+                "fc3_bias",
+                "fc1_zero_points",
+                "fc2_zero_points",
+                "fc3_zero_points",
+                "router_weights",
             )
-        zeros = self.op("Cast", zeros, to=ir.DataType.UINT4)
-        return self.op("DequantizeLinear", weights, scale, zeros, axis=2, block_size=c.block)
-
-
-def _lower(node: ir.Node, c: _Config, prefix: str) -> tuple[list[ir.Node], ir.Value]:
-    e = _Emitter(prefix)
-    x, router, w1, scale1, _, w2, scale2 = node.inputs[:7]
-    assert x is not None and router is not None
-    assert w1 is not None and scale1 is not None
-    assert w2 is not None and scale2 is not None
-    rw = _input(node, 14)
-    if x.dtype == ir.DataType.FLOAT16:
-        router = e.op("Cast", router, to=ir.DataType.FLOAT)
-        scale1 = e.op("Cast", scale1, to=ir.DataType.FLOAT)
-        scale2 = e.op("Cast", scale2, to=ir.DataType.FLOAT)
-        if rw is not None:
-            rw = e.op("Cast", rw, to=ir.DataType.FLOAT)
-    # CPU sorts (logit, expert_id) descending, whereas ONNX TopK breaks ties
-    # toward the lower index. Reverse the expert axis before selecting.
-    reversed_router = e.op(
-        "Gather", router, e.ints(list(range(c.experts - 1, -1, -1))), axis=1
+        ],
+        domain="com.microsoft",
+        name="QMoE",
+        opset_imports={"": 29},
     )
-    top = ir.Node(
-        "",
-        "TopK",
-        inputs=[reversed_router, e.ints([c.k])],
-        num_outputs=2,
-        attributes=ir.convenience.convert_attributes({"axis": 1, "sorted": 1}),
-    )
-    for i, output in enumerate(top.outputs):
-        output.name = f"{prefix}_top_{i}"
-    e.nodes.append(top)
-    selected = e.op("Sub", e.ints([c.experts - 1]), top.outputs[1])
-    if rw is None:
-        routing = e.op("Softmax", top.outputs[0], axis=1)
-    else:
-        routing = e.op("GatherElements", rw, selected, axis=1)
-        if c.normalize:
-            total = e.op("ReduceSum", routing, e.ints([1]), keepdims=1)
-            zero = e.op("Equal", total, e.scalar(0))
-            safe_total = e.op("Where", zero, e.scalar(1), total)
-            routing = e.op("Where", zero, e.scalar(0), e.op("Div", routing, safe_total))
-    # CPU does not enqueue routes with scale <= 1e-8, including negative scales.
-    active = e.op("Greater", routing, e.scalar(1e-8))
-    routing = e.op("Where", active, routing, e.scalar(0))
-    first_weights = e.dequantize(w1, scale1, _input(node, 11), c, 2 * c.intermediate, c.hidden)
-    down_weights = e.dequantize(w2, scale2, _input(node, 12), c, c.hidden, c.intermediate)
-    compute_x = e.op("Cast", x, to=ir.DataType.FLOAT) if x.dtype == ir.DataType.FLOAT16 else x
-    flat = e.op("Reshape", compute_x, e.ints([-1, c.hidden]))
-    first = e.op("GroupedMatMul", flat, first_weights, selected, transB=1)  # [T,k,2I]
-    gate = e.op("Gather", first, e.ints(list(range(0, 2 * c.intermediate, 2))), axis=2)
-    up = e.op("Gather", first, e.ints(list(range(1, 2 * c.intermediate, 2))), axis=2)
-    if math.isfinite(c.limit):
-        gate = e.op("Min", gate, e.scalar(c.limit))
-        up = e.op("Clip", up, e.scalar(-c.limit), e.scalar(c.limit))
-    sigmoid = e.op("Sigmoid", e.op("Mul", gate, e.scalar(c.alpha)))
-    activated = e.op("Mul", e.op("Mul", gate, sigmoid), e.op("Add", up, e.scalar(c.beta)))
-    # Down projection must operate on each selected expert's own intermediate.
-    down = e.op(
-        "GroupedMatMul",
-        e.op("Reshape", activated, e.ints([-1, c.intermediate])),
-        down_weights,
-        e.op("Reshape", selected, e.ints([-1, 1])),
-        transB=1,
-    )
-    down = e.op("Reshape", down, e.ints([-1, c.k, c.hidden]))
-    weighted = e.op("Mul", down, e.op("Unsqueeze", routing, e.ints([2])))
-    # Where, rather than only multiplying by zero, masks inactive expert NaNs.
-    weighted = e.op("Where", e.op("Unsqueeze", active, e.ints([2])), weighted, e.scalar(0))
-    result = e.op("ReduceSum", weighted, e.ints([1]), keepdims=0)
-    result = e.op("Reshape", result, e.op("Shape", x), allowzero=1)
-    if x.dtype == ir.DataType.FLOAT16:
-        result = e.op("Cast", result, to=ir.DataType.FLOAT16)
-    result.type, result.shape = x.type, x.shape
-    return e.nodes, result
-
-
-def lower_qmoe(model: ir.Model) -> ir.Model:
-    """Lower supported QMoE nodes in-place and return *model*.
-
-    Opts the model and compatible existing functions into standard opset 29.
-    No-QMoE models are untouched. All calls and import changes are validated
-    before mutation; unsupported ABIs or unaudited schema changes raise
-    ``ValueError``. This targets the pinned **CPU**
-    reference semantics, not CUDA's differing input-14/normalization behavior.
-
-    Supports FLOAT/FLOAT16 inputs with CPU-reference FLOAT compute, raw UINT8
-    INT4 weights, blocked scales, interleaved SwiGLU, and rank-2/3 hidden input.
-    Router logits and optional input-14 weights must have equal runtime token
-    counts; distinct symbolic annotations or symbolic/static refinements are
-    accepted when no known static counts contradict each other.
-    See ``docs/qmoe-lowering.md``.
-    Requires ``experimental_opset29=True``; otherwise a QMoE conversion raises
-    ``ValueError`` before mutation. Enabling the flag does not trigger lowering
-    automatically or imply runtime kernel support.
-    Requires a runtime supporting GroupedMatMul-29 (or function expansion).
-    """
-    return lower_nodes(model, op_type="QMoE", validate=_validate, generate=_lower)

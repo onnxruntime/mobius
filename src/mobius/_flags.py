@@ -87,8 +87,8 @@ class _Flags:
        * - ``experimental_opset29``
          - ``MOBIUS_EXPERIMENTAL_OPSET29``
          - ``False``
-         - Permit explicit experimental opset-29 lowering.
-           Does not imply runtime kernel support or upgrade ordinary exports.
+         - Build opset-29 standard MoE/QMoE function fallbacks on non-native EPs.
+           Native-capable EPs retain opset 24. No runtime support is implied.
        * - ``tencent_q1_0_use_native_2bit``
          - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
          - ``False``
@@ -142,16 +142,17 @@ class _Flags:
     experimental_opset29: bool = dataclasses.field(
         default_factory=lambda: _env_bool("MOBIUS_EXPERIMENTAL_OPSET29", False)
     )
-    """Permit explicit experimental opset-29 lowering, disabled by default.
+    """Build experimental opset-29 MoE/QMoE function fallbacks, default off.
 
     Set ``MOBIUS_EXPERIMENTAL_OPSET29=1`` before importing mobius, or use
-    ``override_flags(experimental_opset29=True)``, to allow
-    :func:`~mobius.functions.lower_qmoe` or :func:`~mobius.functions.lower_moe`
-    to produce an opset-29 graph. Without this opt-in, an attempted QMoE or MoE
-    conversion raises before mutation.
+    ``override_flags(experimental_opset29=True)`` around the normal build API.
+    EPs without fused MoE support construct new graphs and ordinary functions
+    at opset 29, then register and inline standard MoE/QMoE reference functions.
+    Native-capable EPs keep opset 24 and their native calls without fallback ABI
+    restrictions. Flag-off builds and unrelated generic MoE dispatch are unchanged.
 
-    This flag does not automatically upgrade models, change native exports,
-    or imply ORT/EP kernel support. Opset 29 is experimental and may require
+    Existing opset-24 models must be rebuilt, not upgraded or relabeled.
+    This flag does not imply ORT/EP kernel support. Opset 29 may require
     source-built ONNX schemas and a separately qualified runtime.
     """
 

@@ -48,6 +48,7 @@ import contextlib
 import dataclasses
 import logging
 import warnings
+from collections.abc import Callable
 
 import onnx
 import onnx_ir as ir
@@ -391,6 +392,103 @@ def _apply_stages(
     _apply_stage(model, pending)
 
 
+def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], bool]) -> None:
+    """Run the standard inliner, preserving call-output docs and metadata.
+
+    IR preserves output names/types/shapes, but not docs or metadata at the call
+    boundary. Restore those by the preserved name in the same lexical graph.
+    Inline leaf functions first: IR may recursively expand newly inserted calls
+    in one pass, before their annotations can be restored at this boundary.
+    """
+    while True:
+        selected = {
+            identifier: function
+            for identifier, function in model.functions.items()
+            if criteria(function)
+        }
+        leaves = {
+            identifier
+            for identifier, function in selected.items()
+            if not any(node.op_identifier() in selected for node in function.graph.all_nodes())
+        }
+        if selected and not leaves:
+            # Let the public inliner report its cyclic-function precondition.
+            common_passes.InlinePass(criteria=criteria)(model)
+            return
+        annotations: list[
+            tuple[ir.Graph, str | None, str | None, dict[str, str], dict[str, object]]
+        ] = []
+        roots = [model.graph, *(fn.graph for fn in model.functions.values())]
+        used_names = {
+            value.name
+            for root in roots
+            for graph in (root, *root.subgraphs())
+            for value in (
+                *graph.inputs,
+                *graph.initializers.values(),
+                *(v for node in graph for v in node.outputs),
+            )
+        }
+        for root in roots:
+            for node in root.all_nodes():
+                if node.op_identifier() in leaves:
+                    assert node.graph is not None
+                    for value in node.outputs:
+                        if value.name is None:
+                            name = f"mobius_inline_output_{len(annotations)}"
+                            while name in used_names:
+                                name += "_"
+                            value.name = name
+                            used_names.add(name)
+                        annotations.append(
+                            (
+                                node.graph,
+                                value.name,
+                                value.doc_string,
+                                dict(value.metadata_props),
+                                dict(value.meta),
+                            )
+                        )
+        if not annotations:
+            # Preserve public preconditions even when only unused leaves remain.
+            common_passes.InlinePass(criteria=criteria)(model)
+            return
+
+        def is_leaf(
+            function: ir.Function, leaf_identifiers: set[ir.OperatorIdentifier] = leaves
+        ) -> bool:
+            return function.identifier() in leaf_identifiers
+
+        result = common_passes.InlinePass(criteria=is_leaf)(model)
+        values_by_graph = {
+            graph: {
+                value.name: value
+                for value in (
+                    *graph.inputs,
+                    *graph.outputs,
+                    *graph.initializers.values(),
+                    *(
+                        value
+                        for node in graph
+                        for value in (*node.inputs, *node.outputs)
+                        if value is not None
+                    ),
+                )
+            }
+            for root in [model.graph, *(fn.graph for fn in model.functions.values())]
+            for graph in (root, *root.subgraphs())
+        }
+        for graph, output_name, doc, props, meta in annotations:
+            restored_value = values_by_graph.get(graph, {}).get(output_name)
+            if restored_value is not None:
+                if doc is not None:
+                    restored_value.doc_string = doc
+                restored_value.metadata_props.update(props)
+                restored_value.meta.update(meta)
+        if not result.modified:
+            return
+
+
 def _log_trace_entry(entry: _TraceEntry) -> None:
     if not entry.added and not entry.removed:
         logger.info("[EP Trace]   %-25s: no matches (0 nodes affected)", entry.name)
@@ -640,7 +738,10 @@ def optimize_model(
 
     # Register standard-ONNX ir.Function bodies for all known custom ops.
     # InlinePass below uses these to expand ops the EP cannot execute.
-    register_function_bodies(model)
+    moe_fallback = flags.experimental_opset29 and (
+        caps.name == "onnx-standard" or not caps.supports_fused_moe
+    )
+    register_function_bodies(model, moe_fallback=moe_fallback)
 
     # Build InlinePass criteria: expand custom ops this EP doesn't support.
     def _should_inline(func: ir.Function) -> bool:
@@ -672,9 +773,9 @@ def optimize_model(
         # registered but uninlined (kernels take precedence over local functions).
         if func.domain == "com.microsoft" and func.name == "MatMulNBits":
             return not caps.supports_matmul_nbits
+        if func.domain == "com.microsoft" and func.name in {"MoE", "QMoE"}:
+            return moe_fallback
         return False
-
-    inline_pass = common_passes.InlinePass(criteria=_should_inline)
 
     trace_entries: list[_TraceEntry] = []
 
@@ -690,7 +791,7 @@ def optimize_model(
 
         logger.info("[EP Trace] Stage 2b: InlinePass (expand unsupported custom ops)")
         before = _count_all_ops(model)
-        inline_pass(model)
+        _inline_function_bodies(model, _should_inline)
         after = _count_all_ops(model)
         trace_entries.append(_make_trace_entry("InlinePass", before, after))
         _log_trace_entry(trace_entries[-1])
@@ -709,7 +810,7 @@ def optimize_model(
         _apply_stages(model, fuse_stages)
 
         # Expand unsupported custom ops via registered ir.Function bodies.
-        inline_pass(model)
+        _inline_function_bodies(model, _should_inline)
 
         _apply_stages(model, lower_stages)
 

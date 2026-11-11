@@ -110,11 +110,13 @@ class KimiK3CausalLMTask(ModelTask):
 
         model = _make_model(graph)
         conv = causal_conv_nd_with_state(
+            opset_version=model.graph.opset_imports[""],
             kernel_size=config.linear_conv_kernel_dim,
             channels=projection,
             activation="silu",
         )
         recurrence = linear_attention(
+            opset_version=model.graph.opset_imports[""],
             q_num_heads=config.linear_num_key_heads,
             kv_num_heads=config.linear_num_value_heads,
             update_rule="gated_delta",

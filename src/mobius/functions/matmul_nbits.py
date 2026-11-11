@@ -60,7 +60,9 @@ adapter needs the old source names, but optimizations need not trust an old body
 FUNCTION_BODY_METADATA_VALUE = "1"
 
 
-def matmul_nbits(*, has_zero_points: bool = True) -> ir.Function:
+def matmul_nbits(
+    *, has_zero_points: bool = True, opset_version: int = OPSET_VERSION
+) -> ir.Function:
     """Build an ``ir.Function`` for the 4-bit ``com.microsoft::MatMulNBits`` op.
 
     Args:
@@ -166,7 +168,7 @@ def matmul_nbits(*, has_zero_points: bool = True) -> ir.Function:
         attributes=[
             ir.Attr("block_size", ir.AttributeType.INT, 32),
         ],
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": opset_version},
     )
     if not has_zero_points:
         function.overload = "default_zero_points"

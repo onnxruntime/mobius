@@ -12,8 +12,9 @@ import pytest
 
 from mobius._constants import OPSET_VERSION
 from mobius._flags import override_flags
-from mobius.functions import get_function, lower_moe, lower_qmoe, register_function_bodies
+from mobius.functions import get_function, register_function_bodies
 from mobius.functions._lowering_test_utils import expand_grouped_matmul
+from mobius.functions._moe_test_utils import inline_native_calls
 
 ort = pytest.importorskip("onnxruntime")
 _requires_opset29 = pytest.mark.skipif(
@@ -66,6 +67,7 @@ def _model(
     clipped=False,
     hidden=4,
     inter=3,
+    opset=29,
 ):
     rng = np.random.default_rng(42)
     shape = ["tokens", hidden] if rank == 2 else ["batch", "sequence", hidden]
@@ -107,7 +109,7 @@ def _model(
             [y],
             nodes=[node],
             initializers=[v for v in inputs[2:] if v is not None],
-            opset_imports={"": 24, "com.microsoft": 1},
+            opset_imports={"": opset, "com.microsoft": 1},
             name="moe",
         ),
         ir_version=10,
@@ -226,7 +228,7 @@ def test_scalar_reference_and_schema_roundtrip(tmp_path, activation, dtype):
     )
     expected = _reference(native, feeds)
     initializers = tuple(native.graph.initializers)
-    model = lower_moe(native.clone())
+    model = inline_native_calls(native.clone())
     assert tuple(model.graph.initializers) == initializers
     assert sum(n.op_type == "GroupedMatMul" for n in model.graph) == 2
     assert model.graph.opset_imports[""] == 29
@@ -251,10 +253,19 @@ def _compare_native_cpu(tmp_path, activation, dtype, normalize):
         clipped=activation == "swiglu",
     )
     feeds = _feeds(dtype=np.float16 if dtype == ir.DataType.FLOAT16 else np.float32)
-    expected = _run(native, feeds, tmp_path / "native.onnx")
+    native24 = _model(
+        activation=activation,
+        dtype=dtype,
+        normalize=normalize,
+        clipped=activation == "swiglu",
+        opset=24,
+    )
+    expected = _run(native24, feeds, tmp_path / "native.onnx")
     _assert_close(expected, _reference(native, feeds))
     actual = _run(
-        expand_grouped_matmul(lower_moe(native.clone())), feeds, tmp_path / "expanded.onnx"
+        expand_grouped_matmul(inline_native_calls(native.clone())),
+        feeds,
+        tmp_path / "expanded.onnx",
     )
     _assert_close(actual, expected)
 
@@ -280,7 +291,9 @@ def test_optional_biases_routing_modes_and_all_experts(tmp_path, biases, k, norm
     native = _model(biases=biases, k=k, normalize=normalize, activation="identity")
     feeds = _feeds()
     actual = _run(
-        expand_grouped_matmul(lower_moe(native.clone())), feeds, tmp_path / "expanded.onnx"
+        expand_grouped_matmul(inline_native_calls(native.clone())),
+        feeds,
+        tmp_path / "expanded.onnx",
     )
     _assert_close(actual, _reference(native, feeds))
 
@@ -289,7 +302,7 @@ def test_optional_biases_routing_modes_and_all_experts(tmp_path, biases, k, norm
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
 @_requires_opset29
 def test_empty_tokens(tmp_path, shape, dtype):
-    model = lower_moe(_model(rank=len(shape), dtype=dtype))
+    model = inline_native_calls(_model(rank=len(shape), dtype=dtype))
     path = tmp_path / "empty.onnx"
     ir.save(model, path)
     onnx.checker.check_model(str(path), full_check=True)
@@ -308,12 +321,13 @@ def test_empty_tokens(tmp_path, shape, dtype):
 def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
     _require_native_cpu(ir.DataType.FLOAT)
     native = _model(k=1 if "ties" in case else 3, normalize=normalize)
-    executable = expand_grouped_matmul(lower_moe(native.clone()))
+    executable = expand_grouped_matmul(inline_native_calls(native.clone()))
     for count in (1, 7):
         feeds = _feeds(shape=(count, 4), case=case)
         actual = _run(executable, feeds, tmp_path / f"expanded_{count}.onnx")
         _assert_close(actual, _reference(native, feeds))
-        _assert_close(actual, _run(native, feeds, tmp_path / f"native_{count}.onnx"))
+        native24 = _model(k=1 if "ties" in case else 3, normalize=normalize, opset=24)
+        _assert_close(actual, _run(native24, feeds, tmp_path / f"native_{count}.onnx"))
 
 
 @_requires_opset29
@@ -324,7 +338,9 @@ def test_higher_expert_id_on_probability_rounding_tie(tmp_path):
     node.inputs[5].const_value = ir.tensor(np.array([[1] * 4, [2] * 4, [3] * 4], np.float32))
     feeds = _feeds(shape=(1, 4), case="rounded_ties")
     # Logit 1 is larger, but all FLOAT probabilities round to 1/3. CPU picks ID 2.
-    actual = _run(expand_grouped_matmul(lower_moe(native)), feeds, tmp_path / "ties.onnx")
+    actual = _run(
+        expand_grouped_matmul(inline_native_calls(native)), feeds, tmp_path / "ties.onnx"
+    )
     np.testing.assert_allclose(actual, np.ones((1, 4), np.float32), rtol=1e-6)
 
 
@@ -339,7 +355,9 @@ def test_tiny_positive_routes_are_not_qmoe_thresholded(tmp_path):
     feeds = _feeds(shape=(1, 4), case="tiny")
     expected = _reference(native, feeds)
     assert np.all(expected > 0.1)
-    actual = _run(expand_grouped_matmul(lower_moe(native)), feeds, tmp_path / "tiny.onnx")
+    actual = _run(
+        expand_grouped_matmul(inline_native_calls(native)), feeds, tmp_path / "tiny.onnx"
+    )
     _assert_close(actual, expected)
 
 
@@ -356,7 +374,9 @@ def test_inactive_overflowing_expert_is_masked(tmp_path):
     feeds = _feeds(shape=(1, 4), case="underflow")
     feeds["x"][:] = 2
     expected = _reference(native, feeds)
-    actual = _run(expand_grouped_matmul(lower_moe(native)), feeds, tmp_path / "masked.onnx")
+    actual = _run(
+        expand_grouped_matmul(inline_native_calls(native)), feeds, tmp_path / "masked.onnx"
+    )
     _assert_close(actual, expected)
     assert np.all(np.isfinite(actual))
 
@@ -368,7 +388,7 @@ def test_half_rounding_boundaries_are_observable(tmp_path):
     expected = _reference(native, feeds)
     float_through = _reference(native, feeds, round_stages=False)
     assert not np.array_equal(expected, float_through)
-    lowered = lower_moe(native)
+    lowered = inline_native_calls(native)
     # GEMM1, bias1, activation, GEMM2, bias2, final output each store to half.
     stores = [
         n for n in lowered.graph if n.op_type == "Cast" and n.attributes.get_int("to") == 10
@@ -385,7 +405,7 @@ def _assert_atomic(model, tmp_path, message):
     nodes_before = tuple(model.graph.all_nodes())
     uses = [(v, tuple(v.uses())) for v in model.graph.inputs]
     with pytest.raises(ValueError, match=message):
-        lower_moe(model)
+        inline_native_calls(model)
     ir.save(model, after)
     assert before.read_bytes() == after.read_bytes()
     assert tuple(model.graph.all_nodes()) == nodes_before
@@ -492,7 +512,7 @@ def test_truncated_optional_slots(tmp_path):
     original.outputs[0].replace_all_uses_with(output, replace_graph_outputs=True)
     model.graph.remove(original, safe=True)
     actual = _run(
-        expand_grouped_matmul(lower_moe(model)), feeds, tmp_path / "short_slots.onnx"
+        expand_grouped_matmul(inline_native_calls(model)), feeds, tmp_path / "short_slots.onnx"
     )
     _assert_close(actual, expected)
 
@@ -537,7 +557,8 @@ def test_token_count_output_and_overload_validation(tmp_path):
     _assert_atomic(model, tmp_path, "output metadata")
     node.outputs[0].shape = node.inputs[0].shape
     node.overload = "custom"
-    _assert_atomic(model, tmp_path, "overloads")
+    register_function_bodies(model, moe_fallback=True)
+    assert node.overload == "custom"
 
 
 @pytest.mark.parametrize("activation", ["identity", "swiglu"])
@@ -546,7 +567,9 @@ def test_square_modern_weights_are_qualified(tmp_path, activation):
     native = _model(hidden=4, inter=4, activation=activation)
     feeds = _feeds()
     expected = _reference(native, feeds)
-    actual = _run(expand_grouped_matmul(lower_moe(native)), feeds, tmp_path / "square.onnx")
+    actual = _run(
+        expand_grouped_matmul(inline_native_calls(native)), feeds, tmp_path / "square.onnx"
+    )
     _assert_close(actual, expected)
 
 
@@ -559,14 +582,16 @@ def test_swiglu_limit_boundaries_and_default_normalization(tmp_path, limit):
     del node.attributes["normalize_routing_weights"]
     feeds = _feeds()
     expected = _reference(native, feeds)
-    actual = _run(expand_grouped_matmul(lower_moe(native)), feeds, tmp_path / "limit.onnx")
+    actual = _run(
+        expand_grouped_matmul(inline_native_calls(native)), feeds, tmp_path / "limit.onnx"
+    )
     _assert_close(actual, expected)
 
 
 def test_flag_off_and_flag_alone_do_not_change_native(tmp_path):
-    model = _model()
+    model = _model(opset=24)
     with override_flags(experimental_opset29=False):
-        _assert_atomic(model, tmp_path, "MOBIUS_EXPERIMENTAL_OPSET29=1")
+        _assert_atomic(model, tmp_path, "experimental_opset29")
     ir.save(model, tmp_path / "native.onnx")
     before = (tmp_path / "native.onnx").read_bytes()
     register_function_bodies(model)
@@ -580,9 +605,8 @@ def test_flag_off_and_flag_alone_do_not_change_native(tmp_path):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("qmoe_only", [False, True])
-def test_no_moe_is_byte_preserving(tmp_path, enabled, qmoe_only):
-    # An old unaudited Softmax function must not be audited on no-MoE models.
+def test_no_target_uses_normal_registry_behavior(tmp_path, enabled):
+    # Unrelated caller functions are never audited or relabeled.
     x = ir.Value(name="x", shape=ir.Shape([2, 3]), type=ir.TensorType(ir.DataType.FLOAT))
     y = ir.Value(name="y", shape=x.shape, type=x.type)
     function = ir.Function(
@@ -596,18 +620,17 @@ def test_no_moe_is_byte_preserving(tmp_path, enabled, qmoe_only):
             opset_imports={"": 11},
         ),
     )
-    if qmoe_only:
-        from mobius.functions.qmoe_test import _model as qmodel
-
-        model = qmodel()
-    else:
-        model = ir.Model(ir.Graph([], [], nodes=[], opset_imports={"": 24}), ir_version=10)
+    version = 29 if enabled else 24
+    model = ir.Model(ir.Graph([], [], nodes=[], opset_imports={"": version}), ir_version=10)
     model.functions[function.identifier()] = function
     ir.save(model, tmp_path / "before.onnx")
     with override_flags(experimental_opset29=enabled):
-        assert lower_moe(model) is model
+        register_function_bodies(model, moe_fallback=enabled)
     ir.save(model, tmp_path / "after.onnx")
-    assert (tmp_path / "before.onnx").read_bytes() == (tmp_path / "after.onnx").read_bytes()
+    assert len(model.functions) > 1
+    assert model.functions[function.identifier()] is function
+    assert function.opset_imports[""] == 11
+    assert model.graph.opset_imports[""] == version
 
 
 @_requires_opset29
@@ -620,7 +643,7 @@ def test_output_metadata_name_collision_and_idempotence(tmp_path):
     marker = object()
     original.meta["marker"] = marker
     model.graph.inputs[0].name = "moe29_0_0"
-    assert lower_moe(model) is model
+    assert inline_native_calls(model) is model
     output = model.graph.outputs[0]
     assert output.type == original.type and output.shape == original.shape
     assert output.meta["marker"] is marker
@@ -631,7 +654,7 @@ def test_output_metadata_name_collision_and_idempotence(tmp_path):
     assert restored.name == original.name and restored.doc_string == original.doc_string
     assert restored.metadata_props == original.metadata_props
     before = path.read_bytes()
-    lower_moe(model)
+    inline_native_calls(model)
     ir.save(model, path)
     assert path.read_bytes() == before
 
@@ -653,7 +676,7 @@ def test_untyped_unshaped_native_intermediate(tmp_path, dtype, consumer):
     model.graph.outputs.clear()
     model.graph.append(ir.Node("", consumer, inputs=inputs, outputs=[output]))
     model.graph.outputs.append(output)
-    lower_moe(model)
+    inline_native_calls(model)
     inferred = next(n.outputs[0] for n in model.graph if n.outputs[0].name == "y")
     assert inferred.type == x.type and inferred.shape == x.shape
     assert inferred.doc_string == intermediate.doc_string
@@ -666,43 +689,19 @@ def test_untyped_unshaped_native_intermediate(tmp_path, dtype, consumer):
     _assert_close(actual, expected)
 
 
-@pytest.mark.parametrize(
-    "case", ["old_softmax", "future", "alias", "node_version", "unknown", "shift"]
-)
 @_requires_opset29
-def test_import_audit_is_atomic_and_uses_moe_diagnostics(tmp_path, case):
+def test_registration_does_not_convert_unrelated_function_imports():
     model = _model()
     x = ir.Value(name="audit_x", shape=ir.Shape([2, 3]), type=ir.TensorType(ir.DataType.FLOAT))
     y = ir.Value(name="audit_y", shape=x.shape, type=x.type)
-    node = ir.Node("", "Identity", inputs=[x], outputs=[y])
-    graph = ir.Graph([x], [y], nodes=[node], opset_imports={"": 24})
+    node = ir.Node("", "Softmax", inputs=[x], outputs=[y])
+    graph = ir.Graph([x], [y], nodes=[node], opset_imports={"": 11})
     function = ir.Function("caller", "Audit", graph=graph, attributes=[])
     model.functions[function.identifier()] = function
-    if case == "old_softmax":
-        node.op_type = "Softmax"
-        graph.opset_imports[""] = 11
-    elif case == "future":
-        graph.opset_imports[""] = 30
-    elif case == "alias":
-        graph.opset_imports["ai.onnx"] = 23
-    elif case == "node_version":
-        node.version = 13
-    elif case == "unknown":
-        node.op_type = "Unknown"
-    else:
-        x.dtype = ir.DataType.UINT8
-        y.dtype = ir.DataType.UINT8
-        replacement = ir.Node(
-            "",
-            "BitShift",
-            inputs=[x, x],
-            outputs=[ir.Value(name="shifted", shape=y.shape, type=y.type)],
-            attributes=[ir.AttrString("direction", "RIGHT")],
-        )
-        graph.insert_before(node, replacement)
-        y.replace_all_uses_with(replacement.outputs[0], replace_graph_outputs=True)
-        graph.remove(node, safe=True)
-    _assert_atomic(model, tmp_path, "lower_moe:")
+    imports = dict(graph.opset_imports)
+    register_function_bodies(model, moe_fallback=True)
+    assert dict(graph.opset_imports) == imports
+    assert model.functions[function.identifier()] is function
 
 
 @_requires_opset29
@@ -712,12 +711,12 @@ def test_function_scope_and_registry_import_alignment(tmp_path):
     inner.initializers.clear()
     function = ir.Function("test.moe", "Experts", graph=inner, attributes=[])
     model = ir.Model(
-        ir.Graph([], [], nodes=[], opset_imports={"": 24, "test.moe": 1}, name="outer"),
+        ir.Graph([], [], nodes=[], opset_imports={"": 29, "test.moe": 1}, name="outer"),
         functions=[function],
         ir_version=10,
     )
     register_function_bodies(model)
-    lower_moe(model)
+    inline_native_calls(model)
     assert model.graph.opset_imports[""] == 29
     assert all(fn.opset_imports[""] == 29 for fn in model.functions.values())
     assert not any(n.op_type == "MoE" for n in function.graph.all_nodes())
@@ -727,21 +726,14 @@ def test_function_scope_and_registry_import_alignment(tmp_path):
 
 
 @_requires_opset29
-def test_default_domain_alias_and_explicit_version_are_aligned(tmp_path):
-    model = _model()
-    model.graph.opset_imports.pop("")
-    model.graph.opset_imports["ai.onnx"] = 24
-    # An existing standard node gets aligned together with its containing scope.
+def test_existing24_model_must_be_rebuilt(tmp_path):
+    model = _model(opset=24)
     x = model.graph.inputs[0]
     output = ir.Value(name="existing", shape=x.shape, type=x.type)
     existing = ir.Node("", "Identity", inputs=[x], outputs=[output], version=24)
     model.graph.append(existing)
-    lower_moe(model)
-    assert "ai.onnx" not in model.graph.opset_imports
-    assert model.graph.opset_imports[""] == existing.version == 29
-    path = tmp_path / "alias.onnx"
-    ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    _assert_atomic(model, tmp_path, "rebuild under experimental opset29")
+    assert model.graph.opset_imports[""] == existing.version == 24
 
 
 def test_caller_owned_moe_function_rejected(tmp_path):
@@ -751,7 +743,7 @@ def test_caller_owned_moe_function_rejected(tmp_path):
     graph.initializers.clear()
     function = ir.Function("com.microsoft", "MoE", graph=graph, attributes=[])
     model.functions[function.identifier()] = function
-    _assert_atomic(model, tmp_path, "caller-defined MoE")
+    _assert_atomic(model, tmp_path, "caller-owned source")
 
 
 @_requires_opset29
@@ -783,12 +775,12 @@ def test_nested_subgraphs_are_lowered_and_aligned(tmp_path):
             [condition, *outer_inputs],
             [output],
             nodes=[branch],
-            opset_imports={"": 24, "com.microsoft": 1},
+            opset_imports={"": 29, "com.microsoft": 1},
             name="outer",
         ),
         ir_version=10,
     )
-    lower_moe(model)
+    inline_native_calls(model)
     assert not any(n.op_type == "MoE" for n in model.graph.all_nodes())
     assert all(g.opset_imports[""] == 29 for g in (model.graph, then_graph, else_graph))
     path = tmp_path / "nested.onnx"
@@ -796,9 +788,8 @@ def test_nested_subgraphs_are_lowered_and_aligned(tmp_path):
     onnx.checker.check_model(str(path), full_check=True)
 
 
-@pytest.mark.parametrize("moe_first", [False, True])
 @_requires_opset29
-def test_moe_qmoe_passes_compose(tmp_path, moe_first):
+def test_mixed_moe_qmoe_calls_register_and_inline_together(tmp_path):
     from mobius.functions.qmoe_test import _model as qmodel
 
     model = qmodel(router_weights=False, zero_points=False)
@@ -834,9 +825,8 @@ def test_moe_qmoe_passes_compose(tmp_path, moe_first):
     native.graph.remove(original, safe=True)
     model.graph.append(node)
     model.graph.outputs.append(node.outputs[0])
-    first, second = (lower_moe, lower_qmoe) if moe_first else (lower_qmoe, lower_moe)
-    first(model)
-    second(model)
+    inline_native_calls(model)
+    inline_native_calls(model)  # Repeated registration/inlining is harmless.
     assert sum(n.op_type == "GroupedMatMul" for n in model.graph) == 4
     assert not any(n.op_type in {"MoE", "QMoE"} for n in model.graph)
     path = tmp_path / "composed.onnx"

@@ -33,7 +33,11 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
+from mobius._build_context import (
+    ep_capabilities,
+    get_build_dtype,
+    is_prefill_prefix_pruning_enabled,
+)
 from mobius._configs import ArchitectureConfig, Gemma4Config, QuantizationConfig
 from mobius._constants import GEMMA4_CUSTOM_GEGLU_METADATA_KEY
 from mobius._flags import flags
@@ -1902,7 +1906,14 @@ class Gemma4DecoderLayer(nn.Module):
                     normed_flat,
                 )
             elif (
-                caps.supports_fused_moe
+                (
+                    caps.supports_fused_moe
+                    or (
+                        flags.experimental_opset29
+                        and get_build_dtype() in (ir.DataType.FLOAT, ir.DataType.FLOAT16)
+                        and self._fused_moe_activation == "swiglu"
+                    )
+                )
                 and self._fused_moe_activation is not None
                 and (self._fused_moe_activation != "geglu" or custom_geglu)
             ):

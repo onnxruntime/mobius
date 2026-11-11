@@ -1,21 +1,30 @@
-# Explicit native float MoE lowering (opset 29)
+# Native float MoE function fallback (experimental opset 29)
 
 ```python
-import onnx_ir as ir
+from mobius import build_from_module
 from mobius._flags import override_flags
-from mobius.functions import lower_moe
 
-model = ir.load("native.onnx")
+# module/config use the normal mobius model and configuration APIs.
 with override_flags(experimental_opset29=True):
-    lower_moe(model)  # in-place, also returns model
-ir.save(model, "standard.onnx")
+    package = build_from_module(module, config, execution_provider="onnx-standard")
+model = package["model"]
 ```
 
-**Experimental, default off.** The same permission as `lower_qmoe`,
-`experimental_opset29` (or `MOBIUS_EXPERIMENTAL_OPSET29=1` before import),
-allows this explicit pass. The flag alone does not run either pass, register a
-MoE function body, or change ordinary native exports, global opset 24, generic
-MoELayer dispatch/fallbacks, configuration, or checkpoint loading.
+**Experimental, default off.** Set `experimental_opset29` (or
+`MOBIUS_EXPERIMENTAL_OPSET29=1` before import) around the normal build API.
+On EPs without fused MoE support, graphs and ordinary function bodies are
+created at opset 29 from the outset. Native `com.microsoft::MoE`/`QMoE` calls
+receive call-specialized standard functions through `register_function_bodies`;
+the normal EP-controlled `InlinePass` expands them. There is no separate
+`lower_moe`/`lower_qmoe` API or model-wide compatibility converter.
+
+Flag-off behavior is unchanged. Native-capable EPs keep opset 24 and native
+calls without fallback ABI restrictions, even with the flag enabled. The global
+`OPSET_VERSION` remains 24. Generic `MoELayer` dense dispatch and arbitrary
+gates/experts are unchanged. Only Gemma4's FLOAT/FLOAT16 raw-logit SwiGLU
+path additionally reuses native call construction on fallback EPs. GEGLU,
+BFLOAT16, sigmoid/SparseMixer routing, and Qwen4's probability-based dispatch
+retain their existing paths/restrictions; probabilities must not be softmaxed twice.
 
 This replaces `com.microsoft::MoE` with two standard `GroupedMatMul-29` calls,
 targeting the pinned **CPU reference**, not all execution providers. It requires
@@ -46,7 +55,7 @@ no production expansion or performance/memory-use promise.
 * `normalize_routing_weights` defaults to **0** and must be 0 or 1.
   `use_sparse_mixer` and `swiglu_limit_after_activation` must be absent or 0.
 
-FC3 inputs 6/7, extended slots, overloads, unknown attributes, GEGLU,
+FC3 inputs 6/7, extended slots, unknown attributes, GEGLU,
 fusion=2, sparse mixer, post-activation clipping, legacy-transposed layouts,
 mixed dtypes, BFLOAT16, malformed tensor metadata, and missing input shape/type
 metadata are rejected before mutation. Output metadata is optional (native
@@ -122,21 +131,31 @@ test-copy GroupedMatMul expansion; every independent FLOAT16 test remains
 active, including the proof that intermediate half rounding is observable.
 This is not a claim of native-half parity against the 1.31.1 wheel.
 
-## Atomicity and import alignment
+## Registration, ownership, and imports
 
-All target calls, all existing scopes, and every detached replacement are
-validated/generated before any graph replacement or import mutation.
-Caller-defined MoE functions cannot be overridden. Calls nested in subgraphs
-and local functions are supported. Existing function identities and custom
-imports are preserved. The bounded audit is shared with `lower_qmoe`; see
-[its import-alignment table](qmoe-lowering.md#import-alignment). No audited
-schemas were widened for this pass; arbitrary graphs are not silently relabeled.
-Default-domain aliases, explicit node versions, and function/subgraph imports
-are aligned under the same rules.
+Advanced graph builders may use
+`register_function_bodies(model, moe_fallback=True)` on an already-built
+opset-29 model under the flag. Existing opset-24 models requesting this fallback
+raise **“rebuild under experimental opset29”** before specialization. Nothing
+converts or relabels imported graphs or caller functions. All containing
+function roots must also import 29: lexical child graph hints cannot override
+their serialized root scope. IR's standard inliner rejects both 29-function /
+24-model and 24-function / 29-model mismatches.
 
-Models without MoE are byte-preserving no-ops regardless of the flag, including
-QMoE-only models and models with older unaudited functions. Repeated calls are
-harmless. `lower_moe` and `lower_qmoe` compose in either order.
+All target ABIs, output annotations, specializations, and ownership collisions
+are checked before changing target overloads or adding functions. Bodies have
+eight positional formals; absent optional slots remain `None`, never compacted
+or replaced with dummy tensors. Frozen `MoEFunctionConfig` describes dimensions,
+activation/routing attributes, dtype, and optional-bias masks, not token counts,
+names, or tensor contents. `moe(config)` returns a fresh `ir.Function`.
+
+Deterministic full-config hashes (including stable infinity encoding) identify
+overloads. Existing function-body ownership metadata and config identity make
+registration idempotent and prevent mutable sharing between models. Caller-owned
+source/destination functions are never replaced; unrelated user overloads are
+preserved. No-target registration still attaches the ordinary known bodies; it
+is not a byte-preserving no-op. The existing inline boundary preserves output
+names, compatible annotations/refinements, documentation, and metadata.
 
 ## Pinned authorities
 

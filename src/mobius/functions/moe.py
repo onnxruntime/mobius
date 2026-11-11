@@ -1,11 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Explicit native float CPU MoE lowering; see ``docs/moe-lowering.md``.
-
-Consumes hidden states, router logits, and modern row-major expert projections.
-This is not generic component dispatch or an automatically registered function.
-"""
+"""Native CPU MoE reference function over modern row-major expert projections."""
 
 from __future__ import annotations
 
@@ -13,12 +9,14 @@ import math
 from dataclasses import dataclass
 
 import onnx_ir as ir
+from onnxscript import OpBuilder
+from onnxscript._internal.builder import build_function
 
-from mobius.functions._lowering import Emitter, lower_nodes, validate_output_metadata
+from mobius.functions._moe_utils import validate_output_metadata
 
 
 @dataclass(frozen=True)
-class _Config:
+class MoEFunctionConfig:
     experts: int
     hidden: int
     intermediate: int
@@ -28,10 +26,13 @@ class _Config:
     alpha: float
     beta: float
     limit: float
+    dtype: ir.DataType = ir.DataType.FLOAT
+    bias1: bool = False
+    bias2: bool = False
 
 
 def _error(message: str) -> ValueError:
-    return ValueError(f"lower_moe: {message}")
+    return ValueError(f"MoE fallback: {message}")
 
 
 def _input(node: ir.Node, index: int) -> ir.Value | None:
@@ -49,10 +50,8 @@ def _shape(value: ir.Value, name: str) -> tuple[int | ir.SymbolicDim, ...]:
     return shape
 
 
-def _validate(node: ir.Node) -> _Config:
+def validate_call(node: ir.Node) -> MoEFunctionConfig:
     """Check the bounded native CPU ABI without changing the model."""
-    if node.overload:
-        raise _error("MoE overloads are not supported")
     allowed = {
         "k": ir.AttributeType.INT,
         "activation_type": ir.AttributeType.STRING,
@@ -146,112 +145,115 @@ def _validate(node: ir.Node) -> _Config:
     if all(isinstance(d, int) for d in xs[:-1]) and isinstance(rs[0], int):
         if math.prod(xs[:-1]) != rs[0]:
             raise _error("router_probs token dimension does not match input")
-    validate_output_metadata(node, x, caller="lower_moe")
-    return _Config(
-        experts, hidden, intermediate, k, activation, bool(normalize), alpha, beta, limit
+    validate_output_metadata(node, x, caller="MoE fallback")
+    return MoEFunctionConfig(
+        experts,
+        hidden,
+        intermediate,
+        k,
+        activation,
+        bool(normalize),
+        alpha,
+        beta,
+        limit,
+        x.dtype,
+        _input(node, 3) is not None,
+        _input(node, 5) is not None,
     )
 
 
-def _lower(node: ir.Node, c: _Config, prefix: str) -> tuple[list[ir.Node], ir.Value]:
-    e = Emitter(prefix)
-    x, router, w1, _, w2 = node.inputs[:5]
-    assert x is not None and router is not None and w1 is not None and w2 is not None
-    half = x.dtype == ir.DataType.FLOAT16
+def moe(config: MoEFunctionConfig) -> ir.Function:
+    """Create a fresh opset-29 reference body with all eight native input slots."""
+    c = config
+    if c.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16):
+        raise _error("only FLOAT and FLOAT16 are supported")
 
-    # Arithmetic and scalar constants are FLOAT; half storage is modeled explicitly.
-    def compute(value: ir.Value) -> ir.Value:
-        return e.op("Cast", value, to=ir.DataType.FLOAT) if half else value
+    def body(op: OpBuilder, x, router, w1, bias1, w2, bias2, w3, bias3):
+        half = c.dtype == ir.DataType.FLOAT16
 
-    def round_half(value: ir.Value) -> ir.Value:
-        # Native CPU stores GEMM results, biased results, and activation in T.
-        return compute(e.op("Cast", value, to=ir.DataType.FLOAT16)) if half else value
+        def scalar(value: float):
+            return op.Constant(value_float=float(value))
 
-    # Native MoE softmaxes ALL E logits before selecting probabilities. Reversing
-    # that probability axis reproduces descending (probability, expert_id) ties.
-    probabilities = e.op("Softmax", compute(router), axis=1)
-    reversed_probs = e.op(
-        "Gather", probabilities, e.ints(list(range(c.experts - 1, -1, -1))), axis=1
+        def ints(values: list[int]):
+            return op.Constant(value_ints=values)
+
+        def compute(value):
+            return op.Cast(value, to=ir.DataType.FLOAT) if half else value
+
+        def round_half(value):
+            # Native CPU stores GEMMs, biases, and activation separately in T.
+            return compute(op.Cast(value, to=ir.DataType.FLOAT16)) if half else value
+
+        # Full-E FLOAT softmax precedes TopK. Reverse to select higher IDs on ties.
+        probabilities = op.Softmax(compute(router), axis=1)
+        reversed_probs = op.Gather(
+            probabilities, ints(list(range(c.experts - 1, -1, -1))), axis=1
+        )
+        routing, indices = op.TopK(reversed_probs, ints([c.k]), axis=1, sorted=1, _outputs=2)
+        selected = op.Sub(ints([c.experts - 1]), indices)
+        if c.normalize:
+            routing = op.Mul(
+                routing, op.Reciprocal(op.ReduceSum(routing, ints([1]), keepdims=1))
+            )
+        active = op.Greater(routing, scalar(0))
+        flat = op.Reshape(compute(x), ints([-1, c.hidden]))
+        first = round_half(op.GroupedMatMul(flat, compute(w1), selected, transB=1))
+        if c.bias1:
+            first = round_half(op.Add(first, op.Gather(compute(bias1), selected, axis=0)))
+        if c.activation == "swiglu":
+            gate = op.Gather(first, ints(list(range(0, 2 * c.intermediate, 2))), axis=2)
+            up = op.Gather(first, ints(list(range(1, 2 * c.intermediate, 2))), axis=2)
+            if math.isfinite(c.limit):
+                gate = op.Min(gate, scalar(c.limit))
+                up = op.Clip(up, scalar(-c.limit), scalar(c.limit))
+            activated = op.Mul(
+                op.Mul(gate, op.Sigmoid(op.Mul(gate, scalar(c.alpha)))),
+                op.Add(up, scalar(c.beta)),
+            )
+        elif c.activation == "silu":
+            activated = op.Mul(first, op.Sigmoid(first))
+        elif c.activation == "gelu":
+            activated = op.Gelu(first, approximate="tanh")
+        elif c.activation == "relu":
+            activated = op.Relu(first)
+        else:
+            activated = first
+        activated = round_half(activated)  # [T,k,I]
+        # Every selected route has its own intermediate: flatten T*k, not T.
+        down = round_half(
+            op.GroupedMatMul(
+                op.Reshape(activated, ints([-1, c.intermediate])),
+                compute(w2),
+                op.Reshape(selected, ints([-1, 1])),
+                transB=1,
+            )
+        )
+        down = op.Reshape(down, ints([-1, c.k, c.hidden]))
+        if c.bias2:
+            down = round_half(op.Add(down, op.Gather(compute(bias2), selected, axis=0)))
+        weighted = op.Mul(down, op.Unsqueeze(routing, ints([2])))
+        # CPU never enqueues zero routes; Where also masks their NaNs.
+        weighted = op.Where(op.Unsqueeze(active, ints([2])), weighted, scalar(0))
+        result = op.ReduceSum(weighted, ints([1]), keepdims=0)
+        result = op.Reshape(result, op.Shape(x), allowzero=1)
+        return op.Cast(result, to=ir.DataType.FLOAT16) if half else result
+
+    return build_function(
+        body,
+        [
+            ir.Value(name=name)
+            for name in (
+                "input",
+                "router_probs",
+                "fc1_experts_weights",
+                "fc1_experts_bias",
+                "fc2_experts_weights",
+                "fc2_experts_bias",
+                "fc3_experts_weights",
+                "fc3_experts_bias",
+            )
+        ],
+        domain="com.microsoft",
+        name="MoE",
+        opset_imports={"": 29},
     )
-    top = ir.Node(
-        "",
-        "TopK",
-        inputs=[reversed_probs, e.ints([c.k])],
-        num_outputs=2,
-        attributes=ir.convenience.convert_attributes({"axis": 1, "sorted": 1}),
-    )
-    for index, value in enumerate(top.outputs):
-        value.name = f"{prefix}_top_{index}"
-    e.nodes.append(top)
-    routing = top.outputs[0]  # [T,k], FLOAT even for half inputs
-    selected = e.op("Sub", e.ints([c.experts - 1]), top.outputs[1])
-    if c.normalize:
-        routing = e.op(
-            "Mul",
-            routing,
-            e.op("Reciprocal", e.op("ReduceSum", routing, e.ints([1]), keepdims=1)),
-        )
-    active = e.op("Greater", routing, e.scalar(0))
-    flat = e.op("Reshape", compute(x), e.ints([-1, c.hidden]))
-    first = round_half(e.op("GroupedMatMul", flat, compute(w1), selected, transB=1))
-    bias1 = _input(node, 3)
-    if bias1 is not None:
-        first = round_half(
-            e.op("Add", first, e.op("Gather", compute(bias1), selected, axis=0))
-        )
-    if c.activation == "swiglu":
-        gate = e.op("Gather", first, e.ints(list(range(0, 2 * c.intermediate, 2))), axis=2)
-        up = e.op("Gather", first, e.ints(list(range(1, 2 * c.intermediate, 2))), axis=2)
-        if math.isfinite(c.limit):
-            gate = e.op("Min", gate, e.scalar(c.limit))
-            up = e.op("Clip", up, e.scalar(-c.limit), e.scalar(c.limit))
-        activated = e.op(
-            "Mul",
-            e.op("Mul", gate, e.op("Sigmoid", e.op("Mul", gate, e.scalar(c.alpha)))),
-            e.op("Add", up, e.scalar(c.beta)),
-        )
-    elif c.activation == "silu":
-        activated = e.op("Mul", first, e.op("Sigmoid", first))
-    elif c.activation == "gelu":
-        activated = e.op("Gelu", first, approximate="tanh")
-    elif c.activation == "relu":
-        activated = e.op("Relu", first)
-    else:
-        activated = first
-    activated = round_half(activated)  # [T,k,I]
-    # Every route has its own intermediate: flatten T*k, not just T.
-    down = round_half(
-        e.op(
-            "GroupedMatMul",
-            e.op("Reshape", activated, e.ints([-1, c.intermediate])),
-            compute(w2),
-            e.op("Reshape", selected, e.ints([-1, 1])),
-            transB=1,
-        )
-    )
-    down = e.op("Reshape", down, e.ints([-1, c.k, c.hidden]))
-    bias2 = _input(node, 5)
-    if bias2 is not None:
-        down = round_half(e.op("Add", down, e.op("Gather", compute(bias2), selected, axis=0)))
-    weighted = e.op("Mul", down, e.op("Unsqueeze", routing, e.ints([2])))
-    # CPU never enqueues zero-weight routes; Where also masks their NaNs.
-    weighted = e.op("Where", e.op("Unsqueeze", active, e.ints([2])), weighted, e.scalar(0))
-    result = e.op("ReduceSum", weighted, e.ints([1]), keepdims=0)
-    result = e.op("Reshape", result, e.op("Shape", x), allowzero=1)
-    if half:
-        result = e.op("Cast", result, to=ir.DataType.FLOAT16)
-    result.type, result.shape = x.type, x.shape
-    return e.nodes, result
-
-
-def lower_moe(model: ir.Model) -> ir.Model:
-    """Replace supported native ``com.microsoft::MoE`` calls in-place, returning model.
-
-    Requires the default-off ``experimental_opset29`` permission. No-MoE models
-    are untouched regardless of the flag. All calls and existing scopes are
-    audited before mutation; unsupported ABIs raise ``ValueError`` atomically.
-    Targets pinned CPU FLOAT/FLOAT16 semantics, not provider-universal parity.
-    Requires GroupedMatMul-29 runtime support; enabling the flag does not invoke
-    this pass, change native export defaults, or register a MoE function body.
-    See ``docs/moe-lowering.md`` for shapes, arithmetic, routing, and exclusions.
-    """
-    return lower_nodes(model, op_type="MoE", validate=_validate, generate=_lower)

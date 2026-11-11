@@ -28,7 +28,7 @@ jobs:
       uses: justinchuby/lintrunner-action@main
 
   opset29-lowering:
-    name: Experimental opset 29 lowering
+    name: Experimental opset 29 function fallbacks
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -52,7 +52,16 @@ jobs:
         run: |
           python -c "import onnx; assert not onnx.defs.has('GroupedMatMul', 29)"
           python -m pytest src/mobius/functions/moe_test.py \
-            src/mobius/functions/qmoe_test.py src/mobius/_flags_test.py -q -rs
+            src/mobius/functions/qmoe_test.py src/mobius/functions/moe_registration_test.py \
+            src/mobius/functions/causal_conv_test.py src/mobius/functions/linear_attention_test.py \
+            src/mobius/functions/matmul_nbits_test.py \
+            src/mobius/functions/skip_layer_normalization_test.py \
+            src/mobius/functions/packed_multi_head_attention_test.py \
+            src/mobius/functions/matmul_block_quantized_fp4_weight_test.py \
+            src/mobius/models/gemma4_moe_function_test.py \
+            src/mobius/_build_context_test.py src/mobius/_builder_test.py \
+            tests/ep_optimization_test.py src/mobius/components/_moe_test.py \
+            src/mobius/_flags_test.py -q -rs
       - name: Install pinned opset-29 schemas
         run: |
           pip install --no-cache-dir --no-deps --force-reinstall \
@@ -61,7 +70,16 @@ jobs:
       - name: Test with pinned opset-29 schemas
         run: |
           python -m pytest src/mobius/functions/moe_test.py \
-            src/mobius/functions/qmoe_test.py src/mobius/_flags_test.py -q -rs
+            src/mobius/functions/qmoe_test.py src/mobius/functions/moe_registration_test.py \
+            src/mobius/functions/causal_conv_test.py src/mobius/functions/linear_attention_test.py \
+            src/mobius/functions/matmul_nbits_test.py \
+            src/mobius/functions/skip_layer_normalization_test.py \
+            src/mobius/functions/packed_multi_head_attention_test.py \
+            src/mobius/functions/matmul_block_quantized_fp4_weight_test.py \
+            src/mobius/models/gemma4_moe_function_test.py \
+            src/mobius/_build_context_test.py src/mobius/_builder_test.py \
+            tests/ep_optimization_test.py src/mobius/components/_moe_test.py \
+            src/mobius/_flags_test.py -q -rs
 
   detect-affected:
     name: Detect affected models
