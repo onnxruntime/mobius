@@ -106,6 +106,7 @@ __all__ = [
     "SSMCausalLMTask",
     "Seq2SeqTask",
     "SpeechEnhancementTask",
+    "TimestralTask",
     "SpeechLanguageTask",
     "SpeechToTextTask",
     "TASK_REGISTRY",
@@ -217,6 +218,7 @@ from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
 from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._t5_text_encoder import T5TextEncoderTask
+from mobius.tasks._timestral import TimestralTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._vibevoice import VibeVoiceTask
@@ -325,6 +327,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "glmasr-speech-language": GlmAsrSpeechLanguageTask,
     "fastconformer-rnnt": RNNTTask,
     "speech-enhancement": SpeechEnhancementTask,
+    "time-series-forecasting": TimestralTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,
