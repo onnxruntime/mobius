@@ -5,16 +5,30 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import onnx_ir as ir
+import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import Lfm2Config
-from mobius.components import Conv1d, Conv2d, SiLU, initialize_rope
+from mobius._configs.lfm3_audio import Lfm3AudioConfig
+from mobius.components import (
+    Conv1d,
+    Conv2d,
+    Embedding,
+    LayerNorm,
+    Linear,
+    SiLU,
+    initialize_rope,
+)
 from mobius.models.lfm2 import (
     Lfm2DecoderLayer,
     Lfm2RMSNorm,
     apply_lfm2_config_defaults,
+    rename_lfm2_weight_key,
 )
+from mobius.models.lfm3 import Lfm3Attention, Lfm3RMSNorm, Lfm3TextModel
 
 
 class Lfm3AudioDownsampler(nn.Module):
@@ -197,3 +211,324 @@ class Lfm3AudioEncoder(nn.Module):
         hidden_states = self.downsample(op, input_features, feature_lengths)
         hidden_states = self.lfm(op, op.Transpose(hidden_states, perm=[0, 2, 1]))
         return hidden_states, op.Div(op.Add(feature_lengths, 7), 8)
+
+
+class Lfm3AudioProjector(nn.Module):
+    """LayerNorm and exact-GELU MLP mapping encoder frames to language width."""
+
+    def __init__(self, encoder_size: int, hidden_size: int):
+        super().__init__()
+        self.layer_norm = LayerNorm(encoder_size, eps=1e-5)
+        self.linear_1 = Linear(encoder_size, hidden_size)
+        self.linear_2 = Linear(hidden_size, hidden_size)
+
+    def forward(self, op: OpBuilder, features: ir.Value) -> ir.Value:
+        features = self.linear_1(op, self.layer_norm(op, features))
+        return self.linear_2(op, op.Gelu(features, approximate="none"))
+
+
+class Lfm3AudioProjectedEncoder(nn.Module):
+    """Encode padded spectrograms and project valid-frame features for fusion."""
+
+    def __init__(self, config: Lfm3AudioConfig):
+        super().__init__()
+        encoder = config.encoder_config
+        if encoder is None:
+            raise ValueError("LFM3 Audio needs encoder_config; load the composite config.")
+        self.encoder = Lfm3AudioEncoder(
+            dataclasses.replace(encoder, dtype=config.dtype),
+            num_mel_bins=config.num_mel_bins,
+            conv_channels=config.conv_channels,
+            sliding_window=config.encoder_sliding_window,
+        )
+        self.projector = Lfm3AudioProjector(encoder.hidden_size, config.hidden_size)
+
+    def forward(
+        self, op: OpBuilder, input_features: ir.Value, feature_lengths: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
+        features, lengths = self.encoder(op, input_features, feature_lengths)
+        return self.projector(op, features), lengths
+
+
+class Lfm3AudioEmbedding(nn.Module):
+    """Fuse packed input frames and output codebooks at global placeholder slots."""
+
+    def __init__(self, config: Lfm3AudioConfig):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
+        self.codebook_embedding = Embedding(
+            config.num_codebooks * config.codebook_size, config.hidden_size
+        )
+
+    @staticmethod
+    def _replace(
+        op: OpBuilder,
+        embeddings: ir.Value,
+        input_ids: ir.Value,
+        features: ir.Value,
+        token_id: int,
+    ) -> ir.Value:
+        # Flatten across rows so each packed feature is consumed exactly once.
+        mask = op.Equal(op.Reshape(input_ids, [-1]), token_id)
+        offsets = op.Sub(op.CumSum(op.Cast(mask, to=ir.DataType.INT64), 0), 1)
+        offsets = op.Max(offsets, 0)
+        width = op.Shape(embeddings, start=2, end=3)
+        padded = op.Concat(
+            features,
+            op.Expand(op.CastLike(0.0, features), op.Concat([1], width, axis=0)),
+            axis=0,
+        )
+        selected = op.Gather(padded, offsets, axis=0)
+        flat = op.Reshape(embeddings, op.Concat([-1], width, axis=0))
+        return op.Reshape(
+            op.Where(op.Unsqueeze(mask, [-1]), selected, flat), op.Shape(embeddings)
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        audio_features: ir.Value,
+        audio_out_codes: ir.Value,
+    ) -> ir.Value:
+        embeddings = self.embed_tokens(op, input_ids)
+        embeddings = self._replace(
+            op, embeddings, input_ids, audio_features, self.config.audio_token_id
+        )
+        offsets = [
+            index * self.config.codebook_size for index in range(self.config.num_codebooks)
+        ]
+        code_embeddings = self.codebook_embedding(op, op.Add(audio_out_codes, offsets))
+        output_features = op.ReduceSum(code_embeddings, [1], keepdims=False)
+        return self._replace(
+            op, embeddings, input_ids, output_features, self.config.audio_out_token_id
+        )
+
+
+class Lfm3AudioDecoder(nn.Module):
+    """LFM3 decoder accepting fused embeddings and exposing speech-conditioning states."""
+
+    def __init__(self, config: Lfm3AudioConfig):
+        super().__init__()
+        self.language_model = Lfm3TextModel(config)
+        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values: list,
+    ):
+        hidden, present = self.language_model(
+            op,
+            None,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            inputs_embeds=inputs_embeds,
+        )
+        return self.lm_head(op, hidden), hidden, present
+
+
+class _BidirectionalDepthAttention(Lfm3Attention):
+    """LFM3 head-gated attention over all codebook slots, without a causal mask."""
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value,
+        position_embeddings: tuple,
+        past_key_value: tuple,
+    ):
+        del attention_bias, past_key_value
+        query, key, value = self._project_qkv(op, hidden_states)
+        query = self.q_norm(op, op.Reshape(query, [0, 0, -1, self.head_dim]))
+        key = self.k_norm(op, op.Reshape(key, [0, 0, -1, self.head_dim]))
+        query = self._apply_rotary(
+            op, op.Reshape(query, [0, 0, -1]), position_embeddings, self.num_attention_heads
+        )
+        key = self._apply_rotary(
+            op, op.Reshape(key, [0, 0, -1]), position_embeddings, self.num_key_value_heads
+        )
+        attended = op.Attention(
+            query,
+            key,
+            value,
+            q_num_heads=self.num_attention_heads,
+            kv_num_heads=self.num_key_value_heads,
+            scale=self.scaling,
+            is_causal=0,
+        )
+        gate = op.Unsqueeze(op.Sigmoid(self.gate_proj(op, hidden_states)), [-1])
+        attended = op.Reshape(attended, [0, 0, self.num_attention_heads, self.head_dim])
+        attended = op.Reshape(op.Mul(attended, gate), [0, 0, -1])
+        return self.o_proj(op, attended), ()
+
+
+class _DepthCodebook(nn.Module):
+    def __init__(self, hidden_size: int, codebook_size: int, eps: float):
+        super().__init__()
+        self.embedding = Embedding(codebook_size, hidden_size)
+        self.embedding_norm = Lfm3RMSNorm(hidden_size, eps=eps)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        codes: ir.Value | None,
+        hidden_states: ir.Value | None = None,
+    ) -> ir.Value:
+        if hidden_states is None:
+            assert codes is not None
+            return self.embedding(op, codes)
+        normalized = self.embedding_norm(op, hidden_states)
+        return op.MatMul(normalized, op.Transpose(self.embedding.weight, perm=[1, 0]))
+
+
+class Lfm3AudioDepthDecoder(nn.Module):
+    """Bidirectional LFM3 MaskGIT pass: frame state and masked codes to full logits."""
+
+    def __init__(self, config: Lfm3AudioConfig):
+        super().__init__()
+        depth = config.depth_config
+        if depth is None:
+            raise ValueError("LFM3 Audio needs depth_config; load the composite config.")
+        if set(depth.layer_types or []) != {"full_attention"}:
+            raise ValueError(
+                "LFM3 Audio depth decoder requires full_attention layers only; "
+                "load the checkpoint's noncausal depth_config."
+            )
+        self.config = config
+        self.depth_config = dataclasses.replace(depth, dtype=config.dtype)
+        self.depth_linear = Linear(
+            config.hidden_size, config.num_codebooks * depth.hidden_size
+        )
+        self.mask_embedding = nn.Parameter([depth.hidden_size])
+        self.model = Lfm3TextModel(self.depth_config)
+        for layer in self.model.layers:
+            layer.self_attn = _BidirectionalDepthAttention(self.depth_config)
+        self.depth_embeddings = nn.ModuleList(
+            [
+                _DepthCodebook(depth.hidden_size, config.codebook_size, depth.rms_norm_eps)
+                for _ in range(config.num_codebooks)
+            ]
+        )
+
+    def forward(
+        self, op: OpBuilder, hidden_states: ir.Value, codes: ir.Value, masked: ir.Value
+    ) -> ir.Value:
+        slots = self.config.num_codebooks
+        embeds = [
+            op.Unsqueeze(embedding(op, op.Gather(codes, index, axis=1)), [1])
+            for index, embedding in enumerate(self.depth_embeddings)
+        ]
+        code_embeddings = op.Concat(*embeds, axis=1)  # (frames, codebooks, depth_width)
+        hidden = op.Reshape(
+            self.depth_linear(op, hidden_states), [-1, slots, self.depth_config.hidden_size]
+        )
+        hidden = op.Add(
+            hidden,
+            op.Where(op.Unsqueeze(masked, [-1]), self.mask_embedding, code_embeddings),
+        )
+        # MatMulNBits inference does not propagate the projection's compute type.
+        hidden.type = ir.TensorType(self.depth_config.dtype)
+        shape = op.Shape(codes)
+        attention_mask = op.Expand(op.Constant(value_int=1), shape)
+        positions = op.Expand(op.Unsqueeze(op.Range(0, slots, 1), [0]), shape)
+        hidden, _ = self.model(
+            op,
+            None,
+            attention_mask,
+            positions,
+            [None] * self.depth_config.num_hidden_layers,
+            inputs_embeds=hidden,
+        )
+        logits = []
+        for index, embedding in enumerate(self.depth_embeddings):
+            logits.append(
+                op.Unsqueeze(
+                    embedding(op, None, hidden_states=op.Gather(hidden, index, axis=1)),
+                    [1],
+                )
+            )
+        return op.Concat(*logits, axis=1)
+
+
+class Lfm3AudioForConditionalGeneration(nn.Module):
+    """LiquidAI LFM3 Audio's offline ASR and speech-code generation architecture.
+
+    Replicates HuggingFace Lfm3AudioForConditionalGeneration as encoder,
+    embedding, hybrid decoder, and bidirectional speech depth-decoder graphs.
+    LiquidCodec converts the generated 12-codebook frames to 24-kHz audio.
+
+    Float32 offline export only. ``build_lfm3_audio_package`` in
+    ``mobius.integrations.lfm3_audio`` includes the separately stored codec;
+    ``examples/lfm3_audio_generation.py`` demonstrates ASR and synthesis.
+    """
+
+    default_task: str = "lfm3-audio"
+    category: str = "Audio"
+    config_class: type = Lfm3AudioConfig
+    preserve_standard_attention: bool = True
+
+    def __init__(self, config: Lfm3AudioConfig):
+        super().__init__()
+        if config.dtype != ir.DataType.FLOAT:
+            raise ValueError(
+                "LFM3 Audio currently supports float32 compute only; export with dtype='f32'."
+            )
+        self.config = config
+        self.audio_encoder = Lfm3AudioProjectedEncoder(config)
+        self.embedding = Lfm3AudioEmbedding(config)
+        self.decoder = Lfm3AudioDecoder(config)
+        self.depth_decoder = Lfm3AudioDepthDecoder(config)
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        prefixes = (
+            ("lfm.model.", "model.language_model."),
+            ("lfm.lm_head.", "lm_head."),
+            ("encoder.downsample.", "model.audio_encoder.downsample."),
+            ("encoder.lfm.lfm.", "model.audio_encoder.lfm."),
+            ("mlp.model.0.", "model.audio_projector.layer_norm."),
+            ("mlp.model.1.", "model.audio_projector.linear_1."),
+            ("mlp.model.3.", "model.audio_projector.linear_2."),
+            ("codebook_embedding.", "model.codebook_embedding."),
+            ("depth_linear.", "model.depth_decoder.depth_linear."),
+            ("depthformer.model.", "model.depth_decoder.model."),
+            ("depth_embeddings.", "model.depth_decoder.depth_embeddings."),
+        )
+        weights = {}
+        for name, value in state_dict.items():
+            if name == "mask_embedding":
+                name = "model.depth_decoder.mask_embedding"
+            else:
+                for source, target in prefixes:
+                    if name.startswith(source):
+                        name = target + name[len(source) :]
+                        break
+            if name.startswith("model.audio_encoder."):
+                name = "audio_encoder.encoder." + name[len("model.audio_encoder.") :]
+                name = rename_lfm2_weight_key(name)
+            elif name.startswith("model.audio_projector."):
+                name = "audio_encoder.projector." + name[len("model.audio_projector.") :]
+            elif name == "model.language_model.embed_tokens.weight":
+                name = "embedding.embed_tokens.weight"
+            elif name.startswith("model.language_model."):
+                name = "decoder.language_model." + name[len("model.language_model.") :]
+            elif name.startswith("model.codebook_embedding."):
+                name = (
+                    "embedding.codebook_embedding." + name[len("model.codebook_embedding.") :]
+                )
+            elif name.startswith("model.depth_decoder."):
+                name = "depth_decoder." + name[len("model.depth_decoder.") :]
+            elif name == "lm_head.weight":
+                name = "decoder.lm_head.weight"
+            weights[name] = value
+        if self.config.tie_word_embeddings and "decoder.lm_head.weight" not in weights:
+            weights["decoder.lm_head.weight"] = weights["embedding.embed_tokens.weight"]
+        return weights

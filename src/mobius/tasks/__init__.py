@@ -186,6 +186,7 @@ from mobius.tasks._hy_v3_mtp import HyV3MtpTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._kimi_k3 import KimiK3CausalLMTask
 from mobius.tasks._kimi_linear import KimiLinearCausalLMTask
+from mobius.tasks._lfm3_audio import Lfm3AudioTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
 from mobius.tasks._minimax_music3 import (
     MiniMaxMusic3ConditionTask,
@@ -326,6 +327,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "fastconformer-rnnt": RNNTTask,
     "speech-enhancement": SpeechEnhancementTask,
     "speech-language": SpeechLanguageTask,
+    "lfm3-audio": Lfm3AudioTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,
     "ssm2-text-generation": SSM2CausalLMTask,

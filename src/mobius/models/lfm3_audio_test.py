@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import onnx_ir as ir
 import pytest
+from _test_configs import lfm3_audio_config
 
+from mobius import build_from_module
 from mobius._configs import Lfm2Config
 from mobius._testing import create_test_builder, create_test_input
-from mobius.models.lfm3_audio import Lfm3AudioEncoder
+from mobius.models.lfm3_audio import Lfm3AudioEncoder, Lfm3AudioForConditionalGeneration
 
 
 def _config(**kwargs):
@@ -57,3 +59,20 @@ def test_encoder_builds_dynamic_batch_and_frames():
     assert len(graph.outputs) == 2
     assert any(node.op_type == "Attention" for node in graph)
     assert any(node.op_type == "CausalConvWithState" for node in graph)
+
+
+def test_audio_builds_four_component_package():
+    config = lfm3_audio_config()
+    package = build_from_module(
+        Lfm3AudioForConditionalGeneration(config), config, task="lfm3-audio"
+    )
+    assert set(package) == {"audio_encoder", "embedding", "decoder", "depth_decoder"}
+    assert [value.name for value in package["decoder"].graph.outputs][:2] == [
+        "logits",
+        "hidden_states",
+    ]
+    depth_attention = [
+        node for node in package["depth_decoder"].graph if node.op_type == "Attention"
+    ]
+    assert len(depth_attention) == 1
+    assert depth_attention[0].attributes.get_int("is_causal") == 0

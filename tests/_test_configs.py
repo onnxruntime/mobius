@@ -42,6 +42,7 @@ from mobius._configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    Lfm3AudioConfig,
     Lfm3Config,
     LongcatFlashConfig,
     Mamba2Config,
@@ -3548,7 +3549,66 @@ def vl_overrides(model_type: str) -> dict:
 # ---------------------------------------------------------------------------
 # Speech / TTS / Codec configs
 # ---------------------------------------------------------------------------
+def lfm3_audio_config():
+    return Lfm3AudioConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        vocab_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        num_hidden_layers=3,
+        layer_types=["conv", "full_attention", "sliding_attention"],
+        max_position_embeddings=128,
+        sliding_window=4,
+        encoder_config=Lfm2Config(
+            hidden_size=32,
+            intermediate_size=64,
+            block_auto_adjust_ff_dim=False,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            head_dim=8,
+            layer_types=["conv", "full_attention"],
+            short_conv_kernel=3,
+            rope_type="default",
+            max_position_embeddings=128,
+        ),
+        conv_channels=4,
+        encoder_sliding_window=3,
+        depth_config=Lfm3Config(
+            hidden_size=32,
+            intermediate_size=64,
+            vocab_size=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            use_sandwich_norm=False,
+            max_position_embeddings=12,
+            rope_parameters={
+                "full_attention": {
+                    "rope_type": "default",
+                    "rope_theta": 1_000_000.0,
+                    "partial_rotary_factor": 1.0,
+                }
+            },
+        ),
+        num_codebooks=3,
+        codebook_size=17,
+        audio_eos_code=16,
+        maskgit_schedule=(1, 1, 1),
+        audio_token_id=240,
+        audio_out_token_id=241,
+        audio_start_token_id=242,
+        text_end_token_id=243,
+        mixed_start_token_id=244,
+    )
+
+
 SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
+    ("lfm3_audio", {"_config_cls": Lfm3AudioConfig, **vars(lfm3_audio_config())}, True),
     # --- Parakeet CTC (feature-input offline FastConformer) ---
     (
         "parakeet_ctc",
