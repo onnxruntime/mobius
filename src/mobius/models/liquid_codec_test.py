@@ -29,7 +29,10 @@ def test_decoder_builds_independent_codes_to_waveform_graph():
     assert [value.name for value in model.graph.outputs] == ["waveform"]
     assert any(node.op_type == "DFT" for node in model.graph)
     assert any(node.op_type == "Col2Im" for node in model.graph)
-    assert any(node.op_type == "Attention" for node in model.graph)
+    attention_nodes = [node for node in model.graph if node.op_type == "Attention"]
+    assert attention_nodes
+    for node in attention_nodes:
+        assert all(value is None for value in node.inputs[4:6])
     assert any(node.op_type == "CausalConvWithState" for node in model.graph)
 
 

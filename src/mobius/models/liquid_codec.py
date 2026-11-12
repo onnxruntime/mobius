@@ -142,6 +142,7 @@ class _LiquidCodecLfm(Lfm3TextModel):
         layer_types = self.config.layer_types
         assert layer_types is not None
         for layer, kind in zip(self.layers, layer_types, strict=True):
+            past: tuple
             if kind == "conv":
                 cache_shape = op.Concat(batch, [self.config.hidden_size, 6], axis=0)
                 past = (
@@ -150,15 +151,9 @@ class _LiquidCodecLfm(Lfm3TextModel):
                     ),
                 )
             else:
-                cache_shape = op.Concat(
-                    batch,
-                    [self.config.num_key_value_heads, 0, self.config.head_dim],
-                    axis=0,
-                )
-                empty = op.ConstantOfShape(
-                    cache_shape, value=ir.tensor(np.array([0], np.float32))
-                )
-                past = (empty, empty)
+                # Offline synthesis has no KV history. CUDA requires live present
+                # outputs when past inputs exist, even for zero-length past tensors.
+                past = (None, None)
             hidden_states, _ = layer(
                 op,
                 hidden_states,
