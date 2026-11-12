@@ -50,6 +50,11 @@ class EmbeddingGemma2Task(ModelTask):
             raise TypeError(
                 "EmbeddingGemma2Task requires EmbeddingGemma2Model and its config."
             )
+        if config.dtype != ir.DataType.FLOAT:
+            raise ValueError(
+                f"EmbeddingGemma2 currently supports float32 only, got {config.dtype}. "
+                "Export with dtype='f32'; float16 overflows this architecture."
+            )
         self._validate_components(module)
         graph, builder = _make_graph("embedding_encoder")
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=["batch", "seq"])

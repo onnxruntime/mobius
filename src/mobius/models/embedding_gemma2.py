@@ -237,12 +237,20 @@ class EmbeddingGemma2TextModel(nn.Module):
         audio_features=None,
     ):
         self._validate()
-        h = self.embed_tokens(op, input_ids)
-        for token_id, features in (
+        media_streams = (
             (self.config.image_token_id, image_features),
             (self.config.video_token_id, video_features),
             (self.config.audio.audio_token_id if self.config.audio else None, audio_features),
-        ):
+        )
+        lookup_ids = input_ids
+        for token_id, _ in media_streams:
+            if token_id is not None:
+                # Media placeholders may lie outside the text embedding table.
+                lookup_ids = op.Where(
+                    op.Equal(input_ids, token_id), self.config.pad_token_id, lookup_ids
+                )
+        h = self.embed_tokens(op, lookup_ids)
+        for token_id, features in media_streams:
             if features is not None and token_id is not None:
                 # Feature rows follow placeholder order over the flattened batch.
                 # Keep image and video streams separate even though they share a tower.

@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-from mobius._configs._base import _as_attribute_config
+from types import SimpleNamespace
+
 from mobius._configs._extractors import register_audio_hook, register_vision_hook
 from mobius._configs._sub_configs import Gemma4AudioConfig
 
@@ -13,7 +14,8 @@ from mobius._configs._sub_configs import Gemma4AudioConfig
 @register_audio_hook("embedding_gemma2", "embedding_gemma2_text")
 def _embedding_gemma2_audio(config, parent_config, model_type, fields):
     parent = parent_config or config
-    ac = _as_attribute_config(getattr(parent, "audio_config", None))
+    ac = getattr(parent, "audio_config", None)
+    ac = SimpleNamespace(**ac) if isinstance(ac, dict) else ac
     if ac is None:
         return None
     expected = {
@@ -47,7 +49,8 @@ def _embedding_gemma2_audio(config, parent_config, model_type, fields):
 @register_vision_hook("embedding_gemma2", "embedding_gemma2_text")
 def _embedding_gemma2_vision(config, parent_config, model_type, fields):
     parent = parent_config or config
-    vc = _as_attribute_config(getattr(parent, "vision_config", None))
+    vc = getattr(parent, "vision_config", None)
+    vc = SimpleNamespace(**vc) if isinstance(vc, dict) else vc
     if vc is None:
         return None
     rope = vc.rope_parameters

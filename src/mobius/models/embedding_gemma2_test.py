@@ -101,6 +101,10 @@ def test_embedding_gemma2_rejects_unqualified_precision(dtype):
         EmbeddingGemma2Model(tiny_config(dtype=dtype))
     config = tiny_config()
     module = EmbeddingGemma2Model(config)
+    with pytest.raises(ValueError, match="float32 only"):
+        build_from_module(
+            module, dataclasses.replace(config, dtype=dtype), task="embedding-gemma2"
+        )
     config.dtype = dtype
     with pytest.raises(ValueError, match="float32 only"):
         build_from_module(module, config, task="embedding-gemma2")
@@ -204,12 +208,13 @@ def test_embedding_gemma2_media_pipeline(tmp_path):
         text_config=text,
         vision_config=vision,
         audio_config=audio,
-        image_token_id=60,
-        video_token_id=61,
-        audio_token_id=62,
+        image_token_id=64,
+        video_token_id=65,
+        audio_token_id=66,
     )
     reference = HFModel(hf_config).eval()
-    config = EmbeddingGemma2Config.from_transformers(hf_config)
+    config = EmbeddingGemma2Config.from_transformers(hf_config.to_dict())
+    assert config == EmbeddingGemma2Config.from_transformers(hf_config)
     module = EmbeddingGemma2Model(config)
     package = build_from_module(module, config, task="embedding-gemma2")
     package.apply_weights(module.preprocess_weights(reference.state_dict()))
@@ -238,7 +243,7 @@ def test_embedding_gemma2_media_pipeline(tmp_path):
     # Distinct rows exercise flattened-batch offsets and separate video ordering.
     sound_tokens = encoded_sound.shape[0]
     ids = torch.tensor(
-        [[2, 60, *([62] * sound_tokens), 1], [2, 61, *([62] * sound_tokens), 1]]
+        [[2, 64, *([66] * sound_tokens), 1], [2, 65, *([66] * sound_tokens), 1]]
     )
     mask = torch.ones_like(ids)
     positions = torch.arange(ids.shape[1]).expand_as(ids)
