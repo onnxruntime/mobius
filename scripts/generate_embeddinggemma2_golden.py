@@ -74,7 +74,11 @@ def generate(output: Path) -> None:
         ),
     ]
     scenarios = [
-        ("text", {"text": ["Here is my poem:", "A much shorter poem."], "padding": True}),
+        ("text", {"text": ["Here is my poem:", "Poem."], "padding": True}),
+        (
+            "sliding_boundary",
+            {"text": "A small orange cat rests quietly beside an open window. " * 64},
+        ),
         (
             "image",
             {
@@ -117,6 +121,10 @@ def generate(output: Path) -> None:
         inputs = {
             key: value for key, value in inputs.items() if isinstance(value, torch.Tensor)
         }
+        if name == "text":
+            assert (inputs["attention_mask"] == 0).any(), "Text fixture must exercise padding."
+        if name == "sliding_boundary":
+            assert inputs["input_ids"].shape[1] > reference.config.text_config.sliding_window
         with torch.no_grad():
             tokens = reference(**{key: value.cuda() for key, value in inputs.items()})
             hidden = tokens.last_hidden_state.float()
