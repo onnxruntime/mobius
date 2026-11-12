@@ -23,10 +23,6 @@ concurrency:
 
 jobs:
   embedding-parity:
-    env:
-      HF_HOME: ${{ runner.temp }}/embeddinggemma-hf-cache
-      HF_HUB_CACHE: ${{ runner.temp }}/embeddinggemma-hf-cache/hub
-      HF_XET_CACHE: ${{ runner.temp }}/embeddinggemma-hf-cache/xet
     runs-on:
       - self-hosted
       - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
@@ -34,6 +30,11 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+      - name: Configure isolated model cache
+        run: |
+          echo "HF_HOME=$RUNNER_TEMP/embeddinggemma-hf-cache" >> "$GITHUB_ENV"
+          echo "HF_HUB_CACHE=$RUNNER_TEMP/embeddinggemma-hf-cache/hub" >> "$GITHUB_ENV"
+          echo "HF_XET_CACHE=$RUNNER_TEMP/embeddinggemma-hf-cache/xet" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
