@@ -57,6 +57,7 @@ jobs:
           python -c "import torch, onnxruntime as ort; assert torch.cuda.is_available(); assert 'CUDAExecutionProvider' in ort.get_available_providers(); print(torch.__version__, ort.__version__, torch.cuda.get_device_name())"
           python -m pytest src/mobius/models/embedding_gemma2_test.py -v --junitxml="$RUNNER_TEMP/embedding-l3.xml"
       - name: Generate independent reference goldens
+        id: reference
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
@@ -69,15 +70,16 @@ jobs:
           MOBIUS_EMBEDDING_GOLDEN_DIR: ${{ runner.temp }}/embedding-goldens
         run: |
           source "$RUNNER_TEMP/embedding-venv/bin/activate"
-          python -m pytest tests/embedding_gemma2_golden_test.py -m golden -v --junitxml="$RUNNER_TEMP/embedding-l4.xml"
+          python -m pytest tests/embedding_gemma2_golden_test.py -m golden -v -s --junitxml="$RUNNER_TEMP/embedding-l4.xml"
       - name: GPU L5 semantic retrieval
+        if: ${{ !cancelled() && steps.reference.outcome == 'success' }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MOBIUS_TEST_DEVICE: cuda
           MOBIUS_EMBEDDING_GOLDEN_DIR: ${{ runner.temp }}/embedding-goldens
         run: |
           source "$RUNNER_TEMP/embedding-venv/bin/activate"
-          python -m pytest tests/embedding_gemma2_golden_test.py -m generation -v --junitxml="$RUNNER_TEMP/embedding-l5.xml"
+          python -m pytest tests/embedding_gemma2_golden_test.py -m generation -v -s --junitxml="$RUNNER_TEMP/embedding-l5.xml"
       - name: Retain reference goldens and exact test evidence
         if: always()
         uses: actions/upload-artifact@v7

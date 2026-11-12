@@ -111,13 +111,33 @@ def replay(*, level: str) -> None:
             for output_name in ("last_hidden_state", "sentence_embedding"):
                 expected = arrays[f"{name}/output/{output_name}"]
                 assert outputs[output_name].shape == expected.shape
-                np.testing.assert_allclose(
-                    outputs[output_name],
-                    expected,
-                    atol=1e-3,
-                    rtol=1e-3,
-                    err_msg=f"{name}/{output_name}",
+                difference = outputs[output_name] - expected
+                relative_error = np.linalg.norm(difference, axis=-1) / np.maximum(
+                    np.linalg.norm(expected, axis=-1), 1e-12
                 )
+                print(
+                    f"{name}/{output_name}: "
+                    f"max_abs={np.abs(difference).max():.8g}, "
+                    f"max_vector_relative_l2={relative_error.max():.8g}",
+                    flush=True,
+                )
+                if output_name == "last_hidden_state":
+                    # Near-zero projected channels suffer cancellation: even
+                    # native HF CPU/CUDA fails elementwise 1e-3 on long inputs.
+                    # Bound the error of every complete, unnormalized vector.
+                    np.testing.assert_array_less(
+                        relative_error,
+                        5e-4,
+                        err_msg=f"{name}/{output_name}",
+                    )
+                else:
+                    np.testing.assert_allclose(
+                        outputs[output_name],
+                        expected,
+                        atol=1e-4,
+                        rtol=1e-4,
+                        err_msg=f"{name}/{output_name}",
+                    )
             actual_embeddings[name] = outputs["sentence_embedding"]
     if level == "L5":
         semantic = json.loads((root / "embeddinggemma-2_retrieval.json").read_text())
