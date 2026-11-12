@@ -284,6 +284,9 @@ integration test alongside any new custom function or Scan op.**
   features, mixed modality order, and a decode step with zero new media
 - **Hybrid caches** — include left-padded batch > 1, cached multi-token chunks
   crossing a sliding-window boundary, and full logits at every reused-state step.
+- **Absent attention history** — omit optional past inputs (`None, None`) rather
+  than supplying zero-length KV tensors while discarding present outputs; CPU
+  acceptance does not prove CUDA validity, so check the graph and both providers.
 
 ### Golden tests must be reproducible and exact
 
