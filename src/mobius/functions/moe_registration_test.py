@@ -15,7 +15,6 @@ from onnx_ir.passes import PreconditionError
 from onnx_ir.passes.common import InlinePass
 from onnxscript._internal.builder import build_function
 
-import mobius.functions as functions
 from mobius._build_context import build_context, get_build_opset_version
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import override_flags
@@ -30,6 +29,7 @@ from mobius.components import (
     create_body_graph,
 )
 from mobius.functions import (
+    _config_identity,
     causal_conv1d_with_state,
     causal_conv_nd_with_state,
     get_function,
@@ -83,9 +83,14 @@ def test_build_opset_selected_before_builder_and_snapshotted(enabled, native):
         assert explicit.opset_imports[""] == 24
         with override_flags(experimental_opset29=not enabled):
             assert get_build_opset_version() == expected
-        with pytest.raises(RuntimeError), build_context(ep_registry.require("cpu")):
-            assert get_build_opset_version() == 24
-            raise RuntimeError("restore")
+
+        def fail_in_nested_build():
+            with build_context(ep_registry.require("cpu")):
+                assert get_build_opset_version() == 24
+                raise RuntimeError("restore")
+
+        with pytest.raises(RuntimeError, match="restore"):
+            fail_in_nested_build()
         assert get_build_opset_version() == expected
     assert get_build_opset_version() == 24
 
@@ -266,7 +271,6 @@ def test_all_targets_validated_before_schema_or_body_construction(
         inner = make_model(opset=24).graph
         inner.inputs.extend(inner.initializers.values())
         inner.initializers.clear()
-        second = next(iter(inner))
         function = ir.Function("test", "Experts", graph=inner, attributes=[])
         model.functions[function.identifier()] = function
     else:
@@ -288,7 +292,7 @@ def test_all_targets_validated_before_schema_or_body_construction(
                 overload = second.overload = "caller"
             else:
                 validate = validate_moe if second.op_type == "MoE" else validate_qmoe
-                identity = functions._config_identity(validate(second))
+                identity = _config_identity(validate(second))
                 overload = "mobius_" + hashlib.sha256(identity.encode()).hexdigest()
             function = ir.Function(
                 first.domain,
@@ -303,8 +307,8 @@ def test_all_targets_validated_before_schema_or_body_construction(
         pytest.fail("All targets must be validated before schema checks or body construction")
 
     monkeypatch.setattr(onnx.defs, "has", unexpected_schema_or_build)
-    monkeypatch.setattr(functions, "moe", unexpected_schema_or_build)
-    monkeypatch.setattr(functions, "qmoe", unexpected_schema_or_build)
+    monkeypatch.setattr("mobius.functions.moe", unexpected_schema_or_build)
+    monkeypatch.setattr("mobius.functions.qmoe", unexpected_schema_or_build)
     before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
     ir.save(model, before)
     with pytest.raises(ValueError, match=message):
@@ -485,7 +489,14 @@ def test_passthrough_function_preserves_call_output_annotations(version):
         graph=ir.Graph([formal], [formal], nodes=[], opset_imports={"": version}),
         attributes=[],
     )
-    x = ir.Value(name="x", type=formal.type, shape=formal.shape)
+    x = ir.Value(
+        name="x",
+        type=formal.type,
+        shape=formal.shape,
+        doc_string="input docs",
+        metadata_props={"label": "input"},
+    )
+    input_marker = x.meta["marker"] = object()
     result = ir.Value(
         name="y",
         type=x.type,
@@ -500,13 +511,103 @@ def test_passthrough_function_preserves_call_output_annotations(version):
         functions=[function],
         ir_version=10,
     )
-    _inline_function_bodies(model, lambda function: True)
+    with override_flags(experimental_opset29=version == 29):
+        _inline_function_bodies(model, lambda function: True)
     output = model.graph.outputs[0]
-    assert not list(model.graph)
+    assert output is not x
+    assert x.name == "x" and x.doc_string == "input docs"
+    assert x.metadata_props == {"label": "input"}
+    assert x.meta["marker"] is input_marker
+    assert [node.op_type for node in model.graph] == ["Identity"]
     assert output.name == "y" and output.doc_string == "call output"
     assert output.metadata_props["label"] == "preserved"
     assert output.meta["marker"] is marker
     assert output.type == x.type and output.shape == x.shape
+    assert function.outputs[0] is formal and not list(function.graph)
+
+
+def test_passthrough_shared_upstream_keeps_separate_output_boundaries():
+    formal = ir.Value(name="formal")
+    function = ir.Function(
+        "test",
+        "Passthrough",
+        graph=ir.Graph([formal], [formal], nodes=[], opset_imports={"": 24}),
+        attributes=[],
+    )
+    x = ir.Value(name="x")
+    upstream = ir.Node(
+        "", "Identity", [x], outputs=[ir.Value(name="upstream", doc_string="upstream docs")]
+    )
+    source = upstream.outputs[0]
+    source.metadata_props["label"] = "source"
+    source.meta["marker"] = object()
+    calls = [
+        ir.Node(
+            "test",
+            "Passthrough",
+            [source],
+            outputs=[
+                ir.Value(name=f"y{i}", doc_string=f"docs{i}", metadata_props={"label": str(i)})
+            ],
+        )
+        for i in range(2)
+    ]
+    model = ir.Model(
+        ir.Graph(
+            [x],
+            [source, *(call.outputs[0] for call in calls)],
+            nodes=[upstream, *calls],
+            opset_imports={"": 24, "test": 1},
+        ),
+        functions=[function],
+        ir_version=10,
+    )
+    _inline_function_bodies(model, lambda function: True)
+    assert model.graph.outputs[0] is source
+    assert source.name == "upstream" and source.doc_string == "upstream docs"
+    assert source.metadata_props == {"label": "source"}
+    for i, output in enumerate(model.graph.outputs[1:]):
+        assert output is not source and output.name == f"y{i}"
+        assert output.doc_string == f"docs{i}" and output.metadata_props["label"] == str(i)
+
+
+@requires_schema
+@pytest.mark.parametrize("make_model", [float_model, quantized_model])
+def test_registered_not_inlined_save_load_reregister_is_stable(make_model, tmp_path):
+    model = make_model(clipped=True)
+    register_function_bodies(model, moe_fallback=True)
+    original = next(iter(model.graph))
+    overload, identifiers = original.overload, set(model.functions)
+    path = tmp_path / "registered.onnx"
+    ir.save(model, path)
+    loaded = ir.load(path)
+    call = next(iter(loaded.graph))
+    assert call.domain == "com.microsoft" and call.overload == overload
+    assert call.attributes.get_float("activation_alpha").hex() == (1.7000000476837158).hex()
+    register_function_bodies(loaded, moe_fallback=True)
+    assert call.overload == overload and set(loaded.functions) == identifiers
+    # Compare executable copies, leaving both saved/registered graphs uninlined.
+    import numpy as np
+
+    from mobius._testing.ort_inference import OnnxModelSession
+    from mobius.functions._lowering_test_utils import expand_grouped_matmul
+    from mobius.functions._moe_test_utils import inline_native_calls
+    from mobius.functions.moe_test import _feeds as float_feeds
+    from mobius.functions.qmoe_test import _feeds as quantized_feeds
+
+    feeds = float_feeds() if call.op_type == "MoE" else quantized_feeds()
+    results = []
+    for registered in (model, loaded):
+        executable = registered.clone()
+        inline_native_calls(executable)
+        expand_grouped_matmul(executable)
+        session = OnnxModelSession(executable, device="cpu")
+        try:
+            results.append(session.run(feeds)["y"])
+        finally:
+            session.close()
+    assert np.isfinite(results[0]).all()
+    np.testing.assert_array_equal(results[0], results[1])
 
 
 @requires_schema

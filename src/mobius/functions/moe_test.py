@@ -15,12 +15,48 @@ from mobius._flags import override_flags
 from mobius.functions import get_function, register_function_bodies
 from mobius.functions._lowering_test_utils import expand_grouped_matmul
 from mobius.functions._moe_test_utils import inline_native_calls
+from mobius.functions.moe import MoEFunctionConfig, moe
 
 ort = pytest.importorskip("onnxruntime")
 _requires_opset29 = pytest.mark.skipif(
     not onnx.defs.has("GroupedMatMul", 29),
     reason="Official ONNX opset-29 GroupedMatMul schema is required (ONNX >=1.24)",
 )
+
+
+@pytest.mark.parametrize(
+    "changes,message",
+    [
+        ({"activation": "geglu"}, "activation_type"),
+        ({"experts": 0}, "dimensions"),
+        ({"hidden": -1}, "dimensions"),
+        ({"intermediate": 1.5}, "dimensions"),
+        ({"k": 0}, "k must"),
+        ({"k": 4}, "k must"),
+        ({"alpha": float("inf")}, "finite"),
+        ({"beta": float("nan")}, "finite"),
+        ({"alpha": 1e100}, "finite"),
+        ({"limit": float("nan")}, "nonnegative"),
+        ({"limit": -0.1}, "nonnegative"),
+        ({"limit": -1e-100}, "nonnegative"),
+        ({"dtype": ir.DataType.BFLOAT16}, "FLOAT"),
+    ],
+)
+def test_direct_factory_rejects_invalid_config_before_build(changes, message):
+    kwargs = dict(
+        experts=3,
+        hidden=4,
+        intermediate=3,
+        k=2,
+        activation="swiglu",
+        normalize=True,
+        alpha=1.0,
+        beta=0.0,
+        limit=float("inf"),
+    )
+    kwargs.update(changes)
+    with pytest.raises(ValueError, match=message):
+        moe(MoEFunctionConfig(**kwargs))
 
 
 def _require_native_cpu(dtype):

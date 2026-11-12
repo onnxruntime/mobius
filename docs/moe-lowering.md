@@ -21,16 +21,23 @@ the normal EP-controlled `InlinePass` expands them. There is no separate
 Flag-off behavior is unchanged. Native-capable EPs keep opset 24 and native
 calls without fallback ABI restrictions, even with the flag enabled. The global
 `OPSET_VERSION` remains 24. Generic `MoELayer` dense dispatch and arbitrary
-gates/experts are unchanged. Only Gemma4's FLOAT/FLOAT16 raw-logit SwiGLU
+gates/experts are unchanged. Only Gemma4's FLOAT raw-logit SwiGLU
 path additionally reuses native call construction on fallback EPs. GEGLU,
 BFLOAT16, sigmoid/SparseMixer routing, and Qwen4's probability-based dispatch
 retain their existing paths/restrictions; probabilities must not be softmaxed twice.
+Gemma4 FLOAT16 retains dense dispatch to preserve its activation and weighted
+contribution rounding boundaries. The FLOAT fallback consumes any remaining
+per-expert scale (including partial updates); already-folded scales are ones.
 
 This replaces `com.microsoft::MoE` with two standard `GroupedMatMul-29` calls,
 targeting the pinned **CPU reference**, not all execution providers. It requires
 ONNX opset-29 schemas and a runtime implementing them. ORT 1.31.1 cannot execute these
 graphs directly; tests expand GroupedMatMul on a test copy at opset 24. There is
 no production expansion or performance/memory-use promise.
+The experimental schema environment uses the tested ONNX 1.24 source build,
+IR 1.1.0, and onnxscript 0.7.2 combination; see the
+[schema compatibility requirements](qmoe-lowering.md#runtime-and-validation).
+Default dependency minimums are unchanged.
 
 ## Supported ABI
 
@@ -52,6 +59,10 @@ no production expansion or performance/memory-use promise.
   Defaults: alpha=1, beta=0, L=infinity. Alpha/beta must be finite; L must be
   nonnegative and not NaN (infinity allowed). As in CPU, these attributes have
   no effect on non-SwiGLU activations.
+  Config validation also applies to direct `moe(MoEFunctionConfig(...))` calls.
+  Alpha, beta, and limit use ONNX FLOAT (binary32) precision in both body
+  constants and specialization identities, so saved registered calls can be
+  loaded and registered again without changing their overloads.
 * `normalize_routing_weights` defaults to **0** and must be 0 or 1.
   `use_sparse_mixer` and `swiglu_limit_after_activation` must be absent or 0.
 

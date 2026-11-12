@@ -6,13 +6,13 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import onnx_ir as ir
 from onnxscript import OpBuilder
 from onnxscript._internal.builder import build_function
 
-from mobius.functions._moe_utils import validate_output_metadata
+from mobius.functions._moe_utils import validate_config_parameters, validate_output_metadata
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,27 @@ class MoEFunctionConfig:
 
 def _error(message: str) -> ValueError:
     return ValueError(f"MoE fallback: {message}")
+
+
+def _validate_activation(activation: str) -> None:
+    if activation not in {"relu", "gelu", "silu", "identity", "swiglu"}:
+        raise _error("activation_type must be relu, gelu, silu, identity, or swiglu")
+
+
+def _validate_config(config: MoEFunctionConfig) -> MoEFunctionConfig:
+    _validate_activation(config.activation)
+    alpha, beta, limit = validate_config_parameters(
+        experts=config.experts,
+        hidden=config.hidden,
+        intermediate=config.intermediate,
+        k=config.k,
+        alpha=config.alpha,
+        beta=config.beta,
+        limit=config.limit,
+        dtype=config.dtype,
+        caller="MoE fallback",
+    )
+    return replace(config, alpha=alpha, beta=beta, limit=limit)
 
 
 def _input(node: ir.Node, index: int) -> ir.Value | None:
@@ -70,8 +91,7 @@ def validate_call(node: ir.Node) -> MoEFunctionConfig:
             raise _error(f"attribute {name} must be a literal {allowed[name].name}")
     attrs = node.attributes
     activation = attrs.get_string("activation_type", "")
-    if activation not in {"relu", "gelu", "silu", "identity", "swiglu"}:
-        raise _error("activation_type must be relu, gelu, silu, identity, or swiglu")
+    _validate_activation(activation)
     fusion = attrs.get_int("swiglu_fusion", 0)
     if fusion != (1 if activation == "swiglu" else 0):
         raise _error("swiglu_fusion must be 1 for swiglu and 0 otherwise")
@@ -84,8 +104,6 @@ def validate_call(node: ir.Node) -> MoEFunctionConfig:
     alpha = attrs.get_float("activation_alpha", 1.0)
     beta = attrs.get_float("activation_beta", 0.0)
     limit = attrs.get_float("swiglu_limit", math.inf)
-    if not math.isfinite(alpha) or not math.isfinite(beta) or math.isnan(limit) or limit < 0:
-        raise _error("activation alpha/beta must be finite and swiglu_limit nonnegative")
     if len(node.outputs) != 1:
         raise _error("MoE must have exactly one output")
     if len(node.inputs) > 8:
@@ -146,27 +164,27 @@ def validate_call(node: ir.Node) -> MoEFunctionConfig:
         if math.prod(xs[:-1]) != rs[0]:
             raise _error("router_probs token dimension does not match input")
     validate_output_metadata(node, x, caller="MoE fallback")
-    return MoEFunctionConfig(
-        experts,
-        hidden,
-        intermediate,
-        k,
-        activation,
-        bool(normalize),
-        alpha,
-        beta,
-        limit,
-        x.dtype,
-        _input(node, 3) is not None,
-        _input(node, 5) is not None,
+    return _validate_config(
+        MoEFunctionConfig(
+            experts,
+            hidden,
+            intermediate,
+            k,
+            activation,
+            bool(normalize),
+            alpha,
+            beta,
+            limit,
+            x.dtype,
+            _input(node, 3) is not None,
+            _input(node, 5) is not None,
+        )
     )
 
 
 def moe(config: MoEFunctionConfig) -> ir.Function:
     """Create a fresh opset-29 reference body with all eight native input slots."""
-    c = config
-    if c.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16):
-        raise _error("only FLOAT and FLOAT16 are supported")
+    c = _validate_config(config)
 
     def body(op: OpBuilder, x, router, w1, bias1, w2, bias2, w3, bias3):
         half = c.dtype == ir.DataType.FLOAT16

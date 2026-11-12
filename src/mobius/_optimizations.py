@@ -401,6 +401,8 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
     in one pass, before their annotations can be restored at this boundary.
     """
     while True:
+        # Validate before adapting any alias boundaries, including empty selections.
+        common_passes.InlinePass(criteria=criteria).requires(model)
         selected = {
             identifier: function
             for identifier, function in model.functions.items()
@@ -419,6 +421,27 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
             # No selected leaves: let the public inliner report its cycle precondition.
             common_passes.InlinePass(criteria=criteria)(model)
             return
+        for identifier in leaves:
+            function = model.functions[identifier]
+            outputs = set(function.outputs)
+            if not outputs.intersection(function.inputs) and len(outputs) == len(
+                function.outputs
+            ):
+                continue
+            # Do not mutate caller-owned function objects. The public cloner
+            # preserves body annotations, metadata and lexical captures.
+            function = function.clone()
+            seen = set(function.inputs)
+            for index, value in enumerate(tuple(function.outputs)):
+                if value in seen:
+                    boundary = ir.Value(
+                        type=value.type,
+                        shape=value.shape.copy() if value.shape is not None else None,
+                    )
+                    function.graph.append(ir.Node("", "Identity", [value], outputs=[boundary]))
+                    function.outputs[index] = boundary
+                seen.add(value)
+            model.functions[identifier] = function
         annotations: list[
             tuple[ir.Graph, str | None, str | None, dict[str, str], dict[str, object]]
         ] = []
@@ -483,12 +506,11 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
             for graph in (root, *root.subgraphs())
         }
         for graph, output_name, doc, props, meta in annotations:
-            restored_value = values_by_graph.get(graph, {}).get(output_name)
-            if restored_value is not None:
-                if doc is not None:
-                    restored_value.doc_string = doc
-                restored_value.metadata_props.update(props)
-                restored_value.meta.update(meta)
+            restored_value = values_by_graph[graph][output_name]
+            if doc is not None:
+                restored_value.doc_string = doc
+            restored_value.metadata_props.update(props)
+            restored_value.meta.update(meta)
         if not result.modified:
             return
         # Recompute leaves: expansion can make their selected callers eligible.

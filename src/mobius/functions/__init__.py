@@ -33,6 +33,7 @@ import onnx_ir as ir
 
 from mobius._constants import OPSET_VERSION
 from mobius._flags import flags
+from mobius.functions._moe_utils import float32_parameters
 from mobius.functions.causal_conv import (
     causal_conv1d_with_state,
     causal_conv_nd_with_state,
@@ -134,6 +135,13 @@ def _config_identity(config: MoEFunctionConfig | QMoEFunctionConfig) -> str:
     # Encode floats as exact strings, including +inf (the native default limit).
     # RFC8785 and strict JSON numbers intentionally cannot represent infinity.
     fields = dataclasses.asdict(config)
+    fields.update(
+        zip(
+            ("alpha", "beta", "limit"),
+            float32_parameters(config.alpha, config.beta, config.limit),
+            strict=True,
+        )
+    )
     return json.dumps(
         {
             key: value.hex() if isinstance(value, float) else value
@@ -228,7 +236,7 @@ def _register_moe_bodies(model: ir.Model) -> None:
         if output.type is None:
             output.type = x.type
         if output.shape is None:
-            output.shape = x.shape
+            output.shape = x.shape.copy() if x.shape is not None else None
 
 
 def register_function_bodies(model: ir.Model, *, moe_fallback: bool = False) -> None:

@@ -19,6 +19,7 @@ from mobius.functions._lowering_test_utils import (
     expand_grouped_matmul as _expand_grouped_matmul,
 )
 from mobius.functions._moe_test_utils import inline_native_calls
+from mobius.functions.qmoe import QMoEFunctionConfig, qmoe
 
 ort = pytest.importorskip("onnxruntime")
 _requires_opset29 = pytest.mark.skipif(
@@ -32,6 +33,45 @@ _requires_native_cpu_qmoe = pytest.mark.skipif(
     ),
     reason="ORT CPU QMoE kernel is required for native parity",
 )
+
+
+@pytest.mark.parametrize(
+    "changes,message",
+    [
+        ({"experts": 0}, "dimensions"),
+        ({"hidden": -1}, "dimensions"),
+        ({"intermediate": 1.5}, "dimensions"),
+        ({"block": 0}, "power of two"),
+        ({"block": 8}, "power of two"),
+        ({"block": 24}, "power of two"),
+        ({"block": 16.0}, "power of two"),
+        ({"hidden": 31}, "divisible"),
+        ({"intermediate": 47}, "divisible"),
+        ({"k": 0}, "k must"),
+        ({"k": 4}, "k must"),
+        ({"alpha": float("inf")}, "finite"),
+        ({"beta": float("nan")}, "finite"),
+        ({"limit": float("nan")}, "nonnegative"),
+        ({"limit": -0.1}, "nonnegative"),
+        ({"limit": -1e-100}, "nonnegative"),
+        ({"dtype": ir.DataType.BFLOAT16}, "FLOAT"),
+    ],
+)
+def test_direct_factory_rejects_invalid_config_before_build(changes, message):
+    kwargs = dict(
+        experts=3,
+        hidden=32,
+        intermediate=48,
+        block=16,
+        k=2,
+        normalize=True,
+        alpha=1.0,
+        beta=0.0,
+        limit=float("inf"),
+    )
+    kwargs.update(changes)
+    with pytest.raises(ValueError, match=message):
+        qmoe(QMoEFunctionConfig(**kwargs))
 
 
 @pytest.fixture(autouse=True)

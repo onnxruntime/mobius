@@ -6,14 +6,18 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder
 from onnxscript._internal.builder import build_function
 
-from mobius.functions._moe_utils import validate_output_metadata
+from mobius.functions._moe_utils import (
+    validate_block,
+    validate_config_parameters,
+    validate_output_metadata,
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,22 @@ def _input(node: ir.Node, index: int) -> ir.Value | None:
 
 def _error(message: str) -> ValueError:
     return ValueError(f"QMoE fallback: {message}")
+
+
+def _validate_config(config: QMoEFunctionConfig) -> QMoEFunctionConfig:
+    alpha, beta, limit = validate_config_parameters(
+        experts=config.experts,
+        hidden=config.hidden,
+        intermediate=config.intermediate,
+        k=config.k,
+        alpha=config.alpha,
+        beta=config.beta,
+        limit=config.limit,
+        dtype=config.dtype,
+        caller="QMoE fallback",
+    )
+    validate_block(config.block, config.hidden, config.intermediate)
+    return replace(config, alpha=alpha, beta=beta, limit=limit)
 
 
 def _shape(value: ir.Value, name: str) -> tuple[int | ir.SymbolicDim, ...]:
@@ -105,8 +125,6 @@ def validate_call(node: ir.Node) -> QMoEFunctionConfig:
     alpha = attrs.get_float("activation_alpha", 1.0)
     beta = attrs.get_float("activation_beta", 0.0)
     limit = attrs.get_float("swiglu_limit", math.inf)
-    if not math.isfinite(alpha) or not math.isfinite(beta) or math.isnan(limit) or limit < 0:
-        raise _error("activation alpha/beta must be finite and swiglu_limit nonnegative")
     if len(node.outputs) != 1:
         raise _error("QMoE must have exactly one output")
     if len(node.inputs) > 15:
@@ -147,10 +165,7 @@ def validate_call(node: ir.Node) -> QMoEFunctionConfig:
     assert isinstance(experts, int) and isinstance(twice_intermediate, int)
     intermediate = twice_intermediate // 2
     block = attrs.get_int("block_size", 0)
-    if block < 16 or block & (block - 1):
-        raise _error("block_size must be a power of two >= 16")
-    if hidden % block or intermediate % block:
-        raise _error("hidden and intermediate dimensions must be divisible by block_size")
+    validate_block(block, hidden, intermediate)
     if s1 != (experts, 2 * intermediate, hidden // 2) or s2 != (
         experts,
         hidden,
@@ -202,28 +217,28 @@ def validate_call(node: ir.Node) -> QMoEFunctionConfig:
         ):
             raise _error(f"input {zp_index} zero points must be UINT8 [E,N,ceil(nblocks/2)]")
     validate_output_metadata(node, x, caller="QMoE fallback")
-    return QMoEFunctionConfig(
-        experts,
-        hidden,
-        intermediate,
-        block,
-        k,
-        bool(normalize),
-        alpha,
-        beta,
-        limit,
-        x.dtype,
-        _input(node, 11) is not None,
-        _input(node, 12) is not None,
-        rw is not None,
+    return _validate_config(
+        QMoEFunctionConfig(
+            experts,
+            hidden,
+            intermediate,
+            block,
+            k,
+            bool(normalize),
+            alpha,
+            beta,
+            limit,
+            x.dtype,
+            _input(node, 11) is not None,
+            _input(node, 12) is not None,
+            rw is not None,
+        )
     )
 
 
 def qmoe(config: QMoEFunctionConfig) -> ir.Function:
     """Create a fresh opset-29 body retaining all fifteen native positional slots."""
-    c = config
-    if c.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16):
-        raise _error("only FLOAT and FLOAT16 are supported")
+    c = _validate_config(config)
 
     def body(
         op: OpBuilder,
