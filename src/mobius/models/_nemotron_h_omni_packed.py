@@ -334,9 +334,22 @@ def _pack_moe(graph: ir.Graph, config: NemotronHOmniConfig, index: int):
             # routing, prepare a row denominator from the same full selection
             # scores; MoEPacked still selects and gathers its own expert routes.
             if normalize:
-                _, chosen = op.TopK(scores, [topk], axis=-1, largest=1, sorted=1, _outputs=2)
-                chosen_weights = op.GatherElements(mixing, chosen, axis=-1)
-                total = op.ReduceSum(chosen_weights, [-1], keepdims=1)
+                # Match native lower-index tie breaking and rank-ordered FP32
+                # addition; CUDA TopK and tree reductions can change the denominator.
+                remaining = scores
+                total = None
+                mask = None
+                for rank in range(topk):
+                    chosen = op.ArgMax(remaining, axis=-1, keepdims=1, select_last_index=0)
+                    chosen_weight = op.GatherElements(mixing, chosen, axis=-1)
+                    total = chosen_weight if total is None else op.Add(total, chosen_weight)
+                    if rank + 1 < topk:
+                        if mask is None:
+                            mask = op.ConstantOfShape(
+                                op.Shape(chosen),
+                                value=ir.tensor([-float("inf")], dtype=ir.DataType.FLOAT),
+                            )
+                        remaining = op.ScatterElements(remaining, chosen, mask, axis=-1)
                 mixing = op.Div(mixing, op.Add(total, 1e-20))
             mixing = op.Mul(mixing, layer.routed_scaling_factor)
             normalize = 0

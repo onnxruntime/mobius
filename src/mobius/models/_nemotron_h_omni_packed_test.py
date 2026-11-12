@@ -207,9 +207,7 @@ def test_compact_decoder_wires_full_fp32_routing_without_compact_ids(normalize, 
             assert scaled.op_type == "Mul"
             assert scaled.inputs[1].const_value.numpy().item() == np.float32(scale)
             assert next(iter(consumer.outputs[0].uses())).node.op_type != "Cast"
-    assert sum(node.op_type == "TopK" for node in graph) == (
-        len(consumers) if normalize and scale != 1.0 else 0  # noqa: RUF069
-    )
+    assert not any(node.op_type == "TopK" for node in graph)
     assert not any(
         node.op_type in {"MoEPackedIQ2XXS", "MatMulPackedIQ2XXS", "MatMulPackedQ8"}
         for node in graph.all_nodes()
@@ -225,12 +223,17 @@ def test_compact_decoder_wires_full_fp32_routing_without_compact_ids(normalize, 
     )
 
 
-@pytest.mark.parametrize("topk", [1, 2])
+@pytest.mark.parametrize("provider", ["CPUExecutionProvider", "CUDAExecutionProvider"])
+@pytest.mark.parametrize("topk", [1, 2, 8])
 @pytest.mark.parametrize("normalize", [False, True])
-def test_compact_decoder_prescales_selected_mixing_in_fp32(tmp_path, topk, normalize):
-    graph = optimize_nemotron_h_omni_cuda(_fixture(topk=topk, normalize=normalize, scale=5.0))[
-        "decoder"
-    ].graph
+def test_compact_decoder_prescales_selected_mixing_in_fp32(
+    tmp_path, topk, normalize, provider
+):
+    if provider not in ort.get_available_providers():
+        pytest.skip(f"{provider} is unavailable")
+    graph = optimize_nemotron_h_omni_cuda(
+        _fixture(topk=topk, experts=8, normalize=normalize, scale=5.0)
+    )["decoder"].graph
     router = next(node for node in graph if node.op_type == "MoEGroupRouter")
     consumer = next(node for node in graph if node.op_type == "MoEPacked")
     preparation = ir.convenience.extract(
@@ -238,18 +241,37 @@ def test_compact_decoder_prescales_selected_mixing_in_fp32(tmp_path, topk, norma
     )
     path = tmp_path / "mixing.onnx"
     ir.save(ir.Model(preparation, ir_version=10), path)
-    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    scores = np.array([[0.7, 0.9, 0.9, 0.6], [0.2, 0.5, 0.1, 0.4]], np.float32)
-    mixing = np.array([[0.8, 0.2, 0.6, 0.9], [0, 0, 0, 0]], np.float32)
+    session = ort.InferenceSession(str(path), providers=[provider])
+    assert session.get_providers()[0] == provider
+    scores = np.array(
+        [
+            [30, 29.577760696411133, 29.577760696411133, 4, 3, 2, 1, 0],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [7, 6, 5, 4, 3, 2, 1, 0],
+        ],
+        np.float32,
+    )
+    mixing = np.array(
+        [
+            [0.8, 0.2, 0.6, 0.9, 0.3, 0.4, 0.5, 0.1],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 2**-24, 2**-24, 2**-24, 2**-24, 2**-24, 2**-24, 2**-24],
+        ],
+        np.float32,
+    )
     actual = session.run(
         None, dict(zip([value.name for value in preparation.inputs], [scores, mixing]))
     )[0]
     chosen = np.argsort(-scores, axis=-1, kind="stable")[:, :topk]
-    expected = np.take_along_axis(mixing, chosen, axis=-1)
+    expected = mixing
     if normalize:
-        expected = expected / (expected.sum(axis=-1, keepdims=True) + np.float32(1e-20))
+        selected = np.take_along_axis(mixing, chosen, axis=-1)
+        total = selected[:, :1].copy()
+        for rank in range(1, topk):
+            total = total + selected[:, rank : rank + 1]
+        expected = expected / (total + np.float32(1e-20))
     expected = expected * np.float32(5.0)
-    np.testing.assert_array_equal(np.take_along_axis(actual, chosen, axis=-1), expected)
+    np.testing.assert_array_equal(actual, expected)
     assert actual.dtype == np.float32
     assert np.isfinite(actual).all()
 
