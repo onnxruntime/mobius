@@ -138,10 +138,14 @@ def validate_call(node: ir.Node) -> QMoEFunctionConfig:
 
     x, router = node.inputs[:2]
     assert x is not None and router is not None
-    xs = _shape(x, "input")
-    if len(xs) not in (2, 3) or not isinstance(xs[-1], int) or xs[-1] <= 0:
+    input_shape = _shape(x, "input")
+    if (
+        len(input_shape) not in (2, 3)
+        or not isinstance(input_shape[-1], int)
+        or input_shape[-1] <= 0
+    ):
         raise _error("input must be rank 2 or 3 with a positive static hidden dimension")
-    hidden = xs[-1]
+    hidden = input_shape[-1]
     # The raw CPU kernel lifts half inputs/scales to FLOAT and keeps both GEMMs,
     # SwiGLU, and routing accumulation in FLOAT, casting only the final output.
     if x.dtype not in (ir.DataType.FLOAT, ir.DataType.FLOAT16):
@@ -154,19 +158,22 @@ def validate_call(node: ir.Node) -> QMoEFunctionConfig:
             )
     w1, w2 = node.inputs[2], node.inputs[5]
     assert w1 is not None and w2 is not None
-    s1, s2 = _shape(w1, "fc1 weights"), _shape(w2, "fc2 weights")
+    first_weight_shape = _shape(w1, "fc1 weights")
+    down_weight_shape = _shape(w2, "fc2 weights")
     if (
-        len(s1) != 3
-        or len(s2) != 3
-        or any(not isinstance(d, int) or d <= 0 for d in (*s1, *s2))
+        len(first_weight_shape) != 3
+        or len(down_weight_shape) != 3
+        or any(
+            not isinstance(d, int) or d <= 0 for d in (*first_weight_shape, *down_weight_shape)
+        )
     ):
         raise _error("packed weights require positive static rank-3 shapes")
-    experts, twice_intermediate, _ = s1
+    experts, twice_intermediate, _ = first_weight_shape
     assert isinstance(experts, int) and isinstance(twice_intermediate, int)
     intermediate = twice_intermediate // 2
     block = attrs.get_int("block_size", 0)
     validate_block(block, hidden, intermediate)
-    if s1 != (experts, 2 * intermediate, hidden // 2) or s2 != (
+    if first_weight_shape != (experts, 2 * intermediate, hidden // 2) or down_weight_shape != (
         experts,
         hidden,
         intermediate // 2,
@@ -175,31 +182,35 @@ def validate_call(node: ir.Node) -> QMoEFunctionConfig:
     k = attrs.get_int("k", 0)
     if not 1 <= k <= experts:
         raise _error(f"k must be between 1 and num_experts ({experts})")
-    rs = _shape(router, "router_probs")
-    if len(rs) != 2 or rs[1] != experts:
+    router_shape = _shape(router, "router_probs")
+    if len(router_shape) != 2 or router_shape[1] != experts:
         raise _error("router_probs must have shape [tokens, experts]")
-    if all(isinstance(d, int) for d in xs[:-1]) and isinstance(rs[0], int):
-        if math.prod(xs[:-1]) != rs[0]:
+    if all(isinstance(d, int) for d in input_shape[:-1]) and isinstance(router_shape[0], int):
+        if math.prod(input_shape[:-1]) != router_shape[0]:
             raise _error("router_probs token dimension does not match input")
-    rw = _input(node, 14)
-    if rw is not None:
-        rws = _shape(rw, "router_weights")
+    router_weights = _input(node, 14)
+    if router_weights is not None:
+        router_weight_shape = _shape(router_weights, "router_weights")
         # Symbol names are annotations, not proof of unequal runtime counts.
         # Feeds must have equal token counts even when metadata cannot prove it.
         if (
-            len(rws) != 2
-            or rws[1] != experts
-            or (isinstance(rws[0], int) and isinstance(rs[0], int) and rws[0] != rs[0])
+            len(router_weight_shape) != 2
+            or router_weight_shape[1] != experts
             or (
-                isinstance(rws[0], int)
-                and all(isinstance(d, int) for d in xs[:-1])
-                and math.prod(xs[:-1]) != rws[0]
+                isinstance(router_weight_shape[0], int)
+                and isinstance(router_shape[0], int)
+                and router_weight_shape[0] != router_shape[0]
+            )
+            or (
+                isinstance(router_weight_shape[0], int)
+                and all(isinstance(d, int) for d in input_shape[:-1])
+                and math.prod(input_shape[:-1]) != router_weight_shape[0]
             )
         ):
             raise _error(
                 "router_weights must be rank 2 with E experts and compatible token counts"
             )
-    for weight_index, scale_index, zp_index, n, width in (
+    for weight_index, scale_index, zero_point_index, rows, width in (
         (2, 3, 11, 2 * intermediate, hidden),
         (5, 6, 12, hidden, intermediate),
     ):
@@ -208,14 +219,17 @@ def validate_call(node: ir.Node) -> QMoEFunctionConfig:
         if weight.dtype != ir.DataType.UINT8:
             raise _error(f"input {weight_index} must be packed UINT8")
         blocks = width // block
-        if _shape(scale, f"input {scale_index} scales") != (experts, n, blocks):
+        if _shape(scale, f"input {scale_index} scales") != (experts, rows, blocks):
             raise _error(f"input {scale_index} scales must have shape [E,N,K/block_size]")
-        zp = _input(node, zp_index)
-        if zp is not None and (
-            zp.dtype != ir.DataType.UINT8
-            or _shape(zp, f"input {zp_index} zero points") != (experts, n, (blocks + 1) // 2)
+        zero_points = _input(node, zero_point_index)
+        if zero_points is not None and (
+            zero_points.dtype != ir.DataType.UINT8
+            or _shape(zero_points, f"input {zero_point_index} zero points")
+            != (experts, rows, (blocks + 1) // 2)
         ):
-            raise _error(f"input {zp_index} zero points must be UINT8 [E,N,ceil(nblocks/2)]")
+            raise _error(
+                f"input {zero_point_index} zero points must be UINT8 [E,N,ceil(nblocks/2)]"
+            )
     validate_output_metadata(node, x, caller="QMoE fallback")
     return _validate_config(
         QMoEFunctionConfig(
@@ -231,7 +245,7 @@ def validate_call(node: ir.Node) -> QMoEFunctionConfig:
             x.dtype,
             _input(node, 11) is not None,
             _input(node, 12) is not None,
-            rw is not None,
+            router_weights is not None,
         )
     )
 
@@ -253,10 +267,10 @@ def qmoe(config: QMoEFunctionConfig) -> ir.Function:
         w3,
         scale3,
         bias3,
-        zp1,
-        zp2,
-        zp3,
-        rw,
+        zero_points1,
+        zero_points2,
+        zero_points3,
+        router_weights,
     ):
         half = c.dtype == ir.DataType.FLOAT16
 
@@ -270,6 +284,8 @@ def qmoe(config: QMoEFunctionConfig) -> ir.Function:
             return op.Cast(value, to=ir.DataType.FLOAT) if half else value
 
         def unpack(packed, shape: list[int]):
+            # TODO: Use a standard raw nibble-unpack operator if ONNX adds one.
+            # BitCast requires equal bit widths; DequantizePacked is GGUF-specific.
             mask = op.Constant(value=ir.tensor(np.uint8(15)))
             shift = op.Constant(value=ir.tensor(np.uint8(4)))
             low = op.BitwiseAnd(packed, mask)
@@ -279,13 +295,16 @@ def qmoe(config: QMoEFunctionConfig) -> ir.Function:
             )
             return op.Reshape(pairs, ints(shape))
 
-        def dequantize(packed, scale, zp, has_zp: bool, n: int, width: int):
-            weights = op.Cast(unpack(packed, [c.experts, n, width]), to=ir.DataType.UINT4)
+        def dequantize(
+            packed, scale, zero_points, has_zero_points: bool, rows: int, width: int
+        ):
+            weights = op.Cast(unpack(packed, [c.experts, rows, width]), to=ir.DataType.UINT4)
             blocks = width // c.block
-            if has_zp:
-                zeros = unpack(zp, [c.experts, n, -1])
+            if has_zero_points:
+                zeros = unpack(zero_points, [c.experts, rows, -1])
                 zeros = op.Slice(zeros, ints([0]), ints([blocks]), ints([2]))
             else:
+                # Native QMoE defaults to 8, whereas omitted ONNX DQ zeros mean 0.
                 zeros = op.ConstantOfShape(
                     op.Shape(scale), value=ir.tensor(np.array([8], dtype=np.uint8))
                 )
@@ -294,11 +313,13 @@ def qmoe(config: QMoEFunctionConfig) -> ir.Function:
 
         router, scale1, scale2 = compute(router), compute(scale1), compute(scale2)
         # QMoE selects logits first, with descending expert-ID ties.
-        reversed_router = op.Gather(router, ints(list(range(c.experts - 1, -1, -1))), axis=1)
+        reversed_router = op.Slice(
+            router, ints([c.experts - 1]), ints([-c.experts - 1]), ints([1]), ints([-1])
+        )
         logits, indices = op.TopK(reversed_router, ints([c.k]), axis=1, sorted=1, _outputs=2)
         selected = op.Sub(ints([c.experts - 1]), indices)
         if c.router_weights:
-            routing = op.GatherElements(compute(rw), selected, axis=1)
+            routing = op.GatherElements(compute(router_weights), selected, axis=1)
             if c.normalize:
                 total = op.ReduceSum(routing, ints([1]), keepdims=1)
                 zero = op.Equal(total, scalar(0))
@@ -308,20 +329,20 @@ def qmoe(config: QMoEFunctionConfig) -> ir.Function:
             routing = op.Softmax(logits, axis=1)
         # CPU does not enqueue routes <=1e-8, including negative scales.
         active = op.Greater(routing, scalar(1e-8))
-        routing = op.Where(active, routing, scalar(0))
         first_weights = dequantize(
-            w1, scale1, zp1, c.zero_points1, 2 * c.intermediate, c.hidden
+            w1, scale1, zero_points1, c.zero_points1, 2 * c.intermediate, c.hidden
         )
-        down_weights = dequantize(w2, scale2, zp2, c.zero_points2, c.hidden, c.intermediate)
+        down_weights = dequantize(
+            w2, scale2, zero_points2, c.zero_points2, c.hidden, c.intermediate
+        )
         flat = op.Reshape(compute(x), ints([-1, c.hidden]))
         first = op.GroupedMatMul(flat, first_weights, selected, transB=1)  # [T,k,2I]
-        gate = op.Gather(first, ints(list(range(0, 2 * c.intermediate, 2))), axis=2)
-        up = op.Gather(first, ints(list(range(1, 2 * c.intermediate, 2))), axis=2)
+        gate = op.Slice(first, ints([0]), ints([2 * c.intermediate]), ints([2]), ints([2]))
+        up = op.Slice(first, ints([1]), ints([2 * c.intermediate]), ints([2]), ints([2]))
         if math.isfinite(c.limit):
             gate = op.Min(gate, scalar(c.limit))
             up = op.Clip(up, scalar(-c.limit), scalar(c.limit))
-        sigmoid = op.Sigmoid(op.Mul(gate, scalar(c.alpha)))
-        activated = op.Mul(op.Mul(gate, sigmoid), op.Add(up, scalar(c.beta)))
+        activated = op.SwiGLU(gate, op.Add(up, scalar(c.beta)), alpha=c.alpha)
         down = op.GroupedMatMul(
             op.Reshape(activated, ints([-1, c.intermediate])),
             down_weights,

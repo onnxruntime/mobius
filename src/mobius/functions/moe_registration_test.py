@@ -8,7 +8,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 
-import onnx
 import onnx_ir as ir
 import pytest
 from onnx_ir.passes import PreconditionError
@@ -53,9 +52,7 @@ from mobius.functions.qmoe import validate_call as validate_qmoe
 from mobius.functions.qmoe_test import _model as quantized_model
 from mobius.tasks._base import _make_graph
 
-requires_schema = pytest.mark.skipif(
-    not onnx.defs.has("GroupedMatMul", 29), reason="GroupedMatMul-29 schemas unavailable"
-)
+pytestmark = pytest.mark.opset29
 
 
 @pytest.fixture(autouse=True)
@@ -221,6 +218,132 @@ def test_inline_preserves_public_cycle_precondition_with_unused_leaf(unused_leaf
         _inline_function_bodies(model, lambda function: selected)
 
 
+def test_inline_reports_no_progress_in_a_preserved_call_graph_attribute():
+    # Public InlinePass does not traverse graph attributes of a local function
+    # call excluded by its criteria. Our all_nodes traversal still sees Leaf.
+    # This exercises a real no-progress case, without replacing the inliner.
+    leaf = build_function(
+        lambda op, x: op.Identity(x),
+        [ir.Value(name="x")],
+        domain="test",
+        name="Leaf",
+        opset_imports={"": 24},
+    )
+    holder = build_function(
+        lambda op, x: op.Identity(x),
+        [ir.Value(name="x")],
+        domain="test",
+        name="Holder",
+        opset_imports={"": 24},
+    )
+    x = ir.Value(name="x")
+    nested = ir.Node("test", "Leaf", [x], outputs=[ir.Value(name="nested")])
+    branch = ir.Graph([], nested.outputs, nodes=[nested], opset_imports={"": 24, "test": 1})
+    call = ir.Node(
+        "test",
+        "Holder",
+        [x],
+        outputs=[ir.Value(name="y")],
+        attributes=[ir.AttrGraph("body", branch)],
+    )
+    model = ir.Model(
+        ir.Graph([x], call.outputs, nodes=[call], opset_imports={"": 24, "test": 1}),
+        functions=[leaf, holder],
+        ir_version=10,
+    )
+    with pytest.raises(RuntimeError, match="no progress retiring selected leaves"):
+        _inline_function_bodies(model, lambda function: function.name == "Leaf")
+    assert model.functions[leaf.identifier()] is leaf
+    assert tuple(branch) == (nested,)
+
+
+@pytest.mark.parametrize("depth", [1, 4])
+def test_inline_function_count_bound_allows_leaf_first_chains(depth):
+    functions = []
+    for index in range(depth):
+        x = ir.Value(name="x")
+        node = ir.Node(
+            "test" if index else "",
+            f"Layer{index - 1}" if index else "Identity",
+            [x],
+            outputs=[ir.Value(name="y")],
+        )
+        functions.append(
+            ir.Function(
+                "test",
+                f"Layer{index}",
+                graph=ir.Graph(
+                    [x], node.outputs, nodes=[node], opset_imports={"": 24, "test": 1}
+                ),
+                attributes=[],
+            )
+        )
+    x = ir.Value(name="x")
+    call = ir.Node("test", f"Layer{depth - 1}", [x], outputs=[ir.Value(name="y")])
+    model = ir.Model(
+        ir.Graph([x], call.outputs, nodes=[call], opset_imports={"": 24, "test": 1}),
+        functions=functions,
+        ir_version=10,
+    )
+    _inline_function_bodies(model, lambda function: True)
+    assert not model.functions
+    assert [node.op_type for node in model.graph] == ["Identity"]
+
+
+@pytest.mark.parametrize(
+    "make_model,validate,factory",
+    [
+        (float_model, validate_moe, moe),
+        (quantized_model, validate_qmoe, qmoe),
+    ],
+)
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+@pytest.mark.parametrize("clipped", [False, True])
+def test_standard_swiglu_and_strided_slice_structure(
+    make_model, validate, factory, dtype, clipped
+):
+    config = validate(next(iter(make_model(dtype=dtype, clipped=clipped).graph)))
+    function = factory(config)
+    activation = next(node for node in function if node.op_type == "SwiGLU")
+    assert activation.domain == "" and activation.attributes.get_float("alpha") == config.alpha
+    assert activation.inputs[0].producer().op_type == ("Min" if clipped else "Slice")
+    assert activation.inputs[1].producer().op_type == "Add"  # up + beta
+    assert not any(node.op_type == "Sigmoid" for node in function)
+
+    def constant_ints(value):
+        return list(value.producer().attributes.get_ints("value_ints"))
+
+    slices = [
+        node
+        for node in function
+        if node.op_type == "Slice"
+        and len(node.inputs) == 5
+        and constant_ints(node.inputs[4]) == [2]
+    ]
+    assert len(slices) == 2
+    for start, node in enumerate(slices):
+        assert constant_ints(node.inputs[1]) == [start]
+        assert constant_ints(node.inputs[2]) == [2 * config.intermediate]
+        assert constant_ints(node.inputs[3]) == [2]
+    reverse = next(
+        node
+        for node in function
+        if node.op_type == "Slice"
+        and len(node.inputs) == 5
+        and constant_ints(node.inputs[4]) == [-1]
+    )
+    assert constant_ints(reverse.inputs[1]) == [config.experts - 1]
+    assert constant_ints(reverse.inputs[2]) == [-config.experts - 1]
+    assert constant_ints(reverse.inputs[3]) == [1]
+
+
+def test_silu_uses_standard_swish():
+    config = validate_moe(next(iter(float_model(activation="silu").graph)))
+    function = moe(config)
+    assert sum(node.op_type == "Swish" for node in function) == 1
+    assert not any(node.op_type == "Sigmoid" for node in function)
+
+
 @pytest.mark.parametrize("make_model", [float_model, quantized_model])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_native_capable_optimizer_does_not_validate_restricted_fallback_abi(
@@ -303,12 +426,11 @@ def test_all_targets_validated_before_schema_or_body_construction(
             )
             model.functions[function.identifier()] = function
 
-    def unexpected_schema_or_build(*args, **kwargs):
-        pytest.fail("All targets must be validated before schema checks or body construction")
+    def unexpected_body_construction(*args, **kwargs):
+        pytest.fail("All targets must be validated before any body construction")
 
-    monkeypatch.setattr(onnx.defs, "has", unexpected_schema_or_build)
-    monkeypatch.setattr("mobius.functions.moe", unexpected_schema_or_build)
-    monkeypatch.setattr("mobius.functions.qmoe", unexpected_schema_or_build)
+    monkeypatch.setattr("mobius.functions.moe", unexpected_body_construction)
+    monkeypatch.setattr("mobius.functions.qmoe", unexpected_body_construction)
     before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
     ir.save(model, before)
     with pytest.raises(ValueError, match=message):
@@ -319,7 +441,6 @@ def test_all_targets_validated_before_schema_or_body_construction(
     assert first.outputs[0].type is None and first.outputs[0].shape is None
 
 
-@requires_schema
 @pytest.mark.parametrize(
     "make_model,validate,factory,arity",
     [
@@ -353,7 +474,6 @@ def test_factory_formals_and_complete_config_identity(make_model, validate, fact
     )
 
 
-@requires_schema
 @pytest.mark.parametrize("make_model", [float_model, quantized_model])
 def test_mixed_configs_masks_and_ownership_collisions_are_atomic(make_model):
     model = make_model()
@@ -435,7 +555,6 @@ def test_containing_function24_rejected_even_with_child29_hint(make_model):
     assert target.overload == "" and tuple(model.functions) == (fn.identifier(),)
 
 
-@requires_schema
 def test_nested_function_expansion_preserves_moe_output_annotations():
     inner = float_model().graph
     inner.inputs.extend(inner.initializers.values())
@@ -571,7 +690,6 @@ def test_passthrough_shared_upstream_keeps_separate_output_boundaries():
         assert output.doc_string == f"docs{i}" and output.metadata_props["label"] == str(i)
 
 
-@requires_schema
 @pytest.mark.parametrize("make_model", [float_model, quantized_model])
 def test_registered_not_inlined_save_load_reregister_is_stable(make_model, tmp_path):
     model = make_model(clipped=True)
@@ -610,7 +728,6 @@ def test_registered_not_inlined_save_load_reregister_is_stable(make_model, tmp_p
     np.testing.assert_array_equal(results[0], results[1])
 
 
-@requires_schema
 def test_unnamed_call_output_documentation_survives_inline_boundary():
     model = float_model()
     model.graph.inputs[0].name = "mobius_inline_output_0"

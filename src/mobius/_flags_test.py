@@ -9,6 +9,8 @@ import pytest
 
 from mobius import _flags
 
+pytestmark = pytest.mark.opset29
+
 
 class TestDefaultValues:
     """Flags have the expected defaults when no env vars are set."""

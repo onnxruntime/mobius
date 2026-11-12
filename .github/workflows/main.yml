@@ -46,22 +46,13 @@ jobs:
         run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Install released dependencies
         run: |
-          pip install -e . pytest onnx==1.19.0 onnxruntime==1.31.1 onnxruntime-easy==0.1.2 \
+          pip install -e . pytest httpx "gguf>=0.10.0" \
+            onnx==1.19.0 onnxruntime==1.31.1 onnxruntime-easy==0.1.2 \
             onnxscript==0.7.2 onnx_ir==1.1.0
       - name: Test with released ONNX 1.19 schemas
         run: |
           python -c "import onnx; assert not onnx.defs.has('GroupedMatMul', 29)"
-          python -m pytest src/mobius/functions/moe_test.py \
-            src/mobius/functions/qmoe_test.py src/mobius/functions/moe_registration_test.py \
-            src/mobius/functions/causal_conv_test.py src/mobius/functions/linear_attention_test.py \
-            src/mobius/functions/matmul_nbits_test.py \
-            src/mobius/functions/skip_layer_normalization_test.py \
-            src/mobius/functions/packed_multi_head_attention_test.py \
-            src/mobius/functions/matmul_block_quantized_fp4_weight_test.py \
-            src/mobius/models/gemma4_moe_function_test.py \
-            src/mobius/_build_context_test.py src/mobius/_builder_test.py \
-            tests/ep_optimization_test.py src/mobius/components/_moe_test.py \
-            src/mobius/_flags_test.py -q -rs
+          python -m pytest src/mobius tests/ep_optimization_test.py -m opset29 -q -rs
       - name: Install pinned opset-29 schemas
         run: |
           pip install --no-cache-dir --no-deps --force-reinstall \
@@ -69,17 +60,7 @@ jobs:
           python -c "import onnx; assert onnx.defs.has('GroupedMatMul', 29)"
       - name: Test with pinned opset-29 schemas
         run: |
-          python -m pytest src/mobius/functions/moe_test.py \
-            src/mobius/functions/qmoe_test.py src/mobius/functions/moe_registration_test.py \
-            src/mobius/functions/causal_conv_test.py src/mobius/functions/linear_attention_test.py \
-            src/mobius/functions/matmul_nbits_test.py \
-            src/mobius/functions/skip_layer_normalization_test.py \
-            src/mobius/functions/packed_multi_head_attention_test.py \
-            src/mobius/functions/matmul_block_quantized_fp4_weight_test.py \
-            src/mobius/models/gemma4_moe_function_test.py \
-            src/mobius/_build_context_test.py src/mobius/_builder_test.py \
-            tests/ep_optimization_test.py src/mobius/components/_moe_test.py \
-            src/mobius/_flags_test.py -q -rs
+          python -m pytest src/mobius tests/ep_optimization_test.py -m opset29 -q -rs
 
   detect-affected:
     name: Detect affected models

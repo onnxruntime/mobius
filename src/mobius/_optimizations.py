@@ -400,7 +400,9 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
     Inline leaf functions first: IR may recursively expand newly inserted calls
     in one pass, before their annotations can be restored at this boundary.
     """
-    while True:
+    # Each productive round must retire at least one selected leaf. One extra
+    # round handles the empty selection after retiring the last function.
+    for _ in range(len(model.functions) + 1):
         # Validate before adapting any alias boundaries, including empty selections.
         common_passes.InlinePass(criteria=criteria).requires(model)
         selected = {
@@ -514,9 +516,10 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
                 restored_value.doc_string = doc
             restored_value.metadata_props.update(props)
             restored_value.meta.update(meta)
-        if not result.modified:
-            return
+        if not result.modified or not leaves.difference(model.functions):
+            raise RuntimeError("Function inlining made no progress retiring selected leaves")
         # Recompute leaves: expansion can make their selected callers eligible.
+    raise RuntimeError("Function inlining exhausted its initial function-count bound")
 
 
 def _log_trace_entry(entry: _TraceEntry) -> None:

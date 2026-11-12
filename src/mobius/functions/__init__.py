@@ -28,7 +28,6 @@ import json
 from collections.abc import Callable
 from functools import partial
 
-import onnx
 import onnx_ir as ir
 
 from mobius._constants import OPSET_VERSION
@@ -162,7 +161,7 @@ def _register_moe_bodies(model: ir.Model) -> None:
         ir.OperatorIdentifier, tuple[MoEFunctionConfig | QMoEFunctionConfig, str]
     ] = {}
     calls: list[tuple[ir.Node, str]] = []
-    # Validate every target before schema checks or any function construction.
+    # Validate every target before any function construction.
     roots = [model.graph, *(fn.graph for fn in model.functions.values())]
     for root in roots:
         for node in root.all_nodes():
@@ -217,8 +216,6 @@ def _register_moe_bodies(model: ir.Model) -> None:
             calls.append((node, overload))
 
     # Build all unique bodies without changing the model, so build failures are atomic.
-    if specializations and not onnx.defs.has("GroupedMatMul", 29):
-        raise ValueError("MoE fallback requires ONNX opset-29 GroupedMatMul schemas")
     additions: dict[ir.OperatorIdentifier, ir.Function] = {}
     for identifier, (config, identity) in specializations.items():
         function = moe(config) if isinstance(config, MoEFunctionConfig) else qmoe(config)

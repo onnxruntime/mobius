@@ -9,6 +9,8 @@ import pytest
 
 from mobius.functions.causal_conv import causal_conv_nd_with_state
 
+pytestmark = pytest.mark.opset29
+
 
 class TestCausalConvNdWithState:
     """Tests for the causal_conv_nd_with_state ir.Function builder."""

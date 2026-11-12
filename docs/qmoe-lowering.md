@@ -22,8 +22,10 @@ without running the restricted fallback validator. The global default
 `OPSET_VERSION` remains 24; the flag selects the per-build override described above.
 Generic dense MoE dispatch, gate algebra, checkpoint loading, and packed native
 input lists are unchanged. The flag does not imply runtime support:
-schema/checker support alone cannot qualify execution, and the tested ORT
-1.31.1 cannot execute these opset-29 graphs directly.
+construction and registration do not require installed opset-29 schemas.
+Checking and execution require schemas and a runtime implementing these operators;
+ORT 1.31.1 cannot execute these opset-29 graphs directly. This is a portable CPU
+semantic reference, not a promise of fused-kernel memory use or speed.
 
 ## Initial qualified ABI
 
@@ -110,35 +112,6 @@ while compatible symbolic/static refinements are preserved. The existing inline
 boundary preserves output names, annotations, docs, and metadata. No-target
 registration uses normal ordinary-function registration, not a byte-preserving
 no-op. See also [the float MoE boundary](moe-lowering.md).
-
-## Runtime and validation
-
-The output requires ONNX schemas and a runtime implementing **opset 29**.
-Older ORT releases cannot directly load it. Tests expand the official
-GroupedMatMul function algorithm on a *test copy* to run on prior kernels;
-that expansion is test-only, not a production fallback. Packed weights stay under their
-original names and are dequantized in the graph; this is a portable reference
-lowering, not a promise of fused-kernel memory use or speed. Native kernels may
-use approximate/integer-activation GEMMs; numerical comparisons use the FLOAT
-dequantized reference, not those provider-specific approximations.
-
-Checker and shape-inference validation used a source build of official ONNX
-at the pinned revision below (reporting version 1.24), with the opset-29 schema.
-This does not require or imply an available ONNX 1.24 release wheel. Released ONNX
-1.23.2 stops at opset 28. This experimental schema environment requires the
-tested combination of the pinned ONNX 1.24 source build, `onnx_ir==1.1.0`, and
-`onnxscript==0.7.2`. IR 1.0.0 cannot parse the newer `FLOAT6E2M3` schema enum.
-This does not raise the default dependency minimums: IR 1.0.0 and onnxscript
-0.7.1 remain qualified with released ONNX 1.19 for schema-independent tests.
-ORT 1.31.1 does **not** execute these opset-29 graphs:
-even with its development-opset guard disabled, it rejects standard operators
-at version 29 before reaching GroupedMatMul. Direct-runtime tests report that
-capability limitation explicitly; numerical coverage uses the test-copy
-expansion plus independent references and native CPU QMoE comparisons.
-Lowering tests require schema availability, and native parity tests depend
-on the presence of the CPU QMoE kernel, so older environments can still run the
-existing non-opset-29 tests. Registration reports a clear error if the
-GroupedMatMul-29 schemas needed to construct the body are unavailable.
 
 Authoritative sources (pinned ORT revision
 `bbedf7b115be0077a2f4b76fd927fa94a82d0d1a`):

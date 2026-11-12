@@ -20,9 +20,13 @@ FunctionArityMismatch (``call.input.len()=6 > func.input.len()=5``).
 
 from __future__ import annotations
 
+import pytest
+
 from mobius.functions.packed_multi_head_attention import (
     packed_multi_head_attention,
 )
+
+pytestmark = pytest.mark.opset29
 
 EXPECTED_INPUT_ORDER = [
     "query",

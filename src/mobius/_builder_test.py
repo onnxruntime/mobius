@@ -21,6 +21,8 @@ from mobius._builder import (
 )
 from mobius._model_package import ModelPackage
 
+pytestmark = pytest.mark.opset29
+
 
 @pytest.mark.parametrize("level", [None, 0, 4])
 @pytest.mark.parametrize("bits", [4, 8])

@@ -22,6 +22,7 @@ from mobius.functions._moe_test_utils import inline_native_calls
 from mobius.functions.qmoe import QMoEFunctionConfig, qmoe
 
 ort = pytest.importorskip("onnxruntime")
+pytestmark = pytest.mark.opset29
 _requires_opset29 = pytest.mark.skipif(
     not onnx.defs.has("GroupedMatMul", 29),
     reason="Official ONNX opset-29 GroupedMatMul schema is required (ONNX >=1.24)",
@@ -278,7 +279,6 @@ def _run(model, feeds, path):
     ),
 )
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
-@_requires_opset29
 def test_numerical_reference(
     tmp_path, rank, k, zero_points, router_weights, normalize, clipped, dtype
 ):
@@ -315,12 +315,12 @@ def test_numerical_reference(
 
 @pytest.mark.parametrize("shape", [(0, 32), (2, 0, 32), (0, 3, 32), (0, 0, 32)])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
-@_requires_opset29
 def test_empty_token_dimensions_survive_roundtrip(tmp_path, shape, dtype):
     model = inline_native_calls(_model(rank=len(shape), dtype=dtype))
     path = tmp_path / "empty.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
     executable = _expand_grouped_matmul(ir.load(path))
     numpy_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
     feeds = _feeds(count=0, dtype=numpy_dtype)
@@ -336,7 +336,6 @@ def test_empty_token_dimensions_survive_roundtrip(tmp_path, shape, dtype):
 @pytest.mark.parametrize("case", ["ties", "zero", "negative", "cancellation", "masked"])
 @pytest.mark.parametrize("normalize", [0, 1])
 @_requires_native_cpu_qmoe
-@_requires_opset29
 def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
     native = _model(normalize=normalize)
     lowered = inline_native_calls(native.clone())
@@ -356,7 +355,6 @@ def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
 )
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
 @_requires_native_cpu_qmoe
-@_requires_opset29
 def test_native_cpu_parity(tmp_path, router_weights, normalize, clipped, dtype):
     native = _model(
         router_weights=router_weights, normalize=normalize, clipped=clipped, dtype=dtype
@@ -509,7 +507,6 @@ def test_native_serialization_no_automatic_opset29(tmp_path):
     assert path.read_bytes() == before
 
 
-@_requires_opset29
 def test_output_annotations_survive_roundtrip(tmp_path):
     model = _model()
     original = model.graph.outputs[0]
@@ -535,7 +532,6 @@ def test_output_annotations_survive_roundtrip(tmp_path):
     assert restored.metadata_props["test.qmoe.annotation"] == "preserved"
 
 
-@_requires_opset29
 def test_unrelated_model_noop_and_idempotence(tmp_path):
     model = _model()
     inline_native_calls(model)
@@ -566,7 +562,6 @@ def test_opset29_checker_and_shape_inference(tmp_path, dtype):
 
 
 @pytest.mark.parametrize("zp1,zp2", list(itertools.product((False, True), repeat=2)))
-@_requires_opset29
 def test_independent_optional_zero_points_and_all_experts(tmp_path, zp1, zp2):
     native = _model(k=3, router_weights=False)
     node = next(iter(native.graph))
@@ -583,7 +578,74 @@ def test_independent_optional_zero_points_and_all_experts(tmp_path, zp1, zp2):
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
-@_requires_opset29
+@pytest.mark.parametrize("zero_point", [3, 8])
+def test_omitted_zero_points_mean_eight_not_onnx_default(tmp_path, zero_point):
+    feeds = _feeds()
+    results = []
+    for provided in (False, True):
+        model = _model(zero_points=provided)
+        if provided:
+            for index in (11, 12):
+                value = next(iter(model.graph)).inputs[index]
+                value.const_value = ir.tensor(
+                    np.full(tuple(value.shape), zero_point | (zero_point << 4), dtype=np.uint8)
+                )
+        expected = _reference(model, feeds)
+        executable = _expand_grouped_matmul(inline_native_calls(model))
+        actual = _run(executable, feeds, tmp_path / f"zeros-{provided}.onnx")
+        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
+        results.append(actual)
+    if zero_point == 8:
+        np.testing.assert_array_equal(*results)
+    else:
+        assert not np.allclose(*results)
+
+
+@pytest.mark.parametrize("router_weights,normalize", itertools.product((False, True), (0, 1)))
+def test_routing_masks_only_final_contributions(router_weights, normalize):
+    config_model = _model(router_weights=router_weights, normalize=normalize)
+    inline_native_calls(config_model)
+    masks = [node for node in config_model.graph if node.op_type == "Where"]
+    assert len(masks) == (3 if router_weights and normalize else 1)
+    final = masks[-1]
+    assert final.inputs[0].producer().op_type == "Unsqueeze"
+    assert final.inputs[0].producer().inputs[0].producer().op_type == "Greater"
+    assert final.inputs[1].producer().op_type == "Mul"
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [[1.0, 0.0, 0.0], [1.0, -0.5, 1e-10], [0.0, 0.0, 0.0], [0.5, -0.5, 0.0]],
+)
+@pytest.mark.parametrize("normalize", [0, 1])
+def test_inactive_overflowing_experts_are_masked(tmp_path, weights, normalize):
+    model = _model(k=3, normalize=normalize, zero_points=False)
+    node = next(iter(model.graph))
+    packed = node.inputs[2].const_value.numpy().copy()
+    packed[1:] = 255
+    node.inputs[2].const_value = ir.tensor(packed)
+    scales = node.inputs[3].const_value.numpy().copy()
+    scales[1:] = np.finfo(np.float32).max
+    node.inputs[3].const_value = ir.tensor(scales)
+    down_scales = node.inputs[6].const_value.numpy().copy()
+    down_scales[1:] = 0
+    node.inputs[6].const_value = ir.tensor(down_scales)
+    # All inputs/scales are finite. Inactive experts overflow GEMM1, then
+    # encounter 0*inf in GEMM2. Only the final contribution Where masks NaNs.
+    feeds = _feeds(count=1)
+    feeds["x"][:] = 1
+    feeds["router"][:] = [3, 2, 1]
+    feeds["routing_weights"][:] = weights
+    expected = _reference(model, feeds)
+    actual = _run(
+        _expand_grouped_matmul(inline_native_calls(model)),
+        feeds,
+        tmp_path / "inactive_nan.onnx",
+    )
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
+
+
 def test_truncated_optional_slots(tmp_path):
     original = _model(zero_points=False, router_weights=False)
     feeds = _feeds(router_weights=False)
@@ -632,7 +694,6 @@ def test_prepacked_default_is_not_assumed_raw():
         inline_native_calls(model)
 
 
-@_requires_opset29
 def test_name_collisions_are_avoided(tmp_path):
     model = _model()
     model.graph.inputs[0].name = "qmoe29_0_0"
@@ -645,10 +706,10 @@ def test_name_collisions_are_avoided(tmp_path):
     assert len(set(names)) == len(names)
     path = tmp_path / "collision.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path))
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path))
 
 
-@_requires_opset29
 def test_function_scope_registration_uses_existing29(tmp_path):
     graph = _model().graph
     graph.inputs.extend(graph.initializers.values())
@@ -664,7 +725,8 @@ def test_function_scope_registration_uses_existing29(tmp_path):
     loaded = ir.load(path)
     assert loaded.graph.opset_imports[""] == 29
     assert loaded.functions[function.identifier()].opset_imports[""] == 29
-    onnx.checker.check_model(str(path))
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path))
 
 
 def _caller_function(op_type="Identity", *, opset=24):
@@ -680,7 +742,6 @@ def _caller_function(op_type="Identity", *, opset=24):
     return ir.Function("caller", "PreserveMe", graph=graph, attributes=[])
 
 
-@_requires_opset29
 def test_unrelated_function_import_is_not_audited(tmp_path):
     model = _model()
     register_function_bodies(model)
@@ -699,7 +760,6 @@ def test_unrelated_function_import_is_not_audited(tmp_path):
     assert tuple(qmoe.inputs[0].uses()) == uses_before
 
 
-@_requires_opset29
 def test_caller_function_preserved_without_relabeling(tmp_path):
     model = _model()
     function = _caller_function(opset=29)
@@ -725,7 +785,8 @@ def test_caller_function_preserved_without_relabeling(tmp_path):
     assert model.graph.opset_imports[""] == 29
     path = tmp_path / "compatible.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
     feeds = _feeds()
     feeds["caller_feed"] = np.arange(6, dtype=np.float32).reshape(2, 3)
     actual = _run(
@@ -799,7 +860,6 @@ def test_qmoe_contradictory_output_metadata_is_atomic(tmp_path, dtype, shape):
     _assert_atomic_error(model, inline_native_calls, tmp_path, "output metadata")
 
 
-@_requires_opset29
 @pytest.mark.parametrize(
     "input_shape,output_shape,typed",
     [
@@ -827,7 +887,8 @@ def test_qmoe_compatible_output_annotations(tmp_path, input_shape, output_shape,
     assert result.type == x.type and result.meta["marker"] is marker
     path = tmp_path / "compatible_output.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
     restored = ir.load(path)
     assert restored.graph.outputs[0].doc_string == output.doc_string
     assert restored.graph.outputs[0].metadata_props == output.metadata_props
@@ -835,7 +896,6 @@ def test_qmoe_compatible_output_annotations(tmp_path, input_shape, output_shape,
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
-@_requires_opset29
 @pytest.mark.parametrize(
     "router_tokens,weight_tokens",
     [
@@ -856,7 +916,8 @@ def test_router_weight_token_annotations_are_not_runtime_mismatches(
     inline_native_calls(model)
     path = tmp_path / "refined_router.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
     actual = _run(_expand_grouped_matmul(ir.load(path)), feeds, tmp_path / "expanded.onnx")
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
@@ -875,45 +936,37 @@ def test_static_router_weight_token_mismatch_is_atomic(tmp_path, static_input):
 
 @pytest.mark.parametrize("op_type", ["MoE", "QMoE"])
 def test_schema_absent_flag_noop_and_abi_validation(tmp_path, op_type):
-    # Remove the actual schema, not just a capability predicate. This also runs
-    # unchanged on released ONNX installations that never registered schema 29.
-    schema = (
-        onnx.defs.get_schema("GroupedMatMul", 29)
-        if onnx.defs.has("GroupedMatMul", 29)
-        else None
+    # Runs on released ONNX without registering schemas or changing builder state.
+    model, lower = _family_model(op_type)
+    with override_flags(experimental_opset29=False):
+        _assert_atomic_error(model, lower, tmp_path, "experimental")
+    next(iter(model.graph)).attributes["k"] = ir.AttrInt64("k", 0)
+    _assert_atomic_error(model, lower, tmp_path, "k must")
+    model, lower = _family_model(op_type)
+    register_function_bodies(model, moe_fallback=True)
+    call = next(iter(model.graph))
+    assert (
+        sum(n.op_type == "GroupedMatMul" for n in model.functions[call.op_identifier()]) == 2
     )
-    if schema is not None:
-        onnx.defs.deregister_schema("GroupedMatMul", 29, "")
-    try:
-        assert not onnx.defs.has("GroupedMatMul", 29)
-        model, lower = _family_model(op_type)
-        with override_flags(experimental_opset29=False):
-            _assert_atomic_error(model, lower, tmp_path, "experimental")
-        next(iter(model.graph)).attributes["k"] = ir.AttrInt64("k", 0)
-        _assert_atomic_error(model, lower, tmp_path, "k must")
-        model, lower = _family_model(op_type)
-        _assert_atomic_error(model, lower, tmp_path, "opset-29 GroupedMatMul schemas")
-        # Preserve old unaudited bodies on no-target.
-        function = _caller_function("Softmax", opset=11)
-        unrelated = ir.Model(
-            ir.Graph([], [], nodes=[], opset_imports={"": 29}),
-            functions=[function],
-            ir_version=10,
-        )
-        before, after = tmp_path / "noop_before.onnx", tmp_path / "noop_after.onnx"
-        ir.save(unrelated, before)
-        for enabled in (False, True):
-            with override_flags(experimental_opset29=enabled):
-                register_function_bodies(unrelated, moe_fallback=enabled)
-            ir.save(unrelated, after)
-            assert unrelated.functions[function.identifier()] is function
-            assert function.opset_imports[""] == 11
-    finally:
-        if schema is not None:
-            onnx.defs.register_schema(schema)
+    identifiers, overload = set(model.functions), call.overload
+    register_function_bodies(model, moe_fallback=True)
+    assert set(model.functions) == identifiers and call.overload == overload
+    lower(model)
+    assert sum(n.op_type == "GroupedMatMul" for n in model.graph) == 2
+    # Preserve old unaudited bodies on no-target.
+    function = _caller_function("Softmax", opset=11)
+    unrelated = ir.Model(
+        ir.Graph([], [], nodes=[], opset_imports={"": 29}),
+        functions=[function],
+        ir_version=10,
+    )
+    for enabled in (False, True):
+        with override_flags(experimental_opset29=enabled):
+            register_function_bodies(unrelated, moe_fallback=enabled)
+        assert unrelated.functions[function.identifier()] is function
+        assert function.opset_imports[""] == 11
 
 
-@_requires_opset29
 def test_nested_qmoe_updates_containing_imports(tmp_path):
     then_graph = _model().graph
     else_graph = _model().graph
@@ -955,14 +1008,14 @@ def test_nested_qmoe_updates_containing_imports(tmp_path):
     assert not any(n.op_type == "QMoE" for n in model.graph.all_nodes())
     path = tmp_path / "nested.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
 
 
 @pytest.mark.parametrize("rank", [2, 3])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
 @_requires_opset29
-def test_direct_grouped_matmul29_runtime(tmp_path, monkeypatch, rank, dtype):
-    monkeypatch.setenv("ALLOW_RELEASED_ONNX_OPSET_ONLY", "0")
+def test_direct_grouped_matmul29_runtime(tmp_path, rank, dtype):
     native = _model(rank=rank, dtype=dtype)
     numpy_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
     feeds = _feeds(rank=rank, dtype=numpy_dtype)
@@ -980,6 +1033,7 @@ def test_direct_grouped_matmul29_runtime(tmp_path, monkeypatch, rank, dtype):
             or ("No Op registered for" in message and "domain_version of 29" in message)
             or "Could not find an implementation for GroupedMatMul" in message
             or ("support for domain ai.onnx is till opset" in message and "29" in message)
+            or "ONNX Runtime only *guarantees* support" in message
         ):
             pytest.skip(f"ORT {ort.__version__} lacks opset-29 runtime support: {message}")
         raise
@@ -989,7 +1043,6 @@ def test_direct_grouped_matmul29_runtime(tmp_path, monkeypatch, rank, dtype):
 
 @pytest.mark.parametrize("symmetric", [False, True])
 @_requires_native_cpu_qmoe
-@_requires_opset29
 def test_real_mobius_moe_layer_lowering(tmp_path, symmetric):
     from onnx_shape_inference import infer_symbolic_shapes
 
@@ -1045,14 +1098,21 @@ def test_real_mobius_moe_layer_lowering(tmp_path, symmetric):
     original_names = tuple(graph.initializers)
     register_function_bodies(model, moe_fallback=True)
     assert tuple(graph.initializers) == original_names
-    optimize_model(model, ep="onnx-standard")
+    if onnx.defs.has("GroupedMatMul", 29):
+        optimize_model(model, ep="onnx-standard")
+    else:
+        # Construction/inlining succeeds; only the export schema audit rejects
+        # this environment. Still execute the resulting test copy below.
+        with pytest.raises(ValueError, match=r"GroupedMatMul.*no standard ONNX schema"):
+            optimize_model(model, ep="onnx-standard")
     assert not any(n.op_type == "QMoE" for n in graph)
     assert graph.opset_imports[""] == 29
     assert all(fn.name not in {"MoE", "QMoE"} for fn in model.functions.values())
     assert all(function.opset_imports[""] == 29 for function in model.functions.values())
     path = tmp_path / "real_registered29.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
     executable = _expand_grouped_matmul(model)
     rng = np.random.default_rng(109)
     for count in (1, 4):

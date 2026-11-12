@@ -30,14 +30,12 @@ contribution rounding boundaries. The FLOAT fallback consumes any remaining
 per-expert scale (including partial updates); already-folded scales are ones.
 
 This replaces `com.microsoft::MoE` with two standard `GroupedMatMul-29` calls,
-targeting the pinned **CPU reference**, not all execution providers. It requires
-ONNX opset-29 schemas and a runtime implementing them. ORT 1.31.1 cannot execute these
-graphs directly; tests expand GroupedMatMul on a test copy at opset 24. There is
-no production expansion or performance/memory-use promise.
-The experimental schema environment uses the tested ONNX 1.24 source build,
-IR 1.1.0, and onnxscript 0.7.2 combination; see the
-[schema compatibility requirements](qmoe-lowering.md#runtime-and-validation).
-Default dependency minimums are unchanged.
+targeting the pinned **CPU reference**, not all execution providers.
+Construction and registration do not require installed opset-29 schemas;
+checking and execution require schemas and a runtime implementing these operators.
+ORT 1.31.1 cannot execute these graphs directly. There is no production
+opset-24 expansion or performance/memory-use promise. Default dependency
+minimums are unchanged.
 
 ## Supported ABI
 

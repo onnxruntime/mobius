@@ -22,6 +22,8 @@ from mobius.models import Gemma4CausalLMModel
 from mobius.models.gemma4_test import _build_gemma4_text, _tiny_gemma4_text_moe_config
 from mobius.tasks import CausalLMTask
 
+pytestmark = pytest.mark.opset29
+
 
 @pytest.mark.parametrize(
     "enabled,dtype,activation,native",
@@ -58,7 +60,8 @@ def test_fallback_ep_reuses_native_call_only_for_supported_raw_logit_swiglu(
 
 
 @pytest.mark.skipif(
-    not onnx.defs.has("GroupedMatMul", 29), reason="GroupedMatMul-29 schemas unavailable"
+    not onnx.defs.has("GroupedMatMul", 29),
+    reason="Normal onnx-standard export includes an installed-schema audit",
 )
 def test_normal_build_inlines_gemma4_swiglu_at29():
     config = _tiny_gemma4_text_moe_config(dtype=ir.DataType.FLOAT, hidden_act="silu")
@@ -170,9 +173,6 @@ def _run_experts(model, hidden, logits):
         session.close()
 
 
-@pytest.mark.skipif(
-    not onnx.defs.has("GroupedMatMul", 29), reason="GroupedMatMul-29 schemas unavailable"
-)
 @pytest.mark.parametrize("update", ["preinitialized", "scale-only", "folded"])
 def test_actual_float_dispatch_matches_dense_and_hf_with_remaining_scale(update):
     rng = np.random.default_rng(108)
@@ -204,9 +204,6 @@ def test_actual_float_dispatch_matches_dense_and_hf_with_remaining_scale(update)
     np.testing.assert_allclose(actual[1], expected, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.skipif(
-    not onnx.defs.has("GroupedMatMul", 29), reason="GroupedMatMul-29 schemas unavailable"
-)
 def test_actual_float_top1_dispatch_scales_only_selected_expert():
     fc1 = np.zeros((2, 2, 64), dtype=np.float32)
     fc1[:, 0, 0], fc1[:, 1, 0] = [1, 2], 1

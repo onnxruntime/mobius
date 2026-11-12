@@ -30,6 +30,8 @@ from mobius._registry import registry
 from mobius._testing import create_test_builder, create_test_input
 from mobius.components._scan_utils import create_body_graph
 
+pytestmark = pytest.mark.opset29
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -204,8 +204,8 @@ def moe(config: MoEFunctionConfig) -> ir.Function:
 
         # Full-E FLOAT softmax precedes TopK. Reverse to select higher IDs on ties.
         probabilities = op.Softmax(compute(router), axis=1)
-        reversed_probs = op.Gather(
-            probabilities, ints(list(range(c.experts - 1, -1, -1))), axis=1
+        reversed_probs = op.Slice(
+            probabilities, ints([c.experts - 1]), ints([-c.experts - 1]), ints([1]), ints([-1])
         )
         routing, indices = op.TopK(reversed_probs, ints([c.k]), axis=1, sorted=1, _outputs=2)
         selected = op.Sub(ints([c.experts - 1]), indices)
@@ -219,17 +219,14 @@ def moe(config: MoEFunctionConfig) -> ir.Function:
         if c.bias1:
             first = round_half(op.Add(first, op.Gather(compute(bias1), selected, axis=0)))
         if c.activation == "swiglu":
-            gate = op.Gather(first, ints(list(range(0, 2 * c.intermediate, 2))), axis=2)
-            up = op.Gather(first, ints(list(range(1, 2 * c.intermediate, 2))), axis=2)
+            gate = op.Slice(first, ints([0]), ints([2 * c.intermediate]), ints([2]), ints([2]))
+            up = op.Slice(first, ints([1]), ints([2 * c.intermediate]), ints([2]), ints([2]))
             if math.isfinite(c.limit):
                 gate = op.Min(gate, scalar(c.limit))
                 up = op.Clip(up, scalar(-c.limit), scalar(c.limit))
-            activated = op.Mul(
-                op.Mul(gate, op.Sigmoid(op.Mul(gate, scalar(c.alpha)))),
-                op.Add(up, scalar(c.beta)),
-            )
+            activated = op.SwiGLU(gate, op.Add(up, scalar(c.beta)), alpha=c.alpha)
         elif c.activation == "silu":
-            activated = op.Mul(first, op.Sigmoid(first))
+            activated = op.Swish(first)
         elif c.activation == "gelu":
             activated = op.Gelu(first, approximate="tanh")
         elif c.activation == "relu":

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Test-only official GroupedMatMul expansion for execution on opset-24 ORT."""
+"""Test-copy GroupedMatMul and SwiGLU expansions for execution on opset-24 ORT."""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ from onnxscript._internal.builder import build_function
 
 
 def expand_grouped_matmul(model: ir.Model) -> ir.Model:
-    """Expand the pinned official transB=1/no-bias FLOAT function on a test copy.
+    """Expand GroupedMatMul and SwiGLU on an executable test copy.
 
-    Source: onnx/defs/math/defs.cc at
+    GroupedMatMul source (transB=1/no-bias FLOAT): onnx/defs/math/defs.cc at
     82721c0908fa965dd84e674c006147791313f3e1.
     This is not a production lowering or a general opset converter.
     """
@@ -47,7 +47,27 @@ def expand_grouped_matmul(model: ir.Model) -> ir.Model:
             node.attributes.clear()
     InlinePass()(model)
     RemoveUnusedFunctionsPass()(model)
-    # Only the two GroupedMatMul calls required 29. All other emitted operators
-    # have the same used semantics at 24. This assertion is specific to tests.
+    for node in list(model.graph):
+        if node.domain == "" and node.op_type == "SwiGLU":
+            # SwiGLU-28(A,B,alpha) = Swish-24(A,alpha) * B. Never merely
+            # relabel SwiGLU as opset 24: no such schema exists.
+            swish = ir.Node(
+                "",
+                "Swish",
+                [node.inputs[0]],
+                attributes=[ir.AttrFloat32("alpha", node.attributes.get_float("alpha", 1.0))],
+                num_outputs=1,
+            )
+            product = ir.Node("", "Mul", [swish.outputs[0], node.inputs[1]], num_outputs=1)
+            ir.convenience.replace_nodes_and_values(
+                model.graph,
+                insertion_point=node,
+                old_nodes=[node],
+                new_nodes=[swish, product],
+                old_values=node.outputs,
+                new_values=product.outputs,
+            )
+    # Remaining operators have the same used semantics at 24. Production
+    # graphs retain their standard operators and opset-29 imports.
     model.graph.opset_imports[""] = 24
     return model

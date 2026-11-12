@@ -18,6 +18,7 @@ from mobius.functions._moe_test_utils import inline_native_calls
 from mobius.functions.moe import MoEFunctionConfig, moe
 
 ort = pytest.importorskip("onnxruntime")
+pytestmark = pytest.mark.opset29
 _requires_opset29 = pytest.mark.skipif(
     not onnx.defs.has("GroupedMatMul", 29),
     reason="Official ONNX opset-29 GroupedMatMul schema is required (ONNX >=1.24)",
@@ -254,9 +255,33 @@ def _assert_close(actual, expected):
     np.testing.assert_allclose(actual, expected, rtol=rtol, atol=atol)
 
 
+@pytest.mark.parametrize("alpha", [-1.7, 0.0, 1.0, 1.7])
+def test_test_copy_swiglu_expansion_equivalence(tmp_path, alpha):
+    gate = ir.Value(name="gate", type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape([5]))
+    up = ir.Value(name="up", type=gate.type, shape=gate.shape)
+    node = ir.Node(
+        "",
+        "SwiGLU",
+        [gate, up],
+        attributes=[ir.AttrFloat32("alpha", alpha)],
+        outputs=[ir.Value(name="y", type=gate.type, shape=gate.shape)],
+    )
+    original = ir.Model(
+        ir.Graph([gate, up], node.outputs, nodes=[node], opset_imports={"": 29}), ir_version=10
+    )
+    executable = expand_grouped_matmul(original.clone())
+    assert original.graph.opset_imports[""] == 29 and node.op_type == "SwiGLU"
+    assert executable.graph.opset_imports[""] == 24
+    assert [n.op_type for n in executable.graph] == ["Swish", "Mul"]
+    values = np.array([-20, -2, 0, 2, 20], dtype=np.float32)
+    other = np.array([3, -4, 0, 2, -1], dtype=np.float32)
+    expected = values / (1 + np.exp(-np.float32(alpha) * values)) * other
+    actual = _run(executable, {"gate": values, "up": other}, tmp_path / "swiglu.onnx")
+    _assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("activation", ["relu", "gelu", "silu", "identity", "swiglu"])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
-@_requires_opset29
 def test_scalar_reference_and_schema_roundtrip(tmp_path, activation, dtype):
     native = _model(activation=activation, dtype=dtype, rank=3, clipped=activation == "swiglu")
     feeds = _feeds(
@@ -270,14 +295,22 @@ def test_scalar_reference_and_schema_roundtrip(tmp_path, activation, dtype):
     assert model.graph.opset_imports[""] == 29
     path = tmp_path / "standard.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
-    inferred = tmp_path / "inferred.onnx"
-    onnx.shape_inference.infer_shapes_path(str(path), str(inferred), strict_mode=True)
-    restored = ir.load(inferred)
-    assert restored.graph.outputs[0].shape == native.graph.outputs[0].shape
-    assert restored.graph.outputs[0].dtype == dtype
     actual = _run(expand_grouped_matmul(ir.load(path)), feeds, tmp_path / "expanded.onnx")
     _assert_close(actual, expected)
+
+
+@_requires_opset29
+@pytest.mark.parametrize("activation", ["relu", "gelu", "silu", "identity", "swiglu"])
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
+def test_opset29_checker_and_shape_inference(tmp_path, activation, dtype):
+    model = inline_native_calls(_model(activation=activation, dtype=dtype, rank=3))
+    path, inferred = tmp_path / "standard.onnx", tmp_path / "inferred.onnx"
+    ir.save(model, path)
+    onnx.checker.check_model(str(path), full_check=True)
+    onnx.shape_inference.infer_shapes_path(str(path), str(inferred), strict_mode=True)
+    restored = ir.load(inferred)
+    assert restored.graph.outputs[0].shape == model.graph.outputs[0].shape
+    assert restored.graph.outputs[0].dtype == dtype
 
 
 def _compare_native_cpu(tmp_path, activation, dtype, normalize):
@@ -308,12 +341,10 @@ def _compare_native_cpu(tmp_path, activation, dtype, normalize):
 
 @pytest.mark.parametrize("activation", ["relu", "gelu", "silu", "identity", "swiglu"])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
-@_requires_opset29
 def test_native_cpu_parity(tmp_path, activation, dtype):
     _compare_native_cpu(tmp_path, activation, dtype, normalize=0)
 
 
-@_requires_opset29
 def test_normalized_float_native_cpu_parity(tmp_path):
     _compare_native_cpu(tmp_path, "swiglu", ir.DataType.FLOAT, normalize=1)
 
@@ -322,7 +353,6 @@ def test_normalized_float_native_cpu_parity(tmp_path):
     "biases", [(False, False), (False, True), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("k,normalize", [(1, 0), (1, 1), (3, 0), (3, 1)])
-@_requires_opset29
 def test_optional_biases_routing_modes_and_all_experts(tmp_path, biases, k, normalize):
     native = _model(biases=biases, k=k, normalize=normalize, activation="identity")
     feeds = _feeds()
@@ -336,12 +366,12 @@ def test_optional_biases_routing_modes_and_all_experts(tmp_path, biases, k, norm
 
 @pytest.mark.parametrize("shape", [(0, 4), (2, 0, 4), (0, 3, 4), (0, 0, 4)])
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
-@_requires_opset29
 def test_empty_tokens(tmp_path, shape, dtype):
     model = inline_native_calls(_model(rank=len(shape), dtype=dtype))
     path = tmp_path / "empty.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
     feeds = _feeds(
         shape=shape, dtype=np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
     )
@@ -353,7 +383,6 @@ def test_empty_tokens(tmp_path, shape, dtype):
     "case", ["ties", "rounded_ties", "tiny", "extreme", "masked", "underflow"]
 )
 @pytest.mark.parametrize("normalize", [0, 1])
-@_requires_opset29
 def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
     _require_native_cpu(ir.DataType.FLOAT)
     native = _model(k=1 if "ties" in case else 3, normalize=normalize)
@@ -366,7 +395,6 @@ def test_routing_boundaries_and_dynamic_tokens(tmp_path, case, normalize):
         _assert_close(actual, _run(native24, feeds, tmp_path / f"native_{count}.onnx"))
 
 
-@_requires_opset29
 def test_higher_expert_id_on_probability_rounding_tie(tmp_path):
     native = _model(activation="identity", k=1, biases=(False, True))
     node = next(iter(native.graph))
@@ -380,7 +408,6 @@ def test_higher_expert_id_on_probability_rounding_tie(tmp_path):
     np.testing.assert_allclose(actual, np.ones((1, 4), np.float32), rtol=1e-6)
 
 
-@_requires_opset29
 def test_tiny_positive_routes_are_not_qmoe_thresholded(tmp_path):
     native = _model(activation="identity", k=3, biases=(False, True))
     node = next(iter(native.graph))
@@ -397,7 +424,6 @@ def test_tiny_positive_routes_are_not_qmoe_thresholded(tmp_path):
     _assert_close(actual, expected)
 
 
-@_requires_opset29
 def test_inactive_overflowing_expert_is_masked(tmp_path):
     native = _model(activation="identity", k=3, biases=(False, False))
     node = next(iter(native.graph))
@@ -417,7 +443,6 @@ def test_inactive_overflowing_expert_is_masked(tmp_path):
     assert np.all(np.isfinite(actual))
 
 
-@_requires_opset29
 def test_half_rounding_boundaries_are_observable(tmp_path):
     native = _model(dtype=ir.DataType.FLOAT16)
     feeds = _feeds(dtype=np.float16)
@@ -528,7 +553,6 @@ def test_missing_required_input(tmp_path, index):
     _assert_atomic(model, tmp_path, f"required MoE input {index}")
 
 
-@_requires_opset29
 def test_truncated_optional_slots(tmp_path):
     model = _model(biases=(False, False))
     feeds = _feeds()
@@ -598,7 +622,6 @@ def test_token_count_output_and_overload_validation(tmp_path):
 
 
 @pytest.mark.parametrize("activation", ["identity", "swiglu"])
-@_requires_opset29
 def test_square_modern_weights_are_qualified(tmp_path, activation):
     native = _model(hidden=4, inter=4, activation=activation)
     feeds = _feeds()
@@ -610,7 +633,6 @@ def test_square_modern_weights_are_qualified(tmp_path, activation):
 
 
 @pytest.mark.parametrize("limit", [0.0, np.inf])
-@_requires_opset29
 def test_swiglu_limit_boundaries_and_default_normalization(tmp_path, limit):
     native = _model()
     node = next(iter(native.graph))
@@ -669,7 +691,6 @@ def test_no_target_uses_normal_registry_behavior(tmp_path, enabled):
     assert model.graph.opset_imports[""] == version
 
 
-@_requires_opset29
 def test_output_metadata_name_collision_and_idempotence(tmp_path):
     model = _model()
     original = model.graph.outputs[0]
@@ -685,7 +706,8 @@ def test_output_metadata_name_collision_and_idempotence(tmp_path):
     assert output.meta["marker"] is marker
     path = tmp_path / "annotations.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
     restored = ir.load(path).graph.outputs[0]
     assert restored.name == original.name and restored.doc_string == original.doc_string
     assert restored.metadata_props == original.metadata_props
@@ -697,7 +719,6 @@ def test_output_metadata_name_collision_and_idempotence(tmp_path):
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16])
 @pytest.mark.parametrize("consumer", ["CastLike", "Identity"])
-@_requires_opset29
 def test_untyped_unshaped_native_intermediate(tmp_path, dtype, consumer):
     model = _model(dtype=dtype)
     feeds = _feeds(dtype=np.float16 if dtype == ir.DataType.FLOAT16 else np.float32)
@@ -719,13 +740,13 @@ def test_untyped_unshaped_native_intermediate(tmp_path, dtype, consumer):
     assert inferred.metadata_props == intermediate.metadata_props
     path = tmp_path / "untyped.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
     restored = ir.load(path)
     actual = _run(expand_grouped_matmul(restored), feeds, tmp_path / "expanded.onnx")
     _assert_close(actual, expected)
 
 
-@_requires_opset29
 def test_registration_does_not_convert_unrelated_function_imports():
     model = _model()
     x = ir.Value(name="audit_x", shape=ir.Shape([2, 3]), type=ir.TensorType(ir.DataType.FLOAT))
@@ -740,7 +761,6 @@ def test_registration_does_not_convert_unrelated_function_imports():
     assert model.functions[function.identifier()] is function
 
 
-@_requires_opset29
 def test_function_scope_and_registry_import_alignment(tmp_path):
     inner = _model().graph
     inner.inputs.extend(inner.initializers.values())
@@ -758,10 +778,10 @@ def test_function_scope_and_registry_import_alignment(tmp_path):
     assert not any(n.op_type == "MoE" for n in function.graph.all_nodes())
     path = tmp_path / "functions.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
 
 
-@_requires_opset29
 def test_existing24_model_must_be_rebuilt(tmp_path):
     model = _model(opset=24)
     x = model.graph.inputs[0]
@@ -782,7 +802,6 @@ def test_caller_owned_moe_function_rejected(tmp_path):
     _assert_atomic(model, tmp_path, "caller-owned source")
 
 
-@_requires_opset29
 def test_nested_subgraphs_are_lowered_and_aligned(tmp_path):
     then_graph, else_graph = _model().graph, _model().graph
     outer_inputs = list(then_graph.inputs)
@@ -821,10 +840,10 @@ def test_nested_subgraphs_are_lowered_and_aligned(tmp_path):
     assert all(g.opset_imports[""] == 29 for g in (model.graph, then_graph, else_graph))
     path = tmp_path / "nested.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)
 
 
-@_requires_opset29
 def test_mixed_moe_qmoe_calls_register_and_inline_together(tmp_path):
     from mobius.functions.qmoe_test import _model as qmodel
 
@@ -867,4 +886,5 @@ def test_mixed_moe_qmoe_calls_register_and_inline_together(tmp_path):
     assert not any(n.op_type in {"MoE", "QMoE"} for n in model.graph)
     path = tmp_path / "composed.onnx"
     ir.save(model, path)
-    onnx.checker.check_model(str(path), full_check=True)
+    if onnx.defs.has("GroupedMatMul", 29):
+        onnx.checker.check_model(str(path), full_check=True)

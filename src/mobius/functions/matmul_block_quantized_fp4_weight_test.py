@@ -9,6 +9,7 @@ import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
+import pytest
 from onnx_ir.passes.common import InlinePass
 
 from mobius.functions import (
@@ -20,6 +21,8 @@ from mobius.functions.matmul_block_quantized_fp4_weight import (
     _E2M1_TABLE,
     _E4M3_TABLE,
 )
+
+pytestmark = pytest.mark.opset29
 
 _OP_ID = ("com.microsoft", "MatMulBlockQuantizedFp4Weight", "")
 
