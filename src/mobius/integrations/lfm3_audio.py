@@ -139,7 +139,21 @@ class Lfm3AudioPipeline:
         mask: np.ndarray,
         features: np.ndarray,
         codes: np.ndarray,
+        cache: dict[str, np.ndarray],
     ) -> dict[str, np.ndarray]:
+        if (
+            codes.ndim != 2
+            or codes.dtype != np.int64
+            or codes.shape[1] != self.config.num_codebooks
+            or (
+                codes.size
+                and (np.min(codes) < 0 or np.max(codes) >= self.config.codebook_size)
+            )
+        ):
+            raise ValueError(
+                f"audio_out_codes must be int64 with shape (frames, {self.config.num_codebooks}) "
+                f"and codes in [0, {self.config.codebook_size})."
+            )
         for token_id, count, name in (
             (self.config.audio_token_id, features.shape[0], "audio_features"),
             (self.config.audio_out_token_id, codes.shape[0], "audio_out_codes"),
@@ -150,18 +164,6 @@ class Lfm3AudioPipeline:
                     f"LFM3 Audio has {actual} placeholders for {name} but {count} feature rows; "
                     "use the pinned processor and trim encoder padding before fusion."
                 )
-        if (
-            codes.ndim != 2
-            or codes.shape[1] != self.config.num_codebooks
-            or (
-                codes.size
-                and (np.min(codes) < 0 or np.max(codes) >= self.config.codebook_size)
-            )
-        ):
-            raise ValueError(
-                f"audio_out_codes must have shape (frames, {self.config.num_codebooks}) "
-                f"with codes in [0, {self.config.codebook_size})."
-            )
         embeds = self.sessions["embedding"].run(
             {"input_ids": ids, "audio_features": features, "audio_out_codes": codes}
         )["inputs_embeds"]
@@ -171,7 +173,7 @@ class Lfm3AudioPipeline:
                 "inputs_embeds": embeds,
                 "attention_mask": mask,
                 "position_ids": positions,
-                **self._cache,
+                **cache,
             }
         )
         self._mask = mask
@@ -242,15 +244,20 @@ class Lfm3AudioPipeline:
             if audio_out_codes is None
             else audio_out_codes
         )
-        self._cache = self._empty_cache(input_ids.shape[0])
-        return self._forward(input_ids, mask.astype(np.int64), features, codes)
+        return self._forward(
+            input_ids,
+            mask.astype(np.int64),
+            features,
+            codes,
+            self._empty_cache(input_ids.shape[0]),
+        )
 
     def step(
         self, input_ids: np.ndarray, audio_out_codes: np.ndarray | None = None
     ) -> dict[str, np.ndarray]:
         if self._mask is None:
             raise ValueError("Call prefill before decoding an LFM3 Audio continuation.")
-        if input_ids.shape != (self._mask.shape[0], 1):
+        if input_ids.dtype != np.int64 or input_ids.shape != (self._mask.shape[0], 1):
             raise ValueError("A decode step requires one int64 token per prefilled batch row.")
         mask = np.concatenate([self._mask, np.ones_like(input_ids)], axis=1)
         return self._forward(
@@ -260,6 +267,7 @@ class Lfm3AudioPipeline:
             np.empty((0, self.config.num_codebooks), dtype=np.int64)
             if audio_out_codes is None
             else audio_out_codes,
+            self._cache,
         )
 
     def generate_text(self, max_new_tokens: int = 24) -> np.ndarray:

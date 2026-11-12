@@ -35,9 +35,9 @@ ROOT = Path(__file__).resolve().parents[1]
 GOLDENS = ROOT / "testdata" / "golden" / "audio"
 
 
-def _golden(name, value):
+def _golden(name, value=None):
     path = GOLDENS / f"{name}.json"
-    if os.environ.get("MOBIUS_LFM3_AUDIO_UPDATE_GOLDEN") == "1":
+    if value is not None and os.environ.get("MOBIUS_LFM3_AUDIO_UPDATE_GOLDEN") == "1":
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     if not path.exists():
@@ -46,7 +46,9 @@ def _golden(name, value):
             "L4 GPU workflow with update_lfm3_audio_goldens=true, then commit its artifacts."
         )
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved == value, f"Pinned upstream reference changed for {path.name}"
+    if value is not None:
+        assert saved == value, f"Pinned upstream reference changed for {path.name}"
+    return saved
 
 
 def _reference(device):
@@ -240,9 +242,27 @@ def run_lfm3_audio_l5(tmp_path):
         )
         orders = []
         randperm = torch.randperm
+        stored_orders = (
+            None
+            if os.environ.get("MOBIUS_LFM3_AUDIO_UPDATE_GOLDEN") == "1"
+            else _golden("lfm3-audio-2b_generation")["codebook_orders"]
+        )
 
         def record_order(*args, **kwargs):
-            permutation = randperm(*args, **kwargs)
+            if stored_orders is None:
+                permutation = randperm(*args, **kwargs)
+            else:
+                # CPU and CUDA RNG streams differ: replay the independently
+                # recorded upstream permutations, not a device-dependent seed.
+                assert len(orders) < len(stored_orders), (
+                    "Upstream requested extra speech frames."
+                )
+                assert args[0] == len(stored_orders[len(orders)])
+                permutation = torch.tensor(
+                    stored_orders[len(orders)],
+                    device=kwargs.get("device"),
+                    dtype=kwargs.get("dtype", torch.int64),
+                )
             orders.append(permutation.cpu().tolist())
             return permutation
 
@@ -262,7 +282,7 @@ def run_lfm3_audio_l5(tmp_path):
         expected_length = int(generated.audio_lengths[0])
         expected_codes = expected_codes[:, :, :expected_length]
         assert 20 <= expected_length < 128, (
-            "Speech L5 must produce at least20 real frames and terminate within128 decisions."
+            "Speech L5 must produce at least 20 real frames and terminate within 128 decisions."
         )
         pipeline.prefill(
             speech["input_ids"].cpu().numpy(),
@@ -312,7 +332,7 @@ def run_lfm3_audio_l5(tmp_path):
             },
         )
 
-        # Release the large language model before loading the separate147MB codec.
+        # Release the large language model before loading the separate 147MB codec.
         for name in list(sessions):
             if name != "audio_decoder":
                 sessions.pop(name).close()

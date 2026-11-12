@@ -317,10 +317,18 @@ def test_audio_pipeline_and_cached_decode_match_upstream(tmp_path):
             ids, input_features=features, feature_lengths=lengths, audio_out_codes=out_codes
         )
         np.testing.assert_allclose(fused["logits"], expected_logits, rtol=1e-4, atol=1e-5)
-        cached = pipeline.step(next_ids)
-        np.testing.assert_allclose(cached["logits"], next_expected, rtol=1e-4, atol=1e-5)
         with pytest.raises(ValueError, match="placeholders for audio_features"):
             pipeline.prefill(ids, audio_out_codes=out_codes)
+        with pytest.raises(ValueError, match="int64 token"):
+            pipeline.step(next_ids.astype(np.float32))
+        for invalid_codes in (np.array(1, dtype=np.int64), out_codes.astype(np.float32)):
+            with pytest.raises(ValueError, match="audio_out_codes must be int64"):
+                pipeline.prefill(
+                    np.array([[config.audio_out_token_id]], dtype=np.int64),
+                    audio_out_codes=invalid_codes,
+                )
+        cached = pipeline.step(next_ids)
+        np.testing.assert_allclose(cached["logits"], next_expected, rtol=1e-4, atol=1e-5)
     finally:
         for session in sessions.values():
             session.close()
