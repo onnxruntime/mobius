@@ -55,6 +55,6 @@ def _embedding_gemma2_vision(config, parent_config, model_type, fields):
         pooling_kernel_size=vc.pooling_kernel_size,
         hidden_act=vc.hidden_activation,
         norm_eps=vc.rms_norm_eps,
-        rope_theta=rope["rope_theta"],
+        rope_theta=rope["rope_theta"] if isinstance(rope, dict) else rope.rope_theta,
     )
     return None

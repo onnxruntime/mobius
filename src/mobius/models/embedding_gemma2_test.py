@@ -10,7 +10,7 @@ import onnx_ir as ir
 import pytest
 import torch
 
-from mobius import build_from_module
+from mobius import ModelPackage, build_from_module
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.embedding_gemma2 import EmbeddingGemma2Config, EmbeddingGemma2Model
 
@@ -51,6 +51,48 @@ def test_embedding_gemma2_builds_stateless_encoder():
     attention = [n for n in model.graph if n.op_type == "Attention"]
     assert len(attention) == 2
     assert all(n.attributes["is_causal"].as_int() == 0 for n in attention)
+
+
+def test_embedding_gemma2_raw_sparse_config():
+    # Older Transformers versions load the registered architecture as raw JSON.
+    config = EmbeddingGemma2Config.from_transformers(
+        {
+            "model_type": "embedding_gemma2",
+            "vision_config": None,
+            "audio_config": None,
+            "text_config": {
+                "model_type": "embedding_gemma2_text",
+                "vocab_size": 64,
+                "hidden_size": 16,
+                "hidden_activation": "gelu_pytorch_tanh",
+                "intermediate_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 8,
+                "hidden_size_per_layer_input": 8,
+                "embedding_dim": 24,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "per_layer_config": {"01": {"head_dim": 16, "num_key_value_heads": 2}},
+                "sliding_window": 2,
+                "rope_parameters": {
+                    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                    "full_attention": {"rope_type": "default", "rope_theta": 1000000.0},
+                },
+                "torch_dtype": "bfloat16",
+            },
+        }
+    )
+    assert (config.head_dim, config.num_key_value_heads) == (8, 1)
+    assert (config.global_head_dim, config.num_global_key_value_heads) == (16, 2)
+    assert config.rope_theta == pytest.approx(10000.0)
+    assert config.global_rope_theta == pytest.approx(1000000.0)
+    assert config.rope_local_base_freq == pytest.approx(10000.0)
+    assert config.vision is None
+    assert config.audio is None
+    assert config.dtype == ir.DataType.FLOAT
+    package = build_from_module(EmbeddingGemma2Model(config), config, task="embedding-gemma2")
+    assert set(package) == {"model"}
 
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
@@ -112,7 +154,7 @@ def test_embedding_gemma2_synthetic_parity():
 
 
 @pytest.mark.integration
-def test_embedding_gemma2_media_pipeline():
+def test_embedding_gemma2_media_pipeline(tmp_path):
     from transformers import EmbeddingGemma2Config as HFConfig
     from transformers import EmbeddingGemma2Model as HFModel
     from transformers import EmbeddingGemma2TextConfig as HFTextConfig
@@ -171,6 +213,8 @@ def test_embedding_gemma2_media_pipeline():
     module = EmbeddingGemma2Model(config)
     package = build_from_module(module, config, task="embedding-gemma2")
     package.apply_weights(module.preprocess_weights(reference.state_dict()))
+    package.save(tmp_path, progress_bar=False)
+    package = ModelPackage.load(tmp_path)
     vision_session = OnnxModelSession(package["vision_encoder"])
     audio_session = OnnxModelSession(package["audio_encoder"])
     encoder_session = OnnxModelSession(package["model"])

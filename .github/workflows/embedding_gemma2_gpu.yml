@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: embedding-gemma2-${{ github.ref }}
+  group: embedding-gemma2-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
@@ -45,7 +45,7 @@ jobs:
           "$pythonLocation/bin/python" -m venv "$RUNNER_TEMP/embedding-venv"
           source "$RUNNER_TEMP/embedding-venv/bin/activate"
           python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-          python -m pip install -e '.[testing,transformers]' -r requirements/ci/embedding_gemma2.txt
+          python -m pip install -e . -r requirements/ci/embedding_gemma2.txt onnxruntime-easy pytest pytest-timeout Pillow librosa soundfile
           python -m pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
       - name: Verify native CUDA and synthetic pipeline
         run: |

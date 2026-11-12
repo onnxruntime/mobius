@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+from types import SimpleNamespace
 from typing import ClassVar
 
 import onnx_ir as ir
@@ -19,7 +20,6 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import Gemma4Config
-from mobius._configs._base import _as_attribute_config
 from mobius.components import GatedMLP, Linear, RMSNorm, get_activation, initialize_rope
 from mobius.models.gemma4 import (
     Gemma4Model,
@@ -41,15 +41,22 @@ class EmbeddingGemma2Config(Gemma4Config):
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> EmbeddingGemma2Config:
-        config = _as_attribute_config(config)
-        parent = _as_attribute_config(parent_config) or config
-        text = _as_attribute_config(getattr(config, "text_config", config))
+        # Keep RoPE and sparse per-layer dictionaries as mappings.
+        config = SimpleNamespace(**config) if isinstance(config, dict) else config
+        parent = parent_config or config
+        parent = SimpleNamespace(**parent) if isinstance(parent, dict) else parent
+        text = getattr(config, "text_config", config)
+        text = SimpleNamespace(**text) if isinstance(text, dict) else text
         # The generic extractor does not support this encoder's heterogeneous
         # per-layer schema. Resolve overrides explicitly, including sparse JSON.
         source = copy.copy(text)
         source.per_layer_config = None
+        if getattr(source, "rope_scaling", None) is None:
+            source.rope_scaling = getattr(source, "rope_parameters", None)
         base = Gemma4Config.from_transformers(source, parent)
         overrides = getattr(text, "per_layer_config", None) or {}
+        if isinstance(overrides, SimpleNamespace):
+            overrides = vars(overrides)
         dims: dict[str, set[tuple[int, int]]] = {}
         for i, layer_type in enumerate(base.layer_types or []):
             entry = (
@@ -60,12 +67,12 @@ class EmbeddingGemma2Config(Gemma4Config):
             hd = (
                 entry.get("head_dim", base.head_dim)
                 if isinstance(entry, dict)
-                else entry.head_dim
+                else getattr(entry, "head_dim", base.head_dim)
             )
             kv = (
                 entry.get("num_key_value_heads", base.num_key_value_heads)
                 if isinstance(entry, dict)
-                else entry.num_key_value_heads
+                else getattr(entry, "num_key_value_heads", base.num_key_value_heads)
             )
             dims.setdefault(layer_type, set()).add((hd, kv))
         if any(len(values) != 1 for values in dims.values()):
@@ -308,7 +315,9 @@ class EmbeddingGemma2Model(Gemma4Model):
 
     The package includes a bidirectional embedding encoder and optional Gemma4
     image/video and audio towers. Media features replace placeholders before
-    projection-only PLE; there is no decoder, LM head, or KV cache.
+    projection-only PLE; there is no decoder, LM head, or KV cache. Only float32
+    export is qualified. The shared vision graph processes one image or video
+    frame per call; callers concatenate its feature rows in processor order.
     """
 
     default_task = "embedding-gemma2"
