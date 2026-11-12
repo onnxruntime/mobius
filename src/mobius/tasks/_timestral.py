@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import json
 from typing import ClassVar
 
 import onnx_ir as ir
 
 from mobius._model_package import ModelPackage
+from mobius.models.timestral import TimestralConfig
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 
 
@@ -38,4 +40,7 @@ class TimestralTask(ModelTask):
         result.shape = ir.Shape(["rows", "prediction_length", len(config.quantile_knots)])
         result.dtype = ir.DataType.FLOAT
         builder.add_output(result, "quantiles")
-        return ModelPackage({"model": _make_model(graph)}, config=config)
+        model = _make_model(graph)
+        settings = {name: getattr(config, name) for name in TimestralConfig.__annotations__}
+        model.metadata_props["mobius.timestral.config"] = json.dumps(settings)
+        return ModelPackage({"model": model}, config=config)

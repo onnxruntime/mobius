@@ -77,6 +77,9 @@ Rows sharing a group are variates of the same example; other groups are isolated
 The NumPy helper handles missing observations, padding, context truncation,
 advancing normalization frames, median-feedback rollout, symmetric averaging,
 and nonnegative clipping. No PyTorch is needed for exported-model inference.
+After `package.save(...)` / `ModelPackage.load(...)`, recover the host settings
+with `TimestralConfig.from_onnx(loaded["model"])`; these are stored in the ONNX
+metadata rather than an ORT GenAI decoder configuration.
 
 Complete independent upstream reference tensors live in the
 `time-series-forecasting/timestral-5m` L4/L5 golden case. L5 forecasts 97 steps

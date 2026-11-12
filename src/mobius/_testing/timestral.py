@@ -103,10 +103,9 @@ def assert_timestral_golden(
     case: GoldenTestCase, json_path: Path, *, generation: bool
 ) -> None:
     """Verify every quantile and rollout block, including actual CUDA kernel use."""
-    import onnx_ir as ir
     import onnxruntime as ort
 
-    from mobius import build
+    from mobius import ModelPackage, build
     from mobius.integrations.timestral import forecast_timestral
     from mobius.models.timestral import TimestralConfig
 
@@ -129,7 +128,14 @@ def assert_timestral_golden(
     blocks = []
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "model.onnx"
-        ir.save(package["model"], path)
+        package.save(directory, progress_bar=False)
+        restored = ModelPackage.load(directory)
+        restored_config = TimestralConfig.from_onnx(restored["model"])
+        assert all(
+            getattr(restored_config, name) == getattr(config, name)
+            for name in TimestralConfig.__annotations__
+        )
+        config = restored_config
         options = ort.SessionOptions()
         options.enable_profiling = cuda
         options.profile_file_prefix = str(Path(directory) / "profile")

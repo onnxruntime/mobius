@@ -14,6 +14,7 @@ Known-future and past-only covariates are not part of this initial export contra
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 
 import numpy as np
@@ -151,6 +152,22 @@ class TimestralConfig(ArchitectureConfig):
             raise ValueError(
                 "Timestral scale floor, norm epsilon and RoPE base must be positive."
             )
+
+    @classmethod
+    def from_onnx(cls, model: ir.Model) -> TimestralConfig:
+        """Restore the inference settings carried by a saved Timestral graph."""
+        encoded = model.metadata_props.get("mobius.timestral.config")
+        if encoded is None:
+            raise ValueError(
+                "ONNX graph has no Timestral inference settings; rebuild it with "
+                "TimestralTask or supply the matching TimestralConfig explicitly."
+            )
+        settings = json.loads(encoded)
+        settings["block_schedule"] = tuple(settings["block_schedule"])
+        settings["quantile_knots"] = tuple(settings["quantile_knots"])
+        config = cls(**settings)
+        config.validate()
+        return config
 
 
 def _norm(op, x, scale, eps):

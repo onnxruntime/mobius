@@ -10,7 +10,7 @@ import onnx_ir as ir
 import pytest
 from onnx_ir.passes.common import CheckerPass
 
-from mobius import build_from_module
+from mobius import ModelPackage, build_from_module
 from mobius.integrations.transformers._config_resolver import _try_load_config_json
 from mobius.models.timestral import TimestralConfig, TimestralModel
 from tests.build_graph._support import _fill_dummy_weights
@@ -69,3 +69,22 @@ def test_timestral_native_config_detection(tmp_path):
     del raw["quantile_knots"]
     (tmp_path / "config.json").write_text(json.dumps(raw))
     assert _try_load_config_json(str(tmp_path)) is None
+
+
+def test_timestral_forecasting_settings_survive_package_roundtrip(tmp_path):
+    config = TimestralConfig(
+        hidden_size=32,
+        num_attention_heads=2,
+        intermediate_size=48,
+        patch_size=4,
+        block_schedule=("variate_time",),
+        quantile_knots=(0.2, 0.5, 0.8),
+        context_length=64,
+        block_size=3,
+        minimum_scale=0.01,
+    )
+    package = build_from_module(TimestralModel(config), config, "time-series-forecasting")
+    _fill_dummy_weights(package["model"])
+    package.save(str(tmp_path), progress_bar=False)
+    restored = ModelPackage.load(str(tmp_path))
+    assert TimestralConfig.from_onnx(restored["model"]) == config
