@@ -88,7 +88,9 @@ class CausalLMTask(ModelTask):
             runtime only needs the final token's logits (single-token
             autoregressive generation).  Breaks workflows that require
             per-token logits (logprob scoring, speculative decoding,
-            multi-token generation).
+            multi-token generation).  The kept position is the static index
+            ``-1``, so right-padded batches with more than one row are also
+            unsupported.
     """
 
     def __init__(
@@ -429,6 +431,45 @@ class HybridCausalLMTask(ModelTask):
         return ModelPackage({"model": model}, config=config)
 
 
+# Projections emitted by the Linear, QuantizedLinear and TiedQuantizedLMHead LM heads.
+_LM_HEAD_PROJECTIONS = frozenset({("", "MatMul"), ("com.microsoft", "MatMulNBits")})
+
+
+def _producer(value: ir.Value | None) -> ir.Node | None:
+    return value.producer() if value is not None else None
+
+
+def _constant_input(node: ir.Node, index: int) -> object:
+    """Return a constant input as a Python scalar or (nested) list, else ``None``."""
+    value = node.inputs[index] if index < len(node.inputs) else None
+    tensor = ir.convenience.get_const_tensor(value) if value is not None else None
+    return None if tensor is None else tensor.numpy().tolist()
+
+
+def _projects_last_sequence_token(logits: ir.Value) -> bool:
+    """Whether *logits* is the LM head applied to ``_retain_last_sequence_token``'s output.
+
+    Matches ``[Add] <- MatMul|MatMulNBits <- Unsqueeze(axes=[1]) <- Gather(axis=1)`` with a
+    scalar ``-1`` index. ``tolist()`` keeps the rank, so an index of ``[-1]`` does not match.
+    """
+    head = _producer(logits)
+    if head is not None and (head.domain, head.op_type) == ("", "Add"):  # LM-head bias
+        head = _producer(head.inputs[0])
+    if head is None or (head.domain, head.op_type) not in _LM_HEAD_PROJECTIONS:
+        return False
+    unsqueeze = _producer(head.inputs[0])
+    if unsqueeze is None or (unsqueeze.domain, unsqueeze.op_type) != ("", "Unsqueeze"):
+        return False
+    gather = _producer(unsqueeze.inputs[0])
+    return (
+        gather is not None
+        and (gather.domain, gather.op_type) == ("", "Gather")
+        and gather.attributes.get_int("axis", 0) == 1
+        and _constant_input(gather, 1) == -1
+        and _constant_input(unsqueeze, 1) == [1]
+    )
+
+
 def _validate_pruned_logits(
     logits: ir.Value,
     prune_prefill_prefix: bool,
@@ -438,6 +479,10 @@ def _validate_pruned_logits(
     if not prune_prefill_prefix:
         return
     shape = logits.shape
+    if shape is None and _projects_last_sequence_token(logits):
+        # Custom-domain ops (e.g. MatMulNBits, QMoE) get no shape inference while the graph
+        # is built, so check the selection that _retain_last_sequence_token inserts instead.
+        return
     if shape is None or len(shape) != 3 or shape[1] != 1:
         raise ValueError(
             f"{type(module).__name__} does not support prune_prefill_prefix. "

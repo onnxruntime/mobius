@@ -25,7 +25,7 @@ from mobius._registry import (
 from mobius._testing import make_config
 from mobius.components import LayerNorm, Linear, QuantizedLinear, RMSNormBias
 from mobius.models.base import CausalLMModel, TextModel
-from mobius.models.moe import Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
+from mobius.models.moe import MoECausalLMModel, Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
 from mobius.tasks import CausalLMTask
 
 
@@ -322,6 +322,81 @@ class TestPrunePrefillPrefix:
         config = make_config()
         with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
             build_from_module(UnsupportedCausalLM(config), config, prune_prefill_prefix=True)
+
+    @staticmethod
+    def _quantized_moe_config(**quantization):
+        return make_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            dtype=ir.DataType.FLOAT16,
+            quantization=QuantizationConfig(bits=4, group_size=32, sym=True, **quantization),
+        )
+
+    @pytest.mark.parametrize(
+        ("model_class", "quantization"),
+        [
+            pytest.param(
+                MoECausalLMModel, {"quant_method": "olive", "quantize_moe": True}, id="qmoe"
+            ),
+            pytest.param(
+                PhiMoEGGUFCausalLMModel,
+                {"quant_method": "gguf", "quantize_lm_head": True},
+                id="matmulnbits-head-with-bias",
+            ),
+        ],
+    )
+    def test_prune_quantized_moe_without_inferred_logits_shape(
+        self, model_class, quantization
+    ):
+        """MatMulNBits and QMoE leave logits shapeless during the build; pruning is accepted."""
+        config = self._quantized_moe_config(**quantization)
+        module = model_class(config)
+        model = build_from_module(module, config, prune_prefill_prefix=True)["model"]
+
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        assert logits.shape[1] == 1
+
+    @pytest.mark.parametrize(
+        ("index", "axis", "axes"),
+        [
+            pytest.param(None, None, None, id="unpruned"),
+            pytest.param(-1, 0, [1], id="gather-axis-0"),
+            pytest.param([0, 1], 1, [1], id="gather-two-positions"),
+            pytest.param([-1], 1, [1], id="gather-vector-index"),
+            pytest.param(-1, 1, [0], id="unsqueeze-axis-0"),
+        ],
+    )
+    def test_prune_quantized_moe_rejects_other_selections(self, index, axis, axes):
+        """Shapeless logits are accepted only for the scalar last-token selection."""
+
+        class CustomSelectionMoE(MoECausalLMModel):
+            def forward(
+                self,
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values=None,
+            ):
+                hidden_states, present = self.model(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                if index is not None:
+                    indices = op.Constant(value=ir.tensor(index, dtype=ir.DataType.INT64))
+                    hidden_states = op.Unsqueeze(
+                        op.Gather(hidden_states, indices, axis=axis),
+                        op.Constant(value_ints=axes),
+                    )
+                return self.lm_head(op, hidden_states), present
+
+        config = self._quantized_moe_config(quant_method="olive", quantize_moe=True)
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            build_from_module(CustomSelectionMoE(config), config, prune_prefill_prefix=True)
 
 
 class TestDeepStackCaptureOrdering:
