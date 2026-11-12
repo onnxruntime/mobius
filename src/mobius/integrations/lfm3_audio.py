@@ -200,7 +200,7 @@ class Lfm3AudioPipeline:
         if (
             mask.shape != input_ids.shape
             or not np.isin(mask, [0, 1]).all()
-            or (not mask[:, -1].all() or (np.diff(mask, axis=1) < 0).any())
+            or (not mask[:, -1].all() or (mask[:, :-1] > mask[:, 1:]).any())
         ):
             raise ValueError(
                 "attention_mask must match input_ids and describe contiguous left-padded "

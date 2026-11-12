@@ -321,6 +321,10 @@ def test_audio_pipeline_and_cached_decode_match_upstream(tmp_path):
             pipeline.prefill(ids, audio_out_codes=out_codes)
         with pytest.raises(ValueError, match="int64 token"):
             pipeline.step(next_ids.astype(np.float32))
+        invalid_mask = np.ones_like(ids, dtype=np.bool_)
+        invalid_mask[0, 1] = False
+        with pytest.raises(ValueError, match="contiguous left-padded"):
+            pipeline.prefill(ids, attention_mask=invalid_mask)
         for invalid_codes in (np.array(1, dtype=np.int64), out_codes.astype(np.float32)):
             with pytest.raises(ValueError, match="audio_out_codes must be int64"):
                 pipeline.prefill(
