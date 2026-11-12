@@ -33,12 +33,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._build_context import (
-    ep_capabilities,
-    get_build_dtype,
-    get_build_opset_version,
-    is_prefill_prefix_pruning_enabled,
-)
+from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
 from mobius._configs import ArchitectureConfig, Gemma4Config, QuantizationConfig
 from mobius._constants import GEMMA4_CUSTOM_GEGLU_METADATA_KEY
 from mobius._flags import flags
@@ -1907,14 +1902,7 @@ class Gemma4DecoderLayer(nn.Module):
                     normed_flat,
                 )
             elif (
-                (
-                    caps.supports_fused_moe
-                    or (
-                        get_build_opset_version() == 29
-                        and get_build_dtype() == ir.DataType.FLOAT
-                        and self._fused_moe_activation == "swiglu"
-                    )
-                )
+                caps.supports_fused_moe
                 and self._fused_moe_activation is not None
                 and (self._fused_moe_activation != "geglu" or custom_geglu)
             ):
@@ -1962,23 +1950,12 @@ class Gemma4DecoderLayer(nn.Module):
                     ),
                     op.Constant(value_ints=[e_dim, 2 * inter, hidden]),
                 )  # [E, 2*inter, H] interleaved
-                # Calling the router first realizes its parameters under their
-                # qualified names, including the remaining per-expert scale.
-                router_logits = self.router(op, residual_flat)
-                fc2 = self.fc2_experts_weights
-                if not caps.supports_fused_moe:
-                    # FLOAT-only standard fallback: scaling W2 is equivalent to
-                    # scaling each selected expert's contribution. Preprocessing
-                    # resets folded scales to ones; partial updates remain live.
-                    fc2 = op.Mul(
-                        fc2, op.Reshape(self.router.per_expert_scale, [-1, 1, 1])
-                    )  # [E, H, I]
                 moe_result = op.MoE(  # type: ignore[attr-defined]
                     normed_flat,
-                    router_logits,
+                    self.router(op, residual_flat),
                     fc1_interleaved,
                     None,  # fc1_experts_bias (slot 3, optional)
-                    fc2,
+                    self.fc2_experts_weights,
                     activation_type=self._fused_moe_activation,
                     k=self._top_k,
                     normalize_routing_weights=1,

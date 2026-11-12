@@ -134,6 +134,173 @@ def test_registry_constructs_fresh_bodies_at_root_version(version):
     assert fn.opset_imports[""] == version
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qnn_capabilities_select_experimental_build_opset(enabled):
+    caps = ep_registry.require("qnn")
+    assert not caps.supports_fused_moe
+    with override_flags(experimental_opset29=enabled), build_context(caps):
+        graph, builder = _make_graph()
+        expected = 29 if enabled else 24
+        assert graph.opset_imports[""] == expected
+        assert get_build_opset_version() == expected
+        assert (
+            builder.op.Identity(builder.op.Constant(value_int=1)).producer().version
+            == expected
+        )
+
+
+def test_qnn_raw_int4_qmoe_registration_and_public_inlining():
+    # Construction only: this does not assert QNN runtime opset-29 support.
+    caps = ep_registry.require("qnn")
+    with build_context(caps):
+        model = quantized_model(opset=get_build_opset_version())
+    optimize_model(model, ep="qnn")
+    assert model.graph.opset_imports[""] == 29
+    assert sum(node.op_type == "GroupedMatMul" for node in model.graph) == 2
+    assert not any(node.op_type in {"MoE", "QMoE"} for node in model.graph.all_nodes())
+    assert not any(fn.name in {"MoE", "QMoE"} for fn in model.functions.values())
+
+
+@pytest.mark.parametrize("imports", [{"ai.onnx": 29}, {"": 29, "ai.onnx": 29}, {}])
+def test_ordinary_registry_resolves_core_import_aliases(imports):
+    model = ir.Model(ir.Graph([], [], nodes=[], opset_imports=imports), ir_version=10)
+    register_function_bodies(model)
+    expected = 29 if imports else 24
+    assert all(fn.opset_imports[""] == expected for fn in model.functions.values())
+    assert all(
+        node.version == expected
+        for fn in model.functions.values()
+        for node in fn.graph.all_nodes()
+    )
+    assert dict(model.graph.opset_imports) == imports
+
+
+@pytest.mark.parametrize("make_model", [float_model, quantized_model])
+@pytest.mark.parametrize("scope", ["model", "function", "both", "matching"])
+def test_core_alias_roots_register_and_publicly_inline(make_model, scope):
+    model = make_model()
+    target_graph = model.graph
+    if scope in {"function", "both"}:
+        target_graph.inputs.extend(target_graph.initializers.values())
+        target_graph.initializers.clear()
+        fn = ir.Function("test", "Experts", graph=target_graph, attributes=[])
+        model = ir.Model(
+            ir.Graph([], [], nodes=[], opset_imports={"": 29}),
+            functions=[fn],
+            ir_version=10,
+        )
+    roots = (
+        [model.graph, target_graph]
+        if scope == "both"
+        else [target_graph if scope == "function" else model.graph]
+    )
+    for root in roots:
+        if scope != "matching":
+            del root.opset_imports[""]
+        root.opset_imports["ai.onnx"] = 29
+    original_imports = dict(target_graph.opset_imports)
+    register_function_bodies(model, moe_fallback=True)
+    assert dict(target_graph.opset_imports) == original_imports
+    InlinePass(criteria=lambda fn: fn.name in {"MoE", "QMoE"})(model)
+    assert sum(node.op_type == "GroupedMatMul" for node in target_graph) == 2
+    assert not any(node.op_type in {"MoE", "QMoE"} for node in target_graph)
+
+
+@pytest.mark.parametrize("make_model", [float_model, quantized_model])
+@pytest.mark.parametrize("matching", [False, True])
+def test_owned_specialization_accepts_core_alias_imports(make_model, matching):
+    model = make_model()
+    register_function_bodies(model, moe_fallback=True)
+    node = next(iter(model.graph))
+    function = model.functions[node.op_identifier()]
+    if not matching:
+        del function.opset_imports[""]
+    function.opset_imports["ai.onnx"] = 29
+    imports = dict(function.opset_imports)
+    functions = dict(model.functions)
+    # Checks both the source and destination of an already-specialized call.
+    register_function_bodies(model, moe_fallback=True)
+    assert dict(model.functions) == functions
+    assert dict(function.opset_imports) == imports
+    InlinePass(criteria=lambda fn: fn.name in {"MoE", "QMoE"})(model)
+    assert sum(n.op_type == "GroupedMatMul" for n in model.graph) == 2
+    assert dict(function.opset_imports) == imports
+
+
+@pytest.mark.parametrize("make_model", [float_model, quantized_model])
+@pytest.mark.parametrize("scope", ["model", "function", "destination", "source"])
+@pytest.mark.parametrize("conflict", [False, True])
+def test_core_alias_conflicts_and_scope_mismatches_are_atomic(
+    make_model, scope, conflict, tmp_path
+):
+    model = make_model()
+    node = next(iter(model.graph))
+    root = model.graph
+    if scope == "function":
+        inner = make_model().graph
+        inner.inputs.extend(inner.initializers.values())
+        inner.initializers.clear()
+        fn = ir.Function("test", "Experts", graph=inner, attributes=[])
+        model.functions[fn.identifier()] = fn
+        root = inner
+    elif scope in {"destination", "source"}:
+        register_function_bodies(model, moe_fallback=True)
+        root = model.functions[node.op_identifier()].graph
+        if scope == "destination":
+            node.overload = ""
+        else:
+            # Separate source from destination while retaining ownership/config.
+            source = model.functions[node.op_identifier()].clone()
+            source.overload = node.overload = "mobius_source"
+            model.functions[source.identifier()] = source
+            root = source.graph
+    if not conflict:
+        del root.opset_imports[""]
+    root.opset_imports["ai.onnx"] = 24
+    before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
+    ir.save(model, before)
+    overload, functions = node.overload, dict(model.functions)
+    message = (
+        "Conflicting core-domain opset imports"
+        if conflict
+        else {
+            "model": "requires opset 29",
+            "function": "containing function must use opset 29",
+            "destination": "conflicting destination",
+            "source": "specialization config mismatch",
+        }[scope]
+    )
+    with pytest.raises(ValueError, match=message):
+        register_function_bodies(model, moe_fallback=True)
+    ir.save(model, after)
+    assert before.read_bytes() == after.read_bytes()
+    assert node.overload == overload and dict(model.functions) == functions
+
+
+def test_ordinary_registry_rejects_conflicting_core_imports_atomically(tmp_path):
+    model = ir.Model(
+        ir.Graph([], [], nodes=[], opset_imports={"": 24, "ai.onnx": 29}), ir_version=10
+    )
+    before, after = tmp_path / "before.onnx", tmp_path / "after.onnx"
+    ir.save(model, before)
+    with pytest.raises(ValueError, match="Conflicting core-domain opset imports"):
+        register_function_bodies(model)
+    ir.save(model, after)
+    assert before.read_bytes() == after.read_bytes()
+    assert not model.functions
+
+
+def test_moe_flag_is_checked_before_core_import_aliases():
+    model = float_model()
+    model.graph.opset_imports["ai.onnx"] = 24
+    with (
+        override_flags(experimental_opset29=False),
+        pytest.raises(ValueError, match="requires experimental_opset29=True"),
+    ):
+        register_function_bodies(model, moe_fallback=True)
+    assert not model.functions
+
+
 @pytest.mark.parametrize("model_version,function_version", [(24, 29), (29, 24), (29, 29)])
 @pytest.mark.parametrize("in_function", [False, True])
 def test_public_inliner_rejects_both_import_mismatch_directions(

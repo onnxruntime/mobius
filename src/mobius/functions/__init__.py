@@ -25,7 +25,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 
 import onnx_ir as ir
@@ -130,6 +130,18 @@ def _specialize_matmul_nbits_calls(model: ir.Model) -> None:
 _MOE_CONFIG_METADATA = "mobius.function_body.config"
 
 
+def _core_opset_version(opset_imports: Mapping[str, int]) -> int | None:
+    """Resolve the standard-domain aliases without changing their imports."""
+    version = opset_imports.get("")
+    alias_version = opset_imports.get("ai.onnx")
+    if version is not None and alias_version is not None and version != alias_version:
+        raise ValueError(
+            "Conflicting core-domain opset imports: "
+            f"'' imports {version}, 'ai.onnx' imports {alias_version}"
+        )
+    return version if version is not None else alias_version
+
+
 def _config_identity(config: MoEFunctionConfig | QMoEFunctionConfig) -> str:
     # Encode floats as exact strings, including +inf (the native default limit).
     # RFC8785 and strict JSON numbers intentionally cannot represent infinity.
@@ -155,7 +167,7 @@ def _config_identity(config: MoEFunctionConfig | QMoEFunctionConfig) -> str:
 def _register_moe_bodies(model: ir.Model) -> None:
     if not flags.experimental_opset29:
         raise ValueError("MoE fallback requires experimental_opset29=True")
-    if model.graph.opset_imports.get("") != 29:
+    if _core_opset_version(model.graph.opset_imports) != 29:
         raise ValueError("MoE fallback requires opset 29; rebuild under experimental opset29")
     specializations: dict[
         ir.OperatorIdentifier, tuple[MoEFunctionConfig | QMoEFunctionConfig, str]
@@ -177,7 +189,7 @@ def _register_moe_bodies(model: ir.Model) -> None:
             # Unknown user overloads are not native operator calls.
             if node.overload and source is None:
                 continue
-            if root.opset_imports.get("") != 29:
+            if _core_opset_version(root.opset_imports) != 29:
                 raise ValueError(
                     f"{node.op_type} fallback: containing function must use opset 29; "
                     "rebuild under experimental opset29"
@@ -193,7 +205,7 @@ def _register_moe_bodies(model: ir.Model) -> None:
                 destination.metadata_props.get(FUNCTION_BODY_METADATA_KEY)
                 != FUNCTION_BODY_METADATA_VALUE
                 or destination.metadata_props.get(_MOE_CONFIG_METADATA) != identity
-                or destination.opset_imports.get("") != 29
+                or _core_opset_version(destination.opset_imports) != 29
             ):
                 raise ValueError(
                     f"{node.op_type} fallback: caller-owned or conflicting destination"
@@ -203,7 +215,7 @@ def _register_moe_bodies(model: ir.Model) -> None:
                 and node.overload
                 and (
                     source.metadata_props.get(_MOE_CONFIG_METADATA) != identity
-                    or source.opset_imports.get("") != 29
+                    or _core_opset_version(source.opset_imports) != 29
                 )
             ):
                 raise ValueError(f"{node.op_type} fallback: specialization config mismatch")
@@ -269,6 +281,9 @@ def register_function_bodies(model: ir.Model, *, moe_fallback: bool = False) -> 
     """
     if moe_fallback:
         _register_moe_bodies(model)
+    opset_version = _core_opset_version(model.graph.opset_imports)
+    if opset_version is None:
+        opset_version = OPSET_VERSION
     _specialize_matmul_nbits_calls(model)
     for op_id in _FUNCTION_BUILDERS:
         if op_id in model.functions:
@@ -280,9 +295,7 @@ def register_function_bodies(model: ir.Model, *, moe_fallback: bool = False) -> 
             node.domain == op_id[0] and node.op_type == op_id[1] for node in model.graph
         ):
             continue
-        fn = get_function(
-            op_id, opset_version=model.graph.opset_imports.get("", OPSET_VERSION)
-        )
+        fn = get_function(op_id, opset_version=opset_version)
         if fn is not None:
             model.functions[op_id] = fn
 

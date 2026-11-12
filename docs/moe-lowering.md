@@ -21,13 +21,14 @@ the normal EP-controlled `InlinePass` expands them. There is no separate
 Flag-off behavior is unchanged. Native-capable EPs keep opset 24 and native
 calls without fallback ABI restrictions, even with the flag enabled. The global
 `OPSET_VERSION` remains 24. Generic `MoELayer` dense dispatch and arbitrary
-gates/experts are unchanged. Only Gemma4's FLOAT raw-logit SwiGLU
-path additionally reuses native call construction on fallback EPs. GEGLU,
-BFLOAT16, sigmoid/SparseMixer routing, and Qwen4's probability-based dispatch
-retain their existing paths/restrictions; probabilities must not be softmaxed twice.
-Gemma4 FLOAT16 retains dense dispatch to preserve its activation and weighted
-contribution rounding boundaries. The FLOAT fallback consumes any remaining
-per-expert scale (including partial updates); already-folded scales are ones.
+gates/experts are unchanged. Gemma4 retains its model-specific dense dispatch
+on non-native EPs at both opset 24 and 29, preserving lower-ID TopK ties and
+applying any remaining per-expert scale to normalized routing weights, not W2.
+This includes live scales supplied by partial weight updates. Generic function
+lowering only touches pre-existing supported native calls; it does not change
+Gemma4 dispatch. GEGLU, BFLOAT16, sigmoid/SparseMixer routing, and Qwen4's
+probability-based dispatch retain their existing paths/restrictions;
+probabilities must not be softmaxed twice.
 
 This replaces `com.microsoft::MoE` with two standard `GroupedMatMul-29` calls,
 targeting the pinned **CPU reference**, not all execution providers.
@@ -150,6 +151,9 @@ converts or relabels imported graphs or caller functions. All containing
 function roots must also import 29: lexical child graph hints cannot override
 their serialized root scope. IR's standard inliner rejects both 29-function /
 24-model and 24-function / 29-model mismatches.
+Standard-domain imports may use `""`, `"ai.onnx"`, or both at the same version.
+Conflicting simultaneous aliases are rejected before registration changes;
+imports are not normalized or relabeled.
 
 All target ABIs, output annotations, specializations, and ownership collisions
 are checked before changing target overloads or adding functions. Bodies have
