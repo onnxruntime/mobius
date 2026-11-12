@@ -10,5 +10,7 @@ notes: >-
   L4 compares full token and normalized sentence embeddings for text, image,
   video, audio, and a padded mixed-media batch. L5 checks deterministic semantic
   retrieval and re-normalized Matryoshka dimensions, not autoregressive tokens.
+  Native image/video fixtures use a 70-soft-token budget per image/frame;
+  replay stages components sequentially for the pool's 4 GiB A10-4Q partitions.
   Regenerate with scripts/generate_embeddinggemma2_golden.py using the isolated
   requirements/ci/embedding_gemma2.txt reference on CUDA.

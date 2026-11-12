@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 
 import numpy as np
@@ -41,12 +42,14 @@ def replay(*, level: str) -> None:
         load_weights=True,
         execution_provider="cuda" if device == "cuda" else "cpu",
     )
-    sessions = {
-        name: OnnxModelSession(model, device=device) for name, model in package.items()
-    }
-    if device == "cuda":
-        for session in sessions.values():
-            assert session._session.get_providers()[0] == "CUDAExecutionProvider"
+
+    def run_component(name: str, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        # A10-4Q runners have 4 GiB: release each tower before loading the next.
+        with closing(OnnxModelSession(package[name], device=device)) as session:
+            if device == "cuda":
+                assert session._session.get_providers()[0] == "CUDAExecutionProvider"
+            return session.run(inputs)
+
     actual_embeddings = {}
     with np.load(root / "embeddinggemma-2.npz", allow_pickle=False) as arrays:
         for sample in metadata["samples"]:
@@ -68,11 +71,12 @@ def replay(*, level: str) -> None:
                 if pixels_name in inputs:
                     features[output_name] = np.concatenate(
                         [
-                            sessions["vision_encoder"].run(
+                            run_component(
+                                "vision_encoder",
                                 {
                                     "pixel_values": pixels[None],
                                     "pixel_position_ids": positions[None],
-                                }
+                                },
                             )["image_features"]
                             for pixels, positions in zip(
                                 inputs[pixels_name], inputs[positions_name], strict=True
@@ -81,20 +85,22 @@ def replay(*, level: str) -> None:
                         axis=0,
                     )
             if "input_features" in inputs:
-                features["audio_features"] = sessions["audio_encoder"].run(
+                features["audio_features"] = run_component(
+                    "audio_encoder",
                     {
                         "input_features": inputs["input_features"],
                         "input_features_mask": inputs["input_features_mask"],
-                    }
+                    },
                 )["audio_features"]
             positions = np.broadcast_to(np.arange(ids.shape[1], dtype=np.int64), ids.shape)
-            outputs = sessions["model"].run(
+            outputs = run_component(
+                "model",
                 {
                     "input_ids": ids,
                     "attention_mask": inputs["attention_mask"],
                     "position_ids": positions.copy(),
                     **features,
-                }
+                },
             )
             assert np.isfinite(outputs["sentence_embedding"]).all()
             np.testing.assert_allclose(

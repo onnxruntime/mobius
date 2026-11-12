@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from importlib.metadata import distribution
 from pathlib import Path
 
 import numpy as np
@@ -18,8 +19,17 @@ from transformers import AutoModel, AutoProcessor
 
 from mobius.models.embedding_gemma2 import MODEL_ID, MODEL_REVISION
 
+TRANSFORMERS_REVISION = "f210a32fbf2e3213a143dad8c587935216088b38"
+
 
 def generate(output: Path) -> None:
+    source = json.loads(distribution("transformers").read_text("direct_url.json") or "{}")
+    reference_commit = source.get("vcs_info", {}).get("commit_id")
+    if reference_commit != TRANSFORMERS_REVISION:
+        raise RuntimeError(
+            f"EmbeddingGemma 2 goldens require Transformers {TRANSFORMERS_REVISION}, "
+            f"got {reference_commit!r}. Install requirements/ci/embedding_gemma2.txt."
+        )
     assert torch.cuda.is_available(), "Golden generation requires a real CUDA GPU."
     torch.manual_seed(0)
     processor = AutoProcessor.from_pretrained(MODEL_ID, revision=MODEL_REVISION)
@@ -65,7 +75,14 @@ def generate(output: Path) -> None:
     ]
     scenarios = [
         ("text", {"text": ["Here is my poem:", "A much shorter poem."], "padding": True}),
-        ("image", {"text": "<|image|>", "images": cat}),
+        (
+            "image",
+            {
+                "text": "<|image|>",
+                "images": cat,
+                "images_kwargs": {"max_soft_tokens": 70},
+            },
+        ),
         ("audio", {"text": "<|audio|>", "audio": sound, "sampling_rate": rate}),
         (
             "video",
@@ -74,6 +91,7 @@ def generate(output: Path) -> None:
                 "videos": frames,
                 "do_sample_frames": False,
                 "video_metadata": {"fps": 1.0, "total_num_frames": 2},
+                "videos_kwargs": {"max_soft_tokens": 70},
             },
         ),
         (
@@ -81,6 +99,7 @@ def generate(output: Path) -> None:
             {
                 "text": ["A cat: <|image|>", "A recording: <|audio|>"],
                 "images": [[cat], []],
+                "images_kwargs": {"max_soft_tokens": 70},
                 "audio": [sound],
                 "sampling_rate": rate,
                 "padding": True,
@@ -92,6 +111,7 @@ def generate(output: Path) -> None:
     samples = []
     rankings = {}
     for name, kwargs in scenarios:
+        print(f"Generating {name} reference on CUDA.", flush=True)
         inputs = processor(**kwargs, return_tensors="pt")
         # Processor-only metadata is not a model operand.
         inputs = {
@@ -120,10 +140,13 @@ def generate(output: Path) -> None:
         "model_id": MODEL_ID,
         "revision": MODEL_REVISION,
         "dtype": "float32",
-        "transformers_revision": "f210a32fbf2e3213a143dad8c587935216088b38",
+        "transformers_revision": reference_commit,
         "transformers_version": transformers.__version__,
         "torch_version": torch.__version__,
         "device": torch.cuda.get_device_name(),
+        "device_memory_bytes": torch.cuda.get_device_properties(0).total_memory,
+        "image_max_soft_tokens": 70,
+        "video_max_soft_tokens": 70,
         "samples": samples,
     }
     (output / "embeddinggemma-2.json").write_text(json.dumps(metadata, indent=2) + "\n")
