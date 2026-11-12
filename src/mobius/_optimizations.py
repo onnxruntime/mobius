@@ -406,13 +406,17 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
             for identifier, function in model.functions.items()
             if criteria(function)
         }
+        if not selected:
+            # Empty selection still requires public validation, including cycles.
+            common_passes.InlinePass(criteria=criteria)(model)
+            return
         leaves = {
             identifier
             for identifier, function in selected.items()
             if not any(node.op_identifier() in selected for node in function.graph.all_nodes())
         }
-        if selected and not leaves:
-            # Let the public inliner report its cyclic-function precondition.
+        if not leaves:
+            # No selected leaves: let the public inliner report its cycle precondition.
             common_passes.InlinePass(criteria=criteria)(model)
             return
         annotations: list[
@@ -450,7 +454,7 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
                             )
                         )
         if not annotations:
-            # Preserve public preconditions even when only unused leaves remain.
+            # Unused leaves can coexist with a cyclic component; defer validation.
             common_passes.InlinePass(criteria=criteria)(model)
             return
 
@@ -487,6 +491,7 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
                 restored_value.meta.update(meta)
         if not result.modified:
             return
+        # Recompute leaves: expansion can make their selected callers eligible.
 
 
 def _log_trace_entry(entry: _TraceEntry) -> None:

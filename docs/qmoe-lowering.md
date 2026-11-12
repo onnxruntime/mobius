@@ -18,8 +18,9 @@ route expands native QMoE calls into blocked `DequantizeLinear` and two
 `GroupedMatMul-29` calls. There is no separate `lower_qmoe` API or import auditor.
 
 Flag-off builds stay unchanged. Native-capable EPs keep opset 24/native calls
-without running the restricted fallback validator. The global opset remains 24;
-generic dense MoE dispatch, gate algebra, checkpoint loading, and packed native
+without running the restricted fallback validator. The global default
+`OPSET_VERSION` remains 24; the flag selects the per-build override described above.
+Generic dense MoE dispatch, gate algebra, checkpoint loading, and packed native
 input lists are unchanged. The flag does not imply runtime support:
 schema/checker support alone cannot qualify execution, and the tested ORT
 1.31.1 cannot execute these opset-29 graphs directly.

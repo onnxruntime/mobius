@@ -111,7 +111,11 @@ def build_context(
 
 
 def get_build_opset_version() -> int:
-    """Return the opset selected when the active build context was entered."""
+    """Return the opset snapshotted at build-context entry, or the default outside it.
+
+    The public inliner rejects mismatched function/model opsets. Snapshotting
+    prevents nested flag overrides during a build from mixing those versions.
+    """
     return _current_opset.get()
 
 

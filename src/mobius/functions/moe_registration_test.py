@@ -179,7 +179,8 @@ def test_24_target_rejection_is_atomic_without_schema_requirement(make_model):
 
 
 @pytest.mark.parametrize("unused_leaf", [False, True])
-def test_inline_preserves_public_cycle_precondition_with_unused_leaf(unused_leaf):
+@pytest.mark.parametrize("selected", [False, True])
+def test_inline_preserves_public_cycle_precondition_with_unused_leaf(unused_leaf, selected):
     formal = ir.Value(name="z")
     recursive = ir.Node("test", "Loop", [formal], outputs=[ir.Value(name="out")])
     function = ir.Function(
@@ -210,7 +211,9 @@ def test_inline_preserves_public_cycle_precondition_with_unused_leaf(unused_leaf
         )
         model.functions[unused.identifier()] = unused
     with pytest.raises(PreconditionError, match="Cyclic dependency detected"):
-        _inline_function_bodies(model, lambda function: True)
+        InlinePass(criteria=lambda function: selected)(model)
+    with pytest.raises(PreconditionError, match="Cyclic dependency detected"):
+        _inline_function_bodies(model, lambda function: selected)
 
 
 @pytest.mark.parametrize("make_model", [float_model, quantized_model])

@@ -1,11 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""ONNX Function definitions for proposed linear attention operators.
+"""Standard-ONNX function bodies for contrib operators.
 
-These functions define reference implementations using standard ONNX ops
-for the operators proposed in https://github.com/onnx/onnx/issues/7689.
-They serve as:
+These factories define reference implementations for attention, convolution,
+normalization, quantized matrix multiplication, and mixture-of-experts operators.
+They use standard ONNX ops and serve as:
 
 1. **Semantic specifications** — precise mathematical definitions of each op
 2. **Fallback implementations** — backends that don't have native kernels
@@ -237,16 +237,30 @@ def register_function_bodies(model: ir.Model, *, moe_fallback: bool = False) -> 
     After calling this, :class:`onnx_ir.passes.common.InlinePass` can
     expand any of these ops by passing a suitable ``criteria`` predicate.
 
-    Only registers functions for ops that are not already defined in the
-    model (to avoid overwriting user-provided function bodies).
+    Ordinary bodies are registered only when their identifiers are not already
+    defined, preserving user-provided bodies. The optional MoE path additionally
+    specializes calls as described below.
 
-    Each call creates **fresh** ``ir.Function`` objects so that concurrent
-    builds in different threads (or sequential builds in the same process)
-    cannot corrupt each other's function bodies.
+    Newly registered bodies are **fresh** ``ir.Function`` objects so that
+    concurrent builds in different threads (or sequential builds in the same
+    process) cannot corrupt each other's function bodies.
 
     MatMulNBits calls without zero points select an overload implementing the
     operator's default. Native op inputs and packed weights are left unchanged,
     and caller-provided MatMulNBits function definitions are preserved.
+
+    With ``moe_fallback=True``, ``flags.experimental_opset29`` must be enabled
+    and the model root must already use opset 29, even without native targets;
+    rebuild existing opset-24 models rather than converting their imports.
+    Native MoE/QMoE calls receive
+    configuration-specialized overloads and matching function bodies, without
+    changing their inputs or attributes. Caller-owned or conflicting source
+    and destination functions are rejected rather than overwritten.
+
+    All MoE/QMoE targets are validated and all needed bodies are constructed
+    before changing their call overloads, output annotations, or registered
+    functions. This target-specific guarantee does not cover subsequent failures
+    in the ordinary function registry.
     """
     if moe_fallback:
         _register_moe_bodies(model)
