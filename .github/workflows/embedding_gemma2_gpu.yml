@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
 
+env:
+  NVIDIA_TF32_OVERRIDE: "0"
+
 concurrency:
   group: embedding-gemma2-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
