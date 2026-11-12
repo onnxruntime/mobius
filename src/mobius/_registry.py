@@ -180,6 +180,7 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
+from mobius.models.embedding_gemma2 import EmbeddingGemma2Config, EmbeddingGemma2Model
 from mobius.models.esm import EsmConfig, EsmModel
 from mobius.models.falcon import (
     BloomCausalLMModel,
@@ -811,6 +812,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "fuyu": ModelRegistration(LLaVAModel, task="vision-language"),
     "gemma3n": ModelRegistration(
         Gemma3nMultiModalModel, task="gemma3n", config_class=Gemma3nMultiModalConfig
+    ),
+    "embedding_gemma2": ModelRegistration(
+        EmbeddingGemma2Model,
+        task="embedding-gemma2",
+        config_class=EmbeddingGemma2Config,
+        test_model_id="google/embeddinggemma-2",
+        test_revision="f9972ac22e696a105c482202646979e33e4b5a1e",
     ),
     "gemma4": ModelRegistration(Gemma4Model, task="gemma4", config_class=Gemma4Config),
     "gemma4_unified": ModelRegistration(

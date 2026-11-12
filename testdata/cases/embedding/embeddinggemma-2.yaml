@@ -1,0 +1,14 @@
+model_id: google/embeddinggemma-2
+model_type: embedding_gemma2
+revision: f9972ac22e696a105c482202646979e33e4b5a1e
+task_type: embedding-gemma2
+dtype: float32
+level: L4+L5
+inputs:
+  prompts: ["Here is my poem:"]
+notes: >-
+  L4 compares full token and normalized sentence embeddings for text, image,
+  video, audio, and a padded mixed-media batch. L5 checks deterministic semantic
+  retrieval and re-normalized Matryoshka dimensions, not autoregressive tokens.
+  Regenerate with scripts/generate_embeddinggemma2_golden.py using the isolated
+  requirements/ci/embedding_gemma2.txt reference on CUDA.
