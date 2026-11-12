@@ -117,7 +117,19 @@ def _device():
         assert torch.cuda.is_available(), (
             "CUDA requested but unavailable; do not fall back to CPU."
         )
-        print(f"GPU evidence: {torch.cuda.get_device_name(0)}; torch={torch.__version__}")
+        properties = torch.cuda.get_device_properties(0)
+        memory_gib = properties.total_memory / 1024**3
+        print(
+            f"GPU evidence: {properties.name}; VRAM={memory_gib:.2f} GiB; "
+            f"torch={torch.__version__}"
+        )
+        if memory_gib < 20:
+            raise RuntimeError(
+                f"Full float32 LFM3 Audio reference/ORT validation needs approximately "
+                f"20 GiB VRAM, but {properties.name} exposes only {memory_gib:.2f} GiB. "
+                "Use an existing larger GPU partition or an explicitly approved reduced "
+                "real-weight fixture; this test never substitutes CPU or reduced precision."
+            )
     return device
 
 

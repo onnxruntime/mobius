@@ -105,6 +105,7 @@ class Lfm3AudioPipeline:
     Sessions use the named-array ``run(feeds) -> outputs`` contract. Speech
     uses greedy MaskGIT with an explicit permutation for every frame; supplying
     recorded upstream permutations makes reference replay reproducible.
+    Prefill and cache steps support batches; generation requires one prompt.
     """
 
     def __init__(self, config: Lfm3AudioConfig, sessions: Mapping[str, AudioComponentSession]):
@@ -312,6 +313,11 @@ class Lfm3AudioPipeline:
     def generate_speech(
         self, max_frames: int = 24, *, codebook_orders: Sequence[Sequence[int]] | None = None
     ) -> np.ndarray:
+        """Use sequential codebook order by default, or replay recorded orders.
+
+        The sequential default is deterministic but differs from upstream's
+        randomly permuted MaskGIT schedule, even with greedy code logits.
+        """
         if max_frames <= 0:
             raise ValueError("max_frames must be positive; provide a speech frame budget.")
         if codebook_orders is not None and len(codebook_orders) < max_frames:
