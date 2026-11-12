@@ -29,7 +29,7 @@ def validate_config_parameters(
     dtype: ir.DataType,
     caller: str,
 ) -> tuple[float, float, float]:
-    """Shared invariants for both explicit configs and native call validation."""
+    """Validate shared invariants and return binary32-rounded alpha/beta/limit."""
     if any(type(d) is not int or d <= 0 for d in (experts, hidden, intermediate)):
         raise ValueError(
             f"{caller}: expert, hidden and intermediate dimensions must be positive integers"
@@ -49,6 +49,7 @@ def validate_config_parameters(
 
 
 def validate_block(block: int, hidden: int, intermediate: int) -> None:
+    """Validate the qualified QMoE packed-block contract, not all native layouts."""
     if type(block) is not int or block < 16 or block & (block - 1):
         raise ValueError("QMoE fallback: block_size must be a power of two >= 16")
     if hidden % block or intermediate % block:

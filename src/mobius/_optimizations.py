@@ -423,6 +423,8 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
             return
         for identifier in leaves:
             function = model.functions[identifier]
+            # Aliased returns need distinct boundaries so restoring call-site
+            # annotations cannot overwrite inputs or merge separate outputs.
             outputs = set(function.outputs)
             if not outputs.intersection(function.inputs) and len(outputs) == len(
                 function.outputs
@@ -506,6 +508,7 @@ def _inline_function_bodies(model: ir.Model, criteria: Callable[[ir.Function], b
             for graph in (root, *root.subgraphs())
         }
         for graph, output_name, doc, props, meta in annotations:
+            # A missing boundary means inlining broke the restoration invariant.
             restored_value = values_by_graph[graph][output_name]
             if doc is not None:
                 restored_value.doc_string = doc
