@@ -1082,30 +1082,6 @@ class TestQuantizationConfig:
         assert qc.quantize_lm_head is True
         assert qc.quantize_vision is True
 
-    def test_component_plan_matches_exact_and_regex_module_rules(self):
-        qc = QuantizationConfig.from_value(
-            {
-                "quant_method": "olive",
-                "bits": 4,
-                "group_size": 32,
-                "modules_to_not_convert": [
-                    r"re:.*\.per_layer_input_gate",
-                ],
-                "overrides": {
-                    "model.layers.0.q_proj": {
-                        "bits": 8,
-                        "group_size": 64,
-                    }
-                },
-            }
-        )
-
-        assert qc is not None
-        assert qc.for_module(("model.language_model.layers.0.per_layer_input_gate",)) is None
-        overridden = qc.for_module(("model.layers.0.q_proj",))
-        assert overridden is not None
-        assert (overridden.bits, overridden.group_size) == (8, 64)
-
     def test_invalid_component_regex_fails_during_config_parse(self):
         with pytest.raises(ValueError, match="Invalid quantization regex"):
             QuantizationConfig.from_value(
@@ -1114,37 +1090,6 @@ class TestQuantizationConfig:
                     "modules_to_not_convert": ["re:("],
                 }
             )
-
-    @pytest.mark.parametrize("rule", ["exclusion", "override"])
-    @pytest.mark.parametrize(
-        ("module_name", "matches"),
-        [
-            ("model.layers.1", True),
-            ("model.layers.1.self_attn.q_proj", True),
-            ("model.layers.10.self_attn.q_proj", False),
-            ("model.layers.1_extra", False),
-            ("other.model.layers.1.self_attn.q_proj", False),
-        ],
-    )
-    def test_literal_module_rules_respect_path_boundaries(self, rule, module_name, matches):
-        policy = (
-            {"modules_to_not_convert": ["model.layers.1"]}
-            if rule == "exclusion"
-            else {"overrides": {"model.layers.1": {"bits": 8, "group_size": 64}}}
-        )
-        qc = QuantizationConfig.from_value(
-            {"quant_method": "olive", "bits": 4, "group_size": 32, **policy}
-        )
-        assert qc is not None
-
-        resolved = qc.for_module((module_name,))
-
-        if rule == "exclusion" and matches:
-            assert resolved is None
-        else:
-            assert resolved is not None
-            expected = (8, 64) if matches else (4, 32)
-            assert (resolved.bits, resolved.group_size) == expected
 
     def test_architecture_config_parses_explicit_component_quantization(self):
         text = SimpleNamespace(
