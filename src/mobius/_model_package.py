@@ -29,7 +29,7 @@ import shutil
 import tempfile
 import threading
 from collections import UserDict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -724,6 +724,10 @@ class ModelPackage(UserDict[str, ir.Model]):
         :attr:`mtp_head` package is saved under a collision-free directory named
         by ``.mobius-package.json``.
 
+        Interface symbolic dimension names are preserved within each model.
+        Non-contractual intermediate symbols are anonymized during serialization;
+        in-memory shapes remain unchanged.
+
         .. note::
             This method writes ONNX files only.  If you need a directory that
             ``onnxruntime-genai`` can load (i.e. with ``genai_config.json`` and
@@ -945,7 +949,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             if use_subfolders:
                 os.makedirs(model_dir, exist_ok=True)
             path = os.path.join(model_dir, "model.onnx")
-            with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
+            with _anonymized_intermediate_symbolic_dimensions(model) as saved_model:
                 if reuse_plan is not None:
                     from mobius.integrations.gguf._reuse import save_reuse_package
 
@@ -1561,11 +1565,10 @@ class ModelPackage(UserDict[str, ir.Model]):
 
 
 @contextmanager
-def _namespaced_symbolic_dimensions(
+def _anonymized_intermediate_symbolic_dimensions(
     model: ir.Model,
-    namespace: str,
-) -> Iterator[ir.Model]:
-    """Namespace interface symbols and discard non-contractual intermediate aliases."""
+) -> Generator[ir.Model, None, None]:
+    """Discard non-contractual intermediate aliases, preserving interface symbols."""
     interface_values = {id(value) for value in (*model.graph.inputs, *model.graph.outputs)}
     values: dict[int, ir.Value] = {}
     graphs: list[ir.GraphProtocol] = []
@@ -1579,10 +1582,9 @@ def _namespaced_symbolic_dimensions(
             values[id(value)] = value
 
     originals: list[tuple[ir.Value, ir.Shape]] = []
-    symbols: dict[str, str] = {}
     try:
         for value in values.values():
-            if value.shape is None:
+            if value.shape is None or id(value) in interface_values:
                 continue
             dimensions: list[int | str | ir.SymbolicDim] = []
             changed = False
@@ -1593,12 +1595,7 @@ def _namespaced_symbolic_dimensions(
                 if dimension.value is None:
                     dimensions.append(dimension)
                     continue
-                if id(value) not in interface_values:
-                    dimensions.append(ir.SymbolicDim(None))
-                    changed = True
-                    continue
-                text = str(dimension)
-                dimensions.append(symbols.setdefault(text, f"{namespace}.{text}"))
+                dimensions.append(ir.SymbolicDim(None))
                 changed = True
             if changed:
                 originals.append((value, value.shape))
