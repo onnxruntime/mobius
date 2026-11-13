@@ -20,8 +20,8 @@ from mobius._configs import VisionConfig
 from mobius._export_report import ComponentExportDisposition, ComponentExportReport
 from mobius._model_package import (
     ModelPackage,
+    _anonymized_intermediate_symbolic_dimensions,
     _make_progress_callback,
-    _namespaced_symbolic_dimensions,
     _save_safetensors,
 )
 from mobius._testing import make_config
@@ -1328,7 +1328,10 @@ class TestModelPackageSaveLoad:
         loaded = ModelPackage.load(str(tmp_path))
         assert loaded.policy_components["sample"].contract_id == "onnx-genai.token-sampler@1"
 
-    def test_save_namespaces_component_symbols_without_mutating_package(self, tmp_path):
+    @pytest.mark.parametrize("component_names", [("decoder",), ("decoder", "encoder")])
+    def test_save_preserves_component_symbols_without_mutating_package(
+        self, tmp_path, component_names
+    ):
         input_value = ir.Value(
             name="input",
             type=ir.TensorType(ir.DataType.FLOAT),
@@ -1357,23 +1360,34 @@ class TestModelPackageSaveLoad:
             ),
             ir_version=10,
         )
-        pkg = ModelPackage({"decoder": model})
+        pkg = ModelPackage({name: model.clone() for name in component_names})
+        original_shapes = [
+            (value, value.shape)
+            for component in pkg.values()
+            for value in (
+                *component.graph.inputs,
+                *component.graph.outputs,
+                *(node.outputs[0] for node in component.graph),
+            )
+        ]
 
         pkg.save(str(tmp_path))
 
-        saved = ir.load(tmp_path / "model.onnx")
-        assert [str(dimension) for dimension in saved.graph.inputs[0].shape] == [
-            "component.decoder.batch",
-            "component.decoder.sequence",
-        ]
-        assert saved.graph.inputs[0].shape.get_denotation(0) == "DATA_BATCH"
-        assert all(
-            dimension.value is None for dimension in next(iter(saved.graph)).outputs[0].shape
+        loaded = ModelPackage.load(str(tmp_path))
+        assert set(loaded) == (
+            {"model"} if len(component_names) == 1 else set(component_names)
         )
-        assert [str(dimension) for dimension in model.graph.inputs[0].shape] == [
-            "batch",
-            "sequence",
-        ]
+        for saved in loaded.values():
+            for value in (*saved.graph.inputs, *saved.graph.outputs):
+                assert [str(dimension) for dimension in value.shape] == ["batch", "sequence"]
+            assert saved.graph.inputs[0].shape.get_denotation(0) == "DATA_BATCH"
+            assert all(
+                dimension.value is None
+                for dimension in next(iter(saved.graph)).outputs[0].shape
+            )
+        for value, shape in original_shapes:
+            assert value.shape is shape
+            assert [str(dimension) for dimension in value.shape] == ["batch", "sequence"]
 
     def test_save_anonymizes_nested_graph_intermediate_symbols(self):
         condition = ir.Value(
@@ -1421,7 +1435,7 @@ class TestModelPackageSaveLoad:
             ir_version=10,
         )
 
-        with _namespaced_symbolic_dimensions(model, "component.decoder"):
+        with _anonymized_intermediate_symbolic_dimensions(model):
             assert all(dimension.value is None for dimension in branch_output.shape)
 
         assert str(branch_output.shape[1]) == "branch_sequence"
