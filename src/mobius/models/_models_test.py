@@ -398,6 +398,40 @@ class TestPrunePrefillPrefix:
         with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
             build_from_module(CustomSelectionMoE(config), config, prune_prefill_prefix=True)
 
+    def test_prune_quantized_moe_rejects_non_bias_add(self):
+        """An Add of anything but a 1-D bias could broadcast the logits back to every position."""
+
+        class FullSequenceAddMoE(MoECausalLMModel):
+            def forward(
+                self,
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values=None,
+            ):
+                hidden_states, present = self.model(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                last = op.Unsqueeze(
+                    op.Gather(
+                        hidden_states,
+                        op.Constant(value=ir.tensor(-1, dtype=ir.DataType.INT64)),
+                        axis=1,
+                    ),
+                    op.Constant(value_ints=[1]),
+                )
+                logits = op.Add(self.lm_head(op, last), self.lm_head(op, hidden_states))
+                return logits, present
+
+        config = self._quantized_moe_config(quant_method="olive", quantize_moe=True)
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            build_from_module(FullSequenceAddMoE(config), config, prune_prefill_prefix=True)
+
 
 class TestDeepStackCaptureOrdering:
     """``output_layer_indices`` must capture the post-DeepStack-injection state.

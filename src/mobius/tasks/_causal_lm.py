@@ -449,11 +449,15 @@ def _constant_input(node: ir.Node, index: int) -> object:
 def _projects_last_sequence_token(logits: ir.Value) -> bool:
     """Whether *logits* is the LM head applied to ``_retain_last_sequence_token``'s output.
 
-    Matches ``[Add] <- MatMul|MatMulNBits <- Unsqueeze(axes=[1]) <- Gather(axis=1)`` with a
-    scalar ``-1`` index. ``tolist()`` keeps the rank, so an index of ``[-1]`` does not match.
+    Matches ``[Add(., 1-D bias)] <- MatMul|MatMulNBits <- Unsqueeze(axes=[1]) <- Gather(axis=1)``
+    with a scalar ``-1`` index. ``tolist()`` keeps the rank, so an index of ``[-1]`` does not match.
     """
     head = _producer(logits)
     if head is not None and (head.domain, head.op_type) == ("", "Add"):  # LM-head bias
+        bias = head.inputs[1] if len(head.inputs) > 1 else None
+        # Any operand of higher rank could broadcast the logits back to every position.
+        if bias is None or bias.shape is None or len(bias.shape) != 1:
+            return False
         head = _producer(head.inputs[0])
     if head is None or (head.domain, head.op_type) not in _LM_HEAD_PROJECTIONS:
         return False
