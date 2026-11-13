@@ -815,7 +815,20 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     Preserve the shipped root Transpose naming convention and fold projection
     packing to a fixed point. Generic weight layout chains remain explicit.
     """
-    common_passes.LiftConstantsToInitializersPass()(model)
+    # size_limit=1 (the pass defaults to 16) so rank-0 scalars are lifted too,
+    # matching onnxscript's ORT path (rewriter/ort_fusions/_core.py). Gemma-4's
+    # final logit softcap (models/gemma4.py, ``cap * tanh(x / cap)``) is a
+    # 1-element ``value`` tensor and so sat under the default threshold, leaving
+    # a Constant node where a downstream runtime that matches on graph structure
+    # expects an initializer. Constant and initializer are interchangeable in
+    # ONNX, so this is semantics-preserving. ``lift_all_constants`` stays False,
+    # so value_int / value_ints / value_floats Constants are still left alone.
+    #
+    # Applied here and not in _DEFAULT_PASSES: that stage runs before the fusion
+    # rewrites (see optimize_model), several of which match on Constant nodes,
+    # so lowering the threshold there could silently stop GQA/RoPE/MoE rules
+    # from matching.
+    common_passes.LiftConstantsToInitializersPass(size_limit=1)(model)
     for graph in model.graphs():
         for value in graph.initializers.values():
             tensor = value.const_value
