@@ -35,12 +35,16 @@ from typing import TYPE_CHECKING
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import NemotronHConfig
+from mobius._configs import NemotronHConfig, NemotronHPuzzleConfig
 from mobius._weight_utils import tie_word_embeddings
 from mobius.components import (
     FCMLP,
+    INT64_MAX,
     Attention,
     Embedding,
+    Float32GatedRMSNorm,
+    Float32RMSNorm,
+    Float32SiLUMamba2Block,
     Linear,
     Mamba2Block,
     RMSNorm,
@@ -64,12 +68,14 @@ class NemotronHMambaLayer(nn.Module):
         config: NemotronH architecture config.
     """
 
+    mamba_block_class: type[Mamba2Block] = Mamba2Block
+
     def __init__(self, config: NemotronHConfig):
         super().__init__()
         # d_inner = num_heads * head_dim (not hidden_size * expand)
         d_inner = config.mamba_n_heads * config.mamba_d_head
 
-        self.mamba = Mamba2Block(
+        self.mamba = self.mamba_block_class(
             d_model=config.hidden_size,
             d_inner=d_inner,
             num_heads=config.mamba_n_heads,
@@ -113,6 +119,62 @@ class NemotronHMambaLayer(nn.Module):
         hidden_states = op.Add(residual, mamba_out)
 
         return hidden_states, (new_conv_state, new_ssm_state)
+
+
+class _NemotronHPuzzleMamba2Block(Float32SiLUMamba2Block):
+    def _apply_conv_padding_mask(
+        self, op: OpBuilder, activated: ir.Value, padding_mask: ir.Value
+    ) -> ir.Value:
+        # The pinned CUDA path masks x, not B/C. In particular, padded output
+        # positions may still read a preceding state through their unmasked C.
+        x, bc = op.Split(
+            activated,
+            [self.d_inner, 2 * self.n_groups * self.d_state],
+            axis=-1,
+            _outputs=2,
+        )
+        return op.Concat(op.Mul(x, op.CastLike(padding_mask, x)), bc, axis=-1)
+
+
+class NemotronHPuzzleMambaLayer(NemotronHMambaLayer):
+    """Puzzle Mamba with source Conv/bias, readout/D and norm precision.
+
+    Outer RMSNorm keeps gamma in FP32. Biased convolution stores in model dtype
+    before complete FP32 SiLU and a second native store; readout-plus-D and inner
+    grouped norm retain their separately qualified FP32 accumulation boundaries.
+    """
+
+    mamba_block_class: type[Mamba2Block] = _NemotronHPuzzleMamba2Block
+
+    def __init__(self, config: NemotronHConfig):
+        super().__init__(config)
+        self.norm = Float32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        d_inner = config.mamba_n_heads * config.mamba_d_head
+        self.mamba.norm = Float32GatedRMSNorm(
+            d_inner,
+            eps=config.rms_norm_eps,
+            group_size=d_inner // config.mamba_n_groups,
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value,
+        position_embeddings: tuple,
+        past_key_value: tuple | None,
+        padding_mask: ir.Value | None = None,
+    ):
+        del attention_bias, position_embeddings
+        residual = hidden_states
+        hidden_states = self.norm(op, hidden_states)
+        if padding_mask is not None:
+            hidden_states = op.Mul(hidden_states, op.CastLike(padding_mask, hidden_states))
+        conv_state, ssm_state = past_key_value if past_key_value is not None else (None, None)
+        output, conv_state, ssm_state = self.mamba(
+            op, hidden_states, conv_state, ssm_state, padding_mask=padding_mask
+        )
+        return op.Add(residual, output), (conv_state, ssm_state)
 
 
 class NemotronHAttentionLayer(nn.Module):
@@ -233,6 +295,7 @@ class NemotronHMoEGate(nn.Module):
         self.weight = nn.Parameter([num_experts, hidden_size])
         # Correction bias for expert selection (loaded from checkpoint)
         self.e_score_correction_bias = nn.Parameter([num_experts])
+        self.e_score_correction_bias._keep_float32 = True  # type: ignore[attr-defined]
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Cast to float32 for numerical stability (eps=1e-20 underflows
@@ -240,7 +303,7 @@ class NemotronHMoEGate(nn.Module):
         # in NemotronHTopkRouter.forward and never casts back.
         hidden_states = op.Cast(hidden_states, to=1)  # FLOAT32
 
-        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        weight_t = op.Transpose(op.Cast(self.weight, to=1), perm=[1, 0])
         router_logits = op.MatMul(hidden_states, weight_t)
 
         # Sigmoid probabilities (these become the final routing weights)
@@ -262,9 +325,8 @@ class NemotronHMoEGate(nn.Module):
         if self.routed_scaling_factor != 1.0:  # noqa: RUF069
             routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
 
-        # Keep routing_weights in float32 (matching HF which never casts back).
-        # The expert dispatch multiplies these with expert outputs, and ONNX
-        # type promotion handles the mixed-dtype matmul naturally.
+        # Keep routing weights in FP32; expert outputs are explicitly promoted
+        # before multiplication because ONNX does not implicitly promote types.
         return routing_weights, selected_experts
 
 
@@ -375,12 +437,15 @@ class NemotronHMoEBlock(nn.Module):
             weighted = op.Mul(routing_weights, match_float)
             # Sum matched routing weights across top_k dim → per-token weight
             weight = op.ReduceSum(weighted, [-1], keepdims=True)
-            contribution = op.Mul(expert_output, weight)
+            contribution = op.Mul(op.Cast(expert_output, to=1), weight)
             if result is None:
                 result = contribution
             else:
                 result = op.Add(result, contribution)
 
+        # HF accumulates the weighted experts in FP32, then rounds once before
+        # the model-dtype latent output projection and shared-expert addition.
+        result = op.CastLike(result, hidden_states)
         # Optional latent projection back to hidden_size
         if self._has_latent:
             result = self.fc2_latent_proj(op, result)
@@ -443,6 +508,8 @@ class _NemotronHTextModel(nn.Module):
         ``"mlp"`` → NemotronHMLPLayer
     """
 
+    mamba_layer_class: type[NemotronHMambaLayer] = NemotronHMambaLayer
+
     def __init__(self, config: NemotronHConfig):
         super().__init__()
         self._dtype = config.dtype
@@ -460,15 +527,16 @@ class _NemotronHTextModel(nn.Module):
             raise ValueError(f"Unknown Nemotron-H layer type in {layer_types!r}")
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
+            layer_config = config.for_layer(i)
             ltype = layer_types[i]
             if ltype == "mamba2":
-                self.layers.append(NemotronHMambaLayer(config))
+                self.layers.append(self.mamba_layer_class(layer_config))
             elif ltype == "mlp":
-                self.layers.append(NemotronHMLPLayer(config))
+                self.layers.append(NemotronHMLPLayer(layer_config))
             elif ltype == "moe":
-                self.layers.append(NemotronHMoELayer(config))
+                self.layers.append(NemotronHMoELayer(layer_config))
             else:
-                self.layers.append(NemotronHAttentionLayer(config))
+                self.layers.append(NemotronHAttentionLayer(layer_config))
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -519,11 +587,12 @@ class NemotronHCausalLMModel(nn.Module):
     default_task: str = "hybrid-text-generation"
     category: str = "Hybrid SSM+Attention"
     config_class: type = NemotronHConfig
+    text_model_class: type[_NemotronHTextModel] = _NemotronHTextModel
 
     def __init__(self, config: NemotronHConfig):
         super().__init__()
         self.config = config
-        self.model = _NemotronHTextModel(config)
+        self.model = self.text_model_class(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
@@ -597,6 +666,75 @@ class NemotronHCausalLMModel(nn.Module):
                 new_state_dict[new_key] = value
 
         return new_state_dict
+
+
+class _NemotronHPuzzleTextModel(_NemotronHTextModel):
+    mamba_layer_class = NemotronHPuzzleMambaLayer
+
+    def __init__(self, config: NemotronHConfig):
+        super().__init__(config)
+        # The pinned Puzzle HF block uses FP32 gamma for every mixer family,
+        # including the final stateless MoE, and for the final decoder norm.
+        for layer in self.layers:
+            norm = getattr(layer, "norm", None)
+            if not isinstance(norm, RMSNorm):
+                raise TypeError("Puzzle decoder layers require an RMSNorm pre-norm")
+            layer.norm = Float32RMSNorm(config.hidden_size, eps=norm.variance_epsilon)
+        self.norm = Float32RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value | None,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+        inputs_embeds: ir.Value | None = None,
+    ):
+        del position_ids  # Puzzle attention has no positional encoding.
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("Puzzle requires exactly one of input_ids or inputs_embeds")
+        hidden_states = (
+            self.embed_tokens(op, input_ids) if inputs_embeds is None else inputs_embeds
+        )
+        attention_bias = create_padding_mask(op, hidden_states, attention_mask)
+        query_length = op.Shape(hidden_states, start=1, end=2)
+        total_length = op.Shape(attention_mask, start=1, end=2)
+        current_mask = op.Slice(attention_mask, op.Neg(query_length), [INT64_MAX], axes=[1])
+        # HF drops the Mamba padding mask when reusing state. Attention retains
+        # the complete past+current mask; never reinterpret it as current-only.
+        current_mask = op.Where(
+            op.Greater(total_length, query_length), op.CastLike(1, current_mask), current_mask
+        )
+        mamba_mask = op.Unsqueeze(current_mask, [-1])
+        present_key_values = []
+        past_kvs = past_key_values or [None] * len(self.layers)
+        for layer, past_kv in zip(self.layers, past_kvs):
+            kwargs = {}
+            if isinstance(layer, NemotronHPuzzleMambaLayer):
+                kwargs["padding_mask"] = mamba_mask
+            hidden_states, present_kv = layer(
+                op,
+                hidden_states=hidden_states,
+                attention_bias=attention_bias,
+                position_embeddings=None,
+                past_key_value=past_kv,
+                **kwargs,
+            )
+            present_key_values.append(present_kv)
+        return self.norm(op, hidden_states), present_key_values
+
+
+class NemotronHPuzzleCausalLMModel(NemotronHCausalLMModel):
+    """Heterogeneous Nemotron-H decoder matching ``NemotronHPuzzleForCausalLM``.
+
+    Accepts token IDs, padding masks and mixed attention/Mamba caches; returns
+    logits and updated caches. This decoder class does not implement the Omni
+    vision wrapper or reinterpret packed IQ2 checkpoint weights as dense weights.
+    """
+
+    config_class = NemotronHPuzzleConfig
+    text_model_class = _NemotronHPuzzleTextModel
 
 
 # Layer index regex: {backbone|model}.layers.<N>.<rest>

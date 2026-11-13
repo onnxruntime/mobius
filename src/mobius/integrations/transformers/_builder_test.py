@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 from types import SimpleNamespace
 from unittest import mock
 
@@ -19,6 +20,7 @@ from mobius._configs import (
     QuantizationOverride,
     QuantizedWeightFormat,
 )
+from mobius._flags import override_flags
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.integrations._block_quant import BlockQuantScheme
@@ -36,6 +38,44 @@ class _DummyModule(nn.Module):
 class _DummyFp8Module(_DummyModule):
     def build_fp8_streaming_plan(self, *_args):
         raise AssertionError("mock streaming function should own planning")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"execution_provider": "cpu"},
+        {"dtype": "f16"},
+        {"load_weights": False},
+        {"keep_quantized": False},
+    ],
+)
+def test_packed_bolt_rejects_incompatible_exports_before_build_or_weight_io(
+    monkeypatch, options
+):
+    from mobius._configs import NemotronHOmniConfig
+    from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
+
+    config = NemotronHOmniConfig.from_transformers(_omni_config())
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *a, **k: (SimpleNamespace(model_type="nemotron_h_omni"), False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *a, **k: (_DummyModule, "nemotron-h-omni", "nemotron_h_omni"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *a, **k: config)
+    core = mock.Mock(side_effect=AssertionError("must fail before graph/weight construction"))
+    monkeypatch.setattr(transformers_builder, "build_from_module", core)
+    kwargs = {"dtype": "bf16", "execution_provider": "cuda", **options}
+    with (
+        override_flags(bolt_packed_cuda=True),
+        pytest.raises((ValueError, NotImplementedError), match=r"CUDA|BF16|dequantize"),
+    ):
+        transformers_builder.build_transformers_model("local-model", **kwargs)
+    core.assert_not_called()
 
 
 @pytest.mark.parametrize("level", [None, 0, 4])
@@ -110,6 +150,110 @@ def _native_gptoss_config(*, dtype=ir.DataType.FLOAT16):
             weight_format=QuantizedWeightFormat.MXFP4,
         ),
     )
+
+
+@pytest.mark.parametrize("local_checkpoint", [False, True])
+@pytest.mark.parametrize("revision", [None, "explicit-revision"])
+@pytest.mark.parametrize("packed", [False, True])
+def test_native_omni_pins_detection_and_streams_before_eager(
+    monkeypatch, tmp_path, local_checkpoint, revision, packed
+) -> None:
+    from mobius._configs import NemotronHOmniConfig
+    from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
+    from mobius.integrations.transformers import _nemotron_h_omni_weights
+    from mobius.models import _nemotron_h_omni_packed
+    from mobius.models.nemotron_h_omni import BOLT_REVISION
+
+    model_id = (
+        str(tmp_path) if local_checkpoint else "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"
+    )
+    expected_revision = revision
+    if not local_checkpoint and revision is None:
+        expected_revision = BOLT_REVISION
+    config = NemotronHOmniConfig.from_transformers(_omni_config())
+    package = ModelPackage(
+        {
+            name: ir.Model(ir.Graph([], [], nodes=[], name=name), ir_version=11)
+            for name in ("decoder", "vision_encoder", "embedding")
+        },
+        config=config,
+    )
+    probe = mock.Mock(return_value=(SimpleNamespace(model_type="nemotron_h_omni"), False))
+    monkeypatch.setattr(transformers_builder, "_load_transformers_config", probe)
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "nemotron-h-omni", "nemotron_h_omni"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        transformers_builder, "build_from_module", lambda *args, **kwargs: package
+    )
+    eager = mock.Mock(side_effect=AssertionError("Omni must not load the full checkpoint"))
+    stream = mock.Mock(return_value={})
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+    monkeypatch.setattr(
+        _nemotron_h_omni_weights, "stream_nemotron_h_omni_safetensors_to_package", stream
+    )
+    optimize = mock.Mock(return_value=package)
+    monkeypatch.setattr(_nemotron_h_omni_packed, "optimize_nemotron_h_omni_cuda", optimize)
+    with override_flags(bolt_packed_cuda=packed):
+        result = transformers_builder.build_transformers_model(
+            model_id, revision=revision, dtype="bf16", execution_provider="cuda"
+        )
+    assert result is package
+    probe.assert_called_once_with(
+        model_id, revision=expected_revision, trust_remote_code=False
+    )
+    eager.assert_not_called()
+    assert stream.call_count == 1
+    assert optimize.call_count == int(packed)
+    args, kwargs = stream.call_args
+    assert args[:2] == (package, model_id)
+    assert isinstance(args[2], NemotronHOmniConfig)
+    assert args[2].dtype == ir.DataType.BFLOAT16
+    assert kwargs == {"revision": expected_revision}
+    assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
+        expected_revision or "unpinned"
+    }
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"keep_quantized": False}, "separate"),
+        ({"execution_provider": "cpu"}, "CUDA"),
+        ({"execution_provider": "default"}, "CUDA"),
+        ({"dtype": "f32"}, "dtype"),
+    ],
+)
+def test_native_omni_rejects_unsupported_modes_before_graph_or_weight_io(
+    monkeypatch, options, message
+) -> None:
+    from mobius._configs import NemotronHOmniConfig
+    from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
+
+    config = NemotronHOmniConfig.from_transformers(_omni_config())
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (SimpleNamespace(model_type="nemotron_h_omni"), False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "nemotron-h-omni", "nemotron_h_omni"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    graph = mock.Mock(side_effect=AssertionError("must reject before graph construction"))
+    eager = mock.Mock(side_effect=AssertionError("must reject before loading weights"))
+    monkeypatch.setattr(transformers_builder, "build_from_module", graph)
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+    kwargs = {"dtype": "bf16", "execution_provider": "cuda", **options}
+    with pytest.raises((ValueError, NotImplementedError), match=message):
+        transformers_builder.build_transformers_model("fake/omni", **kwargs)
+    graph.assert_not_called()
+    eager.assert_not_called()
 
 
 @pytest.mark.parametrize("local_checkpoint", [False, True], ids=["model-id", "local-config"])
@@ -728,6 +872,35 @@ def test_transformers_config_accepts_hub_without_strict_validation_error(monkeyp
         revision=None,
         trust_remote_code=False,
     ) == (config, False)
+
+
+def test_transformers_config_preserves_puzzle_omni_with_newer_native_layout(
+    monkeypatch, tmp_path
+) -> None:
+    import transformers
+
+    from mobius._configs import NemotronHOmniConfig
+    from mobius._configs.per_model._nemotron_h_omni_test import _omni_config
+
+    source = _omni_config()
+    (tmp_path / "config.json").write_text(json.dumps(source))
+    native = SimpleNamespace(
+        model_type="nemotron_h_omni",
+        text_config=SimpleNamespace(model_type="nemotron_h"),
+    )
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: native
+    )
+
+    config, raw_json = transformers_builder._load_transformers_config(
+        str(tmp_path), revision="pinned-revision", trust_remote_code=False
+    )
+    actual = NemotronHOmniConfig.from_transformers(config)
+    expected = NemotronHOmniConfig.from_transformers(source)
+
+    assert raw_json
+    assert actual.layer_types == expected.layer_types
+    assert actual.quantized_projections == expected.quantized_projections
 
 
 def test_transformers_config_accepts_hub_without_errors_module(monkeypatch) -> None:

@@ -229,7 +229,7 @@ def test_nemotron_h_runtime_blocker_is_pinned_without_support_claim() -> None:
     assert all("cannot describe" not in blocker for blocker in record.blockers)
 
 
-def test_nemotron_h_runtime_blocker_graph_census_matches_pinned_config() -> None:
+def test_current_nemotron_h_graph_preserves_pinned_blocker_topology() -> None:
     evidence = iter_runtime_blocker_evidence()[0]
     config = _pinned_nemotron_h_config()
 
@@ -241,7 +241,9 @@ def test_nemotron_h_runtime_blocker_graph_census_matches_pinned_config() -> None
         )["model"]
         .graph
     )
-    assert len(raw_graph) == evidence.pre_optimization_graph_node_count
+    # Historical node counts describe the frozen implementation, not future
+    # precision casts. Preserve that receipt and check the architecture itself.
+    assert Counter(node.op_type for node in raw_graph)["MatMul"] == evidence.graph_matmul_count
 
     production_graph = build_from_module(
         NemotronHCausalLMModel(config),
@@ -251,11 +253,24 @@ def test_nemotron_h_runtime_blocker_graph_census_matches_pinned_config() -> None
     )["model"].graph
     op_counts = Counter(node.op_type for node in production_graph)
 
-    assert len(production_graph) == evidence.graph_node_count
     assert len(production_graph.initializers) == evidence.graph_initializer_count
     assert op_counts["MatMul"] == evidence.graph_matmul_count
     assert len(production_graph.inputs) == 60
     assert len(production_graph.outputs) == 59
+    mixed_arithmetic = [
+        node.name
+        for node in production_graph
+        if node.op_type in {"MatMul", "Mul"}
+        and len(
+            {
+                value.dtype
+                for value in node.inputs
+                if value is not None and value.dtype is not None
+            }
+        )
+        > 1
+    ]
+    assert not mixed_arithmetic
 
 
 def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(

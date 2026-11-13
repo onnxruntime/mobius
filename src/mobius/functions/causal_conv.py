@@ -13,11 +13,32 @@ Op spec: https://github.com/onnx/onnx/issues/7689
 from __future__ import annotations
 
 import onnx_ir as ir
+from onnxscript import OpBuilder
 from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
 
 DOMAIN = "com.microsoft"
+
+
+def prepare_causal_conv_state(
+    op: OpBuilder,
+    input_val: ir.Value,
+    conv_state: ir.Value,
+    *,
+    state_width: int,
+    temporal_axis: int,
+) -> tuple[ir.Value, ir.Value]:
+    """Prepend carry state and return the last ``state_width`` input positions."""
+    conv_input = op.Concat(conv_state, input_val, axis=temporal_axis)
+    total_len = op.Shape(conv_input, start=temporal_axis, end=temporal_axis + 1)
+    present = op.Slice(
+        conv_input,
+        op.Sub(total_len, op.Constant(value_ints=[state_width])),
+        total_len,
+        op.Constant(value_ints=[temporal_axis]),
+    )
+    return conv_input, present
 
 
 def causal_conv_nd_with_state(
@@ -92,19 +113,13 @@ def causal_conv_nd_with_state(
     temporal_axis = ndim + 1
 
     def body(op, input_val, weight_val, bias_val, conv_state_val):
-        # Step 1: Prepend conv_state along the temporal axis.
-        conv_input = op.Concat(conv_state_val, input_val, axis=temporal_axis)
-
-        # Step 2: Extract new carry state — last K-1 positions of conv_input.
-        total_len = op.Gather(
-            op.Shape(conv_input), op.Constant(value_int=temporal_axis), axis=0
-        )
-        state_start = op.Sub(total_len, op.Constant(value_int=state_width))
-        present_state = op.Slice(
-            conv_input,
-            op.Reshape(state_start, op.Constant(value_ints=[1])),
-            op.Reshape(total_len, op.Constant(value_ints=[1])),
-            op.Constant(value_ints=[temporal_axis]),
+        # Prepend state and retain the last K-1 original input values.
+        conv_input, present_state = prepare_causal_conv_state(
+            op,
+            input_val,
+            conv_state_val,
+            state_width=state_width,
+            temporal_axis=temporal_axis,
         )
         present_state.name = "present_state"
 
