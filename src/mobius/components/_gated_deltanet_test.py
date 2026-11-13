@@ -45,6 +45,36 @@ def test_gated_deltanet_propagates_activation_and_state_dtypes(dtype, state_dtyp
     assert output.dtype == dtype
 
 
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_gated_deltanet_normalizes_and_gates_in_state_precision(dtype):
+    config = make_config(
+        dtype=dtype,
+        mamba_ssm_dtype=ir.DataType.FLOAT,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+    )
+    module = GatedDeltaNet(config)
+    _cast_module_dtype(module, dtype)
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 2, 64], dtype)
+    conv = create_test_input(builder, "conv_state", [1, 128, 3], dtype)
+    state = create_test_input(builder, "state", [1, 4, 16, 16], ir.DataType.FLOAT)
+    module(op, hidden, conv, state)
+    reductions = [node for node in graph if node.op_type == "ReduceSumSquare"]
+    assert len(reductions) == 2
+    for node in reductions:
+        cast = node.inputs[0].producer()
+        assert cast.op_type == "Cast"
+        assert cast.attributes["to"].as_int() == ir.DataType.FLOAT
+    beta = next(node for node in graph if node.op_type == "Sigmoid")
+    cast = beta.inputs[0].producer()
+    assert cast.op_type == "Cast"
+    assert cast.attributes["to"].as_int() == ir.DataType.FLOAT
+
+
 class TestGatedDeltaNet:
     """Tests for the GatedDeltaNet linear attention module."""
 

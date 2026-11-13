@@ -20,6 +20,7 @@ from mobius.integrations._weight_loading import (
     StreamingTransformedWeightSource,
     StreamingWeightPlan,
     StreamingWeightSource,
+    _lazy_safetensors_source_parent_aliases,
     _local_weight_paths,
     _resolve_shard_paths,
     stream_preprocessed_safetensors_to_model,
@@ -34,17 +35,6 @@ from mobius.models.gptoss import (
 )
 
 _FLOAT_DTYPES = frozenset({"BF16", "F16", "F32"})
-
-
-def _lazy_safetensors_source_parent_aliases(paths: list[str]) -> frozenset[pathlib.Path]:
-    """Return both directory identities from which lazy shards may be read."""
-    # HF snapshots can contain shard symlinks into the blob cache. Resolving
-    # the parent preserves the snapshot directory, while resolving the whole
-    # shard path follows the symlink and identifies the blob directory.
-    return frozenset(
-        {pathlib.Path(path).parent.resolve() for path in paths}
-        | {pathlib.Path(path).resolve().parent for path in paths}
-    )
 
 
 def _repack_blocks(tensor: torch.Tensor, _source_name: str) -> torch.Tensor:

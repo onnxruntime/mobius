@@ -16,6 +16,7 @@ import onnx_ir as ir
 from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
+from mobius.components import float32_silu
 
 DOMAIN = "com.microsoft"
 
@@ -128,7 +129,10 @@ def causal_conv_nd_with_state(
 
         # Step 5: Apply activation.
         if activation in ("silu", "swish"):
-            output = op.Swish(conv_out)
+            output = op.CastLike(
+                float32_silu(op, conv_out),
+                conv_out,
+            )
         elif activation == "none":
             output = conv_out
         else:

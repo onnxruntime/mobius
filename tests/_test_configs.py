@@ -72,8 +72,68 @@ from mobius._configs import (
     WhisperConfig,
     YolosConfig,
     Zamba2Config,
+    _as_attribute_config,
 )
+from mobius._configs.fish_omni import FishOmniConfig
 from mobius.models import EsmConfig, ReUseConfig
+
+# Tiny composite config for Drama 3's model-local parity and speech graph matrix.
+FISH_OMNI_CONFIG = {
+    "model_type": "fish_omni",
+    "architectures": ["FishOmniModel"],
+    "speech_template_version": "reference-bracket-v1",
+    "semantic_start_token_id": 16,
+    "semantic_end_token_id": 31,
+    "eos_token_id": 2,
+    "text_config": {
+        "model_type": "fish_omni_text",
+        "hidden_size": 32,
+        "intermediate_size": 48,
+        "num_hidden_layers": 2,
+        "layer_types": ["linear_attention", "full_attention"],
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "vocab_size": 128,
+        "hidden_act": "silu",
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 256,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000000.0,
+            "partial_rotary_factor": 0.25,
+        },
+        "linear_conv_kernel_dim": 4,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 16,
+        "shared_expert_intermediate_size": 16,
+        "tie_word_embeddings": False,
+    },
+    "audio_decoder_config": {
+        "model_type": "fish_qwen3_audio_decoder",
+        "dim": 32,
+        "text_dim": 32,
+        "n_layer": 1,
+        "shared_enrichment_layers": 1,
+        "intermediate_size": 48,
+        "n_head": 4,
+        "n_local_heads": 2,
+        "head_dim": 8,
+        "norm_eps": 1e-6,
+        "rope_base": 10000000.0,
+        "rotary_percent": 0.25,
+        "vocab_size": 16,
+        "num_codebooks": 3,
+        "vq_backbone_codebooks": 1,
+        "vq_feature_placement": "backbone_partial",
+        "attention_qk_norm": False,
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Tiny model dimensions shared by all configs
@@ -3535,6 +3595,14 @@ def vl_overrides(model_type: str) -> dict:
 # Speech / TTS / Codec configs
 # ---------------------------------------------------------------------------
 SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "fish_omni",
+        {
+            "_config_cls": FishOmniConfig,
+            **vars(FishOmniConfig.from_transformers(_as_attribute_config(FISH_OMNI_CONFIG))),
+        },
+        True,
+    ),
     # --- Parakeet CTC (feature-input offline FastConformer) ---
     (
         "parakeet_ctc",

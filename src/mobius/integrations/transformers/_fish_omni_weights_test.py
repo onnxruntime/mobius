@@ -1,0 +1,618 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import json
+from pathlib import Path
+
+import numpy as np
+import onnx_ir as ir
+import pytest
+import torch
+from _test_configs import FISH_OMNI_CONFIG
+from safetensors.torch import load_file, save_file
+
+from mobius import build_from_module
+from mobius.__main__ import main
+from mobius._configs.fish_omni import DRAMA3_REVISION
+from mobius._model_package import ModelPackage
+from mobius.integrations.transformers import _builder
+from mobius.integrations.transformers import _fish_omni_weights as fish_weights
+from mobius.integrations.transformers._config_resolver import _dict_to_pretrained_config
+from mobius.integrations.transformers._fish_omni_weights import (
+    _source_name,
+    build_fish_omni_streaming_plan,
+    stream_fish_omni_safetensors_to_package,
+)
+from mobius.models import FishOmniModel
+from mobius.models.fish_omni_test import (
+    native_fp8_prototype_config,
+    reduced_precision_prototype_task,
+    tiny_config,
+)
+
+
+def _checkpoint(package):
+    torch.manual_seed(19)
+    weights = {}
+    for model in package.values():
+        for name, value in model.graph.initializers.items():
+            if value.const_value is not None:
+                continue
+            tensor = torch.randn(tuple(value.shape), dtype=torch.float32) * 0.02
+            source = _source_name(name)
+            if ".packed_experts." in name:
+                prefix, projection = source.rsplit(".experts.", 1)
+                for expert, matrix in enumerate(tensor):
+                    if projection == "gate_up_proj.weight":
+                        gate, up = matrix.chunk(2, dim=0)
+                        weights[f"{prefix}.experts.{expert}.gate_proj.weight"] = (
+                            gate.contiguous()
+                        )
+                        weights[f"{prefix}.experts.{expert}.up_proj.weight"] = up.contiguous()
+                    else:
+                        weights[f"{prefix}.experts.{expert}.{projection}"] = (
+                            matrix.contiguous()
+                        )
+            else:
+                weights[source] = tensor
+    return weights
+
+
+def _lazy_checkpoint(directory, layout):
+    directory.mkdir(parents=True)
+    models = {}
+    weights = {}
+    for i, (component, name) in enumerate(
+        (
+            ("embedding", "embedding.embed_tokens.weight"),
+            ("decoder", "decoder.lm_head.weight"),
+            ("audio_decoder", "audio_decoder.codebook_heads.0.weight"),
+        )
+    ):
+        value = ir.Value(
+            name=name, shape=ir.Shape([16, 16]), type=ir.TensorType(ir.DataType.FLOAT)
+        )
+        models[component] = ir.Model(
+            ir.Graph([], [value], nodes=[], initializers=[value], opset_imports={"": 24}),
+            ir_version=12,
+        )
+        weights[_source_name(name)] = torch.full((16, 16), float(i + 1))
+    if layout == "single":
+        save_file(weights, directory / "model.safetensors")
+    else:
+        shard_directory = directory / "weights" if layout == "nested" else directory
+        shard_directory.mkdir(exist_ok=True)
+        weight_map = {}
+        for i, (name, tensor) in enumerate(weights.items()):
+            shard = shard_directory / f"model-{i + 1:05d}-of-00003.safetensors"
+            save_file({name: tensor}, shard)
+            weight_map[name] = shard.relative_to(directory).as_posix()
+        (directory / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+    config = tiny_config()
+    return ModelPackage(models, config=config), config, weights
+
+
+def _snapshot(directory):
+    return {
+        path.relative_to(directory): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+def _assert_lazy_values(package, weights):
+    for model in package.values():
+        for name, value in model.graph.initializers.items():
+            np.testing.assert_array_equal(
+                value.const_value.numpy(), weights[_source_name(name)].numpy()
+            )
+
+
+@pytest.mark.parametrize("layout", ["single", "indexed", "nested"])
+@pytest.mark.parametrize("alias", ["direct", "relative", "directory_symlink"])
+def test_fish_partial_save_rejects_checkpoint_directory(tmp_path, monkeypatch, layout, alias):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, layout)
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    destination = checkpoint
+    if alias == "relative":
+        monkeypatch.chdir(tmp_path)
+        destination = Path("checkpoint")
+    elif alias == "directory_symlink":
+        destination = tmp_path / "alias"
+        try:
+            destination.symlink_to(checkpoint, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlinks are unavailable: {error}")
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="source checkpoint directory"):
+        package.save(
+            str(destination),
+            components=lambda name: name == "embedding",
+            external_data="safetensors",
+            progress_bar=False,
+        )
+    assert _snapshot(tmp_path) == before
+    _assert_lazy_values(package, weights)
+
+
+@pytest.mark.parametrize("source_kind", ["shard", "index"])
+@pytest.mark.parametrize("alias_kind", ["hardlink", "symlink"])
+def test_fish_partial_save_rejects_source_file_alias(tmp_path, source_kind, alias_kind):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, "indexed")
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    source = checkpoint / (
+        "model-00001-of-00003.safetensors"
+        if source_kind == "shard"
+        else "model.safetensors.index.json"
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+    alias = output / "model.safetensors"
+    try:
+        if alias_kind == "hardlink":
+            alias.hardlink_to(source)
+        else:
+            alias.symlink_to(source)
+    except OSError as error:
+        pytest.skip(f"{alias_kind}s are unavailable: {error}")
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="aliases lazy source file"):
+        package.save(
+            str(output),
+            components=lambda name: name == "embedding",
+            external_data="safetensors",
+            progress_bar=False,
+        )
+    assert _snapshot(tmp_path) == before
+    _assert_lazy_values(package, weights)
+
+
+def test_fish_full_save_rejects_component_directory_overlapping_checkpoint(tmp_path):
+    output = tmp_path / "output"
+    checkpoint = output / "embedding"
+    package, config, weights = _lazy_checkpoint(checkpoint, "nested")
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="source checkpoint directory"):
+        package.save(str(output), external_data="safetensors", progress_bar=False)
+    assert _snapshot(tmp_path) == before
+    _assert_lazy_values(package, weights)
+
+
+@pytest.mark.parametrize("layout", ["single", "indexed", "nested"])
+@pytest.mark.parametrize("partial", [False, True])
+def test_fish_noncolliding_save_preserves_checkpoint(tmp_path, layout, partial):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, layout)
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    before = _snapshot(checkpoint)
+    output = tmp_path / "output"
+    package.save(
+        str(output),
+        components=(lambda name: name == "embedding") if partial else None,
+        external_data="safetensors",
+        progress_bar=False,
+    )
+    loaded = ModelPackage.load(str(output))
+    assert len(loaded) == (1 if partial else 3)
+    _assert_lazy_values(loaded, weights)
+    assert _snapshot(checkpoint) == before
+    _assert_lazy_values(package, weights)
+
+
+def test_fish_resolves_shards_once_with_revision(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, "single")
+    paths = [str(checkpoint / "model.safetensors")]
+    calls = []
+
+    def resolve(model_id, revision):
+        calls.append((model_id, revision))
+        return paths
+
+    monkeypatch.setattr(fish_weights, "_resolve_shard_paths", resolve)
+    stream_fish_omni_safetensors_to_package(
+        package, "synthetic/drama-3", config, revision="pinned-revision"
+    )
+    assert calls == [("synthetic/drama-3", "pinned-revision")]
+    assert package._native_streaming_source_files == frozenset({Path(paths[0]).resolve()})
+    _assert_lazy_values(package, weights)
+
+
+def test_fish_registers_nested_shards_and_local_index(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    package, config, weights = _lazy_checkpoint(checkpoint, "nested")
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    assert package._native_streaming_source_files == frozenset(
+        path.resolve() for path in checkpoint.rglob("*") if path.is_file()
+    )
+    assert package._native_streaming_source_directories == frozenset(
+        {checkpoint.resolve(), (checkpoint / "weights").resolve()}
+    )
+    _assert_lazy_values(package, weights)
+
+
+@pytest.mark.parametrize("destination_kind", ["snapshot", "blobs"])
+def test_fish_registers_snapshot_and_blob_directory_aliases(tmp_path, destination_kind):
+    checkpoint = tmp_path / "snapshot"
+    package, config, weights = _lazy_checkpoint(checkpoint, "single")
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    shard = checkpoint / "model.safetensors"
+    blob = blobs / "blob"
+    shard.rename(blob)
+    try:
+        shard.symlink_to(blob)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    stream_fish_omni_safetensors_to_package(package, str(checkpoint), config, revision=None)
+    assert package._native_streaming_source_files == frozenset({blob.resolve()})
+    assert package._native_streaming_source_directories == frozenset(
+        {checkpoint.resolve(), blobs.resolve()}
+    )
+    before = _snapshot(tmp_path)
+    destination = checkpoint if destination_kind == "snapshot" else blobs
+    with pytest.raises(ValueError, match="source checkpoint directory"):
+        package.save(
+            str(destination),
+            components=lambda name: name == "embedding",
+            external_data="safetensors",
+            progress_bar=False,
+        )
+    assert _snapshot(tmp_path) == before
+    _assert_lazy_values(package, weights)
+
+
+@pytest.mark.parametrize("failure", [None, "scale_dtype", "scale_shape", "target_dtype"])
+def test_native_fp8_streaming_preserves_original_code_bytes_and_fp32_grids(tmp_path, failure):
+    config = native_fp8_prototype_config()
+    package = build_from_module(
+        FishOmniModel(config),
+        config,
+        task=reduced_precision_prototype_task("fish-omni"),
+        execution_provider="cuda",
+    )
+    weights = _checkpoint(package)
+    for name, value in list(weights.items()):
+        if ".mlp.experts." not in name:
+            continue
+        if name.endswith(".weight"):
+            # Every finite E4M3FN byte, including negative zero and both extrema.
+            raw = torch.arange(value.numel()).remainder(254)
+            raw = torch.where(raw >= 127, raw + 1, raw)
+            weights[name] = raw.to(torch.uint8).reshape(value.shape).view(torch.float8_e4m3fn)
+        else:
+            weights[name] = value.abs() + 0.01
+    scale = next(name for name in weights if name.endswith(".weight_scale_inv"))
+    if failure == "scale_dtype":
+        weights[scale] = weights[scale].bfloat16()
+    elif failure == "scale_shape":
+        weights[scale] = torch.ones((1, 2))
+    elif failure == "target_dtype":
+        target = next(
+            value
+            for name, value in package["decoder"].graph.initializers.items()
+            if ".packed_experts." in name and name.endswith(".weight")
+        )
+        target.type = ir.TensorType(ir.DataType.FLOAT)
+    save_file(weights, tmp_path / "model.safetensors")
+    if failure:
+        with pytest.raises((ValueError, TypeError), match=r"FP32|shape|identical FP8"):
+            stream_fish_omni_safetensors_to_package(
+                package, str(tmp_path), config, revision=None
+            )
+        assert all(
+            value.const_value is None
+            for name, value in package["decoder"].graph.initializers.items()
+            if ".packed_experts." in name
+        )
+        return
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    assert package.weight_loading_report["native_fp8"] is True
+    assert package.weight_loading_report["activation_quantization"] == "dynamic_fp8"
+    path = tmp_path / "decoder.onnx"
+    ir.save(package["decoder"], path, external_data="decoder.data")
+    saved = ir.load(path)
+    for name, value in saved.graph.initializers.items():
+        if ".packed_experts." not in name:
+            continue
+        prefix, projection = _source_name(name).rsplit(".experts.", 1)
+        source = [
+            weights[f"{prefix}.experts.{i}.{projection}"]
+            for i in range(config.num_local_experts)
+        ]
+        if name.endswith(".weight"):
+            assert value.dtype == ir.DataType.FLOAT8E4M3FN
+            expected = torch.stack([tensor.view(torch.uint8) for tensor in source]).numpy()
+            np.testing.assert_array_equal(value.const_value.numpy().view(np.uint8), expected)
+        else:
+            assert value.dtype == ir.DataType.FLOAT
+            np.testing.assert_array_equal(
+                value.const_value.numpy(), torch.stack(source).numpy()
+            )
+
+
+def test_fish_omni_streams_all_components(tmp_path):
+    config = tiny_config()
+    package = build_from_module(FishOmniModel(config), config, task="fish-omni")
+    weights = _checkpoint(package)
+    save_file(weights, tmp_path / "model.safetensors")
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    for model in package.values():
+        for name, value in model.graph.initializers.items():
+            assert value.const_value is not None, name
+            if ".packed_experts." in name:
+                prefix, projection = _source_name(name).rsplit(".experts.", 1)
+                projections = (
+                    ("gate_proj.weight", "up_proj.weight")
+                    if projection == "gate_up_proj.weight"
+                    else (projection,)
+                )
+                expected = torch.stack(
+                    [
+                        torch.cat(
+                            [weights[f"{prefix}.experts.{i}.{part}"] for part in projections]
+                        )
+                        for i in range(value.shape[0])
+                    ]
+                )
+                torch.testing.assert_close(
+                    torch.from_numpy(value.const_value.numpy()), expected
+                )
+            elif name.startswith(
+                (
+                    "embedding.",
+                    "decoder.model.layers.",
+                    "decoder.lm_head.",
+                    "audio_decoder.shared_layers.",
+                    "audio_decoder.residual_layers.",
+                    "audio_decoder.codebook_heads.",
+                )
+            ):
+                torch.testing.assert_close(
+                    torch.from_numpy(value.const_value.numpy()), weights[_source_name(name)]
+                )
+    assert package.weight_loading_report["native_fp8"] is False
+    assert package.weight_loading_report["codec_included"] is False
+
+
+@pytest.mark.parametrize("failure", ["unexpected", "missing", "shape"])
+def test_fish_omni_rejects_bad_checkpoint_transactionally(tmp_path, failure):
+    config = tiny_config()
+    package = build_from_module(FishOmniModel(config), config, task="fish-omni")
+    weights = _checkpoint(package)
+    if failure == "unexpected":
+        weights["unknown.weight"] = torch.ones(1)
+    elif failure == "missing":
+        weights.pop("lm_head.weight")
+    else:
+        weights["lm_head.weight"] = torch.ones(1)
+    save_file(weights, tmp_path / "model.safetensors")
+    unbound = [
+        value
+        for model in package.values()
+        for value in model.graph.initializers.values()
+        if value.const_value is None
+    ]
+    with pytest.raises(ValueError):
+        stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    assert all(value.const_value is None for value in unbound)
+    assert not package._native_streaming_source_files
+    assert not package._native_streaming_source_directories
+
+
+def test_fish_omni_fp8_classification():
+    name = "decoder.model.layers.0.mlp.experts.0.gate_proj.weight"
+    value = ir.Value(
+        name=name, shape=ir.Shape([128, 128]), type=ir.TensorType(ir.DataType.FLOAT)
+    )
+    source = _source_name(name)
+    index = {source: ("unused", [128, 128], "F8_E4M3")}
+    plan = build_fish_omni_streaming_plan(
+        index, {name: value}, dataclasses.replace(tiny_config(), fp8_experts=True)
+    )
+    assert plan.targets[name].mode == "fp8_block_128"
+    assert plan.targets[name].reconstruction_dtype == torch.float32
+    index[source] = ("unused", [128, 128], "BF16")
+    with pytest.raises(ValueError, match="F8_E4M3"):
+        build_fish_omni_streaming_plan(
+            index, {name: value}, dataclasses.replace(tiny_config(), fp8_experts=True)
+        )
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT, ir.DataType.BFLOAT16])
+def test_fish_omni_fp8_scales_are_reconstructed_in_fp32(tmp_path, dtype):
+    config = dataclasses.replace(tiny_config(), fp8_experts=True, dtype=dtype)
+    name = "decoder.model.layers.0.mlp.experts.0.gate_proj.weight"
+    value = ir.Value(name=name, shape=ir.Shape([128, 128]), type=ir.TensorType(dtype))
+    model = ir.Model(ir.Graph([], [], nodes=[], initializers=[value]), ir_version=12)
+    package = ModelPackage({"decoder": model}, config=config)
+    source = _source_name(name)
+    weight = torch.linspace(-1, 1, 128 * 128).reshape(128, 128).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.123456]], dtype=torch.float32)
+    save_file(
+        {
+            source: weight,
+            source.removesuffix(".weight") + ".weight_scale_inv": scale,
+        },
+        tmp_path / "model.safetensors",
+    )
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    expected = weight.float() * scale
+    if dtype == ir.DataType.BFLOAT16:
+        expected = expected.to(torch.bfloat16).float()
+    actual = torch.tensor(value.const_value.numpy().astype("float32"))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fish_omni_cuda_banks_preserve_fp8_reconstruction_and_expert_order(tmp_path):
+    config = dataclasses.replace(tiny_config(), fp8_experts=True)
+    name = "decoder.model.layers.0.mlp.packed_experts.gate_proj.weight"
+    count = config.num_local_experts
+    value = ir.Value(
+        name=name, shape=ir.Shape([count, 128, 128]), type=ir.TensorType(ir.DataType.FLOAT)
+    )
+    package = ModelPackage(
+        {"decoder": ir.Model(ir.Graph([], [], nodes=[], initializers=[value]), ir_version=12)},
+        config=config,
+    )
+    tensors = {}
+    expected = []
+    for expert in range(count):
+        source = f"model.language_model.layers.0.mlp.experts.{expert}.gate_proj.weight"
+        weight = torch.linspace(-1, 1, 128 * 128).reshape(128, 128).to(torch.float8_e4m3fn)
+        scale = torch.tensor([[0.123456 * (expert + 1)]], dtype=torch.float32)
+        tensors[source] = weight
+        tensors[source.removesuffix(".weight") + ".weight_scale_inv"] = scale
+        expected.append(weight.float() * scale)
+    save_file(tensors, tmp_path / "model.safetensors")
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    torch.testing.assert_close(
+        torch.from_numpy(value.const_value.numpy()), torch.stack(expected), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("revision", [None, "explicit-revision"])
+def test_fish_omni_revision_reaches_first_config_read(monkeypatch, revision):
+    seen = []
+
+    def load(model_id, **kwargs):
+        seen.append(kwargs["revision"])
+        return _dict_to_pretrained_config(copy.deepcopy(FISH_OMNI_CONFIG)), True
+
+    monkeypatch.setattr(_builder, "_load_transformers_config", load)
+    package = _builder.build_transformers_model(
+        "fishaudio/drama-3", revision=revision, load_weights=False
+    )
+    expected = revision or DRAMA3_REVISION
+    assert seen == [expected]
+    assert all(
+        m.metadata_props["mobius.source_revision"] == expected for m in package.values()
+    )
+
+
+def test_fish_omni_requires_explicit_dequantization_before_weight_io(monkeypatch):
+    raw = copy.deepcopy(FISH_OMNI_CONFIG)
+    raw["quantization_config"] = {
+        "quant_method": "bsgemm-moe",
+        "weight_block_size": [128, 128],
+        "activation_scheme": "dynamic",
+    }
+    monkeypatch.setattr(
+        _builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (_dict_to_pretrained_config(raw), True),
+    )
+    with pytest.raises(ValueError, match="--dequantize"):
+        _builder.build_transformers_model("fishaudio/drama-3")
+
+
+@pytest.mark.parametrize(
+    "task,ep",
+    [
+        ("fish-omni", "default"),
+        ("fish-omni-generation", "default"),
+        ("fish-omni-generation", "cuda"),
+    ],
+)
+def test_fish_omni_cli_persists_three_weighted_models(tmp_path, task, ep):
+    config = tiny_config()
+    package = build_from_module(FishOmniModel(config), config, task="fish-omni")
+    (tmp_path / "config.json").write_text(json.dumps(FISH_OMNI_CONFIG), encoding="utf-8")
+    save_file(_checkpoint(package), tmp_path / "model.safetensors")
+    output = tmp_path / "output"
+    main(
+        [
+            "build",
+            "--model",
+            str(tmp_path),
+            "--dtype",
+            "f32",
+            "--task",
+            task,
+            "--execution-provider",
+            ep,
+            "--dequantize",
+            "--output",
+            str(output),
+        ]
+    )
+    audio = "audio_generator" if task == "fish-omni-generation" else "audio_decoder"
+    for component in ("embedding", "decoder", audio):
+        model = ir.load(output / component / "model.onnx")
+        assert all(
+            value.const_value is not None for value in model.graph.initializers.values()
+        )
+    report = json.loads((output / "weight-loading-report.json").read_text())
+    assert report["native_fp8"] is False
+
+
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16, torch.float8_e4m3fn])
+def test_fp16_source_saturation_is_finite_logged_and_does_not_modify_checkpoint(
+    tmp_path, caplog, source_dtype
+):
+    fp8 = source_dtype == torch.float8_e4m3fn
+    config = dataclasses.replace(tiny_config(), dtype=ir.DataType.FLOAT16, fp8_experts=fp8)
+    name = "decoder.model.layers.0.mlp.experts.0.gate_proj.weight"
+    source = _source_name(name)
+    value = ir.Value(
+        name=name, shape=ir.Shape([128, 128]), type=ir.TensorType(ir.DataType.FLOAT16)
+    )
+    package = ModelPackage(
+        {"decoder": ir.Model(ir.Graph([], [], nodes=[], initializers=[value]), ir_version=12)},
+        config=config,
+    )
+    if fp8:
+        weights = torch.linspace(-1, 1, 128 * 128).reshape(128, 128).to(source_dtype)
+        scale = torch.tensor([[100000.0]], dtype=torch.float32)
+        checkpoint = {
+            source: weights,
+            source.removesuffix(".weight") + ".weight_scale_inv": scale,
+        }
+        reconstructed = weights.float() * scale
+    else:
+        weights = torch.linspace(-100000, 100000, 128 * 128).reshape(128, 128).to(source_dtype)
+        weights[0, 0] = 65536
+        checkpoint = {source: weights}
+        reconstructed = weights.float()
+    path = tmp_path / "model.safetensors"
+    save_file(checkpoint, path)
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    actual = torch.from_numpy(value.const_value.numpy())
+    torch.testing.assert_close(
+        actual, reconstructed.clamp(-65504, 65504).half(), rtol=0, atol=0
+    )
+    assert torch.isfinite(actual).all()
+    assert "Clamping" in caplog.text
+    restored = load_file(path)[source]
+    assert torch.equal(restored.view(torch.uint8), weights.view(torch.uint8))
+    expected_bound = weights.numel() * (weights.element_size() + 8 + 2)
+    assert (
+        package.weight_loading_report["largest_reconstruction_working_set_bytes"]
+        >= expected_bound
+    )
+
+
+def test_fp16_saturation_rejects_nonfinite_source_weights(tmp_path):
+    config = dataclasses.replace(tiny_config(), dtype=ir.DataType.FLOAT16)
+    name = "decoder.lm_head.weight"
+    source = _source_name(name)
+    value = ir.Value(
+        name=name, shape=ir.Shape([1, 2]), type=ir.TensorType(ir.DataType.FLOAT16)
+    )
+    package = ModelPackage(
+        {"decoder": ir.Model(ir.Graph([], [], nodes=[], initializers=[value]), ir_version=12)},
+        config=config,
+    )
+    save_file({source: torch.tensor([[float("nan"), 1.0]])}, tmp_path / "model.safetensors")
+    stream_fish_omni_safetensors_to_package(package, str(tmp_path), config, revision=None)
+    with pytest.raises(ValueError, match="Nonfinite streaming weight"):
+        value.const_value.numpy()

@@ -54,6 +54,7 @@ from mobius._configs import (
     WhisperConfig,
     XverseConfig,
 )
+from mobius._configs.fish_omni import DRAMA3_REVISION
 from mobius.models import (
     ApertusCausalLMModel,
     ArceeCausalLMModel,
@@ -187,6 +188,7 @@ from mobius.models.falcon import (
     MPTCausalLMModel,
 )
 from mobius.models.falcon_h1 import FalconH1ForCausalLM
+from mobius.models.fish_omni import FishOmniModel
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
 from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGUFModel
@@ -914,6 +916,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
     "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
+    "fish_omni": ModelRegistration(
+        FishOmniModel,
+        test_model_id="fishaudio/drama-3",
+        test_revision=DRAMA3_REVISION,
+        family="fish",
+        variant="temporal-codebook-mtp",
+    ),
     "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
     "vibevoice": ModelRegistration(
         VibeVoiceForConditionalGeneration,

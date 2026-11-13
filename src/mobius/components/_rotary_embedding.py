@@ -107,8 +107,9 @@ class BaseRope(nn.Module):
         dtype: Model compute dtype. When not FP32, a Cast is inserted
             after gathering cos/sin embeddings so that the
             ``RotaryEmbedding`` op receives inputs with matching types.
-            The cache itself stays FP32 for precision; only the gathered
-            per-position embeddings are cast.
+            Caches are initialized in FP32, but the exporter normally casts
+            parameters to the model dtype. Architectures needing FP32 rotation
+            explicitly preserve their cache parameters.
     """
 
     def __init__(
@@ -140,8 +141,8 @@ class BaseRope(nn.Module):
         """Cast cos/sin embeddings to model dtype if needed.
 
         The RotaryEmbedding op requires all tensor inputs to share the
-        same type ``T``.  Since caches are stored in FP32, a Cast is
-        needed when the model uses FP16 or BF16.
+        same type ``T``. An explicit Cast also handles architectures that
+        preserve FP32 cache parameters in an FP16 or BF16 model.
         """
         if self._dtype != ir.DataType.FLOAT:
             cos = op.Cast(cos, to=self._dtype)
