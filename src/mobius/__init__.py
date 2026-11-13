@@ -96,7 +96,7 @@ __all__ = [
     "tasks",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from mobius import components, generation, models, tasks
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
