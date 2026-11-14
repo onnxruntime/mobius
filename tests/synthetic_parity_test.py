@@ -157,6 +157,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # GLM4: pre+post norm FP accumulation → ~0.007 max diff.
     # Argmax correct, cosine≥0.999 — functionally correct.
     "glm4": 0.01,
+    # GLM-5.3 combines strict-fp32 mHC/KDA routing with ONNX recurrent
+    # kernels; four tiny layers accumulate <0.004 while retaining exact top-1.
+    "glm5_next_text": 0.005,
     "olmoe": 0.035,  # ~0.031 max diff, cosine=0.998
     "phimoe": 0.065,  # ~0.058 max diff, cosine=0.993 (SparseMixerGate)
     "qwen3_moe": 0.025,  # ~0.020 max diff, cosine=0.999
@@ -554,7 +557,44 @@ def _adapt_hy_v3_config(hf_kwargs: dict) -> None:
         hf_kwargs.pop(field, None)
 
 
+def _adapt_glm5_next_text_config(hf_kwargs: dict) -> None:
+    """Translate the typed Mobius GLM-5.3 fields to the upstream config."""
+    num_heads = hf_kwargs.pop("linear_num_heads")
+    head_dim = hf_kwargs.pop("linear_head_dim")
+    conv_kernel = hf_kwargs.pop("linear_conv_kernel_dim")
+    lower_bound = hf_kwargs.pop("linear_lower_bound")
+    hf_kwargs["linear_attn_config"] = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "short_conv_kernel_size": conv_kernel,
+        "gate_lower_bound": lower_bound,
+        "safe_gate": True,
+    }
+    hf_kwargs["n_routed_experts"] = hf_kwargs.pop("num_local_experts")
+    for field in (
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_gate_lower_bound",
+        "use_expert_bias",
+        "scoring_func",
+        "topk_method",
+        "rope_type",
+        "rope_theta",
+        "rope_scaling",
+        "partial_rotary_factor",
+        "index_kpool_compress",
+        "image_start_token_id",
+        "image_end_token_id",
+        "video_start_token_id",
+        "video_end_token_id",
+    ):
+        hf_kwargs.pop(field, None)
+
+
 _HF_CONFIG_ADAPTERS = {
+    "glm5_next_text": _adapt_glm5_next_text_config,
     "hy_v3": _adapt_hy_v3_config,
     "muse_glimmer_text": _adapt_muse_glimmer_text_config,
     "qwen4_exp_text": _adapt_qwen4_exp_text_config,
@@ -778,7 +818,14 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         hf_kwargs.pop(key, None)
 
     try:
-        hf_config = AutoConfig.for_model(hf_model_type, **hf_kwargs)
+        if hf_model_type == "glm5_next_text":
+            from transformers.models.glm5_next.configuration_glm5_next import (
+                Glm5NextTextConfig,
+            )
+
+            hf_config = Glm5NextTextConfig(**hf_kwargs)
+        else:
+            hf_config = AutoConfig.for_model(hf_model_type, **hf_kwargs)
     except (ValueError, KeyError) as e:
         pytest.skip(f"Cannot create HF config for {model_type}: {e}")
 
@@ -810,7 +857,29 @@ def _create_softcapped_backbone_causal_lm(hf_config):
     return _SoftcappedBackboneCausalLM()
 
 
+def _create_glm5_next_causal_lm(hf_config):
+    """Wrap the upstream GLM-5.3 text backbone with its untied LM head."""
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
+
+    class _Glm5NextCausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Glm5NextTextModel(hf_config)
+            self.lm_head = torch.nn.Linear(
+                hf_config.hidden_size,
+                hf_config.vocab_size,
+                bias=False,
+            )
+
+        def forward(self, **kwargs):
+            hidden_states = self.model(**kwargs).last_hidden_state
+            return type("CausalLMOutput", (), {"logits": self.lm_head(hidden_states)})()
+
+    return _Glm5NextCausalLM()
+
+
 _HF_MODEL_FACTORIES = {
+    "glm5_next_text": _create_glm5_next_causal_lm,
     "muse_glimmer_text": _create_softcapped_backbone_causal_lm,
 }
 
