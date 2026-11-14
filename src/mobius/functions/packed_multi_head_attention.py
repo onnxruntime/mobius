@@ -46,7 +46,7 @@ from mobius._constants import OPSET_VERSION
 DOMAIN = "com.microsoft"
 
 
-def packed_multi_head_attention() -> ir.Function:
+def packed_multi_head_attention(*, opset_version: int = OPSET_VERSION) -> ir.Function:
     """Build an ``ir.Function`` for ``PackedMultiHeadAttention``.
 
     Standard-ONNX body builds a block-diagonal attention bias from
@@ -178,5 +178,5 @@ def packed_multi_head_attention() -> ir.Function:
             ir.Attr("num_heads", ir.AttributeType.INT, 1),
             ir.Attr("scale", ir.AttributeType.FLOAT, 1.0),
         ],
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": opset_version},
     )

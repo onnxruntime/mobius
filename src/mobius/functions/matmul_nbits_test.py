@@ -35,6 +35,8 @@ from mobius.functions.matmul_nbits import (
     FUNCTION_BODY_METADATA_VALUE,
 )
 
+pytestmark = pytest.mark.opset29
+
 
 def _run(model: ir.Model, feeds: dict) -> np.ndarray:
     with tempfile.TemporaryDirectory() as directory:

@@ -51,7 +51,7 @@ _E2M1_TABLE = np.array(
 _E4M3_TABLE = np.arange(256, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
 
 
-def matmul_block_quantized_fp4_weight() -> ir.Function:
+def matmul_block_quantized_fp4_weight(*, opset_version: int = OPSET_VERSION) -> ir.Function:
     """Build the exact four-input standard-ONNX NVFP4 fallback."""
 
     def body(op, a_input, b_packed, raw_scales, global_scale):
@@ -108,7 +108,7 @@ def matmul_block_quantized_fp4_weight() -> ir.Function:
         domain=DOMAIN,
         name=OP_TYPE,
         attributes=[ir.Attr("block_size", ir.AttributeType.INT, BLOCK_SIZE)],
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": opset_version},
     )
 
 

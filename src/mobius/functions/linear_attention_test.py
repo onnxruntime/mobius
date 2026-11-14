@@ -9,6 +9,8 @@ import pytest
 
 from mobius.functions.linear_attention import linear_attention
 
+pytestmark = pytest.mark.opset29
+
 
 class TestLinearAttentionSeparateQKV:
     """Tests for LinearAttention with separate Q, K, V inputs."""

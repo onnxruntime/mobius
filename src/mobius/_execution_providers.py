@@ -401,6 +401,7 @@ def _register_builtins() -> None:
         # soc_model and the EP-context binary path are set per-device at build time.
         EpCapabilities(
             name="qnn",
+            supports_fused_moe=False,  # no ORT contrib MoE/QMoE kernels
             gqa_dtypes=frozenset(),  # no GroupQueryAttention (no QNN GQA builder)
             qkv_pack_dtypes=frozenset(),  # no PackQKV
             supports_fused_rope=False,  # SeparateRoPE + UnpackQKV

@@ -35,7 +35,7 @@ import onnx_ir as ir
 from onnxscript._internal.builder import build_function
 
 from mobius._constants import OPSET_VERSION
-from mobius.components._scan_utils import (
+from mobius.components import (
     create_body_graph,
     rename_subgraph_values,
 )
@@ -50,6 +50,7 @@ def linear_attention(
     update_rule: str = "gated_delta",
     scale: float = 1.0,
     stash_type: ir.DataType = ir.DataType.FLOAT,
+    opset_version: int = OPSET_VERSION,
 ) -> ir.Function:
     """Build an ir.Function for LinearAttention.
 
@@ -188,7 +189,9 @@ def linear_attention(
         )
 
         # --- Build Scan for sequential recurrence ---
-        scan_body = _build_recurrence_body(uses_decay, uses_beta, stash_type=stash_type)
+        scan_body = _build_recurrence_body(
+            uses_decay, uses_beta, stash_type=stash_type, opset_version=opset_version
+        )
 
         # Transpose to T-first for Scan: (B, H, T, D) -> (T, B, H, D)
         q_t = op.Transpose(scaled_query, perm=[2, 0, 1, 3])
@@ -255,7 +258,7 @@ def linear_attention(
                 ref_attr_name="kv_num_heads",
             ),
         ],
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": opset_version},
     )
 
 
@@ -264,6 +267,7 @@ def _build_recurrence_body(
     uses_beta: bool,
     *,
     stash_type: ir.DataType = ir.DataType.FLOAT,
+    opset_version: int = OPSET_VERSION,
 ) -> ir.Graph:
     """Build the Scan body for single-token delta-rule recurrence.
 
@@ -306,6 +310,7 @@ def _build_recurrence_body(
         state_inputs=[state_in],
         scan_inputs=scan_in_vals,
         name="delta_recurrence",
+        opset_version=opset_version,
     )
     bop = body_builder.op
 

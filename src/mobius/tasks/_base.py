@@ -14,8 +14,8 @@ import onnx_ir as ir
 from onnxscript import GraphBuilder, nn
 
 import mobius
+from mobius._build_context import get_build_opset_version
 from mobius._configs import BaseModelConfig
-from mobius._constants import OPSET_VERSION
 from mobius._model_package import ModelPackage
 
 if TYPE_CHECKING:
@@ -195,7 +195,7 @@ def _make_graph(
         [],
         nodes=[],
         name=name,
-        opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
+        opset_imports={"": get_build_opset_version(), "com.microsoft": 1},
     )
     return graph, GraphBuilder(graph)
 

@@ -71,6 +71,7 @@ addopts = "--tb=short --color=yes"
 testpaths = ["src", "tests", "scripts"]
 python_files = ["*_test.py"]
 markers = [
+    "opset29: experimental function fallbacks and adjacent default-opset regression coverage",
     "integration: integration tests requiring model downloads and GPU/CPU inference (deselect with '-m \"not integration\"')",
     "integration_fast: integration tests for single-modality models (text, encoder, audio)",
     "integration_slow: integration tests for multi-modality models (vision-language, multimodal)",
