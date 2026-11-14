@@ -68,6 +68,15 @@ class CausalLMTask(ModelTask):
 
         No ``attention_mask`` input — causal masking uses ``is_causal=1``.
 
+    **GQA static cache** (``static_cache=True, gqa_cache=True``):
+        ``com.microsoft::GroupQueryAttention`` owns the same pre-allocated
+        buffers and appends the new key/value itself, so the graph carries no
+        ``TensorScatter``. The buffers become 4-D ``[batch, kv_heads,
+        max_seq_len, head_dim]`` and ``write_indices`` disappears; everything
+        else matches the static cache above. Only models whose decoder layers
+        use the shared :class:`~mobius.components.Attention` qualify, without
+        a sliding window or attention softcapping.
+
     The module's ``forward()`` must accept
     ``(op, input_ids, attention_mask, position_ids, past_key_values)``
     and return ``(logits, list_of_(key, value)_tuples)``.  In static cache
@@ -80,6 +89,9 @@ class CausalLMTask(ModelTask):
         max_seq_len: Maximum sequence length for static cache buffers.
             Only used when ``static_cache=True``.  Defaults to
             ``config.max_position_embeddings``.
+        gqa_cache: With ``static_cache``, let ``GroupQueryAttention`` own the
+            cache instead of ``TensorScatter`` + ``Attention``. This changes
+            the exported model's I/O.
         prune_prefill_prefix: If ``True``, insert ``Gather(axis=1, index=-1)``
             before the LM head so only the last token's hidden state is
             projected to logits.  Output logits shape becomes ``[B, 1,
@@ -98,10 +110,14 @@ class CausalLMTask(ModelTask):
         paged_cache: bool = False,
         max_seq_len: int | None = None,
         prune_prefill_prefix: bool = False,
+        gqa_cache: bool = False,
     ):
         if static_cache and paged_cache:
             raise ValueError("static_cache and paged_cache are mutually exclusive.")
+        if gqa_cache and not static_cache:
+            raise ValueError("gqa_cache requires static_cache=True.")
         self._static_cache = static_cache
+        self._gqa_cache = gqa_cache
         self._paged_cache = paged_cache
         self._max_seq_len = max_seq_len
         self._prune_prefill_prefix = prune_prefill_prefix
@@ -125,6 +141,8 @@ class CausalLMTask(ModelTask):
                     "config.max_position_embeddings is set."
                 )
             _validate_static_cache_support(module)
+            if self._gqa_cache:
+                _validate_gqa_cache_support(module, config)
 
         # --- Graph input dims ---
         batch = ir.SymbolicDim("batch")
@@ -161,6 +179,7 @@ class CausalLMTask(ModelTask):
                 batch,
                 max_seq_len,
                 cache_specs=cache_specs,
+                gqa=self._gqa_cache,
             )
         else:
             past_seq_len = ir.SymbolicDim("past_sequence_len")
@@ -481,12 +500,18 @@ def _make_static_cache_inputs(
     batch: ir.SymbolicDim,
     max_seq_len: int,
     cache_specs: list[tuple[int, int]] | None = None,
+    gqa: bool = False,
 ) -> list[StaticCacheState]:
     """Create static KV cache inputs for the cache-owning layers.
 
     Uses ``builder.input()`` to create and register graph inputs directly.
 
     Args:
+        gqa: Shape the buffers for ``com.microsoft::GroupQueryAttention``
+            (4-D ``[B, kv_heads, max_seq_len, head_dim]``) and derive its
+            ``seqlens_k`` / ``total_seq_len`` pair instead of creating
+            ``write_indices``. The op appends the new key/value itself, so the
+            graph carries no ``TensorScatter``.
         cache_specs: Optional per-cache-layer ``(num_key_value_heads, head_dim)``
             list. When provided (e.g. from a model's ``static_kv_cache_specs()``),
             one buffer is allocated per entry with its own ``kv_hidden`` — this
@@ -505,30 +530,49 @@ def _make_static_cache_inputs(
 
     cache_pairs: list[tuple[ir.Value, ir.Value]] = []
     for i, (kv_heads, layer_head_dim) in enumerate(cache_specs):
-        kv_hidden = kv_heads * layer_head_dim
-        key_cache = builder.input(
-            f"key_cache.{i}",
-            dtype=dtype,
-            shape=[batch, max_seq_len, kv_hidden],
+        shape = (
+            [batch, kv_heads, max_seq_len, layer_head_dim]
+            if gqa
+            else [batch, max_seq_len, kv_heads * layer_head_dim]
         )
-        value_cache = builder.input(
-            f"value_cache.{i}",
-            dtype=dtype,
-            shape=[batch, max_seq_len, kv_hidden],
-        )
+        key_cache = builder.input(f"key_cache.{i}", dtype=dtype, shape=shape)
+        value_cache = builder.input(f"value_cache.{i}", dtype=dtype, shape=shape)
         cache_pairs.append((key_cache, value_cache))
 
     # Shared inputs across all layers
-    write_indices = builder.input(
-        STATIC_CACHE_WRITE_INDICES,
-        dtype=ir.DataType.INT64,
-        shape=[batch],
+    write_indices = (
+        None
+        if gqa
+        else builder.input(
+            STATIC_CACHE_WRITE_INDICES,
+            dtype=ir.DataType.INT64,
+            shape=[batch],
+        )
     )
     nonpad_kv_seqlen = builder.input(
         STATIC_CACHE_KV_SEQUENCE_LENGTH,
         dtype=ir.DataType.INT64,
         shape=[batch],
     )
+
+    seqlens_k = total_seq_len = None
+    if gqa:
+        # GQA wants the last valid index per batch entry and the scalar total,
+        # both int32; nonpad_kv_seqlen already carries the length, so the pair
+        # is derived once here rather than added to the model's input contract.
+        #
+        # total_sequence_length is the buffer's capacity rather than the live
+        # length on purpose. ORT wants that scalar on the host, so computing it
+        # from nonpad_kv_seqlen would put a device-to-host copy in the decode
+        # step, which a captured CUDA graph cannot hold -- capture then fails.
+        # A constant has no such copy, and it is sound because the op bounds
+        # the KV it reads by seqlens_k; the parity tests against the
+        # TensorScatter path hold with it.
+        op = builder.op
+        seqlens_k = op.Cast(
+            op.Sub(nonpad_kv_seqlen, op.Constant(value_int=1)), to=ir.DataType.INT32
+        )
+        total_seq_len = op.Cast(op.Constant(value_int=max_seq_len), to=ir.DataType.INT32)
 
     # Build StaticCacheState for each layer (shared indices)
     static_caches: list[StaticCacheState] = []
@@ -539,6 +583,8 @@ def _make_static_cache_inputs(
                 value_cache=value_cache,
                 write_indices=write_indices,
                 nonpad_kv_seqlen=nonpad_kv_seqlen,
+                seqlens_k=seqlens_k,
+                total_seq_len=total_seq_len,
             )
         )
 
@@ -622,6 +668,53 @@ def _register_paged_cache_outputs(
     for i, present in enumerate(present_key_values):
         updated_key = present[0] if isinstance(present, (tuple, list)) else present
         builder.add_output(updated_key, f"updated_key_cache.{i}")
+
+
+def _validate_gqa_cache_support(module: nn.Module, config: ArchitectureConfig) -> None:
+    """Check that every decoder layer can hand its cache to GroupQueryAttention.
+
+    The GQA-owned cache has no ``write_indices``, so a layer that writes the
+    cache itself would get ``None`` there -- and ``TensorScatter`` treats a
+    missing ``write_indices`` as "write at 0", which is wrong without being an
+    error. Only the shared :class:`~mobius.components.Attention`, which routes
+    through ``_apply_attention``, is known to take the GQA branch, so it is the
+    only one accepted. The GQA branch also passes no ``local_window_size`` and
+    no ``softcap``, so models with either are refused rather than silently
+    attending past their window or without their cap.
+
+    Run after :func:`_validate_static_cache_support`, which has already
+    rejected layers that cannot take a static cache at all.
+
+    Raises:
+        TypeError: If a decoder layer's attention is not the shared
+            ``Attention``.
+        ValueError: If the model uses a sliding window or softcapping.
+    """
+    from mobius.components._attention import Attention
+
+    if config.sliding_window is not None or "sliding_attention" in (config.layer_types or ()):
+        raise ValueError(
+            "gqa_cache does not support sliding-window attention; use the "
+            "TensorScatter static cache instead."
+        )
+    if getattr(config, "attn_logit_softcapping", None):
+        raise ValueError(
+            "gqa_cache does not support attention softcapping; use the "
+            "TensorScatter static cache instead."
+        )
+    for name, child in module.named_modules():
+        if not isinstance(child, nn.ModuleList):
+            continue
+        for i, layer in enumerate(child):
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            if type(attn) is not Attention:
+                raise TypeError(
+                    f"gqa_cache requires decoder layers built on the shared "
+                    f"Attention, but {name}[{i}].self_attn is "
+                    f"{type(attn).__name__}."
+                )
 
 
 def _validate_static_cache_support(module: nn.Module) -> None:
