@@ -153,6 +153,7 @@ __all__ = [
     "YouTuVLProjector",
     "YouTuVLVisionEncoder",
     "apply_rms_norm",
+    "ProportionalRope",
     "apply_rotary_pos_emb",
     "build_packed_token_offset",
     "create_attention_bias",
@@ -457,7 +458,11 @@ from mobius.components._rms_norm import (
     ScaleFreeRMSNorm,
     apply_rms_norm,
 )
-from mobius.components._rotary_embedding import apply_rotary_pos_emb, initialize_rope
+from mobius.components._rotary_embedding import (
+    ProportionalRope,
+    apply_rotary_pos_emb,
+    initialize_rope,
+)
 from mobius.components._sanm_attention import (
     SANMFFN as SANMFFN,
 )

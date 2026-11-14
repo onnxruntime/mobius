@@ -10,6 +10,8 @@ only) and seq2seq (encoder-decoder) architectures.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 
@@ -43,6 +45,7 @@ class OnnxGenerator:
         input_ids: np.ndarray,
         max_new_tokens: int = 20,
         eos_token_id: int | None = None,
+        repetition_penalty: float = 1.0,
     ) -> np.ndarray:
         """Generate tokens autoregressively using greedy decoding.
 
@@ -50,11 +53,14 @@ class OnnxGenerator:
             input_ids: [batch, seq_len] int64 prompt token IDs.
             max_new_tokens: Maximum number of new tokens to generate.
             eos_token_id: If set, stop generation when this token is produced.
+            repetition_penalty: Sign-aware penalty for tokens already in each row.
 
         Returns:
             [batch, seq_len + generated_len] int64 array of all token IDs
             (prompt + generated).
         """
+        if not math.isfinite(repetition_penalty) or repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be finite and positive")
         batch_size, _prompt_len = input_ids.shape
         num_layers = self.config.num_hidden_layers
         num_kv_heads = self.config.num_key_value_heads
@@ -133,7 +139,15 @@ class OnnxGenerator:
 
             # Extract logits and take argmax of last token
             logits = outputs["logits"]  # [batch, cur_seq_len, vocab]
-            next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True)
+            scores = logits[:, -1, :].astype(np.float32, copy=True)
+            if repetition_penalty != 1.0:  # noqa: RUF069
+                for batch_idx in range(batch_size):
+                    token_ids = np.unique(all_ids[batch_idx])
+                    seen = scores[batch_idx, token_ids]
+                    scores[batch_idx, token_ids] = np.where(
+                        seen < 0, seen * repetition_penalty, seen / repetition_penalty
+                    )
+            next_token = np.argmax(scores, axis=-1, keepdims=True)
             # next_token: [batch, 1]
 
             all_ids = np.concatenate([all_ids, next_token], axis=1)
