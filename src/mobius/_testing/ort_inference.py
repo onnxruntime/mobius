@@ -69,16 +69,12 @@ def _ort_value_to_numpy(value: ort.OrtValue) -> np.ndarray:
 def _numpy_to_ort_value(value: np.ndarray) -> ort.OrtValue:
     """Convert a NumPy array to an OrtValue, supporting ml_dtypes and bool.
 
-    ``onnxruntime_easy.ort_value`` prefers the DLPack path, which is broken
-    for ml_dtypes scalars (NumPy's __dlpack__ rejects non-standard dtypes)
-    and for bool (DLPack has no native bool type code). Route those arrays
-    through the explicit numpy-to-OrtValue APIs instead.
+    Use ORT's NumPy APIs instead of ``onnxruntime_easy``'s DLPack path,
+    whose private ORT call signature changed in ORT 1.32. Explicit ONNX
+    element types retain support for non-standard ml_dtypes scalars.
     """
     if isinstance(value, np.ndarray):
-        if value.dtype == np.bool_:
-            # ORT supports tensor(bool) natively but DLPack does not, so
-            # bypass ort_easy's DLPack-first path.
-            return ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(value))
+        value = np.require(value, requirements=["C"])
         try:
             import ml_dtypes
         except ImportError:  # pragma: no cover
@@ -87,8 +83,9 @@ def _numpy_to_ort_value(value: np.ndarray) -> ort.OrtValue:
             onnx_type = ort_easy._ml_dtypes_to_onnx_type(value.dtype)
             if onnx_type is not None:
                 return ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
-                    np.ascontiguousarray(value), onnx_element_type=onnx_type
+                    value, onnx_element_type=onnx_type
                 )
+        return ort.OrtValue.ortvalue_from_numpy(value)
     return ort_easy.ort_value(value)
 
 
