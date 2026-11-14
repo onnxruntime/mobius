@@ -11,6 +11,8 @@ exercised by the parametrized tests there.
 
 from __future__ import annotations
 
+import sys
+
 import onnx_ir as ir
 import pytest
 import torch
@@ -25,7 +27,7 @@ from mobius._registry import (
 from mobius._testing import make_config
 from mobius.components import LayerNorm, Linear, QuantizedLinear, RMSNormBias
 from mobius.models.base import CausalLMModel, TextModel
-from mobius.models.moe import Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
+from mobius.models.moe import MoECausalLMModel, Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
 from mobius.tasks import CausalLMTask
 
 
@@ -322,6 +324,127 @@ class TestPrunePrefillPrefix:
         config = make_config()
         with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
             build_from_module(UnsupportedCausalLM(config), config, prune_prefill_prefix=True)
+
+    @staticmethod
+    def _quantized_moe_config(**quantization):
+        return make_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            dtype=ir.DataType.FLOAT16,
+            quantization=QuantizationConfig(bits=4, group_size=32, sym=True, **quantization),
+        )
+
+    @pytest.mark.parametrize(
+        ("model_class", "quantization"),
+        [
+            pytest.param(
+                MoECausalLMModel, {"quant_method": "olive", "quantize_moe": True}, id="qmoe"
+            ),
+            pytest.param(
+                PhiMoEGGUFCausalLMModel,
+                {"quant_method": "gguf", "quantize_lm_head": True},
+                id="matmulnbits-head-with-bias",
+            ),
+        ],
+    )
+    def test_prune_quantized_moe_infers_logits_shape(
+        self, model_class, quantization, monkeypatch
+    ):
+        """MatMulNBits and QMoE have no ONNX schema; the task infers the logits shape itself."""
+        # Skip the optimizer, which runs shape inference too, to check the task's own graph.
+        monkeypatch.setattr("mobius._builder.optimize_model", lambda *args, **kwargs: None)
+        config = self._quantized_moe_config(**quantization)
+        module = model_class(config)
+        model = build_from_module(module, config, prune_prefill_prefix=True)["model"]
+
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        assert len(logits.shape) == 3
+        assert logits.shape[1] == 1
+        assert logits.shape[2] == config.vocab_size
+
+    @pytest.mark.parametrize(
+        ("index", "axis", "axes"),
+        [
+            pytest.param(None, None, None, id="unpruned"),
+            pytest.param(-1, 0, [1], id="gather-axis-0"),
+            pytest.param([0, 1], 1, [1], id="gather-two-positions"),
+            pytest.param([-1], 1, [1], id="gather-vector-index"),
+            pytest.param(-1, 1, [0], id="unsqueeze-axis-0"),
+            pytest.param(slice(-2, None), 1, None, id="slice-last-two"),
+        ],
+    )
+    def test_prune_quantized_moe_rejects_other_selections(self, index, axis, axes):
+        """The inferred logits shape rejects every selection but the last token."""
+
+        class CustomSelectionMoE(MoECausalLMModel):
+            def forward(
+                self,
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values=None,
+            ):
+                hidden_states, present = self.model(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                if isinstance(index, slice):
+                    hidden_states = op.Slice(
+                        hidden_states,
+                        op.Constant(value_ints=[index.start]),
+                        op.Constant(value_ints=[sys.maxsize]),
+                        op.Constant(value_ints=[axis]),
+                    )
+                elif index is not None:
+                    indices = op.Constant(value=ir.tensor(index, dtype=ir.DataType.INT64))
+                    hidden_states = op.Unsqueeze(
+                        op.Gather(hidden_states, indices, axis=axis),
+                        op.Constant(value_ints=axes),
+                    )
+                return self.lm_head(op, hidden_states), present
+
+        config = self._quantized_moe_config(quant_method="olive", quantize_moe=True)
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            build_from_module(CustomSelectionMoE(config), config, prune_prefill_prefix=True)
+
+    def test_prune_quantized_moe_rejects_non_bias_add(self):
+        """Adding full-sequence logits broadcasts the pruned logits back to every position."""
+
+        class FullSequenceAddMoE(MoECausalLMModel):
+            def forward(
+                self,
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values=None,
+            ):
+                hidden_states, present = self.model(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                last = op.Unsqueeze(
+                    op.Gather(
+                        hidden_states,
+                        op.Constant(value=ir.tensor(-1, dtype=ir.DataType.INT64)),
+                        axis=1,
+                    ),
+                    op.Constant(value_ints=[1]),
+                )
+                logits = op.Add(self.lm_head(op, last), self.lm_head(op, hidden_states))
+                return logits, present
+
+        config = self._quantized_moe_config(quant_method="olive", quantize_moe=True)
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            build_from_module(FullSequenceAddMoE(config), config, prune_prefill_prefix=True)
 
 
 class TestDeepStackCaptureOrdering:

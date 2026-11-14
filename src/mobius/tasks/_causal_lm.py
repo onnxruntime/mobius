@@ -15,6 +15,7 @@ from mobius._constants import (
     STATIC_CACHE_WRITE_INDICES,
 )
 from mobius._model_package import ModelPackage
+from mobius._optimizations import SymbolicShapeInferencePass
 from mobius.components._attention import StaticCacheState
 from mobius.tasks._base import (
     ModelTask,
@@ -88,7 +89,9 @@ class CausalLMTask(ModelTask):
             runtime only needs the final token's logits (single-token
             autoregressive generation).  Breaks workflows that require
             per-token logits (logprob scoring, speculative decoding,
-            multi-token generation).
+            multi-token generation).  The kept position is the static index
+            ``-1``, so right-padded batches with more than one row are also
+            unsupported.
     """
 
     def __init__(
@@ -226,8 +229,6 @@ class CausalLMTask(ModelTask):
         else:
             logits, present_key_values = result
 
-        _validate_pruned_logits(logits, self._prune_prefill_prefix, module)
-
         builder.add_output(logits, "logits")
 
         # --- Output registration (static vs dynamic) ---
@@ -260,7 +261,9 @@ class CausalLMTask(ModelTask):
         if final_hidden_state is not None:
             builder.add_output(final_hidden_state, "mtp_seed")
 
-        return ModelPackage({"model": _make_model(graph)}, config=config)
+        model = _make_model(graph)
+        _validate_pruned_logits(model, logits, seq_len, self._prune_prefill_prefix, module)
+        return ModelPackage({"model": model}, config=config)
 
     def _build_paged(
         self,
@@ -401,8 +404,6 @@ class HybridCausalLMTask(ModelTask):
         else:
             logits, present_key_values = result
 
-        _validate_pruned_logits(logits, self._prune_prefill_prefix, module)
-
         builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
             builder,
@@ -419,6 +420,7 @@ class HybridCausalLMTask(ModelTask):
 
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
+        _validate_pruned_logits(model, logits, seq_len, self._prune_prefill_prefix, module)
         if config.model_type in {"jamba", "nemotron_h"}:
             model.metadata_props["mobius.runtime_support"] = (
                 "Deferred: ORT GenAI 0.15.2 discovers sparse KV and conv/recurrent slots, "
@@ -430,19 +432,36 @@ class HybridCausalLMTask(ModelTask):
 
 
 def _validate_pruned_logits(
+    model: ir.Model,
     logits: ir.Value,
+    sequence_len: ir.SymbolicDim,
     prune_prefill_prefix: bool,
     module: nn.Module,
 ) -> None:
     """Fail when a custom model forward ignores the task's pruning request."""
     if not prune_prefill_prefix:
         return
-    shape = logits.shape
-    if shape is None or len(shape) != 3 or shape[1] != 1:
+    if not _is_last_token_shape(logits.shape, sequence_len):
+        # The builder infers shapes only for ops with an ONNX schema, so custom-domain ops
+        # (e.g. MatMulNBits, QMoE) leave the logits shapeless until the optimizer runs.
+        SymbolicShapeInferencePass()(model)
+    if not _is_last_token_shape(logits.shape, sequence_len):
         raise ValueError(
             f"{type(module).__name__} does not support prune_prefill_prefix. "
-            "The model must select the final hidden state before its LM-head projection."
+            "The model must select the final hidden state before its LM-head projection "
+            f"(logits shape: {logits.shape})."
         )
+
+
+def _is_last_token_shape(shape: ir.Shape | None, sequence_len: ir.SymbolicDim) -> bool:
+    """Whether *shape* is ``[batch, 1, vocab]``.
+
+    A ``sequence_len`` axis anywhere, e.g. ``[sequence_len, 1, vocab]`` after a Gather on the
+    batch axis, means logits are still produced for every token.
+    """
+    return (
+        shape is not None and len(shape) == 3 and shape[1] == 1 and sequence_len not in shape
+    )
 
 
 def _register_intermediate_hidden_states(
