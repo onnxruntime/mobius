@@ -11,9 +11,15 @@ import numpy as np
 import onnx
 import onnx_ir as ir
 import pytest
+import torch
+from onnxscript import nn
 
+from mobius._builder import build_from_module
+from mobius._configs import QuantizationConfig
 from mobius._constants import OPSET_VERSION
 from mobius._flags import override_flags
+from mobius._testing import make_config
+from mobius.components import Embedding, MoELayer
 from mobius.functions import register_function_bodies
 from mobius.functions._lowering_test_utils import (
     expand_grouped_matmul as _expand_grouped_matmul,
@@ -270,6 +276,101 @@ def _run(model, feeds, path):
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     session = ort.InferenceSession(str(path), options, providers=["CPUExecutionProvider"])
     return session.run(None, feeds)[0]
+
+
+@_requires_opset29
+def test_multilayer_build_then_bind_packed_checkpoint(tmp_path):
+    """Build uninitialized consecutive QMoEs, then bind their original names."""
+    config = make_config(
+        hidden_size=32,
+        intermediate_size=48,
+        num_local_experts=3,
+        num_experts_per_tok=2,
+        quantization=QuantizationConfig(bits=4, group_size=16, quant_method="olive", sym=True),
+    )
+
+    class TinyQuantizedEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
+            self.layers = nn.ModuleList([MoELayer(config) for _ in range(2)])
+
+        def forward(self, op, input_ids, attention_mask, token_type_ids):
+            hidden = self.embed_tokens(op, input_ids)  # (batch, sequence, hidden)
+            for layer in self.layers:
+                hidden = layer(op, hidden)
+            return hidden
+
+    module = TinyQuantizedEncoder()
+    assert all(parameter.const_value is None for parameter in module.parameters())
+    package = build_from_module(
+        module, config, task="feature-extraction", execution_provider="onnx-standard"
+    )
+    model = package["model"]
+    assert model.graph.opset_imports[""] == 29
+    assert sum(node.op_type == "GroupedMatMul" for node in model.graph) == 4
+    assert not any(node.op_type in {"QMoE", "MoE"} for node in model.graph.all_nodes())
+    assert not any(fn.name in {"QMoE", "MoE"} for fn in model.functions.values())
+
+    rng = np.random.default_rng(814)
+    checkpoint = {
+        "embed_tokens.weight": torch.from_numpy(
+            rng.normal(0, 0.3, (config.vocab_size, 32)).astype(np.float32)
+        )
+    }
+    for index in range(2):
+        prefix = f"layers.{index}."
+        checkpoint[prefix + "gate.weight"] = torch.from_numpy(
+            rng.normal(0, 0.2, (3, 32)).astype(np.float32)
+        )
+        for projection, rows, width in (("fc1", 96, 32), ("fc2", 32, 48)):
+            codes = rng.integers(0, 16, (3, rows, width), dtype=np.uint8)
+            checkpoint[prefix + projection + "_experts_weights"] = torch.from_numpy(
+                _pack(codes)
+            )
+            checkpoint[prefix + projection + "_scales"] = torch.from_numpy(
+                rng.uniform(0.005, 0.04, (3, rows, width // 16)).astype(np.float32)
+            )
+    # Optimization may also create shape constants; checkpoint parameters must survive.
+    assert set(checkpoint) <= set(model.graph.initializers)
+    assert all(model.graph.initializers[name].const_value is None for name in checkpoint)
+    assert package.apply_weights(checkpoint) == set(checkpoint)
+
+    def dequantize(prefix, projection):
+        packed = checkpoint[prefix + projection + "_experts_weights"].numpy()
+        scales = checkpoint[prefix + projection + "_scales"].numpy()
+        # Decode by byte/column, independently of the lowering's UINT4 reshape.
+        columns = np.arange(packed.shape[-1] * 2)
+        codes = (packed[..., columns // 2] >> (4 * (columns % 2))) & 15
+        # Raw INT4 with omitted zero points is centered at 8, not DQ's zero 0.
+        return (codes.astype(np.float64) - 8) * scales[..., columns // 16]
+
+    ids = np.array([[1, 7, 3], [4, 2, 9]], dtype=np.int64)
+    hidden = checkpoint["embed_tokens.weight"].numpy()[ids].astype(np.float64)
+    for index in range(2):
+        prefix = f"layers.{index}."
+        fc1, fc2 = (dequantize(prefix, projection) for projection in ("fc1", "fc2"))
+        flat = hidden.reshape(-1, 32)
+        logits = flat @ checkpoint[prefix + "gate.weight"].numpy().T
+        result = np.zeros_like(flat)
+        for token, row in enumerate(flat):
+            selected = np.argsort(logits[token])[-2:]
+            scores = logits[token, selected]
+            weights = np.exp(scores - scores.max())
+            weights /= weights.sum()
+            for expert, weight in zip(selected, weights, strict=True):
+                # Checkpoint FC1 rows are gate-then-up, before component interleaving.
+                gate, up = np.split(fc1[expert] @ row, 2)
+                middle = gate / (1 + np.exp(-gate)) * up
+                result[token] += weight * (fc2[expert] @ middle)
+        hidden = result.reshape(hidden.shape)
+    # This attention-free encoder does not consume the task's optional masks.
+    feeds = {"input_ids": ids}
+    executable = _expand_grouped_matmul(model.clone())
+    actual = _run(executable, feeds, tmp_path / "multilayer_executable.onnx")
+    np.testing.assert_allclose(actual, hidden.astype(np.float32), rtol=2e-5, atol=2e-6)
+    assert model.graph.opset_imports[""] == 29
+    assert sum(node.op_type == "GroupedMatMul" for node in model.graph) == 4
 
 
 @pytest.mark.parametrize(

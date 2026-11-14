@@ -534,10 +534,14 @@ def test_native_capable_optimizer_does_not_validate_restricted_fallback_abi(
 def test_flag_off_fallback_ep_keeps_native_calls(make_model):
     model = make_model(opset=24)
     node = next(iter(model.graph))
+    inputs, attributes = tuple(node.inputs), dict(node.attributes)
+    assert not ep_registry.require("qnn").supports_fused_moe
     with override_flags(experimental_opset29=False):
-        optimize_model(model, ep="default")
+        optimize_model(model, ep="qnn")
     assert node.graph is model.graph and node.overload == ""
+    assert tuple(node.inputs) == inputs and dict(node.attributes) == attributes
     assert model.graph.opset_imports[""] == 24
+    assert not any(fn.name in {"MoE", "QMoE"} for fn in model.functions.values())
 
 
 @pytest.mark.parametrize("make_model", [float_model, quantized_model])

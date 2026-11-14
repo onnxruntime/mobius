@@ -17,15 +17,25 @@ EPs without fused MoE support build new graphs and ordinary functions at opset
 route expands native QMoE calls into blocked `DequantizeLinear` and two
 `GroupedMatMul-29` calls. There is no separate `lower_qmoe` API or import auditor.
 
-Flag-off builds stay unchanged. Native-capable EPs keep opset 24/native calls
-without running the restricted fallback validator. The global default
+Except for the QNN profile correction below, flag-off builds stay unchanged.
+Native-capable EPs keep opset 24/native calls without running the restricted
+fallback validator. The global default
 `OPSET_VERSION` remains 24; the flag selects the per-build override described above.
-Generic dense MoE dispatch, gate algebra, checkpoint loading, and packed native
+Generic dense MoE implementations, gate algebra, checkpoint loading, and packed native
 input lists are unchanged. The flag does not imply runtime support:
 construction and registration do not require installed opset-29 schemas.
 Checking and execution require schemas and a runtime implementing these operators;
 ORT 1.31.1 cannot execute these opset-29 graphs directly. This is a portable CPU
 semantic reference, not a promise of fused-kernel memory use or speed.
+
+**QNN exception, with the flag off or on:** this PR corrects QNN's profile to
+`supports_fused_moe=False`, because QNN has no ORT contrib MoE/QMoE kernels.
+That changes existing capability-based model dispatch even with the flag off:
+Qwen4 selects `_standard_dispatch`, and eligible unquantized Gemma4 configurations
+that previously selected native MoE use the existing dense path instead.
+Flag-off QNN still builds at opset 24 without registering these MoE/QMoE
+fallback bodies. This capability correction does not qualify QNN device
+execution of opset 29 or quantized Gemma4.
 
 ## Initial qualified ABI
 

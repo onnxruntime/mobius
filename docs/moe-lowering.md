@@ -18,17 +18,27 @@ receive call-specialized standard functions through `register_function_bodies`;
 the normal EP-controlled `InlinePass` expands them. There is no separate
 `lower_moe`/`lower_qmoe` API or model-wide compatibility converter.
 
-Flag-off behavior is unchanged. Native-capable EPs keep opset 24 and native
-calls without fallback ABI restrictions, even with the flag enabled. The global
-`OPSET_VERSION` remains 24. Generic `MoELayer` dense dispatch and arbitrary
-gates/experts are unchanged. Gemma4 retains its model-specific dense dispatch
+Except for the QNN profile correction below, flag-off behavior is unchanged.
+Native-capable EPs keep opset 24 and native calls without fallback ABI restrictions,
+even with the flag enabled. The global `OPSET_VERSION` remains 24. The lowering
+does not modify generic `MoELayer` dense implementations or arbitrary gates/experts.
+Gemma4 uses its existing model-specific dense dispatch
 on non-native EPs at both opset 24 and 29, preserving lower-ID TopK ties and
 applying any remaining per-expert scale to normalized routing weights, not W2.
 This includes live scales supplied by partial weight updates. Generic function
-lowering only touches pre-existing supported native calls; it does not change
-Gemma4 dispatch. GEGLU, BFLOAT16, sigmoid/SparseMixer routing, and Qwen4's
-probability-based dispatch retain their existing paths/restrictions;
-probabilities must not be softmaxed twice.
+lowering only touches pre-existing supported native calls; it does not add a
+Gemma4 dispatch path. GEGLU, BFLOAT16, and sigmoid/SparseMixer routing remain
+outside the qualified fallback ABI. Qwen4's probability-based routing is not
+converted to raw-logit routing; probabilities must not be softmaxed twice.
+
+**QNN exception, with the flag off or on:** this PR corrects QNN's profile to
+`supports_fused_moe=False`, because QNN has no ORT contrib MoE/QMoE kernels.
+That changes existing capability-based model dispatch even with the flag off:
+Qwen4 selects `_standard_dispatch`, and eligible unquantized Gemma4 configurations
+that previously selected native MoE use the existing dense path instead.
+Flag-off QNN still builds at opset 24 without registering these MoE/QMoE
+fallback bodies. This capability correction does not qualify QNN device
+execution of opset 29 or quantized Gemma4.
 
 This replaces `com.microsoft::MoE` with two standard `GroupedMatMul-29` calls,
 targeting the pinned **CPU reference**, not all execution providers.
