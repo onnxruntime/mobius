@@ -65,7 +65,8 @@
         "speech-language",
         "speech-to-text",
         "text-to-speech",
-        "text-generation"
+        "text-generation",
+        "time-series-forecasting"
       ],
       "description": "Task type string matching the mobius registry."
     },
@@ -397,6 +398,16 @@
     "generation": {
       "type": "object",
       "properties": {
+        "prediction_length": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Time-series forecast horizon in time steps."
+        },
+        "per_shot_horizon_patches": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Time-series forecast patches per autoregressive block."
+        },
         "max_new_tokens": {
           "type": "integer",
           "minimum": 1,

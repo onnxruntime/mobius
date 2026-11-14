@@ -47,6 +47,46 @@ across **40+ task types** and **100+ reusable components**.
 
 See the [model documentation](https://onnxruntime.github.io/mobius/models/index.html) for the complete list.
 
+### Timestral forecasting
+
+`mistralai/Timestral-5M` supports native float32 ONNX export for target-only
+univariate and multivariate time series. Known-future/past-only covariates,
+categorical inputs, and reduced-precision exports are not supported.
+
+```python
+import numpy as np
+from onnxruntime_easy import OnnxModelSession
+from mobius import build
+from mobius.integrations.timestral import forecast_timestral
+
+package = build(
+    "mistralai/Timestral-5M",
+    revision="bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f",
+    dtype="f32",
+)
+session = OnnxModelSession(package)
+quantiles = forecast_timestral(session, package.config, np.arange(64, dtype=np.float32), 97)
+# [batch, variates, horizon, quantiles]; probability levels: package.config.quantile_knots
+```
+
+The graph consumes float32 `context` and boolean `observed_mask`, both
+`[rows, context_length]`, int64 `group_ids` `[rows]`, and int64
+`horizon_patches` `[1]`. Direct callers must use finite, zero-filled missing
+context, a positive patch-aligned length, and positive forecast patch count.
+Rows sharing a group are variates of the same example; other groups are isolated.
+The NumPy helper handles missing observations, padding, context truncation,
+advancing normalization frames, median-feedback rollout, symmetric averaging,
+and nonnegative clipping. No PyTorch is needed for exported-model inference.
+After `package.save(...)` / `ModelPackage.load(...)`, recover the host settings
+with `TimestralConfig.from_onnx(loaded["model"])`; these are stored in the ONNX
+metadata rather than an ORT GenAI decoder configuration.
+
+Complete independent upstream reference tensors live in the
+`time-series-forecasting/timestral-5m` L4/L5 golden case. L5 forecasts 97 steps
+across multiple feedback blocks and checks every quantile and intermediate
+block. Regeneration requires `requirements/ci/timestral.txt`; this pinned
+reference dependency is not needed for inference or golden replay.
+
 ## Projection-specific QMoE export
 
 Olive's integer-affine, fused, K-last expert checkpoints can independently
