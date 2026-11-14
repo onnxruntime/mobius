@@ -11,6 +11,8 @@ exercised by the parametrized tests there.
 
 from __future__ import annotations
 
+import sys
+
 import onnx_ir as ir
 import pytest
 import torch
@@ -346,16 +348,20 @@ class TestPrunePrefillPrefix:
             ),
         ],
     )
-    def test_prune_quantized_moe_without_inferred_logits_shape(
-        self, model_class, quantization
+    def test_prune_quantized_moe_infers_logits_shape(
+        self, model_class, quantization, monkeypatch
     ):
-        """MatMulNBits and QMoE leave logits shapeless during the build; pruning is accepted."""
+        """MatMulNBits and QMoE have no ONNX schema; the task infers the logits shape itself."""
+        # Skip the optimizer, which runs shape inference too, to check the task's own graph.
+        monkeypatch.setattr("mobius._builder.optimize_model", lambda *args, **kwargs: None)
         config = self._quantized_moe_config(**quantization)
         module = model_class(config)
         model = build_from_module(module, config, prune_prefill_prefix=True)["model"]
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
+        assert len(logits.shape) == 3
         assert logits.shape[1] == 1
+        assert logits.shape[2] == config.vocab_size
 
     @pytest.mark.parametrize(
         ("index", "axis", "axes"),
@@ -365,10 +371,11 @@ class TestPrunePrefillPrefix:
             pytest.param([0, 1], 1, [1], id="gather-two-positions"),
             pytest.param([-1], 1, [1], id="gather-vector-index"),
             pytest.param(-1, 1, [0], id="unsqueeze-axis-0"),
+            pytest.param(slice(-2, None), 1, None, id="slice-last-two"),
         ],
     )
     def test_prune_quantized_moe_rejects_other_selections(self, index, axis, axes):
-        """Shapeless logits are accepted only for the scalar last-token selection."""
+        """The inferred logits shape rejects every selection but the last token."""
 
         class CustomSelectionMoE(MoECausalLMModel):
             def forward(
@@ -386,7 +393,14 @@ class TestPrunePrefillPrefix:
                     position_ids=position_ids,
                     past_key_values=past_key_values,
                 )
-                if index is not None:
+                if isinstance(index, slice):
+                    hidden_states = op.Slice(
+                        hidden_states,
+                        op.Constant(value_ints=[index.start]),
+                        op.Constant(value_ints=[sys.maxsize]),
+                        op.Constant(value_ints=[axis]),
+                    )
+                elif index is not None:
                     indices = op.Constant(value=ir.tensor(index, dtype=ir.DataType.INT64))
                     hidden_states = op.Unsqueeze(
                         op.Gather(hidden_states, indices, axis=axis),
@@ -399,7 +413,7 @@ class TestPrunePrefillPrefix:
             build_from_module(CustomSelectionMoE(config), config, prune_prefill_prefix=True)
 
     def test_prune_quantized_moe_rejects_non_bias_add(self):
-        """An Add of anything but a 1-D bias could broadcast the logits back to every position."""
+        """Adding full-sequence logits broadcasts the pruned logits back to every position."""
 
         class FullSequenceAddMoE(MoECausalLMModel):
             def forward(

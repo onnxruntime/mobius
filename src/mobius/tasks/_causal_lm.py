@@ -15,6 +15,7 @@ from mobius._constants import (
     STATIC_CACHE_WRITE_INDICES,
 )
 from mobius._model_package import ModelPackage
+from mobius._optimizations import SymbolicShapeInferencePass
 from mobius.components._attention import StaticCacheState
 from mobius.tasks._base import (
     ModelTask,
@@ -228,8 +229,6 @@ class CausalLMTask(ModelTask):
         else:
             logits, present_key_values = result
 
-        _validate_pruned_logits(logits, self._prune_prefill_prefix, module)
-
         builder.add_output(logits, "logits")
 
         # --- Output registration (static vs dynamic) ---
@@ -262,7 +261,9 @@ class CausalLMTask(ModelTask):
         if final_hidden_state is not None:
             builder.add_output(final_hidden_state, "mtp_seed")
 
-        return ModelPackage({"model": _make_model(graph)}, config=config)
+        model = _make_model(graph)
+        _validate_pruned_logits(model, logits, seq_len, self._prune_prefill_prefix, module)
+        return ModelPackage({"model": model}, config=config)
 
     def _build_paged(
         self,
@@ -403,8 +404,6 @@ class HybridCausalLMTask(ModelTask):
         else:
             logits, present_key_values = result
 
-        _validate_pruned_logits(logits, self._prune_prefill_prefix, module)
-
         builder.add_output(logits, "logits")
         _register_hybrid_cache_outputs(
             builder,
@@ -421,6 +420,7 @@ class HybridCausalLMTask(ModelTask):
 
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
+        _validate_pruned_logits(model, logits, seq_len, self._prune_prefill_prefix, module)
         if config.model_type in {"jamba", "nemotron_h"}:
             model.metadata_props["mobius.runtime_support"] = (
                 "Deferred: ORT GenAI 0.15.2 discovers sparse KV and conv/recurrent slots, "
@@ -431,67 +431,37 @@ class HybridCausalLMTask(ModelTask):
         return ModelPackage({"model": model}, config=config)
 
 
-# Projections emitted by the Linear, QuantizedLinear and TiedQuantizedLMHead LM heads.
-_LM_HEAD_PROJECTIONS = frozenset({("", "MatMul"), ("com.microsoft", "MatMulNBits")})
-
-
-def _producer(value: ir.Value | None) -> ir.Node | None:
-    return value.producer() if value is not None else None
-
-
-def _constant_input(node: ir.Node, index: int) -> object:
-    """Return a constant input as a Python scalar or (nested) list, else ``None``."""
-    value = node.inputs[index] if index < len(node.inputs) else None
-    tensor = ir.convenience.get_const_tensor(value) if value is not None else None
-    return None if tensor is None else tensor.numpy().tolist()
-
-
-def _projects_last_sequence_token(logits: ir.Value) -> bool:
-    """Whether *logits* is the LM head applied to ``_retain_last_sequence_token``'s output.
-
-    Matches ``[Add(., 1-D bias)] <- MatMul|MatMulNBits <- Unsqueeze(axes=[1]) <- Gather(axis=1)``
-    with a scalar ``-1`` index. ``tolist()`` keeps the rank, so an index of ``[-1]`` does not match.
-    """
-    head = _producer(logits)
-    if head is not None and (head.domain, head.op_type) == ("", "Add"):  # LM-head bias
-        bias = head.inputs[1] if len(head.inputs) > 1 else None
-        # Any operand of higher rank could broadcast the logits back to every position.
-        if bias is None or bias.shape is None or len(bias.shape) != 1:
-            return False
-        head = _producer(head.inputs[0])
-    if head is None or (head.domain, head.op_type) not in _LM_HEAD_PROJECTIONS:
-        return False
-    unsqueeze = _producer(head.inputs[0])
-    if unsqueeze is None or (unsqueeze.domain, unsqueeze.op_type) != ("", "Unsqueeze"):
-        return False
-    gather = _producer(unsqueeze.inputs[0])
-    return (
-        gather is not None
-        and (gather.domain, gather.op_type) == ("", "Gather")
-        and gather.attributes.get_int("axis", 0) == 1
-        and _constant_input(gather, 1) == -1
-        and _constant_input(unsqueeze, 1) == [1]
-    )
-
-
 def _validate_pruned_logits(
+    model: ir.Model,
     logits: ir.Value,
+    sequence_len: ir.SymbolicDim,
     prune_prefill_prefix: bool,
     module: nn.Module,
 ) -> None:
     """Fail when a custom model forward ignores the task's pruning request."""
     if not prune_prefill_prefix:
         return
-    shape = logits.shape
-    if shape is None and _projects_last_sequence_token(logits):
-        # Custom-domain ops (e.g. MatMulNBits, QMoE) get no shape inference while the graph
-        # is built, so check the selection that _retain_last_sequence_token inserts instead.
-        return
-    if shape is None or len(shape) != 3 or shape[1] != 1:
+    if not _is_last_token_shape(logits.shape, sequence_len):
+        # The builder infers shapes only for ops with an ONNX schema, so custom-domain ops
+        # (e.g. MatMulNBits, QMoE) leave the logits shapeless until the optimizer runs.
+        SymbolicShapeInferencePass()(model)
+    if not _is_last_token_shape(logits.shape, sequence_len):
         raise ValueError(
             f"{type(module).__name__} does not support prune_prefill_prefix. "
-            "The model must select the final hidden state before its LM-head projection."
+            "The model must select the final hidden state before its LM-head projection "
+            f"(logits shape: {logits.shape})."
         )
+
+
+def _is_last_token_shape(shape: ir.Shape | None, sequence_len: ir.SymbolicDim) -> bool:
+    """Whether *shape* is ``[batch, 1, vocab]``.
+
+    A ``sequence_len`` axis anywhere, e.g. ``[sequence_len, 1, vocab]`` after a Gather on the
+    batch axis, means logits are still produced for every token.
+    """
+    return (
+        shape is not None and len(shape) == 3 and shape[1] == 1 and sequence_len not in shape
+    )
 
 
 def _register_intermediate_hidden_states(
