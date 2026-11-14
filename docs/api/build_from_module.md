@@ -13,6 +13,9 @@ def build_from_module(
     module: nn.Module,
     config: BaseModelConfig,
     task: str | ModelTask = "text-generation",
+    *,
+    prune_prefill_prefix: bool = False,
+    runtime_last_token_indices: bool = False,
 ) -> ModelPackage:
 ```
 
@@ -23,6 +26,8 @@ def build_from_module(
 | `module` | `nn.Module` | (required) | An `onnxscript.nn.Module` instance. Its `forward()` signature must be compatible with the task. |
 | `config` | `BaseModelConfig` | (required) | Architecture configuration. The `dtype` field controls precision. |
 | `task` | `str \| ModelTask` | `"text-generation"` | Task name string or `ModelTask` instance. |
+| `prune_prefill_prefix` | `bool` | `False` | Enable prefill-prefix pruning for supported causal generation tasks. |
+| `runtime_last_token_indices` | `bool` | `False` | Enable runtime-selected final-token indices for Qwen3-VL pruning, including right-padded batches. Requires `prune_prefill_prefix=True`. |
 
 ## Returns
 
@@ -58,3 +63,9 @@ pkg["model"]  # ir.Model
 2. Casts module parameters to target dtype
 3. Resolves the task and builds the ONNX graph
 4. Applies optimization passes (identity elimination, CSE, etc.)
+
+Enabling `prune_prefill_prefix` preserves a supplied `QwenVLTask`'s
+`runtime_last_token_indices` setting. Runtime indices are enabled when requested
+by either the task or the builder flag; the default `False` does not clear an
+already-enabled task setting. To keep indices disabled, configure the task with
+`runtime_last_token_indices=False` and leave the builder flag disabled.

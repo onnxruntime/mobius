@@ -1531,7 +1531,10 @@ class TestExportForOrtGenai:
         resize = transforms[1]["operation"]["attrs"]
         assert resize["patch_size"] == 14
 
-    def test_qwen3_vl_writes_qwen3_vl_model_type_and_vision_fields(self, tmp_path):
+    @pytest.mark.parametrize("runtime_indices", [False, True])
+    def test_qwen3_vl_writes_qwen3_vl_model_type_and_vision_fields(
+        self, tmp_path, runtime_indices
+    ):
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -1570,6 +1573,7 @@ class TestExportForOrtGenai:
                         "position_ids",
                         "per_layer_inputs",
                     ]
+                    + (["last_token_indices"] if runtime_indices else [])
                 ),
                 "vision_encoder": _mock_model(
                     inputs=["pixel_values", "image_grid_thw"],
@@ -1595,6 +1599,8 @@ class TestExportForOrtGenai:
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
         assert model["decoder"]["inputs"]["per_layer_inputs"] == "per_layer_inputs"
+        assert "last_token_indices" not in model["decoder"]["inputs"]
+        assert ("last_token_indices" in _graph_input_names(pkg["decoder"])) is runtime_indices
         assert model["embedding"]["outputs"]["per_layer_inputs"] == "per_layer_inputs"
         assert model["vision"]["outputs"] == {"image_features": "image_features"}
         assert "deepstack" not in json.dumps(data)

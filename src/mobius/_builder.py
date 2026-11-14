@@ -70,15 +70,28 @@ def _cast_module_dtype(module: nn.Module, dtype: ir.DataType) -> None:
             param.const_value = tensor_adapters.TorchTensor(cast_tensor)
 
 
-def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTask:
+def _enable_prefill_prefix_pruning_task(
+    task: str | ModelTask,
+    *,
+    runtime_last_token_indices: bool = False,
+) -> str | ModelTask:
     """Return a task equivalent to *task* with prefill-prefix pruning enabled."""
     from mobius.tasks import (
         CausalLMTask,
         Gemma4Task,
         Gemma4TextCausalLMTask,
         HybridCausalLMTask,
+        QwenVLTask,
     )
 
+    if task == "qwen-vl" or type(task) is QwenVLTask:
+        return QwenVLTask(
+            prune_prefill_prefix=True,
+            runtime_last_token_indices=runtime_last_token_indices
+            or getattr(task, "_runtime_last_token_indices", False),
+        )
+    if runtime_last_token_indices:
+        raise ValueError("runtime_last_token_indices currently requires the qwen-vl task")
     if task == "text-generation":
         return CausalLMTask(prune_prefill_prefix=True)
     if task == "hybrid-text-generation":
@@ -109,7 +122,7 @@ def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTas
         )
     raise ValueError(
         "prune_prefill_prefix=True is only supported for text-generation, "
-        "hybrid-text-generation, gemma4-text-generation, and gemma4 tasks."
+        "hybrid-text-generation, gemma4-text-generation, gemma4, and qwen-vl tasks."
     )
 
 
@@ -139,6 +152,7 @@ def build_from_module(
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
+    runtime_last_token_indices: bool = False,
     component_manifest: ComponentManifest | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a module instance and config.
@@ -159,15 +173,22 @@ def build_from_module(
         kv_cache_scales: Optional per-layer FP8 key/value scales.
         prune_prefill_prefix: Retain only the final sequence position before
             the LM head for supported causal generation tasks.
+        runtime_last_token_indices: Use runtime-provided final-token indices
+            for Qwen3-VL pruning, including right-padded batches. An enabled
+            setting on a supplied QwenVLTask is preserved when pruning is enabled.
 
     Returns:
         The built :class:`ModelPackage`.
     """
+    if runtime_last_token_indices and not prune_prefill_prefix:
+        raise ValueError("runtime_last_token_indices requires prune_prefill_prefix=True")
     if hasattr(config, "validate"):
         config.validate()
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     if prune_prefill_prefix:
-        task = _enable_prefill_prefix_pruning_task(task)
+        task = _enable_prefill_prefix_pruning_task(
+            task, runtime_last_token_indices=runtime_last_token_indices
+        )
     resolved_task = get_task(task)
     component_manifest = configure_component_quantization(
         module,
