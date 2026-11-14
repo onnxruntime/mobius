@@ -155,6 +155,7 @@ from mobius.tasks._diarization import DiarizationTask
 from mobius.tasks._diarization_streaming import DiarizationStreamingTask
 from mobius.tasks._draft_target import DraftTargetCausalLMTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
+from mobius.tasks._embedding_gemma2 import EmbeddingGemma2Task
 from mobius.tasks._falcon_h1 import FalconH1CausalLMTask
 from mobius.tasks._feature_extraction import (
     FeatureExtractionTask,
@@ -311,6 +312,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "lfm2-vl": Lfm2VlTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "gemma3n": Gemma3nTask,
+    "embedding-gemma2": EmbeddingGemma2Task,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,
     "gemma4-unified": Gemma4UnifiedTask,

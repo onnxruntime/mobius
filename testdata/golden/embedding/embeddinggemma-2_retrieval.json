@@ -1,0 +1,82 @@
+{
+  "rankings": {
+    "128": [
+      [
+        0,
+        1,
+        2
+      ],
+      [
+        1,
+        0,
+        2
+      ],
+      [
+        2,
+        1,
+        0
+      ]
+    ],
+    "256": [
+      [
+        0,
+        1,
+        2
+      ],
+      [
+        1,
+        2,
+        0
+      ],
+      [
+        2,
+        1,
+        0
+      ]
+    ],
+    "512": [
+      [
+        0,
+        1,
+        2
+      ],
+      [
+        1,
+        0,
+        2
+      ],
+      [
+        2,
+        1,
+        0
+      ]
+    ],
+    "768": [
+      [
+        0,
+        1,
+        2
+      ],
+      [
+        1,
+        2,
+        0
+      ],
+      [
+        2,
+        1,
+        0
+      ]
+    ]
+  },
+  "queries": [
+    "task: search result | query: What causes the northern lights?",
+    "task: search result | query: How is bread made?",
+    "task: search result | query: What is a domestic cat?"
+  ],
+  "documents": [
+    "title: none | text: The northern lights occur when charged solar particles collide with gases in Earth's upper atmosphere.",
+    "title: none | text: Bread is made by mixing flour, water and yeast, allowing the dough to rise, then baking it in an oven.",
+    "title: none | text: A domestic cat is a small carnivorous mammal commonly kept as a household pet."
+  ]
+}

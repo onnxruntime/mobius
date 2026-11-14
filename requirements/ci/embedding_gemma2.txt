@@ -1,0 +1,2 @@
+# Isolated reference for EmbeddingGemma 2; the shared VibeVoice pin predates it.
+transformers @ git+https://github.com/huggingface/transformers.git@f210a32fbf2e3213a143dad8c587935216088b38
