@@ -1,0 +1,19 @@
+model_id: "LiquidAI/LFM3-Audio-2B"
+model_type: "lfm3_audio"
+revision: "2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1"
+trust_remote_code: true
+task_type: "lfm3-audio"
+dtype: "float32"
+level: "L4+L5"
+min_token_match_ratio: 1.0
+inputs:
+  prompts:
+    - "Perform ASR in English."
+generation:
+  max_new_tokens: 128
+  do_sample: false
+  repetition_penalty: 1.0
+notes: >-
+  Offline real-waveform ASR, full prefill/depth logits, complete greedy MaskGIT
+  speech-code replay and ONNX LiquidCodec 24kHz waveform parity. Specialized
+  reference pins the checkpoint processor and records random codebook orders.

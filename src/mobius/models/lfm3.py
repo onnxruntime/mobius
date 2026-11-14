@@ -222,12 +222,18 @@ class Lfm3TextModel(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        input_ids: ir.Value,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list,
+        inputs_embeds: ir.Value | None = None,
     ):
-        hidden_states = self.embed_tokens(op, input_ids)
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("LFM3 requires input_ids or precomputed inputs_embeds.")
+            hidden_states = self.embed_tokens(op, input_ids)
+        else:
+            hidden_states = inputs_embeds
         if hidden_states.dtype != ir.DataType.FLOAT:
             raise ValueError(_FLOAT32_ONLY)
         embeddings = {
@@ -237,15 +243,17 @@ class Lfm3TextModel(nn.Module):
         masks = {}
         if "full_attention" in embeddings:
             masks["full_attention"] = create_padding_mask(
-                op, input_ids=input_ids, attention_mask=attention_mask
+                op, input_ids=hidden_states, attention_mask=attention_mask
             )
         if "sliding_attention" in embeddings:
             window = self.config.sliding_window
             assert window is not None
-            masks["sliding_attention"] = _sliding_mask(op, input_ids, attention_mask, window)
+            masks["sliding_attention"] = _sliding_mask(
+                op, hidden_states, attention_mask, window
+            )
         total = op.Shape(attention_mask, start=1, end=2)
         current_mask = op.Slice(
-            attention_mask, op.Sub(total, op.Shape(input_ids, start=1, end=2)), total, [1]
+            attention_mask, op.Sub(total, op.Shape(hidden_states, start=1, end=2)), total, [1]
         )
         present = []
         intermediates = []
