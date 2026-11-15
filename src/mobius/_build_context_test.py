@@ -19,6 +19,8 @@ from mobius._build_context import (
 )
 from mobius._execution_providers import EpCapabilities, ep_registry
 
+pytestmark = pytest.mark.opset29
+
 _CUDA_CAPABILITIES = EpCapabilities(
     name="cuda",
     gqa_dtypes=frozenset({ir.DataType.FLOAT16, ir.DataType.BFLOAT16}),
