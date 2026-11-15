@@ -265,7 +265,7 @@ def test_flag_off_rejects_previously_lossy_projection(packed_sources: dict[str, 
 
 
 def test_manifest_integrity_and_failed_save_preserve_model(
-    packed_sources: dict[str, Path], monkeypatch,
+    packed_sources: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Python 3.10 has no file_digest; package hashing must not depend on it.
     monkeypatch.delattr(hashlib, "file_digest", raising=False)
