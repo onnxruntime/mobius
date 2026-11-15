@@ -55,6 +55,14 @@ class _PackedSource(TypedDict):
     sha256: str
 
 
+def _source_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _binding(tensor: ir.ExternalTensor) -> list[object]:
     dimensions = []
     for dimension in tensor.shape:
@@ -743,11 +751,10 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
             raise ValueError(
                 f"GGUF external source {location!r} changed; rebuild the package."
             )
-        with source.open("rb") as stream:
-            if hashlib.file_digest(stream, "sha256").hexdigest() != info["sha256"]:
-                raise ValueError(
-                    f"GGUF external source {location!r} bytes changed; rebuild the package."
-                )
+        if _source_sha256(source) != info["sha256"]:
+            raise ValueError(
+                f"GGUF external source {location!r} bytes changed; rebuild the package."
+            )
     model = next(iter(package.values()))
     _validate_source_initializers(model)
     for graph in model.graphs():
@@ -845,11 +852,10 @@ def restore_packed_sources(package, directory) -> None:
             raise ValueError(
                 f"GGUF source {location!r} is missing/changed; restore the original file."
             )
-        with source.open("rb") as stream:
-            if hashlib.file_digest(stream, "sha256").hexdigest() != info["sha256"]:
-                raise ValueError(
-                    f"GGUF source {location!r} bytes changed; restore the original file."
-                )
+        if _source_sha256(source) != info["sha256"]:
+            raise ValueError(
+                f"GGUF source {location!r} bytes changed; restore the original file."
+            )
         sources[location] = {**info, "path": str(source)}
     models = list(package.values())
     if (

@@ -6856,6 +6856,15 @@ def build_from_gguf(
     from mobius._flags import flags
 
     lossless_packed = flags.experimental_opset29 and keep_quantized
+    if lossless_packed:
+        import onnx
+
+        if not all(onnx.defs.has(name, 29) for name in ("DequantizePacked", "GroupedMatMul")):
+            raise ValueError(
+                "Lossless GGUF needs ONNX opset-29 DequantizePacked/GroupedMatMul schemas. "
+                "Install current ONNX main (ONNX >=1.24 development build), then retry "
+                "with MOBIUS_EXPERIMENTAL_OPSET29=1 and --ep onnx-standard."
+            )
     if mmproj is not None:
         if lossless_packed:
             raise ValueError(

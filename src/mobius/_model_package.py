@@ -816,6 +816,9 @@ class ModelPackage(UserDict[str, ir.Model]):
 
             if len(component_layout.components) != len(self):
                 raise ValueError("Lossless GGUF save does not support component filtering.")
+            if check_weights:
+                for name, model in self.items():
+                    _check_weights(name, model)
             if (include_policy_components and self.policy_components) or (
                 include_adapter_artifacts and self.adapter_artifacts
             ):

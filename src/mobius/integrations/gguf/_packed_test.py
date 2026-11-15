@@ -17,6 +17,14 @@ from mobius import ModelPackage, build_from_gguf
 from mobius._flags import override_flags
 from mobius.integrations.gguf._builder_test_utils import _write_quantized_gguf
 
+pytestmark = [
+    pytest.mark.opset29,
+    pytest.mark.skipif(
+        not all(onnx.defs.has(name, 29) for name in ("DequantizePacked", "GroupedMatMul")),
+        reason="Official ONNX opset-29 packed/grouped schemas require current ONNX main.",
+    ),
+]
+
 
 @pytest.mark.parametrize(
     "operation", [torch.log, lambda x: x - 1.0], ids=["inverse", "offset"]
@@ -257,8 +265,10 @@ def test_flag_off_rejects_previously_lossy_projection(packed_sources: dict[str, 
 
 
 def test_manifest_integrity_and_failed_save_preserve_model(
-    packed_sources: dict[str, Path],
+    packed_sources: dict[str, Path], monkeypatch,
 ) -> None:
+    # Python 3.10 has no file_digest; package hashing must not depend on it.
+    monkeypatch.delattr(hashlib, "file_digest", raising=False)
     source = packed_sources["lossy"]
     root = source.parent
     with override_flags(experimental_opset29=True):
@@ -285,6 +295,23 @@ def test_manifest_integrity_and_failed_save_preserve_model(
         package.save(str(root))
     assert (root / "model.onnx").read_bytes() == original_model
     assert not (root / ".gguf-packed.lock").exists()
+
+
+def test_packed_save_rejects_missing_generated_initializer(
+    packed_sources: dict[str, Path],
+) -> None:
+    source = packed_sources["parity"]
+    with override_flags(experimental_opset29=True):
+        package = build_from_gguf(source, execution_provider="onnx-standard")
+    initializer = next(
+        value
+        for value in package["model"].graph.initializers.values()
+        if value.const_value is not None
+        and not isinstance(value.const_value, ir.ExternalTensor)
+    )
+    initializer.const_value = None
+    with pytest.raises(ValueError, match="weight"):
+        package.save(str(source.parent))
 
 
 def test_optimization_cannot_fold_original_external_weights(

@@ -26,6 +26,8 @@ Quantized target storage is requested by default. Use
 
 Enable `MOBIUS_EXPERIMENTAL_OPSET29=1`, retain `keep_quantized=True`, and select
 `execution_provider="onnx-standard"`. Save **beside the original GGUF file(s)**:
+The installed ONNX must expose `DequantizePacked-29` and `GroupedMatMul-29`;
+released older ONNX versions fail before source loading with an upgrade message.
 
 ```bash
 MOBIUS_EXPERIMENTAL_OPSET29=1 mobius build-gguf weights/model.gguf \
