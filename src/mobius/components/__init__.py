@@ -102,6 +102,7 @@ __all__ = [
     "Cosmos3EdgeMultiModalProjector",
     "MobileNetV5Encoder",
     "MoELayer",
+    "GroupedMoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
@@ -303,6 +304,7 @@ from mobius.components._mimo_minimax_vision import (
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 from mobius.components._mobilenetv5 import MobileNetV5Encoder
 from mobius.components._moe import (
+    GroupedMoELayer,
     MoELayer,
     SigmoidTopKGate,
     SoftmaxTopKGate,

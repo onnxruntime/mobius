@@ -91,10 +91,7 @@ _NATIVE_BLOCK_FORMATS: MappingProxyType[str, str] = MappingProxyType(
 _AFFINE_REPACK_TARGETS: MappingProxyType[str, AffineRepackSpec] = MappingProxyType(
     {
         "Q4_0": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False, lossless=True),
-        "Q4_1": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False),
         "Q8_0": AffineRepackSpec(bits=8, block_size=32, omit_zero_points=False, lossless=True),
-        "Q4_K": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False),
-        "Q6_K": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False),
         # Mainline Q1_0 is 1-bit binary over 128-element blocks, repacked into
         # 2-bit MatMulNBits with zp=1. Tencent's custom Q1_0 reuses the same
         # type id with a different on-disk layout and is handled separately in
@@ -113,17 +110,17 @@ _STORED_ROUTE_POLICY: MappingProxyType[
 ] = MappingProxyType(
     {
         "Q4_0": (QuantImportRoute.AFFINE_REPACK, RepackExactness.EXACT),
-        "Q4_1": (QuantImportRoute.AFFINE_REPACK, RepackExactness.LOSSY),
-        "Q5_0": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
-        "Q5_1": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "Q4_1": (QuantImportRoute.REJECTED, None),
+        "Q5_0": (QuantImportRoute.REJECTED, None),
+        "Q5_1": (QuantImportRoute.REJECTED, None),
         "Q8_0": (QuantImportRoute.AFFINE_REPACK, RepackExactness.EXACT),
-        "Q2_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
-        "Q3_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
-        "Q4_K": (QuantImportRoute.AFFINE_REPACK, RepackExactness.LOSSY),
-        "Q5_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
-        "Q6_K": (QuantImportRoute.AFFINE_REPACK, RepackExactness.LOSSY),
-        "TQ1_0": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
-        "TQ2_0": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "Q2_K": (QuantImportRoute.REJECTED, None),
+        "Q3_K": (QuantImportRoute.REJECTED, None),
+        "Q4_K": (QuantImportRoute.REJECTED, None),
+        "Q5_K": (QuantImportRoute.REJECTED, None),
+        "Q6_K": (QuantImportRoute.REJECTED, None),
+        "TQ1_0": (QuantImportRoute.REJECTED, None),
+        "TQ2_0": (QuantImportRoute.REJECTED, None),
         "IQ4_NL": (QuantImportRoute.NATIVE_BYTES, None),
         "IQ4_XS": (QuantImportRoute.NATIVE_BYTES, None),
         "IQ3_S": (QuantImportRoute.NATIVE_BYTES, None),
@@ -134,7 +131,7 @@ _STORED_ROUTE_POLICY: MappingProxyType[
         "IQ1_S": (QuantImportRoute.NATIVE_BYTES, None),
         "IQ1_M": (QuantImportRoute.NATIVE_BYTES, None),
         "MXFP4": (QuantImportRoute.NATIVE_BYTES, None),
-        "NVFP4": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "NVFP4": (QuantImportRoute.REJECTED, None),
         "Q1_0": (QuantImportRoute.AFFINE_REPACK, RepackExactness.EXACT),
         "Q2_0": (QuantImportRoute.REJECTED, None),
     }
@@ -368,10 +365,10 @@ def quant_import_decision(
         return (
             QuantImportRoute.REJECTED,
             None,
-            spec.reason
-            or (
-                f"{spec.name} has no trustworthy decoder or compatible runtime kernel. "
-                "Re-quantize to a supported qtype."
+            (
+                f"{spec.name} has no exact legacy packed import route. Enable "
+                "MOBIUS_EXPERIMENTAL_OPSET29=1 and use --ep onnx-standard for "
+                "original GGUF external weights; lossy requantization is not permitted."
             ),
         )
     target = (
@@ -398,14 +395,12 @@ def quant_import_decision(
                     ),
                 )
             return (
-                QuantImportRoute.DEQUANTIZE_REQUANTIZE,
-                RepackExactness.LOSSY,
+                QuantImportRoute.REJECTED,
+                None,
                 (
-                    "GatherBlockQuantized does not consume BlockQuantizedMatMul's "
-                    "native GGUF byte ABI; the embedding must use the affine Gather ABI."
-                    if tensor_role is TensorRole.EMBEDDING
-                    else "This graph exposes only the affine MatMulNBits ABI, not "
-                    "BlockQuantizedMatMul's native GGUF byte ABI."
+                    "The legacy affine consumer cannot consume these native GGUF bytes. "
+                    "Enable MOBIUS_EXPERIMENTAL_OPSET29=1 and use --ep onnx-standard; "
+                    "lossy embedding/projection conversion was removed."
                 ),
             )
         return (
@@ -419,9 +414,12 @@ def quant_import_decision(
     if tensor_role is TensorRole.NON_MATMUL:
         if spec.dequantize is Support.SUPPORTED:
             return (
-                QuantImportRoute.DEQUANTIZE_FLOAT,
+                QuantImportRoute.REJECTED,
                 None,
-                "Non-MatMul tensors are dequantized to float; no packed runtime ABI applies.",
+                (
+                    "No legacy packed non-MatMul ABI applies. Enable "
+                    "MOBIUS_EXPERIMENTAL_OPSET29=1 and use --ep onnx-standard."
+                ),
             )
         return (
             QuantImportRoute.REJECTED,
@@ -459,11 +457,12 @@ def quant_import_decision(
                     ),
                 )
             return (
-                QuantImportRoute.DEQUANTIZE_REQUANTIZE,
-                RepackExactness.LOSSY,
+                QuantImportRoute.REJECTED,
+                None,
                 (
                     f"The exact {spec.repack_params} affine layout does not match target "
-                    f"{target}; conversion through float is lossy."
+                    f"{target}; enable MOBIUS_EXPERIMENTAL_OPSET29=1 and use "
+                    "--ep onnx-standard instead of lossy conversion through float."
                 ),
             )
         if (

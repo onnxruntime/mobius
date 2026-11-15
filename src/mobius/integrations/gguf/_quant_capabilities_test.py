@@ -128,7 +128,7 @@ def test_every_stored_qtype_and_tensor_role_is_explicit() -> None:
             } == set(route)
 
 
-def test_lossy_affine_routes_keep_target_storage_without_claiming_fidelity() -> None:
+def test_removed_lossy_affine_routes_are_rejected() -> None:
     qtypes = _qtypes(quantization_capability_matrix())
     for name in ("Q4_K", "Q6_K"):
         record = qtypes[name]
@@ -136,13 +136,12 @@ def test_lossy_affine_routes_keep_target_storage_without_claiming_fidelity() -> 
         assert isinstance(roles, dict)
         projection = roles["projection"]
         assert isinstance(projection, dict)
-        assert projection["route"] == "affine repack"
-        assert projection["exactness"] == "lossy"
+        assert projection["route"] == "rejected"
+        assert projection["exactness"] is None
         assert projection["source_fidelity"] is False
-        assert projection["target_storage"] == "affine integer blocks"
-        assert projection["target_storage_supported"] is True
-        assert projection["keep_quantized_supported"] is True
-        assert f"_repack_{name.lower()}" in str(projection["transform"])
+        assert projection["target_storage_supported"] is False
+        assert projection["keep_quantized_supported"] is False
+        assert projection["transform"] is None
 
 
 def test_only_q8_has_qtype_level_runtime_execution_evidence() -> None:
@@ -212,7 +211,7 @@ def test_selected_real_artifacts_stay_within_global_budget() -> None:
     assert lossy[0]["lfs_sha256"] == (
         "ed5fa30c487b282ec156c29062f1222e5c20875a944ac98289dbd242e947f747"
     )
-    assert "source_fidelity=false" in lossy[0]["disposition"]
+    assert "removed" in lossy[0]["disposition"]
     assert "runtime support deferred" in lossy[0]["runtime_disposition"]
 
     qwen = next(record for record in artifacts if record["filename"].endswith("Q2_K.gguf"))

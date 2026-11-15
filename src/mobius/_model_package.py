@@ -422,6 +422,7 @@ def _validate_mtp_save_paths(
     if (
         package.export_report is not None
         and package.gguf_reuse_plan is None
+        and getattr(package, "gguf_packed_sources", None) is None
         and (
             package.export_report.status == "partial"
             or package.export_report.runtime_validation_status == "unvalidated"
@@ -810,6 +811,25 @@ class ModelPackage(UserDict[str, ir.Model]):
         )
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
+        if getattr(self, "gguf_packed_sources", None) is not None:
+            from mobius.integrations.gguf._packed import save_packed_package
+
+            if len(component_layout.components) != len(self):
+                raise ValueError("Lossless GGUF save does not support component filtering.")
+            if (include_policy_components and self.policy_components) or (
+                include_adapter_artifacts and self.adapter_artifacts
+            ):
+                raise ValueError(
+                    "Lossless GGUF save does not yet package policy/adapter artifacts; "
+                    "save these separately or omit them explicitly."
+                )
+            save_packed_package(
+                self,
+                directory,
+                external_data=external_data,
+                max_shard_size_bytes=max_shard_size_bytes,
+            )
+            return
         reuse_plan = getattr(self, "gguf_reuse_plan", None)
         streaming_external_data = False
         current_package = self
@@ -1420,6 +1440,13 @@ class ModelPackage(UserDict[str, ir.Model]):
                     name = filename.removesuffix(".onnx")
                     models[name] = ir.load(os.path.join(directory, filename))
         package = cls(models)
+        if os.path.exists(os.path.join(directory, "gguf-packed.json")) or any(
+            model.metadata_props.get("mobius.gguf.original_external_data") == "1"
+            for model in models.values()
+        ):
+            from mobius.integrations.gguf._packed import restore_packed_sources
+
+            restore_packed_sources(package, directory)
         quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
         if os.path.lexists(quantization_report_path):
             if os.path.islink(quantization_report_path) or not os.path.isfile(

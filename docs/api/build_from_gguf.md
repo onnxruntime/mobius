@@ -22,6 +22,33 @@ package.save("output")
 Quantized target storage is requested by default. Use
 `keep_quantized=False` when the output must use float storage.
 
+## Original GGUF external data (opset 29)
+
+Enable `MOBIUS_EXPERIMENTAL_OPSET29=1`, retain `keep_quantized=True`, and select
+`execution_provider="onnx-standard"`. Save **beside the original GGUF file(s)**:
+
+```bash
+MOBIUS_EXPERIMENTAL_OPSET29=1 mobius build-gguf weights/model.gguf \
+    --ep onnx-standard --output weights
+```
+
+The experimental path keeps original typed tensors and packed payloads as ONNX
+external-data ranges in those files. It emits `DequantizePacked` and standard
+layout operations, with `GroupedMatMul` for ordinary routed experts. It does not
+repack, requantize, copy payloads into a new blob, or materialize a dense vocabulary
+at export time. Row-aligned packed embeddings decode only requested rows.
+
+Current packaging is one flat model with its original, little-endian GGUF shards,
+`gguf-packed.json`, and reports. Multi-component/mmproj/MTP packages, transcoded
+safetensors output, and new weight sharding are rejected. Treat source files as
+immutable; load/save verifies source digests and original external bindings.
+The flag does **not** add runtime kernels. See the
+[opset-29 survey](../gguf-capability-catalog.md#lossless-opset-29-survey).
+
+Former lossy affine/requantization routes now raise actionable errors when the
+flag is off. Exact legacy routes remain available. Explicit `--dequantize` is a
+separate float-storage choice, not source-byte preservation.
+
 ## Signature
 
 ```python
@@ -48,7 +75,7 @@ def build_from_gguf(
 | `gguf_path` | GGUF model path. |
 | `task` | Optional task override; otherwise selected from GGUF architecture metadata. |
 | `dtype` | Target float dtype, such as `"f32"`, `"f16"`, or `"bf16"`. |
-| `keep_quantized` | Request quantized target storage where the selected graph and qtype route support it. This does not promise source-byte or numerical fidelity. |
+| `keep_quantized` | Request supported exact legacy packed storage; with the opset-29 flag, retain original GGUF external payloads. Unsupported routes fail rather than requantize. |
 | `execution_provider` | Target EP for EP-aware graph optimization; `"default"` emits portable ONNX. |
 | `mmproj` | Companion projector GGUF for a registry-evidenced multimodal route. |
 | `image_token_id` | Processor-owned image placeholder ID for an `mmproj` package. |

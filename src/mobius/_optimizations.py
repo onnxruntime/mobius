@@ -46,9 +46,11 @@ __all__ = [
 
 import contextlib
 import dataclasses
+import functools
 import logging
 import warnings
 from collections.abc import Callable
+from typing import Concatenate, ParamSpec
 
 import onnx
 import onnx_ir as ir
@@ -666,6 +668,37 @@ def _get_optimization_passes(
 # ---------------------------------------------------------------------------
 
 
+_P = ParamSpec("_P")
+
+
+def _preserve_gguf_external_initializers(
+    function: Callable[Concatenate[ir.Model, _P], None],
+) -> Callable[Concatenate[ir.Model, _P], None]:
+    @functools.wraps(function)
+    def wrapped(model: ir.Model, *args: _P.args, **kwargs: _P.kwargs) -> None:
+        if model.metadata_props.get("mobius.gguf.original_external_data") != "1":
+            function(model, *args, **kwargs)
+            return
+        external = [
+            (value, value.const_value)
+            for graph in model.graphs()
+            for value in graph.initializers.values()
+            if isinstance(value.const_value, ir.ExternalTensor)
+        ]
+        # Shape/type inference and graph fusions remain available, but folding
+        # must never decode or transcode original container-backed weights.
+        for value, _ in external:
+            value.const_value = None
+        try:
+            function(model, *args, **kwargs)
+        finally:
+            for value, tensor in external:
+                value.const_value = tensor
+
+    return wrapped
+
+
+@_preserve_gguf_external_initializers
 def optimize_model(
     model: ir.Model,
     ep: str = "default",
@@ -943,6 +976,7 @@ def optimize_model(
         validate_standard_onnx(model, component=model.graph.name or model_role)
 
 
+@_preserve_gguf_external_initializers
 def fold_initializers_after_weights(model: ir.Model) -> None:
     """Lazily fold initializer matrix Transpose and Concat nodes.
 
