@@ -81,17 +81,21 @@ def _enable_prefill_prefix_pruning_task(
         Gemma4Task,
         Gemma4TextCausalLMTask,
         HybridCausalLMTask,
+        HybridQwenVLTask,
         QwenVLTask,
     )
 
-    if task == "qwen-vl" or type(task) is QwenVLTask:
-        return QwenVLTask(
-            prune_prefill_prefix=True,
-            runtime_last_token_indices=runtime_last_token_indices
-            or getattr(task, "_runtime_last_token_indices", False),
-        )
+    for name, task_class in (("qwen-vl", QwenVLTask), ("hybrid-qwen-vl", HybridQwenVLTask)):
+        if task == name or type(task) is task_class:
+            return task_class(
+                prune_prefill_prefix=True,
+                runtime_last_token_indices=runtime_last_token_indices
+                or getattr(task, "_runtime_last_token_indices", False),
+            )
     if runtime_last_token_indices:
-        raise ValueError("runtime_last_token_indices currently requires the qwen-vl task")
+        raise ValueError(
+            "runtime_last_token_indices requires the qwen-vl or hybrid-qwen-vl task"
+        )
     if task == "text-generation":
         return CausalLMTask(prune_prefill_prefix=True)
     if task == "hybrid-text-generation":
@@ -122,7 +126,8 @@ def _enable_prefill_prefix_pruning_task(
         )
     raise ValueError(
         "prune_prefill_prefix=True is only supported for text-generation, "
-        "hybrid-text-generation, gemma4-text-generation, gemma4, and qwen-vl tasks."
+        "hybrid-text-generation, gemma4-text-generation, gemma4, qwen-vl, "
+        "and hybrid-qwen-vl tasks."
     )
 
 

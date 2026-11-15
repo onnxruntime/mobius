@@ -27,7 +27,7 @@ def build_from_module(
 | `config` | `BaseModelConfig` | (required) | Architecture configuration. The `dtype` field controls precision. |
 | `task` | `str \| ModelTask` | `"text-generation"` | Task name string or `ModelTask` instance. |
 | `prune_prefill_prefix` | `bool` | `False` | Enable prefill-prefix pruning for supported causal generation tasks. |
-| `runtime_last_token_indices` | `bool` | `False` | Enable runtime-selected final-token indices for Qwen3-VL pruning, including right-padded batches. Requires `prune_prefill_prefix=True`. |
+| `runtime_last_token_indices` | `bool` | `False` | Enable runtime-selected final-token indices for Qwen3-VL and dense Qwen3.5-VL pruning, including right-padded batches. Requires `prune_prefill_prefix=True`. |
 
 ## Returns
 

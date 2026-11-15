@@ -42,7 +42,6 @@ from mobius.tasks import (
     get_task,
 )
 from mobius.tasks._vision_language_3model import (
-    HybridQwenVLTask,
     MuseGlimmerVLTask,
     Qwen2VLMultimediaTask,
 )
@@ -58,7 +57,6 @@ class TestBuildGraphVisionLanguage:
     @pytest.mark.parametrize(
         "task_class",
         [
-            HybridQwenVLTask,
             Qwen2VLMultimediaTask,
             MuseGlimmerVLTask,
             Qwen4ExpVisionLanguageTask,
@@ -71,6 +69,58 @@ class TestBuildGraphVisionLanguage:
                 prune_prefill_prefix=True,
                 runtime_last_token_indices=runtime_indices,
             )
+
+    @pytest.mark.parametrize(
+        "prune,runtime_indices", [(False, False), (True, False), (True, True)]
+    )
+    def test_qwen35_vl_last_token_contract(self, prune, runtime_indices):
+        config = _base_config(
+            model_type="qwen3_5",
+            attn_qk_norm=True,
+            partial_rotary_factor=0.5,
+            layer_types=["linear_attention", "full_attention"],
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=16,
+                in_channels=3,
+                out_hidden_size=64,
+                num_position_embeddings=16,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            image_token_id=248056,
+            mrope_section=[8, 12, 12],
+        )
+        package = build_from_module(
+            registry.get("qwen3_5")(config),
+            config,
+            task="hybrid-qwen-vl",
+            execution_provider="cpu",
+            prune_prefill_prefix=prune,
+            runtime_last_token_indices=runtime_indices,
+        )
+        decoder = package["decoder"]
+        inputs = {value.name: value for value in decoder.graph.inputs}
+        outputs = {value.name for value in decoder.graph.outputs}
+        assert ("last_token_indices" in inputs) is runtime_indices
+        assert (decoder.graph.outputs[0].shape[1] == 1) is prune
+        assert {"present.0.conv_state", "present.0.recurrent_state"} <= outputs
+        assert {"present.1.key", "present.1.value"} <= outputs
+        if runtime_indices:
+            indices = inputs["last_token_indices"]
+            assert indices.dtype == ir.DataType.INT32
+            assert list(indices.shape)[1:] == [1, 1]
+            gather = decoder.graph.outputs[0].producer().inputs[0].producer()
+            assert gather.op_type == "GatherND"
+            assert gather.attributes["batch_dims"].value == 1
 
     @pytest.mark.parametrize(
         "prune,runtime_indices", [(False, False), (True, False), (True, True)]

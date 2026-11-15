@@ -1284,3 +1284,108 @@ class TestQwen35MixedPrecisionDecoder:
             _Q_OUT, _H
         )
         assert "model.layers.1.mlp.fc1_experts_weights" in out
+
+
+def _dense_vl_config() -> object:
+    """Two-layer dense Qwen3.5-VL config: layer 0 linear attention, layer 1 full."""
+    return make_config(
+        model_type="qwen3_5",
+        num_hidden_layers=2,
+        hidden_size=_H,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        vision=VisionConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            patch_size=2,
+            in_channels=3,
+            out_hidden_size=_H,
+            num_position_embeddings=4,
+        ),
+        image_token_id=99,
+        temporal_patch_size=1,
+        **_LINEAR_ATTN_DIMS,
+    )
+
+
+@pytest.mark.parametrize("runtime_indices", [False, True])
+def test_qwen35_vl_pruned_decoder_matches_full_decoder(runtime_indices):
+    from mobius._builder import build_from_module
+    from mobius._testing.ort_inference import OnnxModelSession
+    from mobius.rewrite_rules._testing_utils import fill_random_weights
+
+    config = _dense_vl_config()
+    full = build_from_module(
+        Qwen35VL3ModelCausalLMModel(config),
+        config,
+        task="hybrid-qwen-vl",
+        execution_provider="cpu",
+    )["decoder"]
+    pruned = build_from_module(
+        Qwen35VL3ModelCausalLMModel(config),
+        config,
+        task="hybrid-qwen-vl",
+        execution_provider="cpu",
+        prune_prefill_prefix=True,
+        runtime_last_token_indices=runtime_indices,
+    )["decoder"]
+    assert ("last_token_indices" in {v.name for v in pruned.graph.inputs}) is runtime_indices
+    fill_random_weights(full)
+    weights = full.graph.initializers
+    for name, value in pruned.graph.initializers.items():
+        if value.const_value is None:
+            value.const_value = weights[name].const_value
+
+    batch, length = 2, 5
+    rng = np.random.default_rng(0)
+    feeds = {
+        "inputs_embeds": rng.standard_normal((batch, length, _H), dtype=np.float32),
+        "attention_mask": np.ones((batch, length), dtype=np.int64),
+        "position_ids": np.broadcast_to(np.arange(length), (3, batch, length)).copy(),
+    }
+    for value in full.graph.inputs:
+        if value.name.startswith("past_key_values."):
+            # Concrete batch; empty past for symbolic sequence dims.
+            shape = [
+                dim if isinstance(dim, int) else batch if "batch" in str(dim) else 0
+                for dim in value.shape
+            ]
+            feeds[value.name] = np.zeros(shape, dtype=np.float32)
+    rows = np.asarray([1, 3] if runtime_indices else [length - 1] * batch)
+    pruned_feeds = dict(feeds)
+    if runtime_indices:
+        pruned_feeds["last_token_indices"] = rows.astype(np.int32).reshape(batch, 1, 1)
+
+    expected = OnnxModelSession(full, device="cpu", intra_op_num_threads=1).run(feeds)
+    actual = OnnxModelSession(pruned, device="cpu", intra_op_num_threads=1).run(pruned_feeds)
+    assert actual["logits"].shape == (batch, 1, config.vocab_size)
+    np.testing.assert_allclose(
+        actual["logits"][:, 0],
+        expected["logits"][np.arange(batch), rows],
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    assert expected.keys() == actual.keys()
+    for name in expected:
+        if name != "logits":
+            np.testing.assert_allclose(actual[name], expected[name], rtol=1e-4, atol=1e-4)
+
+
+def test_qwen35_moe_vl_rejects_prefill_pruning():
+    from mobius._builder import build_from_module
+
+    config = dataclasses.replace(
+        _hybrid_moe_config(None, vision=True), model_type="qwen3_5_moe_vl"
+    )
+    with pytest.raises(ValueError, match=r"requires dense Qwen3\.5-VL"):
+        build_from_module(
+            Qwen35MoEVL3ModelCausalLMModel(config),
+            config,
+            task="hybrid-qwen-vl",
+            prune_prefill_prefix=True,
+        )

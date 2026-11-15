@@ -20,7 +20,7 @@ from mobius._builder import (
     flags,
 )
 from mobius._model_package import ModelPackage
-from mobius.tasks import QwenVLTask
+from mobius.tasks import HybridQwenVLTask, QwenVLTask
 
 
 @pytest.mark.parametrize("level", [None, 0, 4])
@@ -102,7 +102,8 @@ def test_prefill_prefix_pruning_error_lists_supported_tasks() -> None:
     with pytest.raises(
         ValueError,
         match=(
-            "text-generation, hybrid-text-generation, gemma4-text-generation, gemma4, and qwen-vl tasks"
+            "text-generation, hybrid-text-generation, gemma4-text-generation, gemma4, qwen-vl, "
+            "and hybrid-qwen-vl tasks"
         ),
     ):
         _enable_prefill_prefix_pruning_task("feature-extraction")
@@ -131,6 +132,20 @@ def test_prefill_prefix_pruning_qwen_task_name_runtime_indices(
         "qwen-vl", runtime_last_token_indices=runtime_indices
     )
     assert isinstance(selected, QwenVLTask)
+    assert selected._prune_prefill_prefix is True
+    assert selected._runtime_last_token_indices is runtime_indices
+
+
+@pytest.mark.parametrize("runtime_indices", [False, True])
+@pytest.mark.parametrize("task_object", [False, True])
+def test_prefill_prefix_pruning_selects_hybrid_qwen_task(
+    runtime_indices: bool, task_object: bool
+) -> None:
+    task = HybridQwenVLTask() if task_object else "hybrid-qwen-vl"
+    selected = _enable_prefill_prefix_pruning_task(
+        task, runtime_last_token_indices=runtime_indices
+    )
+    assert type(selected) is HybridQwenVLTask
     assert selected._prune_prefill_prefix is True
     assert selected._runtime_last_token_indices is runtime_indices
 

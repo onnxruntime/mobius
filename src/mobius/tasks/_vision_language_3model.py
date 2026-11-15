@@ -466,19 +466,25 @@ class HybridQwenVLTask(QwenVLTask):
     uses hybrid cache inputs/outputs.
     """
 
-    _supports_prefill_prefix_pruning = False
-
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
         self._validate_components(module)
+        if self._prune_prefill_prefix and config.model_type not in {"qwen3_5", "qwen3_5_vl"}:
+            raise ValueError("Hybrid Qwen VL prefill-prefix pruning requires dense Qwen3.5-VL")
         deepstack = bool(getattr(config, "deepstack_visual_indexes", None))
         models: dict[str, ir.Model] = {}
-        models["decoder"] = build_decoder_from_embeds(
-            module.decoder, config, mrope=True, hybrid=True, deepstack=deepstack
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            models["decoder"] = build_decoder_from_embeds(
+                module.decoder,
+                config,
+                mrope=True,
+                hybrid=True,
+                deepstack=deepstack,
+                runtime_last_token_indices=self._runtime_last_token_indices,
+            )
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
