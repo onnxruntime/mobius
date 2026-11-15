@@ -451,9 +451,17 @@ class Attention(nn.Module):
         }
         if self._softcap:
             gqa_attrs["softcap"] = self._softcap
-        if self.rotary_embedding_dim:
-            # Partial RoPE: only rotate the first rotary_embedding_dim elements.
-            gqa_attrs["rotary_embedding_dim"] = self.rotary_embedding_dim
+        # GroupQueryAttention has no rotary_embedding_dim; it rotates cos_cache.shape[-1] * 2 elements.
+        width = gqa_ctx.cos_cache.shape[-1] if gqa_ctx.cos_cache.shape is not None else None
+        if (
+            self.rotary_embedding_dim
+            and isinstance(width, int)
+            and width * 2 != self.rotary_embedding_dim
+        ):
+            raise ValueError(
+                f"Partial RoPE with rotary_embedding_dim={self.rotary_embedding_dim} needs a "
+                f"cos/sin cache of width {self.rotary_embedding_dim // 2}, got {width}"
+            )
         if gqa_ctx.local_window_size > 0:
             gqa_attrs["local_window_size"] = gqa_ctx.local_window_size
 

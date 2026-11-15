@@ -340,6 +340,38 @@ class TestGQAContextDispatch:
         gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
         assert "local_window_size" not in gqa_node.attributes
 
+    @pytest.mark.parametrize("cache_width", [4, 8])
+    def test_gqa_context_partial_rotary_uses_cache_width(self, cache_width):
+        """Partial RoPE is carried by the cos/sin cache width, not a GQA attribute."""
+        from mobius.components._attention import GQAContext
+
+        config = make_config(partial_rotary_factor=0.5)  # rotary_dim = 16 * 0.5 = 8
+        attn = Attention(config)
+        builder, op, graph = create_test_builder()
+
+        hidden = create_test_input(builder, "hidden", [1, 8, 64])
+        past_key = create_test_input(builder, "past_key", [1, 2, 4, 16])
+        past_value = create_test_input(builder, "past_value", [1, 2, 4, 16])
+        seqlens_k = create_test_input(builder, "seqlens_k", [1], dtype=ir.DataType.INT32)
+        total_seq_len = create_test_input(
+            builder, "total_seq_len", [], dtype=ir.DataType.INT32
+        )
+        cos_cache = create_test_input(builder, "cos_cache", [32, cache_width])
+        sin_cache = create_test_input(builder, "sin_cache", [32, cache_width])
+        gqa_ctx = GQAContext(seqlens_k, total_seq_len, cos_cache, sin_cache)
+
+        if cache_width != 4:
+            with pytest.raises(ValueError, match="cache of width 4, got 8"):
+                attn(op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value))
+            return
+        output, _ = attn(
+            op, hidden, attention_bias=gqa_ctx, past_key_value=(past_key, past_value)
+        )
+        builder._adapt_outputs([output], "")
+
+        gqa_node = next(n for n in graph if n.op_type == "GroupQueryAttention")
+        assert "rotary_embedding_dim" not in gqa_node.attributes
+
     def test_standard_attention_when_no_gqa_context(self):
         """Without GQAContext, standard ONNX Attention is emitted."""
         config = make_config()
