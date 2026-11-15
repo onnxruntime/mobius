@@ -391,8 +391,10 @@ class TestGemma4ModelPreprocessWeights:
         assert result["decoder.lm_head.weight"] is weight
 
     def test_quantized_embedding_fails_closed(self):
-        """A packed embedding table is still rejected: the embedding component
-        would need GatherBlockQuantized to consume it."""
+        """A packed embedding table is still rejected.
+
+        The embedding component would need GatherBlockQuantized to consume it.
+        """
         state_dict = {
             "model.language_model.embed_tokens.weight_qweight": torch.zeros(
                 256, 32, dtype=torch.uint8

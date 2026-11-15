@@ -342,18 +342,14 @@ def _split_per_layer_projection_weight(
 
     scale = state_dict.get(f"{base}.weight_scale")
     if scale is None:
-        raise ValueError(
-            f"{base}.weight dim 0 expected {expected}, got {weight.shape[0]}"
-        )
+        raise ValueError(f"{base}.weight dim 0 expected {expected}, got {weight.shape[0]}")
     pack = 8
     if scale.shape[-1] != expected:
         raise ValueError(
             f"{base}.weight_scale dim -1 expected {expected}, got {scale.shape[-1]}"
         )
     if weight.shape[1] * pack != expected:
-        raise ValueError(
-            f"{base}.weight dim 1 {weight.shape[1]} * {pack} != {expected}"
-        )
+        raise ValueError(f"{base}.weight dim 1 {weight.shape[1]} * {pack} != {expected}")
     if producer % pack or consumer % pack:
         raise ValueError(f"PLE split {producer}/{consumer} not divisible by {pack}")
     pw, cw = weight.split([producer // pack, consumer // pack], dim=1)
@@ -367,6 +363,7 @@ def _split_per_layer_projection_weight(
         pz, cz = zp.split([producer // pack, consumer // pack], dim=-1)
         state_dict[f"{base}.weight_zero_point"] = pz.contiguous()
         state_dict[f"{cons}.weight_zero_point"] = cz.contiguous()
+
 
 def _typed_scalar_constant(op: OpBuilder, value: float, dtype: ir.DataType) -> ir.Value:
     """Create a scalar constant directly in the model compute dtype."""
@@ -3900,8 +3897,7 @@ class Gemma4Model(nn.Module):
             head_present = any(
                 key == head_key
                 or key == "lm_head.weight"
-                or key.startswith("lm_head.weight_")
-                or key.startswith(head_key + "_")
+                or key.startswith(("lm_head.weight_", head_key + "_"))
                 for key in state_dict
             )
             if not head_present and embed_key in state_dict:
@@ -4157,8 +4153,7 @@ class Gemma4UnifiedModel(nn.Module):
             head_present = any(
                 key == head_key
                 or key == "lm_head.weight"
-                or key.startswith("lm_head.weight_")
-                or key.startswith(head_key + "_")
+                or key.startswith(("lm_head.weight_", head_key + "_"))
                 for key in state_dict
             )
             if not head_present and embed_key in state_dict:
