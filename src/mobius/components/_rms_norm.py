@@ -51,6 +51,20 @@ class OffsetRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        if flags.offset_rmsnorm_model_dtype and hidden_states.dtype in (
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+        ):
+            # Model-builder parity: the folded scale is constant-folded at load,
+            # and the plain norm can fuse with a preceding residual Add.
+            weight_f32 = op.Cast(self.weight, to=ir.DataType.FLOAT)
+            effective_weight = op.Cast(op.Add(weight_f32, 1.0), to=hidden_states.dtype)
+            return op.RMSNormalization(
+                hidden_states,
+                effective_weight,
+                epsilon=self.variance_epsilon,
+                axis=-1,
+            )
         # Keep the learned offset and scaling in FP32; rounding 1 + weight
         # in model dtype loses small trained offsets before multiplication.
         hidden_f32 = (
@@ -233,7 +247,10 @@ class PostGatedRMSNorm(nn.Module):
         self.group_size = group_size
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value):
-        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        is_float = hidden_states.dtype == ir.DataType.FLOAT
+        hidden_f32 = (
+            hidden_states if is_float else op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        )
         weight_f32 = op.Cast(self.weight, to=ir.DataType.FLOAT)
         if self.group_size is not None and self.group_size < self.hidden_size:
             n_groups = self.hidden_size // self.group_size
@@ -266,7 +283,7 @@ class PostGatedRMSNorm(nn.Module):
         g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
         gate_activated = op.Swish(g_f32)
         result = op.Mul(normed, gate_activated)
-        return op.CastLike(result, hidden_states)
+        return result if is_float else op.CastLike(result, hidden_states)
 
 
 def apply_rms_norm(op: OpBuilder, x, weight, eps):

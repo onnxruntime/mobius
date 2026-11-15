@@ -216,6 +216,36 @@ class _Flags:
     native dispatch for non-CUDA providers.
     """
 
+    cuda_fused_deltanet: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_CUDA_FUSED_DELTANET", False)
+    )
+    """Emit CUDA GatedDeltaNet layers with native fused kernels.
+
+    Keeps ``CausalConvWithState`` (with fused SiLU) as a native node for every
+    sequence length instead of inlining its Conv-based body, uses
+    ``LpNormalization`` for the per-head Q/K L2 norm, static reshape targets,
+    a single conversion of the convolution output to the recurrent-state
+    dtype, and keeps the FP32 ``LinearAttention`` output in FP32 through the
+    gated norm. Recurrent-state precision is unchanged.
+
+    Requires an ORT build with CUDA ``CausalConvWithState`` and
+    ``LpNormalization`` kernels (ORT >= 1.25). ``LpNormalization`` omits the
+    reference ``1e-6`` epsilon inside the square root and returns zeros for
+    zero vectors. Default ``False`` preserves existing graphs.
+    """
+
+    offset_rmsnorm_model_dtype: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_OFFSET_RMSNORM_MODEL_DTYPE", False)
+    )
+    """Run :class:`~mobius.components.OffsetRMSNorm` in the activation dtype.
+
+    Rounds the effective ``1 + weight`` scale to the FP16/BF16 activation
+    dtype, as the ORT GenAI model builder does, so norms need no FP32
+    conversions and residual ``Add`` + norm pairs fuse into
+    ``SkipSimplifiedLayerNormalization``. Variance is still accumulated in
+    FP32. Default ``False`` keeps the FP32 scale and FP32 normalization.
+    """
+
     allow_dense_moe_experts: bool = dataclasses.field(
         default_factory=lambda: _env_bool("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", False)
     )

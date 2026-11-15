@@ -83,6 +83,7 @@ __all__ = [
     "ep_capabilities",
     "ep_registry",
     "fingerprint_model_weights",
+    "flags",
     "load_peft_adapter",
     "generation",
     "get_build_dtype",
@@ -90,6 +91,7 @@ __all__ = [
     "inspect_components",
     "models",
     "optimize_model",
+    "override_flags",
     "register_ep",
     "registry",
     "stream_safetensors_to_model",
@@ -130,6 +132,7 @@ from mobius._configs import (
 from mobius._constants import OPSET_VERSION
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
 from mobius._export_report import ComponentExportDisposition, ComponentExportReport
+from mobius._flags import flags, override_flags
 from mobius._inspect import (
     ComponentInfo,
     SharedWeightEndpoint,

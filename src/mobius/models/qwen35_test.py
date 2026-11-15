@@ -15,16 +15,20 @@ FP16/BF16 dtype propagation through text, VL, and decoder component-plan adapter
 from __future__ import annotations
 
 import dataclasses
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 import torch
 from onnx_ir import tensor_adapters
 
+from mobius._builder import build_from_module
 from mobius._component_quantization import configure_component_quantization
 from mobius._configs import QuantizationConfig, QuantizationOverride, VisionConfig
+from mobius._flags import override_flags
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.components import QuantizedEmbedding, QuantizedLinear
@@ -1284,3 +1288,100 @@ class TestQwen35MixedPrecisionDecoder:
             _Q_OUT, _H
         )
         assert "model.layers.1.mlp.fc1_experts_weights" in out
+
+
+def _fused_hybrid_config(**overrides) -> object:
+    return make_config(
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        **overrides,
+    )
+
+
+def _build_cuda_dense(config) -> ir.Model:
+    module = Qwen35CausalLMModel(config)
+    return build_from_module(
+        module, config, task=module.default_task, execution_provider="cuda"
+    )["model"]
+
+
+class TestQwen35CudaFusedDeltaNet:
+    def test_fused_graph_uses_native_kernels_and_fused_norms(self):
+        config = _fused_hybrid_config(
+            dtype=ir.DataType.FLOAT16, mamba_ssm_dtype=ir.DataType.FLOAT
+        )
+        with override_flags(cuda_fused_deltanet=True, offset_rmsnorm_model_dtype=True):
+            model = _build_cuda_dense(config)
+        nodes = list(ir.traversal.RecursiveGraphIterator(model.graph))
+        ops = Counter(node.op_type for node in nodes)
+        assert not {"If", "Conv", "ReduceSumSquare", "Sqrt", "Div"} & ops.keys()
+        assert ops["LpNormalization"] == 2
+        # Only the first input norm lacks a residual Add to fuse with.
+        assert ops["SkipSimplifiedLayerNormalization"] == 4
+        conv = next(node for node in nodes if node.op_type == "CausalConvWithState")
+        assert conv.attributes["activation"].as_string() == "silu"
+        attention = next(node for node in nodes if node.op_type == "LinearAttention")
+        for index in (0, 1):
+            normalized = attention.inputs[index].producer().inputs[0].producer()
+            assert normalized.op_type == "LpNormalization"
+        split = attention.inputs[2].producer()
+        assert split.op_type == "Split"
+        assert split.inputs[0].producer().op_type == "Cast"
+        norm_input = next(iter(attention.outputs[0].uses())).node
+        assert norm_input.op_type == "Reshape"
+        assert next(iter(norm_input.outputs[0].uses())).node.op_type == "RMSNormalization"
+        for node in nodes:
+            if node.op_type in ("RMSNormalization", "SkipSimplifiedLayerNormalization"):
+                producer = node.inputs[0].producer()
+                assert producer is None or producer.op_type != "Cast", node.name
+
+    def test_default_cuda_graph_is_unchanged(self):
+        model = _build_cuda_dense(_fused_hybrid_config())
+        ops = Counter(node.op_type for node in model.graph)
+        assert "CausalConvWithState" not in ops
+        assert "LpNormalization" not in ops
+        assert ops["ReduceSumSquare"] == 2
+
+    def test_fused_graph_matches_reference_on_cpu(self, tmp_path):
+        config = _fused_hybrid_config()
+        rng = np.random.default_rng(7)
+        weights = {}
+        outputs = []
+        for fused in (False, True):
+            with override_flags(cuda_fused_deltanet=fused):
+                model = _build_cuda_dense(config)
+            for value in model.graph.initializers.values():
+                if value.const_value is None:
+                    if value.name not in weights:
+                        weights[value.name] = rng.normal(0, 0.2, tuple(value.shape)).astype(
+                            np.float32
+                        )
+                    value.const_value = ir.tensor(weights[value.name])
+            path = tmp_path / f"fused-{fused}.onnx"
+            ir.save(model, path)
+            session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            feeds = {
+                "input_ids": np.array([[1, 2, 3, 4, 5]], dtype=np.int64),
+                "attention_mask": np.ones((1, 5), dtype=np.int64),
+                "position_ids": np.arange(5, dtype=np.int64)[None],
+            }
+            for value in session.get_inputs():
+                if value.name.startswith("past_key_values."):
+                    shape = [dim if isinstance(dim, int) else 0 for dim in value.shape]
+                    shape[0] = 1
+                    feeds[value.name] = np.zeros(shape, dtype=np.float32)
+            prefill = session.run(None, feeds)
+            feeds["input_ids"] = np.array([[6]], dtype=np.int64)
+            feeds["attention_mask"] = np.ones((1, 6), dtype=np.int64)
+            feeds["position_ids"] = np.array([[5]], dtype=np.int64)
+            for value, data in zip(session.get_outputs(), prefill, strict=True):
+                if value.name.startswith("present."):
+                    feeds[value.name.replace("present.", "past_key_values.")] = data
+            outputs.append((prefill, session.run(None, feeds)))
+        for reference, fused in zip(*outputs, strict=True):
+            for expected, actual in zip(reference, fused, strict=True):
+                np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Qwen3.5 CUDA decoder graph opt-ins
+
+#### Added
+
+- `flags.cuda_fused_deltanet` (`MOBIUS_CUDA_FUSED_DELTANET`) keeps native
+  CUDA `CausalConvWithState` with fused SiLU for every sequence length, uses
+  `LpNormalization` for Q/K, static reshapes and one FP32 conversion around
+  the unchanged FP32 recurrent state. It removes Shape/Concat chains and keeps
+  decoders capture-compatible; requires ORT >= 1.25 CUDA kernels.
+- `flags.offset_rmsnorm_model_dtype` (`MOBIUS_OFFSET_RMSNORM_MODEL_DTYPE`)
+  folds the `1 + weight` offset into the FP16/BF16 scale, as the ORT GenAI
+  model builder does, so residual norms fuse into
+  `SkipSimplifiedLayerNormalization`.
+- `mobius.flags` and `mobius.override_flags` are exported as documented.
+  Both flags default off; existing graphs are unchanged.
+
 ### Qwen3.8-27B standard-only multimodal qualification
 
 #### Added
