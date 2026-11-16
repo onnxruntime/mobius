@@ -70,9 +70,18 @@ hidden/embedding/head sharing; representation does not implement acceptance poli
 
 Ordinary MLP MoE experts now retain biases, activations, and exact gated or ungated
 shared-expert composition under grouped dispatch. Specialized custom expert
-compositions are not silently replaced. Grouped graphs avoid per-expert execution,
+compositions are not silently replaced. Flash-Next's existing fused expert banks
+also use grouped dispatch, retaining FP32 routing/SiLU, normalization, scaling,
+and shared gating. Grouped graphs avoid per-expert execution,
 but full-bank dequantization still requires expert-sized workspace unless the EP
 fuses decode with selection; no such fusion/performance claim is made.
+
+Merged `LinearAttention-29` supports independent `v_num_heads`; the portable
+function can opt into a post-update state trajectory. This costs one recurrent
+state per token and is not enabled as a whole-model rollback policy. Convolution,
+PLE and indexed-attention history still need independent restoration. Actual
+schema checking requires an ONNX build containing onnx/onnx#8693, not just a
+version string reporting opset 29.
 The flag does **not** add runtime kernels. See the
 [opset-29 survey](../gguf-capability-catalog.md#lossless-opset-29-survey).
 
