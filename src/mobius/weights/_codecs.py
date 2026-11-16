@@ -114,6 +114,20 @@ class _LegacyAffineCodec:
             raise ValueError(
                 f"codec {self.method!r} cannot group quant_method {config.quant_method!r}"
             )
+        if self.method == "quark":
+            # ``normalize`` below handles Quark, but this grouper keys off
+            # ``_qweight``/``.qweight`` and Quark has neither -- its payload sits
+            # on the bare ``.weight``. Grouping would silently emit three
+            # FloatWeight records instead of one PackedWeight (and the orphan
+            # sidecar check would not catch it either), so fail closed rather
+            # than build a float graph over packed data.
+            raise NotImplementedError(
+                "AMD Quark checkpoints are not supported through the "
+                "component-quantization codec path: Quark stores its packed "
+                "payload on the canonical '.weight' key, which this grouper "
+                "cannot distinguish from a float weight. Use a root "
+                "quantization_config instead of a per-component plan."
+            )
 
         records: dict[str, WeightRecord] = {}
         consumed: set[str] = set()

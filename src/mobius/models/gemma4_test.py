@@ -19,7 +19,12 @@ from mobius._configs import (
     QuantizationConfig,
     QuantizationOverride,
 )
-from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
+from mobius.models.gemma4 import (
+    Gemma4CausalLMModel,
+    Gemma4EmbeddingModel,
+    Gemma4Model,
+    _split_per_layer_projection_weight,
+)
 from mobius.weights import adapt_model_weights
 
 
@@ -854,6 +859,75 @@ class TestGemma4PerComponentQuantization:
             1,
             32,
         )
+
+
+class TestSplitPerLayerProjectionWeight:
+    """The PLE split must pick its layout by sidecar, not by shape alone."""
+
+    LAYERS = 4
+    PER_LAYER = 16
+    SHARED = 1
+
+    def _config(self):
+        return _tiny_gemma4_config(
+            num_hidden_layers=self.LAYERS,
+            num_kv_shared_layers=self.SHARED,
+            hidden_size_per_layer_input=self.PER_LAYER,
+            layer_types=["full_attention"] * self.LAYERS,
+        )
+
+    def test_normalized_layout_splits_scales_and_zero_points(self):
+        """MatMulNBits-layout input: sidecars split with the payload.
+
+        The split-embedding path runs after preprocess_quantized_weights, so
+        the payload is already [N, n_blocks, blob] and dim 0 equals the dense
+        ``expected``. Splitting only the payload leaves .scales/.zero_points at
+        full N and the consumer parameter cannot bind.
+        """
+        config = self._config()
+        expected = self.LAYERS * self.PER_LAYER
+        producer = (self.LAYERS - self.SHARED) * self.PER_LAYER
+        consumer = expected - producer
+        blocks, blob = 4, 8
+        base = "decoder.model.per_layer_model_projection"
+        sd = {
+            f"{base}.weight": torch.zeros(expected, blocks, blob, dtype=torch.uint8),
+            f"{base}.scales": torch.ones(expected, blocks),
+            f"{base}.zero_points": torch.zeros(expected, blocks // 2, dtype=torch.uint8),
+        }
+
+        _split_per_layer_projection_weight(sd, "decoder.model.", config)
+
+        cons = f"{base}_consumer"
+        assert sd[f"{base}.weight"].shape == (producer, blocks, blob)
+        assert sd[f"{cons}.weight"].shape == (consumer, blocks, blob)
+        assert sd[f"{base}.scales"].shape == (producer, blocks)
+        assert sd[f"{cons}.scales"].shape == (consumer, blocks)
+        assert sd[f"{base}.zero_points"].shape == (producer, blocks // 2)
+        assert sd[f"{cons}.zero_points"].shape == (consumer, blocks // 2)
+
+    def test_packed_quark_not_taken_for_dense_when_shapes_collide(self):
+        """A raw Quark payload must not fall into the dense branch.
+
+        ``hidden_size == num_layers * per_layer_dim`` makes the packed tensor's
+        dim 0 equal ``expected``, so shape alone cannot tell the layouts apart.
+        """
+        config = self._config()
+        assert config.hidden_size == self.LAYERS * self.PER_LAYER, "collision setup"
+        expected = self.LAYERS * self.PER_LAYER
+        producer = (self.LAYERS - self.SHARED) * self.PER_LAYER
+        base = "model.per_layer_model_projection"
+        sd = {
+            # Quark layout: [K, N / 8] with K == expected by construction.
+            f"{base}.weight": torch.zeros(expected, expected // 8, dtype=torch.int32),
+            f"{base}.weight_scale": torch.ones(2, expected),
+        }
+
+        _split_per_layer_projection_weight(sd, "model.", config)
+
+        # Split along the packed output axis, not dim 0 as a dense weight.
+        assert sd[f"{base}.weight"].shape == (expected, producer // 8)
+        assert sd[f"{base}.weight_scale"].shape == (2, producer)
 
 
 def test_component_regex_keeps_per_layer_decoder_projections_float():

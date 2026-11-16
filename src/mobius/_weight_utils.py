@@ -1870,8 +1870,14 @@ def preprocess_quantized_weights(
         this matches the *exact* sidecar keys of one named float parameter.
         """
         owner = float_key.removesuffix(".weight")
-        return any(key == float_key + suffix for suffix in OLIVE_PACKED_QUANT_SUFFIXES) or any(
-            key == owner + suffix for suffix in DOTTED_PACKED_QUANT_SUFFIXES
+        return (
+            any(key == float_key + suffix for suffix in OLIVE_PACKED_QUANT_SUFFIXES)
+            or any(key == owner + suffix for suffix in DOTTED_PACKED_QUANT_SUFFIXES)
+            # Quark's payload sits on ``float_key`` itself, so only the sidecars
+            # can reveal it. Without these the guard below is a no-op for Quark:
+            # ``quantize_embeddings`` is never derived from ``exclude``, so a
+            # packed table would pass both tests and reach a float initializer.
+            or any(key == owner + suffix for suffix in QUARK_PACKED_QUANT_SUFFIXES)
         )
 
     # The embedding table and the LM head are gated independently. A decoder

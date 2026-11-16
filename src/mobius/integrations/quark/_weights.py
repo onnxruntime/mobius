@@ -13,7 +13,6 @@ reinterpreted in place.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Collection
 
 import torch
@@ -124,10 +123,20 @@ def preprocess_quark_weights(
                 f"{stem}.weight has shape {tuple(packed.shape)}, which does not pack "
                 f"{out_features} output features at {bits} bits."
             )
-        if math.ceil(in_features / group_size) != n_groups:
+        # Exact division, not ceil: a partial trailing group would survive a
+        # ceil() check and then fail inside the reshape below with an opaque
+        # size error, because the codes are not padded to n_groups*group_size.
+        if in_features % group_size:
+            raise ValueError(
+                f"{stem}: {in_features} input features are not a multiple of "
+                f"group_size={group_size}. A partial trailing group would need the "
+                f"codes padded to {n_groups * group_size} before packing, which "
+                f"this path does not do."
+            )
+        if in_features // group_size != n_groups:
             raise ValueError(
                 f"{stem}: {in_features} input features at group_size={group_size} "
-                f"implies {math.ceil(in_features / group_size)} groups, but "
+                f"implies {in_features // group_size} groups, but "
                 f"{stem}.weight_scale has {n_groups}."
             )
 

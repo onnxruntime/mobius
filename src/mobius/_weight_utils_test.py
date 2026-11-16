@@ -1290,6 +1290,12 @@ class TestPreprocessQuantizedWeights:
                 ".qweight",
                 ".scales",
                 ".qzeros",
+                # Quark keeps the payload on the bare ``.weight`` key, so only
+                # these sidecars can reveal a packed table. Omitting them made
+                # the guard a no-op for Quark, whose quantize_embeddings flag is
+                # never derived from ``exclude``.
+                ".weight_scale",
+                ".weight_zero_point",
             )
         ],
     )
@@ -1299,7 +1305,7 @@ class TestPreprocessQuantizedWeights:
         """Each guard rejects a packed sidecar of its own parameter.
 
         The placeholder tensor is never unpacked: the guard must fire on the
-        key alone, before any layout work.
+        key alone, before any layout work -- and regardless of quant_method.
         """
         owner = float_key.removesuffix(".weight")
         packed_key = float_key + suffix if suffix.startswith("_") else owner + suffix

@@ -147,6 +147,24 @@ class TestPreprocessQuarkWeights:
         with pytest.raises(ValueError, match="implies"):
             preprocess_quark_weights(sd, bits=self.BITS, group_size=64)
 
+    def test_partial_trailing_group_rejected(self):
+        """A non-multiple K must fail validation, not the reshape.
+
+        ``ceil(48 / 32) == 2`` scale groups look consistent, but the codes are
+        not padded to ``n_groups * group_size`` -- the reshape into MatMulNBits
+        blocks would then die with an opaque size error instead.
+        """
+        k = self.GROUP_SIZE + self.GROUP_SIZE // 2  # 48: one and a half groups
+        n_groups = -(-k // self.GROUP_SIZE)  # 2, as ceil() would report
+        codes = torch.randint(0, 16, (k, self.N))
+        sd = {
+            "q_proj.weight": _quark_pack(codes),
+            "q_proj.weight_scale": torch.randn(n_groups, self.N),
+        }
+
+        with pytest.raises(ValueError, match="not a multiple of"):
+            preprocess_quark_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
     def test_dispatches_from_quantized_weights(self):
         """``preprocess_quantized_weights`` routes quant_method='quark' here."""
         codes = torch.randint(0, 16, (self.K, self.N))

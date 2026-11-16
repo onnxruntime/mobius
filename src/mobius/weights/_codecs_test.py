@@ -168,6 +168,24 @@ def test_dotted_affine_weights_normalize_to_component_layout(method, bits, group
     torch.testing.assert_close(normalized["embedding.tokens.scales"], scales.T)
 
 
+def test_quark_grouping_fails_closed():
+    """Quark's payload is on the bare ``.weight``, which this grouper can't see.
+
+    Grouping would emit three FloatWeight records instead of one PackedWeight,
+    silently building a float graph over packed data, so it must raise.
+    """
+    state_dict = {
+        "model.q_proj.weight": torch.zeros(32, 4, dtype=torch.int32),
+        "model.q_proj.weight_scale": torch.ones(2, 32),
+        "model.q_proj.weight_zero_point": torch.zeros(2, 4, dtype=torch.int32),
+    }
+
+    with pytest.raises(NotImplementedError, match="component-quantization codec path"):
+        codec_registry.get("quark").group(
+            _component(), state_dict, _config("quark", sym=False)
+        )
+
+
 def test_registry_rejects_duplicate_method():
     registry = QuantizationCodecRegistry()
     codec = codec_registry.get("olive")

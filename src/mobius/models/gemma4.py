@@ -317,9 +317,16 @@ def _split_per_layer_projection_weight(
 ) -> None:
     """Split the packed PLE projection at the first KV-sharing layer.
 
-    Handles dense ``[N, K]`` weights and Quark-packed ``[K, N/8]`` weights with
-    their scale/zero_point sidecars. Quantized modules reach here still packed
-    by design (see ``_dequantize_float_only_projections``).
+    Three input layouts reach here, discriminated by which sidecars are present
+    rather than by shape alone (a packed tensor can share dim 0 with a dense one):
+
+    * ``MatMulNBits`` ``[N, n_blocks, blob]`` with ``.scales``/``.zero_points`` --
+      the split-embedding path runs after ``preprocess_quantized_weights``.
+    * raw Quark ``[K, N/8]`` with ``.weight_scale``/``.weight_zero_point``.
+    * dense ``[N, K]``.
+
+    Quantized modules reach here still packed by design (see
+    ``_dequantize_float_only_projections``).
     """
     shared_layers = config.num_kv_shared_layers
     per_layer_dim = config.hidden_size_per_layer_input
@@ -334,14 +341,40 @@ def _split_per_layer_projection_weight(
     producer = (config.num_hidden_layers - shared_layers) * per_layer_dim
     consumer = expected - producer
 
-    if weight.shape[0] == expected:
+    # Already normalized to the MatMulNBits layout: the payload splits along
+    # dim 0 like a dense weight, but .scales/.zero_points are indexed by the
+    # same N and must be split with it or the consumer cannot bind.
+    normalized_scales = state_dict.get(f"{base}.scales")
+    if normalized_scales is not None:
+        if weight.shape[0] != expected:
+            raise ValueError(
+                f"{base}.weight dim 0 expected {expected}, got {weight.shape[0]}"
+            )
+        if normalized_scales.shape[0] != expected:
+            raise ValueError(
+                f"{base}.scales dim 0 expected {expected}, got "
+                f"{normalized_scales.shape[0]}"
+            )
         pw, cw = weight.split([producer, consumer], dim=0)
         state_dict[f"{base}.weight"] = pw.contiguous()
         state_dict[f"{cons}.weight"] = cw.contiguous()
+        ps, cs = normalized_scales.split([producer, consumer], dim=0)
+        state_dict[f"{base}.scales"] = ps.contiguous()
+        state_dict[f"{cons}.scales"] = cs.contiguous()
+        zero_points = state_dict.get(f"{base}.zero_points")
+        if zero_points is not None:
+            pz, cz = zero_points.split([producer, consumer], dim=0)
+            state_dict[f"{base}.zero_points"] = pz.contiguous()
+            state_dict[f"{cons}.zero_points"] = cz.contiguous()
         return
 
     scale = state_dict.get(f"{base}.weight_scale")
     if scale is None:
+        if weight.shape[0] == expected:
+            pw, cw = weight.split([producer, consumer], dim=0)
+            state_dict[f"{base}.weight"] = pw.contiguous()
+            state_dict[f"{cons}.weight"] = cw.contiguous()
+            return
         raise ValueError(f"{base}.weight dim 0 expected {expected}, got {weight.shape[0]}")
     pack = 8
     if scale.shape[-1] != expected:
