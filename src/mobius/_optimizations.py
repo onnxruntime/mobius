@@ -949,7 +949,8 @@ def fold_initializers_after_weights(model: ir.Model) -> None:
     Preserve the shipped root Transpose naming convention and fold projection
     packing to a fixed point. Generic weight layout chains remain explicit.
     """
-    common_passes.LiftConstantsToInitializersPass()(model)
+    # size_limit=1 (default 16) also lifts rank-0 scalars, as onnxscript's ORT path does.
+    common_passes.LiftConstantsToInitializersPass(size_limit=1)(model)
     for graph in model.graphs():
         for value in graph.initializers.values():
             tensor = value.const_value
