@@ -2177,6 +2177,7 @@ def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str
 
 # ---- Dispatcher ----
 
+
 def _generate_tips(case: TestCase, json_path: Path, device: str) -> None:
     from mobius._testing.tips import generate_golden
 
