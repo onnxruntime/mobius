@@ -44,6 +44,9 @@ reason — before the PR is merged.
       uninitialized/no-op lintrunner is not evidence)
       On Windows `WinError 206`, format explicit changed-file batches, then run
       `lintrunner -a`; disclose the all-files limitation.
+- [ ] Remote validation covers the exact committed snapshot, not selected model
+      files. Transfer every formatter change back (including scripts), commit it,
+      and verify the resulting head; record interpreter and commands.
 
 ### 2. L1 — Graph builds
 
@@ -144,7 +147,8 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 - [ ] `mobius build --model <hf-model-id> --output /tmp/out` completes without error
 - [ ] Saved package reloads with `ModelPackage.load` and runs using persisted
       metadata, not only the original in-memory config
-- [ ] Output directory contains the expected ONNX files and `genai_config.json`
+- [ ] Output directory contains expected ONNX files and task-appropriate metadata;
+      require `genai_config.json` only for routes that emit ORT GenAI metadata
 - [ ] Multi-model tasks use standardised ModelPackage keys: `"decoder"`,
       `"vision_encoder"`, `"audio_encoder"`, `"embedding"` (not legacy names
       like `"model"`, `"vision"`, `"audio"`, or `"speech"`)
@@ -153,7 +157,12 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 
 ### 8a. Multi-EP correctness (CUDA)
 
-- [ ] Model runs correctly with `--ep cuda` (or `--device cuda`)
+- [ ] CLI export uses `--execution-provider cuda` (`--ep cuda`); inference and
+      golden commands preserve the selected CUDA index end-to-end
+- [ ] Verify the installed ORT runtime and available providers after setup:
+      CPU/GPU wheels share a module and can overwrite one another
+- [ ] Actual profiling places critical compute kernels on CUDA; GPU hardware
+      presence or registered providers alone is not execution evidence
 - [ ] CUDA results match CPU results (compare generation output)
 - [ ] No crashes from large tensor operations (see ORT Gather int32
       overflow: microsoft/onnxruntime#28107)
@@ -247,6 +256,10 @@ novel weight layouts (e.g. fused QKV, non-standard expert routing).
 
 ### 13. Publication and CI triage
 
+- [ ] Give reviewers the exact interpreter, device contract, public task-object
+      API, and revision/checksum guarantees. Request correction/missing-context
+      feedback from interactive agents and retain actual replies; do not claim
+      noninteractive hosted bots were interviewed.
 - [ ] Run specialist review after L1-L3, before expensive L4/L5, and again
       after optimization or rebase changes
 - [ ] Rebase linearly onto `origin/main`; resolve shared registries/helpers

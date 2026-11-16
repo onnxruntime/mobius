@@ -202,7 +202,8 @@ Compare ONNX outputs against pre-computed golden files in `testdata/golden/`.
 These are causal-LM examples, not mandatory output contracts. For embeddings,
 L5 checks semantic retrieval/rankings (including supported truncated dimensions).
 For continuous outputs, compare the full horizon and postprocessing against an
-independent pinned reference across multiple host feedback blocks. Greedy
+independent pinned reference across multiple host feedback blocks, using meaningful
+semantic trajectories rather than random sequences alone. Greedy
 refinement can still draw random permutations: record upstream draw orders when
 a seed alone cannot reproduce CPU/CUDA execution.
 
@@ -218,6 +219,22 @@ For multi-component exports, test `package.save` -> `ModelPackage.load` -> actua
 inference using restored metadata; arbitrary `ArchitectureConfig` fields are not
 automatically reconstructed. Separate codec checkpoints need their own immutable
 revision, config-layout checks, and exact initializer-binding evidence.
+
+Validate golden horizon, revision, dtype, and prompt/input provenance against the
+independent YAML case contract, not values read back from the golden itself.
+Add corruption regressions so truncated or mismatched goldens cannot redefine
+their own acceptance criteria. For speculative decoding, cover zero, partial,
+and full acceptance, final truncation, and rollback/bonus-token cache and valid
+length invariants.
+
+Checkpoint tensor integrity does not prove reference validity. Assert finite,
+nondegenerate upstream outputs before generating goldens. If meta loading leaves
+nonpersistent buffers (for example RoPE) uninitialized, trace their original
+constructor/buffer provenance; do not silently patch reference math. Distinguish
+generated install/cache files from edits to tracked upstream reference code.
+Preserve `cuda:N` through loaders, CLI, generators, and ORT device selection;
+upstream temporary allocations may also need `with torch.device(device):`,
+not just `model.to(device)`.
 
 > Read [`references/test-examples.md`](references/test-examples.md) for
 > YAML format, golden file format, and step-by-step coverage instructions.

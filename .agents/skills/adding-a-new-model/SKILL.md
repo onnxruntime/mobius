@@ -12,7 +12,7 @@ description: >
 
 ## When to use
 
-Use this skill when adding support for a new HuggingFace model architecture
+Use this skill when adding support for a new model architecture
 (e.g. a new LLM family, vision model, encoder-decoder, audio model, or
 diffusion component) to the `mobius` package.
 
@@ -31,10 +31,11 @@ Read these when you need deeper detail on a specific topic:
 
 ## Prerequisites
 
-- Identify the HuggingFace `model_type` string (from the model's `config.json`)
+- Identify the HuggingFace `model_type` string (from `config.json`), or the
+  distinctive native format signature when no Transformers config exists
 - Find a small checkpoint on HuggingFace Hub for testing
-- Have the HuggingFace `transformers` source available to reference the
-  PyTorch implementation
+- Have the pinned upstream implementation available (`transformers` or the
+  model's native source)
 - Pin the checkpoint revision before collecting configs, weights, processors,
   parity data, or goldens
 - Before a long run, smoke-test the pinned upstream loader in the exact task
@@ -45,6 +46,9 @@ Read these when you need deeper detail on a specific topic:
 - If an architecture needs newer upstream code, isolate an immutable reference
   pin to its tests; verify installed commit provenance and replay with the
   unchanged shared reference dependencies.
+- For native non-Transformers checkpoints, use their actual config and loader;
+  do not invent a HuggingFace config to force the Transformers route. Check the
+  public builder/task contracts and the test dispatch points before implementation.
 
 ## Step-by-step
 
@@ -55,6 +59,7 @@ architecture with no special components.  Before writing a custom class,
 check whether `CausalLMModel` from `models/base.py` produces correct results:
 
 ```python
+from mobius import build
 from mobius._registry import registry
 from mobius.models.base import CausalLMModel
 
@@ -88,7 +93,9 @@ class MyTextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
-        self.layers = [MyDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.layers = nn.ModuleList(
+            [MyDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
 
@@ -259,6 +266,11 @@ Preserve mapping-valued metadata (RoPE, sparse layer overrides, integer-keyed
 tables) when adapting config sections. Detect untagged native configs only from
 a distinctive complete signature; set compute dtype explicitly and test inherited
 `None` defaults rather than confusing checkpoint storage dtype with export dtype.
+Trace composite unwrapping through the public builder and config resolver:
+required vision/audio fields must survive via `parent_config`. Compare actual
+raw pinned JSON with the trusted config class, not two hand-built lookalikes.
+Checkpoint-scoped support should reject unsupported structure explicitly rather
+than fill missing architecture fields with compatibility-masking defaults.
 
 ### 7. Write tests
 
@@ -294,6 +306,11 @@ See the **writing-tests** skill for full details.  At minimum:
    ```bash
    mobius build --model org/my-small-model --output mymodel/output
    ```
+   Also exercise public `build(..., load_weights=True)`, including supported
+   task names and task objects; `build_from_module` alone bypasses routing and
+   config contracts. Explicit revisions must not bypass checkpoint checksum
+   validation where a loader provides it. Run golden generation through its
+   real entrypoint too, including task dispatch in `scripts/generate_golden.py`.
 
 ### 8. Documentation
 
@@ -492,6 +509,9 @@ config-driven features for the offending subclass.
   positional parameters and add a positional-call compatibility test.
 - Helpers with rank/shape contracts must receive a value of that rank; do not
   rely on incidental compatibility from a higher-rank tensor.
+- Verify attention-mask ranks on the target EP: rank-3 Q/K/V attention may need
+  an explicitly expanded `[batch, 1, query_length, key_length]` mask rather than
+  a broadcast-only query dimension. Preserve padding polarity and semantics.
 
 ## Reference examples
 
