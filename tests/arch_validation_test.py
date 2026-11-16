@@ -105,6 +105,11 @@ def _load_hf_config(model_id: str, revision: str | None = None):
     ``n_embd`` → ``hidden_size``).  Raw config.json is used when the
     model type isn't registered in transformers.
     """
+    if model_id == "google/gnm-v3":
+        from mobius.models.gnm import GNMConfig
+
+        return GNMConfig.from_pretrained(model_id, revision=revision)
+
     import transformers
 
     class _MissingStrictDataclassClassValidationError(Exception):

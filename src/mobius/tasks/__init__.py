@@ -75,6 +75,7 @@ __all__ = [
     "KevTask",
     "Lfm2VlTask",
     "ModelTask",
+    "MeshGenerationTask",
     "MultiComponentModelTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
@@ -187,6 +188,7 @@ from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._kimi_k3 import KimiK3CausalLMTask
 from mobius.tasks._kimi_linear import KimiLinearCausalLMTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
+from mobius.tasks._mesh import MeshGenerationTask
 from mobius.tasks._minimax_music3 import (
     MiniMaxMusic3ConditionTask,
     MiniMaxMusic3DenoisingTask,
@@ -248,6 +250,7 @@ from mobius.tasks._world_model import WorldModelTask
 # ---------------------------------------------------------------------------
 
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
+    "mesh-generation": MeshGenerationTask,
     "adapter": AdapterTask,
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,

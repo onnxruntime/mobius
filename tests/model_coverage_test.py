@@ -74,6 +74,7 @@ def _l1_l3_model_types() -> set[str]:
     detection, SSM, vision-language, and speech.
     """
     types: set[str] = set()
+    types.add("gnm")  # Native NPZ architecture: dedicated mesh graph/parity tests.
     all_configs = (
         ALL_CAUSAL_LM_CONFIGS
         + ENCODER_CONFIGS

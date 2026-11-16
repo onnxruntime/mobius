@@ -92,6 +92,7 @@ from mobius.models import (
     GlmCausalLMModel,
     GlmMoeDsaCausalLMModel,
     GlmOcrForConditionalGeneration,
+    GNMHeadModel,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     GraniteMoECausalLMModel,
@@ -1144,6 +1145,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         SEMambaSpeechEnhancementModel,
         task="speech-enhancement",
         config_class=ReUseConfig,
+    ),
+    "gnm": ModelRegistration(
+        GNMHeadModel,
+        task="mesh-generation",
+        config_class=GNMHeadModel.config_class,
+        test_model_id="google/gnm-v3",
+        test_revision="c01e90d298d82301f9fd18f54806be751775cb7c",
     ),
     "semamba": ModelRegistration(
         SEMambaSpeechEnhancementModel,

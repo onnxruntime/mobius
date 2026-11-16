@@ -37,6 +37,7 @@ multi-component export for pipelines.
 | **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
 | **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage / Qwen-Image-Edit-2509, HunyuanDiT, CogVideoX |
 | **Adapters** | T2I-Adapter, IP-Adapter |
+| **3D mesh generation** | Google GNM v3 articulated head |
 
 Mage-VL supports direct three-model ONNX export. ORT GenAI export is currently
 rejected because the runtime cannot supply its required `patch_positions` input
@@ -46,6 +47,23 @@ Supports **290+ Transformers model types** and **10 Diffusers component types**
 across **40+ task types** and **100+ reusable components**.
 
 See the [model documentation](https://onnxruntime.github.io/mobius/models/index.html) for the complete list.
+
+### GNM articulated head meshes
+
+`mobius build --model google/gnm-v3 --dtype f32 --output gnm-output` imports the
+pinned Apache-2.0 native NPZ release. The graph takes float32 `identity [B,253]`,
+`expression [B,383]`, `rotations [B,4,3]` (axis-angle radians), and
+`translation [B,3]`, and returns all `vertices [B,17821,3]`. Joint ordering is
+neck, head, left eye, right eye. Supply zero-valued tensors for neutral controls;
+all inputs share the same batch size. Mesh topology/UVs remain in the original
+NPZ archive. Only float32 is qualified; reduced precision and quantization are
+rejected. GNM is not a token-generating model and does not use ORT GenAI.
+
+Full-checkpoint CUDA L4 and 24-frame semantic L5 references are regenerated with
+`python scripts/generate_gnm_golden.py --reference-root <google-gnm-checkout>`.
+Use upstream revision `dfd3e4b96bda2f0061c6013a458b435cf3cb519f` and install its
+`gnm/shape` package into an isolated reference environment. Replay both with
+`MOBIUS_TEST_DEVICE=cuda python -m pytest tests/e2e_golden_test.py -k gnm -v`.
 
 ## Projection-specific QMoE export
 

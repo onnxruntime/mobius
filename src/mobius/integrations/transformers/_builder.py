@@ -370,6 +370,40 @@ def build_transformers_model(
     bespoke builders do not support this option.
     """
     validate_matmul_nbits_accuracy_level(matmul_nbits_accuracy_level)
+    if model_id == "google/gnm-v3" or model_id.endswith("gnm_head.npz"):
+        from mobius.integrations._gnm import build_gnm
+        from mobius.tasks import MeshGenerationTask
+
+        unsupported = {
+            "task": task not in (None, "mesh-generation")
+            and not isinstance(task, MeshGenerationTask),
+            "module_class": module_class is not None,
+            "output_layer_indices": output_layer_indices is not None,
+            "trace_optimization": trace_optimization,
+            "keep_quantized=False": not keep_quantized,
+            "matmul_nbits_accuracy_level": matmul_nbits_accuracy_level is not None,
+            "text_only": text_only,
+            "fp8_kv_cache": fp8_kv_cache,
+            "kv_cache_scales": kv_cache_scales is not None,
+            "prune_prefill_prefix": prune_prefill_prefix,
+            "glm_full_attention": glm_full_attention,
+            "export_paged_attention": export_paged_attention,
+            "input_sampling_rate": input_sampling_rate is not None,
+            "bwe_sampling_rate": bwe_sampling_rate is not None,
+        }
+        selected = sorted(name for name, enabled in unsupported.items() if enabled)
+        if selected:
+            raise ValueError(
+                "GNM only supports native float32 mesh generation; remove these "
+                "unsupported build options: " + ", ".join(selected)
+            )
+        return build_gnm(
+            model_id,
+            revision=revision,
+            dtype=dtype,
+            execution_provider=execution_provider,
+            load_weights=load_weights,
+        )
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 

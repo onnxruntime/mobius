@@ -1,0 +1,6 @@
+model_id: google/gnm-v3
+model_type: gnm
+revision: c01e90d298d82301f9fd18f54806be751775cb7c
+task_type: mesh-generation
+dtype: float32
+level: L4+L5
