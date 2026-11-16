@@ -924,7 +924,8 @@ def test_per_layer_projections_quantize_when_not_excluded():
 def _quark_pack_test_tensor(codes: torch.Tensor) -> torch.Tensor:
     """Pack ``[R, C]`` uint4 codes the way AMD Quark does.
 
-    8 codes per int32, interleaved order (see ``_weight_utils_test._quark_pack``).
+    8 codes per int32, interleaved order (see
+    ``mobius.integrations.quark._weights_test._quark_pack``).
     """
     order = [0, 2, 4, 6, 1, 3, 5, 7]
     rows, cols = codes.shape

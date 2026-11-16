@@ -39,7 +39,6 @@ from mobius._constants import GEMMA4_CUSTOM_GEGLU_METADATA_KEY
 from mobius._flags import flags
 from mobius._weight_utils import (
     QMoEQuantizationLayout,
-    dequantize_quark_projections,
     is_packed_quant_key,
     preprocess_quantized_weights,
     resolve_qmoe_quantization,
@@ -64,6 +63,7 @@ from mobius.components import (
 from mobius.components._activations import get_activation
 from mobius.components._gemma4_audio import Gemma4AudioEncoder
 from mobius.components._mlp import GatedMLP
+from mobius.integrations.quark import dequantize_quark_projections
 from mobius.models.base import CausalLMModel, _retain_last_sequence_token
 from mobius.models.gemma3_text import Gemma3TextScaledWordEmbedding
 
