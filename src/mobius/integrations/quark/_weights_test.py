@@ -12,6 +12,7 @@ from mobius._configs import QuantizationConfig
 from mobius._weight_utils import preprocess_quantized_weights
 from mobius.integrations.quark import preprocess_quark_weights
 
+
 def _quark_pack(codes: torch.Tensor) -> torch.Tensor:
     """Pack ``[R, C]`` uint4 codes the way AMD Quark does.
 

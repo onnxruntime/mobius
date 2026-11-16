@@ -73,4 +73,4 @@ class TestQuarkConfig:
 
     def test_quark_requires_group_size(self):
         with pytest.raises(ValueError, match="group_size"):
-            QuantizationConfig.from_value(self._quark_config(group_size=None))
+            QuantizationConfig.from_value(self._quark_config(group_size=None))

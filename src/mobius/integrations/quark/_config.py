@@ -55,8 +55,7 @@ def parse_quark_config(qc: Mapping) -> QuantizationConfig:
         )
     if not isinstance(weight, Mapping):
         raise TypeError(
-            "Quark global_quant_config.weight must be a mapping, got "
-            f"{type(weight).__name__}."
+            f"Quark global_quant_config.weight must be a mapping, got {type(weight).__name__}."
         )
 
     dtype = weight.get("dtype")

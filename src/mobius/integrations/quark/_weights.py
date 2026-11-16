@@ -214,4 +214,3 @@ def dequantize_quark_projections(
         )
         state_dict.pop(f"{stem}.weight_scale", None)
         state_dict.pop(f"{stem}.weight_zero_point", None)
-

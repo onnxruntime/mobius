@@ -347,13 +347,10 @@ def _split_per_layer_projection_weight(
     normalized_scales = state_dict.get(f"{base}.scales")
     if normalized_scales is not None:
         if weight.shape[0] != expected:
-            raise ValueError(
-                f"{base}.weight dim 0 expected {expected}, got {weight.shape[0]}"
-            )
+            raise ValueError(f"{base}.weight dim 0 expected {expected}, got {weight.shape[0]}")
         if normalized_scales.shape[0] != expected:
             raise ValueError(
-                f"{base}.scales dim 0 expected {expected}, got "
-                f"{normalized_scales.shape[0]}"
+                f"{base}.scales dim 0 expected {expected}, got {normalized_scales.shape[0]}"
             )
         pw, cw = weight.split([producer, consumer], dim=0)
         state_dict[f"{base}.weight"] = pw.contiguous()
