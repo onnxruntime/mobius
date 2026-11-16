@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import numpy as np
+import onnx
 import onnx_ir as ir
 import pytest
 from onnxscript import GraphBuilder
@@ -14,6 +15,62 @@ from mobius._testing.ort_inference import OnnxModelSession
 from mobius.functions.linear_attention import linear_attention
 
 pytestmark = pytest.mark.opset29
+
+
+@pytest.mark.parametrize("trajectory", [False, True])
+def test_merged_value_head_schema_checks_and_infers(trajectory: bool) -> None:
+    if "v_num_heads" not in onnx.defs.get_schema("LinearAttention", 29).attributes:
+        pytest.skip("Requires ONNX containing merged onnx/onnx#8693")
+    shapes = [
+        [1, 3, 4],
+        [1, 3, 4],
+        [1, 3, 8],
+        [1, 4, 2, 2],
+        [1, 3, 4],
+        [1, 3, 4],
+    ]
+    inputs = [
+        ir.Value(name=name, type=ir.TensorType(ir.DataType.FLOAT), shape=ir.Shape(shape))
+        for name, shape in zip(
+            ("query", "key", "value", "state", "decay", "beta"), shapes, strict=True
+        )
+    ]
+    expected = [[1, 3, 8], [1, 4, 2, 2]]
+    if trajectory:
+        expected.append([1, 3, 4, 2, 2])
+    outputs = [
+        ir.Value(
+            name=f"output{index}",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([None] * len(shape)),
+        )
+        for index, shape in enumerate(expected)
+    ]
+    node = ir.Node(
+        "",
+        "LinearAttention",
+        inputs,
+        attributes=ir.convenience.convert_attributes(
+            {
+                "q_num_heads": 2,
+                "kv_num_heads": 2,
+                "v_num_heads": 4,
+                "update_rule": "gated_delta",
+            }
+        ),
+        outputs=outputs,
+    )
+    model = ir.Model(
+        ir.Graph(
+            inputs, outputs, nodes=[node], opset_imports={"": 29}, name="flash_next_schema"
+        ),
+        ir_version=10,
+    )
+    serialized = ir.serde.serialize_model(model)
+    onnx.checker.check_model(serialized, full_check=True)
+    inferred = onnx.shape_inference.infer_shapes(serialized, strict_mode=True, data_prop=True)
+    restored = ir.serde.deserialize_model(inferred)
+    assert [list(value.shape) for value in restored.graph.outputs] == expected
 
 
 def _run_flash_next(

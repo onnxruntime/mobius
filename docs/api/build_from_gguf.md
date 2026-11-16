@@ -75,6 +75,8 @@ also use grouped dispatch, retaining FP32 routing/SiLU, normalization, scaling,
 and shared gating. Grouped graphs avoid per-expert execution,
 but full-bank dequantization still requires expert-sized workspace unless the EP
 fuses decode with selection; no such fusion/performance claim is made.
+LFM2MoE also has an exact grouped adapter retaining its selection-only correction
+bias, sigmoid weights, optional normalization and routed scaling.
 
 Merged `LinearAttention-29` supports independent `v_num_heads`; the portable
 function can opt into a post-update state trajectory. This costs one recurrent

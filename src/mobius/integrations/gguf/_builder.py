@@ -7957,6 +7957,7 @@ def _replace_grouped_moe_layers(module) -> list[str]:
         GroupedUngatedSharedMoELayer,
         MoELayer,
     )
+    from mobius.models.lfm2 import GroupedLfm2MoEFeedForward, Lfm2MoEFeedForward
     from mobius.models.moe import Qwen2MoELayer, UngatedSharedMoELayer
     from mobius.models.qwen35 import Qwen35MoEBlock
 
@@ -7965,6 +7966,7 @@ def _replace_grouped_moe_layers(module) -> list[str]:
         Qwen2MoELayer: GroupedGatedSharedMoELayer,
         Qwen35MoEBlock: GroupedGatedSharedMoELayer,
         UngatedSharedMoELayer: GroupedUngatedSharedMoELayer,
+        Lfm2MoEFeedForward: GroupedLfm2MoEFeedForward,
     }
     replaced: list[str] = []
     for name, child in list(module.named_modules()):
