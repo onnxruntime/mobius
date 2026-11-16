@@ -180,7 +180,7 @@ def test_quark_grouping_fails_closed():
         "model.q_proj.weight_zero_point": torch.zeros(2, 4, dtype=torch.int32),
     }
 
-    with pytest.raises(NotImplementedError, match="component-quantization codec path"):
+    with pytest.raises(NotImplementedError, match="cannot be grouped by this codec"):
         codec_registry.get("quark").group(
             _component(), state_dict, _config("quark", sym=False)
         )
