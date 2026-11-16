@@ -28,15 +28,14 @@ def test_gnm_synthetic_gpu_parity(tmp_path):
 
     reference_file = Path(gnm_pytorch.__file__).resolve()
     root = next(parent for parent in reference_file.parents if (parent / ".git").exists())
-    assert (
-        subprocess.check_output(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
-        ).strip()
-        == GNM_REFERENCE_REVISION
-    )
-    assert not subprocess.check_output(
+    current_revision = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    assert current_revision == GNM_REFERENCE_REVISION
+    git_status = subprocess.check_output(
         ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"], text=True
     )
+    assert not git_status
     assert torch.cuda.is_available()
     assert "CUDAExecutionProvider" in ort.get_available_providers()
     assert os.environ.get("NVIDIA_TF32_OVERRIDE") == "0"
