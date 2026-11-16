@@ -233,6 +233,7 @@ from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.talkie import TalkieForCausalLM
+from mobius.models.tips import TIPS_REVISION, TipsConfig, TipsModel
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vibevoice import (
     VIBEVOICE_ASR_STREAMING_MODEL_ID,
@@ -1102,6 +1103,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "sam2": ModelRegistration(Sam2VisionModel, task="image-classification"),
     "segformer": ModelRegistration(
         SegformerForSemanticSegmentation, task="image-classification"
+    ),
+    "tipsv2": ModelRegistration(
+        TipsModel,
+        task="tips-feature-extraction",
+        config_class=TipsConfig,
+        test_model_id="google/tipsv1-b14",
+        test_revision=TIPS_REVISION,
     ),
     "siglip": ModelRegistration(SigLIPVisionModel, task="image-classification"),
     "siglip2": ModelRegistration(SigLIPVisionModel, task="image-classification"),

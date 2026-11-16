@@ -159,6 +159,8 @@ def _make_params(configs: list[tuple[str, dict, bool]]) -> list:
 
 
 _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
+    # Dual-tower spatial embeddings (co-located models/tips_test.py).
+    "tipsv2",
     # Internal GGUF-only graph covered by _exact_legacy_decoder_test.py.
     "gguf_legacy",
     # Mistral4 owns a K-only latent cache, covered by _remaining_dense_test.py.

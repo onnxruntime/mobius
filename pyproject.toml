@@ -45,6 +45,7 @@ testing = [
     "transformers>=5.0",
     "safetensors",
     "onnxruntime-genai",
+    "sentencepiece",  # TIPS's pinned independent reference tokenizer
     "pytest-xdist",
     "pytest-timeout",
     "gguf>=0.10.0",

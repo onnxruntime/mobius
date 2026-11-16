@@ -34,7 +34,7 @@ multi-component export for pipelines.
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
 | **Speech-to-Text** | Whisper, Moonshine, Moonshine Streaming, FastConformer-RNNT, FunASR, GLM-ASR, Qwen3-ASR, SenseVoice |
 | **Audio** | Wav2Vec2, HuBERT, WavLM, SpeechT5 |
-| **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
+| **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP, TIPS (global + spatial image/text embeddings) |
 | **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage / Qwen-Image-Edit-2509, HunyuanDiT, CogVideoX |
 | **Adapters** | T2I-Adapter, IP-Adapter |
 

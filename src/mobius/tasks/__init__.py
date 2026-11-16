@@ -110,6 +110,7 @@ __all__ = [
     "SpeechToTextTask",
     "TASK_REGISTRY",
     "TTSTask",
+    "TipsFeatureExtractionTask",
     "VibeVoiceTask",
     "VibeVoiceStreamingTask",
     "VibeVoiceASRTask",
@@ -217,6 +218,7 @@ from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
 from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
 from mobius.tasks._t5_text_encoder import T5TextEncoderTask
+from mobius.tasks._tips import TipsFeatureExtractionTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._vibevoice import VibeVoiceTask
@@ -248,6 +250,7 @@ from mobius.tasks._world_model import WorldModelTask
 # ---------------------------------------------------------------------------
 
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
+    "tips-feature-extraction": TipsFeatureExtractionTask,
     "adapter": AdapterTask,
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,

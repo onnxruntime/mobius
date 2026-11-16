@@ -1,0 +1,16 @@
+model_id: google/tipsv1-b14
+model_type: tipsv2
+revision: 424f5e0ee56557079d99419c729a655e2cbcc7b1
+task_type: tips-feature-extraction
+dtype: float32
+level: L4+L5
+trust_remote_code: true
+inputs:
+  prompts:
+    - a photo of a cat
+    - a photo of a dog
+    - a photo of a bus
+    - a photo of a forest
+  images:
+    - pipeline-cat-chonk.jpeg
+    - mage-vl-dog.jpg

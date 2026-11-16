@@ -65,7 +65,8 @@
         "speech-language",
         "speech-to-text",
         "text-to-speech",
-        "text-generation"
+        "text-generation",
+        "tips-feature-extraction"
       ],
       "description": "Task type string matching the mobius registry."
     },
