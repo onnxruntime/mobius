@@ -10,7 +10,11 @@ import torch
 
 from mobius._configs import QuantizationConfig
 from mobius._weight_utils import preprocess_quantized_weights
-from mobius.integrations.quark import preprocess_quark_weights
+from mobius.integrations.quark import (
+    dequantize_quark_projections,
+    dequantize_quark_weight,
+    preprocess_quark_weights,
+)
 
 
 def _quark_pack(codes: torch.Tensor) -> torch.Tensor:
@@ -148,6 +152,47 @@ class TestPreprocessQuarkWeights:
         with pytest.raises(ValueError, match="implies"):
             preprocess_quark_weights(sd, bits=self.BITS, group_size=64)
 
+    def test_output_feature_mismatch_raises(self):
+        """The payload must pack exactly as many outputs as the scales declare."""
+        codes = torch.randint(0, 16, (self.K, self.N))
+        sd = self._state_dict(codes, None)
+        sd["q_proj.weight_scale"] = torch.randn(self.N_GROUPS, self.N * 2)
+        with pytest.raises(ValueError, match="does not pack"):
+            preprocess_quark_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    def test_non_four_bit_rejected(self):
+        """Only the 4-bit packing is implemented; 8-bit must not be guessed at."""
+        bits, per_word = 8, 32 // 8
+        codes = torch.randint(0, 16, (self.K, self.N))
+        sd = {
+            # Shaped so the output-feature check passes and the bit-width
+            # guard is what actually fires.
+            "q_proj.weight": torch.zeros(self.K, self.N // per_word, dtype=torch.int32),
+            "q_proj.weight_scale": torch.randn(self.N_GROUPS, self.N),
+        }
+        del codes
+        with pytest.raises(NotImplementedError, match="4-bit weights only"):
+            preprocess_quark_weights(sd, bits=bits, group_size=self.GROUP_SIZE)
+
+    def test_odd_zero_point_column_count_is_padded(self):
+        """An odd group count leaves a half-used final byte, not a short row."""
+        k, group_size = 96, 32
+        n_groups = k // group_size  # 3 -> odd nibble count per row
+        codes = torch.randint(0, 16, (k, self.N))
+        zeros = torch.randint(0, 16, (n_groups, self.N))
+        sd = {
+            "q_proj.weight": _quark_pack(codes),
+            "q_proj.weight_scale": torch.randn(n_groups, self.N),
+            "q_proj.weight_zero_point": _quark_pack(zeros),
+        }
+
+        result = preprocess_quark_weights(sd, bits=self.BITS, group_size=group_size)
+
+        # ceil(3 * 4 / 8) == 2 bytes per row, the last holding one real nibble.
+        assert result["q_proj.zero_points"].shape == (self.N, 2)
+        recovered = self._unpack_nibbles(result["q_proj.zero_points"], n_groups)
+        assert torch.equal(recovered, zeros.t().to(torch.int64))
+
     def test_partial_trailing_group_rejected(self):
         """A non-multiple K must fail validation, not the reshape.
 
@@ -180,3 +225,123 @@ class TestPreprocessQuarkWeights:
             ),
         )
         assert result["q_proj.weight"].shape == (self.N, self.N_GROUPS, self.BLOB_SIZE)
+
+
+class TestDequantizeQuarkWeight:
+    """Dense reconstruction, for projections whose graph keeps a float Linear."""
+
+    K = 64
+    N = 16
+    BITS = 4
+    GROUP_SIZE = 32
+    N_GROUPS = K // GROUP_SIZE  # 2
+
+    def _packed(self, codes, zeros):
+        return _quark_pack(codes), _quark_pack(zeros)
+
+    def test_round_trip_matches_manual_dequantization(self):
+        codes = torch.randint(0, 16, (self.K, self.N))
+        zeros = torch.randint(0, 16, (self.N_GROUPS, self.N))
+        scale = torch.randn(self.N_GROUPS, self.N)
+        packed, packed_zeros = self._packed(codes, zeros)
+
+        out = dequantize_quark_weight(
+            packed,
+            scale,
+            packed_zeros,
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            dtype=torch.float32,
+        )
+
+        # (code - zero_point) * scale, per group, transposed to [N, K].
+        per_group = self.K // self.N_GROUPS
+        expected = torch.zeros(self.N, self.K)
+        for n in range(self.N):
+            for g in range(self.N_GROUPS):
+                lo, hi = g * per_group, (g + 1) * per_group
+                expected[n, lo:hi] = (codes[lo:hi, n].float() - float(zeros[g, n])) * scale[
+                    g, n
+                ]
+        assert out.shape == (self.N, self.K)
+        torch.testing.assert_close(out, expected)
+
+    def test_missing_zero_points_means_no_offset(self):
+        codes = torch.randint(0, 16, (self.K, self.N))
+        scale = torch.ones(self.N_GROUPS, self.N)
+
+        out = dequantize_quark_weight(
+            _quark_pack(codes),
+            scale,
+            None,
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            dtype=torch.float32,
+        )
+
+        torch.testing.assert_close(out, codes.t().float())
+
+    def test_dtype_is_honoured(self):
+        codes = torch.randint(0, 16, (self.K, self.N))
+        out = dequantize_quark_weight(
+            _quark_pack(codes),
+            torch.ones(self.N_GROUPS, self.N),
+            None,
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            dtype=torch.bfloat16,
+        )
+        assert out.dtype is torch.bfloat16
+
+
+class TestDequantizeQuarkProjections:
+    """In-place replacement of named projections, used by Gemma4's PLE path."""
+
+    K = 64
+    N = 16
+    BITS = 4
+    GROUP_SIZE = 32
+    N_GROUPS = K // GROUP_SIZE
+
+    def _state_dict(self):
+        codes = torch.randint(0, 16, (self.K, self.N))
+        zeros = torch.randint(0, 16, (self.N_GROUPS, self.N))
+        return {
+            "ple.weight": _quark_pack(codes),
+            "ple.weight_scale": torch.randn(self.N_GROUPS, self.N),
+            "ple.weight_zero_point": _quark_pack(zeros),
+            "norm.weight": torch.randn(self.N),
+        }
+
+    def test_named_stem_becomes_dense_and_sidecars_are_dropped(self):
+        sd = self._state_dict()
+
+        dequantize_quark_projections(
+            sd,
+            ["ple"],
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            dtype=torch.float32,
+        )
+
+        assert sd["ple.weight"].shape == (self.N, self.K)
+        assert sd["ple.weight"].dtype is torch.float32
+        assert "ple.weight_scale" not in sd
+        assert "ple.weight_zero_point" not in sd
+        assert "norm.weight" in sd
+
+    def test_absent_and_float_stems_are_skipped(self):
+        """Callers name every float projection without inspecting the checkpoint."""
+        norm = torch.randn(self.N)
+        sd = {"norm.weight": norm}
+
+        dequantize_quark_projections(
+            sd,
+            ["norm", "not_in_checkpoint"],
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            dtype=torch.float32,
+        )
+
+        assert torch.equal(sd["norm.weight"], norm)
+        assert "not_in_checkpoint.weight" not in sd

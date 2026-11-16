@@ -74,3 +74,74 @@ class TestQuarkConfig:
     def test_quark_requires_group_size(self):
         with pytest.raises(ValueError, match="group_size"):
             QuantizationConfig.from_value(self._quark_config(group_size=None))
+
+    def test_quark_rejects_layer_type_overrides(self):
+        config = self._quark_config()
+        config["layer_type_quant_config"] = {"Linear": {}}
+
+        with pytest.raises(NotImplementedError, match="layer_type_quant_config"):
+            QuantizationConfig.from_value(config)
+
+    def test_missing_weight_layout_raises(self):
+        config = self._quark_config()
+        config["global_quant_config"] = {}
+
+        with pytest.raises(ValueError, match=r"missing global_quant_config\.weight"):
+            QuantizationConfig.from_value(config)
+
+    def test_non_mapping_weight_layout_raises(self):
+        config = self._quark_config()
+        config["global_quant_config"] = {"weight": ["uint4"]}
+
+        with pytest.raises(TypeError, match="must be a mapping"):
+            QuantizationConfig.from_value(config)
+
+    def test_non_sequence_exclude_raises(self):
+        config = self._quark_config()
+        config["exclude"] = {"lm_head": True}
+
+        with pytest.raises(TypeError, match="exclude must be a list or tuple"):
+            QuantizationConfig.from_value(config)
+
+    def test_regex_exclusions_are_validated(self):
+        config = self._quark_config()
+        config["exclude"] = ["re:model\\.layers\\.[0-9]+\\.mlp.*"]
+
+        qc = QuantizationConfig.from_value(config)
+
+        assert qc.modules_to_not_convert == ("re:model\\.layers\\.[0-9]+\\.mlp.*",)
+
+    def test_invalid_regex_exclusion_raises(self):
+        config = self._quark_config()
+        config["exclude"] = ["re:model\\.layers\\.[0-9"]
+
+        with pytest.raises(ValueError, match="Invalid quantization regex"):
+            QuantizationConfig.from_value(config)
+
+    def test_excluded_lm_head_is_float(self):
+        """Quark marks float modules in ``exclude``, so a listed head is float."""
+        qc = QuantizationConfig.from_value(self._quark_config())
+
+        assert qc.quantize_lm_head is False
+
+    def test_lm_head_absent_from_exclude_is_quantized(self):
+        """The inverse test that the AWQ/GPTQ reader gets wrong for Quark.
+
+        Quark never writes an explicit ``lm_head`` key, so that parser defaults
+        the flag False and a float head is built over packed weights.
+        """
+        config = self._quark_config()
+        config["exclude"] = ["model.vision_tower"]
+
+        qc = QuantizationConfig.from_value(config)
+
+        assert qc.quantize_lm_head is True
+
+    def test_embeddings_are_never_inferred_as_quantized(self):
+        """Quark ships embed_tokens as plain BF16, so the flag stays off."""
+        config = self._quark_config()
+        config["exclude"] = []
+
+        qc = QuantizationConfig.from_value(config)
+
+        assert qc.quantize_embeddings is False
