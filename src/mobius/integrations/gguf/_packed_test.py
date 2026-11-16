@@ -180,11 +180,14 @@ def test_all_stored_reader_formats(tmp_path: Path, qtype: str) -> None:
         SimpleNamespace(preprocess_weights=lambda state: state),
         SimpleNamespace(model_type="qwen2"),
     )
+    assert [value.name for value in model.graph.outputs] == ["out"]
     package.save(str(tmp_path))
+    restored = ModelPackage.load(str(tmp_path))
+    assert [value.name for value in restored["model"].graph.outputs] == ["out"]
     onnx.checker.check_model(str(tmp_path / "model.onnx"), full_check=True)
     evaluator = ReferenceEvaluator(str(tmp_path / "model.onnx"))
     indices = np.array([[1, 0, 1], [-1, -2, 0]], dtype=np.int64)
-    actual = evaluator.run(None, {"ids": indices})[0]
+    actual = evaluator.run(["out"], {"ids": indices})[0]
     if qtype == "Q4_0":
         empty = evaluator.run(None, {"ids": np.empty((1, 0), dtype=np.int64)})[0]
         assert empty.shape == (1, 0, block)

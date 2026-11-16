@@ -14,16 +14,17 @@ import pytest
 from mobius import build_from_gguf
 from mobius._flags import override_flags
 from mobius.integrations.gguf._arch_registry import iter_arch_specs
+from mobius.integrations.gguf._builder_test_utils import _write_quantized_gguf
 
 
 @pytest.mark.opset29
-def test_missing_packed_schemas_reject_before_reading_source(monkeypatch) -> None:
+def test_packed_construction_does_not_require_installed_schemas(tmp_path, monkeypatch) -> None:
+    source = tmp_path / "weights.gguf"
+    _write_quantized_gguf(source)
     monkeypatch.setattr(onnx.defs, "has", lambda *_args: False)
-    with (
-        override_flags(experimental_opset29=True),
-        pytest.raises(ValueError, match="Install current ONNX main"),
-    ):
-        build_from_gguf("does-not-exist.gguf", execution_provider="onnx-standard")
+    with override_flags(experimental_opset29=True):
+        package = build_from_gguf(source, execution_provider="onnx-standard")
+    assert any(node.op_type == "DequantizePacked" for node in package["model"].graph)
 
 
 def test_lossless_survey_covers_census_without_promoting_runtime() -> None:

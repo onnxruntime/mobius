@@ -217,7 +217,7 @@ def _select_packed_rows(model: ir.Model) -> None:
         index_shape = ir.Value(name=f"{prefix}.index_shape")
         final_shape = ir.Value(name=f"{prefix}.output_shape")
         replacement = ir.Value(
-            name=f"{prefix}.output", shape=node.outputs[0].shape, type=node.outputs[0].type
+            name=node.outputs[0].name, shape=node.outputs[0].shape, type=node.outputs[0].type
         )
         scanned = ir.Value(
             name=f"{prefix}.scanned", shape=scan_output.shape, type=scan_output.type
