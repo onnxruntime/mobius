@@ -2177,8 +2177,16 @@ def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str
 
 # ---- Dispatcher ----
 
+
 # Map task_type strings to generator functions.
+def _generate_nemotron_sigma(case, json_path, device):
+    from mobius._testing.nemotron_sigma_golden import generate_golden
+
+    generate_golden(case, json_path, device)
+
+
 _GENERATORS = {
+    "nemotron-sigma": _generate_nemotron_sigma,
     "text-generation": _generate_causal_lm,
     "feature-extraction": _generate_encoder,
     "seq2seq": _generate_seq2seq,

@@ -125,6 +125,7 @@ from mobius.models import (
     Nemotron3DiarizationModel,
     NemotronCausalLMModel,
     NemotronParseForConditionalGeneration,
+    NemotronSigmaModel,
     OLMo2CausalLMModel,
     OLMoCausalLMModel,
     ParakeetForCTCModel,
@@ -707,6 +708,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         variant="gguf",
     ),
     "smollm3": ModelRegistration(SmolLM3CausalLMModel),
+    "nemotron_labs_sigma": ModelRegistration(
+        NemotronSigmaModel,
+        test_model_id="nvidia/Nemotron-Labs-Sigma-distill-spec-3B",
+        test_revision="9769b2d388000e0ff61736d26359074efbf0dc9d",
+    ),
     "stablelm": ModelRegistration(LayerNormCausalLMModel),
     "starcoder2": ModelRegistration(StarCoder2CausalLMModel),
     # --- Mixture of Experts ---

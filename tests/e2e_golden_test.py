@@ -2372,6 +2372,13 @@ class TestL4CheckpointVerified:
 
     @pytest.mark.parametrize("case", _L4_CASES)
     def test_prefill_argmax_matches_golden(self, case: GoldenTestCase) -> None:
+        if case.task_type == "nemotron-sigma":
+            from mobius._testing.nemotron_sigma_golden import assert_golden
+
+            assert_golden(
+                _build_model_package(case), golden_path_for_case(case), case=case, level="L4"
+            )
+            return
         if case.task_type == "text-to-speech":
             pytest.skip(
                 "Continuous-token TTS uses tests/vibevoice_golden_test.py "
@@ -3188,6 +3195,13 @@ class TestL5GenerationE2E:
 
     @pytest.mark.parametrize("case", _L5_CASES)
     def test_generation_matches_golden(self, case: GoldenTestCase) -> None:
+        if case.task_type == "nemotron-sigma":
+            from mobius._testing.nemotron_sigma_golden import assert_golden
+
+            assert_golden(
+                _build_model_package(case), golden_path_for_case(case), case=case, level="L5"
+            )
+            return
         # --- Guard: skip unsupported task types ---
         if case.task_type not in _GENERATION_SUPPORTED_TASKS:
             pytest.skip(

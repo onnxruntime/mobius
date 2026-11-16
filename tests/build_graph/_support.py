@@ -269,6 +269,7 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # input_ids; the generic ALL_CAUSAL_LM_CONFIGS matrix can't drive it).
     # Covered by src/mobius/models/_dflash_test.py.
     "DFlashDraftModel",
+    "nemotron_labs_sigma",
     # Gemma4-Assistant: bespoke IO contract (consumes inputs_embeds +
     # the target's shared KV instead of input_ids), so the generic
     # ALL_CAUSAL_LM_CONFIGS matrix can't drive it. Covered by
