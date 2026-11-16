@@ -811,7 +811,10 @@ class ModelPackage(UserDict[str, ir.Model]):
         )
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
-        if getattr(self, "gguf_packed_sources", None) is not None:
+        if getattr(self, "gguf_packed_sources", None) is not None or any(
+            model.metadata_props.get("mobius.gguf.original_external_data") == "1"
+            for model in self.values()
+        ):
             from mobius.integrations.gguf._packed import save_packed_package
 
             if len(component_layout.components) != len(self):

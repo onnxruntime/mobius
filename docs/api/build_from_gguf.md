@@ -40,10 +40,39 @@ layout operations, with `GroupedMatMul` for ordinary routed experts. It does not
 repack, requantize, copy payloads into a new blob, or materialize a dense vocabulary
 at export time. Row-aligned packed embeddings decode only requested rows.
 
-Current packaging is one flat model with its original, little-endian GGUF shards,
-`gguf-packed.json`, and reports. Multi-component/mmproj/MTP packages, transcoded
-safetensors output, and new weight sharding are rejected. Treat source files as
-immutable; load/save verifies source digests and original external bindings.
+Packages may contain multiple components and an independently cached MTP head,
+sharing the same original, little-endian GGUF shards. `gguf-packed.json` v2
+records component names and the MTP chain; single `model` exports retain v1.
+All sources must have unique filenames and reside in the output directory.
+Treat source files as immutable; load/save verifies source digests, ranges, and
+original external bindings. Transcoded safetensors output and new weight sharding
+remain unsupported.
+
+Lossless standalone mmproj conversion currently supports `janus_pro`:
+
+```python
+from mobius.integrations.gguf import build_mmproj_from_gguf
+
+vision = build_mmproj_from_gguf(
+    "weights/mmproj.gguf",
+    projector_type="janus_pro",
+    target_architecture="llama",
+    execution_provider="onnx-standard",
+)
+vision.save("weights")
+```
+
+This exports a functional vision/projector component, not a paired text-insertion
+runtime. Other lossless projector routes and the paired `mmproj=` path still
+raise explicitly. Existing Qwen3.5/3.8 and Hunyuan-V3 MTP contract restrictions
+remain: one physical prediction block, independent dynamic cache, explicit
+hidden/embedding/head sharing; representation does not implement acceptance policy.
+
+Ordinary MLP MoE experts now retain biases, activations, and exact gated or ungated
+shared-expert composition under grouped dispatch. Specialized custom expert
+compositions are not silently replaced. Grouped graphs avoid per-expert execution,
+but full-bank dequantization still requires expert-sized workspace unless the EP
+fuses decode with selection; no such fusion/performance claim is made.
 The flag does **not** add runtime kernels. See the
 [opset-29 survey](../gguf-capability-catalog.md#lossless-opset-29-survey).
 
