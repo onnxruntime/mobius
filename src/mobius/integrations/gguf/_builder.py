@@ -271,13 +271,12 @@ def _raise_for_sharded_gguf(
 
 
 class SparseMoEExportError(NotImplementedError):
-    """An explicitly sparse-only export cannot fuse its routed MoE experts.
+    """Routed MoE experts would execute an all-expert dense fallback.
 
-    Raised before export when a checkpoint's routed experts lower to per-expert
-    native ``pkg.nxrt::BlockQuantizedMatMul`` nodes (e.g. GLM-5.2 UD-IQ1_{S,M})
-    for which no sparse top-k ``BlockQuantizedMoE`` fusion exists — exporting
-    anyway would recompute every expert for every token (dense-all-expert
-    compute). Default exports allow that fallback with a warning.
+    This includes native ``pkg.nxrt::BlockQuantizedMatMul`` experts without
+    sparse fusion and modules without an exact standard grouped lowering.
+    Computing every expert for every token requires explicit opt-in; standard
+    ``GroupedMatMul`` selected-expert dispatch does not.
     """
 
 
@@ -310,7 +309,7 @@ def _assert_sparse_moe_capability(module, config, *, source: str, allow_dense: b
     the only sparse MoE path today; native IQ/MXFP4 block experts stay as
     per-expert ``BlockQuantizedMatMul`` nodes. Exporting those yields a graph
     that evaluates every expert for every token. Warn when dense fallback is
-    allowed; reject only an explicitly sparse-only request.
+    allowed; reject by default.
     """
     num_experts = int(getattr(config, "num_local_experts", 0) or 0)
     if num_experts <= 0:
@@ -342,11 +341,40 @@ def _assert_sparse_moe_capability(module, config, *, source: str, allow_dense: b
         "block formats — only int4 MatMulNBits experts are fused into "
         "com.microsoft::QMoE. Exporting anyway would build a dense-all-expert "
         "graph (every expert evaluated for every token) with no performance "
-        "guarantee, but sparse-only export was requested. To allow the dense "
+        "guarantee, so the build fails closed by default. To allow the dense "
         "fallback, re-run with allow_dense_moe=True (or set "
         "MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this makes no throughput claim. "
         "The supported fix is a sparse IQ-block BlockQuantizedMoE fusion "
         "(top-k gather over native-block expert weights)."
+    )
+
+
+def _assert_grouped_moe_capability(module, *, source: str, allow_dense: bool) -> None:
+    """Reject remaining all-expert modules, not selected-expert grouped dispatch."""
+    from onnxscript import nn
+
+    from mobius.components import GroupedMoELayer, MoELayer
+
+    dense_paths = [
+        name
+        for name, child in module.named_modules()
+        if isinstance(child, MoELayer)
+        and not isinstance(child, GroupedMoELayer)
+        and isinstance(child.experts, nn.ModuleList)
+    ]
+    if not dense_paths:
+        return
+    detail = (
+        f"GGUF {source!r} retains all-expert MoE execution at {dense_paths} after "
+        "opset-29 grouped replacement. These modules evaluate every expert for "
+        "every token; they are not GroupedMatMul selected-expert dispatch."
+    )
+    if allow_dense:
+        logger.warning("allow_dense_moe: %s No throughput claim is made.", detail)
+        return
+    raise SparseMoEExportError(
+        f"{detail} Add an exact grouped lowering, or explicitly opt in to the "
+        "inefficient fallback with allow_dense_moe=True for correctness study."
     )
 
 
@@ -364,9 +392,9 @@ def _fuse_native_block_moe(pkg, *, allow_dense: bool) -> int:
     UD-IQ1) can only be expressed with the ``block_layout_version=2``
     per-projection ABI, which no shipped onnx-genai runtime executes yet. The
     production builder therefore never enables v2: such layers retain their
-    dense graph with a warning, or typed-reject when sparse-only export is
-    explicitly requested, rather than emit an unrunnable node. There is no
-    environment or CLI opt-in -- v2 stays a schema-construction test path until a
+    dense graph only with explicit opt-in, or typed-reject by default, rather
+    than emit an unrunnable node. There is no environment or CLI opt-in for v2;
+    it stays a schema-construction test path until a
     real typed runtime-capability handshake exists.
     """
     # Imported lazily: the generic rewrite lives in the rewrite_rules package and
@@ -408,7 +436,7 @@ def _assert_sparse_moe_graph(pkg, *, source: str, allow_dense: bool) -> None:
     routed per-expert ``BlockQuantizedMatMul`` storm that survived fusion (e.g. a
     dispatch shape the rewrite did not recognise): shipping it silently would be
     a dense-all-expert graph with no throughput guarantee. Warn even when the
-    fusion did not recognize the layer, or reject an explicitly sparse-only request.
+    fusion did not recognize the layer, or reject without explicit dense opt-in.
     """
     storm = [n for model in pkg.values() for n in _routed_dense_block_matmul_nodes(model)]
     if not storm:
@@ -428,8 +456,8 @@ def _assert_sparse_moe_graph(pkg, *, source: str, allow_dense: bool) -> None:
         "per-expert pkg.nxrt::BlockQuantizedMatMul nodes after native-block MoE "
         "fusion (no sparse top-k BlockQuantizedMoE was applied). Exporting anyway "
         "would build a dense-all-expert graph (every expert evaluated for every "
-        "token) with no performance guarantee, but sparse-only export was "
-        "requested. To allow the dense fallback, re-run with allow_dense_moe=True (or set "
+        "token) with no performance guarantee, so the build fails closed by default. "
+        "To allow the dense fallback, re-run with allow_dense_moe=True (or set "
         "MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this makes no throughput claim."
     )
 
@@ -6823,15 +6851,15 @@ def build_from_gguf(
         max_seq_len: Maximum sequence length for the static cache buffers.
             Only used when ``static_cache=True``. Defaults to the model's
             ``max_position_embeddings``.
-        allow_dense_moe: Allow exporting routed MoE experts that have no
+        allow_dense_moe: Opt in to exporting routed MoE experts that have no
             sparse top-k fusion (they lower to per-expert native
             ``BlockQuantizedMatMul`` nodes, i.e. dense-all-expert compute with
             no performance guarantee). When ``None`` (default), the value of
             the ``allow_dense_moe_experts`` flag is used, which defaults to
-            ``True``. The existing dense graph is retained with a warning and
-            no throughput claim; unsupported fused ABIs are not emitted.
-            Explicit ``False`` requires sparse fusion and raises a typed
-            capability error when it is unavailable.
+            ``False``. An all-expert fallback requires explicit ``True`` and
+            emits a warning without a throughput claim. Standard opset-29
+            grouped top-k dispatch does not require this opt-in, even when
+            its packed weights are decoded as a full bank.
         reuse_gguf_weights: Reuse compatible tensor payloads directly from the
             original GGUF via ONNX external-data ranges. The GGUF must be a real
             file in the final flat output directory. Converted tensors are
@@ -7570,6 +7598,9 @@ def build_from_gguf(
                 logger.warning("%s", warning)
     if lossless_packed:
         _replace_grouped_moe_layers(module)
+        _assert_grouped_moe_capability(
+            module, source=str(gguf_path), allow_dense=allow_dense_moe
+        )
     effective_norms = False
     original_decay_paths: frozenset[str] = frozenset()
     if lossless_packed:
@@ -7702,7 +7733,8 @@ def build_from_gguf(
     # Now that every native block carries its real packed bytes, collapse the
     # routed per-expert BlockQuantizedMatMul storm into one sparse top-k
     # pkg.nxrt::BlockQuantizedMoE per layer (byte-for-byte, no requantization),
-    # then report any dense fallback (or reject an explicit sparse-only request).
+    # then reject any dense fallback unless explicitly opted in. The lossless
+    # opset-29 route uses selected-expert GroupedMatMul, not these native ops.
     if preserve_quantization:
         _fuse_native_block_moe(pkg, allow_dense=allow_dense_moe)
         _assert_sparse_moe_graph(pkg, source=str(gguf_path), allow_dense=allow_dense_moe)

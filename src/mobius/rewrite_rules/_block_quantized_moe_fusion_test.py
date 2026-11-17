@@ -650,16 +650,23 @@ def test_alien_routing_weights_expert_fails_closed() -> None:
     assert _count(graph, "Equal") == E  # dense graph left untouched
 
 
-@pytest.mark.parametrize("allow_dense_moe", [None, True])
-def test_allow_dense_moe_keeps_dense_fallback(allow_dense_moe, caplog) -> None:
-    """Default exports and explicit dense exports retain the original graph.
+def test_default_rejects_all_expert_dense_fallback() -> None:
+    model, _ = _build_dense_graph(corrupt_expert_gate_fmt=(1, "iq1_m"))
+    nodes_before = list(model.graph)
+    with pytest.raises(SparseMoEExportError, match="fails closed by default"):
+        fuse_block_quantized_moe(model)
+    assert list(model.graph) == nodes_before
+
+
+def test_allow_dense_moe_keeps_dense_fallback(caplog) -> None:
+    """Explicit dense exports retain the original graph.
 
     Sparse-fusion failure must not change the original dense computation.
     """
     model, _ = _build_dense_graph(corrupt_expert_gate_fmt=(1, "iq1_m"))
     graph = model.graph
     nodes_before = list(graph)
-    fused = fuse_block_quantized_moe(model, allow_dense_moe=allow_dense_moe)
+    fused = fuse_block_quantized_moe(model, allow_dense_moe=True)
     assert fused == 0
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E  # dense fallback preserved, not fused

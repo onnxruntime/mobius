@@ -1068,13 +1068,15 @@ def _grouped_experts(config, shape):
 
 
 def test_opset29_standard_moe_uses_exact_grouped_banks():
-    model = _grouped_experts(_config(num_local_experts=8), [2, 3, 16])
+    with override_flags(allow_dense_moe_experts=False):
+        model = _grouped_experts(_config(num_local_experts=8), [2, 3, 16])
     nodes = list(model.graph.all_nodes())
     grouped = [node for node in nodes if node.op_type == "GroupedMatMul"]
     assert len(grouped) == 2
     assert all(node.attributes["transB"].value == 1 for node in grouped)
     assert grouped[0].inputs[1].name == "gate_up_proj"
     assert grouped[1].inputs[1].name == "down_proj"
+    assert grouped[0].inputs[2].producer().op_type == "TopK"
     assert not any(node.op_type in {"Scan", "NonZero"} for node in nodes)
 
 

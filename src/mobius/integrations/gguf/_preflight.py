@@ -12,9 +12,9 @@ export decision:
   sha256 checksums.
 * The GGUF ``general.architecture`` and the canonical Mobius model type it
   bridges to (e.g. ``glm-dsa`` → ``glm_moe_dsa``).
-* Whether the export is *blocked* — most importantly the sparse-MoE honesty
-  blocker: routed IQ/MXFP4 experts have no sparse ``BlockQuantizedMoE`` fusion,
-  so a build would be dense-all-expert.
+* Whether the export is blocked by an all-expert fallback or an unsupported
+  contract. Standard opset-29 grouped top-k dispatch is not dense execution;
+  decoding a full packed weight bank is a separate materialization cost.
 
 Everything here is **metadata only**. For a Hub reference it uses
 ``HfApi.model_info(expand=["gguf"])`` for the architecture/expert counts and
@@ -76,9 +76,8 @@ _MOE_MODEL_TYPES = frozenset(
     }
 )
 
-# GGUF quantization tokens whose routed experts lower to native
-# ``pkg.nxrt::BlockQuantizedMatMul`` blocks (no sparse top-k fusion exists yet).
-# Only int4 ``MatMulNBits`` experts fuse into ``com.microsoft::QMoE``.
+# GGUF quantization tokens whose legacy routed experts use native block ops.
+# The standard opset-29 path instead preserves packed source weight banks.
 _NATIVE_BLOCK_QUANT_RE = re.compile(
     r"(IQ1_[SM]|IQ2_(XXS|XS|S)|IQ3_(XXS|S)|IQ4_(NL|XS)|MXFP4|TQ1_0|TQ2_0)",
     re.IGNORECASE,
@@ -302,8 +301,9 @@ def _assess_sparse_moe(
     """Return ``(fusion_supported, blockers, warnings)`` for routed experts.
 
     Native-block sparse fusion depends on the final per-projection layouts.
-    Metadata alone cannot establish that support; a faithful dense fallback is
-    a performance advisory unless sparse-only export was explicitly requested.
+    Metadata alone cannot establish grouped lowering. The opset-29 builder
+    checks actual modules after replacement; legacy all-expert execution
+    remains blocked unless explicitly opted in.
     """
     is_nemotron_h_moe = architecture == "nemotron_h_moe"
     if not is_nemotron_h_moe and not _is_moe(model_type, num_experts):
@@ -327,18 +327,35 @@ def _assess_sparse_moe(
         # int4-class MoE experts can be repacked to MatMulNBits and fused.
         return True, [], []
 
+    from mobius._flags import flags
+
+    if flags.experimental_opset29:
+        return (
+            False,
+            [],
+            [
+                (
+                    f"opset-29 MoE dispatch assessment for {source}: the standard packed "
+                    "route checks actual expert modules after grouped replacement. "
+                    "GroupedMatMul computes only selected experts and needs no dense "
+                    "opt-in; remaining all-expert modules are rejected by default. "
+                    "DequantizePacked may still materialize the full weight bank; "
+                    "grouped dispatch alone is not a quantized-kernel throughput claim."
+                )
+            ],
+        )
+
     advisory = (
         f"sparse-MoE fusion advisory: {source} is a MoE architecture "
         f"('{model_type}') whose routed experts use '{quantization}' native "
         "blocks. Sparse BlockQuantizedMoE fusion depends on the final expert "
-        "layouts. When unavailable, export retains dense-all-expert compute "
-        "(every expert evaluated for every token) with a warning and no "
-        "throughput claim. Inspect the final graph before deployment."
+        "layouts. An unfused fallback performs dense-all-expert compute "
+        "(every expert evaluated for every token) and requires explicit "
+        "allow_dense_moe=True or MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1."
     )
-    from mobius._flags import flags
 
     if not flags.allow_dense_moe_experts:
-        return False, [advisory + " Sparse-only export was explicitly requested."], []
+        return False, [advisory + " Dense fallback is disabled by default."], []
     return False, [], [advisory]
 
 

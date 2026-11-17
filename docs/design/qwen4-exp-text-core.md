@@ -99,6 +99,14 @@ with the existing float32 processor input boundary. Validate image-text outputs
 before deployment, or select FP32/FP16. BF16 text-only exports and other EPs
 are unchanged. Successful export does not establish numerical qualification.
 
+With experimental opset 29, routed experts use two standard `GroupedMatMul`
+calls driven by top-k expert IDs. This is selected-expert dispatch, not the
+inefficient fallback that evaluates every expert for every token, and does not
+require `allow_dense_moe=True`. When packed source weights are decoded into a
+full bank before grouped dispatch, that materialization cost remains separate;
+the graph alone makes no quantized-kernel throughput claim. Actual all-expert
+native-block fallbacks remain disabled by default and require explicit opt-in.
+
 The standard expert dispatch selects TopK from float32 router probabilities
 with a one-dimensional INT64 K tensor. When requested, it divides the selected
 probabilities by their float32 sum (not a second softmax), then casts route

@@ -43,11 +43,12 @@ is rewired to consume the ``BlockQuantizedMoE`` output.
 The rewrite is **property-gated**: a layer that is not a native
 dense-expert storm is skipped, and a *routed native-block* storm whose experts
 cannot be expressed as one expert-major bank (mixed native formats, per-expert
-bias, an incomplete/untraceable expert group, ...) logs the reason and leaves
-the existing dense graph unchanged by default, without a throughput claim.
-Pass ``allow_dense_moe=False`` (or set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=0``)
-to require sparse fusion and raise
-:class:`~mobius.integrations.gguf.SparseMoEExportError` instead.
+bias, an incomplete/untraceable expert group, ...) raises
+:class:`~mobius.integrations.gguf.SparseMoEExportError` by default.
+Pass ``allow_dense_moe=True`` (or set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1``)
+to retain the inefficient all-expert graph with a warning and no throughput claim.
+Standard opset-29 grouped dispatch does not run every expert and is not subject
+to this native-block fallback gate.
 
 Example::
 
@@ -824,7 +825,7 @@ def _fail_closed(layer: _DenseMoELayer, reason: _UnfusableError, *, allow_dense:
         f"Sparse-MoE export blocker: {detail}. No sparse top-k BlockQuantizedMoE "
         "fusion was applied, so exporting would build a dense-all-expert graph "
         "(every expert evaluated for every token) with no performance guarantee, "
-        "but sparse-only export was requested. To allow the dense fallback, re-run with "
+        "so the build fails closed by default. To allow the dense fallback, re-run with "
         "allow_dense_moe=True (or set MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this "
         "makes no throughput claim."
     ) from reason
@@ -851,9 +852,9 @@ def fuse_block_quantized_moe(
     an unrelated ``Equal`` pattern) is skipped silently. A *routed native-block*
     storm that cannot be collapsed into one expert-major bank -- mixed native
     formats across experts, a per-expert bias, an incomplete/untraceable expert
-    group, ragged packed shapes -- retains its dense graph with a warning by
-    default. Explicitly requiring sparse fusion raises
-    :class:`~mobius.integrations.gguf.SparseMoEExportError` instead.
+    group, ragged packed shapes -- raises
+    :class:`~mobius.integrations.gguf.SparseMoEExportError` by default.
+    Explicit dense opt-in retains the existing graph with a warning instead.
 
     Args:
         model: The IR model to rewrite in place.
@@ -861,7 +862,7 @@ def fuse_block_quantized_moe(
             left as the runnable dense fallback (with a loud warning) instead of
             failing closed. When ``None`` (default), the value of the
             ``allow_dense_moe_experts`` flag / ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS``
-            environment variable is used (default ``True``). This makes no
+            environment variable is used (default ``False``). This makes no
             throughput claim and never enables an unsupported fused ABI.
         _allow_perproj_v2_schema: Private, test-only switch. A layer that mixes
             native formats across its fc1/fc2/fc3 banks (e.g. GLM-5.2 UD-IQ1 with
@@ -869,8 +870,8 @@ def fuse_block_quantized_moe(
             ``block_layout_version=2`` per-projection ``BlockQuantizedMoE`` ABI.
             No shipped onnx-genai runtime implements that ABI, so this defaults to
             ``False`` (fail closed): the production ``build_from_gguf`` path never
-            sets it, and a mixed-format layer retains its dense graph (or rejects
-            an explicit sparse-only request) rather than emitting an unrunnable
+            sets it, and a mixed-format layer rejects by default (or retains its
+            dense graph with explicit opt-in) rather than emitting an unrunnable
             v2 node. It is ``True`` only in schema-construction tests
             that assert the v2 node's shape; that node is not runnable and must
             never be shipped. Until a real typed runtime-capability handshake
@@ -881,7 +882,7 @@ def fuse_block_quantized_moe(
 
     Raises:
         SparseMoEExportError: A routed native-block MoE layer cannot be sparse
-            fused and ``allow_dense_moe=False`` was explicitly requested.
+            fused and ``allow_dense_moe=True`` was not requested.
     """
     if allow_dense_moe is None:
         from mobius._flags import flags

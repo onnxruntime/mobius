@@ -336,10 +336,10 @@ def test_honesty_gate_noop_for_non_moe():
     _assert_sparse_moe_capability(module, _Cfg(0), source="x.gguf", allow_dense=False)
 
 
-def test_allow_dense_moe_default_and_explicit_sparse_requirement(monkeypatch):
+def test_allow_dense_moe_default_and_explicit_opt_in(monkeypatch):
     from mobius._flags import _Flags
 
     monkeypatch.delenv("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", raising=False)
-    assert _Flags().allow_dense_moe_experts is True
-    monkeypatch.setenv("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", "0")
     assert _Flags().allow_dense_moe_experts is False
+    monkeypatch.setenv("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", "1")
+    assert _Flags().allow_dense_moe_experts is True

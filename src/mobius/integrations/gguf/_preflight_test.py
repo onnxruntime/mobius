@@ -334,7 +334,7 @@ def test_report_json_roundtrip_is_resumable(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_assess_sparse_moe_warns_for_iq1_moe():
+def test_assess_sparse_moe_blocks_legacy_iq1_moe_by_default():
     ok, blockers, warnings = _assess_sparse_moe(
         model_type="glm_moe_dsa",
         num_experts=160,
@@ -342,16 +342,15 @@ def test_assess_sparse_moe_warns_for_iq1_moe():
         source="unsloth/GLM-5.2-GGUF",
     )
     assert ok is False
-    assert blockers == []
-    assert len(warnings) == 1
-    assert "sparse" in warnings[0].lower()
-    assert "dense-all-expert" in warnings[0]
+    assert len(blockers) == 1
+    assert "Dense fallback is disabled by default" in blockers[0]
+    assert warnings == []
 
 
-def test_assess_sparse_moe_preserves_explicit_sparse_requirement():
+def test_assess_sparse_moe_warns_with_explicit_dense_opt_in():
     from mobius._flags import override_flags
 
-    with override_flags(allow_dense_moe_experts=False):
+    with override_flags(allow_dense_moe_experts=True):
         ok, blockers, warnings = _assess_sparse_moe(
             model_type="glm_moe_dsa",
             num_experts=160,
@@ -359,9 +358,28 @@ def test_assess_sparse_moe_preserves_explicit_sparse_requirement():
             source="synthetic.gguf",
         )
     assert ok is False
-    assert len(blockers) == 1
-    assert "Sparse-only export was explicitly requested" in blockers[0]
-    assert warnings == []
+    assert blockers == []
+    assert len(warnings) == 1
+    assert "dense-all-expert" in warnings[0]
+
+
+def test_assess_opset29_moe_does_not_classify_packed_banks_as_dense():
+    from mobius._flags import override_flags
+
+    with override_flags(experimental_opset29=True, allow_dense_moe_experts=False):
+        ok, blockers, warnings = _assess_sparse_moe(
+            architecture="qwen3moe",
+            model_type="qwen3_moe",
+            num_experts=8,
+            quantization="IQ1_S",
+            source="synthetic.gguf",
+        )
+    assert ok is False  # Metadata alone cannot prove the final dispatch.
+    assert blockers == []
+    assert len(warnings) == 1
+    assert "GroupedMatMul computes only selected experts" in warnings[0]
+    assert "remaining all-expert modules are rejected by default" in warnings[0]
+    assert "materialize the full weight bank" in warnings[0]
 
 
 def test_assess_sparse_moe_allows_non_moe():
@@ -531,8 +549,8 @@ def test_hf_preflight_metadata_only(monkeypatch):
     assert report.total_files == 6
     assert report.total_bytes == sum(sizes.values())
     assert all(f.sha256 for f in report.files)
-    assert report.exportable
-    assert any("sparse-MoE" in warning for warning in report.warnings)
+    assert not report.exportable
+    assert any("dense-all-expert" in blocker for blocker in report.blockers)
     # And nothing was downloaded.
     assert fake.downloaded == []
 
@@ -632,10 +650,10 @@ def test_budget_reflects_real_artifacts_only_no_second_copy(tmp_path):
     assert _json.loads(report.to_json())["output_bytes"] == report.output_bytes
 
 
-def test_sparse_iq1_moe_is_advisory_not_export_blocker(tmp_path):
-    # Flagship GLM-5.2 UD-IQ1_S composition: a *sharded*, MoE, IQ1_S set whose
-    # Sparse-fusion uncertainty belongs in warnings, not hard export blockers.
-    # Keep real metadata/filename detection exercised through the report.
+@pytest.mark.parametrize("opset29", [False, True])
+def test_sparse_iq1_moe_distinguishes_legacy_and_opset29_routes(tmp_path, opset29):
+    from mobius._flags import override_flags
+
     shards = _write_glm_moe_iq1_sharded_gguf(tmp_path, num_experts=8)
 
     # -- Preconditions, proved explicitly (not assumed) ----------------------
@@ -647,7 +665,8 @@ def test_sparse_iq1_moe_is_advisory_not_export_blocker(tmp_path):
     assert first_name.endswith(".gguf")
     assert _detect_quantization(first_name) == "IQ1_S"
 
-    report = preflight_local_gguf(shards[0])
+    with override_flags(experimental_opset29=opset29, allow_dense_moe_experts=False):
+        report = preflight_local_gguf(shards[0])
 
     # Sharded set + architecture resolves => neither is (or causes) a blocker.
     assert report.is_sharded is True
@@ -665,15 +684,22 @@ def test_sparse_iq1_moe_is_advisory_not_export_blocker(tmp_path):
     assert all(s.disposition == "native-preserve" for s in iq1_stats)
     assert report.unsupported_types == []
 
-    # Sparse fusion is not promised, but missing performance evidence is advisory.
+    # Opset-29 dispatch is assessed from actual modules at build time; a full
+    # packed-bank decode is not evidence that every expert executes.
     assert report.sparse_moe_fusion_supported is False
-    assert report.exportable
-    assert report.blockers == []
-    advisory = next(w for w in report.warnings if "sparse-MoE fusion advisory" in w)
-    assert "dense-all-expert" in advisory
-    assert "BlockQuantizedMoE" in advisory
-    assert "glm_moe_dsa" in advisory
-    assert "IQ1_S" in advisory
+    assert report.exportable is opset29
+    if opset29:
+        assert report.blockers == []
+        assert any(
+            "GroupedMatMul computes only selected experts" in w for w in report.warnings
+        )
+    else:
+        assert len(report.blockers) == 1
+        blocker = report.blockers[0]
+        assert "dense-all-expert" in blocker
+        assert "BlockQuantizedMoE" in blocker
+        assert "glm_moe_dsa" in blocker
+        assert "IQ1_S" in blocker
 
     # -- Sharding is explicitly NOT the blocker ------------------------------
     joined = " ".join(report.blockers).lower()

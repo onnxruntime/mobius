@@ -22,7 +22,11 @@ from mobius.components import (
 )
 from mobius.functions._lowering_test_utils import expand_grouped_matmul
 from mobius.integrations._weight_loading import apply_weights
-from mobius.integrations.gguf._builder import _replace_grouped_moe_layers
+from mobius.integrations.gguf import SparseMoEExportError
+from mobius.integrations.gguf._builder import (
+    _assert_grouped_moe_capability,
+    _replace_grouped_moe_layers,
+)
 from mobius.models.lfm2 import GroupedLfm2MoEFeedForward, Lfm2MoEFeedForward
 from mobius.models.moe import Qwen2MoELayer, UngatedSharedMoELayer
 from mobius.tasks._base import _make_graph, _make_model
@@ -54,6 +58,7 @@ def test_replaces_exact_supported_compositions() -> None:
         root = _Root(source)
         assert _replace_grouped_moe_layers(root) == ["mlp"]
         assert type(root.mlp) is expected_type
+        _assert_grouped_moe_capability(root, source="synthetic.gguf", allow_dense=False)
 
 
 def test_does_not_blanket_replace_specialized_subclasses() -> None:
@@ -63,6 +68,16 @@ def test_does_not_blanket_replace_specialized_subclasses() -> None:
     root = _Root(SpecializedMoE(_config()))
     assert _replace_grouped_moe_layers(root) == []
     assert type(root.mlp) is SpecializedMoE
+    with pytest.raises(SparseMoEExportError, match="all-expert MoE execution"):
+        _assert_grouped_moe_capability(root, source="synthetic.gguf", allow_dense=False)
+
+
+def test_ungrouped_all_expert_execution_requires_explicit_opt_in(caplog) -> None:
+    root = _Root(MoELayer(_config()))
+    with pytest.raises(SparseMoEExportError, match="allow_dense_moe=True"):
+        _assert_grouped_moe_capability(root, source="synthetic.gguf", allow_dense=False)
+    _assert_grouped_moe_capability(root, source="synthetic.gguf", allow_dense=True)
+    assert "every expert for every token" in caplog.text
 
 
 @pytest.mark.parametrize(

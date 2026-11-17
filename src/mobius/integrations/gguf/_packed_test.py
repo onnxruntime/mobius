@@ -391,7 +391,7 @@ def test_packed_expert_layout_and_standard_moe(
 ) -> None:
     source = packed_sources[architecture]
     tmp_path = source.parent
-    with override_flags(experimental_opset29=True):
+    with override_flags(experimental_opset29=True, allow_dense_moe_experts=False):
         package = build_from_gguf(source, execution_provider="onnx-standard")
     package.save(str(tmp_path))
     if architecture == "qwen3moe":

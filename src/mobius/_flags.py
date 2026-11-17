@@ -217,17 +217,18 @@ class _Flags:
     """
 
     allow_dense_moe_experts: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", True)
+        default_factory=lambda: _env_bool("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", False)
     )
-    """Allow faithful dense MoE fallbacks when sparse top-k fusion is unavailable.
+    """Opt in to inefficient all-expert MoE execution when sparse fusion is unavailable.
 
-    Default ``True``: an unfusable native-block MoE retains its existing dense
-    graph and logs the reason. Every expert runs for every token; no throughput
-    claim is made. This does not enable an unsupported fused operator ABI or
-    relax source tensor, layout, or architecture validation.
+    Default ``False``: reject native-block fallbacks that evaluate every expert
+    for every token. Set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1`` or pass
+    ``allow_dense_moe=True`` only for correctness study, without a throughput
+    claim. Source, layout, and architecture validation remain enforced.
 
-    Set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=0`` or pass ``allow_dense_moe=False``
-    to require sparse fusion explicitly and reject a dense fallback.
+    Standard opset-29 ``GroupedMatMul`` dispatch computes only selected experts
+    and does not require this opt-in. Full-bank weight dequantization, when
+    present, is a separate materialization cost, not all-expert execution.
     """
 
 

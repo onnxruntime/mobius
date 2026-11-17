@@ -8,7 +8,7 @@ These tests exercise the ``build_from_gguf`` post-export integration points
 exported packages -- i.e. the graph state the builder hands to the fusion after
 ``pkg.apply_weights``. They are distinct from the rewrite-rule unit tests: the
 focus here is the *builder's* fallback policy (no unsupported
-mixed-format per-projection v2 emission, default dense
+mixed-format per-projection v2 emission, opt-in dense
 retention, and the final-graph-state backstop), byte-preserving expert banks,
 and deterministic external data.
 
@@ -17,8 +17,8 @@ correctness is proven structurally (the routed expert storm collapses; the share
 expert is untouched) and by byte-preservation (the native blocks are stacked
 verbatim). GLM-5.2 UD-IQ1 layers mix native formats across their fc1/fc2/fc3
 banks, so they require the ``block_layout_version=2`` per-projection ABI; until
-that ships in the runtime the builder retains the dense graph, or typed-rejects
-when sparse-only export is explicitly requested, rather than emit an unrunnable node.
+that ships in the runtime the builder typed-rejects by default, or retains the
+dense graph with explicit opt-in, rather than emit an unrunnable node.
 """
 
 from __future__ import annotations
@@ -379,7 +379,7 @@ def test_e2e_mixed_format_sparse_requirement_rejects_through_builder(
     _write_native_moe_gguf(path, down_fmt="iq4_xs")
 
     with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        build_from_gguf(path, keep_quantized=True, allow_dense_moe=False)
+        build_from_gguf(path, keep_quantized=True)
 
 
 def test_e2e_env_flag_cannot_force_v2_through_builder(monkeypatch, tmp_path) -> None:
@@ -399,11 +399,8 @@ def test_e2e_env_flag_cannot_force_v2_through_builder(monkeypatch, tmp_path) -> 
         build_from_gguf(path, keep_quantized=True, allow_dense_moe=False)
 
 
-@pytest.mark.parametrize("allow_dense_moe", [None, True])
-def test_e2e_allow_dense_retains_storm_through_builder(
-    monkeypatch, tmp_path, allow_dense_moe, caplog
-) -> None:
-    """Default and explicit dense exports keep the per-expert fallback.
+def test_e2e_allow_dense_retains_storm_through_builder(monkeypatch, tmp_path, caplog) -> None:
+    """Explicit dense exports keep the per-expert fallback.
 
     It must warn+retain, never count as a fused success: the 12 routed expert
     matmuls stay, so no BlockQuantizedMoE is produced.
@@ -414,7 +411,7 @@ def test_e2e_allow_dense_retains_storm_through_builder(
     path = tmp_path / "mixed-moe-dense.gguf"
     _write_native_moe_gguf(path, down_fmt="iq4_xs")
 
-    pkg = build_from_gguf(path, keep_quantized=True, allow_dense_moe=allow_dense_moe)
+    pkg = build_from_gguf(path, keep_quantized=True, allow_dense_moe=True)
     moe, matmul = _e2e_ops(pkg)
     assert moe == 0
     # 4 attention + 4 experts * 3 projections all remain as dense BlockQuantizedMatMul.
