@@ -11,8 +11,6 @@ exercised by the parametrized tests there.
 
 from __future__ import annotations
 
-import sys
-
 import onnx_ir as ir
 import pytest
 import torch
@@ -29,6 +27,8 @@ from mobius.components import LayerNorm, Linear, QuantizedLinear, RMSNormBias
 from mobius.models.base import CausalLMModel, TextModel
 from mobius.models.moe import MoECausalLMModel, Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
 from mobius.tasks import CausalLMTask
+
+_INT64_MAX = 2**63 - 1
 
 
 class TestTextModel:
@@ -397,7 +397,7 @@ class TestPrunePrefillPrefix:
                     hidden_states = op.Slice(
                         hidden_states,
                         op.Constant(value_ints=[index.start]),
-                        op.Constant(value_ints=[sys.maxsize]),
+                        op.Constant(value_ints=[_INT64_MAX]),
                         op.Constant(value_ints=[axis]),
                     )
                 elif index is not None:
