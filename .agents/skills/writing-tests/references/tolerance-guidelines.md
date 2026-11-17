@@ -77,6 +77,20 @@ for k, v in config.to_dict().items():
 
 ## Dtype-specific tolerance guidance
 
+### Reference execution versus storage and metrics
+
+Ordinary golden generators must explicitly pass the case's selected dtype to
+the reference model loader. Casting FP32 reference outputs to BF16 does not
+reproduce BF16 execution. Unsupported backend/precision combinations must fail,
+not silently retry in FP32. An intentionally higher-precision accuracy oracle
+is a separate, explicit test policy, not the default parity reference.
+
+Preserve per-tensor cache storage and opaque recurrent state: a BF16 model can
+legitimately use FP32 SSM state and deliberate FP32 internal math. Output casts
+to FP32/FP64 for metric calculation do not change reference execution precision.
+Existing legacy goldens have unverified execution precision; preserve them
+without claiming they have been requalified.
+
 ### fp32
 
 Standard tolerance: `atol=1e-3, rtol=1e-3`. Target **100% token match** in

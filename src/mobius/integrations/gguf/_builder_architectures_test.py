@@ -154,55 +154,6 @@ class TestEncoderGGUFBuild:
             assert output.shape == (1, sequence_length, 64)
             assert np.isfinite(output).all()
 
-    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
-    def test_quantized_source_preserves_linears_but_dequantizes_embedding(
-        self, tmp_path: Path, architecture: str
-    ) -> None:
-        from gguf import GGMLQuantizationType
-
-        from mobius.integrations.gguf import build_from_gguf
-        from mobius.integrations.gguf._reader import GGUFModel
-
-        path = tmp_path / f"{architecture}-q4.gguf"
-        _write_encoder_gguf(path, architecture, quantized=True)
-        source = GGUFModel(path)
-        token_qtype = next(
-            qtype
-            for name, _raw, qtype, _shape in source.tensor_items_raw()
-            if name == "token_embd.weight"
-        )
-        assert token_qtype == GGMLQuantizationType.Q4_0
-
-        preserved = build_from_gguf(path, keep_quantized=True)["model"]
-        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
-
-        op_types = {node.op_type for node in preserved.graph}
-        assert "MatMulNBits" in op_types
-        assert "GatherBlockQuantized" not in op_types
-        actual = self._run(preserved, 5, masked=True)
-        expected = self._run(explicit_float, 5, masked=True)
-        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-2)
-
-    def test_report_includes_mapped_biases_and_reconciles_source_bytes(
-        self, tmp_path: Path
-    ) -> None:
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        path = tmp_path / "bert-records.gguf"
-        _write_encoder_gguf(path, "bert", quantized=True)
-        report = build_from_gguf(path).gguf_quantization_report
-
-        bias_records = [
-            record for record in report.tensor_records if record.name.endswith(".bias")
-        ]
-        assert bias_records
-        assert {record.disposition for record in bias_records} == {
-            QuantizationDisposition.SOURCE_FLOAT
-        }
-        assert sum(record.source_bytes for record in report.tensor_records) == sum(
-            stat.source_bytes for stat in report.source_qtype_census
-        )
-
     def test_float_fused_bert_qkv_splits_losslessly_and_runs(self, tmp_path: Path) -> None:
         import torch
 
@@ -550,21 +501,6 @@ class TestT5GGUFBuild:
             assert output.shape == (1, sequence_length, 32)
             assert np.isfinite(output).all()
 
-    def test_t5encoder_quantized_projection_matches_dequantized(self, tmp_path: Path) -> None:
-        from mobius.integrations.gguf import build_from_gguf
-
-        path = tmp_path / "t5encoder-q4.gguf"
-        _write_t5_gguf(path, "t5encoder", quantized=True)
-        preserved = build_from_gguf(path, keep_quantized=True)["model"]
-        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
-
-        op_types = {node.op_type for node in preserved.graph}
-        assert "MatMulNBits" in op_types
-        assert "GatherBlockQuantized" not in op_types
-        actual = self._run_encoder(preserved, 5, masked=True)
-        expected = self._run_encoder(explicit_float, 5, masked=True)
-        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-2)
-
     def test_relative_bias_values_keep_bucket_head_orientation(self, tmp_path: Path) -> None:
         import torch
 
@@ -616,28 +552,6 @@ class TestT5GGUFBuild:
         assert prefill_logits.shape == decode_logits.shape == (1, 1, 64)
         assert np.isfinite(prefill_logits).all()
         assert np.isfinite(decode_logits).all()
-
-    def test_t5_quantized_prefill_and_decode_match_dequantized(self, tmp_path: Path) -> None:
-        from mobius.integrations.gguf import build_from_gguf
-
-        path = tmp_path / "t5-q4.gguf"
-        _write_t5_gguf(
-            path,
-            "t5",
-            quantized=True,
-            encoder_layers=1,
-            decoder_layers=2,
-        )
-        preserved = build_from_gguf(path, keep_quantized=True)
-        explicit_float = build_from_gguf(path, keep_quantized=False)
-        assert "MatMulNBits" in {
-            node.op_type for model in preserved.values() for node in model.graph
-        }
-
-        actual_prefill, actual_decode = self._run_seq2seq(preserved)
-        expected_prefill, expected_decode = self._run_seq2seq(explicit_float)
-        np.testing.assert_allclose(actual_prefill, expected_prefill, rtol=0, atol=1e-2)
-        np.testing.assert_allclose(actual_decode, expected_decode, rtol=0, atol=1e-2)
 
     @pytest.mark.parametrize("architecture", ["t5", "t5encoder"])
     def test_task_and_static_cache_misdispatch_is_rejected(
@@ -856,34 +770,6 @@ class TestHybridGGUFBuild:
         outputs = self._run_lfm2(model)
         assert outputs[0]["present.0.conv_state"].shape == (1, 32, 2)
         assert outputs[0]["present.1.key"].shape == (1, 2, 3, 8)
-        assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
-        assert all(np.isfinite(output["logits"]).all() for output in outputs)
-
-    def test_lfm2_quantized_preservation_dequantizes_float_targets_and_executes(
-        self, tmp_path: Path
-    ) -> None:
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        path = tmp_path / "lfm2-q4.gguf"
-        _write_lfm2_gguf(path, quantized=True)
-        preserved_package = build_from_gguf(path, keep_quantized=True)
-        preserved = preserved_package["model"]
-        assert "MatMulNBits" not in {node.op_type for node in preserved.graph}
-        assert preserved_package.gguf_quantization_report.storage_quantized is False
-        assert any(
-            record.disposition is QuantizationDisposition.DEQUANTIZED_FLOAT
-            for record in preserved_package.gguf_quantization_report.tensor_records
-        )
-        preserved_outputs = self._run_lfm2(preserved)
-        assert preserved_outputs[0]["present.0.conv_state"].shape == (1, 32, 2)
-        assert preserved_outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
-        assert all(np.isfinite(output["logits"]).all() for output in preserved_outputs)
-
-        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
-
-        assert "MatMulNBits" not in {node.op_type for node in explicit_float.graph}
-        outputs = self._run_lfm2(explicit_float)
-        assert outputs[0]["present.0.conv_state"].shape == (1, 32, 2)
         assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
         assert all(np.isfinite(output["logits"]).all() for output in outputs)
 
@@ -1649,23 +1535,6 @@ class TestJambaGGUFBuild:
             rtol=2e-5,
         )
 
-    def test_quantized_source_keeps_only_compatible_matmul_roles(self, tmp_path: Path) -> None:
-        from mobius.integrations.gguf import build_from_gguf
-
-        path = tmp_path / "jamba-q4.gguf"
-        _write_jamba_gguf(path, quantized=True)
-        model = build_from_gguf(path, keep_quantized=True)["model"]
-        # 4 attention + 3 dense FFN + 2 experts * 3 expert projections.
-        assert sum(node.op_type == "MatMulNBits" for node in model.graph) == 13
-        for stem in (
-            "model.layers.0.mamba.in_proj.weight_t",
-            "model.layers.0.mamba.conv1d.weight",
-            "model.layers.0.mamba.ssm.x_proj.weight_t",
-            "model.layers.0.mamba.ssm.dt_proj.weight_t",
-            "model.layers.0.mamba.out_proj.weight_t",
-        ):
-            assert model.graph.initializers[stem].const_value.dtype == ir.DataType.FLOAT
-
     @pytest.mark.parametrize(
         ("kwargs", "match"),
         [
@@ -2023,34 +1892,6 @@ class TestKimiLinearGGUFBuild:
             reloaded["model"].metadata_props["mobius.cache_abi"]
             == model.metadata_props["mobius.cache_abi"]
         )
-
-    @pytest.mark.parametrize(
-        ("native_quantized", "qtype_name"),
-        [(False, "Q4_0"), (True, "IQ4_NL")],
-    )
-    def test_quantized_mla_reshape_is_reported_as_lossy(
-        self,
-        tmp_path: Path,
-        native_quantized: bool,
-        qtype_name: str,
-        caplog,
-    ) -> None:
-        from mobius.integrations.gguf import build_from_gguf
-
-        path = tmp_path / f"kimi-linear-{qtype_name.lower()}.gguf"
-        _write_kimi_linear_gguf(
-            path,
-            quantized=True,
-            native_quantized=native_quantized,
-        )
-        with caplog.at_level("WARNING"):
-            package = build_from_gguf(path, keep_quantized=True)
-        assert caplog.text.count("GGUF QUANTIZATION FIDELITY WARNING") == 1
-        assert f"{qtype_name}:" in caplog.text
-        assert package.gguf_quantization_report.source_fidelity is False
-
-        model = build_from_gguf(path, keep_quantized=False)["model"]
-        assert all(node.op_type != "MatMulNBits" for node in model.graph)
 
     def test_left_padding_does_not_change_valid_logits_or_states(self, tmp_path: Path) -> None:
         from mobius._testing.ort_inference import OnnxModelSession

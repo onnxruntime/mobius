@@ -37,6 +37,14 @@ Read these when you need deeper detail on a specific topic:
   PyTorch implementation
 - Pin the checkpoint revision before collecting configs, weights, processors,
   parity data, or goldens
+- Before a long run, smoke-test the pinned upstream loader in the exact task
+  interpreter. Record its dependency versions and the selected CUDA provider.
+- Use the repository's pinned CI reference dependencies. Assert the validated
+  layer vocabulary and supported compute dtype for raw JSON and trusted configs;
+  validators can remap layer names or carry checkpoint storage dtypes.
+- If an architecture needs newer upstream code, isolate an immutable reference
+  pin to its tests; verify installed commit provenance and replay with the
+  unchanged shared reference dependencies.
 
 ## Step-by-step
 
@@ -144,6 +152,9 @@ Standard categories: `"Text Generation"`, `"Mixture of Experts"`,
 
 ### 3. Identify what's different
 
+Read the actual packed-QKV ordering, gate placement, and RoPE frequency/pair
+layout before reusing attention. Similar names or shapes do not prove equivalence.
+
 Compare the HuggingFace PyTorch source against `CausalLMModel` / `DecoderLayer`.
 Common variations to look for:
 
@@ -162,6 +173,8 @@ Common variations to look for:
 | MoE layers | PhiMoE, GPTOSS | See the **moe-models** skill |
 | Vision encoder | Gemma3 | See the **multimodal-models** skill |
 | Gated attention output | Qwen3.5 | Subclass `Attention` with doubled q_proj → Q+gate split |
+| Per-head attention gate | LFM3 | Separate head-sized projection; apply gate before output projection |
+| Zero-tail partial RoPE | LFM3 | Keep full-head frequency denominator and half-pair layout; do not use compact-prefix rotation |
 | Hybrid layer types | Qwen3.5 | Use `config.layer_types` list to dispatch per-layer |
 | Fused QKV / gate+up | ModernBERT | Split in `preprocess_weights` |
 | Subclass-only (weight rename) | BLIP, TrOCR | Override only `preprocess_weights` |
@@ -242,6 +255,10 @@ order (rounding/scaling), explicit `None`, alias precedence, zero-as-disabled
 sentinels, and wrapped/unwrapped composite configs. Add focused tests for each
 nontrivial transform. Test both trusted/custom config classes and raw pinned
 JSON, especially nested decoder fields such as head/layer counts.
+Preserve mapping-valued metadata (RoPE, sparse layer overrides, integer-keyed
+tables) when adapting config sections. Detect untagged native configs only from
+a distinctive complete signature; set compute dtype explicitly and test inherited
+`None` defaults rather than confusing checkpoint storage dtype with export dtype.
 
 ### 7. Write tests
 
@@ -275,7 +292,7 @@ See the **writing-tests** skill for full details.  At minimum:
 
 4. **Test with the CLI:**
    ```bash
-   mobius build --model org/my-small-model mymodel/output
+   mobius build --model org/my-small-model --output mymodel/output
    ```
 
 ### 8. Documentation
@@ -302,7 +319,9 @@ see the [quality-checklist skill](../quality-checklist/SKILL.md).
 - [ ] Exported from `models/__init__.py`
 - [ ] Config extraction works (`ArchitectureConfig.from_transformers`)
 - [ ] Tiny config in `tests/_test_configs.py` (with `is_representative` flag)
-- [ ] L2 YAML test case in `testdata/cases/` with `test_model_id`
+- [ ] Registry `test_model_id` and immutable `test_revision` set; L2 passes via
+      `python -m pytest tests/arch_validation_test.py -k "<model_type>"`
+- [ ] Golden YAML in `testdata/cases/` validates against its schema
 - [ ] L3 synthetic parity passes (`tests/synthetic_parity_test.py -k "<model_type>"`)
 - [ ] Focused integration test in `tests/integration/` (if small checkpoint available)
 - [ ] L4 golden file generated and committed (`testdata/golden/`)
@@ -310,7 +329,8 @@ see the [quality-checklist skill](../quality-checklist/SKILL.md).
 - [ ] Graph-derived ORT GenAI metadata is tested; downstream load/generation is
       optional evidence and never an export capability gate
 - [ ] CLI build works (`mobius build --model ...`)
-- [ ] Multi-dtype correctness verified (fp32, fp16, bf16)
+- [ ] Each claimed dtype passes full-checkpoint parity, not only tiny tests;
+      unsupported dtypes fail at construction and graph creation
 - [ ] Pinned revision reaches every Hub/processor/weight/golden call
 
 **Note:** Default optimizer passes (CSE, deduplicate initializers, identity
@@ -377,6 +397,10 @@ long_factor = np.array(config.rope_scaling["long_factor"])
 # GOOD
 long_factor = np.array(config.rope_scaling["long_factor"], dtype=np.float32)
 ```
+
+Direct NumPy operands require explicit ONNX constants:
+`op.Constant(value=ir.tensor(long_factor))`. Match operator rank contracts too:
+ONNX RoPE positions must include the batch axis even if HF broadcasts a 1D input.
 
 ### 2. Normalization type mismatch (RMSNorm vs LayerNorm)
 

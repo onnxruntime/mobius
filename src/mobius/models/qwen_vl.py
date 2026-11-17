@@ -1006,6 +1006,7 @@ class Qwen3VLVisionEncoderModel(nn.Module):
         assert vc.num_hidden_layers is not None
         assert vc.num_attention_heads is not None
         self.num_deepstack = len(config.deepstack_visual_indexes or [])
+        self._dtype = config.dtype
         self.visual = Qwen3VLVisionModel(
             depth=vc.num_hidden_layers,
             hidden_size=vc.hidden_size,
@@ -1026,6 +1027,8 @@ class Qwen3VLVisionEncoderModel(nn.Module):
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
+        # Processors emit float32 packed pixels even for reduced-precision models.
+        pixel_values = op.Cast(pixel_values, to=self._dtype)
         outputs = self.visual(
             op,
             hidden_states=pixel_values,
@@ -1071,19 +1074,19 @@ class Qwen3VLVisionEncoderModel(nn.Module):
 class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
     """Qwen3-VL embedding model for the 3-model split.
 
-    Scatters merged image features at image-token positions (like
-    Qwen2.5-VL) and, when the vision encoder produces DeepStack features,
+    Scatters merged image/video features at their placeholder-token positions
+    and, when the vision encoder produces DeepStack features,
     also scatters each intermediate DeepStack map into a full-length tensor
-    (zero at non-image positions). The maps are flattened into the generic
+    (zero at non-visual positions). The maps are flattened into the generic
     rank-3 ``per_layer_inputs`` output consumed by ORT GenAI.
 
     Inputs:
         - input_ids: (batch, seq_len) INT64
-        - image_features: (num_image_tokens, (D + 1) * hidden_size) FLOAT
-          when DeepStack is active
+        - image_features: merged visual features in flattened batch/token order,
+          (num_visual_tokens, (D + 1) * hidden_size) when DeepStack is active
     Outputs:
-        - inputs_embeds: (batch, seq_len, hidden_size) FLOAT
-        - per_layer_inputs: (batch, seq_len, D * hidden_size) FLOAT
+        - inputs_embeds: (batch, seq_len, hidden_size), model dtype
+        - per_layer_inputs: (batch, seq_len, D * hidden_size), model dtype
           (only when DeepStack is active)
     """
 
@@ -1096,17 +1099,20 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
     ):
         text_embeds = self.embed_tokens(op, input_ids)
 
-        # Image-token positions and their running index into the packed
-        # feature tensors (shared by the main image scatter and every
-        # DeepStack scatter).
-        image_mask = op.Equal(input_ids, op.Constant(value_int=self.image_token_id))
-        image_mask_3d = op.Unsqueeze(image_mask, [-1])
-        mask_int = op.Cast(image_mask, to=7)  # INT64
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
+        # Packed features follow image/video placeholders across the whole batch,
+        # matching HF's flattened masked_scatter rather than restarting per row.
+        visual_mask = op.Or(
+            op.Equal(input_ids, op.Constant(value_int=self.image_token_id)),
+            op.Equal(input_ids, op.Constant(value_int=self.video_token_id)),
+        )
+        visual_mask_3d = op.Unsqueeze(visual_mask, [-1])
+        mask_int = op.Reshape(op.Cast(visual_mask, to=7), [-1])  # (B*S,) INT64
+        cumsum = op.CumSum(mask_int, op.Constant(value_int=0))
         indices = op.Clip(
             op.Sub(cumsum, op.Constant(value_int=1)),
             op.Constant(value_int=0),
         )
+        indices = op.Reshape(indices, op.Shape(input_ids))
 
         def _scatter(features: ir.Value, fallback: ir.Value) -> ir.Value:
             # Pad with one zero row so Gather stays in-bounds for text-only
@@ -1121,7 +1127,7 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
             )
             padded = op.Concat(features, pad_row, axis=0)
             gathered = op.Gather(padded, indices, axis=0)
-            return op.Where(image_mask_3d, gathered, fallback)
+            return op.Where(visual_mask_3d, gathered, fallback)
 
         inputs_embeds = _scatter(image_features, text_embeds)
 

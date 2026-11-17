@@ -99,11 +99,12 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "gemma2": "gemma",
     "gemma4": "gemma4",
     "gemma4_text": "gemma4_text",
-    # gemma-4-12B "unified" (encoder-free) variant reuses the gemma4 ORT GenAI
-    # pipelines: the multimodal package (decoder taking inputs_embeds + vision
-    # embedder + embedding fusion) maps to "gemma4"; the standalone text
-    # backbone maps to "gemma4_text".
-    "gemma4_unified": "gemma4",
+    # gemma-4-12B "unified" (encoder-free) variant. The multimodal package
+    # (decoder taking inputs_embeds + encoder-free vision/audio embedders +
+    # embedding fusion) maps to the dedicated "gemma4_unified" ORT GenAI type,
+    # which drives the unified processor (48px merged patches / raw 640-sample
+    # audio frames). The standalone text backbone maps to "gemma4_text".
+    "gemma4_unified": "gemma4_unified",
     "gemma4_unified_text": "gemma4_text",
     "mistral": "mistral",
     "mistral3": "mistral3",
@@ -194,12 +195,12 @@ _GEMMA4_MODEL_TYPES = frozenset(
 )
 # Encoder-free gemma-4-12B "unified" variants. Their image/audio inputs are raw
 # merged pixel patches (48px, 6912-dim) / raw waveform frames (640-dim), NOT the
-# SigLIP 16px / 128-dim log-mel contract that the ort-extensions
-# ``Gemma4ImageTransform`` / ``Gemma4LogMel`` ops implement. There is no
-# genai-native transform for the unified contract, so we deliberately do NOT
-# emit image_processor.json / audio_processor.json for these models — callers
-# must preprocess with the HuggingFace processor and feed tensors via
-# ``Generator.set_inputs`` (see examples/gemma4_unified_ort_genai.py).
+# SigLIP 16px / 128-dim log-mel contract of the standard gemma4 (E2B/E4B) model.
+# These are produced natively by ort-extensions: ``Gemma4ImageTransform`` with
+# patch_size=48 / pooling_kernel_size=1 (the 48px merged patch is identical to a
+# direct 48px patchify) and the ``Gemma4UnifiedAudioFrames`` raw-framing op. The
+# genai ``gemma4_unified`` processor consumes both (see the companion
+# onnxruntime-genai / onnxruntime-extensions support).
 _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"})
 _GLMASR_MODEL_TYPES = frozenset({"glmasr"})
 _MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
@@ -230,6 +231,7 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "glm_ocr_text",
         "qwen3_vl_text",
         "qwen3_5",
+        "qwen3_5_text",
         "qwen3_5_vl",
         "qwen3_5_vl_text",
         "qwen3_5_moe",
@@ -243,6 +245,7 @@ _QWEN_VL_MODEL_TYPES = frozenset(
 _QWEN35_VL_MODEL_TYPES = frozenset(
     {
         "qwen3_5",
+        "qwen3_5_text",
         "qwen3_5_vl",
         "qwen3_5_vl_text",
         "qwen3_5_moe",
@@ -937,9 +940,10 @@ def _write_vision_processor_config(
 
     - **Gemma4** (``gemma4``, ``gemma4_text``): Writes ``image_processor.json``
       with a ``DecodeImage → Gemma4ImageTransform`` pipeline.
-    - **Gemma4 unified** (``gemma4_unified*``): Returns ``None`` — the
-      encoder-free model has no matching ort-extensions transform; callers feed
-      HF-preprocessed pixel_values via ``Generator.set_inputs``.
+    - **Gemma4 unified** (``gemma4_unified*``): Writes ``image_processor.json``
+      with a ``DecodeImage → Gemma4ImageTransform`` pipeline configured for the
+      encoder-free 48px merged-patch contract (patch_size=48,
+      pooling_kernel_size=1, patch_dim=6912).
     - **Gemma3** (``gemma3`` or ``gemma3_text``): Writes
       ``processor_config.json`` with a 5-step pipeline (DecodeImage →
       Resize[fixed] → Rescale → Normalize → Permute3D). Uses a
@@ -971,16 +975,6 @@ def _write_vision_processor_config(
         return None
 
     model_type = getattr(config, "model_type", "")
-    if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
-        # Encoder-free unified model: no ort-extensions transform matches its
-        # raw merged-patch contract. Emit no image_processor.json; callers feed
-        # HF-preprocessed pixel_values via Generator.set_inputs.
-        logger.info(
-            "Skipping image_processor.json for encoder-free %s "
-            "(no native ort-extensions transform; use HF processor + set_inputs)",
-            model_type,
-        )
-        return None
     if model_type in _MINICPM_MODEL_TYPES:
         # MiniCPM needs adaptive slicing and NaViT horizontal patch packing.
         # ort-extensions has no equivalent transform, so preserving the HF
@@ -1007,7 +1001,49 @@ def _write_vision_processor_config(
     vision_model_type = getattr(vision, "model_type", None)
     is_pixtral = vision_model_type == "pixtral" or model_type in _PIXTRAL_MODEL_TYPES
 
-    if model_type in _GEMMA4_MODEL_TYPES:
+    if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
+        # Encoder-free unified model: it consumes 48px MERGED patches
+        # (patch_dim = 48*48*3 = 6912) directly, with no SigLIP tower to pool
+        # 3x3 teacher patches. HuggingFace produces these via
+        # (16px patchify -> 3x3 patches_merge), which is provably identical to a
+        # direct 48px patchify. So we reuse the same ort-extensions
+        # ``Gemma4ImageTransform`` op with the merged geometry: patch_size =
+        # patch_size * pooling_kernel_size (48) and pooling_kernel_size = 1.
+        max_soft_tokens = (
+            getattr(vision, "mm_tokens_per_image", None)
+            or getattr(config, "mm_tokens_per_image", None)
+            or 280
+        )
+        patch_size = getattr(vision, "patch_size", None) or 16
+        pooling = getattr(vision, "pooling_kernel_size", None) or 3
+        model_patch_size = patch_size * pooling  # 16 * 3 = 48
+        processor_config: dict[str, Any] = {
+            "processor": {
+                "name": "gemma_4_unified_image_processing",
+                "transforms": [
+                    {
+                        "operation": {
+                            "name": "decode_image",
+                            "type": "DecodeImage",
+                            "attrs": {"color_space": "RGB"},
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma4_image_transform",
+                            "type": "Gemma4ImageTransform",
+                            "attrs": {
+                                "patch_size": model_patch_size,
+                                "max_soft_tokens": max_soft_tokens,
+                                "pooling_kernel_size": 1,
+                            },
+                        }
+                    },
+                ],
+            }
+        }
+        path = os.path.join(output_dir, "image_processor.json")
+    elif model_type in _GEMMA4_MODEL_TYPES:
         # Gemma4 needs an onnxruntime-extensions format processor config
         # with a transforms pipeline (DecodeImage -> Gemma4ImageTransform).
         max_soft_tokens = (
@@ -1017,7 +1053,7 @@ def _write_vision_processor_config(
         )
         patch_size = getattr(vision, "patch_size", None) or 16
         pooling_kernel_size = getattr(vision, "pooling_kernel_size", None) or 3
-        processor_config: dict[str, Any] = {
+        processor_config = {
             "processor": {
                 "name": "gemma_4_image_processing",
                 "transforms": [
@@ -1256,15 +1292,10 @@ def _write_vision_processor_config(
                 }
             )
         elif model_type in _QWEN_VL_MODEL_TYPES:
-            # Qwen-VL models need the PatchImage transform to extract
-            # temporal+spatial patches, and qwen2_5_vl/qwen3_vl flag
-            # on Normalize for correct interleaving.
+            # DecodeImage(color_space="RGB") already emits RGB. Normalize's
+            # qwen2_5_vl/qwen3_vl flags perform BGR->RGB swaps, not interleaving:
+            # keep ordinary RGB normalization. PatchImage owns patch layout.
             temporal_patch_size = config.temporal_patch_size
-            # Add qwen3_vl flag to the Normalize step
-            for t in transforms:
-                op = t.get("operation", {})
-                if op.get("type") == "Normalize":
-                    op.setdefault("attrs", {})["qwen2_5_vl"] = 1
             transforms.append(
                 {
                     "operation": {
@@ -1306,7 +1337,7 @@ def _write_audio_processor_config(
     config: Any,
     output_dir: str,
 ) -> str | None:
-    """Write audio_processor.json for models with audio encoders.
+    """Write the native audio processor config for models with audio encoders.
 
     Returns the path if written, None otherwise.
     """
@@ -1317,18 +1348,42 @@ def _write_audio_processor_config(
     model_type = getattr(config, "model_type", "")
 
     if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
-        # Encoder-free unified model: raw 640-dim waveform frames, not the
-        # 128-dim log-mel Gemma4LogMel contract. Emit no audio_processor.json;
-        # callers feed HF-preprocessed input_features via Generator.set_inputs.
-        logger.info(
-            "Skipping audio_processor.json for encoder-free %s "
-            "(no native ort-extensions transform; use HF processor + set_inputs)",
-            model_type,
-        )
-        return None
-
-    if model_type in _GEMMA4_MODEL_TYPES:
-        # Gemma4 USM-style 128-dim log-mel spectrogram.
+        # Encoder-free unified model: each audio soft token is a raw chunk of the
+        # 16 kHz waveform (audio_samples_per_token = audio_embed_dim, 640), not a
+        # 128-dim log-mel frame. Reproduced natively by the ort-extensions
+        # ``Gemma4Audio`` op with ``type="raw_frames"`` (pad to a whole number of
+        # frames, reshape to (num_tokens, 640)).
+        # Disable the decoder's Whisper-compatible 30-second truncation.
+        samples_per_token = getattr(audio, "hidden_size", None) or 640
+        processor = {
+            "feature_extraction": {
+                "sequence": [
+                    {
+                        "operation": {
+                            "name": "audio_decoder",
+                            "type": "AudioDecoder",
+                            "attrs": {"max_samples": 0},
+                        }
+                    },
+                    {
+                        "operation": {
+                            "name": "gemma4_audio",
+                            "type": "Gemma4Audio",
+                            "attrs": {
+                                "type": "raw_frames",
+                                "audio_samples_per_token": samples_per_token,
+                                "sampling_rate": 16000,
+                                "padding_value": 0.0,
+                            },
+                        }
+                    },
+                ]
+            }
+        }
+        proc_filename = "audio_feature_extraction.json"
+    elif model_type in _GEMMA4_MODEL_TYPES:
+        # Gemma4 USM-style 128-dim log-mel spectrogram via the ort-extensions
+        # ``Gemma4LogMel`` op.
         # OrtxCreateSpeechFeatureExtractor requires the feature_extraction.sequence format.
         processor = {
             "feature_extraction": {
@@ -1523,25 +1578,12 @@ def _write_genai_config(
     # node, the model supports shared-buffer mode; otherwise force it off
     # regardless of the EP capability flag.
     #
-    # ``com.microsoft.LinearAttention`` (linear/recurrent-attention layers,
-    # e.g. Qwen3.5's GatedDeltaNet) is a separate, *mandatory* case: its
-    # recurrent state requires ``past_present_share_buffer=True`` regardless
-    # of whether any other layer uses GQA (ORT GenAI raises "RecurrentState
-    # requires past_present_share_buffer=true" otherwise).
-    #
-    # Hybrid models mix LinearAttention layers with full-attention layers,
-    # which may lower to GQA *or* to the standard (non-GQA) ``Attention`` op
-    # depending on EP/dtype (e.g. the CPU EP only lowers to GQA for fp32;
-    # fp16 falls back to standard Attention -- see ``_execution_providers.py``
-    # ``gqa_dtypes``). If a hybrid graph has LinearAttention but its
-    # full-attention layers are still standard (non-GQA) Attention, forcing
-    # ``past_present_share_buffer=True`` produces an unrunnable config: the
-    # recurrent state requires it, but standard Attention's dynamic-shape KV
-    # concat cannot honor a pre-allocated shared buffer, which fails at
-    # generation time with an ``attn_mask``/``total_sequence_length``
-    # mismatch rather than at load time. Rather than silently emit a broken
-    # config, raise a clear error so the caller picks an EP/dtype combination
-    # (e.g. fp32 on CPU) that lowers full attention to GQA.
+    # Preserve the legacy sharing policy for fused LinearAttention graphs.
+    # This is not a universal recurrent-state requirement: native runtime
+    # versions differ in their support for non-shared recurrent-state swaps.
+    # A standard-only hybrid graph has neither custom op and therefore emits
+    # sharing=False, as its dynamic full-attention KV outputs require. Native
+    # progression/reset must be qualified separately for the installed build.
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
         has_gqa = any(
@@ -1793,6 +1835,46 @@ def _write_genai_config(
             )
 
     return generator.write(output_dir)
+
+
+def _write_component_genai_config(
+    config: Any,
+    output_dir: str,
+    *,
+    ep: str,
+    context_length: int,
+    bos_token_id: int | None,
+    eos_token_id: int | list[int] | None,
+    pad_token_id: int | None,
+) -> str:
+    """Write the session configuration consumed by non-generative components."""
+    intra_op_threads = 16 if ep == "cpu" else 1
+    model = {
+        "type": "component",
+        "pad_token_id": pad_token_id if pad_token_id is not None else 0,
+        "eos_token_id": eos_token_id if eos_token_id is not None else 0,
+        "vocab_size": max(1, int(getattr(config, "vocab_size", 1))),
+        "context_length": max(
+            context_length,
+            int(getattr(config, "max_position_embeddings", 0)),
+        ),
+        "decoder": {
+            "filename": "backbone/model.onnx",
+            "session_options": {
+                "intra_op_num_threads": intra_op_threads,
+                "inter_op_num_threads": 1,
+                "session.intra_op.allow_spinning": "0",
+                "session.inter_op.allow_spinning": "0",
+            },
+        },
+    }
+    if bos_token_id is not None:
+        model["bos_token_id"] = bos_token_id
+    path = os.path.join(output_dir, "genai_config.json")
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump({"model": model}, file, indent=4)
+        file.write("\n")
+    return path
 
 
 def _mtp_state_ports(model: Any) -> list[dict[str, str]]:
@@ -2127,26 +2209,39 @@ def write_ort_genai_config(
             result[tf] = os.path.join(directory, tf)
 
     logger.info("Generating genai_config.json for %s (ep=%s)", ort_model_type, ep)
-    genai_path = _write_genai_config(
-        config,
-        directory,
-        pkg=pkg,
-        ort_model_type=ort_model_type,
-        ep=ep,
-        context_length=context_length,
-        bos_token_id=bos_token_id,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        is_vlm=is_vlm,
-        has_speech=has_speech,
-    )
+    if set(pkg) == {"backbone", "pointer_head"}:
+        genai_path = _write_component_genai_config(
+            config,
+            directory,
+            ep=ep,
+            context_length=context_length,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+    else:
+        genai_path = _write_genai_config(
+            config,
+            directory,
+            pkg=pkg,
+            ort_model_type=ort_model_type,
+            ep=ep,
+            context_length=context_length,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            is_vlm=is_vlm,
+            has_speech=has_speech,
+        )
     result["genai_config"] = genai_path
 
     # Write processor config for VLMs
     processor_path = _write_vision_processor_config(
         config,
         directory,
-        hf_model_id=hf_model_id,
+        # --config uses local HF assets too: otherwise the processor silently
+        # retains CLIP defaults instead of the checkpoint's normalization/bounds.
+        hf_model_id=hf_model_id or local_config_dir,
         trust_remote_code=trust_remote_code,
         revision=revision,
     )

@@ -35,6 +35,7 @@ Available passes
     Folds ``Concat(init_0, init_1, ...)`` patterns (where every input is a
     graph initializer) into a single pre-concatenated initializer.  Used to
     pre-pack QKV weight matrices after weight loading.
+
 """
 
 from __future__ import annotations
