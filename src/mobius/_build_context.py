@@ -29,12 +29,15 @@ from contextlib import contextmanager
 
 import onnx_ir as ir
 
+from mobius._constants import OPSET_VERSION
 from mobius._execution_providers import EpCapabilities
+from mobius._flags import flags
 
 __all__ = [
     "build_context",
     "ep_capabilities",
     "get_build_dtype",
+    "get_build_opset_version",
     "get_matmul_nbits_accuracy_level",
     "is_prefill_prefix_pruning_enabled",
     "prefill_prefix_pruning",
@@ -48,6 +51,9 @@ _current_ep: contextvars.ContextVar[EpCapabilities] = contextvars.ContextVar(
 )
 _current_dtype: contextvars.ContextVar[ir.DataType] = contextvars.ContextVar(
     "mobius_build_dtype", default=ir.DataType.FLOAT
+)
+_current_opset: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "mobius_build_opset", default=OPSET_VERSION
 )
 _matmul_nbits_accuracy_level: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "mobius_matmul_nbits_accuracy_level", default=None
@@ -90,12 +96,27 @@ def build_context(
     capabilities_token = _current_ep.set(capabilities)
     dtype_token = _current_dtype.set(dtype)
     accuracy_token = _matmul_nbits_accuracy_level.set(matmul_nbits_accuracy_level)
+    opset_token = _current_opset.set(
+        29
+        if flags.experimental_opset29 and not capabilities.supports_fused_moe
+        else OPSET_VERSION
+    )
     try:
         yield
     finally:
         _current_ep.reset(capabilities_token)
         _current_dtype.reset(dtype_token)
         _matmul_nbits_accuracy_level.reset(accuracy_token)
+        _current_opset.reset(opset_token)
+
+
+def get_build_opset_version() -> int:
+    """Return the opset snapshotted at build-context entry, or the default outside it.
+
+    The public inliner rejects mismatched function/model opsets. Snapshotting
+    prevents nested flag overrides during a build from mixing those versions.
+    """
+    return _current_opset.get()
 
 
 def validate_matmul_nbits_accuracy_level(level: int | None) -> None:
