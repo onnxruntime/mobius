@@ -19,7 +19,10 @@ pytestmark = pytest.mark.opset29
 
 @pytest.mark.parametrize("trajectory", [False, True])
 def test_merged_value_head_schema_checks_and_infers(trajectory: bool) -> None:
-    if "v_num_heads" not in onnx.defs.get_schema("LinearAttention", 29).attributes:
+    if (
+        not onnx.defs.has("LinearAttention", 29)
+        or "v_num_heads" not in onnx.defs.get_schema("LinearAttention", 29).attributes
+    ):
         pytest.skip("Requires ONNX containing merged onnx/onnx#8693")
     shapes = [
         [1, 3, 4],

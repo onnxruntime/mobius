@@ -43,6 +43,11 @@ at export time. Row-aligned packed embeddings decode only requested rows.
 Packages may contain multiple components and an independently cached MTP head,
 sharing the same original, little-endian GGUF shards. `gguf-packed.json` v2
 records component names and the MTP chain; single `model` exports retain v1.
+Multi-component saves publish unique graph-generation filenames, then atomically
+replace the manifest. Loading selects only that committed generation; unreferenced
+graphs from prior or interrupted saves are ignored, not substituted for missing
+components. Policy and adapter artifacts anywhere in the MTP chain must be
+explicitly omitted or saved separately.
 All sources must have unique filenames and reside in the output directory.
 Treat source files as immutable; load/save verifies source digests, ranges, and
 original external bindings. Transcoded safetensors output and new weight sharding

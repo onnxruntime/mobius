@@ -25,12 +25,12 @@ from mobius.tasks._base import _make_graph
 
 
 class _DecayProbe(GatedDeltaNet):
-    def forward(self, op, reference):
+    def forward(self, op, reference, conv_state=None, rec_state=None):
         return self._decay_coefficient(op, reference)
 
 
 class _OriginalDecayProbe(OriginalDecayGatedDeltaNet):
-    def forward(self, op, reference):
+    def forward(self, op, reference, conv_state=None, rec_state=None):
         return self._decay_coefficient(op, reference)
 
 

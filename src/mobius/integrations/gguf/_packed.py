@@ -16,6 +16,7 @@ import math
 import os
 import re
 import tempfile
+import uuid
 from pathlib import Path
 from typing import TypedDict
 
@@ -975,8 +976,10 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
     if not models:
         raise ValueError("Cannot save an empty GGUF package; build at least one component.")
     legacy = len(models) == 1 and package.mtp_head is None and models[0][1] == "model"
+    generation = uuid.uuid4().hex
     filenames = [
-        "model.onnx" if legacy else f"component-{index}.onnx" for index in range(len(models))
+        "model.onnx" if legacy else f"component-{generation}-{index}.onnx"
+        for index in range(len(models))
     ]
     reserved = {
         *filenames,
@@ -999,7 +1002,12 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
         ".gguf-packed.lock",
     }
     if root.exists():
-        unexpected = {p.name for p in root.iterdir()} - allowed
+        unexpected = {
+            p.name
+            for p in root.iterdir()
+            if p.name not in allowed
+            and re.fullmatch(r"component-(?:[0-9a-f]{32}-)?[0-9]+\.onnx", p.name) is None
+        }
         if unexpected:
             raise ValueError(
                 f"Lossless GGUF output contains unrelated/stale artifacts: "
@@ -1078,6 +1086,56 @@ def _validate_external_ranges(model, sources) -> None:
                         f"GGUF initializer {value.name!r} has an invalid source range. "
                         "Restore the original binding or rebuild the component."
                     )
+
+
+def packed_model_filenames(directory) -> list[str] | None:
+    """Select only graphs committed by the packed manifest, ignoring orphan generations."""
+    root = Path(directory)
+    if (root / ".gguf-packed.lock").exists():
+        raise ValueError(
+            "GGUF save is in progress or interrupted; finish recovery before loading."
+        )
+    manifest = root / _MANIFEST
+    if not manifest.exists():
+        return None
+    if not manifest.is_file() or manifest.is_symlink():
+        raise ValueError(
+            "GGUF manifest must be a regular file; restore the original manifest."
+        )
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "GGUF manifest is invalid JSON; restore the original manifest."
+        ) from error
+    if isinstance(payload, dict) and payload.get("format") == "mobius.gguf-packed.v1":
+        filenames = ["model.onnx"]
+    elif isinstance(payload, dict) and payload.get("format") == "mobius.gguf-packed.v2":
+        records = payload.get("models")
+        if not isinstance(records, list) or not records:
+            raise ValueError(
+                "GGUF component manifest is empty or invalid; rebuild the package."
+            )
+        filenames = []
+        for record in records:
+            filename = record.get("file") if isinstance(record, dict) else None
+            if (
+                not isinstance(filename, str)
+                or re.fullmatch(r"component-(?:[0-9a-f]{32}-)?[0-9]+\.onnx", filename) is None
+            ):
+                raise ValueError("Invalid GGUF component filename; restore the manifest.")
+            if filename in filenames:
+                raise ValueError("GGUF component manifest contains missing/duplicate models.")
+            filenames.append(filename)
+    else:
+        raise ValueError("Invalid GGUF packed manifest; rebuild from the original GGUF.")
+    for filename in filenames:
+        path = root / filename
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(
+                f"GGUF manifest component {filename!r} is missing/unsafe; restore the package."
+            )
+    return filenames
 
 
 def restore_packed_sources(package, directory) -> None:
@@ -1186,7 +1244,8 @@ def _restore_components(package, records) -> None:
             or not isinstance(record["component"], str)
             or not record["component"]
             or not isinstance(record["file"], str)
-            or re.fullmatch(r"component-[0-9]+\.onnx", record["file"]) is None
+            or re.fullmatch(r"component-(?:[0-9a-f]{32}-)?[0-9]+\.onnx", record["file"])
+            is None
         ):
             raise ValueError("Invalid GGUF component record; restore the manifest or rebuild.")
         name = record["file"].removesuffix(".onnx")

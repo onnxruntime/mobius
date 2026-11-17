@@ -68,6 +68,8 @@ def packed_sources(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
         "mtp_shared",
         "mtp_dedicated",
         "shared_components",
+        "atomic",
+        "artifacts",
         "qwen3moe_8",
         "qwen3moe_64",
         "qwen35",
@@ -598,6 +600,81 @@ def test_shared_source_components_validate_manifest(
         manifest_path.write_text(original)
 
 
+@pytest.mark.parametrize("fail_after", [1, 2])
+def test_component_publication_failure_preserves_previous_generation(
+    packed_sources: dict[str, Path], monkeypatch: pytest.MonkeyPatch, fail_after: int
+) -> None:
+    from mobius.integrations.gguf import _packed
+
+    source = packed_sources["atomic"]
+    with override_flags(experimental_opset29=True):
+        bound = build_from_gguf(source, execution_provider="onnx-standard")
+    package = ModelPackage({"first": bound["model"], "second": bound["model"]})
+    package.save(source.parent, progress_bar=False)
+    manifest_path = source.parent / "gguf-packed.json"
+    previous_manifest = manifest_path.read_bytes()
+    bound["model"].metadata_props["test.generation"] = "new"
+    replace = _packed.os.replace
+    published = 0
+
+    def interrupt(src, dst):
+        nonlocal published
+        if str(dst).endswith(".onnx"):
+            published += 1
+        if published == fail_after + 1 or str(dst).endswith("gguf-packed.json"):
+            raise OSError("injected component publication interruption")
+        return replace(src, dst)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(_packed.os, "replace", interrupt)
+        with pytest.raises(OSError, match="publication interruption"):
+            package.save(source.parent, progress_bar=False)
+    assert manifest_path.read_bytes() == previous_manifest
+    loaded = ModelPackage.load(str(source.parent))
+    assert set(loaded) == {"first", "second"}
+    assert all("test.generation" not in model.metadata_props for model in loaded.values())
+    package.save(source.parent, progress_bar=False)
+    loaded = ModelPackage.load(str(source.parent))
+    assert all(model.metadata_props["test.generation"] == "new" for model in loaded.values())
+
+
+@pytest.mark.parametrize("kind", ["policy", "adapter"])
+def test_packed_mtp_artifact_requests_are_not_silently_dropped(
+    packed_sources: dict[str, Path], kind: str
+) -> None:
+    from mobius.adapters import AdapterArtifact, AdapterTarget, AdapterWeights
+    from mobius.generation import build_greedy_sampler
+
+    source = packed_sources["artifacts"]
+    with override_flags(experimental_opset29=True):
+        package = build_from_gguf(source, execution_provider="onnx-standard")
+    package.mtp_head = ModelPackage({"model": package["model"]})
+    if kind == "policy":
+        package.mtp_head.add_policy_component("sample", build_greedy_sampler())
+    else:
+        package.mtp_head.adapter_artifacts["style"] = AdapterArtifact(
+            "style",
+            "test-base",
+            (
+                AdapterWeights(
+                    AdapterTarget("model", "projection.weight"),
+                    ir.tensor(np.ones((1, 2), dtype=np.float32)),
+                    ir.tensor(np.ones((2, 1), dtype=np.float32)),
+                    1.0,
+                ),
+            ),
+        )
+    with pytest.raises(ValueError, match="target or MTP chain"):
+        package.save(source.parent, progress_bar=False)
+    package.save(
+        source.parent,
+        progress_bar=False,
+        include_policy_components=kind != "policy",
+        include_adapter_artifacts=kind != "adapter",
+    )
+    assert ModelPackage.load(str(source.parent)).mtp_head is not None
+
+
 @requires_grouped_schema
 def test_original_expert_bank_graph_size_is_independent_of_expert_count(
     packed_sources: dict[str, Path],
@@ -616,6 +693,10 @@ def test_original_expert_bank_graph_size_is_independent_of_expert_count(
     "validate_schema",
     [False, pytest.param(True, marks=requires_packed_schema)],
     ids=["binding-roundtrip", "reference"],
+)
+@pytest.mark.skipif(
+    not _has_schema29("LinearAttention"),
+    reason="The hybrid exporter validates standard LinearAttention-29 during optimization.",
 )
 def test_original_deltanet_decay_needs_no_inverse_reparameterization(
     packed_sources: dict[str, Path], validate_schema: bool
