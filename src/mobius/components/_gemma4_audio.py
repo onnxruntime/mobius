@@ -72,11 +72,6 @@ def _glu(op: OpBuilder, x: ir.Value) -> ir.Value:
     return op.Mul(a, op.Sigmoid(b))
 
 
-def _swish(op: OpBuilder, x: ir.Value) -> ir.Value:
-    """SiLU/Swish activation: x * sigmoid(x)."""
-    return op.Mul(x, op.Sigmoid(x))
-
-
 # ---------------------------------------------------------------------------
 # Public components
 # ---------------------------------------------------------------------------
@@ -152,6 +147,7 @@ class Gemma4ConvSubsampling(nn.Module):
         conv_channels: list[int] | None = None,
         hidden_size: int = 1024,
         norm_eps: float = 1e-6,
+        linear_cls: type[nn.Module] = Linear,
     ):
         super().__init__()
         if conv_channels is None:
@@ -173,7 +169,7 @@ class Gemma4ConvSubsampling(nn.Module):
         # Linear: (c1 * freq_after_2_stages) → hidden_size
         # HF Gemma4AudioSubSampleConvProjection uses nn.Linear(bias=False)
         # for this projection, so no bias initializer should be created.
-        self.input_proj_linear = Linear(c1 * freq, hidden_size, bias=False)
+        self.input_proj_linear = linear_cls(c1 * freq, hidden_size, bias=False)
 
     def _conv_norm_relu(
         self,
@@ -211,7 +207,10 @@ class Gemma4ConvSubsampling(nn.Module):
         # Broadcast mask [B, T] → [B, 1, T, 1] over C and F dims
         mask_4d = op.Unsqueeze(mask, [1, 3])  # [B, 1, T, 1]
         x = op.Mul(x, op.CastLike(mask_4d, x))
-        # Downsample mask by conv stride (2): mask[:, ::2]
+        # Downsample mask by conv stride (2): mask[:, ::2]. The INT64_MAX
+        # ``ends`` sentinel means "to the end"; onnx-shape-inference (>=0.3.1)
+        # normalizes it to the axis length for strided slices, yielding a
+        # ceil(T/2) extent instead of a 2^62 sentinel.
         mask = op.Slice(
             mask,
             [0],  # starts
@@ -282,6 +281,8 @@ class Gemma4FeedForward(nn.Module):
         rms_norm_eps: Epsilon for RMSNorm.
         residual_weight: Scale applied to FF output before adding residual (0.5).
         gradient_clipping: Clamp value for numerical stability (1e9).
+        linear_cls: Projection class. Gemma 3n reuses this block with plain
+            :class:`Linear`, since its checkpoint ships no clipping bounds.
     """
 
     def __init__(
@@ -290,14 +291,15 @@ class Gemma4FeedForward(nn.Module):
         rms_norm_eps: float = 1e-6,
         residual_weight: float = 0.5,
         gradient_clipping: float = 1e9,
+        linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         self._residual_weight = residual_weight
         self._gradient_clipping = gradient_clipping
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.ffw_layer_1 = ClippableLinear(hidden_size, hidden_size * 4, bias=False)
-        self.ffw_layer_2 = ClippableLinear(hidden_size * 4, hidden_size, bias=False)
+        self.ffw_layer_1 = linear_cls(hidden_size, hidden_size * 4, bias=False)
+        self.ffw_layer_2 = linear_cls(hidden_size * 4, hidden_size, bias=False)
         self.post_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
     def forward(self, op: OpBuilder, x: ir.Value):
@@ -305,7 +307,7 @@ class Gemma4FeedForward(nn.Module):
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.pre_layer_norm(op, x)
         x = self.ffw_layer_1(op, x)  # [B, T, 4h]
-        x = _swish(op, x)
+        x = op.Swish(x)
         x = self.ffw_layer_2(op, x)  # [B, T, h]
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.post_layer_norm(op, x)
@@ -334,6 +336,8 @@ class Gemma4LightConv1d(nn.Module):
         conv_kernel_size: Depthwise conv kernel size (Gemma4 default: 5).
         rms_norm_eps: Epsilon for RMSNorm.
         gradient_clipping: Clamp value for numerical stability.
+        linear_cls: Projection class. Gemma 3n reuses this block with plain
+            :class:`Linear`, since its checkpoint ships no clipping bounds.
     """
 
     def __init__(
@@ -342,15 +346,16 @@ class Gemma4LightConv1d(nn.Module):
         conv_kernel_size: int = 5,
         rms_norm_eps: float = 1e-6,
         gradient_clipping: float = 1e9,
+        linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         self._gradient_clipping = gradient_clipping
 
         self.pre_layer_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear_start = ClippableLinear(hidden_size, hidden_size * 2, bias=False)
+        self.linear_start = linear_cls(hidden_size, hidden_size * 2, bias=False)
         self.depthwise_conv1d = CausalDepthwiseConv1d(hidden_size, conv_kernel_size)
         self.conv_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.linear_end = ClippableLinear(hidden_size, hidden_size, bias=False)
+        self.linear_end = linear_cls(hidden_size, hidden_size, bias=False)
 
     def forward(self, op: OpBuilder, x: ir.Value):
         residual = x
@@ -365,7 +370,7 @@ class Gemma4LightConv1d(nn.Module):
 
         x = _gradient_clip(op, x, self._gradient_clipping)
         x = self.conv_norm(op, x)
-        x = _swish(op, x)
+        x = op.Swish(x)
         x = self.linear_end(op, x)  # [B, T, h]
         return op.Add(x, residual)
 
@@ -425,6 +430,8 @@ class Gemma4Attention(nn.Module):
         num_heads: int = 8,
         attention_context_left: int = 13,
         attention_logit_cap: float = 50.0,
+        linear_cls: type[nn.Module] = Linear,
+        clippable_linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         self._num_heads = num_heads
@@ -437,17 +444,17 @@ class Gemma4Attention(nn.Module):
         self._k_scale = math.log(1 + math.e) / math.log(2)
 
         # Q/K/V: no bias (HF nn.Linear(..., bias=False))
-        self.q_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
-        self.k_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
-        self.v_proj = ClippableLinear(hidden_size, hidden_size, bias=False)
+        self.q_proj = clippable_linear_cls(hidden_size, hidden_size, bias=False)
+        self.k_proj = clippable_linear_cls(hidden_size, hidden_size, bias=False)
+        self.v_proj = clippable_linear_cls(hidden_size, hidden_size, bias=False)
         # post: no bias (HF has no .bias key for self_attn.post in checkpoint)
-        self.post = ClippableLinear(hidden_size, hidden_size, bias=False)
+        self.post = clippable_linear_cls(hidden_size, hidden_size, bias=False)
 
         # Learnable per-head-dim scale applied to Q after projection
         self.per_dim_scale = nn.Parameter([self._head_dim])
 
         # Relative position key projection: no bias (HF nn.Linear(..., bias=False))
-        self.relative_k_proj = Linear(hidden_size, hidden_size, bias=False)
+        self.relative_k_proj = linear_cls(hidden_size, hidden_size, bias=False)
 
         # Precomputed sinusoidal relative position embeddings [context_left, hidden_size].
         # Positions are ordered [context_left-1, ..., 1, 0] (descending relative distance).
@@ -477,7 +484,10 @@ class Gemma4Attention(nn.Module):
         """Build [1, 1, T, T] causal sliding-window attention bias."""
         zero = op.Constant(value_int=0)
         one = op.Constant(value_int=1)
-        positions = op.Range(zero, seq_len, one)  # [T] int64
+        # ``seq_len`` is a 1-D [1] tensor from op.Shape; Range requires a
+        # scalar limit, so squeeze the singleton axis.
+        seq_len_scalar = op.Squeeze(seq_len, [0])
+        positions = op.Range(zero, seq_len_scalar, one)  # [T] int64
         q_pos = op.Unsqueeze(positions, [1])  # [T, 1]
         k_pos = op.Unsqueeze(positions, [0])  # [1, T]
         diff = op.Sub(q_pos, k_pos)  # [T, T]: i - j
@@ -570,7 +580,9 @@ class Gemma4Attention(nn.Module):
         # pos_embed is ordered [ctx_left-1, ..., 0], so distance d maps to index ctx_left-1-d
         zero_i = op.Constant(value_int=0)
         one_i = op.Constant(value_int=1)
-        positions = op.Range(zero_i, seq_len, one_i)  # [T]
+        # Range requires a scalar limit; ``seq_len`` is a 1-D [1] shape tensor.
+        seq_len_scalar = op.Squeeze(seq_len, [0])
+        positions = op.Range(zero_i, seq_len_scalar, one_i)  # [T]
         q_pos_i = op.Unsqueeze(positions, [1])  # [T, 1]
         k_pos_i = op.Unsqueeze(positions, [0])  # [1, T]
         diff_i = op.Sub(q_pos_i, k_pos_i)  # [T, T]: i-j
@@ -661,21 +673,40 @@ class Gemma4AudioLayer(nn.Module):
         rms_norm_eps: float = 1e-6,
         residual_weight: float = 0.5,
         gradient_clipping: float = 1e9,
+        linear_cls: type[nn.Module] = Linear,
+        clippable_linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         self._gradient_clipping = gradient_clipping
 
         self.feed_forward1 = Gemma4FeedForward(
-            hidden_size, rms_norm_eps, residual_weight, gradient_clipping
+            hidden_size,
+            rms_norm_eps,
+            residual_weight,
+            gradient_clipping,
+            clippable_linear_cls,
         )
         self.self_attn = Gemma4Attention(
-            hidden_size, num_heads, attention_context_left, attention_logit_cap
+            hidden_size,
+            num_heads,
+            attention_context_left,
+            attention_logit_cap,
+            linear_cls,
+            clippable_linear_cls,
         )
         self.lconv1d = Gemma4LightConv1d(
-            hidden_size, conv_kernel_size, rms_norm_eps, gradient_clipping
+            hidden_size,
+            conv_kernel_size,
+            rms_norm_eps,
+            gradient_clipping,
+            clippable_linear_cls,
         )
         self.feed_forward2 = Gemma4FeedForward(
-            hidden_size, rms_norm_eps, residual_weight, gradient_clipping
+            hidden_size,
+            rms_norm_eps,
+            residual_weight,
+            gradient_clipping,
+            clippable_linear_cls,
         )
         self.norm_pre_attn = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.norm_post_attn = RMSNorm(hidden_size, eps=rms_norm_eps)
@@ -754,13 +785,19 @@ class Gemma4AudioEncoder(nn.Module):
         rms_norm_eps: float = 1e-6,
         residual_weight: float = 0.5,
         gradient_clipping: float = 1e9,
+        linear_cls: type[nn.Module] = Linear,
+        clippable_linear_cls: type[nn.Module] = ClippableLinear,
     ):
         super().__init__()
         if conv_channels is None:
             conv_channels = [128, 32]
 
         self.subsample_conv_projection = Gemma4ConvSubsampling(
-            input_size, conv_channels, hidden_size, rms_norm_eps
+            input_size,
+            conv_channels,
+            hidden_size,
+            rms_norm_eps,
+            linear_cls,
         )
         self.layers = nn.ModuleList(
             [
@@ -773,6 +810,8 @@ class Gemma4AudioEncoder(nn.Module):
                     rms_norm_eps,
                     residual_weight,
                     gradient_clipping,
+                    linear_cls,
+                    clippable_linear_cls,
                 )
                 for _ in range(num_layers)
             ]
@@ -784,7 +823,7 @@ class Gemma4AudioEncoder(nn.Module):
         # Keep bias=True here; the caller's pre_projection_norm must use
         # manual primitive ops (not op.RMSNormalization) to prevent this
         # fusion pattern.
-        self.output_proj = Linear(hidden_size, output_proj_dims, bias=True)
+        self.output_proj = linear_cls(hidden_size, output_proj_dims, bias=True)
 
     def forward(
         self,

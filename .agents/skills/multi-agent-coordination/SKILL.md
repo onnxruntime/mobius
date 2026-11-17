@@ -40,7 +40,8 @@ git fetch origin && git checkout <branch> && git pull
 
 ## 2. Commit Coordination Protocol
 
-Multiple agents committing to the same branch requires discipline to avoid divergence.
+Choose the branch strategy in §9 first. When multiple agents contribute to one
+branch, use this protocol to avoid divergence.
 
 **Rules**:
 1. **Pull before commit**: Always `git pull origin <branch> --rebase` immediately before committing.
@@ -61,17 +62,29 @@ git push origin <branch>              # push immediately
 
 ## 3. Verification Gates
 
+For requested post-task interviews, ask each agent in its initial assignment
+to report missing context and concrete corrections needed after the first prompt.
+Use follow-up-capable agents if a later interview is required; synchronous agents
+may reject follow-up messages. Record interview coverage and tool limitations
+honestly, and consolidate only evidence-backed, generalizable skill changes.
+
 Checks at each stage prevent problems from compounding across agents.
 
 ### Before starting work
 - Verify the branch exists and is up to date.
 - Run the relevant tests to establish a baseline — know what was already failing before you touched anything.
 - Check for uncommitted changes left by previous agents in your worktree.
+- Verify `inspect.getfile(mobius)` points into the agent's worktree; editable
+  installs from another worktree invalidate all test evidence.
+- Pass the exact Python executable, `PYTHONPATH`, Hub/temp cache locations, and
+  `CUDA_VISIBLE_DEVICES` to every agent, including reviewers. Check these before
+  treating a missing dependency as a branch failure.
 
 ### After each commit
 - Run the affected tests immediately (don't batch; catch regressions early).
 - Verify the commit landed on the correct branch (`git log --oneline -3`).
 - Confirm the push succeeded.
+- Confirm the remote ref/PR head SHA, not just local `HEAD`.
 
 ### Before final review (lead audit)
 - Check ALL worktrees for unpushed commits or uncommitted changes.
@@ -84,6 +97,15 @@ Checks at each stage prevent problems from compounding across agents.
 - All review findings addressed.
 - Final test run passes.
 - PR description updated with an accurate scorecard of what changed.
+
+### CI failures and main refreshes
+- Compare the exact failing test on the exact base SHA; a red overall workflow
+  does not prove the same job failed on base.
+- Keep feature scope: document unrelated baseline names/metrics instead of
+  changing their code or tolerances.
+- Rebase independent PRs linearly onto `origin/main`. Resolve shared registries,
+  exports, helpers, and guards semantically by retaining both sides; then run
+  shared-surface tests, lint, and review before `push --force-with-lease`.
 
 ---
 
@@ -171,18 +193,14 @@ Match the agent role to the task type. Mismatched roles waste agent capacity.
 
 ---
 
-## 9. Single-Branch Strategy
+## 9. Branch Strategy
 
-For large multi-agent efforts, use **one shared feature branch** rather than one branch per agent.
-
-**Why**: Avoids complex multi-branch merge scenarios at the end. All agents commit to the same branch via their isolated worktrees.
-
-**Trade-offs**:
-- More `pull --rebase` cycles per agent.
-- Occasional push conflicts (recoverable with rebase).
-- BUT: much simpler final state, single PR, linear history.
-
-**Alternative**: Separate branches per agent merged via separate PRs — only viable when features are truly independent and don't share files.
+- Use one branch only when agents contribute to one atomic PR; serialize edits
+  to shared files and require pull/rebase before every push.
+- Use separate branches/PRs for independent deliverables (for example, separate
+  model architectures). This isolates CI, review, rollback, and publication.
+- Never merge main into a linear-history feature branch. Rebase, resolve shared
+  surfaces semantically, and force-push only with `--force-with-lease`.
 
 ---
 
@@ -197,6 +215,9 @@ Before sending a task, verify your prompt includes all of the following:
 5. ☐ **Commit message format** — so the history is readable
 6. ☐ **Push reminder** — explicit instruction to push after committing
 7. ☐ **Definition of done** — what "finished" looks like (tests passing, specific output, etc.)
+8. ☐ **Recovery handoff** — report blockers, exact test results, and corrections
+   beyond the initial prompt. Persist a coherent checkpoint before a long run;
+   never report a cancelled agent's unfinished work as verified.
 
 **Example delegation prompt**:
 ```
@@ -207,7 +228,7 @@ Fix the Phi-2 MLP weight mismatch: replace the gated MLP (gate_proj/up_proj/down
 with FCMLP (fc1/fc2) in src/mobius/models/phi.py. The HF weights use fc1/fc2.
 
 After changes, run:
-  python -m pytest tests/build_graph_test.py -k "phi" -q
+  python -m pytest tests/build_graph -k "phi" -q
 
 Commit message: "fix: use FCMLP for Phi-1/2 model (HF uses fc1/fc2 not gated MLP)"
 Push to justinchu/fix-model-parity immediately after committing.

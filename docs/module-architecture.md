@@ -1,32 +1,33 @@
 # Module Architecture Guide
 
 This guide documents the internal module structure of `mobius`,
-covering model registration, decoder layer extension, weight loading security,
-and backward compatibility.
+covering model registration, decoder layer extension, and weight loading security.
 
 ## Module Overview
 
-The original `_exporter.py` monolith (1,188 lines) has been split into five
-focused modules:
+The original `_exporter.py` monolith (1,188 lines) has been split into focused
+modules:
 
 | Module | Responsibility |
 |---|---|
 | `_registry.py` | Model registration — maps HuggingFace `model_type` strings to `nn.Module` subclasses |
-| `_config_resolver.py` | Resolves HuggingFace `PretrainedConfig` objects to internal `BaseModelConfig` subclasses |
-| `_weight_loading.py` | Downloads and applies safetensors weights to ONNX IR models |
-| `_builder.py` | Core build API — `build()` and `build_from_module()` |
-| `_diffusers_builder.py` | Builds ONNX models from diffusers pipelines (Flux, SD3, VAEs) |
+| `integrations/transformers/_config_resolver.py` | Resolves HuggingFace `PretrainedConfig` objects to internal `BaseModelConfig` subclasses |
+| `integrations/_weight_loading.py` | Eager and bounded-streaming checkpoint binding for ONNX IR models |
+| `_builder.py` | Ecosystem-agnostic graph construction via `build_from_module()` |
+| `integrations/transformers/_builder.py` | Transformers checkpoint orchestration |
+| `integrations/diffusers/_builder.py` | Diffusers pipeline orchestration |
 
 ### Dependency graph
 
 ```
-_builder.py          ← build(), build_from_module()
+integrations/transformers/_builder.py  ← build_transformers_model()
   ├── _registry.py
-  ├── _config_resolver.py
-  └── _weight_loading.py
-_diffusers_builder.py
+  ├── integrations/transformers/_config_resolver.py
+  ├── integrations/_weight_loading.py
+  └── _builder.py    (build_from_module, resolve_dtype)
+integrations/diffusers/_builder.py
   ├── _builder.py    (build_from_module, resolve_dtype)
-  └── _weight_loading.py
+  └── integrations/_weight_loading.py
 ```
 
 ---
@@ -243,29 +244,29 @@ the decoder layer.
 
 ## 3. Weight Loading Security Policy
 
-### Policy: safetensors only — no `torch.load`
+### Policy: prefer safetensors; restrict legacy PyTorch loading
 
-All weight loading in `_weight_loading.py` uses the
-[safetensors](https://github.com/huggingface/safetensors) format exclusively.
+Bounded streaming requires
+[safetensors](https://github.com/huggingface/safetensors), whose headers can be
+inspected without materializing tensor payloads. The generic eager loader
+prefers safetensors and supports legacy PyTorch state dictionaries only through
+`torch.load(..., weights_only=True)`.
 
-> **`torch.load()` and pickle deserialization are prohibited.** Pickle files
-> can execute arbitrary code when loaded. Using `torch.load()` — even with
-> `weights_only=True` — is not permitted anywhere in the weight loading path.
+> Unrestricted pickle deserialization is prohibited. Legacy files must load on
+> CPU with `weights_only=True`. The generic Transformers loader also validates
+> the result as a mapping from string names to tensors. Architecture-specific
+> streaming paths must not fall back to pickle formats.
 
 This policy is enforced by:
 
-1. **Code-level comment** at the top of `_weight_loading.py`:
-   ```python
-   # SECURITY: Do NOT use torch.load() or pickle deserialization anywhere
-   # in this module. Only safetensors is permitted for weight loading to
-   # prevent arbitrary code execution from untrusted weight files.
-   ```
-
-2. **Implementation** — `_download_weights()` calls
-   `safetensors.torch.load_file()`, never `torch.load()`.
-
-3. **Regression tests** — security tests verify that the weight loading
-   path does not call `torch.load`.
+1. **Format preference** — `_download_weights()` checks safetensors indexes
+   and single-file checkpoints before legacy PyTorch files.
+2. **Restricted fallback** — legacy loading uses `weights_only=True`; the
+   generic Transformers loader also uses `map_location="cpu"` and validates
+   the returned state dict.
+3. **Streaming preflight** — streaming planners inspect safetensors headers,
+   reject duplicate or unclassified keys, and validate source and target
+   metadata before publication.
 
 ### How weight loading works
 
@@ -275,8 +276,12 @@ _download_weights(model_id)
   ├── Try model.safetensors.index.json  (sharded checkpoint)
   │     └── Download all shards in parallel via _parallel_download()
   │
-  └── Fall back to model.safetensors   (single file)
-        └── safetensors.torch.load_file()
+  ├── Fall back to model.safetensors   (single file)
+  │     └── safetensors.torch.load_file()
+  │
+  └── Fall back to pytorch_model.bin(.index.json)
+        └── torch.load(weights_only=True, map_location="cpu")
+        └── Validate dict[str, torch.Tensor]
                                         ↓
                                    state_dict: dict[str, torch.Tensor]
                                         ↓
@@ -288,18 +293,55 @@ apply_weights(model, state_dict)
         └── Assign to initializer.const_value
 ```
 
+Large or layout-changing checkpoints use bounded streaming instead:
+
+```text
+integrations/transformers/_builder.py
+  -> architecture-specific planner (_<model>_weights.py)
+       -> inspect safetensors headers
+       -> classify every source
+       -> validate source and target metadata
+       -> build StreamingWeightPlan
+  -> integrations/_weight_loading.py
+       -> bind lazy sources to graph initializers
+  -> ModelPackage.save()
+       -> materialize one source/transform at a time
+       -> write ONNX external data transactionally
+```
+
+The source types have separate responsibilities:
+
+- `StreamingWeightSource` binds one source tensor directly.
+- `StreamingExpertBankSource` assembles per-expert matrices.
+- `StreamingTransformedWeightSource` validates and lazily transforms one
+  source into a differently laid-out target.
+
+The generic loader owns lifecycle, metadata checks, and lazy materialization.
+The architecture planner owns checkpoint names, topology, and source-to-target
+mapping. Model graph math and format-specific transforms remain in the model
+module. The Transformers builder may select a planner, but should not contain
+operator layout or repacking logic.
+
 ### For diffusers components
 
-`_diffusers_builder.py` uses `_download_diffusers_component_weights()` which
-follows the same safetensors-only pattern. It looks for:
+`integrations/diffusers/_builder.py` uses
+`_download_diffusers_component_weights()` which
+prefers safetensors and uses the same restricted `weights_only=True` fallback
+for legacy PyTorch files. It looks for:
 - `{component}/diffusion_pytorch_model.safetensors(.index.json)`
+- `{component}/pytorch_model.safetensors(.index.json)`
 - `{component}/model.safetensors(.index.json)`
+- `{component}/diffusion_pytorch_model.bin(.index.json)`
+- `{component}/pytorch_model.bin(.index.json)`
+- `{component}/model.bin(.index.json)`
 
 ### Key implementation details
 
 - **Lazy casting**: When the weight dtype doesn't match the model's declared
   type, `ir.LazyTensor` defers the cast to serialization time, avoiding
   eager memory allocation.
+- **Bounded transformation**: Custom repacking runs during serialization, so
+  only the current source, scratch space, and target tensor are live.
 - **Parallel downloads**: Sharded checkpoints are downloaded using a
   thread pool (`max_workers=8`) for faster loading.
 - **No temp files**: Weights are loaded directly from the HuggingFace
@@ -312,21 +354,23 @@ follows the same safetensors-only pattern. It looks for:
 All code imports directly from the specific module that owns the symbol:
 
 ```python
-from mobius._builder import build, build_from_module
+from mobius._builder import build_from_module
 from mobius._registry import registry
-from mobius._weight_loading import apply_weights
-from mobius._diffusers_builder import build_diffusers_pipeline
+from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations.diffusers._builder import build_diffusers_pipeline
+from mobius.integrations.transformers._builder import build_transformers_model
 ```
 
 ### Module → symbols reference
 
 | Source module | Symbols |
 |---|---|
-| `_builder` | `DTYPE_MAP`, `build`, `build_from_module`, `resolve_dtype`, `_cast_module_dtype`, `_DEFAULT_PASSES`, `_optimize` |
-| `_config_resolver` | `_config_from_hf`, `_default_task_for_model`, `_dict_to_pretrained_config`, `_try_load_config_json` |
-| `_diffusers_builder` | `build_diffusers_pipeline`, `_DIFFUSERS_CLASS_MAP`, `_download_diffusers_component_weights`, `_init_diffusers_class_map`, `_load_diffusers_component_config`, `_load_diffusers_pipeline_index` |
+| `_builder` | `DTYPE_MAP`, `build_from_module`, `resolve_dtype`, `_cast_module_dtype` |
+| `integrations.transformers._builder` | `build_transformers_model` |
+| `integrations.transformers._config_resolver` | `_config_from_hf`, `_default_task_for_model`, `_dict_to_pretrained_config`, `_try_load_config_json` |
+| `integrations.diffusers._builder` | `build_diffusers_pipeline`, `_DIFFUSERS_CLASS_MAP`, `_download_diffusers_component_weights`, `_init_diffusers_class_map`, `_load_diffusers_component_config`, `_load_diffusers_pipeline_index` |
 | `_registry` | `MODEL_MAP`, `ModelRegistration`, `ModelRegistry`, `registry` |
-| `_weight_loading` | `apply_weights`, `_download_weights`, `_parallel_download` |
+| `integrations._weight_loading` | `apply_weights`, `_download_weights`, `_parallel_download` |
 
 ---
 
@@ -335,7 +379,7 @@ from mobius._diffusers_builder import build_diffusers_pipeline
 ### Build a model from HuggingFace
 
 ```python
-from mobius._builder import build
+from mobius import build
 
 pkg = build("meta-llama/Llama-3-8B")
 pkg.save("/output/llama/")
@@ -344,7 +388,7 @@ pkg.save("/output/llama/")
 ### Build from a custom module
 
 ```python
-from mobius._builder import build_from_module
+from mobius import build_from_module
 
 module = MyCausalLMModel(config)
 pkg = build_from_module(module, config, task="text-generation")
@@ -353,8 +397,8 @@ pkg = build_from_module(module, config, task="text-generation")
 ### Register and build a custom architecture
 
 ```python
+from mobius import build
 from mobius._registry import registry
-from mobius._builder import build
 
 registry.register("my_arch", MyCausalLMModel)
 pkg = build("my-org/my-model")  # auto-detects "my_arch" from config.json
@@ -363,8 +407,8 @@ pkg = build("my-org/my-model")  # auto-detects "my_arch" from config.json
 ### Apply weights separately
 
 ```python
-from mobius._builder import build
-from mobius._weight_loading import apply_weights, _download_weights
+from mobius import build
+from mobius.integrations._weight_loading import apply_weights, _download_weights
 
 pkg = build("meta-llama/Llama-3-8B", load_weights=False)
 state_dict = _download_weights("meta-llama/Llama-3-8B")

@@ -88,6 +88,15 @@ class GoldenTestCase:
     images: list[str]
     """Image paths relative to ``testdata/`` (VL tasks)."""
 
+    videos: list[str]
+    """Video paths relative to ``testdata/`` (video-language tasks)."""
+
+    video_num_frames: int | None
+    """Optional deterministic number of frames sampled from each video."""
+
+    media_max_pixels: int | None
+    """Optional deterministic pixel budget applied to each image/video frame."""
+
     audio: list[str]
     """Audio paths relative to ``testdata/`` (speech tasks)."""
 
@@ -99,6 +108,9 @@ class GoldenTestCase:
 
     trust_remote_code: bool
     """Whether the HF model requires ``trust_remote_code``."""
+
+    reference_loader: str
+    """HF reference loader kind: ``causal-lm`` or ``multimodal``."""
 
     skip_reason: str | None
     """If set, the test runner should skip with this message."""
@@ -119,6 +131,16 @@ class GoldenTestCase:
     specific module class + task at build time.  Needed for auxiliary heads
     (DFlash, MTP) that share a base checkpoint whose ``architectures`` field
     would otherwise auto-route to the base model.  ``None`` = auto-detect."""
+
+    gguf_source: dict[str, object] | None
+    """Pinned GGUF artifact used instead of HuggingFace weights.
+
+    ``model_id`` and ``revision`` still identify the independent HuggingFace
+    tokenizer/reference checkpoint used to create the golden data.
+    """
+
+    ort_genai: dict[str, object] | None
+    """Pinned ORT GenAI E2E enrollment and released-runtime capability record."""
 
     yaml_path: Path
     """Absolute path to the source YAML file."""
@@ -235,14 +257,20 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         level=data["level"],
         prompts=inputs.get("prompts", []) or [],
         images=inputs.get("images", []) or [],
+        videos=inputs.get("videos", []) or [],
+        video_num_frames=inputs.get("video_num_frames"),
+        media_max_pixels=inputs.get("media_max_pixels"),
         audio=inputs.get("audio", []) or [],
         decoder_prompt=inputs.get("decoder_prompt", "") or "",
         generation_params=generation,
         trust_remote_code=data.get("trust_remote_code", False),
+        reference_loader=data.get("reference_loader", "causal-lm"),
         skip_reason=data.get("skip_reason"),
         ci_skip_reason=data.get("ci_skip_reason"),
         min_token_match_ratio=data.get("min_token_match_ratio"),
         architecture=data.get("architecture"),
+        gguf_source=data.get("gguf"),
+        ort_genai=data.get("ort_genai"),
         yaml_path=yaml_path,
     )
 
@@ -304,6 +332,7 @@ def save_golden_ref(
     input_ids: np.ndarray | list[int],
     component_norms: dict[str, float] | None = None,
     component_shapes: dict[str, tuple[int, ...]] | None = None,
+    provenance: dict[str, object] | None = None,
 ) -> None:
     """Save golden reference data to a ``.json`` file (L4 only).
 
@@ -329,6 +358,7 @@ def save_golden_ref(
         input_ids: Tokenized input array.
         component_norms: L2 norms for multi-model component outputs.
         component_shapes: Output shapes for multi-model components.
+        provenance: Immutable source identities used to generate the golden.
     """
     json_path = Path(json_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,6 +393,8 @@ def save_golden_ref(
         data["component_shapes"] = {
             k: [int(x) for x in v] for k, v in component_shapes.items()
         }
+    if provenance:
+        data["provenance"] = provenance
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -376,6 +408,7 @@ def save_generation_json(
     prompt: str,
     generated_tokens: list[int],
     generated_text: str | None = None,
+    provenance: dict[str, object] | None = None,
 ) -> None:
     """Save a ``*_generation.json`` L5 marker file alongside the main golden.
 
@@ -389,6 +422,7 @@ def save_generation_json(
         generated_tokens: Token IDs produced by greedy generation (prompt excluded).
         generated_text: Decoded string of ``generated_tokens``. ``None`` if
             the tokenizer was not available at generation time.
+        provenance: Immutable source identities used to generate the golden.
     """
     json_path = Path(json_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,6 +434,8 @@ def save_generation_json(
     }
     if generated_text is not None:
         data["generated_text"] = generated_text
+    if provenance:
+        data["provenance"] = provenance
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -477,6 +513,90 @@ def load_drafter_inputs(
     if not path.exists():
         return None
     with np.load(path, allow_pickle=False) as data:
+        return {k: data[k] for k in data.files}
+
+
+def diarization_probs_path_for_case(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> Path:
+    """Return the companion ``*_probs.npz`` path for a diarization test case.
+
+    Diarization models (``diarization`` / ``diarization-streaming``) emit
+    continuous per-frame per-speaker sigmoid probabilities rather than a
+    vocab logit vector, so ``compare_golden()``'s argmax/top-K gate does not
+    apply and the raw arrays cannot be compactly summarized the way
+    ``GoldenRef`` summarizes a logit vector. Streaming cases additionally
+    need the per-chunk Arrival-Order Speaker Cache (AOSC) + FIFO cache-state
+    tensors so a multi-chunk session can be replayed exactly. Both are
+    stored in this companion ``.npz`` (see :func:`save_diarization_golden`),
+    mirroring the ``*_inputs.npz`` pattern used by drafter tasks.
+
+    Maps ``testdata/cases/<task>/<name>.yaml``
+    to  ``testdata/golden/<task>/<name>_probs.npz``.
+    """
+    task_dir = case.yaml_path.parent.name
+    return golden_dir / task_dir / f"{case.case_id}_probs.npz"
+
+
+def save_diarization_golden(
+    json_path: Path,
+    *,
+    arrays: dict[str, np.ndarray],
+    provenance: dict[str, object] | None = None,
+) -> None:
+    """Save a diarization test case's golden reference.
+
+    The full-precision arrays (per-frame speaker probabilities and, for
+    streaming cases, the per-chunk cache-state tensors) are stored in a
+    companion ``*_probs.npz`` next to ``json_path`` (see
+    :func:`diarization_probs_path_for_case`); ``json_path`` itself records
+    only lightweight, human-diffable shape/provenance metadata so a reviewer
+    can sanity-check a regenerated golden without loading the ``.npz``.
+
+    Args:
+        json_path: Destination path for the metadata ``.json`` file.
+        arrays: Named reference arrays, e.g. ``{"probs": ...}`` for an
+            offline case or ``{"chunk0_probs": ..., "chunk0_past_fifo":
+            ..., ...}`` for a streaming session.
+        provenance: Immutable source identities used to generate the golden.
+    """
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    npz_path = json_path.with_name(json_path.stem + "_probs.npz")
+    np.savez(npz_path, **arrays)  # type: ignore[arg-type]
+
+    data: dict = {"array_shapes": {k: list(v.shape) for k, v in arrays.items()}}
+    if provenance:
+        data["provenance"] = provenance
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")  # trailing newline for POSIX compliance
+
+
+def load_diarization_golden(
+    case: GoldenTestCase,
+    golden_dir: Path = GOLDEN_DIR,
+) -> dict[str, np.ndarray] | None:
+    """Load a diarization test case's golden reference arrays.
+
+    Returns the ``.npz`` companion arrays saved by
+    :func:`save_diarization_golden` (e.g. ``{"probs": ...}`` or the
+    per-chunk ``chunk{i}_*`` streaming arrays), or ``None`` if either the
+    metadata ``.json`` or its companion ``.npz`` is missing.
+
+    Args:
+        case: The test case whose golden to load.
+        golden_dir: Root directory for golden files.
+    """
+    json_path = golden_path_for_case(case, golden_dir)
+    if not json_path.exists():
+        return None
+    npz_path = diarization_probs_path_for_case(case, golden_dir)
+    if not npz_path.exists():
+        return None
+    with np.load(npz_path, allow_pickle=False) as data:
         return {k: data[k] for k in data.files}
 
 

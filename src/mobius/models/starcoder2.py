@@ -69,7 +69,7 @@ class StarCoder2CausalLMModel(LayerNormCausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = _StarCoder2TextModel(config)
+        self._replace_text_model(_StarCoder2TextModel(config))
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

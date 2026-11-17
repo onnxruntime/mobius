@@ -1,0 +1,14 @@
+model_id: "mradermacher/llama-embed-nemotron-8b-GGUF"
+model_type: "llama_embed_gguf"
+revision: "e7ae3cbae4f7693bbd75ec959bf293f39e1f2e25"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Hello"
+
+level: "L4"
+skip_reason: "The only pinned real llama-embed GGUF uses Llama 3 rope scaling, which is deliberately outside the promoted dense default-RoPE subset and must fail closed."
+
+notes: "The pinned NVIDIA source revision aa3b43a495a9b280d1bdb716da37c54bb495d630 proves a bidirectional, stateless Llama encoder with average pooling, but its factor-8 Llama 3 RoPE requires dedicated scaled-RoPE closure. Synthetic nonzero ORT tests cover the exact promoted default-RoPE subset. Runtime packaging and packed projection preservation remain deferred."

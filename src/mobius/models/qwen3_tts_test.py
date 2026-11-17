@@ -35,8 +35,12 @@ _TINY_CONFIG = ArchitectureConfig(
     num_key_value_heads=1,
     head_dim=4,
     vocab_size=_CODEC_VOCAB,
+    max_position_embeddings=128,
     rms_norm_eps=1e-6,
     hidden_act="silu",
+    mrope_section=[1, 1, 0],
+    mrope_interleaved=True,
+    rope_type="default",
     tts=TTSConfig(
         num_code_groups=_NUM_CODE_GROUPS,
         text_hidden_size=_TEXT_HIDDEN,
@@ -120,6 +124,73 @@ def test_step_embedder_batched():
     got = session.run({"frame_codes": frame_codes, "text_embed": text_embed})["inputs_embeds"]
     assert got.shape == (batch, 1, _HIDDEN)
     np.testing.assert_allclose(got, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_code_predictor_transition_components_use_exported_embeddings():
+    task = TTSTask()
+    prefill = OnnxModelSession(task._build_code_predictor_prefill(_TINY_CONFIG))
+    step = OnnxModelSession(task._build_code_predictor_step_embedder(_TINY_CONFIG))
+    talker_hidden = np.arange(8, dtype=np.float32).reshape(1, 1, 8)
+    group_0_embed = talker_hidden + 10
+    got_prefill = prefill.run(
+        {
+            "talker_hidden": talker_hidden,
+            "group_0_embed": group_0_embed,
+        }
+    )["inputs_embeds"]
+    np.testing.assert_array_equal(
+        got_prefill,
+        np.concatenate([talker_hidden, group_0_embed], axis=1),
+    )
+
+    tables = np.arange(
+        (_NUM_CODE_GROUPS - 1) * _CP_VOCAB * _HIDDEN,
+        dtype=np.float32,
+    ).reshape(_NUM_CODE_GROUPS - 1, _CP_VOCAB, _HIDDEN)
+    got_step = step.run(
+        {
+            "codec_embeddings": tables,
+            "token": np.array([4], np.int64),
+            "embedding_index": np.array(1, np.int64),
+        }
+    )["inputs_embeds"]
+    np.testing.assert_array_equal(got_step, tables[1, 4].reshape(1, 1, _HIDDEN))
+
+
+def test_talker_text_step_clamps_to_last_trailing_embedding():
+    session = OnnxModelSession(TTSTask()._build_talker_text_step(_TINY_CONFIG))
+    trailing = np.arange(3 * _HIDDEN, dtype=np.float32).reshape(1, 3, _HIDDEN)
+    got = session.run(
+        {
+            "trailing_text_embeds": trailing,
+            "iteration": np.array([7], np.int64),
+        }
+    )["text_embed"]
+    np.testing.assert_array_equal(got, trailing[:, 2:3])
+
+
+def test_every_built_component_declares_a_role():
+    """model_roles must cover every key the task puts in the package.
+
+    ``build_from_module`` looks each component up in ``model_roles`` and falls
+    back to ``"decoder"`` when it is absent, which would hand the parameter-free
+    loop-wiring graphs the GQA / QKV-packing passes meant for attention stacks.
+    ``inspect_components`` reports exactly ``model_roles``, so an undeclared
+    component would also be invisible to callers planning per-component work.
+    """
+    module = Qwen3TTSForConditionalGeneration(_TINY_CONFIG)
+    package = TTSTask().build(module, _TINY_CONFIG)
+
+    # speaker_encoder is optional, so the package is a subset of the declared
+    # roles; nothing may be built that is not declared.
+    assert set(package) <= set(TTSTask.model_roles)
+    assert set(TTSTask.model_roles) - set(package) == {"speaker_encoder"}
+
+    # Glue components are pure wiring: every tensor they read is a graph input,
+    # so preprocess_weights never routes a parameter to one.
+    glue = {name for name, role in TTSTask.model_roles.items() if role == "glue"}
+    weights = module.preprocess_weights({})
+    assert not [name for name in weights if name.split(".")[0] in glue]
 
 
 def test_step_embedder_weights_shared_with_existing_tables():

@@ -23,14 +23,24 @@ from __future__ import annotations
 # defaults run separately as an explicit first pass, so `ruff` / `isort`
 # may freely re-sort this block.
 from mobius._configs.per_model import (  # noqa: F401
+    _cosmos3_edge_vision,
+    _gemma3n_audio,
+    _gemma3n_vision,
     _gemma4_audio,
     _gemma4_unified_audio,
     _gemma4_unified_vision,
+    _glm_ocr_vision,
+    _glmasr_audio,
     _hunyuan_vl_mot_vision,
     _internvl_vision,
+    _lfm2_vl_vision,
+    _mage_vl_vision,
+    _minicpmv4_6_vision,
+    _muse_glimmer_vision,
     _phi4mm_audio,
     _phi4mm_vision,
     _phi_vision,
     _qwen3_asr_audio,
+    _sensenova_u1_vision,
     _sensevoice_audio,
 )

@@ -3,6 +3,8 @@ model_type: "nemotron_h"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"
+trust_remote_code: true
+skip_reason: "Requires trust_remote_code custom modeling + mamba-ssm CUDA kernels for the HF reference, which are unavailable in CI golden generation (same limitation as jamba-v0_1 and granitemoehybrid-tiny). The mobius build now succeeds (correct mamba2 layer_types via trust_remote_code), but a valid golden cannot be regenerated here; the previously committed golden was produced without trust_remote_code and reflects the wrong native `linear_attention` config."
 
 inputs:
   prompts:

@@ -1,0 +1,31 @@
+{
+  "model_id": "zai-org/GLM-OCR",
+  "prompt": "Text Recognition:",
+  "generated_tokens": [
+    20312,
+    15708,
+    3725,
+    665,
+    8480,
+    22761,
+    1948,
+    8561,
+    378,
+    78,
+    395,
+    369,
+    3073,
+    33540,
+    32,
+    50,
+    46,
+    48,
+    378,
+    3159,
+    4576,
+    2093,
+    14636,
+    53411
+  ],
+  "generated_text": "MOBIUS OCR VALIDATION\n\nNemotron Parse 2.0\n\nThis document verifies deterministic"
+}

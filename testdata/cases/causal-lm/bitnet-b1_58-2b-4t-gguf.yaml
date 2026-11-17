@@ -1,0 +1,18 @@
+model_id: "microsoft/bitnet-b1.58-2B-4T-gguf"
+model_type: "bitnet"
+revision: "a1f2f1c765812aa8af3f6eda4a313707064bba15"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Hello"
+
+level: "L4+L5"
+skip_reason: "Pinned public GGUF is legacy bitnet-b1.58/I2_S rather than canonical pinned llama.cpp bitnet/TQ1_0 or TQ2_0, so it cannot provide exact parity evidence."
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Exact float GGUF import only. The pinned public artifact uses legacy architecture bitnet-b1.58 and ggml type I2_S (36), neither present in the pinned llama.cpp census/gguf reader ABI; therefore it cannot supply real parity evidence for the promoted canonical bitnet/TQ route. Quantization-preserving import and runtime packaging fail closed pending a canonical artifact and full-logit prefill/cached-decode parity."

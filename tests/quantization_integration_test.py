@@ -19,7 +19,7 @@ from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights
 
 # Tiny model dimensions — small enough for fast tests, large enough
 # to exercise quantization (K must be divisible by group_size).

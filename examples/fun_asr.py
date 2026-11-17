@@ -17,7 +17,7 @@ Supports real-time microphone input and audio file input.
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] sounddevice torchaudio pyyaml
+    pip install mobius-onnx[transformers] sounddevice torchaudio pyyaml
 
 Usage::
 

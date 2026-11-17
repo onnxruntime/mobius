@@ -96,7 +96,8 @@ def _build_q1_0(gguf_ref: str, output_dir: Path) -> None:
     # past_present_share_buffer mode cannot be used; mobius's
     # write_ort_genai_config inspects the resulting graph and turns
     # share_buffer off automatically when GQA is absent.
-    pkg = build_from_gguf(gguf_ref, keep_quantized=True, dtype="f32", execution_provider="cpu")
+    # Direct GGUF conversion preserves supported quantization by default.
+    pkg = build_from_gguf(gguf_ref, dtype="f32", execution_provider="cpu")
     pkg.save(str(output_dir))
     write_ort_genai_config(pkg, str(output_dir), hf_model_id=HF_MODEL_ID, ep="cpu")
     print("  genai_config.json + tokenizer files written")

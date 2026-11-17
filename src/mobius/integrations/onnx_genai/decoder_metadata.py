@@ -54,22 +54,12 @@ def _canonical_float_dtype(value: Any) -> str | None:
     return _FLOAT_DTYPE_ALIASES.get(token)
 
 
-def _infer_kv_native_dtype(config: Any) -> str | None:
-    """Infer KV storage dtype from the model's activation/compute dtype."""
-    for name in ("activation_dtype", "compute_dtype", "dtype", "torch_dtype"):
-        dtype = _canonical_float_dtype(getattr(config, name, None))
-        if dtype is not None:
-            return dtype
-    return None
-
-
 def build_decoder_metadata(
     *,
     num_attention_heads: int,
     head_dim: int,
     num_kv_heads: int | None = None,
     max_sequence_length: int | None = None,
-    kv_native_dtype: str | None = None,
     attention_type: str | None = None,
     sliding_window: int | None = None,
     sink_tokens: int | None = None,
@@ -84,8 +74,6 @@ def build_decoder_metadata(
         num_kv_heads: Number of key/value heads (defaults to
             ``num_attention_heads`` = multi-head; a smaller value = GQA).
         max_sequence_length: Maximum total sequence length in tokens.
-        kv_native_dtype: KV-cache storage dtype (e.g. ``"float16"``,
-            ``"bfloat16"``).
         attention_type: Override the derived attention type (``multi_head`` /
             ``grouped_query_attention``).
         sliding_window: Sliding-window length in tokens (None = full context).
@@ -146,12 +134,10 @@ def build_decoder_metadata(
     if mixture_of_experts is not None:
         model["mixture_of_experts"] = mixture_of_experts
 
-    metadata: dict[str, Any] = {"required_capabilities": capabilities, "model": model}
-    if kv_native_dtype:
-        metadata["kv_cache"] = {
-            "native_dtype": _canonical_float_dtype(kv_native_dtype) or kv_native_dtype
-        }
-    return metadata
+    # The cache's storage representation is a runtime-private choice derived
+    # from the exported graph (port dtypes, Q/DQ, scale ports), so the package
+    # deliberately declares no package-level KV dtype.
+    return {"required_capabilities": capabilities, "model": model}
 
 
 def moe_metadata_from_config(
@@ -253,9 +239,7 @@ def moe_metadata_from_config(
     }
 
 
-def decoder_metadata_from_config(
-    config: Any, *, kv_native_dtype: str | None = None
-) -> dict[str, Any]:
+def decoder_metadata_from_config(config: Any) -> dict[str, Any]:
     """Build decoder metadata from a Mobius ``BaseModelConfig``/``ArchitectureConfig``.
 
     Unset fields (Mobius' ``DEFAULT_INT`` sentinel) are dropped. ``head_dim``
@@ -275,16 +259,12 @@ def decoder_metadata_from_config(
     sliding = getattr(config, "sliding_window", None)
     sliding = _clean_int(sliding) if sliding not in (None, _UNSET) else None
 
-    if kv_native_dtype is None:
-        kv_native_dtype = _infer_kv_native_dtype(config)
-
     return build_decoder_metadata(
         num_attention_heads=num_heads,
         head_dim=head_dim,
         num_kv_heads=num_kv,
         max_sequence_length=_clean_int(getattr(config, "max_position_embeddings", None)),
         sliding_window=sliding,
-        kv_native_dtype=kv_native_dtype,
         architecture=getattr(config, "architecture", None)
         or getattr(config, "model_type", None),
         mixture_of_experts=moe_metadata_from_config(config),

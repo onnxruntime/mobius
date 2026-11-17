@@ -1,0 +1,23 @@
+model_id: "ibm-granite/granite-4.0-1b"
+model_type: "granitemoehybrid"
+revision: "main"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: >-
+  GraniteMoeHybrid dense variant: all full_attention layers (no Mamba), RoPE
+  (position_embedding_type='rope'), and no routed experts (num_local_experts=0)
+  so only the shared MLP runs. Exercises the Granite scaling multipliers
+  (embedding/attention/residual/logits). Unlike granite-4.0-tiny-preview this
+  runs natively in transformers (no trust_remote_code, no mamba-ssm), so a
+  golden can be generated in CI.

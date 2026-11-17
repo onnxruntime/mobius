@@ -17,5 +17,4 @@ generation:
   do_sample: false
 
 trust_remote_code: true
-skip_reason: "Custom trust_remote_code model code written for transformers 4.x is incompatible with transformers 5.x (DynamicCache API changes, attention mask shape changes)."
-notes: "Phi-3.5 Vision. CLIP ViT-L/14-336 vision encoder + MLP projector + Phi-3.5 text decoder. Vision config stored in img_processor dict (non-standard)."
+notes: "Phi-3.5 Vision. CLIP ViT-L/14-336 vision encoder + host-side HD feature transform + img_projection MLP + Phi-3.5 (rope_type=su) text decoder. Vision config stored in img_processor dict (non-standard). Vision encoder ONNX emits raw CLIP patch features (num_crops, 576, 1024); the HD 2x2 patch merge, learnable sub_GN/glb_GN separators and img_projection run host-side (image-size dependent)."

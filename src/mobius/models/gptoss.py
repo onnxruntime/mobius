@@ -19,12 +19,13 @@ HuggingFace reference: ``GptOssForCausalLM``.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._build_context import ep_capabilities, get_build_dtype
+from mobius._configs import ArchitectureConfig, QuantizedWeightFormat
 from mobius.components import (
     Embedding,
     Linear,
@@ -32,11 +33,270 @@ from mobius.components import (
     create_attention_bias,
     initialize_rope,
 )
+from mobius.components._moe import (
+    _flatten_to_2d,
+    _realize_gate_and_get_qmoe_routing,
+)
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+_MXFP4_BLOCK_SIZE = 32
+_MXFP4_REPACK_OUTPUT_PAIRS_PER_CHUNK = 64
+_MXFP4_SCALE_VALIDATION_ELEMENTS_PER_CHUNK = 1 << 20
+
+
+def _is_native_mxfp4(config: ArchitectureConfig) -> bool:
+    quantization = config.quantization
+    return bool(
+        quantization is not None and quantization.weight_format is QuantizedWeightFormat.MXFP4
+    )
+
+
+def _gqa_kv_lengths(op: OpBuilder, attention_mask: ir.Value) -> tuple[ir.Value, ir.Value]:
+    """Build GQA lengths from a right-padded decoder mask and dense cache.
+
+    ``seqlens_k`` is the zero-based index of each row's last valid token,
+    while ``total_sequence_length`` is the shared padded width. This assumes
+    valid tokens and cached states precede padding; left-padded inputs are not
+    supported by this conversion.
+    """
+    one_i64 = op.Constant(value_int=1)
+    seqlens_k = op.Cast(
+        op.Sub(op.ReduceSum(attention_mask, [1], keepdims=0), one_i64),
+        to=ir.DataType.INT32,
+    )
+    total_sequence_length = op.Cast(
+        op.Gather(op.Shape(attention_mask), 1),
+        to=ir.DataType.INT32,
+    )
+    return seqlens_k, total_sequence_length
+
+
+def repack_gptoss_mxfp4_blocks(blocks: torch.Tensor) -> torch.Tensor:
+    """Losslessly repack GPT-OSS MXFP4 codes for QMoE.
+
+    The checkpoint layout is ``[E, N, K/32, 16]``. Each byte stores two
+    adjacent K-axis E2M1 codes (even K in the low nibble). QMoE's native FP4
+    input is the legacy column-major layout ``[E, K, N/2]`` where each byte
+    stores adjacent N-axis codes (even N in the low nibble).
+
+    Only nibble placement changes; no FP4 value is decoded or requantized.
+    """
+    if blocks.dtype != torch.uint8:
+        raise TypeError(f"GPT-OSS MXFP4 blocks must be uint8, got {blocks.dtype}")
+    if blocks.ndim != 4:
+        raise ValueError(
+            "GPT-OSS MXFP4 blocks must have rank 4 with shape "
+            f"[E, N, K/32, 16], got {tuple(blocks.shape)}"
+        )
+    if blocks.shape[-1] != _MXFP4_BLOCK_SIZE // 2:
+        raise ValueError(
+            "GPT-OSS MXFP4 blocks must have 16 packed bytes per block, "
+            f"got shape {tuple(blocks.shape)}"
+        )
+    if blocks.shape[1] % 2:
+        raise ValueError(
+            f"GPT-OSS MXFP4 output dimension N must be even, got N={blocks.shape[1]}"
+        )
+
+    num_experts, output_size, num_blocks, _ = blocks.shape
+    output_pairs = output_size // 2
+    destination = torch.empty(
+        (num_experts, num_blocks * _MXFP4_BLOCK_SIZE, output_pairs),
+        dtype=torch.uint8,
+        device=blocks.device,
+    )
+    # Expose K as [block, packed-K-byte, K-nibble] so each assignment writes
+    # directly into the final storage. Only one bounded scratch plane is used;
+    # in particular, there are no projection-sized even/odd/stack/contiguous
+    # intermediates while repacking 120B expert banks.
+    destination_planes = destination.view(
+        num_experts,
+        num_blocks,
+        _MXFP4_BLOCK_SIZE // 2,
+        2,
+        output_pairs,
+    )
+    chunk_pairs = max(1, min(_MXFP4_REPACK_OUTPUT_PAIRS_PER_CHUNK, output_pairs))
+    scratch = torch.empty(
+        (num_experts, num_blocks, _MXFP4_BLOCK_SIZE // 2, chunk_pairs),
+        dtype=torch.uint8,
+        device=blocks.device,
+    )
+    for pair_start in range(0, output_pairs, chunk_pairs):
+        pair_end = min(pair_start + chunk_pairs, output_pairs)
+        chunk_size = pair_end - pair_start
+        even_n = blocks[:, 2 * pair_start : 2 * pair_end : 2].permute(0, 2, 3, 1)
+        odd_n = blocks[:, 2 * pair_start + 1 : 2 * pair_end : 2].permute(0, 2, 3, 1)
+        workspace = scratch[..., :chunk_size]
+
+        # even K code: low nibble = even N, high nibble = odd N.
+        target = destination_planes[..., 0, pair_start:pair_end]
+        target.copy_(odd_n)
+        target.bitwise_and_(0x0F)
+        target.bitwise_left_shift_(4)
+        workspace.copy_(even_n)
+        workspace.bitwise_and_(0x0F)
+        target.bitwise_or_(workspace)
+
+        # odd K code: the corresponding high checkpoint nibbles.
+        target = destination_planes[..., 1, pair_start:pair_end]
+        target.copy_(odd_n)
+        target.bitwise_and_(0xF0)
+        workspace.copy_(even_n)
+        workspace.bitwise_right_shift_(4)
+        target.bitwise_or_(workspace)
+
+    return destination
+
+
+def _validate_mxfp4_scale_bytes(scales: torch.Tensor, scale_key: str) -> None:
+    """Validate raw E8M0 bytes using bounded scratch.
+
+    ONNX FLOAT8E8M0 reserves byte ``0xff`` for NaN, which is not a valid MXFP4
+    block scale. Validation is chunked so checking a 120B checkpoint does not
+    allocate another projection-sized boolean tensor.
+    """
+    flattened = scales.reshape(-1)
+    for start in range(0, flattened.numel(), _MXFP4_SCALE_VALIDATION_ELEMENTS_PER_CHUNK):
+        chunk = flattened[start : start + _MXFP4_SCALE_VALIDATION_ELEMENTS_PER_CHUNK]
+        if torch.any(chunk == 0xFF).item():
+            raise ValueError(
+                f"GPT-OSS MXFP4 scales {scale_key!r} contain invalid raw E8M0 "
+                "byte 0xff (NaN); valid scale bytes are 0x00 through 0xfe."
+            )
+
+
+def _reinterpret_mxfp4_scales_unchecked(scales: torch.Tensor) -> torch.Tensor:
+    """Reinterpret prevalidated raw scale bytes without numeric conversion."""
+    if not scales.is_contiguous():
+        scales = scales.contiguous()
+    # Same-size dtype views preserve the raw storage and exponent bytes.
+    return scales.view(torch.float8_e8m0fnu)
+
+
+def _native_mxfp4_projection_specs(
+    config: ArchitectureConfig,
+) -> dict[str, dict[str, tuple[tuple[int, ...], str]]]:
+    """Return deterministic source geometry and graph targets for every MoE layer."""
+    num_experts = config.num_local_experts
+    if num_experts is None:
+        raise ValueError("GPT-OSS MXFP4 requires num_local_experts")
+    return {
+        f"model.layers.{layer_index}.mlp": {
+            "gate_up_proj": (
+                (
+                    num_experts,
+                    2 * config.intermediate_size,
+                    config.hidden_size // _MXFP4_BLOCK_SIZE,
+                    _MXFP4_BLOCK_SIZE // 2,
+                ),
+                "fc1",
+            ),
+            "down_proj": (
+                (
+                    num_experts,
+                    config.hidden_size,
+                    config.intermediate_size // _MXFP4_BLOCK_SIZE,
+                    _MXFP4_BLOCK_SIZE // 2,
+                ),
+                "fc2",
+            ),
+        }
+        for layer_index in range(config.num_hidden_layers)
+    }
+
+
+def _validate_gptoss_mxfp4_state(
+    state_dict: dict[str, torch.Tensor],
+    config: ArchitectureConfig,
+    mxfp4_blocks: dict[str, str],
+    mxfp4_scales: dict[str, str],
+) -> dict[str, dict[str, tuple[tuple[int, ...], str]]]:
+    """Preflight the complete native expert set without mutating caller state."""
+    specs = _native_mxfp4_projection_specs(config)
+    expected_bases = {
+        f"{mlp_root}.experts.{projection}"
+        for mlp_root, projections in specs.items()
+        for projection in projections
+    }
+    block_bases = set(mxfp4_blocks)
+    scale_bases = set(mxfp4_scales)
+    if block_bases != expected_bases or scale_bases != expected_bases:
+        missing_blocks = sorted(expected_bases - block_bases)
+        missing_scales = sorted(expected_bases - scale_bases)
+        unexpected_blocks = sorted(block_bases - expected_bases)
+        unexpected_scales = sorted(scale_bases - expected_bases)
+        raise ValueError(
+            "Malformed GPT-OSS MXFP4 checkpoint: every expected MoE layer must "
+            "contain exactly gate_up_proj/down_proj block tensors with a "
+            "matching scale tensor. "
+            f"Missing blocks: {missing_blocks}; missing scales: {missing_scales}; "
+            f"unexpected blocks: {unexpected_blocks}; unexpected scales: "
+            f"{unexpected_scales}."
+        )
+
+    num_experts = config.num_local_experts
+    assert num_experts is not None
+    for mlp_root in sorted(specs):
+        for projection, (expected_block_shape, _target) in specs[mlp_root].items():
+            base = f"{mlp_root}.experts.{projection}"
+            block_key = mxfp4_blocks[base]
+            scale_key = mxfp4_scales[base]
+            blocks = state_dict[block_key]
+            scales = state_dict[scale_key]
+            if blocks.dtype != torch.uint8:
+                raise TypeError(
+                    f"GPT-OSS MXFP4 blocks {block_key!r} must be uint8, got {blocks.dtype}"
+                )
+            if tuple(blocks.shape) != expected_block_shape:
+                raise ValueError(
+                    f"GPT-OSS MXFP4 blocks {block_key!r} must have shape "
+                    f"{expected_block_shape}, got {tuple(blocks.shape)}"
+                )
+            expected_scale_shape = expected_block_shape[:-1]
+            if scales.dtype != torch.uint8:
+                raise TypeError(
+                    f"GPT-OSS MXFP4 scales {scale_key!r} must contain raw "
+                    f"E8M0 bytes as uint8, got {scales.dtype}"
+                )
+            if tuple(scales.shape) != expected_scale_shape:
+                raise ValueError(
+                    f"GPT-OSS MXFP4 scales {scale_key!r} must have shape "
+                    f"{expected_scale_shape}, got {tuple(scales.shape)}"
+                )
+            _validate_mxfp4_scale_bytes(scales, scale_key)
+
+        tensor_specs = {
+            f"{mlp_root}.experts.gate_up_proj_bias": (
+                (num_experts, 2 * config.intermediate_size),
+                "expert bias",
+            ),
+            f"{mlp_root}.experts.down_proj_bias": (
+                (num_experts, config.hidden_size),
+                "expert bias",
+            ),
+            f"{mlp_root}.router.weight": (
+                (num_experts, config.hidden_size),
+                "router tensor",
+            ),
+            f"{mlp_root}.router.bias": ((num_experts,), "router tensor"),
+        }
+        for key, (expected_shape, description) in tensor_specs.items():
+            tensor = state_dict.get(key)
+            if tensor is None:
+                raise ValueError(f"GPT-OSS MXFP4 requires {description} tensor {key!r}.")
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"GPT-OSS {description} {key!r} must have shape "
+                    f"{expected_shape}, got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype not in {torch.bfloat16, torch.float16, torch.float32}:
+                raise TypeError(
+                    f"GPT-OSS {description} {key!r} must be bfloat16, float16, "
+                    f"or float32, got {tensor.dtype}"
+                )
+    return specs
 
 
 class _GptOssGate(nn.Module):
@@ -63,6 +323,12 @@ class _GptOssGate(nn.Module):
         # Softmax over top-k logits only
         routing_weights = op.Softmax(routing_weights, axis=-1)
         return routing_weights, selected_experts
+
+    def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
+        """Return biased logits for QMoE's internal top-k and normalization."""
+        weight_t = op.Transpose(self.weight, perm=[1, 0])
+        router_logits = op.Add(op.MatMul(hidden_states, weight_t), self.bias)
+        return op.CastLike(router_logits, hidden_states), None, True, 1.0
 
 
 class _GptOssExpertMLP(nn.Module):
@@ -118,14 +384,138 @@ class _GptOssMoELayer(nn.Module):
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         self.gate = _GptOssGate(config.hidden_size, self.num_experts, self.top_k)
-        self.experts = nn.ModuleList(
+        native_mxfp4 = _is_native_mxfp4(config)
+        if native_mxfp4:
+            if config.disable_qmoe:
+                raise ValueError(
+                    "Native GPT-OSS MXFP4 weights require com.microsoft::QMoE; "
+                    "disable_qmoe=True has no lossless dense fallback."
+                )
+            self.experts = None
+            self._init_native_mxfp4_parameters(config)
+        else:
+            self.experts = nn.ModuleList(
+                [
+                    _GptOssExpertMLP(config.hidden_size, config.intermediate_size)
+                    for _ in range(self.num_experts)
+                ]
+            )
+
+    def _init_native_mxfp4_parameters(self, config: ArchitectureConfig) -> None:
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        if hidden_size % _MXFP4_BLOCK_SIZE or intermediate_size % _MXFP4_BLOCK_SIZE:
+            raise ValueError(
+                "Native GPT-OSS MXFP4 QMoE requires hidden_size and "
+                f"intermediate_size divisible by 32, got {hidden_size} and {intermediate_size}"
+            )
+
+        # QMoE's native FP4 initializer is column-major [E, K, N/2].
+        self.fc1_experts_weights = nn.Parameter(
+            [self.num_experts, hidden_size, intermediate_size],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc1_scales = nn.Parameter(
             [
-                _GptOssExpertMLP(config.hidden_size, config.intermediate_size)
-                for _ in range(self.num_experts)
-            ]
+                self.num_experts,
+                2 * intermediate_size,
+                hidden_size // _MXFP4_BLOCK_SIZE,
+            ],
+            dtype=ir.DataType.FLOAT8E8M0,
+        )
+        self.fc1_experts_bias = nn.Parameter([self.num_experts, 2 * intermediate_size])
+        self.fc1_global_scales = nn.Parameter(
+            [self.num_experts],
+            dtype=ir.DataType.FLOAT,
+        )
+        self.fc1_global_scales._keep_float32 = True  # type: ignore[attr-defined]
+
+        self.fc2_experts_weights = nn.Parameter(
+            [self.num_experts, intermediate_size, hidden_size // 2],
+            dtype=ir.DataType.UINT8,
+        )
+        self.fc2_scales = nn.Parameter(
+            [
+                self.num_experts,
+                hidden_size,
+                intermediate_size // _MXFP4_BLOCK_SIZE,
+            ],
+            dtype=ir.DataType.FLOAT8E8M0,
+        )
+        self.fc2_experts_bias = nn.Parameter([self.num_experts, hidden_size])
+        self.fc2_global_scales = nn.Parameter(
+            [self.num_experts],
+            dtype=ir.DataType.FLOAT,
+        )
+        self.fc2_global_scales._keep_float32 = True  # type: ignore[attr-defined]
+
+    def _native_mxfp4_forward(self, op: OpBuilder, hidden_states: ir.Value):
+        """Emit the native op only for a CUDA FP4-QMoE FP16/BF16 build."""
+        target_ep = ep_capabilities().name
+        if target_ep != "cuda":
+            raise NotImplementedError(
+                "Native GPT-OSS MXFP4 requires the CUDA FP4-QMoE runtime/build; "
+                f"got execution_provider={target_ep!r}. Export with "
+                "--execution-provider cuda and --dtype f16 (or bf16). "
+                "CPU/default cannot execute FLOAT8E8M0-scaled FP4 QMoE, and no "
+                "lossless dense fallback exists. ORT must be built with FP4 QMoE "
+                "enabled (CUDA >=12.8); pre-Blackwell GPUs such as A100 may require "
+                "the available SM80 fallback/runtime configuration."
+            )
+        build_dtype = get_build_dtype()
+        if build_dtype not in {
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+        }:
+            raise ValueError(
+                "Native GPT-OSS MXFP4 requires an FP16 or BF16 CUDA FP4-QMoE "
+                f"runtime/build, got build dtype {build_dtype}. Export with "
+                "--execution-provider cuda and --dtype f16 (or bf16). ORT must "
+                "be built with FP4 QMoE enabled (CUDA >=12.8); pre-Blackwell "
+                "GPUs such as A100 may require the available SM80 "
+                "fallback/runtime configuration."
+            )
+
+        router_probs, _, normalize, output_scale = _realize_gate_and_get_qmoe_routing(
+            op, self.gate, hidden_states
+        )
+        assert output_scale == 1.0  # noqa: RUF069 - QMoE owns the unscaled router output
+
+        return op.QMoE(
+            hidden_states,
+            _flatten_to_2d(op, router_probs),
+            self.fc1_experts_weights,
+            self.fc1_scales,
+            self.fc1_experts_bias,
+            self.fc2_experts_weights,
+            self.fc2_scales,
+            self.fc2_experts_bias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            self.fc1_global_scales,
+            self.fc2_global_scales,
+            activation_type="swiglu",
+            activation_alpha=1.702,
+            activation_beta=1.0,
+            swiglu_limit=7.0,
+            normalize_routing_weights=int(normalize),
+            k=self.top_k,
+            expert_weight_bits=4,
+            block_size=_MXFP4_BLOCK_SIZE,
+            swiglu_fusion=1,
+            quant_type="fp4",
+            _domain="com.microsoft",
         )
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        if self.experts is None:
+            return self._native_mxfp4_forward(op, hidden_states)
+
         routing_weights, selected_experts = self.gate(op, hidden_states)
 
         # Loop over experts: mask-and-accumulate dispatch
@@ -158,10 +548,12 @@ class _GptOssAttention(nn.Module):
         probs    = softmax(combined, dim=-1)[..., :-1]           # drop sink, [B, H, S, S_kv]
         out      = probs @ V
 
-    Implements this manually (cannot use fused op.Attention with sinks).
+    Native MXFP4 CUDA builds use ``com.microsoft::GroupQueryAttention`` and
+    its ``head_sink`` input. Portable/full-precision builds retain the
+    equivalent decomposed formulation.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, local_window_size: int = -1):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.head_dim = config.head_dim
@@ -169,10 +561,15 @@ class _GptOssAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_kv_groups = config.num_attention_heads // config.num_key_value_heads
         self.scale = config.head_dim**-0.5
+        self._use_direct_gqa = _is_native_mxfp4(config)
+        self.local_window_size = local_window_size
+        partial_rotary_factor = config.partial_rotary_factor
+        if partial_rotary_factor is None:
+            raise ValueError("GPT-OSS requires partial_rotary_factor")
         self._rotary_embedding_dim = (
             0
-            if math.isclose(config.partial_rotary_factor, 1.0)
-            else int(self.head_dim * config.partial_rotary_factor)
+            if math.isclose(partial_rotary_factor, 1.0)
+            else int(self.head_dim * partial_rotary_factor)
         )
         self._rope_interleave = config.rope_interleave
 
@@ -200,6 +597,50 @@ class _GptOssAttention(nn.Module):
 
         # Learnable sink logit: one scalar per attention head [num_heads]
         self.sinks = nn.Parameter([config.num_attention_heads])
+
+    def _forward_gqa(
+        self,
+        op: OpBuilder,
+        query: ir.Value,
+        key: ir.Value,
+        value: ir.Value,
+        past_key_value: tuple | None,
+        gqa_lengths: tuple[ir.Value, ir.Value],
+    ):
+        """Emit sink-aware GQA over explicitly YaRN-rotated Q/K tensors."""
+        past_key = past_key_value[0] if past_key_value is not None else None
+        past_value = past_key_value[1] if past_key_value is not None else None
+        seqlens_k, total_sequence_length = gqa_lengths
+        attributes: dict = {
+            "num_heads": self.num_attention_heads,
+            "kv_num_heads": self.num_key_value_heads,
+            "scale": self.scale,
+            # GPT-OSS keeps Mobius's explicit YaRN implementation above. The
+            # full RoPE caches and position_ids are therefore intentionally
+            # absent from this GQA call.
+            "do_rotary": 0,
+        }
+        if self.local_window_size > 0:
+            attributes["local_window_size"] = self.local_window_size
+
+        output, present_key, present_value = op.GroupQueryAttention(
+            query,
+            key,
+            value,
+            past_key,
+            past_value,
+            seqlens_k,
+            total_sequence_length,
+            None,  # cos_cache
+            None,  # sin_cache
+            None,  # position_ids
+            None,  # attention_bias: GQA applies causal/padding masking from lengths
+            op.Cast(self.sinks, to=get_build_dtype()),  # head_sink
+            _domain="com.microsoft",
+            _outputs=3,
+            **attributes,
+        )
+        return self.o_proj(op, output), (present_key, present_value)
 
     def _expand_kv_for_gqa(
         self,
@@ -241,11 +682,8 @@ class _GptOssAttention(nn.Module):
         attention_bias: ir.Value | None,
         position_embeddings: tuple | None = None,
         past_key_value: tuple | None = None,
+        gqa_lengths: tuple[ir.Value, ir.Value] | None = None,
     ):
-        # hidden_states: [B, S, H]
-        batch_1d = op.Shape(hidden_states, start=0, end=1)  # 1D tensor containing B
-        seq_1d = op.Shape(hidden_states, start=1, end=2)  # 1D tensor containing S
-
         # QKV projections: [B, S, heads * d]
         query = self.q_proj(op, hidden_states)
         key = self.k_proj(op, hidden_states)
@@ -269,6 +707,25 @@ class _GptOssAttention(nn.Module):
                 rotary_embedding_dim=self._rotary_embedding_dim,
                 interleaved=self._rope_interleave,
             )
+
+        if self._use_direct_gqa:
+            if gqa_lengths is None:
+                raise ValueError(
+                    "Native GPT-OSS MXFP4 attention requires an attention_mask "
+                    "to derive GroupQueryAttention sequence lengths."
+                )
+            return self._forward_gqa(
+                op,
+                query,
+                key,
+                value,
+                past_key_value,
+                gqa_lengths,
+            )
+
+        # Portable decomposed attention starts by materializing dynamic shapes.
+        batch_1d = op.Shape(hidden_states, start=0, end=1)  # 1D tensor containing B
+        seq_1d = op.Shape(hidden_states, start=1, end=2)  # 1D tensor containing S
 
         # Reshape to 4D and transpose: [B, S, heads, d] → [B, heads, S, d]
         query = op.Transpose(
@@ -353,9 +810,9 @@ class _GptOssAttention(nn.Module):
 class _GptOssDecoderLayer(nn.Module):
     """GPT-OSS decoder layer: pre-norm attention (with sinks) + pre-norm MoE FFN."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, local_window_size: int = -1):
         super().__init__()
-        self.self_attn = _GptOssAttention(config)
+        self.self_attn = _GptOssAttention(config, local_window_size=local_window_size)
         self.mlp = _GptOssMoELayer(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -367,12 +824,18 @@ class _GptOssDecoderLayer(nn.Module):
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
         past_key_value: tuple | None,
+        gqa_lengths: tuple[ir.Value, ir.Value] | None,
     ):
         # Pre-norm attention block
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
         attn_out, present_kv = self.self_attn(
-            op, hidden_states, attention_bias, position_embeddings, past_key_value
+            op,
+            hidden_states,
+            attention_bias,
+            position_embeddings,
+            past_key_value,
+            gqa_lengths,
         )
         hidden_states = op.Add(residual, attn_out)
 
@@ -391,16 +854,59 @@ class _GptOssTextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self._layer_types = config.layer_types  # list of 'sliding_attention'/'full_attention'
+        configured_layer_types = getattr(config, "layer_types", None)
+        if configured_layer_types is None:
+            normalized_layer_types = [
+                "sliding_attention" if layer_id % 2 == 0 else "full_attention"
+                for layer_id in range(config.num_hidden_layers)
+            ]
+        else:
+            normalized_layer_types = list(configured_layer_types)
+        if len(normalized_layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "GPT-OSS requires exactly one layer_types entry per decoder layer, "
+                f"got {len(normalized_layer_types)} for num_hidden_layers="
+                f"{config.num_hidden_layers}."
+            )
+        unsupported = sorted(
+            set(normalized_layer_types) - {"sliding_attention", "full_attention"}
+        )
+        if unsupported:
+            raise ValueError(
+                "GPT-OSS only supports sliding_attention and full_attention layer "
+                f"types, got {unsupported}."
+            )
+        self._layer_types = normalized_layer_types
         self._sliding_window = config.sliding_window
+        if "sliding_attention" in self._layer_types and (
+            self._sliding_window is None or self._sliding_window <= 0
+        ):
+            raise ValueError(
+                "GPT-OSS sliding-attention layers require a positive sliding_window."
+            )
+        self._use_direct_gqa = _is_native_mxfp4(config)
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
-            [_GptOssDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                _GptOssDecoderLayer(
+                    config,
+                    local_window_size=(
+                        int(self._sliding_window)
+                        if layer_type == "sliding_attention"
+                        and self._sliding_window is not None
+                        else -1
+                    ),
+                )
+                for layer_type in self._layer_types
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = initialize_rope(config)
+        rotary_emb = initialize_rope(config)
+        if rotary_emb is None:
+            raise ValueError("GPT-OSS requires rotary position embeddings")
+        self.rotary_emb = rotary_emb
 
     def forward(
         self,
@@ -412,33 +918,48 @@ class _GptOssTextModel(nn.Module):
     ):
         hidden_states = self.embed_tokens(op, input_ids)
         position_embeddings = self.rotary_emb(op, position_ids)
+        if self._use_direct_gqa:
+            if attention_mask is None:
+                raise ValueError(
+                    "Native GPT-OSS MXFP4 requires attention_mask for direct "
+                    "GroupQueryAttention export."
+                )
+            gqa_lengths = _gqa_kv_lengths(op, attention_mask)
+        else:
+            gqa_lengths = None
 
-        # Create attention biases (full and sliding window) for dynamic dispatch
-        full_attn_bias = (
-            create_attention_bias(
-                op,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                dtype=self._dtype,
+        # Biases are only consumed by the portable decomposed path. Direct GQA
+        # carries causal/padding semantics in its sequence-length inputs and
+        # local attention in the per-layer local_window_size attribute.
+        if self._use_direct_gqa:
+            full_attn_bias = None
+            sliding_attn_bias = None
+        else:
+            full_attn_bias = (
+                create_attention_bias(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    dtype=self._dtype,
+                )
+                if attention_mask is not None
+                else None
             )
-            if attention_mask is not None
-            else None
-        )
-        sliding_attn_bias = None
-        if self._sliding_window is not None and attention_mask is not None:
-            sliding_attn_bias = create_attention_bias(
-                op,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                sliding_window=self._sliding_window,
-                dtype=self._dtype,
-            )
+            sliding_attn_bias = None
+            if self._sliding_window is not None and attention_mask is not None:
+                sliding_attn_bias = create_attention_bias(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    sliding_window=self._sliding_window,
+                    dtype=self._dtype,
+                )
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)
         for i, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             # Select bias: sliding window for 'sliding_attention' layers, full for others
-            layer_type = self._layer_types[i] if self._layer_types else "full_attention"
+            layer_type = self._layer_types[i]
             if layer_type == "sliding_attention" and sliding_attn_bias is not None:
                 attn_bias = sliding_attn_bias
             else:
@@ -450,6 +971,7 @@ class _GptOssTextModel(nn.Module):
                 attention_bias=attn_bias,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
+                gqa_lengths=gqa_lengths,
             )
             present_key_values.append(present_kv)
 
@@ -475,6 +997,7 @@ class GPTOSSCausalLMModel(CausalLMModel):
     def __init__(self, config: ArchitectureConfig):
         nn.Module.__init__(self)
         self.config = config
+        self._dequantize_mxfp4_checkpoint = False
         self.model = _GptOssTextModel(config)
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -494,33 +1017,97 @@ class GPTOSSCausalLMModel(CausalLMModel):
           ``down_proj.weight [hidden, inter]``
         - ``mlp.experts.down_proj_bias [N, hidden]``: split to per-expert ``down_proj.bias``
 
-        MXFP4 quantized checkpoints store ``_blocks`` + ``_scales`` instead
-        of full weight tensors.  These are dequantized first using HF's
-        ``_convert_moe_packed_tensors`` (4-bit nibble-packed with shared
-        exponent), producing the same ``[N, hidden, 2*inter]`` or
-        ``[N, inter, hidden]`` shapes that the non-quantized path expects.
+        Native MXFP4 checkpoints keep expert ``_blocks`` and ``_scales`` packed:
+        their E2M1 nibbles are losslessly rearranged for QMoE, while E8M0 scale
+        bytes are reinterpreted as FLOAT8E8M0 without numerical conversion.
+        The Transformers builder may instead explicitly mark a dense module for
+        eager MXFP4 dequantization when ``keep_quantized=False``.
         """
-        # Phase 1: Dequantize MXFP4 _blocks + _scales into full tensors.
-        # The mxfp4 module ships with the same transformers version that
-        # added GPT-OSS support, so no version guard is needed.
-        from transformers.integrations.mxfp4 import (
-            _convert_moe_packed_tensors,
-        )
-
-        blocks_keys = [k for k in state_dict if k.endswith("_blocks")]
-        for bk in blocks_keys:
-            sk = bk.replace("_blocks", "_scales")
-            if sk not in state_dict:
-                continue
-            base_key = bk.removesuffix("_blocks")
-            state_dict[base_key] = _convert_moe_packed_tensors(
-                state_dict.pop(bk),
-                state_dict.pop(sk),
-                dtype=torch.bfloat16,
+        native_mxfp4 = _is_native_mxfp4(self.config)
+        mxfp4_blocks = {
+            key.removesuffix("_blocks"): key
+            for key in state_dict
+            if key.endswith("_blocks") and ".mlp.experts." in key
+        }
+        mxfp4_scales = {
+            key.removesuffix("_scales"): key
+            for key in state_dict
+            if key.endswith("_scales") and ".mlp.experts." in key
+        }
+        mxfp4_bases = set(mxfp4_blocks) | set(mxfp4_scales)
+        if mxfp4_bases and not native_mxfp4 and not self._dequantize_mxfp4_checkpoint:
+            raise ValueError(
+                "GPT-OSS MXFP4 expert blocks were found, but the model does not "
+                "declare native MXFP4 quantization and was not explicitly built "
+                "for dense MXFP4 dequantization. Rebuild through "
+                "build(..., keep_quantized=False) or `mobius build --dequantize` "
+                "so original-source classification can set the dense marker."
             )
 
-        # Phase 2: Split fused/stacked weights into per-expert tensors.
-        result: dict[str, torch.Tensor] = {}
+        specs = None
+        if native_mxfp4 or self._dequantize_mxfp4_checkpoint:
+            # Both paths share one fail-closed preflight. It runs before any
+            # source pop, converter call, or destination allocation.
+            specs = _validate_gptoss_mxfp4_state(
+                state_dict,
+                self.config,
+                mxfp4_blocks,
+                mxfp4_scales,
+            )
+
+        native_weights: dict[str, torch.Tensor] = {}
+        if native_mxfp4:
+            num_experts = self.config.num_local_experts
+            assert num_experts is not None
+            assert specs is not None
+            for mlp_root in sorted(specs):
+                for projection, (_expected_block_shape, target) in specs[mlp_root].items():
+                    base = f"{mlp_root}.experts.{projection}"
+                    block_key = mxfp4_blocks[base]
+                    scale_key = mxfp4_scales[base]
+
+                    # Drop both dictionary references before allocating the
+                    # repacked destination. Across a multi-layer 120B checkpoint,
+                    # this lets each original expert bank be reclaimed while
+                    # already-transformed destinations accumulate.
+                    blocks = state_dict.pop(block_key)
+                    scales = state_dict.pop(scale_key)
+                    native_weights[f"{mlp_root}.{target}_scales"] = (
+                        _reinterpret_mxfp4_scales_unchecked(scales)
+                    )
+                    del scales
+                    native_weights[f"{mlp_root}.{target}_experts_weights"] = (
+                        repack_gptoss_mxfp4_blocks(blocks)
+                    )
+                    del blocks
+                    native_weights[f"{mlp_root}.{target}_global_scales"] = torch.ones(
+                        num_experts,
+                        dtype=torch.float32,
+                    )
+
+            for mlp_root in sorted(specs):
+                bias_specs = {
+                    f"{mlp_root}.experts.gate_up_proj_bias": f"{mlp_root}.fc1_experts_bias",
+                    f"{mlp_root}.experts.down_proj_bias": f"{mlp_root}.fc2_experts_bias",
+                }
+                for source, target in bias_specs.items():
+                    native_weights[target] = state_dict.pop(source)
+        elif self._dequantize_mxfp4_checkpoint:
+            assert specs is not None
+            from transformers.integrations.mxfp4 import _convert_moe_packed_tensors
+
+            for mlp_root in sorted(specs):
+                for projection in specs[mlp_root]:
+                    base = f"{mlp_root}.experts.{projection}"
+                    state_dict[base] = _convert_moe_packed_tensors(
+                        state_dict.pop(mxfp4_blocks[base]),
+                        state_dict.pop(mxfp4_scales[base]),
+                        dtype=torch.bfloat16,
+                    )
+
+        # Split fused/stacked weights into per-expert tensors for the full
+        # precision path. Native MXFP4 expert tensors use the QMoE names above.
+        result: dict[str, torch.Tensor] = dict(native_weights)
         for name, tensor in state_dict.items():
             # Router weight/bias rename
             if "mlp.router.weight" in name:

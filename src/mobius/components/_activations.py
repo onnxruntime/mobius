@@ -13,8 +13,8 @@ if TYPE_CHECKING:
 
 
 def silu(op: OpBuilder, x):
-    """SiLU (Swish) activation: x * sigmoid(x)."""
-    return op.Mul(x, op.Sigmoid(x))
+    """SiLU (Swish) activation."""
+    return op.Swish(x)
 
 
 def gelu(op: OpBuilder, x):

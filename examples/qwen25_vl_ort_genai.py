@@ -10,7 +10,7 @@ text generation — with or without an image.
 
 Requirements::
 
-    pip install mobius-ai[ort-genai]
+    pip install mobius-onnx[ort-genai]
 
 Usage::
 
