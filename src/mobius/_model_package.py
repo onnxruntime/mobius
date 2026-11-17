@@ -29,7 +29,7 @@ import shutil
 import tempfile
 import threading
 from collections import UserDict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -41,6 +41,7 @@ import rfc8785
 import torch
 import tqdm
 
+from mobius._constants import LAZY_SOURCE_FILES_META_KEY
 from mobius._export_report import ComponentExportReport
 from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_utils import WeightTransform
@@ -202,6 +203,8 @@ def _validate_streaming_safetensors_destination(
     *,
     external_data: str,
     component_layout: _ComponentSaveLayout,
+    include_policy_components: bool = True,
+    include_adapter_artifacts: bool = True,
 ) -> None:
     """Defensively reject known aliases to files read by a streaming package.
 
@@ -263,13 +266,46 @@ def _validate_streaming_safetensors_destination(
                 _QUANTIZATION_REPORT,
                 _EXPORT_REPORT,
                 _WEIGHT_LOADING_REPORT,
+                "draft_manifest.json",
+                "gguf-reuse.json",
             )
         )
+        if include_policy_components:
+            output_files.update(
+                current_directory / "policies" / f"{name}.onnx"
+                for name in current_package.policy_components
+            )
+        if include_adapter_artifacts:
+            output_files.update(
+                _adapter_artifact_destinations(current_package, current_directory)
+            )
 
         source_directories.update(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_directories", ())
         )
+        # Derived lazy slices may own an external source that is no longer an
+        # initializer after graph cleanup (e.g. restored packed projections).
+        # Register that ownership before any output can be opened/truncated.
+        models = chain(
+            current_package.values(),
+            (
+                component.model
+                for component in current_package.policy_components.values()
+                if include_policy_components
+            ),
+        )
+        for model in models:
+            current_package.register_lazy_source_artifacts(
+                files=model.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+            )
+            for graph in model.graphs():
+                for initializer in graph.initializers.values():
+                    tensor = initializer.const_value
+                    if isinstance(tensor, ir.LazyTensor):
+                        current_package.register_lazy_source_artifacts(
+                            files=tensor.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+                        )
         source_files.update(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_files", ())
@@ -307,6 +343,21 @@ def _validate_streaming_safetensors_destination(
                     f"{str(source_file)!r} through the same path, a hard link, or "
                     "a symlink. Remove the alias or choose a separate output path."
                 )
+
+
+def _adapter_artifact_destinations(package: ModelPackage, directory: Path) -> Iterator[Path]:
+    """Inventory the actual files emitted by save_adapter_artifacts, without writes."""
+    options = package.adapter_service_options
+    for alias, artifact in package.adapter_artifacts.items():
+        root = directory / "adapters" / alias
+        if options.portable_fallback:
+            yield root / "adapter.json"
+        if options.preserve_source_format:
+            if artifact.source.format == "onnx_adapter":
+                yield root / "adapter.onnx_adapter"
+            elif artifact.source.format == "peft_safetensors":
+                yield root / "adapter_model.safetensors"
+                yield root / "adapter_config.json"
 
 
 def _validate_output_directory(
@@ -673,6 +724,10 @@ class ModelPackage(UserDict[str, ir.Model]):
         :attr:`mtp_head` package is saved under a collision-free directory named
         by ``.mobius-package.json``.
 
+        Interface symbolic dimension names are preserved within each model.
+        Non-contractual intermediate symbols are anonymized during serialization;
+        in-memory shapes remain unchanged.
+
         .. note::
             This method writes ONNX files only.  If you need a directory that
             ``onnxruntime-genai`` can load (i.e. with ``genai_config.json`` and
@@ -742,6 +797,8 @@ class ModelPackage(UserDict[str, ir.Model]):
             directory,
             external_data=external_data,
             component_layout=component_layout,
+            include_policy_components=include_policy_components,
+            include_adapter_artifacts=include_adapter_artifacts,
         )
         _validate_mtp_save_paths(
             self,
@@ -892,7 +949,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             if use_subfolders:
                 os.makedirs(model_dir, exist_ok=True)
             path = os.path.join(model_dir, "model.onnx")
-            with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
+            with _anonymized_intermediate_symbolic_dimensions(model) as saved_model:
                 if reuse_plan is not None:
                     from mobius.integrations.gguf._reuse import save_reuse_package
 
@@ -1508,11 +1565,10 @@ class ModelPackage(UserDict[str, ir.Model]):
 
 
 @contextmanager
-def _namespaced_symbolic_dimensions(
+def _anonymized_intermediate_symbolic_dimensions(
     model: ir.Model,
-    namespace: str,
-) -> Iterator[ir.Model]:
-    """Namespace interface symbols and discard non-contractual intermediate aliases."""
+) -> Generator[ir.Model, None, None]:
+    """Discard non-contractual intermediate aliases, preserving interface symbols."""
     interface_values = {id(value) for value in (*model.graph.inputs, *model.graph.outputs)}
     values: dict[int, ir.Value] = {}
     graphs: list[ir.GraphProtocol] = []
@@ -1526,10 +1582,9 @@ def _namespaced_symbolic_dimensions(
             values[id(value)] = value
 
     originals: list[tuple[ir.Value, ir.Shape]] = []
-    symbols: dict[str, str] = {}
     try:
         for value in values.values():
-            if value.shape is None:
+            if value.shape is None or id(value) in interface_values:
                 continue
             dimensions: list[int | str | ir.SymbolicDim] = []
             changed = False
@@ -1540,12 +1595,7 @@ def _namespaced_symbolic_dimensions(
                 if dimension.value is None:
                     dimensions.append(dimension)
                     continue
-                if id(value) not in interface_values:
-                    dimensions.append(ir.SymbolicDim(None))
-                    changed = True
-                    continue
-                text = str(dimension)
-                dimensions.append(symbols.setdefault(text, f"{namespace}.{text}"))
+                dimensions.append(ir.SymbolicDim(None))
                 changed = True
             if changed:
                 originals.append((value, value.shape))

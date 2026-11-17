@@ -187,7 +187,7 @@ def _dense_reference(
     ``full_*_cache`` are the *post-scatter* caches (current chunk already
     written).  For each (batch, query, head) we build the boolean mask in the
     exact rule order ``create_static_cache_attention_bias`` uses — causal,
-    AND sliding window, OR block overlay, AND padding validity — gather the
+    OR block overlay, AND sliding window, AND padding validity — gather the
     valid cache slots (with GQA head sharing) and softmax over them.  Every
     query row keeps its own diagonal slot valid (``q_abs[t] == write+t`` is
     causal, within any window, and ``< nonpad``), so a fully-masked row is
@@ -218,10 +218,10 @@ def _dense_reference(
 
         for t in range(query_len):
             mask = q_abs[t] >= kv_slots  # causal
-            if sliding_window is not None:
-                mask &= (q_abs[t] - kv_slots) < sliding_window  # local window
             if block_sequence_ids is not None and block_sequence_ids[b, t] >= 0:
                 mask |= kv_group == block_sequence_ids[b, t]  # bidirectional block
+            if sliding_window is not None:
+                mask &= (q_abs[t] - kv_slots) < sliding_window  # local window
             mask &= kv_slots < npad  # padding validity
             idx = np.nonzero(mask)[0]
             # The bias-MEA contract keeps every query row's own diagonal slot
@@ -371,7 +371,7 @@ def test_prefill_chunk_bias_matches_dense_reference():
     """Prefill chunk (write=0, S_q=N, nonpad=N) matches the dense reference.
 
     The whole chunk is the valid region; query row ``i`` attends slots within
-    ``[max(0, i - sliding_window + 1), i]``, OR-ed with same-block tokens.
+    ``causal OR same-block``, constrained by the strict left window boundary.
     """
     query_len = 6
     onnx_attn, ref = _run_and_compare(

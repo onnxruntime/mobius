@@ -9,6 +9,8 @@ import pytest
 
 from mobius import _flags
 
+pytestmark = pytest.mark.opset29
+
 
 class TestDefaultValues:
     """Flags have the expected defaults when no env vars are set."""
@@ -17,6 +19,14 @@ class TestDefaultValues:
         monkeypatch.delenv("MOBIUS_SUPPRESS_DEDUP_WARNING", raising=False)
         f = _flags._Flags()
         assert f.suppress_dedup_warning is True
+
+    def test_gemma4_custom_geglu_default_off(self, monkeypatch):
+        monkeypatch.delenv("MOBIUS_GEMMA4_CUSTOM_GEGLU", raising=False)
+        assert _flags._Flags().gemma4_custom_geglu is False
+
+    def test_experimental_opset29_default_off(self, monkeypatch):
+        monkeypatch.delenv("MOBIUS_EXPERIMENTAL_OPSET29", raising=False)
+        assert _flags._Flags().experimental_opset29 is False
 
 
 class TestEnvVarOverride:
@@ -38,6 +48,20 @@ class TestEnvVarOverride:
         monkeypatch.setenv("MOBIUS_SUPPRESS_DEDUP_WARNING", "maybe")
         f = _flags._Flags()
         assert f.suppress_dedup_warning is True  # default
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [("1", True), ("true", True), ("0", False), ("maybe", False)]
+    )
+    def test_gemma4_custom_geglu_opt_in(self, monkeypatch, value, expected):
+        monkeypatch.setenv("MOBIUS_GEMMA4_CUSTOM_GEGLU", value)
+        assert _flags._Flags().gemma4_custom_geglu is expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [("1", True), ("true", True), ("0", False), ("maybe", False)]
+    )
+    def test_experimental_opset29_opt_in(self, monkeypatch, value, expected):
+        monkeypatch.setenv("MOBIUS_EXPERIMENTAL_OPSET29", value)
+        assert _flags._Flags().experimental_opset29 is expected
 
 
 class TestProgrammaticOverride:
@@ -79,6 +103,20 @@ class TestOverrideFlagsContextManager:
                 assert _flags.flags.suppress_dedup_warning is original
             assert _flags.flags.suppress_dedup_warning is not original
         assert _flags.flags.suppress_dedup_warning is original
+
+    def test_custom_geglu_override_is_scoped_even_on_exception(self):
+        original = _flags.flags.gemma4_custom_geglu
+        try:
+            with _flags.override_flags(gemma4_custom_geglu=False):
+                assert not _flags.flags.gemma4_custom_geglu
+                with pytest.raises(RuntimeError, match="test restoration"):
+                    assert not _flags.flags.gemma4_custom_geglu
+                    with _flags.override_flags(gemma4_custom_geglu=True):
+                        assert _flags.flags.gemma4_custom_geglu
+                        raise RuntimeError("test restoration")
+                assert not _flags.flags.gemma4_custom_geglu
+        finally:
+            assert _flags.flags.gemma4_custom_geglu is original
 
     def test_unknown_flag_raises_value_error(self):
         with (
