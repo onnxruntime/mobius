@@ -23,6 +23,7 @@ __all__ = [
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
     "CausalLMTask",
+    "ClefDecisionTask",
     "CLMTask",
     "SmallThinkerGGUFCausalLMTask",
     "CTCAsrTask",
@@ -144,6 +145,7 @@ from mobius.tasks._causal_lm import (
     HybridCausalLMTask,
     SmallThinkerGGUFCausalLMTask,
 )
+from mobius.tasks._clef import ClefDecisionTask
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
 from mobius.tasks._ctc_asr import CTCAsrTask, FeatureCTCAsrTask
@@ -248,6 +250,7 @@ from mobius.tasks._world_model import WorldModelTask
 # ---------------------------------------------------------------------------
 
 TASK_REGISTRY: dict[str, type[ModelTask]] = {
+    "clef-decision": ClefDecisionTask,
     "adapter": AdapterTask,
     "audio-ctc": AudioCTCTask,
     "audio-feature-extraction": AudioFeatureExtractionTask,

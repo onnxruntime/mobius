@@ -1041,6 +1041,16 @@ def write_onnx_genai_config(
     """
     package_config = getattr(pkg, "config", None)
     resolved_config = config if config is not None else package_config
+    if getattr(resolved_config, "model_type", None) == "clef_flash":
+        return _write_advisory_component_contract(
+            pkg,
+            output_dir,
+            warning=(
+                "Clef-Flash requires host-owned schema encoding and full-record "
+                "vision/embedding/backbone/decision-head execution. These component "
+                "contracts are advisory; no autoregressive runtime config is claimed."
+            ),
+        )
     if isinstance(resolved_config, ReUseConfig):
         _validate_reuse_rate_selection(resolved_config)
     config_types = {
