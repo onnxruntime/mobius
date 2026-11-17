@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "validated_at_utc": "2026-08-25T07:43:02Z",
+  "validated_parent_commit": "1315932c93753931aa271d460cc9d01af6a3f9d1",
+  "validation_change_set": "the compatibility and evidence changes committed with this record",
+  "status": "raw-runtime-passed-ort-genai-deferred",
+  "source_checkpoint": {
+    "repository": "pfnet/plamo-2-1b",
+    "revision": "92c75fd6eea9018bcb9c33ee8921589febe071fa",
+    "files": [
+      {
+        "filename": "model-00001-of-00007.safetensors",
+        "bytes": 4060618320,
+        "lfs_sha256": "306bfd09ff22b5c044abfbc310b0a916a85a450ff52beaa90e245bb67b4cb1e9"
+      },
+      {
+        "filename": "model-00002-of-00007.safetensors",
+        "bytes": 285214592,
+        "lfs_sha256": "759d54a62b8f8124031bf4048b2b7e9b9fe3439e75ce772e48562369768836a8"
+      },
+      {
+        "filename": "model-00003-of-00007.safetensors",
+        "bytes": 819200136,
+        "lfs_sha256": "c7172210250c2b4030b1bc9c75a68224844e770838159e939bb6c68593d2e235"
+      },
+      {
+        "filename": "model-00004-of-00007.safetensors",
+        "bytes": 621448,
+        "lfs_sha256": "017d164149a8e31acdde2f8c6dd45568d7a8900951f83cb5fbcebac64c662695"
+      },
+      {
+        "filename": "model-00005-of-00007.safetensors",
+        "bytes": 131976,
+        "lfs_sha256": "6bfe7b7d45c40c75d7ff7b362fd88bf34e23aedf6a637df4eafc9f7d6231f8ca"
+      },
+      {
+        "filename": "model-00006-of-00007.safetensors",
+        "bytes": 5296,
+        "lfs_sha256": "3dadc185925d0be7f495c51924546b0f07f93550cf4222da96dedd335beb3b8f"
+      },
+      {
+        "filename": "model-00007-of-00007.safetensors",
+        "bytes": 40,
+        "lfs_sha256": "60d95b10b6e140a9626a7058d5038528f2ff80148dc4569b881db56052046509"
+      }
+    ],
+    "config_sha256": "7cd00447566283be63bf20efac313f02423129586c5b348466f09d15082053e9",
+    "tokenizer_jsonl_sha256": "9fa8276a87dd2440bb9496f1d569c05ded6274fd2854de802e12dc6545804b95",
+    "tokenizer_config_sha256": "3472dc70138f3d98161b0d54ca424519f031d865882e85efc75e30c349879050",
+    "tokenization_code_sha256": "ebddaf4cd8c4f7cde47d9e94a227a1cec7eccfbf303a70f520a3fda7c060abef",
+    "modeling_code_sha256": "21c0e1d8ba2f777c69305259254da865cf79145c1e06fee4fd26ed926b82451e"
+  },
+  "gguf": {
+    "repository": "yt-koike/plamo-2-1b-gguf",
+    "revision": "184326afcef7232d94df09a33279598255890325",
+    "filename": "plamo-2-1B-F32.gguf",
+    "bytes": 5168220288,
+    "lfs_sha256": "c5deb94bcd21f516db2b00ba4e923e02cc1dede4b7531ef81a15899130b0e5ef",
+    "format_version": 3,
+    "tensor_count": 218,
+    "qtypes": {
+      "F32": 218
+    }
+  },
+  "provenance_comparison": {
+    "method": "streamed comparison of every GGUF tensor against the pinned safetensors after documented norm-offset, convolution-shape, and Mamba-decay transforms",
+    "compared_tensors": 218,
+    "exact_tensors": 211,
+    "missing_tensors": 0,
+    "elements": 1291441920,
+    "max_abs_error": 0.0001220703125,
+    "mean_abs_error": 2.4659848197812267e-13,
+    "non_exact_tensors": "seven ssm_a tensors differ after llama.cpp eagerly applies float32 -exp(A_log); the largest absolute difference is one ULP at |A| ~= 1024"
+  },
+  "architecture": {
+    "layers": 16,
+    "schedule": "alternating mamba and attention, starting with mamba",
+    "hidden_size": 2048,
+    "feed_forward_size": 8192,
+    "attention_heads": 16,
+    "kv_heads": 1,
+    "mamba_inner_size": 4096,
+    "mamba_heads": 32,
+    "mamba_state_size": 64,
+    "mamba_conv_kernel": 4
+  },
+  "mobius_package": {
+    "import": "passed",
+    "save_check_reload": "passed",
+    "files": [
+      "model.onnx",
+      "model.onnx.data"
+    ],
+    "sha256": "5a9a6638087d4b76fff79e102e665fb963e505cd17812f909cfc33e42a29b640",
+    "state_interfaces": 16,
+    "state_abi": "even layers: conv_state+recurrent_state (semantic SSM state); odd layers: key+value"
+  },
+  "independent_reference": {
+    "implementation": "pinned HuggingFace remote model with upstream pure-PyTorch causal_conv1d_ref and selective_state_update_ref equivalents",
+    "transformers_version": "5.12.1",
+    "torch_version": "2.12.1",
+    "compatibility_shims": [
+      "adapt Transformers 5 tied-weight metadata, assign every shard on meta, verify all 218 parameters exactly, then tie lm_head to embed_tokens",
+      "rebuild non-persistent RoPE caches after meta-device loading",
+      "provide pure-PyTorch causal convolution and selective state update"
+    ],
+    "superseded_result": "the previous reference silently retained initialized parameters under Transformers 5.12.1; its plausible generated text was not checkpoint output",
+    "prompt": "Hello",
+    "prompt_tokens": [
+      1,
+      6721
+    ],
+    "generated_tokens": [
+      44,
+      2268,
+      1101,
+      1080,
+      1087,
+      8789,
+      45114,
+      2002,
+      3104,
+      1131,
+      1385,
+      1031,
+      73,
+      39,
+      109,
+      2569,
+      3648,
+      353,
+      32,
+      79135
+    ],
+    "generated_text": ", I'm new to this forum and am looking for some help.\n\nI'm trying to install a 'm trying to Raspberry Pi",
+    "generated_length": 20,
+    "rollback_replay_exact": true
+  },
+  "source_ort_cpu": {
+    "onnxruntime_version": "1.29.0",
+    "execution_provider": "CPUExecutionProvider",
+    "prefill_max_abs_error": 0.0000534057617,
+    "prefill_mean_abs_error": 0.0000069309889,
+    "decode_steps": 19,
+    "decode_max_abs_error": 0.000057220459,
+    "decode_max_mean_abs_error": 0.00000550644416,
+    "generated_tokens": [
+      44,
+      2268,
+      1101,
+      1080,
+      1087,
+      8789,
+      45114,
+      2002,
+      3104,
+      1131,
+      1385,
+      1031,
+      73,
+      39,
+      109,
+      2569,
+      3648,
+      353,
+      32,
+      79135
+    ],
+    "generated_length": 20,
+    "token_equality": true,
+    "rollback_replay_exact": true,
+    "promotion_decision": "passed: prefill, every teacher-forced cached decode, and exact 20-token greedy generation match the verified checkpoint"
+  },
+  "gguf_ort_cpu": {
+    "onnxruntime_version": "1.29.0",
+    "execution_provider": "CPUExecutionProvider",
+    "fused_and_portable_results_equal": true,
+    "prefill_max_abs_error": 0.0000534057617,
+    "prefill_mean_abs_error": 0.00000696335046,
+    "decode_steps": 19,
+    "decode_max_abs_error": 0.0000462532043,
+    "decode_max_mean_abs_error": 0.00000590607647,
+    "generated_tokens": [
+      44,
+      2268,
+      1101,
+      1080,
+      1087,
+      8789,
+      45114,
+      2002,
+      3104,
+      1131,
+      1385,
+      1031,
+      73,
+      39,
+      109,
+      2569,
+      3648,
+      353,
+      32,
+      79135
+    ],
+    "token_equality": true,
+    "root_cause": "the pinned GGUF declares plamo2.rope.freq_base=1e6, but the pinned reference has full_attention_idx=[] and uses its rope_local_theta=1e4 default for every attention layer; trusting the contradictory GGUF field caused the first cached divergence in layer 1 attention and amplified through later recurrent states",
+    "fix": "restore the published PLaMo2 local-RoPE base of 1e4 for the legacy 1e6 GGUF metadata profile and keep A_log in the graph so source checkpoints retain reference float32 discretization",
+    "promotion_decision": "passed: prefill, every teacher-forced cached decode, rollback/replay, and exact 20-token greedy generation match"
+  },
+  "ort_genai": {
+    "released_version": "0.15.2",
+    "released_source_tree": "ed5f4e87147731e5b07810f9f5c90103b3603cdf",
+    "generated_model_type": "decoder",
+    "attention_graph": "CPU-specialized export with all eight attention layers lowered to GroupQueryAttention; unspecialized Attention plus recurrent state is rejected by package config generation",
+    "generated_state_schema": "sparse global layer indices with key/value on odd layers and conv_state/recurrent_state on even layers",
+    "model_load": "passed with type=decoder and num_hidden_layers=16 discovered from sparse global state indices",
+    "state_contract_proof": "v0.15.2 src/models/kv_cache.cpp independently discovers sparse key inputs; src/models/recurrent_state.cpp independently discovers sparse conv_state inputs and derives paired recurrent_state names",
+    "generation_with_prompt_tokens": "passed: [1,6721] generated the exact verified 20-token continuation",
+    "generated_tokens": [
+      44,
+      2268,
+      1101,
+      1080,
+      1087,
+      8789,
+      45114,
+      2002,
+      3104,
+      1131,
+      1385,
+      1031,
+      73,
+      39,
+      109,
+      2569,
+      3648,
+      353,
+      32,
+      79135
+    ],
+    "tokenizer_source_revision": "92c75fd6eea9018bcb9c33ee8921589febe071fa",
+    "tokenizer_jsonl_sha256": "9fa8276a87dd2440bb9496f1d569c05ded6274fd2854de802e12dc6545804b95",
+    "tokenizer_identity": "all 100000 ordered tokens, token types, float32 scores, and special IDs 0/1/2/3 match the pinned GGUF exactly; the official tokenizer has no normalizer or pre-tokenizer",
+    "tokenizer_load": "deferred with exact rejection: ORT GenAI 0.15.2 requires tokenizer.json and reports Invalid file; a standard Unigram(byte_fallback=true) conversion is not identical because official encoding of literal <0xFA> is [60,48,120,5109,62] while the standard tokenizer emits byte token [250]",
+    "upstream_main_commit": "a8e0fdf81b061e67c1c3f9485bfdc06735ccd473",
+    "upstream_main_install": "not feasible from the Python source package: pip built UNKNOWN-0.0.0 without an onnxruntime_genai module",
+    "promotion_decision": "token-ID generation passed; text-tokenizer entry points remain deferred because no identity-preserving tokenizer.json representation was proven"
+  },
+  "l4_l5": {
+    "raw_ort_parity": "passed",
+    "generated_tokens_committed": true,
+    "ort_genai_e2e": "passed on the CPU-specialized GQA package with exact prompt token IDs; text tokenization remains deferred by the proven tokenizer-format mismatch"
+  }
+}

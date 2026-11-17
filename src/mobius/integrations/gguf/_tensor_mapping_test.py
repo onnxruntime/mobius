@@ -13,6 +13,82 @@ from mobius.integrations.gguf._tensor_mapping import (
 )
 
 
+@pytest.mark.parametrize(
+    ("gguf_name", "hf_name"),
+    [
+        (
+            "blk.0.ssm_conv1d_q.weight",
+            "model.layers.0.self_attn.q_conv1d.weight",
+        ),
+        ("blk.0.ssm_a", "model.layers.0.self_attn.A_log"),
+        ("blk.0.ssm_dt.bias", "model.layers.0.self_attn.dt_bias"),
+        (
+            "blk.1.attn_k_b.weight",
+            "model.layers.1.self_attn.k_b_proj.weight",
+        ),
+        (
+            "blk.1.ffn_gate_exps.weight",
+            "model.layers.1.block_sparse_moe.moe.experts.gate_proj.weight",
+        ),
+        (
+            "blk.1.exp_probs_b.bias",
+            "model.layers.1.block_sparse_moe.moe.gate.e_score_correction_bias",
+        ),
+    ],
+)
+def test_kimi_linear_exact_tensor_mapping(gguf_name: str, hf_name: str) -> None:
+    assert map_gguf_to_hf_names(gguf_name, "kimi-linear") == hf_name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "blk.0.ssm_a.weight",
+        "blk.0.ssm_conv1d_q.input_scale",
+        "blk.1.exp_probs_b.weight",
+        "blk.1.attn_kv_b.weight",
+    ],
+)
+def test_kimi_linear_rejects_wrong_or_legacy_suffixes(name: str) -> None:
+    assert map_gguf_to_hf_names(name, "kimi-linear") is None
+
+
+@pytest.mark.parametrize(
+    ("gguf_name", "hf_name"),
+    [
+        ("output_res_score.weight", "model.output_res_score.weight"),
+        ("blk.0.ssm_g.weight", "model.layers.0.self_attn.g_proj.weight"),
+        ("blk.1.attn_q_a.weight", "model.layers.1.self_attn.q_a_proj.weight"),
+        ("blk.1.attn_gate.weight", "model.layers.1.self_attn.g_proj.weight"),
+        (
+            "blk.1.ffn_routed_down.weight",
+            "model.layers.1.block_sparse_moe.routed_down_proj.weight",
+        ),
+        (
+            "blk.1.ffn_routed_norm.weight",
+            "model.layers.1.block_sparse_moe.routed_norm.weight",
+        ),
+        ("blk.1.ffn_res_score.weight", "model.layers.1.ffn_res_score.weight"),
+    ],
+)
+def test_kimi_k3_exact_tensor_mapping(gguf_name: str, hf_name: str) -> None:
+    assert map_gguf_to_hf_names(gguf_name, "kimi-k3") == hf_name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "blk.0.ssm_g_a.weight",
+        "blk.0.ssm_g_b.weight",
+        "blk.1.attn_gate.bias",
+        "blk.1.ffn_routed_norm.scale",
+        "blk.1.attn_res_score.input_scale",
+    ],
+)
+def test_kimi_k3_rejects_wrong_or_legacy_suffixes(name: str) -> None:
+    assert map_gguf_to_hf_names(name, "kimi-k3") is None
+
+
 class TestMapGGUFToHFNames:
     """Tests for map_gguf_to_hf_names()."""
 
@@ -79,6 +155,78 @@ class TestMapGGUFToHFNames:
         result = map_gguf_to_hf_names("blk.0.attn_q.weight", arch)
         assert result == "model.layers.0.self_attn.q_proj.weight"
 
+    @pytest.mark.parametrize("kind", ["q", "k"])
+    def test_qwen3_maps_attention_norms(self, kind: str) -> None:
+        assert (
+            map_gguf_to_hf_names(f"blk.0.attn_{kind}_norm.weight", "qwen3")
+            == f"model.layers.0.self_attn.{kind}_norm.weight"
+        )
+
+    @pytest.mark.parametrize(
+        ("architecture", "gguf_name", "expected"),
+        [
+            (
+                "jamba",
+                "blk.2.ssm_b_norm.weight",
+                "model.layers.2.mamba.b_layernorm.weight",
+            ),
+            (
+                "nemotron_h",
+                "blk.1.ssm_dt.bias",
+                "backbone.layers.1.mixer.dt_bias",
+            ),
+            (
+                "nemotron_h_moe",
+                "blk.1.exp_probs_b.bias",
+                "backbone.layers.1.mixer.gate.e_score_correction_bias",
+            ),
+            (
+                "nemotron_h_moe",
+                "blk.1.ffn_up_exps.weight",
+                "backbone.layers.1.mixer.experts.up_proj",
+            ),
+            (
+                "nemotron_h_moe",
+                "blk.1.ffn_up_shexp.weight",
+                "backbone.layers.1.mixer.shared_experts.up_proj.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_gate.weight",
+                "model.layers.0.shared_mlp.gate_proj.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_gate_inp.weight",
+                "model.layers.0.block_sparse_moe.gate.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_gate_exps.weight",
+                "model.layers.0.block_sparse_moe.gate_proj.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_up_exps.weight",
+                "model.layers.0.block_sparse_moe.up_proj.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_down_exps.weight",
+                "model.layers.0.block_sparse_moe.output_linear.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_gate_shexp.weight",
+                "model.layers.0.shared_mlp.gate_proj.weight",
+            ),
+        ],
+    )
+    def test_second_hybrid_cohort_mapping(
+        self, architecture: str, gguf_name: str, expected: str
+    ) -> None:
+        assert map_gguf_to_hf_names(gguf_name, architecture) == expected
+
     # ---- Bias tensors ----
 
     def test_bias_suffix(self) -> None:
@@ -102,13 +250,20 @@ class TestMapGGUFToHFNames:
     # ---- Gemma family ----
 
     def test_gemma2_extras(self) -> None:
+        # Gemma2 GGUF uses the llama.cpp Gemma tensor names (like Gemma3/4):
+        # ffn_norm is the pre-feedforward norm, post_ffw_norm the post-
+        # feedforward norm, post_attention_norm the post-attention sandwich norm.
         assert (
-            map_gguf_to_hf_names("blk.0.pre_ffn_norm.weight", "gemma2")
+            map_gguf_to_hf_names("blk.0.ffn_norm.weight", "gemma2")
             == "model.layers.0.pre_feedforward_layernorm.weight"
         )
         assert (
-            map_gguf_to_hf_names("blk.0.post_ffn_norm.weight", "gemma2")
+            map_gguf_to_hf_names("blk.0.post_ffw_norm.weight", "gemma2")
             == "model.layers.0.post_feedforward_layernorm.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.0.post_attention_norm.weight", "gemma2")
+            == "model.layers.0.post_attention_layernorm.weight"
         )
 
     def test_gemma2_inherits_llama_base(self) -> None:
@@ -279,20 +434,30 @@ class TestMapGGUFToHFNames:
     # ---- Mamba ----
 
     def test_mamba_mapping(self) -> None:
-        assert (
-            map_gguf_to_hf_names("token_embd.weight", "mamba") == "backbone.embeddings.weight"
-        )
+        assert map_gguf_to_hf_names("token_embd.weight", "mamba") == "model.embeddings.weight"
         assert (
             map_gguf_to_hf_names("blk.0.ssm_in.weight", "mamba")
-            == "backbone.layers.0.mixer.in_proj.weight"
+            == "model.layers.0.mixer.in_proj.weight"
         )
         assert (
             map_gguf_to_hf_names("blk.0.ssm_conv1d.weight", "mamba")
-            == "backbone.layers.0.mixer.conv1d.weight"
+            == "model.layers.0.mixer.conv1d.weight"
+        )
+        assert map_gguf_to_hf_names("blk.0.ssm_a", "mamba") == "model.layers.0.mixer.A_log"
+
+    def test_mamba2_mapping_and_bare_parameters(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.3.ssm_in.weight", "mamba2")
+            == "backbone.layers.3.mixer.in_proj.weight"
         )
         assert (
-            map_gguf_to_hf_names("blk.0.ssm_a.weight", "mamba")
-            == "backbone.layers.0.mixer.A_log.weight"
+            map_gguf_to_hf_names("blk.3.ssm_dt.bias", "mamba2")
+            == "backbone.layers.3.mixer.dt_bias"
+        )
+        assert map_gguf_to_hf_names("blk.3.ssm_a", "mamba2") == "backbone.layers.3.mixer.A_log"
+        assert (
+            map_gguf_to_hf_names("blk.3.ssm_norm.weight", "mamba2")
+            == "backbone.layers.3.mixer.norm.weight"
         )
 
     # ---- MoE ----
@@ -305,29 +470,30 @@ class TestMapGGUFToHFNames:
         assert map_gguf_to_hf_names("blk.0.ffn_gate_exps.weight", "qwen2moe") == (
             "model.layers.0.mlp.experts.gate_proj.weight"
         )
+        assert map_gguf_to_hf_names("blk.1.ffn_down_exps.weight", "granitemoe") == (
+            "model.layers.1.mlp.experts.down_proj.weight"
+        )
+        assert map_gguf_to_hf_names("blk.2.ffn_gate_exps.scale", "qwen3moe") == (
+            "model.layers.2.mlp.experts.gate_proj.scale"
+        )
+        assert map_gguf_to_hf_names("blk.2.ffn_up_exps.input_scale", "qwen3moe") == (
+            "model.layers.2.mlp.experts.up_proj.input_scale"
+        )
+        assert map_gguf_to_hf_names("blk.1.ffn_gate_shexp.weight", "granitemoe") == (
+            "model.layers.1.mlp.shared_expert.gate_proj.weight"
+        )
+        assert map_gguf_to_hf_names("blk.0.attn_q_norm.weight", "qwen3moe") == (
+            "model.layers.0.self_attn.q_norm.weight"
+        )
+        assert map_gguf_to_hf_names("blk.0.attn_k_norm.weight", "olmoe") == (
+            "model.layers.0.self_attn.k_norm.weight"
+        )
 
-    def test_deepseek4_mapping(self) -> None:
-        expected = {
-            "blk.2.attn_q_a.weight": "model.layers.2.self_attn.q_a_proj.weight",
-            "blk.2.attn_kv.weight": "model.layers.2.self_attn.kv_proj.weight",
-            "blk.2.attn_output_a.weight": "model.layers.2.self_attn.o_a_proj.weight",
-            "blk.2.ffn_gate_tid2eid.weight": "model.layers.2.mlp.gate.tid2eid",
-            "blk.2.exp_probs_b.bias": "model.layers.2.mlp.gate.bias",
-            "blk.2.hc_attn_fn.weight": "model.layers.2.hc_attn_fn.weight",
-            "blk.2.attn_sinks.weight": "model.layers.2.self_attn.attn_sink",
-            "blk.2.attn_compressor_ape.weight": ("model.layers.2.self_attn.compressor.ape"),
-            "blk.2.attn_compressor_kv.weight": (
-                "model.layers.2.self_attn.compressor.wkv.weight"
-            ),
-            "blk.2.indexer.attn_q_b.weight": ("model.layers.2.self_attn.indexer.wq_b.weight"),
-            "blk.2.indexer_compressor_norm.weight": (
-                "model.layers.2.self_attn.indexer.compressor.norm.weight"
-            ),
-            "output_hc_fn.weight": "model.hc_head_fn.weight",
-            "output_hc_base.weight": "model.hc_head_base",
-        }
-        for source, target in expected.items():
-            assert map_gguf_to_hf_names(source, "deepseek4") == target
+    @pytest.mark.parametrize("architecture", ["qwen2_moe", "qwen3_moe"])
+    def test_moe_aliases_map_to_canonical_recipe(self, architecture: str) -> None:
+        assert map_gguf_to_hf_names("blk.0.ffn_up_exps.weight", architecture) == (
+            "model.layers.0.mlp.experts.up_proj.weight"
+        )
 
     # ---- Unsupported architecture ----
 
@@ -356,3 +522,47 @@ class TestBuildGGUFToHFMap:
 
     def test_empty_input(self) -> None:
         assert build_gguf_to_hf_map([], "llama") == {}
+
+
+class TestMuseGlimmerMapping:
+    """Tests for the Muse Glimmer GGUF tensor names."""
+
+    def test_projections_and_gate(self) -> None:
+        expected = {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output.weight": "lm_head.weight",
+            "output_norm.weight": "model.norm.weight",
+            "blk.3.attn_q.weight": "model.layers.3.self_attn.q_proj.weight",
+            "blk.3.attn_output.weight": "model.layers.3.self_attn.o_proj.weight",
+            "blk.3.attn_gate.weight": "model.layers.3.self_attn.gate_proj.weight",
+            "blk.3.ffn_down.weight": "model.layers.3.mlp.down_proj.weight",
+        }
+        for source, target in expected.items():
+            assert map_gguf_to_hf_names(source, "muse-glimmer") == target
+
+    def test_four_block_norms(self) -> None:
+        # ffn_norm is the *pre*-feedforward norm here, not the post-attention
+        # norm it maps to in the Llama base mapping.
+        expected = {
+            "blk.7.attn_norm.weight": "model.layers.7.input_layernorm.weight",
+            "blk.7.post_attention_norm.weight": (
+                "model.layers.7.post_attention_layernorm.weight"
+            ),
+            "blk.7.ffn_norm.weight": ("model.layers.7.pre_feedforward_layernorm.weight"),
+            "blk.7.post_ffw_norm.weight": ("model.layers.7.post_feedforward_layernorm.weight"),
+        }
+        for source, target in expected.items():
+            assert map_gguf_to_hf_names(source, "muse-glimmer") == target
+
+    def test_qk_norms_are_dropped(self) -> None:
+        # Muse Glimmer's QK normalization is scale-free: the HF checkpoint has
+        # no q_norm/k_norm parameters, so these llama.cpp-only tensors have no
+        # target. The scale they encode is recovered by the config mapping.
+        assert map_gguf_to_hf_names("blk.0.attn_q_norm.weight", "muse-glimmer") is None
+        assert map_gguf_to_hf_names("blk.0.attn_k_norm.weight", "muse-glimmer") is None
+
+    def test_underscore_spelling_is_accepted(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.1.attn_gate.weight", "muse_glimmer")
+            == "model.layers.1.self_attn.gate_proj.weight"
+        )

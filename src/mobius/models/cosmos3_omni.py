@@ -104,15 +104,14 @@ class Cosmos3OmniReasonerModel(Qwen3VL3ModelCausalLMModel):
     towers.
 
     .. note::
-       **DeepStack is preserved.**  The Qwen3-VL 3-model split threads the
-       intermediate DeepStack feature maps (from vision layers
-       ``deepstack_visual_indexes`` — ``[8, 16, 24]`` for Cosmos3) through an
-       extra ``deepstack_features`` / ``deepstack_embeds`` I/O channel:
-       ``vision_encoder`` emits a stacked ``[D, ...]`` tensor, ``embedding``
-       scatters each map to full sequence length, and the ``decoder`` adds
-       them into the hidden states of its first ``D`` layers — matching
-       HuggingFace's per-layer injection.  The 18 ``deepstack_merger_list.*``
-       weights are therefore exported and routed to ``vision_encoder``.
+       **DeepStack is preserved.** The Qwen3-VL 3-model split packs the
+       intermediate maps (from ``deepstack_visual_indexes`` — ``[8, 16, 24]``
+       for Cosmos3) into ``image_features``. The embedding model scatters and
+       flattens them into ORT GenAI's rank-3 ``per_layer_inputs`` contract,
+       and the decoder restores and injects one map into each of its first
+       ``D`` layers — matching HuggingFace's per-layer injection. The 18
+       ``deepstack_merger_list.*`` weights are therefore exported and routed
+       to ``vision_encoder``.
     """
 
     default_task: str = "qwen-vl"

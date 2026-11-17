@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Unit tests for :func:`mobius._testing.ort_inference._should_lower_opset`.
+"""Unit tests for runtime feed conversion and opset fallback decisions.
 
 CPU-authorable: construct tiny ONNX-IR models directly and assert the opset
 24→23 lowering decision.  In particular these prove the M2 alignment — the
@@ -13,11 +13,42 @@ which the previous top-level-only scan missed.
 
 from __future__ import annotations
 
+import tempfile
+
+import numpy as np
 import onnx_ir as ir
 import pytest
 
 from mobius._flags import flags
-from mobius._testing.ort_inference import _MAX_EP_OPSET, _should_lower_opset
+from mobius._testing.ort_inference import (
+    _MAX_EP_OPSET,
+    OnnxModelSession,
+    _numpy_to_ort_value,
+    _ort_value_to_numpy,
+    _should_lower_opset,
+)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "int64", "bool", "bfloat16"])
+def test_numpy_feed_preserves_dtype_shape_and_values(dtype: str) -> None:
+    if dtype == "bfloat16":
+        numpy_dtype = pytest.importorskip("ml_dtypes").bfloat16
+    else:
+        numpy_dtype = np.dtype(dtype)
+    expected = np.array([[1, 0], [0, 1]], dtype=numpy_dtype)
+    actual = _ort_value_to_numpy(_numpy_to_ort_value(expected))
+    np.testing.assert_array_equal(actual, expected, strict=True)
+
+
+@pytest.mark.parametrize("layout", ["scalar", "strided"])
+def test_numpy_feed_preserves_scalar_and_strided_shapes(layout: str) -> None:
+    expected = (
+        np.array(1.25, dtype=np.float32)
+        if layout == "scalar"
+        else np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2]
+    )
+    actual = _ort_value_to_numpy(_numpy_to_ort_value(expected))
+    np.testing.assert_array_equal(actual, expected, strict=True)
 
 
 def _make_value(name: str) -> ir.Value:
@@ -102,9 +133,33 @@ def test_flag_disabled_never_lowers(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _should_lower_opset(model, device="cuda") is False
 
 
-def test_opset_at_or_below_max_not_lowered(lowering_enabled: None) -> None:
-    # Already at the EP-max opset: nothing to lower.
+@pytest.mark.parametrize("opset", [_MAX_EP_OPSET - 1, _MAX_EP_OPSET, 25, 29])
+def test_opset_other_than24_not_lowered(lowering_enabled: None, opset: int) -> None:
+    # Only the audited 24→23 subset may be relabeled; preserve newer operators.
     node = ir.Node("", "Reshape", inputs=[_make_value("x"), _make_value("shape")])
-    model = _model_with(_graph_with([node], opset=_MAX_EP_OPSET))
+    model = _model_with(_graph_with([node], opset=opset))
 
     assert _should_lower_opset(model, device="cuda") is False
+
+
+def test_close_releases_session_reference() -> None:
+    session = OnnxModelSession.__new__(OnnxModelSession)
+    session._session = object()  # type: ignore[attr-defined]
+    session._tmpdir = tempfile.TemporaryDirectory()  # type: ignore[attr-defined]
+
+    session.close()
+
+    assert not hasattr(session, "_session")
+
+
+def test_providers_returns_runtime_priority_order() -> None:
+    class _Session:
+        def get_providers(self) -> list[str]:
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    session = OnnxModelSession.__new__(OnnxModelSession)
+    session._session = _Session()  # type: ignore[attr-defined]
+    session._tmpdir = tempfile.TemporaryDirectory()  # type: ignore[attr-defined]
+
+    assert session.providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    session.close()

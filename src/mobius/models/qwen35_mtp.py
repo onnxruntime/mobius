@@ -8,14 +8,12 @@ the ``mtp.*`` weight prefix.  HuggingFace ``transformers`` discards those
 weights on ``from_pretrained`` (the base model has no MTP module), so the
 head is built here directly from the checkpoint tensors.
 
-Like the DFlash and Gemma4-Assistant mobius drafters, this head has **no
-embedding table and no LM head** — it shares the target's
-(``mtp_use_dedicated_embeddings = False``), which the speculative-decoding
-orchestrator splits out of the target and applies on either side of the
-head.  It therefore consumes ``inputs_embeds`` (the target's
-``embed_tokens(t_{i+1})``) and emits ``mtp_hidden`` (decoded through the
-target's shared ``lm_head`` by the orchestrator to obtain the draft logits
-for ``t_{i+2}``).
+The GGUF may carry dedicated ``nextn.embed_tokens`` and
+``nextn.shared_head_head`` tables. When present, this sidecar owns them and
+consumes ``input_ids`` and/or emits ``logits``. When absent, it consumes the
+target's ``inputs_embeds`` and/or emits ``mtp_hidden`` for the target's shared
+LM head. ``nextn.shared_head_norm`` similarly falls back to the target's final
+norm weights.
 
 Architecturally::
 
@@ -49,9 +47,9 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import Qwen35MtpConfig
-from mobius.components import Linear, create_attention_bias, initialize_rope
+from mobius.components import Embedding, Linear, create_attention_bias, initialize_rope
 from mobius.components._rms_norm import OffsetRMSNorm
-from mobius.models.qwen35 import Qwen35DecoderLayer
+from mobius.models.qwen35 import Qwen35DecoderLayer, _linear_factory
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -61,10 +59,9 @@ class Qwen35MtpModel(nn.Module):
     """Qwen3.6 MTP self-speculative head (a single cross-conditioned full-attention block).
 
     Inputs (graph-level, set up by :class:`~mobius.tasks.Qwen35MtpTask`):
-        inputs_embeds: ``[batch, seq_len, hidden]`` (model dtype) — the
-            target's ``embed_tokens(t_{i+1})`` for the just-emitted token(s)
-            the head conditions on (the head borrows the target's shared
-            embedding table).
+        input_ids or inputs_embeds: Dedicated embeddings consume token IDs;
+            fallback embeddings arrive from the target as
+            ``[batch, seq_len, hidden]``.
         hidden_states: ``[batch, seq_len, hidden]`` (model dtype) — the
             target model's last hidden state ``h_i`` (post-final-norm).
         attention_mask: ``[batch, total_seq_len]`` INT64.
@@ -72,9 +69,8 @@ class Qwen35MtpModel(nn.Module):
         past_key_values: standard GQA KV cache for the single MTP layer.
 
     Outputs:
-        mtp_hidden: ``[batch, seq_len, hidden]`` (model dtype) — the head's
-            final hidden states.  The orchestrator decodes them through the
-            target's shared ``lm_head`` to obtain the draft token logits.
+        logits or mtp_hidden: Dedicated heads emit vocabulary logits; fallback
+            heads emit final hidden states for the target's shared ``lm_head``.
         present_key_values: updated KV cache for the single MTP layer.
     """
 
@@ -87,14 +83,26 @@ class Qwen35MtpModel(nn.Module):
         self.config = config
         self._dtype = config.dtype
 
+        self.embed_tokens = (
+            Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+            if config.use_dedicated_embeddings
+            else None
+        )
+
         # Input projection: fuse the token embedding with the target hidden.
         self.pre_fc_norm_embedding = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.fc = Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        linear_class = _linear_factory(config) or Linear
+        self.fc = linear_class(2 * config.hidden_size, config.hidden_size, bias=False)
 
         # The single full-attention MTP decoder layer.
         self.layers = nn.ModuleList([Qwen35DecoderLayer(config, layer_idx=0)])
         self.norm = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = (
+            Linear(config.hidden_size, config.vocab_size, bias=False)
+            if config.use_dedicated_lm_head
+            else None
+        )
         self.rotary_emb = initialize_rope(config)
 
     def preprocess_weights(
@@ -102,10 +110,9 @@ class Qwen35MtpModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         """Strip the ``mtp.`` prefix and drop everything else.
 
-        The MTP head borrows the target's ``embed_tokens`` / ``lm_head`` (it
-        has none of its own), so only the ``mtp.*`` weights are consumed;
-        the main decoder layers, the visual tower and the shared
-        embedding / lm_head are dropped here.
+        This is the HuggingFace shared-table path, so only ``mtp.*`` weights
+        are consumed. GGUF dedicated tables are mapped directly to final
+        sidecar names and intentionally bypass this preprocessor.
 
         Mapping::
 
@@ -124,12 +131,20 @@ class Qwen35MtpModel(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        inputs_embeds: ir.Value,
+        inputs_embeds: ir.Value | None,
+        input_ids: ir.Value | None,
         hidden_states: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
+        if self.embed_tokens is not None:
+            if input_ids is None:
+                raise ValueError("Dedicated MTP embeddings require input_ids")
+            inputs_embeds = self.embed_tokens(op, input_ids)
+        elif inputs_embeds is None:
+            raise ValueError("Shared MTP embeddings require inputs_embeds")
+
         # h'_i = fc(concat[pre_fc_norm_embedding(inputs_embeds),
         #                  pre_fc_norm_hidden(h_i)])
         embeds = self.pre_fc_norm_embedding(op, inputs_embeds)
@@ -158,4 +173,6 @@ class Qwen35MtpModel(nn.Module):
             present_key_values.append(present_kv)
 
         mtp_hidden = self.norm(op, hs)
+        if self.lm_head is not None:
+            return self.lm_head(op, mtp_hidden), present_key_values
         return mtp_hidden, present_key_values

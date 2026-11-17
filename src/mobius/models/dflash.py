@@ -4,10 +4,10 @@
 """DFlash speculative-decoding draft model.
 
 Mobius port of ``DFlashDraftModel`` in ``z-lab/dflash:dflash/model.py``.
-The drafter has no embedding table and no LM head — those are borrowed
-from the target at inference time, so this module's forward signature
-is ``(noise_embedding, target_hidden, position_ids, q_position_ids,
-past_key_values) → (draft_hidden, present_key_values)``.
+The drafter has no embedding table. Its LM head is either draft-owned or
+borrowed from the target, so this module's forward signature is
+``(noise_embedding, target_hidden, position_ids, q_position_ids,
+past_key_values) → (draft_output, present_key_values)``.
 
 The two ``*_position_ids`` inputs cover the K and Q rotary positions
 separately so the graph does not need any symbolic slicing of the RoPE
@@ -24,6 +24,7 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import DFlashConfig
 from mobius.components import Linear, RMSNorm, initialize_rope
 from mobius.components._dflash import DFlashDecoderLayer
+from mobius.models.base import linear_class_for_config
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -49,9 +50,9 @@ class DFlashDraftModel(nn.Module):
             speculative steps.
 
     Outputs:
-        draft_hidden: ``[batch, q_len, hidden]`` — final hidden states for
-            each noise position.  The caller decodes them through the
-            target's ``lm_head`` to obtain draft token logits.
+        draft_output: Final hidden states ``[batch, q_len, hidden]`` for the
+            target LM head, or logits ``[batch, q_len, draft_vocab]`` when the
+            checkpoint owns ``output.weight``.
         present_key_values: updated per-layer cache pairs.
     """
 
@@ -70,18 +71,27 @@ class DFlashDraftModel(nn.Module):
                 "dflash.model.build_target_layer_ids()."
             )
 
+        linear_class = linear_class_for_config(config) or Linear
         self.layers = nn.ModuleList(
-            [DFlashDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                DFlashDecoderLayer(config, linear_class=linear_class)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
         # Project the concatenated target hidden states down to hidden_size.
         # No bias — matches the reference implementation.
-        self.fc = Linear(
+        self.fc = linear_class(
             len(config.target_layer_ids) * config.hidden_size,
             config.hidden_size,
             bias=False,
         )
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = (
+            linear_class(config.hidden_size, config.draft_vocab_size, bias=False)
+            if config.use_draft_lm_head
+            else None
+        )
         self.rotary_emb = initialize_rope(config)
 
     def forward(
@@ -118,4 +128,7 @@ class DFlashDraftModel(nn.Module):
             present_key_values.append(present_kv)
 
         hidden_states = self.norm(op, hidden_states)
-        return hidden_states, present_key_values
+        draft_output = (
+            hidden_states if self.lm_head is None else self.lm_head(op, hidden_states)
+        )
+        return draft_output, present_key_values

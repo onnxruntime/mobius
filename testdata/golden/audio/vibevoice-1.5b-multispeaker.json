@@ -1,0 +1,24 @@
+{
+  "model_id": "vibevoice/VibeVoice-1.5B-hf",
+  "revision": "edc39f80f5cae656da37baf8faa8f5502bf7081f",
+  "transformers_commit": "640a08a597034221ca1c4fc0c129cf0118179225",
+  "dtype": "float16",
+  "seed": 20260831,
+  "level": "L4",
+  "input_sequence_length": 203,
+  "audio_rows": 2,
+  "audio_placeholder_count": 138,
+  "control_token_ids": [
+    151652,
+    151653,
+    151654,
+    151643
+  ],
+  "prefill_control_logits": [
+    4.21875,
+    15.125,
+    23.0,
+    6.9921875
+  ],
+  "prompt_sha256": "b0ddac40a3d6cd8188cc085d342a9e26e0af160c2b844271ed76a570cb3b806c"
+}

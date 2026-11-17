@@ -1,0 +1,74 @@
+{
+  "top1_id": 665,
+  "top2_id": 281,
+  "top10_ids": [
+    665,
+    281,
+    253,
+    2276,
+    827,
+    981,
+    986,
+    335,
+    2973,
+    1296
+  ],
+  "top10_logits": [
+    "0x1.86b3140000000p+3",
+    "0x1.81ea560000000p+3",
+    "0x1.40f8320000000p+3",
+    "0x1.1c6d740000000p+3",
+    "0x1.1c3ee40000000p+3",
+    "0x1.0907c60000000p+3",
+    "0x1.069c440000000p+3",
+    "0x1.f31e640000000p+2",
+    "0x1.e567460000000p+2",
+    "0x1.ba6bcc0000000p+2"
+  ],
+  "logits_summary": [
+    "0x1.86b3140000000p+3",
+    "-0x1.3be0520000000p+4",
+    "-0x1.a1d25df16feabp+2",
+    "0x1.984a8941db932p+1"
+  ],
+  "input_ids": [
+    6403,
+    1980,
+    253,
+    655,
+    28
+  ],
+  "provenance": {
+    "reference": {
+      "repository": "HuggingFaceTB/SmolLM-135M",
+      "revision": "1d461723eec654e65efdc40cf49301c89c0c92f4"
+    },
+    "gguf": {
+      "repository": "neopolita/smollm-135m-gguf",
+      "revision": "22cca988936eafe92908e7558907c3964e10bba7",
+      "filename": "ggml-model-f16.gguf",
+      "size": 270885504,
+      "lfs_sha256": "ec8c775c16944a7e4b5251f97b3f848500dcc3e701b0d492ce9055cea42138a2",
+      "tensor_count": 272,
+      "tensor_qtypes": {
+        "F16": 211,
+        "F32": 61
+      },
+      "execution_provider": "cpu",
+      "config_sha256": "134f95e6a635d978737d712ed61ac8959acebdf080eafae838cf97f12c416430",
+      "preserve_quantization": false,
+      "keep_quantized": true,
+      "tokenizer": {
+        "repository": "HuggingFaceTB/SmolLM-135M",
+        "revision": "1d461723eec654e65efdc40cf49301c89c0c92f4",
+        "metadata_sha256": "46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc",
+        "identity_status": "exact",
+        "assets": [
+          {"filename": "special_tokens_map.json", "size": 831, "sha256": "e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3"},
+          {"filename": "tokenizer.json", "size": 2104556, "sha256": "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"},
+          {"filename": "tokenizer_config.json", "size": 3685, "sha256": "238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8"}
+        ]
+      }
+    }
+  }
+}

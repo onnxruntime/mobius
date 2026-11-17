@@ -3,7 +3,7 @@
 
 """Tests for model building — base class and infrastructure unit tests.
 
-Architecture-specific graph construction tests live in tests/build_graph_test.py,
+Architecture-specific graph construction tests live in tests/build_graph,
 which covers every registered model type via ALL_CAUSAL_LM_CONFIGS.  This file
 focuses on the base class contracts and build infrastructure that are not
 exercised by the parametrized tests there.
@@ -16,14 +16,19 @@ import pytest
 import torch
 
 from mobius._builder import build_from_module
+from mobius._configs import QuantizationConfig
 from mobius._registry import (
     MODEL_MAP,
     ModelRegistry,
     registry,
 )
 from mobius._testing import make_config
+from mobius.components import LayerNorm, Linear, QuantizedLinear, RMSNormBias
 from mobius.models.base import CausalLMModel, TextModel
+from mobius.models.moe import MoECausalLMModel, Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
 from mobius.tasks import CausalLMTask
+
+_INT64_MAX = 2**63 - 1
 
 
 class TestTextModel:
@@ -64,6 +69,44 @@ class TestCausalLMModel:
         sd = {"lm_head.weight": torch.zeros(100, 64)}
         sd = model.preprocess_weights(sd)
         assert "model.embed_tokens.weight" not in sd
+
+    def test_phimoe_norm_matches_checkpoint_format(self):
+        config = make_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            partial_rotary_factor=0.5,
+        )
+        native = Phi3MoECausalLMModel(config)
+        gguf = PhiMoEGGUFCausalLMModel(config)
+        assert isinstance(native.model.layers[0].input_layernorm, LayerNorm)
+        assert isinstance(gguf.model.layers[0].input_layernorm, RMSNormBias)
+
+    @pytest.mark.parametrize(
+        ("quantize_lm_head", "head_type"),
+        [(False, Linear), (True, QuantizedLinear)],
+    )
+    def test_phimoe_gguf_honors_quantized_head_contract(self, quantize_lm_head, head_type):
+        config = make_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            partial_rotary_factor=0.5,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="gguf",
+                sym=True,
+                quantize_lm_head=quantize_lm_head,
+            ),
+        )
+        module = PhiMoEGGUFCausalLMModel(config)
+
+        assert isinstance(module.model.layers[0].self_attn.q_proj, QuantizedLinear)
+        assert isinstance(module.lm_head, head_type)
+
+        model = build_from_module(module, config, task=CausalLMTask())["model"]
+        op_types = [node.op_type for node in model.graph]
+        assert "MatMulNBits" in op_types
+        assert ("lm_head.scales" in model.graph.initializers) is quantize_lm_head
 
 
 class TestBuildFromModule:
@@ -137,10 +180,10 @@ class TestBuildFromModule:
         assert isinstance(model, ir.Model)
         assert model.graph.num_nodes() > 0
 
-    def test_build_with_prune_lm_head_feature(self):
+    def test_build_with_prune_prefill_prefix_feature(self):
         config = make_config()
         module = CausalLMModel(config)
-        model = build_from_module(module, config, prune_lm_head=True)["model"]
+        model = build_from_module(module, config, prune_prefill_prefix=True)["model"]
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         assert len(logits.shape) == 3
@@ -191,23 +234,23 @@ class TestTextModelOutputHiddenStates:
         assert model.output_layer_indices == [0, 3]
 
 
-class TestPruneLmHead:
-    """Tests for the ``prune_lm_head`` option in :class:`CausalLMTask`.
+class TestPrunePrefillPrefix:
+    """Tests for the ``prune_prefill_prefix`` option in :class:`CausalLMTask`.
 
     When ``True``, a ``Gather + Unsqueeze`` is inserted after the LM head
     so logits are produced for only the last sequence position.
-    Mirrors onnxruntime-genai Model Builder's ``prune_lm_head`` opt-in.
+    The generic causal task applies the optimization immediately before the LM head.
     """
 
-    def _build(self, prune_lm_head: bool = False) -> ir.Model:
+    def _build(self, prune_prefill_prefix: bool = False) -> ir.Model:
         config = make_config()
         module = CausalLMModel(config)
-        task = CausalLMTask(prune_lm_head=prune_lm_head)
+        task = CausalLMTask(prune_prefill_prefix=prune_prefill_prefix)
         return build_from_module(module, config, task=task)["model"]
 
-    def test_default_emits_no_lm_head_pruning(self):
-        """Default (prune_lm_head=False): graph emits full [B, S, vocab] logits."""
-        model = self._build(prune_lm_head=False)
+    def test_default_emits_no_prefill_prefix_pruning(self):
+        """Default graph emits full [B, S, vocab] logits."""
+        model = self._build(prune_prefill_prefix=False)
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         # Logits must remain rank-3 [B, S, vocab]
@@ -226,7 +269,7 @@ class TestPruneLmHead:
 
     def test_prune_emits_gather_on_logits(self):
         """Pruning selects the final hidden state before the LM-head MatMul."""
-        model = self._build(prune_lm_head=True)
+        model = self._build(prune_prefill_prefix=True)
 
         logits = next(v for v in model.graph.outputs if v.name == "logits")
         # Logits must still be rank-3 [B, 1, vocab] (NOT rank-4 [B, 1, 1, V])
@@ -253,7 +296,7 @@ class TestPruneLmHead:
         input_ids still has dynamic sequence_length
         so the model accepts arbitrary prompts.
         """
-        model = self._build(prune_lm_head=True)
+        model = self._build(prune_prefill_prefix=True)
 
         input_ids = next(v for v in model.graph.inputs if v.name == "input_ids")
         # input dim 1 (sequence_length) should still be dynamic, not 1
@@ -279,8 +322,129 @@ class TestPruneLmHead:
                 return self.lm_head(op, hidden_states), present
 
         config = make_config()
-        with pytest.raises(ValueError, match="does not support prune_lm_head"):
-            build_from_module(UnsupportedCausalLM(config), config, prune_lm_head=True)
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            build_from_module(UnsupportedCausalLM(config), config, prune_prefill_prefix=True)
+
+    @staticmethod
+    def _quantized_moe_config(**quantization):
+        return make_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            dtype=ir.DataType.FLOAT16,
+            quantization=QuantizationConfig(bits=4, group_size=32, sym=True, **quantization),
+        )
+
+    @pytest.mark.parametrize(
+        ("model_class", "quantization"),
+        [
+            pytest.param(
+                MoECausalLMModel, {"quant_method": "olive", "quantize_moe": True}, id="qmoe"
+            ),
+            pytest.param(
+                PhiMoEGGUFCausalLMModel,
+                {"quant_method": "gguf", "quantize_lm_head": True},
+                id="matmulnbits-head-with-bias",
+            ),
+        ],
+    )
+    def test_prune_quantized_moe_infers_logits_shape(
+        self, model_class, quantization, monkeypatch
+    ):
+        """MatMulNBits and QMoE have no ONNX schema; the task infers the logits shape itself."""
+        # Skip the optimizer, which runs shape inference too, to check the task's own graph.
+        monkeypatch.setattr("mobius._builder.optimize_model", lambda *args, **kwargs: None)
+        config = self._quantized_moe_config(**quantization)
+        module = model_class(config)
+        model = build_from_module(module, config, prune_prefill_prefix=True)["model"]
+
+        logits = next(v for v in model.graph.outputs if v.name == "logits")
+        assert len(logits.shape) == 3
+        assert logits.shape[1] == 1
+        assert logits.shape[2] == config.vocab_size
+
+    @pytest.mark.parametrize(
+        ("index", "axis", "axes"),
+        [
+            pytest.param(None, None, None, id="unpruned"),
+            pytest.param(-1, 0, [1], id="gather-axis-0"),
+            pytest.param([0, 1], 1, [1], id="gather-two-positions"),
+            pytest.param([-1], 1, [1], id="gather-vector-index"),
+            pytest.param(-1, 1, [0], id="unsqueeze-axis-0"),
+            pytest.param(slice(-2, None), 1, None, id="slice-last-two"),
+        ],
+    )
+    def test_prune_quantized_moe_rejects_other_selections(self, index, axis, axes):
+        """The inferred logits shape rejects every selection but the last token."""
+
+        class CustomSelectionMoE(MoECausalLMModel):
+            def forward(
+                self,
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values=None,
+            ):
+                hidden_states, present = self.model(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                if isinstance(index, slice):
+                    hidden_states = op.Slice(
+                        hidden_states,
+                        op.Constant(value_ints=[index.start]),
+                        op.Constant(value_ints=[_INT64_MAX]),
+                        op.Constant(value_ints=[axis]),
+                    )
+                elif index is not None:
+                    indices = op.Constant(value=ir.tensor(index, dtype=ir.DataType.INT64))
+                    hidden_states = op.Unsqueeze(
+                        op.Gather(hidden_states, indices, axis=axis),
+                        op.Constant(value_ints=axes),
+                    )
+                return self.lm_head(op, hidden_states), present
+
+        config = self._quantized_moe_config(quant_method="olive", quantize_moe=True)
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            build_from_module(CustomSelectionMoE(config), config, prune_prefill_prefix=True)
+
+    def test_prune_quantized_moe_rejects_non_bias_add(self):
+        """Adding full-sequence logits broadcasts the pruned logits back to every position."""
+
+        class FullSequenceAddMoE(MoECausalLMModel):
+            def forward(
+                self,
+                op,
+                input_ids,
+                attention_mask,
+                position_ids,
+                past_key_values=None,
+            ):
+                hidden_states, present = self.model(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                )
+                last = op.Unsqueeze(
+                    op.Gather(
+                        hidden_states,
+                        op.Constant(value=ir.tensor(-1, dtype=ir.DataType.INT64)),
+                        axis=1,
+                    ),
+                    op.Constant(value_ints=[1]),
+                )
+                logits = op.Add(self.lm_head(op, last), self.lm_head(op, hidden_states))
+                return logits, present
+
+        config = self._quantized_moe_config(quant_method="olive", quantize_moe=True)
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            build_from_module(FullSequenceAddMoE(config), config, prune_prefill_prefix=True)
 
 
 class TestDeepStackCaptureOrdering:

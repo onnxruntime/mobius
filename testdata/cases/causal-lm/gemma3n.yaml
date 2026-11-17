@@ -1,5 +1,5 @@
-model_id: "google/gemma-3n-E2B-pt"
-model_type: "gemma3n"
+model_id: "google/gemma-3n-E2B-it"
+model_type: "gemma3n_text"
 revision: "main"
 task_type: "text-generation"
 dtype: "float32"
@@ -14,5 +14,8 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-notes: "Gemma 3n E2B. AltUp/Laurel per-layer routing with sliding + global attention."
-skip_reason: "Model not yet published on HuggingFace."
+# google/gemma-3n-E2B-pt, which this case originally targeted, is not available;
+# only the -it checkpoints are, and those are multimodal. Follow the
+# gemma-4-e2b precedent and drive the text-only path from an -it checkpoint via
+# model_type "gemma3n_text".
+notes: "Gemma 3n E2B (text-only path). AltUp/Laurel per-layer routing with sliding + global attention, KV layer sharing (layers at/after first_kv_shared_layer_idx reuse the KV of the last non-shared layer of the same type), and per-layer activation sparsity on the early layers."

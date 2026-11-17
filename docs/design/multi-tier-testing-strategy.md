@@ -82,7 +82,7 @@ implicitly proven).
 | **Speed** | <1s per model |
 | **Coverage** | All 270+ model types |
 | **Failure mode** | Missing ops, shape errors, broken component wiring |
-| **File** | `tests/build_graph_test.py` with configs from `tests/_test_configs.py` |
+| **File** | `tests/build_graph` with configs from `tests/_test_configs.py` |
 | **Marker** | None (always runs) |
 
 L1 is the workhorse.  Every model type has at least one config entry.
@@ -492,9 +492,9 @@ characteristics.
 ```
 1. Create model class + register in _registry.py
 2. Add config entry in tests/_test_configs.py  → L1
-3. Run:  python -m pytest tests/build_graph_test.py -k "my_model"        → L1
-4. Add to integration_test.py parametrized list                          → L3
-5. Run:  python -m pytest tests/integration_test.py -m integration -k "my_model"
+3. Run:  python -m pytest tests/build_graph -k "my_model"        → L1
+4. Add to the focused integration suite                                 → L3
+5. Run:  python -m pytest tests/integration -m integration -k "my_model"
 6. Create testdata/cases/<cat>/my-model.yaml with test_model_id          → L2
 7. Run:  python scripts/generate_golden.py --filter 'my-model*'          → L4/L5
 8. Commit testdata/golden/<cat>/my-model.json + my-model_generation.json
@@ -568,9 +568,9 @@ See [Performance Benchmarking](perf-benchmarking.md) for full details.
 | Tier | Status | Coverage | File |
 |------|--------|----------|------|
 | L0 | ✅ Implicit via registry | 273 types | `_registry.py` |
-| L1 | ✅ Full coverage (273) | 273 types | `build_graph_test.py` + `_SPECIALIZED_TEST_MODEL_TYPES` |
+| L1 | ✅ Full coverage (273) | 273 types | `tests/build_graph/` + `specialized_test_model_types()` |
 | L2 | ✅ YAML-driven | ~105 types (YAML cases with `test_model_id`) | `arch_validation_test.py` |
-| L3 | ✅ Causal LM + integration tests | ~116 types | `integration_test.py` + `*_integration_test.py` |
+| L3 | ✅ Causal LM + integration tests | ~116 types | `synthetic_parity_test.py` + `tests/integration/` |
 | L4 | ✅ ~45 checkpoints | 45 golden JSON files | `e2e_golden_test.py` |
 | L5 | ✅ ~32 checkpoints | 32 generation JSON files | `e2e_golden_test.py` |
 | Perf | ⚠️ Script exists, CI not wired | — | `benchmark_build.py` |
@@ -608,16 +608,16 @@ Dashboard level counts are **per-flag**, not exclusive or hierarchical:
 - **L5 count** = models with `l5_generation_golden=True`
 
 A model is counted at every level it passes.  Because every registered
-model type has either a parametrized config entry or a `_SPECIALIZED_TEST_MODEL_TYPES`
+model type has either a parametrized config entry or a `specialized_test_model_types()`
 entry, L1 equals the total number of registered models.
 
 ### Detection sources
 
 | Level | Dashboard scanner | Data source |
 |-------|------------------|-------------|
-| L1 | `_scan_l1_configs` | `tests/_test_configs.py::ALL_CONFIGS` + `tests/build_graph_test.py::_SPECIALIZED_TEST_MODEL_TYPES` |
+| L1 | `_scan_l1_configs` | `tests/_test_configs.py::ALL_CONFIGS` + `tests/build_graph/_support.py::specialized_test_model_types()` |
 | L2 | `_scan_l2_arch_tests` | `test_model_id` field in `testdata/cases/**/*.yaml` |
-| L3 | `_scan_l3_synthetic_parity` | Model type presence in `tests/integration_test.py` and related files |
+| L3 | `_scan_l3_synthetic_parity` | Model type presence in `tests/*integration*.py` |
 | L4 | `_scan_l4_golden_files` | `testdata/golden/<cat>/<model>.json` existence |
 | L5 | `_scan_l5_generation_golden` | `testdata/golden/<cat>/<model>_generation.json` existence |
 
@@ -637,13 +637,13 @@ The dashboard is automatically deployed to GitHub Pages via
 
 ```bash
 # L1: Smoke (all models, ~30s)
-pytest tests/build_graph_test.py -v
+pytest tests/build_graph -v
 
 # L1: Fast (representative only, ~5s)
-pytest tests/build_graph_test.py --fast
+pytest tests/build_graph --fast
 
 # L1: Single model
-pytest tests/build_graph_test.py -k "qwen2"
+pytest tests/build_graph -k "qwen2"
 
 # L2: Architecture validation (requires network)
 pytest tests/arch_validation_test.py -m arch_validation -v
@@ -664,7 +664,7 @@ pytest tests/e2e_golden_test.py -m generation -v
 pytest -m "not integration" --tb=short
 
 # Filter by model type
-pytest tests/build_graph_test.py --models "qwen2,llama"
+pytest tests/build_graph --models "qwen2,llama"
 
 # Regenerate golden files
 python scripts/generate_golden.py --force
@@ -862,12 +862,34 @@ The test must verify:
 3. Image preprocessing config (resize, normalize, crop) matches HF
 4. Tokenizer and processor files are present and well-formed
 
-### Proposed test tiers for ORT GenAI
+### ORT GenAI runtime tiers
 
-| Level | What it tests                        | Cost     | CI cadence    |
-|-------|--------------------------------------|----------|---------------|
-| L1+   | Config generation (no weights)       | Seconds  | Every PR      |
-| E2E   | Full pipeline: export + load + gen   | Minutes  | Weekly / GPU   |
+| Lane | What it tests | Runtime | CI cadence |
+|------|---------------|---------|------------|
+| Fast | Generated generic `decoder` package, tokenizer load, model creation, prefill, four cache-threaded decode steps, deterministic tokens, save/reload, and malformed config rejection | CPU; latest stable `onnxruntime-genai==0.15.2` | Relevant PRs, main, scheduled/manual |
+| Real | YAML-enrolled immutable artifacts with exact tokenizer provenance, byte budget, deterministic full-length generation, and disposable per-test Hub/Xet caches | CPU; currently `onnxruntime-genai==0.15.2` | Weekly and manual |
+
+Run the lanes locally:
+
+```bash
+python -m pytest tests/ort_genai_e2e_test.py -m ort_genai_fast -v
+python -m pytest tests/gguf_small_model_runtime_integration_test.py \
+  -m ort_genai_real -v
+```
+
+The `ort_genai` object in each golden-case YAML is the enrollment record.
+Schema and coverage tests fail when a runtime-supported GGUF route lacks a
+matching evidence ID. Released lanes use the architecture-neutral
+`model.type=decoder`; main-only `state_groups` metadata is explicitly excluded.
+Changes to graph construction, task wiring, ORT GenAI config generation,
+tokenizer packaging, and GGUF qtype/runtime helpers conservatively select the
+fast E2E lane through `detect_affected_models.py`.
+
+CUDA is not a required PR claim. The existing self-hosted GPU lane uses a
+CUDA-12-specific pre-release ORT feed, so adding it to this stable-wheel
+lane would conflate runtime and EP coverage. CUDA runtime E2E remains suitable
+for scheduled/manual validation once that runner can install an equivalently
+pinned released stack.
 
 ---
 
@@ -885,7 +907,7 @@ provides progressively automated coverage:
   `_scan_registry()`.
 - **L1 (Graph builds)**: Achieved by adding a tiny config to
   `_MODEL_CONFIGS` in `tests/_test_configs.py`.  The parametrized
-  `build_graph_test.py` picks it up automatically.
+  `tests/build_graph/` picks it up automatically.
 - **L2 (Architecture validation)**: Achieved by setting `test_model_id`
   in the registry entry.  The `arch_validation_test.py` discovers it
   automatically.
@@ -911,7 +933,7 @@ The `adding-a-new-model` skill documents the complete procedure:
 2. Export from `models/__init__.py`
 3. Register in `_registry.py` with `test_model_id`
 4. Add tiny config to `_MODEL_CONFIGS` in `tests/_test_configs.py`
-5. Run `pytest tests/build_graph_test.py -k "<name>"` → L1
+5. Run `pytest tests/build_graph -k "<name>"` → L1
 6. Run `pytest tests/synthetic_parity_test.py -k "<name>"` → L3
 7. (Optional) Add YAML golden test case → L4/L5
 

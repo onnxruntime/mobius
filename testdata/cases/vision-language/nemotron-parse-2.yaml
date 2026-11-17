@@ -1,0 +1,20 @@
+model_id: "nvidia/NVIDIA-Nemotron-Parse-2.0"
+model_type: "nemotron_parse"
+revision: "635b84d9b09bb9526b9a684d0b2c953d3cc3df05"
+task_type: "image-to-text"
+dtype: "bfloat16"
+level: "L4+L5"
+trust_remote_code: true
+
+inputs:
+  images:
+    - "nemotron-parse-document.png"
+  decoder_prompt: "</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>"
+
+generation:
+  max_new_tokens: 24
+  do_sample: false
+  eos_token_id: 2
+
+ci_skip_reason: "The pinned 903M checkpoint and 2048x1664 C-RADIO input require a CUDA runner with at least 8 GB VRAM."
+notes: "Real nonzero OCR document; BF16 CUDA L4 prefill and 24-token deterministic L5 generation."

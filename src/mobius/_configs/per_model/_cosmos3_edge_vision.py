@@ -14,6 +14,13 @@ into :class:`~mobius._configs.VisionConfig`:
   ``image_size = sqrt(num_patches) * patch_size`` (16 * 16 = 256).
 - The projector's intermediate width lives in a sibling ``projector_config``
   (``merger_intermediate_size``), not in ``vision_config``.
+
+Registered for ``cosmos3_edge_text`` as well as the composite and vision types.
+Callers resolve the composite down to its ``text_config`` before building, which
+renames the model type; a hook registered only on ``cosmos3_edge`` then never
+matches and every field above silently stays ``None`` until an assertion fires
+in the vision tower. ``_muse_glimmer_vision`` registers its ``_text`` variant
+for the same reason.
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ import math
 from mobius._configs._extractors import register_vision_hook
 
 
-@register_vision_hook("cosmos3_edge", "cosmos3_edge_vision")
+@register_vision_hook("cosmos3_edge", "cosmos3_edge_text", "cosmos3_edge_vision")
 def _cosmos3_edge_vision(config, parent_config, model_type: str, fields: dict):
     vision_source = parent_config or config
     hf_vision = getattr(vision_source, "vision_config", None) or getattr(

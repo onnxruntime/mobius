@@ -35,6 +35,16 @@ Read these when you need deeper detail on a specific topic:
 - Find a small checkpoint on HuggingFace Hub for testing
 - Have the HuggingFace `transformers` source available to reference the
   PyTorch implementation
+- Pin the checkpoint revision before collecting configs, weights, processors,
+  parity data, or goldens
+- Before a long run, smoke-test the pinned upstream loader in the exact task
+  interpreter. Record its dependency versions and the selected CUDA provider.
+- Use the repository's pinned CI reference dependencies. Assert the validated
+  layer vocabulary and supported compute dtype for raw JSON and trusted configs;
+  validators can remap layer names or carry checkpoint storage dtypes.
+- If an architecture needs newer upstream code, isolate an immutable reference
+  pin to its tests; verify installed commit provenance and replay with the
+  unchanged shared reference dependencies.
 
 ## Step-by-step
 
@@ -142,6 +152,9 @@ Standard categories: `"Text Generation"`, `"Mixture of Experts"`,
 
 ### 3. Identify what's different
 
+Read the actual packed-QKV ordering, gate placement, and RoPE frequency/pair
+layout before reusing attention. Similar names or shapes do not prove equivalence.
+
 Compare the HuggingFace PyTorch source against `CausalLMModel` / `DecoderLayer`.
 Common variations to look for:
 
@@ -160,6 +173,8 @@ Common variations to look for:
 | MoE layers | PhiMoE, GPTOSS | See the **moe-models** skill |
 | Vision encoder | Gemma3 | See the **multimodal-models** skill |
 | Gated attention output | Qwen3.5 | Subclass `Attention` with doubled q_proj → Q+gate split |
+| Per-head attention gate | LFM3 | Separate head-sized projection; apply gate before output projection |
+| Zero-tail partial RoPE | LFM3 | Keep full-head frequency denominator and half-pair layout; do not use compact-prefix rotation |
 | Hybrid layer types | Qwen3.5 | Use `config.layer_types` list to dispatch per-layer |
 | Fused QKV / gate+up | ModernBERT | Split in `preprocess_weights` |
 | Subclass-only (weight rename) | BLIP, TrOCR | Override only `preprocess_weights` |
@@ -182,6 +197,22 @@ class MyCausalLMModel(CausalLMModel):
 > For detailed examples (fused QKV splitting, expert renames, weight-free
 > norms, identity folding), read
 > [`references/weight-preprocessing.md`](references/weight-preprocessing.md).
+
+Before choosing eager preprocessing, estimate the peak memory from the source
+checkpoint and transformed tensors. Use an architecture-specific streaming
+planner when the checkpoint is large or a packed source must be converted to a
+different operator layout. In particular:
+
+- use `StreamingWeightSource` for direct one-source/one-target bindings;
+- use `StreamingExpertBankSource` to assemble per-expert sources;
+- use `StreamingTransformedWeightSource` for lazy custom repacking;
+- distinguish storage semantics explicitly rather than treating every 4-bit,
+  group-size-32 checkpoint as affine INT4.
+
+The generic streaming engine belongs in `integrations/_weight_loading.py`.
+Model-specific source names, topology checks, and source-to-target mappings
+belong in `integrations/transformers/_<model>_weights.py`; graph math and tensor
+transforms belong in the model module.
 
 ### 5. Register the model
 
@@ -219,6 +250,16 @@ Then add the new module to `src/mobius/_configs/per_model/__init__.py` so its
 side-effect registration runs at import time. The dispatcher filters hooks by
 the declared model_type strings, so unrelated models never see your hook.
 
+Match upstream config semantics, not just field names: preserve transformation
+order (rounding/scaling), explicit `None`, alias precedence, zero-as-disabled
+sentinels, and wrapped/unwrapped composite configs. Add focused tests for each
+nontrivial transform. Test both trusted/custom config classes and raw pinned
+JSON, especially nested decoder fields such as head/layer counts.
+Preserve mapping-valued metadata (RoPE, sparse layer overrides, integer-keyed
+tables) when adapting config sections. Detect untagged native configs only from
+a distinctive complete signature; set compute dtype explicitly and test inherited
+`None` defaults rather than confusing checkpoint storage dtype with export dtype.
+
 ### 7. Write tests
 
 See the **writing-tests** skill for full details.  At minimum:
@@ -234,10 +275,11 @@ See the **writing-tests** skill for full details.  At minimum:
    - `is_representative=True` if the model has unique behaviour
    - `is_representative=False` if it's an alias with no special config
 
-   Then verify: `pytest tests/build_graph_test.py -k "my_model_type"`
+   Then verify: `pytest tests/build_graph -k "my_model_type"`
 
-2. **Add a small model to `tests/integration_test.py`** if a small
-   checkpoint exists (< 1B parameters preferred).
+2. **Add a small model to the appropriate focused integration suite** if a
+   small checkpoint exists (< 1B parameters preferred). Generic causal LMs
+   use `TEXT_MODELS` in `tests/integration/_support.py`.
 
 3. **Testing large models with random weights:** Create a reduced HF model:
    ```python
@@ -250,7 +292,7 @@ See the **writing-tests** skill for full details.  At minimum:
 
 4. **Test with the CLI:**
    ```bash
-   mobius build --model org/my-small-model mymodel/output
+   mobius build --model org/my-small-model --output mymodel/output
    ```
 
 ### 8. Documentation
@@ -269,18 +311,27 @@ see the [quality-checklist skill](../quality-checklist/SKILL.md).
 - [ ] Class has `default_task` and `category` attributes (if not standard text-generation)
 - [ ] Class has a descriptive docstring (first paragraph used in generated docs)
 - [ ] `preprocess_weights` handles any key mismatches
+- [ ] Peak checkpoint/transformation memory was assessed; large or packed-layout
+      conversions use a fail-closed streaming planner
+- [ ] Quantized storage semantics are identified from authoritative metadata and
+      checkpoint headers, not inferred from bit width alone
 - [ ] Registered in `_create_default_registry()`
 - [ ] Exported from `models/__init__.py`
 - [ ] Config extraction works (`ArchitectureConfig.from_transformers`)
 - [ ] Tiny config in `tests/_test_configs.py` (with `is_representative` flag)
-- [ ] L2 YAML test case in `testdata/cases/` with `test_model_id`
+- [ ] Registry `test_model_id` and immutable `test_revision` set; L2 passes via
+      `python -m pytest tests/arch_validation_test.py -k "<model_type>"`
+- [ ] Golden YAML in `testdata/cases/` validates against its schema
 - [ ] L3 synthetic parity passes (`tests/synthetic_parity_test.py -k "<model_type>"`)
-- [ ] Integration test in `tests/integration_test.py` (if small checkpoint available)
+- [ ] Focused integration test in `tests/integration/` (if small checkpoint available)
 - [ ] L4 golden file generated and committed (`testdata/golden/`)
 - [ ] L5 generation golden file generated and committed
-- [ ] ORT GenAI test added to `tests/ort_genai_test.py` (text-generation and VLM models)
+- [ ] Graph-derived ORT GenAI metadata is tested; downstream load/generation is
+      optional evidence and never an export capability gate
 - [ ] CLI build works (`mobius build --model ...`)
-- [ ] Multi-dtype correctness verified (fp32, fp16, bf16)
+- [ ] Each claimed dtype passes full-checkpoint parity, not only tiny tests;
+      unsupported dtypes fail at construction and graph creation
+- [ ] Pinned revision reaches every Hub/processor/weight/golden call
 
 **Note:** Default optimizer passes (CSE, deduplicate initializers, identity
 elimination, remove unused nodes/opsets) are applied automatically.
@@ -346,6 +397,10 @@ long_factor = np.array(config.rope_scaling["long_factor"])
 # GOOD
 long_factor = np.array(config.rope_scaling["long_factor"], dtype=np.float32)
 ```
+
+Direct NumPy operands require explicit ONNX constants:
+`op.Constant(value=ir.tensor(long_factor))`. Match operator rank contracts too:
+ONNX RoPE positions must include the batch axis even if HF broadcasts a 1D input.
 
 ### 2. Normalization type mismatch (RMSNorm vs LayerNorm)
 
@@ -425,6 +480,18 @@ config-driven features for the offending subclass.
 > scaling, identity node folding, fp32 upcast patterns, multi-token prefill,
 > embedding table off-by-one), read
 > [`references/weight-preprocessing.md`](references/weight-preprocessing.md).
+
+### 8. Compatibility and optional dependency traps
+
+- Guard imports of symbols from unpinned dependencies when older supported
+  versions may not define them.
+- If remote code imports an optional package, first prove the selected model
+  path needs it. Scope any test-only shim to that unused import; do not add a
+  production fallback or require an irrelevant package.
+- When extending a public component, append optional parameters after existing
+  positional parameters and add a positional-call compatibility test.
+- Helpers with rank/shape contracts must receive a value of that rank; do not
+  rely on incidental compatibility from a higher-rank tensor.
 
 ## Reference examples
 

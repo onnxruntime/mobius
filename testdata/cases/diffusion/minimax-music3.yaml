@@ -1,0 +1,18 @@
+model_id: "MiniMaxAI/MiniMax-Music3"
+model_type: "minimax_music3"
+revision: "fbdf52fbaaca799592917417eb05f1899f1255ec"
+task_type: "audio-to-audio"
+dtype: "bfloat16"
+level: "L4+L5"
+skip_reason: >
+  L3/L4/L5 and a full weighted CLI export are waived: the pinned modular pipeline is
+  approximately 11.7B parameters, and its reference implementation requires the
+  unmerged diffusers modular API from PR #14456. Native tiny float32 graph/runtime,
+  config, builder, and weight-alignment tests cover the supported neural components;
+  no end-to-end pipeline runtime or generation support is claimed.
+notes: >
+  L2 pinned-config case for MiniMaxMusic3ModularPipeline. Mobius exports the Qwen3
+  language model, RVQ depth decoder, condition encoder, 1D flow transformer, and
+  stereo DAC-style vocoder as separate neural graphs. The condition slices are the
+  global final hidden plus seven growing-depth-step hiddens; feedback uses semantic
+  offset 151675 plus seven acoustic embeddings, all scaled together by 1/sqrt(8).

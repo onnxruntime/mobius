@@ -388,7 +388,7 @@ class SigLIPVisionModel(nn.Module):
     default_task = "image-classification"
     category = "vision"
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: _CLIPVisionConfig):
         super().__init__()
         self.embeddings = _SigLIPVisionEmbeddings(config)
         self.encoder = nn.ModuleList(

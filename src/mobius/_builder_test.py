@@ -13,8 +13,50 @@ from __future__ import annotations
 import onnx_ir as ir
 import pytest
 
-from mobius._builder import _graph_requires_opset24, _maybe_apply_opset_lowering, flags
+from mobius._builder import (
+    _enable_prefill_prefix_pruning_task,
+    _graph_requires_opset24,
+    _maybe_apply_opset_lowering,
+    flags,
+)
 from mobius._model_package import ModelPackage
+
+pytestmark = pytest.mark.opset29
+
+
+@pytest.mark.parametrize("level", [None, 0, 4])
+@pytest.mark.parametrize("bits", [4, 8])
+def test_build_from_module_applies_accuracy_override(level, bits):
+    from mobius._builder import build_from_module
+    from mobius._configs import QuantizationConfig
+    from mobius._testing import make_config
+    from mobius.models import CausalLMModel
+
+    config = make_config(
+        quantization=QuantizationConfig(
+            quant_method="olive", bits=bits, group_size=32, sym=True
+        )
+    )
+    package = build_from_module(
+        CausalLMModel(config),
+        config,
+        execution_provider="cpu",
+        matmul_nbits_accuracy_level=level,
+    )
+    nodes = [
+        node
+        for model in package.values()
+        for node in ir.traversal.RecursiveGraphIterator(model.graph)
+        if node.op_type == "MatMulNBits"
+    ]
+    assert len(nodes) > 1
+    expected = level if level is not None else (4 if bits == 4 else None)
+    for node in nodes:
+        if expected is None:
+            assert "accuracy_level" not in node.attributes
+        else:
+            assert node.attributes["accuracy_level"].value == expected
+        assert node.attributes["bits"].value == bits
 
 
 def _make_value(name: str) -> ir.Value:
@@ -55,6 +97,16 @@ def _static_cache_nodes() -> list[ir.Node]:
 
 def _standard_nodes() -> list[ir.Node]:
     return [ir.Node("", "Reshape", inputs=[_make_value("x"), _make_value("shape")])]
+
+
+def test_prefill_prefix_pruning_error_lists_supported_tasks() -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            "text-generation, hybrid-text-generation, gemma4-text-generation, and gemma4 tasks"
+        ),
+    ):
+        _enable_prefill_prefix_pruning_task("feature-extraction")
 
 
 def test_graph_requires_opset24_tensor_scatter() -> None:
@@ -168,3 +220,11 @@ def test_maybe_apply_opset_lowering_skipped_when_flag_disabled(
     _maybe_apply_opset_lowering(pkg, execution_provider="cuda")
 
     assert pkg["embedding"].graph.opset_imports[""] == 24
+
+
+@pytest.mark.parametrize("opset", [23, 25, 29])
+def test_maybe_apply_opset_lowering_only_processes_exactly24(monkeypatch, opset):
+    monkeypatch.setattr(flags, "ort_lower_opset_for_ep", True)
+    pkg = ModelPackage({"model": _model_with(_standard_nodes(), opset=opset)})
+    _maybe_apply_opset_lowering(pkg, execution_provider="cuda")
+    assert pkg["model"].graph.opset_imports[""] == opset

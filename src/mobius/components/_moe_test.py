@@ -20,13 +20,15 @@ from mobius._weight_utils import (
     pack_qmoe_expert_weights,
     preprocess_gptq_weights,
     preprocess_olive_weights,
+    supported_qmoe_quantization,
 )
 from mobius.components._moe import (
     MoELayer,
     SparseMixerGate,
     TopKGate,
-    _supported_qmoe_quantization,
 )
+
+pytestmark = pytest.mark.opset29
 
 
 class TestTopKGate:
@@ -98,6 +100,27 @@ class TestMoELayer:
         layer = MoELayer(config)
         assert len(layer.experts) == 8
 
+    def test_moe_layer_linear_class_used_for_dense_expert_fallback(self):
+        # When the config doesn't match the native QMoE ABI (e.g. no
+        # quantization here), MoELayer falls back to per-expert dense MLPs.
+        # linear_class must be threaded through to that fallback, not just
+        # to the fused QMoE path -- otherwise quantized dense-fallback
+        # experts would silently lose quantization.
+        from mobius.components._common import Linear
+
+        created = []
+
+        class TrackingLinear(Linear):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        config = make_config(num_local_experts=4, num_experts_per_tok=2)
+        layer = MoELayer(config, linear_class=TrackingLinear)
+        assert layer.experts is not None
+        assert len(created) > 0
+        assert all(isinstance(p, TrackingLinear) for p in created)
+
     def test_moe_layer_forward(self):
         config = make_config(num_local_experts=4, num_experts_per_tok=2)
         layer = MoELayer(config)
@@ -158,7 +181,7 @@ class TestMoELayer:
         qmoe = qmoe_nodes[0]
         assert qmoe.attributes["k"].value == 6
         assert qmoe.attributes["block_size"].value == 32
-        assert qmoe.attributes["swiglu_fusion"].value == 2
+        assert qmoe.attributes["swiglu_fusion"].value == 1
         assert qmoe.attributes["expert_weight_bits"].value == 4
         assert qmoe.attributes["quant_type"].value == "int"
         assert qmoe.attributes["weights_prepacked"].value == 0
@@ -172,7 +195,7 @@ class TestMoELayer:
     def test_olive_group_size_not_power_of_two_falls_back_to_dense(self):
         """Non-pow2 block_size is unrunnable by CUDA QMoE -> dense fallback."""
         quant = QuantizationConfig(bits=4, group_size=48, quant_method="olive", sym=False)
-        assert _supported_qmoe_quantization(quant) is None
+        assert supported_qmoe_quantization(quant) is None
         config = make_config(
             hidden_size=96,
             intermediate_size=48,
@@ -210,7 +233,7 @@ class TestMoELayer:
         qmoe = qmoe_nodes[0]
         assert qmoe.attributes["k"].value == 6
         assert qmoe.attributes["block_size"].value == 32
-        assert qmoe.attributes["swiglu_fusion"].value == 2
+        assert qmoe.attributes["swiglu_fusion"].value == 1
         assert qmoe.attributes["quant_type"].value == "int"
         assert qmoe.attributes["weights_prepacked"].value == 0
         assert layer.fc1_experts_weights.shape == ir.Shape([64, 64, 32])
@@ -223,8 +246,8 @@ class TestMoELayer:
 
         _cast_module_dtype(layer, ir.DataType.FLOAT16)
         assert layer.gate.weight.dtype == ir.DataType.FLOAT16
-        assert layer.fc1_scales.dtype == ir.DataType.FLOAT
-        assert layer.fc2_scales.dtype == ir.DataType.FLOAT
+        assert layer.fc1_scales.dtype == ir.DataType.FLOAT16
+        assert layer.fc2_scales.dtype == ir.DataType.FLOAT16
 
     def test_expert_major_packing_matches_static_64_expert_top6_reference(self):
         """Packed QMoE math matches the existing loop-over-experts semantics."""
@@ -301,12 +324,12 @@ class TestMoELayer:
         fc2_zp = torch.randint(0, 16, (num_experts, hidden_size, fc2_blocks))
 
         raw = {
-            "model.layers.1.mlp.experts.gate_up_proj.qweight": _to_olive_qweight(fc1_codes),
-            "model.layers.1.mlp.experts.gate_up_proj.scales": fc1_scales,
-            "model.layers.1.mlp.experts.gate_up_proj.qzeros": _to_olive_qzeros(fc1_zp),
-            "model.layers.1.mlp.experts.down_proj.qweight": _to_olive_qweight(fc2_codes),
-            "model.layers.1.mlp.experts.down_proj.scales": fc2_scales,
-            "model.layers.1.mlp.experts.down_proj.qzeros": _to_olive_qzeros(fc2_zp),
+            "model.layers.1.mlp.experts.gate_up_proj_qweight": _to_olive_qweight(fc1_codes),
+            "model.layers.1.mlp.experts.gate_up_proj_scales": fc1_scales,
+            "model.layers.1.mlp.experts.gate_up_proj_qzeros": _to_olive_qzeros(fc1_zp),
+            "model.layers.1.mlp.experts.down_proj_qweight": _to_olive_qweight(fc2_codes),
+            "model.layers.1.mlp.experts.down_proj_scales": fc2_scales,
+            "model.layers.1.mlp.experts.down_proj_qzeros": _to_olive_qzeros(fc2_zp),
         }
         packed = pack_qmoe_expert_weights(
             preprocess_olive_weights(raw, bits=4, group_size=block_size),

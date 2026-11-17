@@ -95,7 +95,7 @@ def _run_onnx_steps(
     ]
     ssm_states = [
         np.zeros(
-            (1, config.num_heads, config.head_dim, config.state_size),
+            (1, config.num_heads, config.state_size, config.head_dim),
             dtype=np.float32,
         )
         for _ in range(config.num_hidden_layers)

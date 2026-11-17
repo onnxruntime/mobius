@@ -70,8 +70,8 @@ class TestMLP:
         x = create_test_input(builder, "x", [1, 8, 64])
 
         mlp(op, x)
-        # SiLU = x * sigmoid(x): Sigmoid + Mul
-        assert count_op_type(graph, "Sigmoid") >= 1
+        assert count_op_type(graph, "Swish") == 1
+        assert count_op_type(graph, "Sigmoid") == 0
 
     def test_gelu_activation(self):
         config = make_config(hidden_act="gelu")
@@ -195,9 +195,9 @@ class TestGatedMLP:
         builder, op, graph = create_test_builder()
         x = create_test_input(builder, "x", [1, 8, 64])
         mlp(op, x)
-        # SiLU = x * sigmoid(x): Sigmoid + Mul (gate) + Mul (gate*up)
-        assert count_op_type(graph, "Sigmoid") >= 1
-        assert count_op_type(graph, "Mul") >= 2
+        assert count_op_type(graph, "Swish") == 1
+        assert count_op_type(graph, "Sigmoid") == 0
+        assert count_op_type(graph, "Mul") >= 1
 
     def test_gelu_activation(self):
         mlp = GatedMLP(hidden_size=64, intermediate_size=128, activation="gelu")
@@ -267,8 +267,8 @@ class TestFusedGateUpMLP:
         builder, op, graph = create_test_builder()
         x = create_test_input(builder, "x", [1, 8, 64])
         mlp(op, x)
-        # SiLU = x * sigmoid(x)
-        assert count_op_type(graph, "Sigmoid") >= 1
+        assert count_op_type(graph, "Swish") == 1
+        assert count_op_type(graph, "Sigmoid") == 0
 
     def test_linear_class_applied(self):
         from mobius.components._common import Linear
