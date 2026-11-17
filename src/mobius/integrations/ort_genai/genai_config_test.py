@@ -32,7 +32,7 @@ class TestGenaiConfigGeneratorLLM:
         )
         config = gen.generate()
 
-        assert config["model"]["type"] == "llama"
+        assert config["model"]["type"] == "decoder"
         assert config["model"]["vocab_size"] == 32000
         assert config["model"]["context_length"] == 4096
 
@@ -43,6 +43,75 @@ class TestGenaiConfigGeneratorLLM:
         assert decoder["num_key_value_heads"] == 8
         assert decoder["head_size"] == 128
         assert decoder["filename"] == "model.onnx"
+
+    @pytest.mark.parametrize(
+        "model_type",
+        [
+            "llama",
+            "qwen2",
+            "gemma4_text",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+            "custom",
+        ],
+    )
+    def test_decoder_only_types_are_normalized(self, model_type):
+        gen = GenaiConfigGenerator(
+            model_type,
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+        )
+        assert gen.generate()["model"]["type"] == "decoder"
+
+    @pytest.mark.parametrize(
+        ("model_type", "expected"),
+        [("gpt2", "gpt2"), ("lfm2", "lfm2"), ("lfm2_vl", "lfm2")],
+    )
+    def test_specialized_decoder_types_are_preserved(self, model_type, expected):
+        gen = GenaiConfigGenerator(
+            model_type,
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+        )
+        assert gen.generate()["model"]["type"] == expected
+
+    def test_auxiliary_graph_topology_preserves_runtime_type(self):
+        gen = GenaiConfigGenerator(
+            "qwen2",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            has_specialized_topology=True,
+        )
+        assert gen.generate()["model"]["type"] == "qwen2"
+
+    def test_phi3_type_is_preserved_only_for_longrope(self):
+        common = {
+            "vocab_size": 256,
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+        }
+        assert GenaiConfigGenerator("phi3", **common).generate()["model"]["type"] == "decoder"
+        assert (
+            GenaiConfigGenerator("phi3", uses_longrope=True, **common).generate()["model"][
+                "type"
+            ]
+            == "phi3"
+        )
 
     def test_llm_decoder_inputs_have_input_ids(self):
         """LLM decoders receive input_ids, not inputs_embeds."""
@@ -79,6 +148,63 @@ class TestGenaiConfigGeneratorLLM:
         assert outputs["present_key_names"] == "present.%d.key"
         assert outputs["present_value_names"] == "present.%d.value"
 
+    def test_lfm2_decoder_declares_hybrid_cache(self):
+        gen = GenaiConfigGenerator(
+            "lfm2",
+            vocab_size=65536,
+            hidden_size=1024,
+            num_hidden_layers=4,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=64,
+            layer_types=["conv", "conv", "full_attention", "conv"],
+            conv_cache_size=2,
+        )
+
+        decoder = gen.generate()["model"]["decoder"]
+
+        assert decoder["layer_types"] == ["conv", "conv", "full_attention", "conv"]
+        assert decoder["conv_cache_size"] == 2
+        assert decoder["inputs"]["past_conv_names"] == "past_key_values.%d.conv_state"
+        assert decoder["outputs"]["present_conv_names"] == "present.%d.conv_state"
+        assert gen.generate()["search"]["past_present_share_buffer"] is False
+
+    def test_lfm2_vl_decoder_declares_hybrid_cache(self):
+        gen = GenaiConfigGenerator(
+            "lfm2_vl",
+            vocab_size=128000,
+            hidden_size=2048,
+            num_hidden_layers=4,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=64,
+            layer_types=["conv", "conv", "full_attention", "conv"],
+            conv_cache_size=2,
+        )
+        gen.with_vision(image_token_id=124907, spatial_merge_size=None)
+
+        config = gen.generate()
+        decoder = config["model"]["decoder"]
+        assert decoder["layer_types"] == ["conv", "conv", "full_attention", "conv"]
+        assert decoder["conv_cache_size"] == 2
+        assert decoder["inputs"]["past_conv_names"] == "past_key_values.%d.conv_state"
+        assert decoder["outputs"]["present_conv_names"] == "present.%d.conv_state"
+        assert config["search"]["past_present_share_buffer"] is False
+
+    def test_lfm2_kernel_one_preserves_zero_width_cache(self):
+        gen = GenaiConfigGenerator(
+            "lfm2",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            layer_types=["conv"],
+            conv_cache_size=0,
+        )
+        assert gen.generate()["model"]["decoder"]["conv_cache_size"] == 0
+
     def test_token_ids_included_when_set(self):
         """Token IDs are included in the model section."""
         gen = GenaiConfigGenerator(
@@ -113,6 +239,20 @@ class TestGenaiConfigGeneratorLLM:
         assert "bos_token_id" not in config["model"]
         assert "eos_token_id" not in config["model"]
         assert "pad_token_id" not in config["model"]
+
+    def test_special_tokens_cannot_override_standard_token_ids(self):
+        gen = GenaiConfigGenerator(
+            "llama",
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+        )
+
+        with pytest.raises(ValueError, match="bos_token_id"):
+            gen.with_special_tokens(bos_token_id=1)
 
     def test_search_params_defaults(self):
         """Search section has sensible defaults for CPU EP."""
@@ -231,6 +371,27 @@ class TestGenaiConfigGeneratorLLM:
         webgpu = next(opts["webgpu"] for opts in provider_options if "webgpu" in opts)
         assert webgpu["enableGraphCapture"] == "1"
         assert webgpu["validationMode"] == "disabled"
+
+    def test_webgpu_graph_capture_is_decoder_only_for_multimodal(self):
+        gen = GenaiConfigGenerator(
+            "gemma4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            ep="webgpu",
+        )
+        config = gen.with_vision(image_token_id=255999).with_audio().generate()
+
+        model = config["model"]
+        decoder_webgpu = model["decoder"]["session_options"]["provider_options"][0]["webgpu"]
+        assert decoder_webgpu["enableGraphCapture"] == "1"
+        for component in ("vision", "embedding", "speech"):
+            webgpu = model[component]["session_options"]["provider_options"][0]["webgpu"]
+            assert webgpu["enableGraphCapture"] == "0"
+            assert webgpu["validationMode"] == "basic"
 
     def test_search_params_custom_ep_with_share_buffer(self):
         """A custom EP registered with supports_past_present_share_buffer=True gets the flag set.
@@ -501,6 +662,310 @@ class TestGenaiConfigFromConfig:
         config = gen.generate()
         assert config["model"]["context_length"] == 4096
 
+    def test_num_cache_layer_slots_overrides_num_hidden_layers(self):
+        """KV-sharing models report the graph's cache count, not the layer count.
+
+        Gemma 3n / Gemma 4 trailing layers borrow K,V from an earlier layer and
+        own no cache entry, so ORT-GenAI must bind fewer
+        ``past_key_values.%d.*`` pairs than the architecture has layers.
+        """
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            vocab_size: int = 32000
+            hidden_size: int = 4096
+            num_hidden_layers: int = 35
+            num_attention_heads: int = 32
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+
+        cfg = FakeConfig()
+        gen = GenaiConfigGenerator.from_config(cfg, "gemma3n", num_cache_layer_slots=20)
+        assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 20
+
+        # None falls back to the config value.
+        gen = GenaiConfigGenerator.from_config(cfg, "gemma3n")
+        assert gen.generate()["model"]["decoder"]["num_hidden_layers"] == 35
+
+    def test_hybrid_cache_slots_keep_global_layer_count(self):
+        """Hybrid cache slots retain global layer indices without model checks."""
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            vocab_size: int = 65536
+            hidden_size: int = 1024
+            num_hidden_layers: int = 14
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 64
+            layer_types: list[str] = dataclasses.field(
+                default_factory=lambda: ["conv"] * 8 + ["full_attention"] * 6
+            )
+            short_conv_kernel: int = 3
+
+        gen = GenaiConfigGenerator.from_config(
+            FakeConfig(),
+            "custom_hybrid",
+            num_cache_layer_slots=14,
+        )
+        decoder = gen.generate()["model"]["decoder"]
+        assert decoder["num_hidden_layers"] == 14
+
+
+def test_cuda_enables_decoder_graph_capture_only():
+    gen = GenaiConfigGenerator(
+        "qwen2_5_vl",
+        vocab_size=202048,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    ).with_vision(image_token_id=200092)
+
+    config = gen.generate()
+
+    decoder_options = config["model"]["decoder"]["session_options"]["provider_options"]
+    vision_options = config["model"]["vision"]["session_options"]["provider_options"]
+    embedding_options = config["model"]["embedding"]["session_options"]["provider_options"]
+    assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "1"
+    assert vision_options[0]["cuda"]["enable_cuda_graph"] == "0"
+    assert embedding_options[0]["cuda"]["enable_cuda_graph"] == "0"
+
+
+def test_cuda_decoder_graph_capture_can_be_disabled():
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        decoder_graph_capture=False,
+    )
+
+    config = gen.generate()
+    decoder_options = config["model"]["decoder"]["session_options"]["provider_options"]
+
+    assert decoder_options[0]["cuda"]["enable_cuda_graph"] == "0"
+
+
+def test_cuda_lfm2_disables_graph_capture_when_share_buffer_is_forced_off():
+    gen = GenaiConfigGenerator(
+        "lfm2",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        layer_types=["conv", "full_attention"],
+    )
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["search"]["past_present_share_buffer"] is False
+    assert cuda_options["enable_cuda_graph"] == "0"
+
+
+def test_cuda_search_override_disables_graph_capture_when_share_buffer_is_false():
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        supports_in_place_kv_cache=True,
+    )
+    gen._search_overrides = {"past_present_share_buffer": False}
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["search"]["past_present_share_buffer"] is False
+    assert cuda_options["enable_cuda_graph"] == "0"
+
+
+def test_cuda_beam_search_disables_decoder_graph_capture():
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    )
+    gen._search_overrides = {"num_beams": 4}
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["search"]["past_present_share_buffer"] is True
+    assert cuda_options["enable_cuda_graph"] == "0"
+
+
+def test_cuda_internal_whisper_emitted_as_decoder_disables_beam_graph_capture():
+    gen = GenaiConfigGenerator(
+        "whisper",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    )
+    gen._search_overrides = {"num_beams": 4}
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["model"]["type"] == "decoder"
+    assert config["search"]["past_present_share_buffer"] is True
+    assert cuda_options["enable_cuda_graph"] == "0"
+
+
+def test_cuda_emitted_whisper_preserves_beam_graph_capture():
+    gen = GenaiConfigGenerator(
+        "whisper",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        has_specialized_topology=True,
+    )
+    gen._search_overrides = {"num_beams": 4}
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["model"]["type"] == "whisper"
+    assert config["search"]["past_present_share_buffer"] is True
+    assert cuda_options["enable_cuda_graph"] == "1"
+
+
+@pytest.mark.parametrize("share_buffer", ["true", 1, None])
+def test_graph_capture_rejects_non_boolean_share_buffer(share_buffer):
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    )
+    gen._search_overrides = {"past_present_share_buffer": share_buffer}
+
+    with pytest.raises(TypeError, match="past_present_share_buffer must be a boolean"):
+        gen.generate()
+
+
+@pytest.mark.parametrize("num_beams", [True, "1"])
+def test_graph_capture_rejects_non_integer_num_beams(num_beams):
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+    )
+    gen._search_overrides = {"num_beams": num_beams}
+
+    with pytest.raises(TypeError, match=r"num_beams must be an integer"):
+        gen.generate()
+
+
+@pytest.mark.parametrize(
+    (
+        "supports_in_place_kv_cache",
+        "decoder_graph_capture",
+        "share_buffer",
+        "enable_cuda_graph",
+    ),
+    [
+        (False, True, False, "0"),
+        (True, None, True, "1"),
+        (None, None, True, "1"),
+    ],
+)
+def test_cuda_graph_capture_respects_introspected_kv_cache_capability(
+    supports_in_place_kv_cache,
+    decoder_graph_capture,
+    share_buffer,
+    enable_cuda_graph,
+):
+    gen = GenaiConfigGenerator(
+        "test_model",
+        vocab_size=1000,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        supports_in_place_kv_cache=supports_in_place_kv_cache,
+        decoder_graph_capture=decoder_graph_capture,
+    )
+
+    config = gen.generate()
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+
+    assert config["search"]["past_present_share_buffer"] is share_buffer
+    assert cuda_options["enable_cuda_graph"] == enable_cuda_graph
+
+
+def test_embedding_session_options_can_be_updated():
+    gen = GenaiConfigGenerator(
+        "gemma4",
+        vocab_size=262144,
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="trt-rtx",
+    ).with_embedding(
+        input_names={"input_ids": "input_ids", "image_features": "image_features"},
+        provider_options={
+            "nv_profile_min_shapes": "input_ids:1x1,image_features:0x1024",
+            "nv_profile_opt_shapes": "input_ids:1x226,image_features:192x1024",
+        },
+    )
+
+    embedding_config = gen.generate()["model"]["embedding"]
+    embedding_options = embedding_config["session_options"]["provider_options"][0][
+        "NvTensorRtRtx"
+    ]
+    assert embedding_config["inputs"] == {
+        "input_ids": "input_ids",
+        "image_features": "image_features",
+    }
+    assert embedding_options["enable_cuda_graph"] == "0"
+    assert embedding_options["nv_profile_min_shapes"] == (
+        "input_ids:1x1,image_features:0x1024"
+    )
+    assert embedding_options["nv_profile_opt_shapes"] == (
+        "input_ids:1x226,image_features:192x1024"
+    )
+
 
 class TestGenaiConfigWrite:
     """Test writing genai_config.json to disk."""
@@ -522,7 +987,7 @@ class TestGenaiConfigWrite:
 
         with open(path) as f:
             loaded = json.load(f)
-        assert loaded["model"]["type"] == "llama"
+        assert loaded["model"]["type"] == "decoder"
         assert "search" in loaded
 
     def test_write_roundtrips_vlm(self, tmp_path):

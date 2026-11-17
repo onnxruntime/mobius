@@ -28,15 +28,28 @@ class Eagle3DraftTask(ModelTask):
 
         graph, builder = _make_graph()
 
-        inputs_embeds = builder.input(
-            "inputs_embeds",
-            dtype=config.dtype,
-            shape=[batch, seq_len, config.hidden_size],
-        )
+        input_ids = None
+        inputs_embeds = None
+        if config.use_draft_token_embedding:
+            input_ids = builder.input(
+                "input_ids",
+                dtype=ir.DataType.INT64,
+                shape=[batch, seq_len],
+            )
+        else:
+            inputs_embeds = builder.input(
+                "inputs_embeds",
+                dtype=config.dtype,
+                shape=[batch, seq_len, config.hidden_size],
+            )
         fused_hidden = builder.input(
             "fused_hidden",
             dtype=config.dtype,
-            shape=[batch, seq_len, 3 * config.hidden_size],
+            shape=[
+                batch,
+                seq_len,
+                3 * (config.target_hidden_size or config.hidden_size),
+            ],
         )
         recycled_hidden = builder.input(
             "recycled_hidden",
@@ -62,7 +75,7 @@ class Eagle3DraftTask(ModelTask):
             past_seq_len,
         )
 
-        draft_logits, recycled_hidden_out, present_key_values = module(
+        draft_output, recycled_hidden_out, present_key_values = module(
             builder.op,
             inputs_embeds=inputs_embeds,
             fused_hidden=fused_hidden,
@@ -70,9 +83,13 @@ class Eagle3DraftTask(ModelTask):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            input_ids=input_ids,
         )
 
-        builder.add_output(draft_logits, "draft_logits")
+        builder.add_output(
+            draft_output,
+            "draft_hidden" if config.use_target_lm_head else "draft_logits",
+        )
         builder.add_output(recycled_hidden_out, "next_hidden")
         _register_kv_cache_outputs(
             builder,

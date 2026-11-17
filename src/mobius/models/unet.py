@@ -23,12 +23,12 @@ import numpy as np
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._diffusers_configs import UNet2DConfig
 from mobius.components import Conv2d as _Conv2d
 from mobius.components import GroupNorm as _GroupNorm
 from mobius.components import Linear as _Linear
 from mobius.components import LoRALinear as _LoRALinear
 from mobius.components import SiLU as _SiLU
+from mobius.integrations.diffusers._configs import UNet2DConfig
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -591,14 +591,18 @@ class UNet2DConditionModel(nn.Module):
             )
 
         # Mid block
-        self.mid_block = _UNetMidBlock2DCrossAttn(
-            channels=block_out_channels[-1],
-            time_embed_dim=time_embed_dim,
-            cross_attention_dim=config.cross_attention_dim,
-            attention_head_dim=config.attention_head_dim,
-            norm_num_groups=config.norm_num_groups,
-            linear_class=linear_class,
-            use_linear_projection=config.use_linear_projection,
+        self.mid_block = (
+            _UNetMidBlock2DCrossAttn(
+                channels=block_out_channels[-1],
+                time_embed_dim=time_embed_dim,
+                cross_attention_dim=config.cross_attention_dim,
+                attention_head_dim=config.attention_head_dim,
+                norm_num_groups=config.norm_num_groups,
+                linear_class=linear_class,
+                use_linear_projection=config.use_linear_projection,
+            )
+            if config.mid_block_type is not None
+            else None
         )
 
         # Up blocks (reversed)
@@ -681,7 +685,8 @@ class UNet2DConditionModel(nn.Module):
             down_block_res_samples.extend(res_samples)
 
         # Mid
-        sample = self.mid_block(op, sample, emb, encoder_hidden_states)
+        if self.mid_block is not None:
+            sample = self.mid_block(op, sample, emb, encoder_hidden_states)
 
         # Up
         for up_block in self.up_blocks:

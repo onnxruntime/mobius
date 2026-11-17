@@ -1,0 +1,109 @@
+{
+  "array_shapes": {
+    "num_chunks": [],
+    "chunk0_mel": [
+      1,
+      128,
+      3040
+    ],
+    "chunk0_lookahead": [],
+    "chunk0_probs": [
+      1,
+      2720,
+      8
+    ],
+    "chunk0_cache_embeds": [
+      1,
+      264,
+      512
+    ],
+    "chunk0_cache_probs": [
+      1,
+      264,
+      8
+    ],
+    "chunk0_fifo": [
+      1,
+      264,
+      512
+    ],
+    "chunk0_num_cache_frames": [],
+    "chunk0_num_fifo_frames": [],
+    "chunk0_is_compressed": [],
+    "chunk1_mel": [
+      1,
+      128,
+      3040
+    ],
+    "chunk1_lookahead": [],
+    "chunk1_probs": [
+      1,
+      2720,
+      8
+    ],
+    "chunk1_cache_embeds": [
+      1,
+      264,
+      512
+    ],
+    "chunk1_cache_probs": [
+      1,
+      264,
+      8
+    ],
+    "chunk1_fifo": [
+      1,
+      264,
+      512
+    ],
+    "chunk1_num_cache_frames": [],
+    "chunk1_num_fifo_frames": [],
+    "chunk1_is_compressed": [],
+    "chunk2_mel": [
+      1,
+      128,
+      3040
+    ],
+    "chunk2_lookahead": [],
+    "chunk2_probs": [
+      1,
+      3040,
+      8
+    ],
+    "chunk2_cache_embeds": [
+      1,
+      264,
+      512
+    ],
+    "chunk2_cache_probs": [
+      1,
+      264,
+      8
+    ],
+    "chunk2_fifo": [
+      1,
+      264,
+      512
+    ],
+    "chunk2_num_cache_frames": [],
+    "chunk2_num_fifo_frames": [],
+    "chunk2_is_compressed": []
+  },
+  "provenance": {
+    "model_id": "nvidia/Nemotron-3-Diarization",
+    "revision": "f667ed73aee57d40cc39428eb768b4fd87a0a29e",
+    "transformers_version": "5.18.0.dev0",
+    "transformers_commit": "0291458166a6834a37b179a24c5235f242dadea0",
+    "torch_version": "2.14.0+cu130",
+    "seed": 0,
+    "num_speakers": 8,
+    "mel_dim": 128,
+    "chunk_length": 340,
+    "chunk_right_context": 40,
+    "subsampling_factor": 8,
+    "streaming_fifo_length": 264,
+    "streaming_speaker_cache_length": 264,
+    "streaming_speaker_cache_update_period": 222,
+    "num_stream_chunks": 3
+  }
+}

@@ -62,10 +62,12 @@ __all__ = [
     "TENCENT_Q1_0_NATIVE_ZERO_POINT",
     "is_tencent_q1_0_layout",
     "parse_tencent_q1_0_tensor",
+    "tencent_q1_0_source_nbytes",
+    "tencent_q1_0_target_bits",
 ]
 
 import math
-import os
+from collections.abc import Callable
 
 import numpy as np
 
@@ -103,7 +105,14 @@ def is_tencent_q1_0_layout(gguf_model) -> bool:
     """
     from gguf import GGMLQuantizationType
 
-    reader = gguf_model._reader
+    # Tencent's custom Q1_0 layout only occurs in single-file GGUFs. A
+    # :class:`~mobius.integrations.gguf._shard_set.GgufShardSet` exposes no
+    # single ``_reader`` (its tensors span several files), and the mainline
+    # repack path handles any genuinely-standard Q1_0 shard, so treat a split
+    # set as "not Tencent" rather than reaching into a reader that isn't there.
+    reader = getattr(gguf_model, "_reader", None)
+    if reader is None:
+        return False
     tensors = sorted(
         reader.tensors,
         key=_tensor_data_offset,
@@ -129,8 +138,27 @@ def _tensor_data_offset(tensor) -> int:
     return int(tensor.field.parts[tensor.field.data[-1]][0])
 
 
+def tencent_q1_0_source_nbytes(tensor) -> int:
+    """Return the exact payload bytes for one Tencent-layout Q1_0 tensor."""
+    if len(tensor.shape) != 2:
+        raise ValueError(f"Tensor {tensor.name!r} must be rank 2 for Tencent Q1_0")
+    ne0 = int(tensor.shape[0])
+    ne1 = int(tensor.shape[1])
+    if ne0 % TENCENT_Q1_0_NATIVE_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"Tensor {tensor.name!r} has K={ne0} not divisible by "
+            f"Tencent Q1_0 native block size {TENCENT_Q1_0_NATIVE_BLOCK_SIZE}"
+        )
+    return ne1 * (ne0 // TENCENT_Q1_0_NATIVE_BLOCK_SIZE) * _TENCENT_Q1_0_BLOCK_BYTES
+
+
+def tencent_q1_0_target_bits() -> int:
+    """Return the selected exact MatMulNBits representation width."""
+    return 2 if flags.tencent_q1_0_use_native_2bit else 4
+
+
 def parse_tencent_q1_0_tensor(
-    file_path: str | os.PathLike,
+    read_source_range: Callable[[int, int], bytes],
     data_section_offset: int,
     tensor,
 ) -> RepackedTensor:
@@ -146,7 +174,7 @@ def parse_tencent_q1_0_tensor(
       float ``zp=1.5``. Native 2 bpw but slow on CPU EP today.
 
     Args:
-        file_path: Path to the source ``.gguf`` file.
+        read_source_range: Pinned source reader accepting byte offset and length.
         data_section_offset: Absolute byte offset where the GGUF data
             section begins (``GGUFReader.data_offset``).
         tensor: ``gguf.ReaderTensor`` for the target weight. Must have
@@ -157,7 +185,7 @@ def parse_tencent_q1_0_tensor(
         The ``bits`` field is 2 or 4 depending on the flag.
     """
     native_scales, codes_2bit, ne1, n_native = _read_tencent_blocks(
-        file_path, data_section_offset, tensor
+        read_source_range, data_section_offset, tensor
     )
     if flags.tencent_q1_0_use_native_2bit:
         return _pack_native_2bit(native_scales, codes_2bit, ne1, n_native)
@@ -165,7 +193,7 @@ def parse_tencent_q1_0_tensor(
 
 
 def _read_tencent_blocks(
-    file_path: str | os.PathLike,
+    read_source_range: Callable[[int, int], bytes],
     data_section_offset: int,
     tensor,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
@@ -191,9 +219,7 @@ def _read_tencent_blocks(
     total_bytes = ne1 * bytes_per_row
 
     abs_offset = data_section_offset + _tensor_data_offset(tensor)
-    with open(file_path, "rb") as f:
-        f.seek(abs_offset)
-        blob = f.read(total_bytes)
+    blob = read_source_range(abs_offset, total_bytes)
     if len(blob) != total_bytes:
         raise OSError(
             f"Short read for {tensor.name!r}: got {len(blob)} bytes, expected {total_bytes}"

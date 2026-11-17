@@ -258,18 +258,12 @@ class OnnxSeq2SeqGenerator:
         for name in self.dec_session.input_names:
             if not name.startswith("past_key_values."):
                 continue
-            if ".cross." in name:
-                # Cross-attention cache: starts empty, populated on first step
-                past_kv[name] = np.zeros(
-                    (batch_size, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
-                )
-            else:
-                # Self-attention cache: grows each step
-                past_kv[name] = np.zeros(
-                    (batch_size, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
-                )
+            # Self- and cross-attention caches start empty; each graph input
+            # declares its own storage dtype, independent of model precision.
+            past_kv[name] = np.zeros(
+                (batch_size, num_kv_heads, 0, head_dim),
+                dtype=self.dec_session.get_input_dtype(name) or np.dtype(np.float32),
+            )
 
         # Step 3: Autoregressive decode loop
         cur_dec_ids = np.full((batch_size, 1), decoder_start_token_id, dtype=np.int64)
@@ -341,6 +335,7 @@ class OnnxSpeechToTextGenerator:
     def generate(
         self,
         encoder_hidden_states: np.ndarray,
+        encoder_attention_mask: np.ndarray | None = None,
         max_new_tokens: int = 50,
         eos_token_id: int | None = None,
         decoder_start_token_id: int = 0,
@@ -348,7 +343,8 @@ class OnnxSpeechToTextGenerator:
         """Generate tokens from pre-computed encoder output.
 
         Args:
-            encoder_hidden_states: [batch, enc_seq_len, hidden] float32.
+            encoder_hidden_states: [batch, enc_seq_len, hidden] model-dtype tensor.
+            encoder_attention_mask: Optional [batch, enc_seq_len] encoder padding mask.
             max_new_tokens: Maximum tokens to generate.
             eos_token_id: Stop token.
             decoder_start_token_id: Token to seed the decoder (e.g. 50258).
@@ -366,9 +362,10 @@ class OnnxSpeechToTextGenerator:
         past_kv: dict[str, np.ndarray] = {}
         for name in self.dec_session.input_names:
             if name.startswith("past_key_values."):
+                cache_dtype = self.dec_session.get_input_dtype(name) or np.dtype(np.float32)
                 past_kv[name] = np.zeros(
                     (batch_size, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
+                    dtype=cache_dtype,
                 )
 
         # Seed with decoder_start_token_id
@@ -394,6 +391,15 @@ class OnnxSpeechToTextGenerator:
                     dec_feeds[name] = cur_dec_ids
                 elif name == "position_ids":
                     dec_feeds[name] = position_ids
+                elif name == "encoder_attention_mask":
+                    dec_feeds[name] = (
+                        encoder_attention_mask
+                        if encoder_attention_mask is not None
+                        else np.ones(
+                            (batch_size, encoder_hidden_states.shape[1]),
+                            dtype=np.int64,
+                        )
+                    )
 
             outputs = self.dec_session.run(dec_feeds)
 

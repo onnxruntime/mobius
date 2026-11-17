@@ -1,0 +1,19 @@
+model_id: "openbmb/MiniCPM-V-4.6"
+model_type: "minicpmv4_6"
+revision: "8169864629825dc1d755a5aa1cd8b5935dcbc83f"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+notes: "MiniCPM-V-4.6 with packed variable-resolution SigLIP2 and Qwen3.5 hybrid text."

@@ -1,0 +1,30 @@
+{
+  "model_id": "zai-org/GLM-ASR-Nano-2512",
+  "prompt": "Please transcribe this audio into text",
+  "generated_tokens": [
+    89,
+    23039,
+    524,
+    775,
+    40274,
+    6659,
+    17652,
+    309,
+    35513,
+    44,
+    1120,
+    5325,
+    283,
+    10863,
+    889,
+    1046,
+    2739,
+    320,
+    45543,
+    25485,
+    17652,
+    46,
+    59253
+  ],
+  "generated_text": "Yesterday it was thirty five degrees in Barcelona, but today the temperature will go down to minus twenty degrees."
+}

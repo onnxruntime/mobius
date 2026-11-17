@@ -44,9 +44,9 @@ without passing L2, or have L4 golden data without passing L3.
 
 | Level | Name | What it verifies | Data source |
 |-------|------|-----------------|-------------|
-| **L1** | Graph builds | ONNX graph builds from a tiny synthetic config | `tests/_test_configs.py` + `tests/build_graph_test.py` |
-| **L2** | Config compatible | Full-size HF config produces a valid graph | `test_model_id` in YAML test case (`testdata/cases/`) |
-| **L3** | Synthetic parity | Random-weight forward pass matches HF numerically | `tests/integration_test.py` parametrized tests |
+| **L1** | Graph builds | ONNX graph builds from a tiny synthetic config | `tests/_test_configs.py` + `tests/build_graph` |
+| **L2** | Config compatible | Full-size HF config produces a valid graph | Registry `test_model_id` / `test_revision` + `tests/arch_validation_test.py` |
+| **L3** | Synthetic parity | Random-weight forward pass matches HF numerically | `tests/synthetic_parity_test.py` and focused integration suites |
 | **L4** | Golden match | Real-weight prefill logits match pre-computed reference | `testdata/golden/<cat>/<model>.json` |
 | **L5** | Generation verified | Full multi-token generation matches golden output | `testdata/golden/<cat>/<model>_generation.json` |
 
@@ -60,21 +60,21 @@ models.
 
 ```bash
 # All non-integration tests (fast, no downloads)
-python -m pytest tests/build_graph_test.py tests/cli_test.py src/ -q \
+python -m pytest tests/build_graph tests/cli_test.py src/ -q \
   -k "not phi4mm and not apply_weights_unknown" --tb=short
 
 # Representative models only (~5 seconds)
-python -m pytest tests/build_graph_test.py --fast
+python -m pytest tests/build_graph --fast
 
 # Single model type
-python -m pytest tests/build_graph_test.py -k "phi4mm"
+python -m pytest tests/build_graph -k "phi4mm"
 
 # Integration tests (slow, downloads models)
-python -m pytest tests/integration_test.py -m integration -k "qwen2.5-0.5b"
+python -m pytest tests/integration/text_test.py -m integration -k "qwen2.5-0.5b"
 
 # L4/L5 golden tests
-python -m pytest tests/e2e_golden_test.py -m golden --level L4 -v
-python -m pytest tests/e2e_golden_test.py -m golden --level L5 -v
+python -m pytest tests/e2e_golden_test.py -m golden -v
+python -m pytest tests/e2e_golden_test.py -m generation -v
 
 # Generate golden data
 python scripts/generate_golden.py --level L4 --filter 'my-model*'
@@ -86,16 +86,27 @@ python scripts/generate_golden.py --level L4 --filter 'my-model*'
 
 ```
 tests/
-├── build_graph_test.py       # L1: graph construction (no weights)
+├── build_graph/               # L1: graph construction by model domain
+│   ├── _support.py            # shared helpers and coverage inventory
+│   ├── core_test.py
+│   ├── cache_test.py
+│   ├── diffusion_audio_test.py
+│   ├── recurrent_test.py
+│   ├── speech_test.py
+│   └── vision_language_test.py
 ├── _test_configs.py          # shared model configs for all tests
-├── integration_test.py       # L3: real-weight numerical parity
+├── integration/             # focused real-weight and architecture parity suites
+│   ├── _support.py          # shared session/feed helpers and text cases
+│   ├── text_test.py
+│   ├── generation_test.py
+│   └── ...                  # VLM, encoder/media, architecture, and heavy suites
 ├── e2e_golden_test.py        # L4 + L5: golden file comparison
 ├── yaml_schema_test.py       # YAML test case schema validation
 ├── weight_alignment_test.py  # L1: preprocess_weights correctness
 └── arch_validation_test.py   # L2: full HF config graph build
 
 testdata/
-├── cases/                    # YAML test case definitions (L2, L4, L5)
+├── cases/                    # Schema-validated L4/L5 case definitions
 └── golden/                   # Pre-computed reference outputs
 ```
 
@@ -132,15 +143,17 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
 
 ## L1: Graph build tests
 
-Located in `tests/build_graph_test.py`. Uses tiny synthetic configs
+Located in `tests/build_graph`. Uses tiny synthetic configs
 (64 hidden, 2 layers, 256 vocab) — no weights, no network.
 
 The framework checks: inputs exist (`input_ids`, `attention_mask`,
 `position_ids`), outputs exist (`logits`, KV cache), and initializers
 are present.
 
-VLM/audio models use dedicated test methods tracked in
-`_SPECIALIZED_TEST_MODEL_TYPES`.
+Models with dedicated test methods are tracked in
+`tests/build_graph/_support.py::specialized_test_model_types()`.
+Also update the specialized-test inventory in `tests/model_coverage_test.py`;
+one inventory does not satisfy the other.
 
 ### Weight alignment tests
 
@@ -158,17 +171,19 @@ Place rewrite rule tests **next to** the source file:
 
 ## L2: Config compatibility
 
-Detected from the `test_model_id` field in YAML test cases. To add L2:
-create `testdata/cases/<category>/my-model.yaml` with `test_model_id`
-set to a real HF model ID.
+L2 cases come from registry `ModelRegistration.test_model_id` (including
+`_TEST_MODEL_IDS`) and `test_revision`. Set both, then run
+`python -m pytest tests/arch_validation_test.py -k "<model_type>"`.
+Do not add `test_model_id` to golden YAML: the schema rejects it.
 
 ---
 
 ## L3: Integration tests
 
-Located in `tests/integration_test.py`. Parametrized with
-`(model_id, trust_remote_code)`. Prefer models ≤ 1B, publicly accessible,
-one per distinct model class.
+Located in focused `tests/integration/*_test.py` modules. The generic text
+suite is parametrized with `(model_id, trust_remote_code)` from
+`tests/integration/_support.py`. Prefer models ≤ 1B, publicly accessible, one
+per distinct model class.
 
 > Read [`references/test-examples.md`](references/test-examples.md) for
 > full prefill/decode/generation code patterns.
@@ -183,6 +198,26 @@ Compare ONNX outputs against pre-computed golden files in `testdata/golden/`.
 |-------|-------------|----------|
 | L4 | `<model>.json` | Prefill top-1/top-2 token IDs + logit summary |
 | L5 | `<model>_generation.json` | Prompt + generated token IDs + text |
+
+These are causal-LM examples, not mandatory output contracts. For embeddings,
+L5 checks semantic retrieval/rankings (including supported truncated dimensions).
+For continuous outputs, compare the full horizon and postprocessing against an
+independent pinned reference across multiple host feedback blocks. Greedy
+refinement can still draw random permutations: record upstream draw orders when
+a seed alone cannot reproduce CPU/CUDA execution.
+
+Before GPU runs, inspect actual device VRAM (a pool name may hide a small vGPU
+partition), bound fixtures without removing their semantics, and close staged
+component sessions. Apply the same TF32 policy to reference generators and replay.
+Prove padding is present and exercise sequences beyond the real sliding radius.
+Test OOV media placeholders before lookup, separate export dtype configs, and
+malformed-prefill cache preservation. Cast boolean masks to integers before
+`np.diff` when checking descending transitions.
+
+For multi-component exports, test `package.save` -> `ModelPackage.load` -> actual
+inference using restored metadata; arbitrary `ArchitectureConfig` fields are not
+automatically reconstructed. Separate codec checkpoints need their own immutable
+revision, config-layout checks, and exact initializer-binding evidence.
 
 > Read [`references/test-examples.md`](references/test-examples.md) for
 > YAML format, golden file format, and step-by-step coverage instructions.
@@ -239,6 +274,57 @@ integration test alongside any new custom function or Scan op.**
 - **Vision with real pixel values** — zeros don't exercise the encoder
 - **All dtypes** (f32, f16, bf16) — each can expose different bugs
 - **GPU when available** — different kernels on CUDA
+- **Actual package wiring** — feed each ONNX stage from the preceding ONNX
+  stage, not an HF intermediate that bypasses the integration under test
+- **Defaults and masks** — assert constructor/config defaults in emitted ONNX
+  attributes and test padding invariance across prefill plus cached decode
+- **Real processor contract** — record input names, shapes, dtypes, media-row
+  ordering, and sampled frame positions from nonzero image/video/audio data
+- **Batch and decode edges** — use two rows with distinguishable media
+  features, mixed modality order, and a decode step with zero new media
+- **Hybrid caches** — include left-padded batch > 1, cached multi-token chunks
+  crossing a sliding-window boundary, and full logits at every reused-state step.
+- **Absent attention history** — omit optional past inputs (`None, None`) rather
+  than supplying zero-length KV tensors while discarding present outputs; CPU
+  acceptance does not prove CUDA validity, so check the graph and both providers.
+
+### Golden tests must be reproducible and exact
+
+- Pin one revision through config, processor, weight shards, reference
+  generation, and ONNX build; test that plumbing forwards it.
+- Assert sequence lengths before exact token/frame comparison. For CTC, compare
+  the full argmax frame sequence and collapsed transcript.
+- Test image-only, video-only, and mixed media; pass processor kwargs only for
+  media that are present.
+- On hosted runners, isolate and eagerly delete each test's Hub, assets, and
+  Xet caches. Patching `HF_HOME` after `huggingface_hub` import is insufficient;
+  patch its imported cache constants too.
+- Run registry-driven L2 and YAML schema validation separately; pin the registry
+  revision as well as the golden case revision.
+- Inspect checkpoint generation settings before collecting L5 data. Sampling
+  disabled does not disable repetition penalties; reference and ONNX replay
+  must apply the same processors to the same token history.
+- Tiny parity does not qualify a dtype for the full checkpoint. Diagnose the
+  first divergent stage; reject unverified dtypes rather than weaken gates.
+- Run affected-model detection on the full diff before GPU CI. A new model
+  should select its targeted L4/L5 cases; distinguish all-model timeout or
+  runner termination from a model assertion failure.
+- Reference goldens must come from an independently invoked upstream pipeline,
+  never from the implementation under test or ad-hoc intermediate features.
+- When the checkpoint is too large, HTTP-range-read safetensors headers and the
+  exact tensors for a production-dimension reduced fixture. Cover every layer
+  family and cache contract, record the source layer/row derivation, and create
+  L4/L5 goldens from the independently invoked HuggingFace model. Treat this as
+  reduced real-weight evidence, not as a claim of full-checkpoint parity.
+- Before accepting an architecture xfail, verify config vocabulary, epsilon,
+  and layer-kind translation. A stale `mlp`->`moe` mapping can look like an SSM
+  numerical failure while loading the wrong weights entirely.
+- Compare full prefill and every token-by-token prompt/decode logit on the
+  target EP. Fused cache kernels can match multi-token prefill yet diverge on
+  the first reused-state step. If full-precision and quantized packages fail at
+  the same reused-state step, suspect source cache semantics rather than Olive.
+  Test the equivalent standard-ONNX cache graph before assigning blame; prefer
+  the portable graph when it restores the numeric gate.
 
 ### Recurrent state ≠ KV cache
 

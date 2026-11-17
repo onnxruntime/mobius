@@ -52,7 +52,7 @@ class TestBuildGraphLoRA:
 
 ```python
 @pytest.mark.integration
-@pytest.mark.parametrize("model_id,trust_remote_code", _TEXT_MODELS)
+@pytest.mark.parametrize("model_id,trust_remote_code", TEXT_MODELS)
 class TestForwardNumerical:
     def test_prefill_logits_match(self, model_id, trust_remote_code):
         onnx_model = build(model_id, load_weights=True)
@@ -87,10 +87,10 @@ class TestGreedyGeneration:
 
 ### Adding a new model to integration tests
 
-Add a `pytest.param` to `_TEXT_MODELS`:
+Add a `pytest.param` to `TEXT_MODELS`:
 
 ```python
-_TEXT_MODELS = [
+TEXT_MODELS = [
     pytest.param("Qwen/Qwen2.5-0.5B", False, id="qwen2.5-0.5b"),
     pytest.param("my-org/my-small-model", False, id="my-model"),
     # ...
@@ -147,10 +147,6 @@ inputs:
 **Optional fields:**
 
 ```yaml
-# Identifier for the test model used in L2 config compatibility check.
-# If set, the dashboard counts this model as L2 (full HF config valid).
-test_model_id: "Qwen/Qwen2.5-1.5B-Instruct"
-
 # Skip this test case entirely (model too large, gated repo, etc.).
 # Dashboard shows the model as 'skipped' rather than counting it toward coverage.
 skip_reason: "Model too large (47B MoE) for CPU golden generation."
@@ -208,20 +204,22 @@ Golden files must be committed alongside new test case YAML files.
 **L1 — Graph builds:**
 1. Add `("my_model", {config_overrides}, True)` to the appropriate list in
    `tests/_test_configs.py` (or add a dedicated method if the model is a VLM/audio).
-2. Run `python -m pytest tests/build_graph_test.py -k "my_model"`.
+2. Run `python -m pytest tests/build_graph -k "my_model"`.
 
 **L2 — Config compatible:**
-1. Create `testdata/cases/<category>/my-model.yaml`.
-2. Fill in all required fields, including `model_type` (must match the
-   key registered in `src/mobius/_registry.py`) and `test_model_id`.
-3. Run schema validation: `python -m pytest tests/yaml_schema_test.py`.
-4. Run coverage check: `python -m pytest tests/model_coverage_test.py` —
+1. Set registry `test_model_id` (directly or through `_TEST_MODEL_IDS`) and an
+   immutable `test_revision` in `src/mobius/_registry.py`.
+2. Run `python -m pytest tests/arch_validation_test.py -k "<model_type>"`.
+3. Add a schema-valid golden YAML with `model_type` and pinned `revision`;
+   `test_model_id` is not a YAML field.
+4. Run `python -m pytest tests/yaml_schema_test.py tests/model_coverage_test.py` —
    fails if any registered `model_type` lacks a YAML or `_COVERAGE_SKIP` entry.
 
 **L3 — Synthetic parity:**
 1. Add `pytest.param("org/my-model", False, id="my-model")` to the
-   appropriate parametrized list in `tests/integration_test.py`.
-2. Run `python -m pytest tests/integration_test.py -m integration -k "my-model"`.
+   appropriate focused integration suite (or `TEXT_MODELS` in
+   `tests/integration/_support.py` for a generic causal LM).
+2. Run `python -m pytest tests/integration -m integration -k "my-model"`.
 
 **L4 — Golden match:**
 1. Create/update `testdata/cases/<category>/my-model.yaml` with `level: "L4"`.

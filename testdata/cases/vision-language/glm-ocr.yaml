@@ -1,0 +1,20 @@
+model_id: "zai-org/GLM-OCR"
+model_type: "glm_ocr"
+revision: "ca5d8b3e287e52589e37c28385d9655ee4372f9d"
+task_type: "image-text-to-text"
+dtype: "bfloat16"
+
+inputs:
+  prompts:
+    - "Text Recognition:"
+  images:
+    - "nemotron-parse-document.png"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 24
+  do_sample: false
+
+ci_skip_reason: "The pinned 0.9B checkpoint and 6808-patch document require a CUDA runner with at least 8 GB VRAM."
+notes: "Real nonzero 1024x1280 document; complete vision encoder, embedding mixer, M-RoPE decoder prefill, cached decode, and deterministic OCR generation."

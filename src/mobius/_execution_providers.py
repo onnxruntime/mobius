@@ -53,11 +53,19 @@ class EpCapabilities:
     Attributes:
         name: Canonical EP name (e.g. ``"cuda"``).
         gqa_dtypes: dtypes for which GroupQueryAttention fusion is supported.
-        qkv_pack_dtypes: dtypes for which QKV weight packing for
-            GroupQueryAttention is supported (PackQKV fusion).  Set to an
-            empty frozenset for EPs that do not support packed QKV inputs
-            (e.g. DML, which always unpacks via UnpackQKV in the lowering
-            stage).
+        qkv_pack_dtypes: Dtypes enabling the existing decoder-only GQA-input
+            packing stage (PackQKV). Does not enable the separate projection-only
+            float or INT4 stages. Set to an empty frozenset for EPs that do not
+            support packed QKV inputs (e.g. DML, which always unpacks via
+            UnpackQKV in the lowering stage).
+        matmul_nbits_qkv_pack_dtypes: Activation dtypes for projection-only INT4
+            packing, which preserves separate normalization/attention branches.
+            Experimental: empty on every built-in EP, including CUDA. Explicit
+            opt-in does not waive the unresolved large-model numerical gate.
+        qkv_projection_pack_dtypes: Dtypes for projection-only float packing
+            (PackQKVProjections) for decoder and masked-decoder roles, independent
+            of qkv_pack_dtypes and matmul_nbits_qkv_pack_dtypes. Experimental:
+            empty on every built-in EP until numerical execution is qualified.
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
@@ -93,11 +101,21 @@ class EpCapabilities:
             default) leaves ``Range`` unchanged.  Set ``False`` only when
             static cache is used on runtimes that lack a ``Range`` kernel (QNN
             HTP), where the ``Range`` node would otherwise be forced onto CPU.
+        supports_fp8_kv_cache: ``True`` allows :class:`~mobius._passes.
+            Fp8KvCachePass` to retype the ``GroupQueryAttention`` KV cache to
+            ``FLOAT8E4M3FN``.  Only CUDA (SM89+ Ada/Hopper/Blackwell) ships the
+            FP8 GQA kernel, so this defaults to ``False`` for every other EP —
+            ``--features fp8-kv-cache`` is ignored (with a warning) on EPs that
+            cannot run an FP8 KV cache, preventing invalid/unloadable models.
         supports_matmul_nbits: ``False`` converts ``com.microsoft::MatMulNBits``
             (blockwise-INT4 weight) into a standard ``DequantizeLinear`` +
             ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
             contrib op unchanged.  Set ``False`` only for runtimes that lack a
             ``MatMulNBits`` kernel but can consume QDQ weights (QNN HTP).
+        requires_power_of_two_matmul_nbits_blocks: Reject native ``MatMulNBits``
+            blocks that are not powers of two >= 16 during optimization.
+            Enabled for CPU; target-neutral ``default`` exports leave native
+            layout compatibility to the selected runtime.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -129,6 +147,9 @@ class EpCapabilities:
             large weight tensors (e.g. fused per-layer embedding tables) must
             be split into chunks that each fit within this bound.  WebGPU's
             W3C spec default ``maxBufferSize`` is 268,435,456 bytes (256 MiB).
+        layered_per_layer_inputs: Keep per-layer inputs as
+            ``[batch, sequence, layers, projection]`` instead of flattening the
+            final two dimensions.
         requires_graph_capture_rewrite: Whether this EP requires rewrite rules
             to make models compatible with graph capture (e.g. replacing
             ``Shape`` / ``ConstantOfShape`` with static alternatives for
@@ -153,13 +174,23 @@ class EpCapabilities:
     supports_rotary_embedding: bool = True
     supports_tensor_scatter: bool = True
     supports_range: bool = True
+    supports_fp8_kv_cache: bool = False
     default_int4_accuracy_level: int = 0
     provider_options: dict[str, str] = dataclasses.field(default_factory=dict)
     enable_graph_capture: bool = False
     supports_past_present_share_buffer: bool = False
     cap_kv_buffer_max_length: bool = False
     max_buffer_size: int | None = None
+    layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
+    requires_power_of_two_matmul_nbits_blocks: bool = False
+    # Append new capabilities to preserve all existing positional arguments.
+    matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
+        default_factory=frozenset
+    )
+    qkv_projection_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
+        default_factory=frozenset
+    )
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -290,6 +321,7 @@ def _register_builtins() -> None:
             qkv_pack_dtypes=frozenset(),  # no QKV packing
             supports_skip_layer_norm=False,
             provider_options={"device_type": "NPU"},
+            layered_per_layer_inputs=True,
         ),
         EpCapabilities(
             name="cpu",
@@ -297,6 +329,7 @@ def _register_builtins() -> None:
             qkv_pack_dtypes=frozenset({ir.DataType.FLOAT}),
             default_int4_accuracy_level=4,
             supports_past_present_share_buffer=True,
+            requires_power_of_two_matmul_nbits_blocks=True,
         ),
         EpCapabilities(
             name="cuda",
@@ -308,7 +341,11 @@ def _register_builtins() -> None:
             provider_options={
                 "enable_skip_layer_norm_strict_mode": "1",
             },
+            enable_graph_capture=True,
             supports_past_present_share_buffer=True,
+            # Only CUDA ships the FP8 (E4M3) GroupQueryAttention KV-cache kernel
+            # (SM89+ Ada/Hopper/Blackwell).
+            supports_fp8_kv_cache=True,
         ),
         EpCapabilities(
             name="dml",
@@ -351,6 +388,7 @@ def _register_builtins() -> None:
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
             ),
             supports_skip_layer_norm=False,
+            supports_matmul_nbits=False,
             enable_graph_capture=True,
             supports_past_present_share_buffer=True,
         ),
@@ -363,6 +401,7 @@ def _register_builtins() -> None:
         # soc_model and the EP-context binary path are set per-device at build time.
         EpCapabilities(
             name="qnn",
+            supports_fused_moe=False,  # no ORT contrib MoE/QMoE kernels
             gqa_dtypes=frozenset(),  # no GroupQueryAttention (no QNN GQA builder)
             qkv_pack_dtypes=frozenset(),  # no PackQKV
             supports_fused_rope=False,  # SeparateRoPE + UnpackQKV
@@ -391,6 +430,7 @@ def _register_builtins() -> None:
         # standard Attention's concat-grow semantics handle the cache.
         EpCapabilities(
             name="onnx-standard",
+            supports_fused_moe=False,
             gqa_dtypes=frozenset(),  # no GroupQueryAttention
             qkv_pack_dtypes=frozenset(),  # no PackQKV
             supports_fused_rope=False,  # no fused RoPE inside GQA (GQA not supported)

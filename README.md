@@ -29,19 +29,77 @@ multi-component export for pipelines.
 |---|---|
 | **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3/3.5/3.6, Phi-3/3.5, Gemma 1/2/3/4, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
 | **Mixture of Experts** | PhiMoE, GPTOSS, Mixtral, OLMoE, DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Qwen3-Next, GLM-4-MoE, Arctic, DBRX, Jamba |
-| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), LLaVA, InternVL2, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
+| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), Nemotron Parse, LLaVA, InternVL2, Mage-VL (image + streaming video), MiniCPM-V 4.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral |
 | **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa, DistilBERT, ELECTRA, XLNet |
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
-| **Speech-to-Text** | Whisper, FastConformer-RNNT, FunASR, Qwen3-ASR, SenseVoice |
+| **Speech-to-Text** | Whisper, Moonshine, Moonshine Streaming, FastConformer-RNNT, FunASR, GLM-ASR, Qwen3-ASR, SenseVoice |
 | **Audio** | Wav2Vec2, HuBERT, WavLM, SpeechT5 |
 | **Vision** | ViT, BEiT, DeiT, DINOv2, Swin, CLIP, SigLIP |
-| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage, HunyuanDiT, CogVideoX |
+| **Diffusion** | Stable Diffusion (UNet + VAE + ControlNet), Flux, SD3, DiT, QwenImage / Qwen-Image-Edit-2509, HunyuanDiT, CogVideoX |
 | **Adapters** | T2I-Adapter, IP-Adapter |
+
+Mage-VL supports direct three-model ONNX export. ORT GenAI export is currently
+rejected because the runtime cannot supply its required `patch_positions` input
+or Mage-VL's 1D decoder positions.
 
 Supports **290+ Transformers model types** and **10 Diffusers component types**
 across **40+ task types** and **100+ reusable components**.
 
 See the [model documentation](https://onnxruntime.github.io/mobius/models/index.html) for the complete list.
+
+## Projection-specific QMoE export
+
+Olive's integer-affine, fused, K-last expert checkpoints can independently
+use INT2, INT3, INT4, or INT8 for FC1 and FC2, with a supported model-wide
+INT4 fallback for non-expert projections. All 16 bit-width pairs are accepted
+when their layouts satisfy the checks below; no experimental flag is required. INT3
+uses the proposed raw QMoE contract from `microsoft/onnxruntime#32657`.
+
+```python
+from mobius import build
+
+package = build("./local-olive-qwen3-moe", dtype="f16")
+package.save("./qmoe-export")
+```
+
+Use an Olive model-wide INT4 configuration with exact source-name overrides for
+`model.layers.<i>.mlp.experts.gate_up_proj` and
+`model.layers.<i>.mlp.experts.down_proj`. The generic MoE adapter, including Qwen3-MoE,
+validates fused checkpoint dimensions and binds packed bytes without
+requantization. INT3 is symmetric unsigned offset-4, row-local LSB-first
+`uint8`; FC1 gate/up rows and scales are interleaved together, while FC2
+retains its K-last down-projection layout. Explicit all-4 INT3 zero points are
+validated and omitted in the graph.
+
+Both projections require a shared power-of-two block size of at least 16,
+dividing hidden and intermediate sizes. Pairs containing INT3 require block
+size 32/64/128, symmetric INT3, and FP16/BF16 activations. For these pairs both
+FC scale dtypes must match the activations. Every projection's scales must be
+finite and nonnegative. When the adapter supplies the activation dtype,
+scales must remain finite after conversion. Non-INT3 layouts retain the
+standard weight loader's dtype conversion.
+The legacy uniform INT4 path receives the same numeric scale checks.
+INT2, INT4, and INT8 projections retain their existing zero-point
+semantics; asymmetric zero points must be packed `uint8` sidecars.
+Dense INT3 `MatMulNBits`, embeddings, other source layouts, and schema-unapproved
+tails are not enabled. Keep non-expert projections at supported precisions.
+
+`build()` defers INT3-layout FC1 interleaving to initializer serialization,
+using uncached lazy tensors instead of retaining a second complete FC1 payload.
+The original checkpoint is still loaded eagerly; this bounds additional
+interleaving storage, not total checkpoint memory. Direct `preprocess_weights()`
+calls retain eager behavior unless an output `weight_transforms` mapping is
+provided. Pass that mapping to `ModelPackage.apply_weights()` with the returned
+weights to preserve the deferred transformations.
+
+**Export support is not a runtime qualification matrix.** INT3 QMoE nodes
+carry a draft-format/runtime-warning marker; they do not invent an
+approved schema version. Execution of every pair depends on the target ORT
+version and execution provider. Tests cover bytes, interleaving, binding, and external
+data save/reload, not INT3 kernel execution, model quality, or speed. Final
+schema/version review, a complete quantization provenance manifest, and
+checkpoint-to-ORT parity remain necessary before production use. This is not
+completion of the runtime plan's P5 acceptance gate.
 
 ## Installation
 
@@ -100,16 +158,34 @@ See the [EP quickstart](docs/ep_quickstart.md) and
 ### CLI
 
 ```sh
-mobius build --model Qwen/Qwen2.5-0.5B output_dir/
+mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/
 
 # Build for CUDA with f16
-mobius build --model meta-llama/Llama-3.2-1B output_dir/ --ep cuda --dtype f16
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ --ep cuda --dtype f16
 
 # Build a diffusers pipeline (all components)
-mobius build --model Qwen/Qwen-Image-2512 output_dir/
+mobius build --model Qwen/Qwen-Image-2512 --output output_dir/
 
 # Build encoder-decoder model (produces encoder/model.onnx + decoder/model.onnx)
-mobius build --model openai/whisper-tiny output_dir/
+mobius build --model openai/whisper-tiny --output output_dir/
+```
+
+Build-mode toggles use the cargo-style `--features` option. Available features
+are `static-cache`, `fp8-kv-cache`, `prune-prefill-prefix`, and `text-only`. Pass them
+as a comma-separated list or repeat the option:
+
+```sh
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ \
+      --features static-cache,prune-prefill-prefix --max-seq-len 2048
+```
+
+Use `--release` with either `build` or `build-gguf` to potentially reduce saved model size
+by stripping build-time debug and provenance metadata. Functional metadata with keys prefixed by
+`mobius.` is preserved:
+
+```sh
+mobius build --model meta-llama/Llama-3.2-1B --output output_dir/ --release
+mobius build-gguf model.gguf --output output_dir/ --release
 ```
 
 See the [CLI Reference](https://onnxruntime.github.io/mobius/cli_reference.html) for all subcommands and flags.
@@ -153,10 +229,10 @@ See the [design document](https://onnxruntime.github.io/mobius/design.html) for 
 
 ```bash
 # Unit tests (fast, no network needed)
-pytest tests/build_graph_test.py -v
+pytest tests/build_graph -v
 
 # Integration tests (downloads models)
-pytest tests/integration_test.py -m integration -v
+pytest tests/integration -m integration -v
 
 # All unit tests (components, configs, tasks, models)
 pytest src tests -m "not integration" -v
@@ -166,6 +242,9 @@ lintrunner f --all-files
 ```
 
 ### Adding a new model
+
+To [request a new model](https://github.com/onnxruntime/mobius/issues/new?template=model-request.yml),
+or ask an AI coding agent to implement a new model, use the resources below:
 
 See the [AI-assisted model support strategy](https://onnxruntime.github.io/mobius/ai-model-support-strategy.html)
 and the developer skills in `.agents/skills/`:

@@ -100,7 +100,10 @@ class _FusedMoEBlock(nn.Module):
 
         # Routing gate: HF name is router.layer, renamed to gate in preprocess_weights
         self.gate = TopKGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+            config.hidden_size,
+            config.num_local_experts,
+            config.num_experts_per_tok,
+            routed_scaling_factor=config.routed_scaling_factor,
         )
 
         # Fused 3D expert weights — names match HF directly
@@ -192,7 +195,7 @@ def _feedforward(
     op: OpBuilder,
     hidden_states: ir.Value,
     block_sparse_moe: nn.Module | None,
-    shared_mlp: nn.Module,
+    shared_mlp: nn.Module | None,
 ) -> ir.Value:
     """Combined routed-MoE + shared-MLP feedforward.
 
@@ -200,10 +203,12 @@ def _feedforward(
     variants with ``num_local_experts == 0`` (e.g. granite-4.0-1b) only the
     dense shared MLP runs. Mirrors HF ``GraniteMoeHybridDecoderLayer``.
     """
-    shared_out = shared_mlp(op, hidden_states)
+    shared_out = shared_mlp(op, hidden_states) if shared_mlp is not None else None
     if block_sparse_moe is None:
+        assert shared_out is not None
         return shared_out
-    return op.Add(block_sparse_moe(op, hidden_states), shared_out)
+    routed_out = block_sparse_moe(op, hidden_states)
+    return op.Add(routed_out, shared_out) if shared_out is not None else routed_out
 
 
 class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
@@ -243,7 +248,9 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         self.block_sparse_moe = _FusedMoEBlock(config) if self._has_experts else None
 
         # Dense shared MLP with fused gate+up weight
-        self.shared_mlp = _FusedSharedMLP(config)
+        self.shared_mlp = (
+            _FusedSharedMLP(config) if config.shared_intermediate_size > 0 else None
+        )
 
         self._residual_multiplier = config.residual_multiplier
 
@@ -309,7 +316,9 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         self.block_sparse_moe = _FusedMoEBlock(config) if self._has_experts else None
 
         # Dense shared MLP with fused gate+up weight
-        self.shared_mlp = _FusedSharedMLP(config)
+        self.shared_mlp = (
+            _FusedSharedMLP(config) if config.shared_intermediate_size > 0 else None
+        )
 
         self._residual_multiplier = config.residual_multiplier
 
@@ -371,9 +380,15 @@ class _GraniteMoeHybridTextModel(nn.Module):
         )
 
         layer_types = config.layer_types or []
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "GraniteHybrid layer_types must contain exactly num_hidden_layers entries"
+            )
+        if any(layer_type not in {"mamba2", "full_attention"} for layer_type in layer_types):
+            raise ValueError(f"Unknown GraniteHybrid layer type in {layer_types!r}")
         self.layers = nn.ModuleList([])
         for i in range(config.num_hidden_layers):
-            ltype = layer_types[i] if i < len(layer_types) else "mamba2"
+            ltype = layer_types[i]
             if ltype == "mamba2":
                 self.layers.append(_GraniteMoeHybridMambaDecoderLayer(config))
             else:
@@ -426,11 +441,11 @@ class _GraniteMoeHybridTextModel(nn.Module):
 
 
 class GraniteMoeHybridCausalLMModel(nn.Module):
-    """GraniteMoeHybrid hybrid Mamba2+Attention causal language model with MoE FFN.
+    """GraniteMoeHybrid hybrid Mamba2+Attention causal language model.
 
-    Every layer has both a routed MoE block (``block_sparse_moe``) and a dense
-    shared MLP (``shared_mlp``). Mamba2 layers use the SSD selective scan;
-    attention layers use standard GQA without rotary position embeddings (NoPE).
+    Routed-MoE checkpoints run ``block_sparse_moe`` plus ``shared_mlp``; dense
+    checkpoints run ``shared_mlp`` alone. Mamba2 layers use the SSD selective
+    scan, while attention layers use RoPE or NoPE according to the config.
 
     Uses ``HybridCausalLMTask`` with mixed ``"mamba2"`` and ``"full_attention"``
     layer types for the KV/SSM cache.

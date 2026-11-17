@@ -1,0 +1,5 @@
+# Exact source used by VibeVoice Realtime L3 synthetic parity tests. CI installs
+# this file with --no-deps after resolving requirements/ci/transformers.txt.
+# Upstream still declares Transformers <5; the CI reference uses the pinned
+# Transformers source above rather than downgrading to that older API.
+vibevoice @ git+https://github.com/microsoft/VibeVoice.git@79e516a3e20b599f137c9da03410a2a0b473b63b

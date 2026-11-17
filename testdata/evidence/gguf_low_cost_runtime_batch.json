@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "maximum_download_bytes": 17179869184,
+    "selected_architecture_minimum": 6,
+    "selected_architecture_maximum": 10,
+    "production_revision_policy": "revision=None remains unpinned; arbitrary explicit revisions are forwarded",
+    "runtime": "ort-genai",
+    "runtime_version": "0.15.2",
+    "onnxruntime_version": "1.29.0"
+  },
+  "selected": [
+    {
+      "architecture": "gpt2",
+      "evidence_id": "gpt2-q2-k-ort-genai-0.15.2",
+      "artifact_size": 81196544,
+      "artifact_sha256": "4234545f917ec1df10dab4d926796a83422b68e9010d85a4c111b8b541f32892",
+      "tokenizer_payload_size": 2107986,
+      "storage_mode": "explicit-float"
+    },
+    {
+      "architecture": "gptneox",
+      "evidence_id": "pythia-70m-q2-k-ort-genai-0.15.2",
+      "artifact_size": 38508192,
+      "artifact_sha256": "8e331c8c8016bed8ff1863b78fafe51e86b2364f32c2d7f3e201687e081cf7f7",
+      "tokenizer_payload_size": 2114205,
+      "storage_mode": "explicit-float"
+    },
+    {
+      "architecture": "mpt",
+      "evidence_id": "tiny-mpt-q2-k-ort-genai-0.15.2",
+      "artifact_size": 8734304,
+      "artifact_sha256": "5627dcb0ff18f6f7200f83c0aed2056a6a7c86b5f2d865833e1b5f00b00e4daa",
+      "tokenizer_payload_size": 2114074,
+      "storage_mode": "explicit-float"
+    },
+    {
+      "architecture": "olmo",
+      "evidence_id": "tiny-olmo-q2-k-ort-genai-0.15.2",
+      "artifact_size": 33860576,
+      "artifact_sha256": "be1c5a22ac0e75cd5874467ffd80bcd2c8500609d3bf7ccdb5b269373e4d6da4",
+      "tokenizer_payload_size": 2121082,
+      "storage_mode": "explicit-float"
+    },
+    {
+      "architecture": "starcoder",
+      "evidence_id": "tiny-starcoder-q2-k-ort-genai-0.15.2",
+      "artifact_size": 103899456,
+      "artifact_sha256": "aa8c2170bb9172447baba14309916cfc0d901dbffaf10f1448f4f631e10c1f41",
+      "tokenizer_payload_size": 2058604,
+      "storage_mode": "explicit-float"
+    },
+    {
+      "architecture": "starcoder2",
+      "evidence_id": "tiny-starcoder2-q2-k-ort-genai-0.15.2",
+      "artifact_size": 68039904,
+      "artifact_sha256": "ab0a4b4e79c906520808db065a00a317c8b097e2176638b34088975eada6e0ed",
+      "tokenizer_payload_size": 2070124,
+      "storage_mode": "explicit-float"
+    }
+  ],
+  "totals": {
+    "artifact_bytes": 334238976,
+    "tokenizer_bytes": 12586075,
+    "download_bytes": 346825051
+  },
+  "fail_closed": [
+    {
+      "architecture": "qwen3",
+      "reason_code": "TOKENIZER_CHAT_TEMPLATE_IDENTITY_MISMATCH",
+      "result": "blocked",
+      "detail": "All 310 tensors close after Q/K norm mapping, but the immutable source tokenizer chat template differs from the GGUF template."
+    },
+    {
+      "architecture": "bloom",
+      "reason_code": "FULL_LOGIT_PARITY_DIVERGENCE",
+      "result": "blocked",
+      "detail": "Cache replay remains within 0.000214, but same-value full-sequence logits diverge by up to 6.731415."
+    },
+    {
+      "architecture": "stablelm",
+      "reason_code": "TENSOR_SHAPE_CLOSURE_FAILED",
+      "result": "blocked",
+      "detail": "The replacement artifact does not satisfy exact graph weight-shape closure."
+    },
+    {
+      "architecture": "gemma",
+      "reason_code": "TOKENIZER_COMPILED_SEMANTICS_UNAVAILABLE",
+      "result": "blocked",
+      "detail": "The representative artifact declares tokenizer.ggml.pre semantics that the pinned tokenizer loader cannot prove."
+    },
+    {
+      "architecture": "gemma2",
+      "reason_code": "TOKENIZER_COMPILED_SEMANTICS_UNAVAILABLE",
+      "result": "blocked",
+      "detail": "The representative artifact declares tokenizer.ggml.pre semantics that the pinned tokenizer loader cannot prove."
+    },
+    {
+      "architecture": "gemma3",
+      "reason_code": "TOKENIZER_COMPILED_SEMANTICS_UNAVAILABLE",
+      "result": "blocked",
+      "detail": "The representative artifact declares tokenizer.ggml.pre semantics that the pinned tokenizer loader cannot prove."
+    },
+    {
+      "architecture": "phi3",
+      "reason_code": "TOKENIZER_COMPILED_SEMANTICS_UNAVAILABLE",
+      "result": "blocked",
+      "detail": "The representative artifact declares tokenizer.ggml.pre semantics that the pinned tokenizer loader cannot prove."
+    },
+    {
+      "architecture": "falcon",
+      "reason_code": "INVALID_GGUF_HEADER",
+      "result": "blocked",
+      "detail": "The smallest official candidate is not a readable GGUF artifact."
+    }
+  ],
+  "excluded": [
+    {
+      "route": "qwen35moe",
+      "reason_code": "RECENTLY_HANDLED",
+      "pull_request": 672
+    },
+    {
+      "route": "nemotron_h_moe",
+      "reason_code": "RECENTLY_HANDLED",
+      "pull_request": 674
+    },
+    {
+      "route_class": "tokenizer-only",
+      "reason_code": "OUT_OF_SCOPE"
+    },
+    {
+      "route_class": "abi-blocked",
+      "reason_code": "OUT_OF_SCOPE"
+    }
+  ]
+}
