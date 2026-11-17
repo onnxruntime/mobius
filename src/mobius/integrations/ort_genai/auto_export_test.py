@@ -116,6 +116,42 @@ def _make_fake_llm_pkg(model_type: str = "qwen2"):
     )
 
 
+def _make_fake_kev_pkg():
+    """Build a minimal KEV component package with a Qwen configuration."""
+    from mobius._model_package import ModelPackage
+
+    config = _make_fake_llm_pkg("qwen3_5").config
+    return ModelPackage(
+        {
+            "backbone": _mock_model(),
+            "pointer_head": _mock_model(),
+        },
+        config=config,
+    )
+
+
+@pytest.mark.parametrize(("ep", "threads"), [("cpu", 16), ("cuda", 1)])
+def test_kev_export_writes_default_component_session_options(tmp_path, ep, threads):
+    result = write_ort_genai_config(
+        _make_fake_kev_pkg(),
+        str(tmp_path),
+        ep=ep,
+        context_length=8192,
+    )
+
+    assert result["genai_config"] == str(tmp_path / "genai_config.json")
+    config = json.loads((tmp_path / "genai_config.json").read_text())
+    assert config["model"]["type"] == "component"
+    assert config["model"]["decoder"]["filename"] == "backbone/model.onnx"
+    assert config["model"]["context_length"] == 8192
+    assert config["model"]["decoder"]["session_options"] == {
+        "intra_op_num_threads": threads,
+        "inter_op_num_threads": 1,
+        "session.intra_op.allow_spinning": "0",
+        "session.inter_op.allow_spinning": "0",
+    }
+
+
 class TestResolveOrtGenaiModelType:
     def test_known_model_type(self):
         assert _resolve_ort_genai_model_type("qwen3") == "qwen2"
@@ -347,7 +383,37 @@ class TestWriteProcessorConfig:
             for transform in transforms
             if transform["operation"]["type"] == "Normalize"
         )
-        assert normalize["attrs"]["qwen2_5_vl"] == 1
+        assert set(normalize["attrs"]) == {"mean", "std"}
+
+    @pytest.mark.parametrize("model_type", ["qwen2_5_vl_text", "qwen3_vl", "qwen3_5_text"])
+    def test_qwen_rgb_decode_uses_ordinary_normalize(self, tmp_path, model_type):
+        """RGB decoding must not be followed by a BGR-to-RGB Normalize swap."""
+        config = types.SimpleNamespace(
+            model_type=model_type,
+            vision=types.SimpleNamespace(image_size=448, patch_size=16, spatial_merge_size=2),
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+        path = _write_vision_processor_config(config, str(tmp_path))
+        assert path is not None
+        transforms = json.loads(Path(path).read_text())["processor"]["transforms"]
+        assert [item["operation"]["type"] for item in transforms] == [
+            "DecodeImage",
+            "Resize",
+            "Rescale",
+            "Normalize",
+            "PatchImage",
+        ]
+        assert transforms[0]["operation"]["attrs"] == {"color_space": "RGB"}
+        assert transforms[3]["operation"]["attrs"] == {
+            "mean": [0.48145466, 0.4578275, 0.40821073],
+            "std": [0.26862954, 0.26130258, 0.27577711],
+        }
+        assert transforms[4]["operation"]["attrs"] == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+        }
 
     def test_mage_vl_writes_packed_patch_processor(self, tmp_path):
         vision = types.SimpleNamespace(
@@ -386,7 +452,7 @@ class TestWriteProcessorConfig:
             for transform in transforms
             if transform["operation"]["type"] == "Normalize"
         )
-        assert normalize["attrs"]["qwen2_5_vl"] == 1
+        assert set(normalize["attrs"]) == {"mean", "std"}
 
     def test_mage_vl_processor_propagates_trust_remote_code(self, tmp_path):
         vision = types.SimpleNamespace(
@@ -490,8 +556,8 @@ class TestWriteProcessorConfig:
         """Muse vision consumes flattened patches and image grid dimensions.
 
         No ``ConvertRGB``: it unconditionally swaps R and B, so pairing it with
-        ``DecodeImage(color_space="RGB")`` would hand the encoder BGR. The
-        ``qwen2_5_vl`` flag therefore lands on ``Normalize`` at index 3.
+        ``DecodeImage(color_space="RGB")`` would hand the encoder BGR. Ordinary
+        normalization preserves RGB; PatchImage owns temporal/spatial packing.
         """
         vision = mock.MagicMock()
         vision.image_size = 448
@@ -520,7 +586,7 @@ class TestWriteProcessorConfig:
             "Normalize",
             "PatchImage",
         ]
-        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert set(transforms[3]["operation"]["attrs"]) == {"mean", "std"}
         assert transforms[4]["operation"]["attrs"] == {
             "patch_size": 14,
             "temporal_patch_size": 2,
@@ -554,7 +620,7 @@ class TestWriteProcessorConfig:
             "Normalize",
             "PatchImage",
         ]
-        assert transforms[3]["operation"]["attrs"]["qwen2_5_vl"] == 1
+        assert set(transforms[3]["operation"]["attrs"]) == {"mean", "std"}
         assert transforms[4]["operation"]["attrs"] == {
             "patch_size": 16,
             "temporal_patch_size": 2,
@@ -1003,6 +1069,7 @@ class TestFixChatTemplate:
 
         seq = data["feature_extraction"]["sequence"]
         assert seq[0]["operation"]["type"] == "AudioDecoder"
+        assert seq[0]["operation"]["attrs"] == {"max_samples": 0}
         op = seq[1]["operation"]
         assert op["name"] == "gemma4_audio"
         assert op["type"] == "Gemma4Audio"
@@ -1029,9 +1096,8 @@ class TestFixChatTemplate:
         seq = data["feature_extraction"]["sequence"]
         assert len(seq) == 2
         assert seq[0]["operation"]["type"] == "AudioDecoder"
-        assert seq[1]["operation"]["type"] == "Gemma4Audio"
+        assert seq[1]["operation"]["type"] == "Gemma4LogMel"
         attrs = seq[1]["operation"]["attrs"]
-        assert attrs["type"] == "log_mel"
         assert attrs["feature_size"] == 128
         assert attrs["sampling_rate"] == 16000
         assert attrs["frame_length_ms"] == 20.0  # noqa: RUF069
@@ -1967,11 +2033,11 @@ class TestExportForOrtGenai:
         # First op: AudioDecoder
         op0 = seq[0]["operation"]
         assert op0["type"] == "AudioDecoder"
+        assert "max_samples" not in op0.get("attrs", {})
 
-        # Second op: Gemma4Audio (type=log_mel) with expected attrs
+        # Second op: Gemma4LogMel with expected attrs
         op1 = seq[1]["operation"]
-        assert op1["type"] == "Gemma4Audio"
-        assert op1["attrs"]["type"] == "log_mel"
+        assert op1["type"] == "Gemma4LogMel"
         assert op1["attrs"]["feature_size"] == 128
         assert op1["attrs"]["sampling_rate"] == 16000
         assert op1["attrs"]["mel_floor"] == 0.001  # noqa: RUF069
@@ -4198,6 +4264,11 @@ class TestGemma4RealModel:
 
         with open(result["audio_processor"], encoding="utf-8") as f:
             audio_processor = json.load(f)
+        assert audio_processor["feature_extraction"]["sequence"][0]["operation"] == {
+            "name": "audio_decoder",
+            "type": "AudioDecoder",
+            "attrs": {"max_samples": 0},
+        }
         audio_op = audio_processor["feature_extraction"]["sequence"][1]["operation"]
         assert audio_op == {
             "name": "gemma4_audio",

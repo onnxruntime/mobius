@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     import onnx_ir as ir
     import torch
 
+    from mobius._weight_utils import WeightTransform
+
 
 class GraniteTextModel(nn.Module):
     """Granite text model with embedding multiplier."""
@@ -234,7 +236,10 @@ class GraniteMoECausalLMModel(CausalLMModel):
         return logits, present_key_values
 
     def preprocess_weights(
-        self, state_dict: dict[str, torch.Tensor]
+        self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> dict[str, torch.Tensor]:
         from mobius.models.moe import (
             _preprocess_moe_weights,
@@ -242,4 +247,4 @@ class GraniteMoECausalLMModel(CausalLMModel):
         )
 
         state_dict = _rename_moe_expert_weights(state_dict)
-        return _preprocess_moe_weights(self, state_dict)
+        return _preprocess_moe_weights(self, state_dict, weight_transforms=weight_transforms)

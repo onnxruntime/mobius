@@ -8,8 +8,13 @@ from __future__ import annotations
 import torch
 from onnxscript import nn
 
-from mobius._component_manifest import ComponentDescriptor, ComponentManifest
-from mobius._configs import ArchitectureConfig
+from mobius._component_manifest import (
+    ComponentDescriptor,
+    ComponentManifest,
+    SharedWeightEndpoint,
+    SharedWeightInfo,
+)
+from mobius._configs import ArchitectureConfig, QuantizationConfig, QuantizationOverride
 from mobius.weights import WeightAdapterContext, adapt_model_weights
 
 
@@ -63,3 +68,76 @@ def test_explicit_adapter_takes_precedence():
 
     assert result["adapter.weight"] is tensor
     assert "legacy.weight" not in result
+
+
+def test_materializes_cross_component_tied_quantized_weight_before_adapter():
+    embedding_quantization = QuantizationConfig(
+        bits=8,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+        quantize_embeddings=True,
+    )
+    decoder_quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+        quantize_lm_head=True,
+        overrides={"lm_head": QuantizationOverride(bits=8)},
+    )
+    config = ArchitectureConfig(
+        tie_word_embeddings=True,
+        quantization=decoder_quantization,
+        component_quantization={
+            "decoder": decoder_quantization,
+            "embedding": embedding_quantization,
+        },
+    )
+    manifest = ComponentManifest(
+        (
+            ComponentDescriptor(
+                name="decoder",
+                module_attribute_path="decoder",
+                role="decoder",
+                source_paths=("lm_head",),
+            ),
+            ComponentDescriptor(
+                name="embedding",
+                module_attribute_path="embedding",
+                role="embedding",
+                source_paths=("model.embed_tokens",),
+            ),
+        ),
+        shared_weights=(
+            SharedWeightInfo(
+                name="word_embeddings",
+                kind="tied_word_embeddings",
+                canonical=SharedWeightEndpoint(
+                    component="embedding",
+                    parameter="model.embed_tokens.weight",
+                ),
+                aliases=(
+                    SharedWeightEndpoint(
+                        component="decoder",
+                        parameter="lm_head.weight",
+                    ),
+                ),
+            ),
+        ),
+    )
+    qweight = torch.zeros(32, 32, dtype=torch.uint8)
+    scales = torch.ones(32, 2)
+
+    result = adapt_model_weights(
+        nn.Module(),
+        {
+            "model.embed_tokens.weight_qweight": qweight,
+            "model.embed_tokens.weight_scales": scales,
+        },
+        config=config,
+        manifest=manifest,
+    )
+
+    assert result["lm_head.weight_qweight"] is qweight
+    assert result["lm_head.weight_scales"] is scales

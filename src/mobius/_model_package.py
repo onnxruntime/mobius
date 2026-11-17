@@ -29,7 +29,7 @@ import shutil
 import tempfile
 import threading
 from collections import UserDict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -41,8 +41,10 @@ import rfc8785
 import torch
 import tqdm
 
+from mobius._constants import LAZY_SOURCE_FILES_META_KEY
 from mobius._export_report import ComponentExportReport
 from mobius._optimizations import fold_initializers_after_weights
+from mobius._weight_utils import WeightTransform
 from mobius.adapters import (
     AdapterArtifact,
     AdapterServiceOptions,
@@ -201,6 +203,8 @@ def _validate_streaming_safetensors_destination(
     *,
     external_data: str,
     component_layout: _ComponentSaveLayout,
+    include_policy_components: bool = True,
+    include_adapter_artifacts: bool = True,
 ) -> None:
     """Defensively reject known aliases to files read by a streaming package.
 
@@ -262,13 +266,46 @@ def _validate_streaming_safetensors_destination(
                 _QUANTIZATION_REPORT,
                 _EXPORT_REPORT,
                 _WEIGHT_LOADING_REPORT,
+                "draft_manifest.json",
+                "gguf-reuse.json",
             )
         )
+        if include_policy_components:
+            output_files.update(
+                current_directory / "policies" / f"{name}.onnx"
+                for name in current_package.policy_components
+            )
+        if include_adapter_artifacts:
+            output_files.update(
+                _adapter_artifact_destinations(current_package, current_directory)
+            )
 
         source_directories.update(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_directories", ())
         )
+        # Derived lazy slices may own an external source that is no longer an
+        # initializer after graph cleanup (e.g. restored packed projections).
+        # Register that ownership before any output can be opened/truncated.
+        models = chain(
+            current_package.values(),
+            (
+                component.model
+                for component in current_package.policy_components.values()
+                if include_policy_components
+            ),
+        )
+        for model in models:
+            current_package.register_lazy_source_artifacts(
+                files=model.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+            )
+            for graph in model.graphs():
+                for initializer in graph.initializers.values():
+                    tensor = initializer.const_value
+                    if isinstance(tensor, ir.LazyTensor):
+                        current_package.register_lazy_source_artifacts(
+                            files=tensor.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+                        )
         source_files.update(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_files", ())
@@ -306,6 +343,21 @@ def _validate_streaming_safetensors_destination(
                     f"{str(source_file)!r} through the same path, a hard link, or "
                     "a symlink. Remove the alias or choose a separate output path."
                 )
+
+
+def _adapter_artifact_destinations(package: ModelPackage, directory: Path) -> Iterator[Path]:
+    """Inventory the actual files emitted by save_adapter_artifacts, without writes."""
+    options = package.adapter_service_options
+    for alias, artifact in package.adapter_artifacts.items():
+        root = directory / "adapters" / alias
+        if options.portable_fallback:
+            yield root / "adapter.json"
+        if options.preserve_source_format:
+            if artifact.source.format == "onnx_adapter":
+                yield root / "adapter.onnx_adapter"
+            elif artifact.source.format == "peft_safetensors":
+                yield root / "adapter_model.safetensors"
+                yield root / "adapter_config.json"
 
 
 def _validate_output_directory(
@@ -370,6 +422,7 @@ def _validate_mtp_save_paths(
     if (
         package.export_report is not None
         and package.gguf_reuse_plan is None
+        and getattr(package, "gguf_packed_sources", None) is None
         and (
             package.export_report.status == "partial"
             or package.export_report.runtime_validation_status == "unvalidated"
@@ -651,7 +704,7 @@ class ModelPackage(UserDict[str, ir.Model]):
 
     def _model_for_save(self, name: str, model: ir.Model) -> AbstractContextManager[ir.Model]:
         """Prepare component-local symbolic dimensions for serialization."""
-        return _namespaced_symbolic_dimensions(model, f"component.{name}")
+        return _anonymized_intermediate_symbolic_dimensions(model)
 
     def save(
         self,
@@ -675,6 +728,10 @@ class ModelPackage(UserDict[str, ir.Model]):
         each is saved in its own subfolder as ``{name}/model.onnx``. An attached
         :attr:`mtp_head` package is saved under a collision-free directory named
         by ``.mobius-package.json``.
+
+        Interface symbolic dimension names are preserved within each model.
+        Non-contractual intermediate symbols are anonymized during serialization;
+        in-memory shapes remain unchanged.
 
         .. note::
             This method writes ONNX files only.  If you need a directory that
@@ -745,6 +802,8 @@ class ModelPackage(UserDict[str, ir.Model]):
             directory,
             external_data=external_data,
             component_layout=component_layout,
+            include_policy_components=include_policy_components,
+            include_adapter_artifacts=include_adapter_artifacts,
         )
         _validate_mtp_save_paths(
             self,
@@ -756,6 +815,28 @@ class ModelPackage(UserDict[str, ir.Model]):
         )
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
+        if getattr(self, "gguf_packed_sources", None) is not None:
+            from mobius.integrations.gguf._packed import save_packed_package
+
+            if len(component_layout.components) != len(self):
+                raise ValueError("Lossless GGUF save does not support component filtering.")
+            if check_weights:
+                for name, model in self.items():
+                    _check_weights(name, model)
+            if (include_policy_components and self.policy_components) or (
+                include_adapter_artifacts and self.adapter_artifacts
+            ):
+                raise ValueError(
+                    "Lossless GGUF save does not yet package policy/adapter artifacts; "
+                    "save these separately or omit them explicitly."
+                )
+            save_packed_package(
+                self,
+                directory,
+                external_data=external_data,
+                max_shard_size_bytes=max_shard_size_bytes,
+            )
+            return
         reuse_plan = getattr(self, "gguf_reuse_plan", None)
         streaming_external_data = False
         current_package = self
@@ -1371,6 +1452,13 @@ class ModelPackage(UserDict[str, ir.Model]):
                     name = filename.removesuffix(".onnx")
                     models[name] = ir.load(os.path.join(directory, filename))
         package = cls(models)
+        if os.path.exists(os.path.join(directory, "gguf-packed.json")) or any(
+            model.metadata_props.get("mobius.gguf.original_external_data") == "1"
+            for model in models.values()
+        ):
+            from mobius.integrations.gguf._packed import restore_packed_sources
+
+            restore_packed_sources(package, directory)
         quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
         if os.path.lexists(quantization_report_path):
             if os.path.islink(quantization_report_path) or not os.path.isfile(
@@ -1424,7 +1512,8 @@ class ModelPackage(UserDict[str, ir.Model]):
         prefix_map: dict[str, str] | None = None,
         *,
         fold_constants: bool = True,
-    ) -> None:
+        weight_transforms: dict[str, WeightTransform] | None = None,
+    ) -> set[str]:
         """Apply weights from a state dict across component models.
 
         For single-component packages, all weights are applied to the sole
@@ -1441,16 +1530,33 @@ class ModelPackage(UserDict[str, ir.Model]):
                 Weights whose name starts with a prefix are applied to the
                 named component (with the prefix stripped). Unmatched weights
                 are applied to all components.
+            weight_transforms: Shape-preserving transforms keyed by names in
+                ``state_dict`` (the preprocessed names, before prefix routing),
+                evaluated without caching during serialization.
+
+        Returns:
+            The original state-dict names that matched package initializers.
         """
-        applied = self.apply_weights_partial(state_dict, prefix_map=prefix_map)
+        applied = self.apply_weights_partial(
+            state_dict,
+            prefix_map=prefix_map,
+            weight_transforms=weight_transforms,
+        )
+        if weight_transforms is not None:
+            unused = set(weight_transforms) - applied
+            if unused:
+                raise ValueError(f"Weight transforms were not bound: {sorted(unused)!r}.")
         _log_weight_mapping(state_dict, applied)
         if fold_constants:
             self.finalize_weights()
+        return applied
 
     def apply_weights_partial(
         self,
         state_dict: dict[str, torch.Tensor],
         prefix_map: dict[str, str] | None = None,
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
     ) -> set[str]:
         """Apply one weight shard without folding partially populated graphs.
 
@@ -1468,17 +1574,19 @@ class ModelPackage(UserDict[str, ir.Model]):
         if len(self.data) == 1:
             # Single component — apply all weights directly
             model = next(iter(self.data.values()))
-            applied = _apply_weights_to_model(model, state_dict)
+            applied = _apply_weights_to_model(model, state_dict, weight_transforms)
         elif prefix_map is None:
             # No routing info — try every weight against every model
             for model in self.data.values():
-                applied |= _apply_weights_to_model(model, state_dict)
+                applied |= _apply_weights_to_model(model, state_dict, weight_transforms)
         else:
             # Route by prefix
             routed: dict[str, dict[str, torch.Tensor]] = {name: {} for name in self.data}
+            routed_transforms: dict[str, dict[str, WeightTransform]] = {
+                name: {} for name in self.data
+            }
             unmatched: dict[str, torch.Tensor] = {}
-            # Track original HF names for weights that get stripped
-            stripped_to_original: dict[str, str] = {}
+            stripped_to_original: dict[tuple[str, str], str] = {}
 
             for weight_name, tensor in state_dict.items():
                 matched = False
@@ -1486,7 +1594,11 @@ class ModelPackage(UserDict[str, ir.Model]):
                     if weight_name.startswith(prefix):
                         stripped = weight_name[len(prefix) :].lstrip(".")
                         routed[component][stripped] = tensor
-                        stripped_to_original[stripped] = weight_name
+                        if weight_transforms is not None and weight_name in weight_transforms:
+                            routed_transforms[component][stripped] = weight_transforms[
+                                weight_name
+                            ]
+                        stripped_to_original[(component, stripped)] = weight_name
                         matched = True
                         break
                 if not matched:
@@ -1494,15 +1606,17 @@ class ModelPackage(UserDict[str, ir.Model]):
 
             for component_name, component_weights in routed.items():
                 applied_stripped = _apply_weights_to_model(
-                    self.data[component_name], component_weights
+                    self.data[component_name],
+                    component_weights,
+                    routed_transforms[component_name],
                 )
                 for s in applied_stripped:
-                    applied.add(stripped_to_original.get(s, s))
+                    applied.add(stripped_to_original.get((component_name, s), s))
 
             # Try unmatched weights against all models
             if unmatched:
                 for model in self.data.values():
-                    applied |= _apply_weights_to_model(model, unmatched)
+                    applied |= _apply_weights_to_model(model, unmatched, weight_transforms)
 
         return applied
 
@@ -1518,8 +1632,8 @@ class ModelPackage(UserDict[str, ir.Model]):
 @contextmanager
 def _namespaced_symbolic_dimensions(
     model: ir.Model,
-    namespace: str,
-) -> Iterator[ir.Model]:
+    namespace: str | None,
+) -> Generator[ir.Model, None, None]:
     """Namespace interface symbols and discard non-contractual intermediate aliases."""
     interface_values = {id(value) for value in (*model.graph.inputs, *model.graph.outputs)}
     values: dict[int, ir.Value] = {}
@@ -1552,6 +1666,9 @@ def _namespaced_symbolic_dimensions(
                     dimensions.append(ir.SymbolicDim(None))
                     changed = True
                     continue
+                if namespace is None:
+                    dimensions.append(dimension)
+                    continue
                 text = str(dimension)
                 dimensions.append(symbols.setdefault(text, f"{namespace}.{text}"))
                 changed = True
@@ -1565,6 +1682,15 @@ def _namespaced_symbolic_dimensions(
     finally:
         for value, shape in originals:
             value.shape = shape
+
+
+@contextmanager
+def _anonymized_intermediate_symbolic_dimensions(
+    model: ir.Model,
+) -> Generator[ir.Model, None, None]:
+    """Discard non-contractual intermediate aliases, preserving interface symbols."""
+    with _namespaced_symbolic_dimensions(model, None) as saved_model:
+        yield saved_model
 
 
 def _make_progress_callback():
@@ -1658,7 +1784,11 @@ def _log_weight_mapping(
         )
 
 
-def _apply_weights_to_model(model: ir.Model, state_dict: dict[str, torch.Tensor]) -> set[str]:
+def _apply_weights_to_model(
+    model: ir.Model,
+    state_dict: dict[str, torch.Tensor],
+    weight_transforms: dict[str, WeightTransform] | None = None,
+) -> set[str]:
     """Apply weights to a single model (internal helper).
 
     Uses :func:`_assign_weight` from ``_weight_loading`` for shape
@@ -1672,6 +1802,11 @@ def _apply_weights_to_model(model: ir.Model, state_dict: dict[str, torch.Tensor]
         if name not in model.graph.initializers:
             continue
 
-        _assign_weight(model.graph.initializers[name], tensor, name)
+        _assign_weight(
+            model.graph.initializers[name],
+            tensor,
+            name,
+            transform=weight_transforms.get(name) if weight_transforms is not None else None,
+        )
         applied.add(name)
     return applied

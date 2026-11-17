@@ -29,7 +29,15 @@ __all__ = [
     "Cosmos3OmniGeneratorConfig",
     "Cosmos3OmniGeneratorModel",
     "Cosmos3OmniGeneratorTask",
+    "CLMModel",
+    "CLMProjectionHead",
+    "CLMTask",
+    "ComponentConfig",
+    "ComponentRole",
+    "ComponentSpec",
     "ComponentInfo",
+    "SharedWeightEndpoint",
+    "SharedWeightInfo",
     "ComponentExportDisposition",
     "ComponentExportReport",
     "DepthAnythingConfig",
@@ -51,6 +59,10 @@ __all__ = [
     "ModelRegistry",
     "ModelTask",
     "MLPLatentDynamicsModel",
+    "MultiComponentModelTask",
+    "KevModel",
+    "KevPointerHead",
+    "KevTask",
     "MLPWorldModel",
     "MMSConfig",
     "OPSET_VERSION",
@@ -87,6 +99,7 @@ __all__ = [
     "adapter_source_from_onnx_adapter",
     "attach_peft_adapter",
     "build",
+    "build_clm_package",
     "build_context",
     "build_cosmos3_edge_world_model",
     "build_cosmos3_world_model",
@@ -95,6 +108,10 @@ __all__ = [
     "build_from_module",
     "build_from_nemo",
     "build_world_model",
+    "build_kev_package",
+    "KEV_08_PROVENANCE",
+    "KEV_VARIANTS",
+    "KevVariant",
     "compose_adapter_deltas",
     "components",
     "ep_capabilities",
@@ -120,7 +137,7 @@ __all__ = [
     "world_model_registry",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from mobius import components, generation, models, tasks
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
@@ -160,7 +177,12 @@ from mobius._cosmos3_edge_world_model import build_cosmos3_edge_world_model
 from mobius._cosmos3_world_model import build_cosmos3_world_model
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
 from mobius._export_report import ComponentExportDisposition, ComponentExportReport
-from mobius._inspect import ComponentInfo, inspect_components
+from mobius._inspect import (
+    ComponentInfo,
+    SharedWeightEndpoint,
+    SharedWeightInfo,
+    inspect_components,
+)
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model
 from mobius._pipeline import (
@@ -231,15 +253,30 @@ from mobius.models import (
     Cosmos3AVAEAudioTokenizer,
     Cosmos3OmniGeneratorModel,
     MLPLatentDynamicsModel,
+    KEV_08_PROVENANCE,
+    KEV_VARIANTS,
+    CLMModel,
+    CLMProjectionHead,
+    KevModel,
+    KevPointerHead,
+    KevVariant,
     MLPWorldModel,
+    build_clm_package,
+    build_kev_package,
 )
 from mobius.tasks import (
     CausalLMTask,
+    CLMTask,
     Cosmos3AVAEAudioDecoderTask,
     Cosmos3AVAEAudioTokenizerTask,
     Cosmos3OmniGeneratorTask,
+    ComponentConfig,
+    ComponentRole,
+    ComponentSpec,
+    KevTask,
     LatentDynamicsTask,
     ModelTask,
+    MultiComponentModelTask,
     WanVAETask,
     WorldModelTask,
 )

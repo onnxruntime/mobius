@@ -67,6 +67,39 @@ _DRAFT_RUNTIME_EVIDENCE_PATH = (
 )
 
 DOC_PATH = Path(__file__).resolve().parents[4] / "docs" / "gguf-capability-catalog.md"
+_LOSSLESS_SURVEY_PATH = (
+    Path(__file__).resolve().parents[4] / "testdata" / "evidence" / "gguf_opset29_survey.json"
+)
+
+
+def _lossless_survey() -> str:
+    evidence = json.loads(_LOSSLESS_SURVEY_PATH.read_text(encoding="utf-8"))
+    probe = evidence["architecture_probe"]
+    formats = ", ".join(f"`{record['name']}`" for record in evidence["format_tests"])
+    return f"""## Lossless opset-29 survey
+
+**Universe:** the pinned 148-architecture census and 25 active stored codecs, not every public checkpoint. Existing runtime evidence describes named legacy/float routes, not this new path.
+The [machine-readable survey](../testdata/evidence/gguf_opset29_survey.json) records every census architecture and bounded fixture attempts.
+
+| Layer | Verified scope | Remaining gap |
+|---|---|---|
+| Stored codecs | 24 separately tested real tiny GGUF files: original external byte ranges, checker, independent decode | Q2_0 is in ONNX but missing from the installed GGUF reader |
+| Model graphs | {probe["passed_count"]}/{probe["architecture_count"]} architecture fixture groups passed graph/checker; bounded to five files <=1 MiB per group | A blocked fixture group is not proof that every checkpoint of that architecture is unrepresentable |
+| Numerical/state behavior | Llama, Qwen2 shared-expert MoE and Qwen3 grouped MoE: prefill and two cached chunks against independently decoded reference graphs and dense ORT | No full-checkpoint, tokenizer or GPU execution claim |
+| Source packaging | Mixed typed/packed weights, split shards, BF16 and save/load preserve original GGUF files, offsets, lengths and hashes; folding cannot replace bindings | Flat same-directory package only; mmproj/MTP/nested sharing rejected |
+| Optimization/runtime | Selected-row embedding decode; GroupedMatMul for ordinary bias-free experts | GroupedMatMul consumes floating banks; selected-bank decode fusion and required ORT kernels remain runtime work |
+
+Individually tested codecs: {formats}. Presets such as Q4_K_M mix tensor codecs; they are not affine INT4.
+Tencent SEQ's custom two-bit Q1_0 differs from mainline's one-bit Q1_0 and is rejected. Q8_1/Q8_K are compute intermediates, not active stored-weight routes.
+
+The flag-on path retains source bytes without export-time dense expansion. Big-endian input, unknown/data-dependent layouts and floating inverse/offset preprocessing are rejected rather than rounded.
+Those models need direct original-parameter graph contracts. Shared/custom experts retain their established ONNX graph. Qwen3.8's mixed PLE/indexed-attention preflight restrictions remain in force.
+
+DequantizePacked FLOAT decoding and explicit output casts are compute semantics, not replacement weight storage. Former lossy affine/requantization routes are removed; flag-off cases raise actionable errors.
+
+No new ONNX spec gap was established. DequantizePacked-29 satisfies [onnx/onnx#8359](https://github.com/onnx/onnx/issues/8359)'s primary request; it is not an unresolved representation blocker.
+Flat packaging, reader enums, model contracts, inference implementations and runtime kernels are separate implementation gaps. See [usage](api/build_from_gguf.md#original-gguf-external-data-opset-29).
+"""
 
 
 def _cell(value: object) -> str:
@@ -112,7 +145,8 @@ def _summary() -> str:
                 f"runtime: {dict(sorted(runtime_counts.items()))} |"
             ),
             (
-                f"| Active stored qtypes | {len(stored)} | {len(routed)} have an import route; "
+                f"| Active stored qtypes | {len(stored)} | {len(routed)} have an exact legacy "
+                "packed or explicit-float route; "
                 f"{len(stored) - len(routed)} are explicitly deferred with no route |"
             ),
             (
@@ -198,10 +232,17 @@ def _architectures() -> str:
     rows = [
         (
             "| Canonical architecture | Aliases | Import route | Tensor exactness | "
-            "Config/tensor/graph/runtime/quantized import | Restriction or evidence gap |"
+            "Config/tensor/graph/runtime/quantized import | Opset29 fixture graph/checker | "
+            "Restriction or evidence gap |"
         ),
-        "|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|",
     ]
+    lossless = {
+        record["architecture"]: record["opset29_fixture_graph_checker"]
+        for record in json.loads(_LOSSLESS_SURVEY_PATH.read_text(encoding="utf-8"))[
+            "census_architectures"
+        ]
+    }
     upstream = upstream_architectures()
     for spec in sorted(iter_arch_specs(), key=lambda item: item.gguf_arch):
         aliases = ", ".join(f"`{alias}`" for alias in sorted(spec.aliases)) or "—"
@@ -230,7 +271,8 @@ def _architectures() -> str:
         reason = _architecture_reason(spec)
         rows.append(
             f"| `{spec.gguf_arch}` | {aliases} | {_cell(route)} | {_cell(exactness)} | "
-            f"{_cell(_status(spec.capabilities))} | {_cell(reason)} |"
+            f"{_cell(_status(spec.capabilities))} | "
+            f"{_cell(lossless.get(spec.gguf_arch, 'not-probed'))} | {_cell(reason)} |"
         )
     return "\n".join(rows)
 
@@ -776,6 +818,8 @@ machine review; see [`build_from_gguf()`](api/build_from_gguf.md) for user instr
 
 The [model catalog](model-catalog.md) covers HuggingFace model registrations. It does not
 imply GGUF import or runtime support; those capability-specific claims live only here.
+
+{_lossless_survey()}
 
 <!-- BEGIN GGUF CLOSURE SUMMARY -->
 

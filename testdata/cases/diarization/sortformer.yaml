@@ -1,0 +1,26 @@
+model_id: "nvidia/diar_streaming_sortformer_4spk-v2.1"
+model_type: "sortformer"
+revision: "fafaab5faa1617a0ca52d38dd3dc4bd636800d3d"
+task_type: "diarization"
+dtype: "float32"
+reference_loader: "nemo"
+
+level: "L4+L5"
+
+notes: >
+  Offline (non-streaming) speaker diarization. The golden reference is a
+  deterministic synthetic mel fixture (seeded torch.randn) run through the
+  real NeMo SortformerEncLabelModel (frontend_encoder -> forward_infer),
+  restored from the .nemo archive on HuggingFace Hub via nemo_toolkit (not a
+  mobius runtime dependency -- see scripts/generate_golden.py's sortformer
+  branch). The companion sortformer_probs.npz stores the mel input and the
+  per-frame per-speaker sigmoid probabilities; compare_golden()'s argmax/
+  top-K gate does not apply to this continuous output, so L4 is compared
+  with compare_diarization_golden() (elementwise atol/rtol). L5 additionally
+  checks that the two downstream diarization decisions a consumer reads --
+  the per-frame dominant-speaker argmax and the binarized (threshold 0.5)
+  active-speaker set -- reproduce NeMo's exactly over the whole utterance.
+  The golden's provenance.nemo_commit records the exact upstream nemo_toolkit
+  git commit used, for reproducibility. Regenerate with
+  `python scripts/generate_golden.py --case testdata/cases/diarization/sortformer.yaml`
+  inside an environment with `pip install "nemo_toolkit[asr]"`.
