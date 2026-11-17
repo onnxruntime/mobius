@@ -11,6 +11,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
+from mobius.components._paged_attention import DensePagedState, paged_dense_attention
 from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 
@@ -327,8 +328,6 @@ class Attention(nn.Module):
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
     ):
-        from mobius.components._paged_attention import DensePagedState, paged_dense_attention
-
         query_states, key_states, value_states = self._project_qkv(op, hidden_states)
         if not math.isclose(self._key_multiplier, 1.0):
             key_states = op.Mul(key_states, self._key_multiplier)
