@@ -2121,6 +2121,14 @@ def build_mmproj_from_gguf(
         projector_type=projector_type,
         target_architecture=target_architecture,
     )
+    from mobius._flags import flags
+
+    if flags.experimental_opset29 and projector_type != "janus_pro":
+        raise NotImplementedError(
+            "Lossless standalone mmproj conversion currently supports only the exact "
+            "'janus_pro' route. Disable experimental_opset29 for float-materialized "
+            f"{projector_type!r} conversion."
+        )
     if spec.runtime is not Support.SUPPORTED:
         warnings.warn(
             f"clip projector {projector_type!r} exports an exact ONNX component, "
@@ -4382,13 +4390,38 @@ def build_remaining_vision_projector_from_gguf(
         model.metadata_props["mobius.runtime_support"] = (
             "standalone-sidecar-only; paired multimodal runtime unvalidated"
         )
-    state_dict = remaining_projector_state_dict(mmproj_gguf, projector_type)
-    validate_remaining_projector_state_dict(
-        package["vision_encoder"],
-        state_dict,
-        projector_type,
-    )
-    package.apply_weights(state_dict)
+    from mobius._flags import flags
+
+    if flags.experimental_opset29:
+        if projector_type != "janus_pro":
+            raise NotImplementedError(
+                "Lossless standalone vision-projector conversion currently supports "
+                "only 'janus_pro'; this route requires source-layout transforms."
+            )
+        from mobius.integrations.gguf._packed import bind_packed_weights
+        from mobius.integrations.gguf._remaining_projectors import (
+            map_remaining_projector_weight,
+        )
+
+        def name_mapper(name: str, _architecture: str) -> str | None:
+            return map_remaining_projector_weight(name, projector_type)
+
+        bind_packed_weights(
+            package,
+            mmproj_gguf,
+            GGUFVisionProjectorModel(vision_encoder),
+            config,
+            name_mapper=name_mapper,
+            preprocess=lambda state: state,
+        )
+    else:
+        state_dict = remaining_projector_state_dict(mmproj_gguf, projector_type)
+        validate_remaining_projector_state_dict(
+            package["vision_encoder"],
+            state_dict,
+            projector_type,
+        )
+        package.apply_weights(state_dict)
     _require_loaded_projector_initializers(package, projector_type)
     package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
     package.gguf_projector_type = projector_type  # type: ignore[attr-defined]

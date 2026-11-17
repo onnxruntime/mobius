@@ -5,17 +5,81 @@
 
 from __future__ import annotations
 
+import numpy as np
 import onnx_ir as ir
 import pytest
 
+from mobius._build_context import build_context
 from mobius._builder import _cast_module_dtype
+from mobius._execution_providers import EpCapabilities
+from mobius._flags import override_flags
 from mobius._testing import (
     count_op_type,
     create_test_builder,
     create_test_input,
     make_config,
 )
-from mobius.components._gated_deltanet import GatedDeltaNet
+from mobius._testing.ort_inference import OnnxModelSession
+from mobius.components._gated_deltanet import GatedDeltaNet, OriginalDecayGatedDeltaNet
+from mobius.tasks._base import _make_graph
+
+
+class _DecayProbe(GatedDeltaNet):
+    def forward(self, op, reference, conv_state=None, rec_state=None):
+        return self._decay_coefficient(op, reference)
+
+
+class _OriginalDecayProbe(OriginalDecayGatedDeltaNet):
+    def forward(self, op, reference, conv_state=None, rec_state=None):
+        return self._decay_coefficient(op, reference)
+
+
+def _run_decay_probe(probe_class, stored_coefficient):
+    config = make_config(
+        linear_num_value_heads=2,
+        linear_num_key_heads=1,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        linear_conv_kernel_dim=2,
+    )
+    probe = probe_class(config)
+    probe.A_log.const_value = ir.tensor(np.asarray(stored_coefficient, dtype=np.float32))
+    builder, op, graph = create_test_builder()
+    reference = create_test_input(builder, "reference", [2])
+    output = probe(op, reference)
+    builder.add_output(output, "coefficient")
+    model = ir.Model(graph, ir_version=10)
+    session = OnnxModelSession(model)
+    try:
+        return session.run({"reference": np.zeros(2, dtype=np.float32)})["coefficient"]
+    finally:
+        session.close()
+
+
+def test_original_decay_subclass_consumes_negative_coefficient_directly():
+    source_coefficient = np.array([-2.0, -0.25], dtype=np.float32)
+    actual = _run_decay_probe(_OriginalDecayProbe, source_coefficient)
+    np.testing.assert_array_equal(actual, source_coefficient)
+
+
+def test_original_decay_matches_log_parameterization_numerically():
+    magnitudes = np.array([2.0, 0.25], dtype=np.float32)
+    original = _run_decay_probe(_OriginalDecayProbe, -magnitudes)
+    reparameterized = _run_decay_probe(_DecayProbe, np.log(magnitudes))
+    np.testing.assert_allclose(original, reparameterized, rtol=1e-6, atol=0)
+
+
+def test_original_decay_preserves_a_log_parameter_boundary():
+    module = OriginalDecayGatedDeltaNet(
+        make_config(
+            linear_num_value_heads=2,
+            linear_num_key_heads=1,
+            linear_key_head_dim=2,
+            linear_value_head_dim=2,
+            linear_conv_kernel_dim=2,
+        )
+    )
+    assert "A_log" in dict(module.named_parameters())
 
 
 @pytest.mark.parametrize(
@@ -117,6 +181,50 @@ class TestGatedDeltaNet:
         # No Scan/Conv in parent graph — all inside functions
         assert count_op_type(graph, "Scan") == 0
         assert count_op_type(graph, "Conv") == 0
+
+    @pytest.mark.opset29
+    def test_opset29_uses_standard_flash_next_abi(self):
+        config = self._make_deltanet_config()
+        dn = GatedDeltaNet(config)
+        caps = EpCapabilities(name="standard", supports_fused_moe=False)
+        with override_flags(experimental_opset29=True), build_context(caps):
+            graph, builder = _make_graph()
+            op = builder.op
+            hidden = create_test_input(builder, "hidden", [1, 1, 64])
+            conv_state = create_test_input(builder, "conv_state", [1, 128, 3])
+            rec_state = create_test_input(builder, "rec_state", [1, 4, 16, 16])
+            dn(op, hidden, conv_state, rec_state)
+
+        attention = next(node for node in graph if node.op_type == "LinearAttention")
+        assert attention.domain == ""
+        assert attention.version == 29
+        assert attention.attributes["q_num_heads"].value == 2
+        assert attention.attributes["kv_num_heads"].value == 2
+        assert attention.attributes["v_num_heads"].value == 4
+
+    def test_opset24_keeps_contrib_fallback(self):
+        config = self._make_deltanet_config()
+        dn = GatedDeltaNet(config)
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 1, 64])
+        conv_state = create_test_input(builder, "conv_state", [1, 128, 3])
+        rec_state = create_test_input(builder, "rec_state", [1, 4, 16, 16])
+        dn(op, hidden, conv_state, rec_state)
+        attention = next(node for node in graph if node.op_type == "LinearAttention")
+        assert attention.domain == "com.microsoft"
+
+    def test_forward_initializes_missing_states(self):
+        config = self._make_deltanet_config()
+        dn = GatedDeltaNet(config)
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 4, 64])
+
+        output, new_conv, new_rec = dn(op, hidden, None, None)
+        builder._adapt_outputs([output, new_conv, new_rec], "")
+
+        assert count_op_type(graph, "Expand") >= 2
+        assert count_op_type(graph, "CausalConvWithState") == 1
+        assert count_op_type(graph, "LinearAttention") == 1
 
     def test_forward_has_sigmoid_for_beta(self):
         config = self._make_deltanet_config()

@@ -25,7 +25,7 @@ from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import urlparse
 
 import numpy as np
@@ -6853,7 +6853,15 @@ def build_from_gguf(
     # A companion mmproj GGUF turns this into a multimodal build: the text +
     # vision/audio encoders are assembled by the dedicated VLM builder. Keep
     # build_from_gguf as the single public entry point (text-only or multimodal).
+    from mobius._flags import flags
+
+    lossless_packed = flags.experimental_opset29 and keep_quantized
     if mmproj is not None:
+        if lossless_packed:
+            raise ValueError(
+                "Lossless opset29 GGUF companion-projector packaging is not implemented. "
+                "Text-only lossless export is available; no requantized fallback is allowed."
+            )
         if reuse_gguf_weights:
             raise ValueError(
                 "reuse_gguf_weights=True does not yet support multimodal/mmproj packages."
@@ -7020,6 +7028,8 @@ def build_from_gguf(
         source=str(gguf_path),
         keep_quantized=keep_quantized,
     )
+    if lossless_packed:
+        reuse_gguf_weights = False
     if reuse_gguf_weights and isinstance(gguf_model, GgufShardSet):
         raise ValueError(
             "reuse_gguf_weights=True does not yet support multi-shard GGUF sets. "
@@ -7069,7 +7079,11 @@ def build_from_gguf(
             "dynamic concat-grow KV cache; refusing to silently omit the sidecar"
         )
     logger.info("Loaded GGUF model: %s (arch=%s)", gguf_path, gguf_arch)
-    preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
+    preserve_quantization = (
+        keep_quantized
+        and not lossless_packed
+        and _has_quantized_weights(gguf_model, gguf_arch)
+    )
     arch_spec = try_get_arch_spec(gguf_arch)
     if (
         preserve_quantization
@@ -7540,11 +7554,24 @@ def build_from_gguf(
             preserve_quantization=preserve_quantization,
             execution_provider=execution_provider,
             on_preflight=combine_mtp_report,
+            lossless_packed=lossless_packed,
         )
         if not mtp_preflight_received:
             warning = quantization_report.warning_message()
             if warning is not None:
                 logger.warning("%s", warning)
+    if lossless_packed:
+        _replace_grouped_moe_layers(module)
+    effective_norms = False
+    original_decay_paths: frozenset[str] = frozenset()
+    if lossless_packed:
+        from mobius.integrations.gguf._packed import (
+            use_original_gguf_decay,
+            use_original_gguf_norms,
+        )
+
+        effective_norms = use_original_gguf_norms(module, gguf_arch)
+        original_decay_paths = use_original_gguf_decay(module, config)
     pkg = build_from_module(
         module, config, resolved_task, execution_provider=execution_provider
     )
@@ -7557,7 +7584,19 @@ def build_from_gguf(
 
     # 6. Load tensors from GGUF → state_dict
     reuse_candidates_by_id = {} if reuse_gguf_weights else None
-    if preserve_quantization:
+    if lossless_packed:
+        from mobius.integrations.gguf._packed import bind_packed_weights
+
+        bind_packed_weights(
+            pkg,
+            gguf_model,
+            module,
+            config,
+            effective_norms=effective_norms,
+            original_decay_paths=original_decay_paths,
+        )
+        state_dict = {}
+    elif preserve_quantization:
         state_dict = _load_quantized_state_dict(
             gguf_model,
             gguf_arch,
@@ -7622,7 +7661,7 @@ def build_from_gguf(
     state_dict = _normalize_gguf_weights(state_dict, gguf_arch, config)
 
     # 8. Run model-specific preprocess_weights (HF → ONNX names)
-    if hasattr(module, "preprocess_weights"):
+    if hasattr(module, "preprocess_weights") and not lossless_packed:
         state_dict = module.preprocess_weights(state_dict)
     if is_draft_architecture(gguf_arch):
         state_dict.pop("d2t", None)
@@ -7632,7 +7671,7 @@ def build_from_gguf(
     pkg.apply_weights(
         state_dict,
         prefix_map=prefix_map,
-        fold_constants=not reuse_gguf_weights,
+        fold_constants=not (reuse_gguf_weights or lossless_packed),
     )
     bind_shared_initializers = getattr(resolved_task, "bind_shared_initializers", None)
     if callable(bind_shared_initializers):
@@ -7706,7 +7745,8 @@ def build_from_gguf(
             "execution_provider": execution_provider,
             "model_type": spec.model_type,
             "module_type": module_type,
-            "preserve_quantization": preserve_quantization,
+            "preserve_quantization": preserve_quantization or lossless_packed,
+            "original_gguf_external_data": lossless_packed,
             "registry_import": {
                 "config_key_map": spec.config_key_map,
                 "config_postprocessor": spec.config_postprocessor,
@@ -7908,6 +7948,38 @@ def _replace_child_module(root, path: str, replacement) -> None:
     setattr(parent, child_name, replacement)
 
 
+def _replace_grouped_moe_layers(module) -> list[str]:
+    """Replace only exact, proven float MoE compositions with grouped dispatch."""
+    from mobius.components import (
+        MLP,
+        GroupedGatedSharedMoELayer,
+        GroupedMoELayer,
+        GroupedUngatedSharedMoELayer,
+        MoELayer,
+    )
+    from mobius.models.lfm2 import GroupedLfm2MoEFeedForward, Lfm2MoEFeedForward
+    from mobius.models.moe import Qwen2MoELayer, UngatedSharedMoELayer
+    from mobius.models.qwen35 import Qwen35MoEBlock
+
+    exact_replacements = {
+        MoELayer: GroupedMoELayer,
+        Qwen2MoELayer: GroupedGatedSharedMoELayer,
+        Qwen35MoEBlock: GroupedGatedSharedMoELayer,
+        UngatedSharedMoELayer: GroupedUngatedSharedMoELayer,
+        Lfm2MoEFeedForward: GroupedLfm2MoEFeedForward,
+    }
+    replaced: list[str] = []
+    for name, child in list(module.named_modules()):
+        replacement_type = exact_replacements.get(type(child))
+        if replacement_type is None or not child.experts:
+            continue
+        if any(type(expert) is not MLP for expert in child.experts):
+            continue
+        _replace_child_module(module, name, replacement_type(child))
+        replaced.append(name)
+    return replaced
+
+
 def _replace_native_block_linears(
     module,
     gguf_model,
@@ -8006,6 +8078,9 @@ def _normalize_gguf_weights(
     state_dict: dict,
     gguf_arch: str | None = None,
     config=None,
+    *,
+    effective_norms: bool = False,
+    original_decay_paths: frozenset[str] = frozenset(),
 ) -> dict:
     """Normalize GGUF-specific weight shapes to match HF conventions.
 
@@ -8052,7 +8127,7 @@ def _normalize_gguf_weights(
     """
     import torch
 
-    offset_norms = gguf_arch in _OFFSET_NORM_GGUF_ARCHS
+    offset_norms = gguf_arch in _OFFSET_NORM_GGUF_ARCHS and not effective_norms
 
     result: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
@@ -8181,7 +8256,11 @@ def _normalize_gguf_weights(
         # projection so Mamba/PLaMo SSM modules (which consume ``A = -exp(A_log)``
         # directly) are left untouched.
         if key.endswith(".linear_attn.A_log"):
-            result[key] = torch.log(-value)
+            result[key] = (
+                value
+                if key.removesuffix(".A_log") in original_decay_paths
+                else torch.log(-value)
+            )
             continue
 
         # Zero-centered RMSNorm: undo the converter's baked-in ``+1`` so
@@ -8890,7 +8969,9 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
         )
         raise ValueError(
             "GGUF contains stored qtypes that cannot be imported safely: "
-            f"{details} Re-quantize those tensors to a supported qtype."
+            f"{details} Enable MOBIUS_EXPERIMENTAL_OPSET29=1 and use "
+            "--ep onnx-standard for original GGUF external weights. "
+            "Lossy requantization is no longer supported."
         )
 
     native_counts = Counter(
@@ -9077,14 +9158,13 @@ def _require_supported_requantization(
     bits: int,
     block_size: int,
     tensor_name: str,
-) -> None:
-    if bits != 4 or block_size != 32:
-        raise ValueError(
-            "keep_quantized MatMulNBits requantization currently supports only "
-            f"4-bit/block-32 targets; got bits={bits} block={block_size} "
-            f"for tensor {tensor_name}. Use keep_quantized=False or a "
-            "4-bit/block-32 target."
-        )
+) -> NoReturn:
+    raise ValueError(
+        f"GGUF tensor {tensor_name} cannot be converted exactly to "
+        f"INT{bits}/block-{block_size}. Lossy requantization was removed; enable "
+        "MOBIUS_EXPERIMENTAL_OPSET29=1 and use --ep onnx-standard "
+        "to preserve original GGUF bytes with DequantizePacked."
+    )
 
 
 def repack_gguf_weight_to_target(
@@ -9103,7 +9183,7 @@ def repack_gguf_weight_to_target(
 
     Reuses the shared repacker machinery: a tensor whose native repacked layout
     already matches ``(target_bits, target_block_size)`` is repacked directly;
-    otherwise it is dequantized and requantized to the target layout. This is
+    otherwise the conversion is rejected with an opset-29 migration message. This is
     the single-tensor building block reused by both the text-only
     (:func:`_load_quantized_state_dict`) and the multimodal quantized loaders.
 
@@ -9114,8 +9194,8 @@ def repack_gguf_weight_to_target(
         np_shape: The tensor's logical ``(N, K)`` shape.
         target_bits: Target MatMulNBits bit width.
         target_block_size: Target MatMulNBits block size.
-        target_symmetric: Whether the requantization path should omit
-            zero-points (symmetric). Only used when requantizing.
+        target_symmetric: Retained for caller compatibility; no requantization
+            path is permitted.
         tensor_name: Name used for error messages.
 
     Returns:
@@ -9126,7 +9206,6 @@ def repack_gguf_weight_to_target(
     from mobius.integrations.gguf._quant_registry import quant_import_decision
     from mobius.integrations.gguf._repacker import (
         can_repack,
-        repack_dequantized_tensor,
         repack_gguf_tensor,
     )
     from mobius.integrations.gguf._spec import QuantImportRoute
@@ -9157,13 +9236,6 @@ def repack_gguf_weight_to_target(
         bits=target_bits,
         block_size=target_block_size,
         tensor_name=tensor_name,
-    )
-    values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
-    return repack_dequantized_tensor(
-        values,
-        bits=target_bits,
-        block_size=target_block_size,
-        symmetric=target_symmetric,
     )
 
 
@@ -9277,7 +9349,6 @@ def _load_quantized_state_dict(
     from mobius.integrations.gguf._repacker import (
         can_repack,
         preserve_native_blocks,
-        repack_dequantized_tensor,
         repack_gguf_tensor,
     )
     from mobius.integrations.gguf._spec import QuantImportRoute, TensorRole
@@ -9722,28 +9793,12 @@ def _load_quantized_state_dict(
                         block_size=target_block_size,
                         tensor_name=hf_name,
                     )
-                    values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
-                    repacked = repack_dequantized_tensor(
-                        values.reshape(aggregate_shape),
-                        bits=target_bits,
-                        block_size=target_block_size,
-                        symmetric=target_symmetric,
-                    )
-                    n_requantized += 1
             else:
                 _require_supported_requantization(
                     bits=target_bits,
                     block_size=target_block_size,
                     tensor_name=hf_name,
                 )
-                values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
-                repacked = repack_dequantized_tensor(
-                    values.reshape(aggregate_shape),
-                    bits=target_bits,
-                    block_size=target_block_size,
-                    symmetric=target_symmetric,
-                )
-                n_requantized += 1
 
             packed = repacked.weight.reshape(num_experts, n_out, *repacked.weight.shape[1:])
             scales = repacked.scales.reshape(num_experts, n_out, *repacked.scales.shape[1:])
@@ -9803,22 +9858,11 @@ def _load_quantized_state_dict(
                         f"expects INT{target_bits} block-{target_block_size}."
                     )
             elif is_reshaped_mla_projection:
-                values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
-                if hf_name.endswith(".k_b_proj.weight"):
-                    values = values.transpose(0, 2, 1).reshape(
-                        int(np_shape[0]) * int(np_shape[2]), int(np_shape[1])
-                    )
-                else:
-                    values = values.reshape(
-                        int(np_shape[0]) * int(np_shape[1]), int(np_shape[2])
-                    )
-                repacked = repack_dequantized_tensor(
-                    values,
+                _require_supported_requantization(
                     bits=target_bits,
                     block_size=target_block_size,
-                    symmetric=target_symmetric,
+                    tensor_name=hf_name,
                 )
-                n_requantized += 1
             elif route is QuantImportRoute.AFFINE_REPACK and can_repack(qtype_val):
                 shape_2d = (int(np_shape[0]), int(np_shape[1]))
                 repacked = repack_gguf_tensor(
@@ -9832,28 +9876,12 @@ def _load_quantized_state_dict(
                         block_size=target_block_size,
                         tensor_name=hf_name,
                     )
-                    values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
-                    repacked = repack_dequantized_tensor(
-                        values,
-                        bits=target_bits,
-                        block_size=target_block_size,
-                        symmetric=target_symmetric,
-                    )
-                    n_requantized += 1
             else:
                 _require_supported_requantization(
                     bits=target_bits,
                     block_size=target_block_size,
                     tensor_name=hf_name,
                 )
-                values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
-                repacked = repack_dequantized_tensor(
-                    values,
-                    bits=target_bits,
-                    block_size=target_block_size,
-                    symmetric=target_symmetric,
-                )
-                n_requantized += 1
             w = torch.from_numpy(repacked.weight)
             s = torch.from_numpy(repacked.scales)
 

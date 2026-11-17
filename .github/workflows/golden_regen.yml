@@ -49,6 +49,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Create virtual environment
+        run: |
+          # Keep the shared CPU/CUDA job off the A10 image's externally managed pip.
+          "$pythonLocation/bin/python" -m venv "$RUNNER_TEMP/mobius-venv"
+
       - name: Cache pip packages
         uses: actions/cache@v6
         with:
@@ -67,26 +72,34 @@ jobs:
 
       - name: Install PyTorch (CPU)
         if: inputs.device != 'cuda'
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+        run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install PyTorch (CUDA)
         if: inputs.device == 'cuda'
-        run: pip install torch --index-url https://download.pytorch.org/whl/cu124
+        run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cu124
 
       - name: Install onnxruntime (CPU)
         if: inputs.device != 'cuda'
-        run: pip install onnxruntime
+        run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install onnxruntime
 
       - name: Install dependencies
         run: |
-          pip install -r requirements/ci/requirements.txt
-          pip install -e '.[testing,transformers]'
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
+          python -m pip install -r requirements/ci/requirements.txt
+          python -m pip install -e '.[testing,transformers]'
 
       - name: Install onnxruntime (GPU)
         if: inputs.device == 'cuda'
         run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
           # Install after project dependencies so the CPU ORT package cannot overwrite it.
-          pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
+          python -m pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
 
       - name: Reject trust_remote_code cases
         run: |
@@ -102,6 +115,7 @@ jobs:
           FILTER_PATTERN: ${{ inputs.filter }}
           DEVICE: ${{ inputs.device || 'cpu' }}
         run: |
+          source "$RUNNER_TEMP/mobius-venv/bin/activate"
           args=(--force)
           if [ -n "$FILTER_PATTERN" ]; then
             args+=(--filter "$FILTER_PATTERN")
@@ -178,3 +192,7 @@ jobs:
           name: golden-files
           path: testdata/golden/
           retention-days: 30
+
+      - name: Clean up virtual environment
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/mobius-venv"

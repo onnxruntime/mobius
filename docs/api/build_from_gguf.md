@@ -22,6 +22,61 @@ package.save("output")
 Quantized target storage is requested by default. Use
 `keep_quantized=False` when the output must use float storage.
 
+## Original GGUF external data (opset 29)
+
+Enable `MOBIUS_EXPERIMENTAL_OPSET29=1`, retain `keep_quantized=True`, and select
+`execution_provider="onnx-standard"`. Save **beside the original GGUF file(s)**:
+Construction does not require installed opset-29 schemas. Checking and reference
+execution require ONNX with `DequantizePacked-29` and `GroupedMatMul-29` schemas.
+
+```bash
+MOBIUS_EXPERIMENTAL_OPSET29=1 mobius build-gguf weights/model.gguf \
+    --ep onnx-standard --output weights
+```
+
+The experimental path keeps original typed tensors and packed payloads as ONNX
+external-data ranges in those files. It emits `DequantizePacked` and standard
+layout operations, with `GroupedMatMul` for ordinary routed experts. It does not
+repack, requantize, copy payloads into a new blob, or materialize a dense vocabulary
+at export time. Row-aligned packed embeddings decode only requested rows.
+
+Multi-component and MTP packages share immutable, little-endian GGUF shards.
+Keep uniquely named sources in the output directory; load/save verifies their
+digests and bindings. Multi-component saves publish atomically through
+`gguf-packed.json`. Transcoding, new weight sharding, and included policy/adapter
+artifacts are unsupported.
+The manifest records source filenames, sizes and hashes for integrity, plus each
+component's graph file and MTP depth for loading.
+
+Standalone lossless mmproj supports `janus_pro`:
+
+```python
+from mobius.integrations.gguf import build_mmproj_from_gguf
+
+vision = build_mmproj_from_gguf(
+    "weights/mmproj.gguf",
+    projector_type="janus_pro",
+    target_architecture="llama",
+    execution_provider="onnx-standard",
+)
+vision.save("weights")
+```
+
+Other lossless projectors and paired `mmproj=` insertion are unsupported.
+MTP retains its architecture-specific sharing contract, one physical prediction
+block and independent dynamic cache; speculative acceptance policy is not included.
+
+Grouped dispatch covers ordinary/shared MLP experts, LFM2MoE and Flash-Next,
+not every specialized MoE. Unfused dequantization still needs full-bank workspace.
+Flash-Next uses the merged `LinearAttention-29` value-head ABI (onnx/onnx#8693);
+optional recurrence trajectories do not provide whole-model state rollback.
+The flag does **not** add runtime kernels. See the
+[opset-29 survey](../gguf-capability-catalog.md#lossless-opset-29-survey).
+
+Former lossy affine/requantization routes now raise actionable errors when the
+flag is off. Exact legacy routes remain available. Explicit `--dequantize` is a
+separate float-storage choice, not source-byte preservation.
+
 ## Signature
 
 ```python
@@ -48,7 +103,7 @@ def build_from_gguf(
 | `gguf_path` | GGUF model path. |
 | `task` | Optional task override; otherwise selected from GGUF architecture metadata. |
 | `dtype` | Target float dtype, such as `"f32"`, `"f16"`, or `"bf16"`. |
-| `keep_quantized` | Request quantized target storage where the selected graph and qtype route support it. This does not promise source-byte or numerical fidelity. |
+| `keep_quantized` | Request supported exact legacy packed storage; with the opset-29 flag, retain original GGUF external payloads. Unsupported routes fail rather than requantize. |
 | `execution_provider` | Target EP for EP-aware graph optimization; `"default"` emits portable ONNX. |
 | `mmproj` | Companion projector GGUF for a registry-evidenced multimodal route. |
 | `image_token_id` | Processor-owned image placeholder ID for an `mmproj` package. |

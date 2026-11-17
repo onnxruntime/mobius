@@ -78,6 +78,10 @@ runs ordinary dense attention under that mask. This is numerically faithful,
 including contiguous left padding, but it does not provide the memory savings
 of a dedicated sparse-attention runtime kernel.
 
+Transformers configs may call QSA layers `full_attention` (checkpoint JSON) or
+`indexed_attention` (current normalized config). Both map to Mobius's
+`qwen_sparse_attention`; they do not select ordinary dense-attention semantics.
+
 ## Standard-ONNX-only export
 
 Select the existing `execution_provider="onnx-standard"` to export the text

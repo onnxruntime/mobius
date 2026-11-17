@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import inspect
 import itertools
+import threading
 import weakref
 
 import onnx_ir as ir
@@ -502,9 +504,12 @@ def test_non_int3_export_rejects_invalid_scales(fc1, fc2, projection, invalid):
 @pytest.mark.parametrize("fc1,fc2", _INT3_PAIRS)
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
 @pytest.mark.parametrize("layers", [1, 3])
+@pytest.mark.parametrize("max_workers", [1, 2, 8])
 def test_int3_deferred_interleave_preserves_storage_and_releases_outputs(
-    tmp_path, fc1, fc2, dtype, layers
+    tmp_path, fc1, fc2, dtype, layers, max_workers
 ):
+    if max_workers > 1 and "max_workers" not in inspect.signature(ir.save).parameters:
+        pytest.skip("Concurrent external-data writes require onnx-ir >= 1.1.")
     config = _config(fc1, fc2, dtype)
     config = dataclasses.replace(
         config,
@@ -530,14 +535,23 @@ def test_int3_deferred_interleave_preserves_storage_and_releases_outputs(
     processed = module.preprocess_weights(dict(raw), weight_transforms=transforms)
     calls = []
     outputs = []
+    lock = threading.Lock()
+    overlap = threading.Barrier(2, timeout=10)
     for name, transform in tuple(transforms.items()):
 
         def recorded(tensor, fn=transform, key=name, source=processed[name]):
             assert tensor.data_ptr() == source.data_ptr()
-            assert all(reference() is None for reference in outputs)
-            calls.append(key)
+            with lock:
+                if max_workers == 1:
+                    assert all(reference() is None for reference in outputs)
+                call_index = len(calls)
+                calls.append(key)
             output = fn(tensor)
-            outputs.append(weakref.ref(output))
+            with lock:
+                outputs.append(weakref.ref(output))
+            if max_workers > 1 and call_index < 2:
+                # Require two materialized outputs to overlap, not just two workers.
+                overlap.wait()
             return output
 
         transforms[name] = recorded
@@ -558,10 +572,13 @@ def test_int3_deferred_interleave_preserves_storage_and_releases_outputs(
     package.apply_weights(processed, weight_transforms=transforms)
     assert calls == []
     for directory in ("first", "second"):
-        package.save(str(tmp_path / directory), progress_bar=False)
+        calls.clear()
+        outputs.clear()
+        package.save(str(tmp_path / directory), progress_bar=False, max_workers=max_workers)
         gc.collect()
         assert outputs
         assert all(reference() is None for reference in outputs)
+        assert set(calls) == set(transforms)
         saved = ModelPackage.load(str(tmp_path / directory))["model"].graph
         for layer in range(layers):
             root = _ROOT.replace("layers.0.", f"layers.{layer}.")
@@ -572,7 +589,6 @@ def test_int3_deferred_interleave_preserves_storage_and_releases_outputs(
                 )
                 actual = saved.initializers[f"{root}.fc1_{suffix}"].const_value
                 assert actual.tobytes() == tensor_adapters.TorchTensor(expected).tobytes()
-    assert set(calls) == set(transforms)
 
 
 def test_non_int3_export_preserves_weight_loader_scale_conversion(tmp_path):

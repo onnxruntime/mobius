@@ -32,6 +32,7 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import get_build_opset_version
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
 from mobius.components._rms_norm import PostGatedRMSNorm
@@ -160,12 +161,21 @@ class GatedDeltaNet(nn.Module):
         # Output projection
         self.out_proj = linear_class(self.value_dim, self.hidden_size, bias=False)
 
+    def _decay_coefficient(self, op: OpBuilder, reference: ir.Value) -> ir.Value:
+        """Return the negative state-decay coefficient in ``reference`` precision.
+
+        HuggingFace checkpoints store ``A_log`` and derive ``-exp(A_log)``.
+        Source formats that already store the derived negative coefficient can
+        override this hook without inverse-reparameterizing or rewriting bytes.
+        """
+        return op.Neg(op.Exp(op.CastLike(self.A_log, reference)))
+
     def forward(
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        conv_state: ir.Value,
-        recurrent_state: ir.Value,
+        conv_state: ir.Value | None,
+        recurrent_state: ir.Value | None,
     ):
         """Forward pass for the Gated DeltaNet layer.
 
@@ -184,6 +194,38 @@ class GatedDeltaNet(nn.Module):
             new_recurrent_state: (batch, num_v_heads, k_dim, v_dim)
         """
         batch_dim = op.Shape(hidden_states, start=0, end=1)
+        if conv_state is None:
+            conv_state = op.Expand(
+                op.CastLike(op.Constant(value_float=0.0), hidden_states),
+                op.Concat(
+                    batch_dim,
+                    op.Constant(
+                        value_ints=[
+                            self.conv_dim,
+                            self.conv_kernel_size - 1,
+                        ]
+                    ),
+                    axis=0,
+                ),
+            )
+        if recurrent_state is None:
+            recurrent_state = op.Expand(
+                op.Cast(
+                    op.Constant(value_float=0.0),
+                    to=self._stash_type,
+                ),
+                op.Concat(
+                    batch_dim,
+                    op.Constant(
+                        value_ints=[
+                            self.num_v_heads,
+                            self.head_k_dim,
+                            self.head_v_dim,
+                        ]
+                    ),
+                    axis=0,
+                ),
+            )
 
         # === Projections ===
         mixed_qkv = self.in_proj_qkv(op, hidden_states)
@@ -254,14 +296,13 @@ class GatedDeltaNet(nn.Module):
         if self._dtype == ir.DataType.FLOAT16 or self._stash_type != self._dtype:
             a_f32 = op.Cast(a, to=ir.DataType.FLOAT)
             dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
-            a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
             softplus_val = op.Softplus(op.Add(a_f32, dt_bias_f32))
-            neg_a = op.Neg(op.Exp(a_log_f32))
+            neg_a = self._decay_coefficient(op, a_f32)
             g_f32 = op.Mul(neg_a, softplus_val)
             g = g_f32 if self._stash_type != self._dtype else op.CastLike(g_f32, a)
         else:
             softplus_val = op.Softplus(op.Add(a, self.dt_bias))
-            neg_a = op.Neg(op.Exp(self.A_log))
+            neg_a = self._decay_coefficient(op, a)
             g = op.Mul(neg_a, softplus_val)
         # g: (B, T, num_v_heads)
 
@@ -277,19 +318,43 @@ class GatedDeltaNet(nn.Module):
             recurrent_state = op.Cast(recurrent_state, to=self._stash_type)
             g = op.Cast(g, to=self._stash_type)
             beta = op.Cast(beta, to=self._stash_type)
-        output_3d, new_recurrent_state = op.LinearAttention(
-            query,  # (B, T, num_k_heads * head_k_dim)
-            key,  # (B, T, num_k_heads * head_k_dim)
-            value,  # (B, T, num_v_heads * head_v_dim)
-            recurrent_state,  # (B, num_v_heads, d_k, d_v)
-            g,  # (B, T, num_v_heads) — decay in log-space
-            beta,  # (B, T, num_v_heads) — update rate
+        linear_attention_kwargs = dict(
             scale=1.0 / (self.head_k_dim**0.5),
             q_num_heads=self.num_k_heads,
-            kv_num_heads=self.num_v_heads,
-            _domain="com.microsoft",
             _outputs=2,
         )
+        if get_build_opset_version() < 29:
+            output_3d, new_recurrent_state = op.LinearAttention(
+                query,
+                key,
+                value,
+                recurrent_state,
+                g,
+                beta,
+                kv_num_heads=self.num_v_heads,
+                _domain="com.microsoft",
+                **linear_attention_kwargs,
+            )
+        else:
+            outputs = [
+                ir.Value(type=ir.TensorType(self._stash_type)),
+                ir.Value(type=ir.TensorType(self._stash_type)),
+            ]
+            node = ir.Node(
+                "",
+                "LinearAttention",
+                [query, key, value, recurrent_state, g, beta],
+                {
+                    "scale": ir.AttrFloat32("scale", 1.0 / (self.head_k_dim**0.5)),
+                    "q_num_heads": ir.AttrInt64("q_num_heads", self.num_k_heads),
+                    "kv_num_heads": ir.AttrInt64("kv_num_heads", self.num_k_heads),
+                    "v_num_heads": ir.AttrInt64("v_num_heads", self.num_v_heads),
+                },
+                outputs=outputs,
+                version=29,
+            )
+            op._builder._graph.append(node)
+            output_3d, new_recurrent_state = outputs
         # The contrib op lacks a standard schema for builder type propagation.
         output_3d.type = ir.TensorType(self._stash_type)
         new_recurrent_state.type = ir.TensorType(self._stash_type)
@@ -314,3 +379,14 @@ class GatedDeltaNet(nn.Module):
         output = self.out_proj(op, output)
 
         return output, new_conv_state, new_recurrent_state
+
+
+class OriginalDecayGatedDeltaNet(GatedDeltaNet):
+    """GatedDeltaNet for sources whose ``A_log`` tensor is already ``-exp(A_log)``.
+
+    The parameter intentionally retains the attribute name ``A_log`` so existing
+    checkpoint-name mapping remains stable at the component boundary.
+    """
+
+    def _decay_coefficient(self, op: OpBuilder, reference: ir.Value) -> ir.Value:
+        return op.CastLike(self.A_log, reference)

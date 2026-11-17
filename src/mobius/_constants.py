@@ -9,6 +9,22 @@ from __future__ import annotations
 # Separated into its own module to avoid circular imports between
 # tasks, components, and the top-level package.
 OPSET_VERSION = 24
+QKV_PROJECTION_SOURCES_METADATA_KEY = "pkg.mobius.qkv_projection_sources"
+"""Versioned source names and widths retained on projection-packing Split nodes."""
+
+LEGACY_QKV_PROJECTION_SOURCES_METADATA_KEY = "mobius.qkv_projection_sources"
+"""Read-only key for restoring packed adapters from pre-namespace preview exports."""
+
+LAZY_SOURCE_FILES_META_KEY = "mobius.lazy_source_files"
+"""Backing-file paths retained by lazy tensors and their model in ``.meta``.
+
+Folding can remove an ExternalTensor from the initializer registry while a lazy
+callback still needs its file. ModelPackage checks these paths before saving so
+it cannot overwrite that backing file before the callback reads it. This is
+transient Python bookkeeping, not serialized ``metadata_props``.
+"""
+
+GEMMA4_CUSTOM_GEGLU_METADATA_KEY = "mobius.gemma4.required_runtime_feature"
 
 # ---------------------------------------------------------------------------
 # Static KV cache ABI
