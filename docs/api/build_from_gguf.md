@@ -40,20 +40,13 @@ layout operations, with `GroupedMatMul` for ordinary routed experts. It does not
 repack, requantize, copy payloads into a new blob, or materialize a dense vocabulary
 at export time. Row-aligned packed embeddings decode only requested rows.
 
-Packages may contain multiple components and an independently cached MTP head,
-sharing the same original, little-endian GGUF shards. `gguf-packed.json` v2
-records component names and the MTP chain; single `model` exports retain v1.
-Multi-component saves publish unique graph-generation filenames, then atomically
-replace the manifest. Loading selects only that committed generation; unreferenced
-graphs from prior or interrupted saves are ignored, not substituted for missing
-components. Policy and adapter artifacts anywhere in the MTP chain must be
-explicitly omitted or saved separately.
-All sources must have unique filenames and reside in the output directory.
-Treat source files as immutable; load/save verifies source digests, ranges, and
-original external bindings. Transcoded safetensors output and new weight sharding
-remain unsupported.
+Multi-component and MTP packages share immutable, little-endian GGUF shards.
+Keep uniquely named sources in the output directory; load/save verifies their
+digests and bindings. Multi-component saves publish atomically through
+`gguf-packed.json`. Transcoding, new weight sharding, and included policy/adapter
+artifacts are unsupported.
 
-Lossless standalone mmproj conversion currently supports `janus_pro`:
+Standalone lossless mmproj supports `janus_pro`:
 
 ```python
 from mobius.integrations.gguf import build_mmproj_from_gguf
@@ -67,28 +60,14 @@ vision = build_mmproj_from_gguf(
 vision.save("weights")
 ```
 
-This exports a functional vision/projector component, not a paired text-insertion
-runtime. Other lossless projector routes and the paired `mmproj=` path still
-raise explicitly. Existing Qwen3.5/3.8 and Hunyuan-V3 MTP contract restrictions
-remain: one physical prediction block, independent dynamic cache, explicit
-hidden/embedding/head sharing; representation does not implement acceptance policy.
+Other lossless projectors and paired `mmproj=` insertion are unsupported.
+MTP retains its architecture-specific sharing contract, one physical prediction
+block and independent dynamic cache; speculative acceptance policy is not included.
 
-Ordinary MLP MoE experts now retain biases, activations, and exact gated or ungated
-shared-expert composition under grouped dispatch. Specialized custom expert
-compositions are not silently replaced. Flash-Next's existing fused expert banks
-also use grouped dispatch, retaining FP32 routing/SiLU, normalization, scaling,
-and shared gating. Grouped graphs avoid per-expert execution,
-but full-bank dequantization still requires expert-sized workspace unless the EP
-fuses decode with selection; no such fusion/performance claim is made.
-LFM2MoE also has an exact grouped adapter retaining its selection-only correction
-bias, sigmoid weights, optional normalization and routed scaling.
-
-Merged `LinearAttention-29` supports independent `v_num_heads`; the portable
-function can opt into a post-update state trajectory. This costs one recurrent
-state per token and is not enabled as a whole-model rollback policy. Convolution,
-PLE and indexed-attention history still need independent restoration. Actual
-schema checking requires an ONNX build containing onnx/onnx#8693, not just a
-version string reporting opset 29.
+Grouped dispatch covers ordinary/shared MLP experts, LFM2MoE and Flash-Next,
+not every specialized MoE. Unfused dequantization still needs full-bank workspace.
+Flash-Next uses the merged `LinearAttention-29` value-head ABI (onnx/onnx#8693);
+optional recurrence trajectories do not provide whole-model state rollback.
 The flag does **not** add runtime kernels. See the
 [opset-29 survey](../gguf-capability-catalog.md#lossless-opset-29-survey).
 
