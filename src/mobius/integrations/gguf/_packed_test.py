@@ -17,13 +17,21 @@ from mobius import ModelPackage, build_from_gguf
 from mobius._flags import override_flags
 from mobius.integrations.gguf._builder_test_utils import _write_quantized_gguf
 
-pytestmark = [
-    pytest.mark.opset29,
-    pytest.mark.skipif(
-        not all(onnx.defs.has(name, 29) for name in ("DequantizePacked", "GroupedMatMul")),
-        reason="Official ONNX opset-29 packed/grouped schemas require current ONNX main.",
-    ),
-]
+pytestmark = pytest.mark.opset29
+
+
+def _has_schema29(name: str) -> bool:
+    return onnx.defs.has(name, 29) and onnx.defs.get_schema(name, 29).since_version == 29
+
+
+requires_packed_schema = pytest.mark.skipif(
+    not _has_schema29("DequantizePacked"),
+    reason="DequantizePacked-29 is required for checking and reference execution.",
+)
+requires_grouped_schema = pytest.mark.skipif(
+    not _has_schema29("GroupedMatMul"),
+    reason="GroupedMatMul-29 is required for checking and reference execution.",
+)
 
 
 @pytest.mark.parametrize(
@@ -85,6 +93,11 @@ def packed_sources(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
 
 
 @pytest.mark.parametrize(
+    "validate_schema",
+    [False, pytest.param(True, marks=requires_packed_schema)],
+    ids=["binding-roundtrip", "reference"],
+)
+@pytest.mark.parametrize(
     "qtype",
     [
         "Q4_0",
@@ -113,7 +126,7 @@ def packed_sources(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
         "Q1_0",
     ],
 )
-def test_all_stored_reader_formats(tmp_path: Path, qtype: str) -> None:
+def test_all_stored_reader_formats(tmp_path: Path, qtype: str, validate_schema: bool) -> None:
     from types import SimpleNamespace
 
     import gguf
@@ -184,6 +197,15 @@ def test_all_stored_reader_formats(tmp_path: Path, qtype: str) -> None:
     package.save(str(tmp_path))
     restored = ModelPackage.load(str(tmp_path))
     assert [value.name for value in restored["model"].graph.outputs] == ["out"]
+    payload = next(
+        v.const_value
+        for v in restored["model"].graph.initializers.values()
+        if isinstance(v.const_value, ir.ExternalTensor)
+    )
+    assert payload.numpy().tobytes() == raw.tobytes()
+    assert any(n.op_type == "Scan" for n in model.graph.all_nodes())
+    if not validate_schema:
+        return
     onnx.checker.check_model(str(tmp_path / "model.onnx"), full_check=True)
     evaluator = ReferenceEvaluator(str(tmp_path / "model.onnx"))
     indices = np.array([[1, 0, 1], [-1, -2, 0]], dtype=np.int64)
@@ -201,13 +223,6 @@ def test_all_stored_reader_formats(tmp_path: Path, qtype: str) -> None:
         expected = gguf.dequantize(raw, kind)
     assert np.isfinite(expected).all() and np.count_nonzero(expected)
     np.testing.assert_allclose(actual, expected[indices], rtol=1e-6, atol=1e-7)
-    payload = next(
-        v.const_value
-        for v in model.graph.initializers.values()
-        if isinstance(v.const_value, ir.ExternalTensor)
-    )
-    assert payload.numpy().tobytes() == raw.tobytes()
-    assert any(n.op_type == "Scan" for n in model.graph.all_nodes())
 
 
 @pytest.mark.parametrize("architecture", ["qwen2", "llama"])
@@ -221,7 +236,6 @@ def test_packed_build_roundtrip(packed_sources: dict[str, Path], architecture: s
     assert package.gguf_quantization_report.source_fidelity
     assert any(n.op_type == "DequantizePacked" for n in package["model"].graph)
     package.save(str(tmp_path))
-    onnx.checker.check_model(str(tmp_path / "model.onnx"), full_check=True)
     restored = ModelPackage.load(str(tmp_path))
     restored.save(str(tmp_path))
     assert not (tmp_path / "model.onnx.data").exists()
@@ -251,7 +265,6 @@ def test_split_shards_and_bf16_preserve_external_ranges(
         and v.const_value.dtype == ir.DataType.BFLOAT16
         for v in package["model"].graph.initializers.values()
     )
-    onnx.checker.check_model(str(tmp_path / "model.onnx"), full_check=True)
     ModelPackage.load(str(tmp_path)).save(str(tmp_path))
 
 
@@ -317,6 +330,7 @@ def test_packed_save_rejects_missing_generated_initializer(
         package.save(str(source.parent))
 
 
+@requires_packed_schema
 def test_optimization_cannot_fold_original_external_weights(
     packed_sources: dict[str, Path],
 ) -> None:
@@ -332,7 +346,10 @@ def test_optimization_cannot_fold_original_external_weights(
     assert not (tmp_path / "model.onnx.data").exists()
 
 
-@pytest.mark.parametrize("architecture", ["qwen2moe", "qwen3moe"])
+@pytest.mark.parametrize(
+    "architecture",
+    ["qwen2moe", pytest.param("qwen3moe", marks=requires_grouped_schema)],
+)
 def test_packed_expert_layout_and_standard_moe(
     packed_sources: dict[str, Path], architecture: str
 ) -> None:
@@ -347,10 +364,32 @@ def test_packed_expert_layout_and_standard_moe(
         v.name.endswith("ffn_up_exps.weight") and isinstance(v.const_value, ir.ExternalTensor)
         for v in package["model"].graph.initializers.values()
     )
-    onnx.checker.check_model(str(tmp_path / "model.onnx"), full_check=True)
 
 
-@pytest.mark.parametrize("architecture", ["parity", "qwen2moe", "qwen3moe"])
+@requires_packed_schema
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "qwen2",
+        "llama",
+        "split",
+        "qwen2moe",
+        pytest.param("qwen3moe", marks=requires_grouped_schema),
+    ],
+)
+def test_packed_model_schema(packed_sources: dict[str, Path], architecture: str) -> None:
+    source = packed_sources[architecture]
+    with override_flags(experimental_opset29=True):
+        package = build_from_gguf(source, execution_provider="onnx-standard")
+    package.save(str(source.parent))
+    onnx.checker.check_model(str(source.parent / "model.onnx"), full_check=True)
+
+
+@requires_packed_schema
+@pytest.mark.parametrize(
+    "architecture",
+    ["parity", "qwen2moe", pytest.param("qwen3moe", marks=requires_grouped_schema)],
+)
 def test_packed_next_token_matches_float_source(
     packed_sources: dict[str, Path], architecture: str
 ) -> None:

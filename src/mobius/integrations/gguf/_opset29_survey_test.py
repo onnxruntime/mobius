@@ -38,7 +38,10 @@ def test_packed_construction_does_not_require_installed_schemas(tmp_path, monkey
 
 @pytest.mark.opset29
 @pytest.mark.skipif(
-    not onnx.defs.has("DequantizePacked", 29),
+    not (
+        onnx.defs.has("DequantizePacked", 29)
+        and onnx.defs.get_schema("DequantizePacked", 29).since_version == 29
+    ),
     reason="DequantizePacked-29 schema is required for layout conformance checking.",
 )
 def test_packed_layouts_match_standard_schema() -> None:
