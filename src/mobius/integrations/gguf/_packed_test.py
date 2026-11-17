@@ -377,6 +377,7 @@ def test_optimization_cannot_fold_original_external_weights(
     "architecture",
     ["qwen2moe", pytest.param("qwen3moe", marks=requires_grouped_schema)],
 )
+@requires_grouped_schema
 def test_packed_expert_layout_and_standard_moe(
     packed_sources: dict[str, Path], architecture: str
 ) -> None:
@@ -469,8 +470,13 @@ def test_packed_next_token_matches_float_source(
 
 
 @pytest.mark.parametrize("dedicated", [False, True])
+@pytest.mark.parametrize(
+    "validate_schema",
+    [False, pytest.param(True, marks=requires_packed_schema)],
+    ids=["binding-roundtrip", "reference"],
+)
 def test_original_mtp_composition_roundtrip(
-    packed_sources: dict[str, Path], dedicated: bool
+    packed_sources: dict[str, Path], dedicated: bool, validate_schema: bool
 ) -> None:
     from onnx.reference import ReferenceEvaluator
 
@@ -491,6 +497,13 @@ def test_original_mtp_composition_roundtrip(
     assert manifest["format"] == "mobius.gguf-packed.v2"
     assert len(manifest["sources"]) == 1
     assert {row["depth"] for row in manifest["models"]} == {0, 1}
+    for model in (restored["model"], restored.mtp_head["model"]):
+        assert any(
+            isinstance(value.const_value, ir.ExternalTensor)
+            for value in model.graph.initializers.values()
+        )
+    if not validate_schema:
+        return
     for row in manifest["models"]:
         onnx.checker.check_model(str(source.parent / row["file"]), full_check=True)
 
@@ -585,6 +598,7 @@ def test_shared_source_components_validate_manifest(
         manifest_path.write_text(original)
 
 
+@requires_grouped_schema
 def test_original_expert_bank_graph_size_is_independent_of_expert_count(
     packed_sources: dict[str, Path],
 ) -> None:
@@ -598,8 +612,13 @@ def test_original_expert_bank_graph_size_is_independent_of_expert_count(
     assert counts[0] == counts[1] == counts[2]
 
 
+@pytest.mark.parametrize(
+    "validate_schema",
+    [False, pytest.param(True, marks=requires_packed_schema)],
+    ids=["binding-roundtrip", "reference"],
+)
 def test_original_deltanet_decay_needs_no_inverse_reparameterization(
-    packed_sources: dict[str, Path],
+    packed_sources: dict[str, Path], validate_schema: bool
 ) -> None:
     source = packed_sources["qwen35"]
     before = source.read_bytes()
@@ -620,6 +639,8 @@ def test_original_deltanet_decay_needs_no_inverse_reparameterization(
     restored = ModelPackage.load(str(source.parent))
     restored.save(source.parent, progress_bar=False)
     assert source.read_bytes() == before
+    if not validate_schema:
+        return
 
     import onnxruntime as ort
     from onnx.reference import ReferenceEvaluator
