@@ -6,20 +6,18 @@
 from __future__ import annotations
 
 import onnx_ir as ir
-from onnxscript import OpBuilder
+from onnxscript._internal.builder import build_function
 
-from mobius._function_builder import emit_standard_function
+from mobius._constants import OPSET_VERSION
 
 
 def offset_rms_norm(
-    op: OpBuilder,
-    hidden_states: ir.Value,
-    weight: ir.Value,
     *,
     epsilon: float,
     groups: int = 1,
     group_size: int = 0,
-) -> ir.Value:
+    opset_version: int = OPSET_VERSION,
+) -> ir.Function:
     """Normalize/scale in float32, then round to the activation dtype."""
 
     def body(op, hidden_states, weight):
@@ -37,24 +35,21 @@ def offset_rms_norm(
             result = op.Reshape(result, original_shape)
         return op.CastLike(result, hidden_states)
 
-    return emit_standard_function(
-        op,
-        "GroupedOffsetRMSNorm" if group_size else "OffsetRMSNorm",
+    return build_function(
         body,
-        [hidden_states, weight],
-        specialization=(epsilon, groups, group_size),
+        [ir.Value(name="hidden_states"), ir.Value(name="weight")],
+        domain="com.microsoft",
+        name="GroupedOffsetRMSNorm" if group_size else "OffsetRMSNorm",
+        opset_imports={"": opset_version},
     )
 
 
 def post_gated_rms_norm(
-    op: OpBuilder,
-    hidden_states: ir.Value,
-    weight: ir.Value,
-    gate: ir.Value,
     *,
     epsilon: float,
     activation: str,
-) -> ir.Value:
+    opset_version: int = OPSET_VERSION,
+) -> ir.Function:
     """Round normalized activations before native-dtype scaling and FP32 gating."""
 
     def body(op, hidden_states, weight, gate):
@@ -69,10 +64,14 @@ def post_gated_rms_norm(
             op.Mul(op.Cast(weighted, to=ir.DataType.FLOAT), activated), hidden_states
         )
 
-    return emit_standard_function(
-        op,
-        "PostGatedRMSNorm",
+    return build_function(
         body,
-        [hidden_states, weight, gate],
-        specialization=(epsilon, activation),
+        [
+            ir.Value(name="hidden_states"),
+            ir.Value(name="weight"),
+            ir.Value(name="gate"),
+        ],
+        domain="com.microsoft",
+        name="PostGatedRMSNorm",
+        opset_imports={"": opset_version},
     )

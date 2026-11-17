@@ -57,7 +57,7 @@ pkg = build_from_module(
 | **WebGPU** | `"webgpu"` | ORT WebGPU EP. GQA for FP32/FP16. `Shape` eliminated. INT4 accuracy level 4. |
 | **MLX** | `"mlx"` | Apple-silicon MLX plugin EP. GQA for FP32/FP16/BF16 with unpacked Q/K/V and shared KV buffers. |
 | **TRT-RTX** | `"trt-rtx"` | NVIDIA TensorRT-RTX. GQA for FP16/BF16. `SkipLayerNorm`/`SkipSimplifiedLayerNorm` expanded via InlinePass (TRT handles these primitives natively). GPU graph capture enabled. |
-| **ONNX-standard** | `"onnx-standard"` | Strict ONNX. Zero custom-domain ops — all `com.microsoft` ops (FusedMatMul, SkipLayerNorm, PackedMHA) are expanded to standard ONNX via InlinePass. No GQA or QKV packing. Use for non-ORT runtimes that do not support ORT extensions. |
+| **ONNX-standard** | `"onnx-standard"` | Standard ONNX semantics. Contrib ops (FusedMatMul, SkipLayerNorm, PackedMHA) are expanded; shared component calls retain complete standard-op local bodies. No opaque custom operators, GQA, or QKV packing. |
 
 > **Note:** Passing an unknown EP name raises `ValueError` during
 > optimization. Use `ep_registry` from `mobius` to query registered EPs.
@@ -80,34 +80,35 @@ The `onnx-standard` validator accepts official core ONNX operators (`""` /
 opset against its own schemas. ML operators require an explicit `ai.onnx.ml`
 opset import; they do not inherit the core opset. Custom domains, unknown
 operators, and overloaded identifiers remain rejected unless they resolve to
-the compact standard-body functions described below. Schema validation does
+the registered standard-body functions described below. Schema validation does
 not guarantee that a particular runtime or EP implements the operator.
 Retained function identifiers use the model's imports for their versions;
 function bodies use their own imports.
 
-### Compact standard-opset29 functions (opt-in)
+### Shared component functions
 
-Set `MOBIUS_EXPERIMENTAL_OPSET29=1` and
-`MOBIUS_COMPACT_STANDARD_FUNCTIONS=1` before the normal CLI export, or use:
+Repeated component computations use the normal custom-op + local-function
+representation, with no additional export flag. For experimental opset29
+models, use the existing feature flag:
 
 ```python
-with mobius.override_flags(
-    experimental_opset29=True, compact_standard_functions=True
-):
+with mobius.override_flags(experimental_opset29=True):
     pkg = mobius.build(model_id, execution_provider="onnx-standard")
 ```
 
 This shares explicit offset/grouped/post-gated normalization, full-cache
 depthwise convolution, residual-stream read, grouped SwiGLU expert, and packed
 vision rotary-attention bodies used by Qwen4-Exp and Qwen3-VL. Calls use local
-`com.microsoft` functions with configuration/dtype/rank-specialized overloads,
+`com.microsoft` functions with configuration-specialized overloads,
 not opaque runtime kernels. Parameters remain caller-owned initializers.
 Every retained body and its reachable function closure must resolve to
 schema-valid standard ONNX operators. Sparse `GroupedMatMul` dispatch remains
 grouped; no all-expert dense expansion is introduced.
 
-The default remains flat `onnx-standard` export. The flag has no effect outside
-experimental opset29 `onnx-standard` builds, so existing EP fusions are unchanged.
+The portable `default` and `onnx-standard` EPs retain these bodies. Hardware EPs
+inline them before fusion so their existing kernel-selection patterns remain
+visible. Other contrib fallback/lowering rules are unchanged. Only operations
+that require opset29 (such as grouped expert dispatch) need the experimental flag.
 For consumers requiring flat graphs, expand the saved functions with
 `onnx_ir.passes.common.InlinePass()(model)`. This is a graph-size optimization,
 not a weight-size reduction, runtime-support claim, or numerical qualification.

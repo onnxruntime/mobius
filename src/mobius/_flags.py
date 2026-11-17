@@ -89,11 +89,6 @@ class _Flags:
          - ``False``
          - Build opset-29 standard MoE/QMoE function fallbacks on non-native EPs.
            Native-capable EPs retain opset 24. No runtime support is implied.
-       * - ``compact_standard_functions``
-         - ``MOBIUS_COMPACT_STANDARD_FUNCTIONS``
-         - ``False``
-         - Share explicit standard-op component bodies in experimental opset29
-           ``onnx-standard`` builds; other build modes are unchanged.
        * - ``tencent_q1_0_use_native_2bit``
          - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
          - ``False``
@@ -159,17 +154,6 @@ class _Flags:
     Existing opset-24 models must be rebuilt, not upgraded or relabeled.
     This flag does not imply ORT/EP kernel support. Opset 29 may require
     source-built ONNX schemas and a separately qualified runtime.
-    """
-
-    compact_standard_functions: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_COMPACT_STANDARD_FUNCTIONS", False)
-    )
-    """Share explicit component bodies as local standard-ONNX functions.
-
-    Opt-in only: requires experimental_opset29 and execution_provider="onnx-standard".
-    Other builds retain their existing inline/fusion behavior. Functions carry
-    complete standard-op bodies and can be expanded by ONNX IR's InlinePass.
-    This reduces graph duplication, not weight storage or runtime requirements.
     """
 
     tencent_q1_0_use_native_2bit: bool = dataclasses.field(

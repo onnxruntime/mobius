@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+from unittest import mock
 
 import numpy as np
 import onnx
@@ -28,7 +30,9 @@ pytestmark = pytest.mark.opset29
 
 @pytest.fixture(autouse=True)
 def _require_flash_next_schema():
-    if "v_num_heads" not in onnx.defs.get_schema("LinearAttention", 29).attributes:
+    if not onnx.defs.has("LinearAttention", 29) or (
+        "v_num_heads" not in onnx.defs.get_schema("LinearAttention", 29).attributes
+    ):
         pytest.skip("Requires opset-29 LinearAttention schemas with v_num_heads support")
 
 
@@ -114,7 +118,12 @@ def test_compact_normal_export_roundtrip_and_inline_topology(tmp_path, multimoda
         module = (Qwen4ExpForConditionalGeneration if multimodal else Qwen4ExpCausalLMModel)(
             config
         )
-        with override_flags(experimental_opset29=True, compact_standard_functions=compact):
+        with (
+            override_flags(experimental_opset29=True),
+            contextlib.nullcontext()
+            if compact
+            else mock.patch("mobius._optimizations.is_component_function", return_value=False),
+        ):
             packages.append(
                 build_from_module(
                     module,
@@ -166,7 +175,7 @@ def test_compact_normal_export_roundtrip_and_inline_topology(tmp_path, multimoda
         common.InlinePass()(model)
         assert not model.functions
         # Normalize constant storage/CSE on both sides after public inlining.
-        with override_flags(experimental_opset29=True, compact_standard_functions=False):
+        with override_flags(experimental_opset29=True):
             for candidate in (plain[name], model):
                 optimize_model(candidate, ep="onnx-standard", dtype=dtype)
         assert _fingerprint(model) == _fingerprint(plain[name])
@@ -176,7 +185,12 @@ def test_compact_grouped_decoder_prefill_and_reused_states():
     config = _config(num_experts_per_tok=2, output_gate_type="sigmoid")
     models = []
     for compact in (False, True):
-        with override_flags(experimental_opset29=True, compact_standard_functions=compact):
+        with (
+            override_flags(experimental_opset29=True),
+            contextlib.nullcontext()
+            if compact
+            else mock.patch("mobius._optimizations.is_component_function", return_value=False),
+        ):
             model = build_from_module(
                 Qwen4ExpCausalLMModel(config),
                 config,

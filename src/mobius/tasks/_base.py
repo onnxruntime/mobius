@@ -16,7 +16,6 @@ from onnxscript import GraphBuilder, nn
 import mobius
 from mobius._build_context import get_build_opset_version
 from mobius._configs import BaseModelConfig
-from mobius._function_builder import FUNCTIONS_KEY
 from mobius._model_package import ModelPackage
 
 if TYPE_CHECKING:
@@ -204,7 +203,6 @@ def _make_graph(
 def _make_model(graph: ir.Graph) -> ir.Model:
     """Create an ``ir.Model`` with standard producer metadata."""
     model = ir.Model(graph, ir_version=12)
-    model.functions.update(graph.meta.get(FUNCTIONS_KEY, {}))
     model.producer_name = "mobius"
     model.producer_version = mobius.__version__
     return model

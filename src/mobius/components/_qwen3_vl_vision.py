@@ -26,7 +26,6 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities, get_build_dtype
-from mobius._function_builder import emit_standard_function
 from mobius.components._common import LayerNorm, Linear, build_packed_token_offset
 from mobius.components._mlp import FCMLP
 from mobius.components._scan_utils import (
@@ -170,13 +169,26 @@ class Qwen3VLVisionAttention(nn.Module):
         # position_embeddings: (cos, sin) each (total_seq, rotary_dim)
 
         qkv = self.qkv(op, hidden_states)
-        attn_output = emit_standard_function(
-            op,
-            "PackedVisionRotaryAttention",
-            self._rotary_attention,
-            [qkv, *position_embeddings, cu_seqlens, hidden_states],
-            specialization=(self.num_heads, self.head_dim),
-        )
+        if ep_capabilities().supports_packed_multi_head_attention:
+            attn_output = self._rotary_attention(
+                op,
+                qkv,
+                position_embeddings[0],
+                position_embeddings[1],
+                cu_seqlens,
+                hidden_states,
+            )
+        else:
+            attn_output = op.PackedVisionRotaryAttention(
+                qkv,
+                *position_embeddings,
+                cu_seqlens,
+                hidden_states,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                _domain="com.microsoft",
+            )
+            attn_output.type, attn_output.shape = hidden_states.type, hidden_states.shape
         return self.proj(op, attn_output)
 
     def _rotary_attention(
@@ -221,15 +233,7 @@ class Qwen3VLVisionAttention(nn.Module):
         q_rot = op.Reshape(q_rot, [0, -1])
         k_rot = op.Reshape(k_rot, [0, -1])
 
-        capabilities = ep_capabilities()
-        if capabilities.supports_packed_multi_head_attention:
-            attn_output = self._emit_packed_mha(op, q_rot, k_rot, v, cu_seqlens, hidden_states)
-        else:
-            attn_output = self._emit_standard_attention(
-                op, q_rot, k_rot, v, cu_seqlens, hidden_states
-            )
-
-        return attn_output
+        return self._emit_packed_mha(op, q_rot, k_rot, v, cu_seqlens, hidden_states)
 
     def _emit_packed_mha(self, op, query, key, value, cu_seqlens, hidden_states):
         """Emit com.microsoft.PackedMultiHeadAttention.
@@ -280,69 +284,6 @@ class Qwen3VLVisionAttention(nn.Module):
 
         # Cast back to original dtype
         attn_output = op.CastLike(attn_output, query)
-
-        return attn_output
-
-    def _emit_standard_attention(self, op, query, key, value, cu_seqlens, hidden_states):
-        """Emit standard Attention with block-diagonal bias from cu_seqlens.
-
-        Fallback path for EPs without PackedMultiHeadAttention support.
-
-        Args:
-            query, key: (total_seq, hidden_size) after rotary embedding
-            value: (total_seq, hidden_size) from QKV split
-            cu_seqlens: (num_sub_seqs + 1,) cumulative lengths
-            hidden_states: original input, used only for shape
-        """
-        # Build block-diagonal attention bias from cu_seqlens
-        # Each token only attends to tokens in the same sub-sequence
-        total_seq = op.Shape(hidden_states, start=0, end=1)
-        total_seq_scalar = op.Squeeze(total_seq)
-        positions = op.Range(
-            op.Constant(value_int=0),
-            total_seq_scalar,
-            op.Constant(value_int=1),
-        )
-        positions_2d = op.Unsqueeze(positions, [1])  # (total_seq, 1)
-        cu_seqlens_2d = op.Unsqueeze(cu_seqlens, [0])  # (1, num_sub_seqs+1)
-        greater_or_equal = op.GreaterOrEqual(
-            positions_2d, cu_seqlens_2d
-        )  # (total_seq, num_sub_seqs+1)
-        greater_or_equal_int = op.Cast(greater_or_equal, to=7)  # INT64
-        segment_ids = op.Sub(
-            op.ReduceSum(greater_or_equal_int, [1], keepdims=False),
-            op.Constant(value_int=1),
-        )  # (total_seq,) — segment ID per token
-
-        segment_row = op.Unsqueeze(segment_ids, [1])  # (total_seq, 1)
-        segment_column = op.Unsqueeze(segment_ids, [0])  # (1, total_seq)
-        same_segment = op.Equal(segment_row, segment_column)  # (total_seq, total_seq)
-        attn_bias = op.Where(
-            same_segment,
-            op.CastLike(0.0, query),
-            op.CastLike(-10000.0, query),
-        )
-        # Reshape for Attention: (1, 1, total_seq, total_seq)
-        attn_bias = op.Unsqueeze(attn_bias, [0, 1])
-
-        # Add batch dim: (1, total_seq, hidden_size)
-        query_batched = op.Unsqueeze(query, [0])
-        key_batched = op.Unsqueeze(key, [0])
-        value_batched = op.Unsqueeze(value, [0])
-
-        attn_output = op.Attention(
-            query_batched,
-            key_batched,
-            value_batched,
-            attn_bias,
-            kv_num_heads=self.num_heads,
-            q_num_heads=self.num_heads,
-            scale=self.scale,
-            _outputs=1,
-        )
-
-        # Remove batch dim: (total_seq, hidden_size)
-        attn_output = op.Squeeze(attn_output, [0])
 
         return attn_output
 
