@@ -62,6 +62,12 @@ git push origin <branch>              # push immediately
 
 ## 3. Verification Gates
 
+For requested post-task interviews, ask each agent in its initial assignment
+to report missing context and concrete corrections needed after the first prompt.
+Use follow-up-capable agents if a later interview is required; synchronous agents
+may reject follow-up messages. Record interview coverage and tool limitations
+honestly, and consolidate only evidence-backed, generalizable skill changes.
+
 Checks at each stage prevent problems from compounding across agents.
 
 ### Before starting work

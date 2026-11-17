@@ -155,12 +155,14 @@ class Plamo2CausalLMTask(ModelTask):
         from mobius.functions import causal_conv_nd_with_state, linear_attention
 
         conv = causal_conv_nd_with_state(
+            opset_version=model.graph.opset_imports[""],
             kernel_size=config.mamba_d_conv,
             channels=config.mamba_inner_size,
             ndim=1,
             activation="silu",
         )
         scan = linear_attention(
+            opset_version=model.graph.opset_imports[""],
             q_num_heads=config.mamba_num_heads,
             kv_num_heads=config.mamba_num_heads,
             update_rule="gated",

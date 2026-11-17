@@ -42,6 +42,8 @@ reason — before the PR is merged.
 - [ ] Run the CI formatter first (`lintrunner f --output oneline --all-files`),
       then `lintrunner -a`; confirm the pinned tools actually ran (an
       uninitialized/no-op lintrunner is not evidence)
+      On Windows `WinError 206`, format explicit changed-file batches, then run
+      `lintrunner -a`; disclose the all-files limitation.
 
 ### 2. L1 — Graph builds
 
@@ -84,6 +86,11 @@ reason — before the PR is merged.
 - [ ] `python -m pytest tests/e2e_golden_test.py -m golden -k "<model>"` passes
 
 ### 6. L5 — Generation verified
+
+For non-generative tasks, use the semantic L5 contract in
+[writing-tests](../writing-tests/SKILL.md#l4--l5-golden-tests), not fake token
+generation settings. Token-specific items below apply only to autoregressive
+token tasks; continuous generators need their own full-output contract.
 
 - [ ] YAML test case has `level: "L5"` or `"L4+L5"`
 - [ ] `generation.max_new_tokens` set (≥ 20 recommended)
@@ -134,7 +141,9 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 
 ### 8. CLI build
 
-- [ ] `mobius build --model <hf-model-id> /tmp/out` completes without error
+- [ ] `mobius build --model <hf-model-id> --output /tmp/out` completes without error
+- [ ] Saved package reloads with `ModelPackage.load` and runs using persisted
+      metadata, not only the original in-memory config
 - [ ] Output directory contains the expected ONNX files and `genai_config.json`
 - [ ] Multi-model tasks use standardised ModelPackage keys: `"decoder"`,
       `"vision_encoder"`, `"audio_encoder"`, `"embedding"` (not legacy names
@@ -310,5 +319,5 @@ python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
 python -m pytest tests/quantization_integration_test.py -v
 
 # CLI build
-mobius build --model <hf-model-id> /tmp/out
+mobius build --model <hf-model-id> --output /tmp/out
 ```

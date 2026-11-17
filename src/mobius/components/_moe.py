@@ -692,3 +692,58 @@ class MoELayer(nn.Module):
                 result = op.Add(result, contribution)
 
         return result
+
+
+class GroupedMoELayer(MoELayer):
+    """Bias-free gated experts with unchanged routing and GroupedMatMul-29.
+
+    Keeps the loop representation's parameter names, but computes only selected
+    experts. Custom expert classes are rejected rather than approximated.
+    """
+
+    def __init__(self, source: MoELayer):
+        nn.Module.__init__(self)
+        if source.experts is None or any(type(e) is not MLP for e in source.experts):
+            raise ValueError("GroupedMoELayer requires ordinary unquantized MLP experts.")
+        if any(
+            getattr(e, name).bias is not None
+            for e in source.experts
+            for name in ("gate_proj", "up_proj", "down_proj")
+        ):
+            raise ValueError("GroupedMoELayer does not support expert projection biases.")
+        self.num_experts = source.num_experts
+        self.top_k = source.top_k
+        self.gate = source.gate
+        self.experts = source.experts
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, *gate_args):
+        routing_weights, selected_experts = self.gate(op, hidden_states, *gate_args)
+        # Calls realize each child in its original scope. Unused loop nodes are
+        # removed by the normal exporter; only these qualified weights survive.
+        experts = self.experts
+        if experts is None or not isinstance(experts[0], MLP):
+            raise ValueError("GroupedMoELayer requires ordinary MLP experts.")
+        banks: dict[str, list] = {name: [] for name in ("gate_proj", "up_proj", "down_proj")}
+        for expert in experts:
+            expert(op, hidden_states)
+            for name in banks:
+                banks[name].append(op.Unsqueeze(getattr(expert, name).weight, [0]))
+        weights = {name: op.Concat(*bank, axis=0) for name, bank in banks.items()}
+        width = op.Shape(hidden_states, start=-1)
+        flat = op.Reshape(hidden_states, op.Concat([-1], width, axis=0))
+        ids = op.Reshape(selected_experts, [-1, self.top_k])
+        gate = op.GroupedMatMul(flat, weights["gate_proj"], ids, transB=1)
+        up = op.GroupedMatMul(flat, weights["up_proj"], ids, transB=1)
+        activated = experts[0].act_fn(op, gate)
+        selected_hidden = op.Mul(activated, up)
+        expert_width = op.Shape(selected_hidden, start=-1)
+        selected_flat = op.Reshape(selected_hidden, op.Concat([-1], expert_width, axis=0))
+        projected = op.GroupedMatMul(
+            selected_flat, weights["down_proj"], op.Reshape(ids, [-1, 1]), transB=1
+        )
+        projected = op.Reshape(
+            projected, op.Concat([-1, self.top_k], width, axis=0)
+        )  # (tokens, top_k, hidden)
+        routing = op.Reshape(routing_weights, [-1, self.top_k, 1])
+        combined = op.ReduceSum(op.Mul(projected, routing), [1], keepdims=False)
+        return op.Reshape(combined, op.Shape(hidden_states))

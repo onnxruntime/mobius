@@ -42,6 +42,9 @@ Read these when you need deeper detail on a specific topic:
 - Use the repository's pinned CI reference dependencies. Assert the validated
   layer vocabulary and supported compute dtype for raw JSON and trusted configs;
   validators can remap layer names or carry checkpoint storage dtypes.
+- If an architecture needs newer upstream code, isolate an immutable reference
+  pin to its tests; verify installed commit provenance and replay with the
+  unchanged shared reference dependencies.
 
 ## Step-by-step
 
@@ -149,6 +152,9 @@ Standard categories: `"Text Generation"`, `"Mixture of Experts"`,
 
 ### 3. Identify what's different
 
+Read the actual packed-QKV ordering, gate placement, and RoPE frequency/pair
+layout before reusing attention. Similar names or shapes do not prove equivalence.
+
 Compare the HuggingFace PyTorch source against `CausalLMModel` / `DecoderLayer`.
 Common variations to look for:
 
@@ -249,6 +255,10 @@ order (rounding/scaling), explicit `None`, alias precedence, zero-as-disabled
 sentinels, and wrapped/unwrapped composite configs. Add focused tests for each
 nontrivial transform. Test both trusted/custom config classes and raw pinned
 JSON, especially nested decoder fields such as head/layer counts.
+Preserve mapping-valued metadata (RoPE, sparse layer overrides, integer-keyed
+tables) when adapting config sections. Detect untagged native configs only from
+a distinctive complete signature; set compute dtype explicitly and test inherited
+`None` defaults rather than confusing checkpoint storage dtype with export dtype.
 
 ### 7. Write tests
 
@@ -282,7 +292,7 @@ See the **writing-tests** skill for full details.  At minimum:
 
 4. **Test with the CLI:**
    ```bash
-   mobius build --model org/my-small-model mymodel/output
+   mobius build --model org/my-small-model --output mymodel/output
    ```
 
 ### 8. Documentation
@@ -387,6 +397,10 @@ long_factor = np.array(config.rope_scaling["long_factor"])
 # GOOD
 long_factor = np.array(config.rope_scaling["long_factor"], dtype=np.float32)
 ```
+
+Direct NumPy operands require explicit ONNX constants:
+`op.Constant(value=ir.tensor(long_factor))`. Match operator rank contracts too:
+ONNX RoPE positions must include the batch axis even if HF broadcasts a 1D input.
 
 ### 2. Normalization type mismatch (RMSNorm vs LayerNorm)
 

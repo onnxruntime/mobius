@@ -542,27 +542,8 @@ class TestKimiK3GGUFBuild:
         finally:
             session.close()
 
-    def test_separate_quantized_mla_is_reported_as_lossy(self, tmp_path: Path, caplog) -> None:
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        path = tmp_path / "kimi-k3-q4.gguf"
-        _write_kimi_k3_gguf(path, quantized=True)
-        with caplog.at_level("WARNING"):
-            package = build_from_gguf(path, keep_quantized=True)
-        assert caplog.text.count("GGUF QUANTIZATION FIDELITY WARNING") == 1
-        assert any(
-            record.name.endswith(("attn_k_b.weight", "attn_v_b.weight"))
-            and record.disposition is QuantizationDisposition.LOSSY_REQUANTIZE
-            for record in package.gguf_quantization_report.tensor_records
-        )
-
-        model = build_from_gguf(path, keep_quantized=False)["model"]
-        assert all(node.op_type != "MatMulNBits" for node in model.graph)
-
     def test_fused_kv_b_float_values_and_quantized_import(self, tmp_path: Path) -> None:
         from mobius.integrations.gguf import build_from_gguf
-        from mobius.integrations.gguf._reader import GGUFModel
-        from mobius.integrations.gguf._repacker import repack_gguf_tensor
 
         float_path = tmp_path / "kimi-k3-fused-kv-f32.gguf"
         tensors = _write_kimi_k3_gguf(float_path, fused_kv_b=True)
@@ -583,45 +564,8 @@ class TestKimiK3GGUFBuild:
 
         quantized_path = tmp_path / "kimi-k3-fused-kv-q4.gguf"
         _write_kimi_k3_gguf(quantized_path, quantized=True, fused_kv_b=True)
-        quantized = build_from_gguf(quantized_path, keep_quantized=True)["model"]
-        packed_inputs = {
-            node.inputs[1].name
-            for node in quantized.graph
-            if node.op_type == "MatMulNBits" and len(node.inputs) > 1
-        }
-        assert any("k_b_proj" in name for name in packed_inputs)
-        assert any("v_b_proj" in name for name in packed_inputs)
-        source = GGUFModel(quantized_path)
-        raw, qtype, shape = next(
-            (raw, qtype, shape)
-            for name, raw, qtype, shape in source.tensor_items_raw()
-            if name == "blk.1.attn_kv_b.weight"
-        )
-        repacked = repack_gguf_tensor(raw, qtype.value, shape)
-        for target, start, end in (("k_b_proj", 0, 32), ("v_b_proj", 32, 64)):
-            stem = f"model.layers.1.self_attn.{target}"
-            expected_weight = repacked.weight.reshape(2, 64, *repacked.weight.shape[1:])[
-                :, start:end
-            ].reshape(-1, *repacked.weight.shape[1:])
-            expected_scales = repacked.scales.reshape(2, 64, *repacked.scales.shape[1:])[
-                :, start:end
-            ].reshape(-1, *repacked.scales.shape[1:])
-            np.testing.assert_array_equal(
-                quantized.graph.initializers[f"{stem}.weight"].const_value.numpy(),
-                expected_weight,
-            )
-            np.testing.assert_array_equal(
-                quantized.graph.initializers[f"{stem}.scales"].const_value.numpy(),
-                expected_scales,
-            )
-            if repacked.zero_points is not None:
-                expected_zero_points = repacked.zero_points.reshape(
-                    2, 64, *repacked.zero_points.shape[1:]
-                )[:, start:end].reshape(-1, *repacked.zero_points.shape[1:])
-                np.testing.assert_array_equal(
-                    quantized.graph.initializers[f"{stem}.zero_points"].const_value.numpy(),
-                    expected_zero_points,
-                )
+        with pytest.raises(ValueError, match="MOBIUS_EXPERIMENTAL_OPSET29"):
+            build_from_gguf(quantized_path, keep_quantized=True)
 
     def test_static_cache_is_rejected(self, tmp_path: Path) -> None:
         from mobius.integrations.gguf import build_from_gguf
