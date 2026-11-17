@@ -8,14 +8,14 @@ pip install -e ".[transformers,testing]"
 
 # Run all non-integration tests (~10 seconds)
 # Add -n auto for parallel execution on multi-core machines
-python -m pytest tests/build_graph_test.py tests/cli_test.py src/ -q \
+python -m pytest tests/build_graph tests/cli_test.py src/ -q \
   -k "not phi4mm and not apply_weights_unknown" --tb=short -n auto
 
 # Run a single test by keyword
-python -m pytest tests/build_graph_test.py -k "qwen2"
+python -m pytest tests/build_graph -k "qwen2"
 
 # Run integration tests (requires HuggingFace model downloads)
-python -m pytest tests/integration_test.py -m integration -k "prefill" -sv
+python -m pytest tests/integration -m integration -k "prefill" -sv
 
 # Lint and auto-format
 lintrunner f --output oneline --all-files
@@ -88,8 +88,8 @@ and wrapper modules for nesting. See the `weight-name-alignment` skill.
 - Source: `src/mobius/`
 - Co-located tests: `src/mobius/**/*_test.py` (unit tests next
   to source)
-- Top-level tests: `tests/build_graph_test.py` (graph construction),
-  `tests/integration_test.py` (numerical accuracy vs HuggingFace)
+- Top-level tests: `tests/build_graph/` (graph construction),
+  `tests/integration/` (numerical accuracy vs HuggingFace)
 - Skills: `.agents/skills/<name>/SKILL.md`
 
 ### Code style
@@ -134,8 +134,8 @@ and wrapper modules for nesting. See the `weight-name-alignment` skill.
    appropriate base
 2. Export from `models/__init__.py`
 3. Register in `_registry.py`'s `_create_default_registry()`
-4. Add tiny config to `_MODEL_CONFIGS` in `tests/build_graph_test.py`
-5. Run tests: `python -m pytest tests/build_graph_test.py -k "<name>"`
+4. Add a tiny config to the appropriate list in `tests/_test_configs.py`
+5. Run tests: `python -m pytest tests/build_graph -k "<name>"`
 
 See the `adding-a-new-model` skill for the full guide.
 

@@ -1,0 +1,24 @@
+model_id: "nvidia/Cosmos3-Nano"
+model_type: "cosmos3_omni"
+revision: "411f42a8fdfb8c5b2583cb8786e0938f49796eaa"
+task_type: "image-text-to-text"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Describe this image in detail."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 30
+  do_sample: false
+
+notes: >
+  Cosmos3-Omni understanding tower ("Reasoner"). Architecturally identical to
+  Qwen3-VL (interleaved 3D M-RoPE, QK-norm, DeepStack layers [8, 16, 24]); the
+  reasoner sub-tower of the unified Cosmos3 checkpoint is exported via the
+  Qwen3-VL 3-model split with DeepStack preserved. Generator / Sound / Action
+  towers are dropped.

@@ -1,0 +1,36 @@
+{
+  "llamacpp_commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+  "artifact_sha256": "2d6c6c1d98a1b8ffa38b50916454891a31ad844ee69c686e525976867917d7b2",
+  "seed": 648,
+  "random_count": 128,
+  "random_alphabet_sha256": "d964057090d349ceca1ec1964433ca5c41aff8e60098233b4d4179a2995bc612",
+  "modes": [
+    ["no-add", "no-parse-special"],
+    ["no-add", "parse-special"],
+    ["add-special", "parse-special"]
+  ],
+  "fixed_inputs": [
+    "",
+    " ",
+    "  ",
+    "\n",
+    "\r\n",
+    "\t",
+    "  spaced  text\n",
+    "I'm we'd they'll can't I'M",
+    "0 1 12 123 1234 12345 000001234567890",
+    "!?. ,;:—/\\[]{}()\n",
+    "你好，世界！",
+    "漢字かなカナ 한글",
+    "Café — κόσμος 🚀",
+    "é é",
+    "🙂🚀👩‍💻🇺🇳",
+    "\u0000\u0001\u007f",
+    "A/B\r\nC",
+    "<|user|>hello<|end|>",
+    "<|system|>rules<|assistant|>answer",
+    "<|system|>Be concise.<|end|><|user|>你好 12345!<|end|><|assistant|>"
+  ],
+  "case_count": 444,
+  "ordered_results_sha256": "484246b629d6eec375ebac3672e4f4d4fb29646d3b331917ec4d2cfe385c3b6a"
+}

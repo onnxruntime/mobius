@@ -88,16 +88,49 @@ fp16 and re-save. **Gotcha when re-saving with external data:** if you save with
 then rename the file, the references inside `model.onnx` still point to `X.data`. Either save directly
 with `location="model.onnx.data"`, or rewrite each initializer's `external_data` `location` entry.
 
+**Do not re-save with `onnx.save(..., save_as_external_data=True)` into an existing `.data` file.**
+`onnx.save_model` reaches `onnx.external_data_helper.save_external_data`, which opens the target
+`"r+b"` and then `seek(0, 2)` — it **appends**. The previous copy of the weights is never truncated,
+the offsets in `model.onnx` are rewritten to point at the newly appended copy, and the original copy
+stays on disk referenced by nothing. The model still loads and still produces byte-identical output,
+so nothing fails; the file is simply twice the size it should be. A Qwen2.5-14B int4 export was
+measured at 16.652 GB of which only 8.330 GB (50.02%) was referenced, in a single contiguous
+orphaned prefix `[0, 8322547712)`. That cost 2x disk and download, 2x pinned host RAM on
+memory-mapped weight paths, and produced a wrong weight-budget figure downstream in a consumer that
+reasonably sized from file length (justinchuby/onnx-genai#853).
+
+Use `ir.save`, which is what the rest of mobius uses. It writes the blob with `"wb"` and overwrites
+unconditionally, so there is no second copy to orphan:
+
 ```python
-import onnx, numpy as np
-from onnx import numpy_helper, TensorProto
-m = onnx.load("model.onnx", load_external_data=True)
-for init in m.graph.initializer:
-    if init.data_type == TensorProto.FLOAT:
-        arr = numpy_helper.to_array(init).astype(np.float16)
-        init.CopyFrom(numpy_helper.from_array(arr, init.name))
-onnx.save(m, "model.onnx", save_as_external_data=True, all_tensors_to_one_file=True,
-          location="model.onnx.data", size_threshold=1024, convert_attribute=False)
+import numpy as np
+import onnx_ir as ir
+
+model = ir.load("model.onnx")
+for name, value in model.graph.initializers.items():
+    if value.const_value is not None and value.const_value.dtype == ir.DataType.FLOAT:
+        value.const_value = ir.tensor(value.const_value.numpy().astype(np.float16), name=name)
+ir.save(model, "model.onnx", external_data="model.onnx.data")
+```
+
+Note `ir.save` invalidates any existing external tensor that references the path it is writing, so
+load the values you intend to keep before saving over their backing file.
+
+Because this failure is silent, assert the post-condition rather than eyeballing the file size:
+
+```python
+import onnx, pathlib
+
+m = onnx.load("model.onnx", load_external_data=False)
+referenced = sum(
+    int(dict((kv.key, kv.value) for kv in t.external_data)["length"])
+    for t in m.graph.initializer
+    if t.data_location == onnx.TensorProto.EXTERNAL
+)
+size = pathlib.Path("model.onnx.data").stat().st_size
+assert referenced >= 0.99 * size, (
+    f"external data blob is {size:,} bytes but only {referenced:,} are referenced"
+)
 ```
 
 ## 4. Always validate the export in ORT before profiling

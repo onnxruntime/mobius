@@ -11,25 +11,24 @@ end with ``onnxruntime``::
     user audio --> Mimi encoder --> [Moshi temporal + depformer] --> Mimi
                                      decoder --> Moshi (assistant) audio
 
-The four models (all built from the native Kyutai ``safetensors`` checkpoints
-via :func:`mobius.integrations.moshi.build_mimi` /
-:func:`~mobius.integrations.moshi.build_moshi_lm`):
+The four models are built together from the native Kyutai checkpoint through
+the standard :func:`mobius.build` API:
 
 * **Mimi encoder** ``waveform (B,1,T) -> codes (B,8,Tf)``
 * **Moshi temporal** ``frame (B,17,S) -> hidden + text_logits + KV``
 * **Moshi depformer** ``hidden + prev_token + substep_index + KV -> logits``
-  (stepped 16 times per frame, once per audio codebook)
+  (stepped 8 times for public Moshi/Moshiko or 16 times for PersonaPlex)
 * **Mimi decoder** ``codes (B,8,Tf) -> waveform (B,1,T)``
 
 The generation loop is a faithful NumPy port of Kyutai ``LMGen.step``: a ring
 cache with per-codebook delays, the temporal step, greedy text sampling, the
-16-substep autoregressive depformer, and delayed output collection. The user
-audio stream is fed as the 8 "other" codebooks (``k = 9..16``); the assistant
-(Moshi) audio is generated as codebooks ``k = 1..8`` and decoded by Mimi.
+configurable autoregressive depformer, and delayed output collection. The
+user audio stream is fed as the 8 "other" codebooks (``k = 9..16``); the
+assistant audio uses the first 8 generated codebooks and is decoded by Mimi.
 
 Prerequisites::
 
-    pip install mobius-ai onnxruntime numpy soundfile
+    pip install mobius-onnx onnxruntime numpy soundfile
 
 CUDA note: on H200 / Ampere+ GPUs ORT defaults to TF32 for fp32 matmul, which
 can flip greedy sampling. ``--device cuda`` sets ``use_tf32=0`` for fp32
@@ -46,18 +45,16 @@ Usage::
     # Reuse already-exported ONNX models (skip the build step)
     python examples/personaplex/moshi_ort.py --model-dir out/personaplex/onnx
 
-    # Simulated real-time stream (reports RTF / per-frame budget). Build the
-    # models with an fp16 LM on CUDA first for real-time speed:
-    python examples/personaplex/moshi_ort.py --device cuda --lm-dtype f16 \
+    # Simulated stream (reports RTF / per-frame budget):
+    python examples/personaplex/moshi_ort.py --device cuda \
         --stream --audio user.wav --save-to out/personaplex
 
     # Live full-duplex mic -> speaker (needs sounddevice + audio hardware)
     python examples/personaplex/moshi_ort.py --skip-build --device cuda --mic
 
-Real-time note: each 12.5 Hz frame must finish within 80 ms. On an fp16 LM +
-CUDA the Moshi LM is ~27 ms/frame (~3x headroom); CPU fp32 (~1.8 s/frame) is
-far too slow for ``--stream``/``--mic``. The Mimi codec stays fp32 (its fp16
-export currently hits a Conv dtype mismatch).
+Real-time note: each 12.5 Hz frame must finish within 80 ms. The unified
+package currently supports fp32 only because the Mimi codec has no validated
+fp16/bf16 graph and runtime path.
 """
 
 from __future__ import annotations
@@ -67,6 +64,7 @@ import os
 import time
 
 import numpy as np
+import onnx_ir as ir
 
 _MODEL_ID = "nvidia/personaplex-7b-v1"
 
@@ -165,6 +163,35 @@ def encode_persona(tokenizer, persona_text: str) -> list[int]:
     return list(tokenizer.encode(text))
 
 
+def _model_path(model_dir: str, name: str) -> str:
+    path = os.path.join(model_dir, name, "model.onnx")
+    if not os.path.isfile(path) and name.startswith("mimi_"):
+        path = os.path.join(model_dir, name.removeprefix("mimi_"), "model.onnx")
+    if not os.path.isfile(path):
+        path = os.path.join(model_dir, f"{name}.onnx")
+    return path
+
+
+def _infer_dep_q(model_path: str) -> int:
+    """Read the depformer step count from raw or quantized ONNX weights."""
+    model = ir.load(model_path)
+    widths = {
+        int(value.shape[0])
+        for name, value in model.graph.initializers.items()
+        if name == "depformer_in.weight" or name.startswith("depformer_in.weight_")
+    }
+    if len(widths) != 1:
+        raise ValueError(
+            f"Cannot infer depformer width from {model_path!r}: found widths {sorted(widths)}"
+        )
+    dep_q = widths.pop()
+    if dep_q not in (8, 16):
+        raise ValueError(
+            f"Unsupported depformer width {dep_q} in {model_path!r}; expected 8 or 16"
+        )
+    return dep_q
+
+
 class MoshiORT:
     """Full-duplex Moshi generation driven by four ONNX Runtime sessions."""
 
@@ -179,19 +206,26 @@ class MoshiORT:
         temp_audio: float = 0.8,
         top_k_audio: int = 250,
         seed: int | None = None,
+        dep_q: int | None = None,
     ):
+        depformer_path = _model_path(model_dir, "depformer")
+        inferred_dep_q = _infer_dep_q(depformer_path)
+        if dep_q is not None and dep_q != inferred_dep_q:
+            raise ValueError(
+                f"Requested dep_q={dep_q}, but {depformer_path!r} contains "
+                f"{inferred_dep_q} depformer steps"
+            )
+        dep_q = inferred_dep_q
+
         import onnxruntime as ort
 
         providers = _provider(device, allow_tf32)
 
         def _load(name: str):
-            path = os.path.join(model_dir, name, "model.onnx")
-            if not os.path.isfile(path):
-                path = os.path.join(model_dir, f"{name}.onnx")
-            return ort.InferenceSession(path, providers=providers)
+            return ort.InferenceSession(_model_path(model_dir, name), providers=providers)
 
-        self.enc = _load("mimi_encoder")
-        self.dec = _load("mimi_decoder")
+        self.enc = _load("encoder")
+        self.dec = _load("decoder")
         self.temporal = _load("temporal")
         self.depformer = _load("depformer")
 
@@ -204,6 +238,9 @@ class MoshiORT:
         self.top_k_audio = top_k_audio
         self._rng = np.random.default_rng(seed)
         self._ort = ort
+        self.dep_q = dep_q
+        self.last_text_token: int | None = None
+        self.last_audio_tokens: np.ndarray | None = None
 
         # The graph optimizer may prune unused inputs (e.g. position_ids when
         # RoPE derives its offset from the KV-cache length), and the KV cache
@@ -333,10 +370,14 @@ class MoshiORT:
         self._tkv_ov = [
             (
                 self._ort.OrtValue.ortvalue_from_numpy(
-                    np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype), self._kv_device, 0
+                    np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype),
+                    self._kv_device,
+                    0,
                 ),
                 self._ort.OrtValue.ortvalue_from_numpy(
-                    np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype), self._kv_device, 0
+                    np.zeros((1, T_HEADS, 0, T_HEAD_DIM), self._kv_dtype),
+                    self._kv_device,
+                    0,
                 ),
             )
             for _ in range(T_LAYERS)
@@ -381,13 +422,13 @@ class MoshiORT:
         self._tpos += s
         return hidden[:, -1:], text_logits[0, -1]
 
-    # --- Depformer: 16 autoregressive substeps --------------------------
+    # --- Depformer: 8 or 16 autoregressive substeps ---------------------
     def _depformer_step(self, text_token, hidden, audio_target, audio_provided):
-        """Generate the 16 audio codebooks for one frame.
+        """Generate one frame of depformer tokens.
 
         ``audio_target`` / ``audio_provided``: (16,) teacher-forcing of the
-        16 audio codebooks (used for the user stream at k=9..16 and any forced
-        Moshi tokens). Returns sampled (16,) int64.
+        temporal audio channels (used for the user stream at k=9..16 and any
+        forced Moshi tokens). Returns sampled ``(dep_q,)`` int64.
         """
         past = [
             (
@@ -400,8 +441,8 @@ class MoshiORT:
             f"present.{i}.{kv}" for i in range(D_LAYERS) for kv in ("key", "value")
         ]
         prev = int(text_token)
-        sampled = np.empty(DEP_Q, np.int64)
-        for cb in range(DEP_Q):
+        sampled = np.empty(self.dep_q, np.int64)
+        for cb in range(self.dep_q):
             feeds = {
                 "hidden": hidden,
                 "prev_token": np.array([[prev]], np.int64),
@@ -479,6 +520,7 @@ class MoshiORT:
 
         hidden, text_logits = self._temporal_step(input_)
         sampled_text = _sample_token(text_logits, self.temp_text, self.top_k_text, self._rng)
+        self.last_text_token = sampled_text
         next_text = target_[0, 0] if provided_[0, 0] else sampled_text
 
         sampled_audio = self._depformer_step(
@@ -487,12 +529,13 @@ class MoshiORT:
             target_[0, AUDIO_OFFSET:],
             provided_[0, AUDIO_OFFSET:],
         )
+        self.last_audio_tokens = sampled_audio.copy()
 
         # Write generated tokens into the cache where not provided.
         self.provided[0, :, mip] = False
         if not self.provided[0, 0, tp]:
             self.cache[0, 0, tp] = sampled_text
-        for k in range(1, DEP_Q + 1):
+        for k in range(1, self.dep_q + 1):
             if not self.provided[0, k, tp]:
                 self.cache[0, k, tp] = sampled_audio[k - 1]
 
@@ -501,8 +544,8 @@ class MoshiORT:
             return None
 
         # Collect delayed outputs: cache[k, (offset - max_delay + delay) % CT].
-        out = np.empty(DEP_Q + 1, np.int64)
-        for k in range(DEP_Q + 1):
+        out = np.empty(self.dep_q + 1, np.int64)
+        for k in range(self.dep_q + 1):
             idx = (self.offset - MAX_DELAY + DELAYS[k]) % ct
             out[k] = self.cache[0, k, idx]
         self.offset += 1
@@ -510,32 +553,15 @@ class MoshiORT:
         return out[1 : 1 + MIMI_CB]
 
 
-def _build_models(model_dir: str, device: str, lm_dtype: str = "f32"):
-    """Export the four ONNX models from the native checkpoints (once).
-
-    The Mimi codec is always built in float32 (its fp16 export currently hits a
-    Conv dtype mismatch); the Moshi LM honours ``lm_dtype`` (use ``"f16"`` on
-    CUDA for real-time streaming).
-    """
-    from mobius.integrations.moshi import build_mimi, build_moshi_lm
+def _build_models(model_dir: str, device: str):
+    """Export the four fp32 ONNX models from the native checkpoint."""
+    from mobius import build
 
     os.makedirs(model_dir, exist_ok=True)
     ep = "cuda" if device == "cuda" else "default"
-    print(f"[build] Mimi codec (f32) from {_MODEL_ID} ...")
-    mimi = build_mimi(_MODEL_ID, execution_provider=ep)
-    mimi.save(os.path.join(model_dir, "mimi"))
-    # Mimi saves encoder/ and decoder/ subdirs; flatten the names we load.
-    for role in ("encoder", "decoder"):
-        src = os.path.join(model_dir, "mimi", role)
-        dst = os.path.join(model_dir, f"mimi_{role}")
-        if os.path.isdir(src) and not os.path.isdir(dst):
-            os.rename(src, dst)
-
-    print(f"[build] Moshi LM ({lm_dtype}, temporal + depformer) from {_MODEL_ID} ...")
-    dtype = None if lm_dtype == "f32" else lm_dtype
-    lm = build_moshi_lm(_MODEL_ID, dtype=dtype, execution_provider=ep)
-    lm["temporal"].save(os.path.join(model_dir, "temporal"))
-    lm["depformer"].save(os.path.join(model_dir, "depformer"))
+    print(f"[build] PersonaPlex package (f32) from {_MODEL_ID} ...")
+    package = build(_MODEL_ID, execution_provider=ep)
+    package.save(model_dir)
     print(f"[build] saved ONNX models under {model_dir}")
 
 
@@ -719,20 +745,31 @@ def main() -> None:
     parser.add_argument("--audio", default=None, help="24kHz mono user-stream wav")
     parser.add_argument("--frames", type=int, default=25, help="frames if no --audio")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-    parser.add_argument(
-        "--lm-dtype",
-        choices=["f32", "f16"],
-        default="f32",
-        help="Moshi LM dtype (use f16 on cuda for real-time)",
-    )
     parser.add_argument("--allow-tf32", action="store_true")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Sampling seed for reproducible offline and streaming generation.",
+    )
+    parser.add_argument(
+        "--dep-q",
+        type=int,
+        choices=[8, 16],
+        default=None,
+        help="Expected depformer width; default infers 8 or 16 from the ONNX package.",
+    )
     parser.add_argument("--save-to", default=None, help="dir to write assistant.wav")
     parser.add_argument("--skip-build", action="store_true", help="reuse existing --model-dir")
     parser.add_argument(
-        "--stream", action="store_true", help="simulated real-time stream (measures RTF)"
+        "--stream",
+        action="store_true",
+        help="simulated real-time stream (measures RTF)",
     )
     parser.add_argument(
-        "--mic", action="store_true", help="live full-duplex mic->speaker (needs sounddevice)"
+        "--mic",
+        action="store_true",
+        help="live full-duplex mic->speaker (needs sounddevice)",
     )
     parser.add_argument(
         "--no-pace",
@@ -744,9 +781,15 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.skip_build and not os.path.isdir(os.path.join(args.model_dir, "temporal")):
-        _build_models(args.model_dir, args.device, args.lm_dtype)
+        _build_models(args.model_dir, args.device)
 
-    moshi = MoshiORT(args.model_dir, args.device, args.allow_tf32)
+    moshi = MoshiORT(
+        args.model_dir,
+        args.device,
+        args.allow_tf32,
+        seed=args.seed,
+        dep_q=args.dep_q,
+    )
 
     if args.mic:
         run_stream_mic(moshi, args)

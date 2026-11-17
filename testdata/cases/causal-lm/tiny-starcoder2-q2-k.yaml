@@ -1,0 +1,47 @@
+model_id: "hyper-accel/tiny-random-starcoder2"
+model_type: "starcoder2"
+revision: "193576733055d2108dc9906d0da6e0806ad9be57"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "tensorblock/tiny-random-starcoder2-GGUF"
+  revision: "82c9eb61d1af6ea00dff834f1ff0620144b333e8"
+  filename: "tiny-random-starcoder2-Q2_K.gguf"
+  size: 68039904
+  lfs_sha256: "ab0a4b4e79c906520808db065a00a317c8b097e2176638b34088975eada6e0ed"
+  tensor_count: 36
+  tensor_qtypes: {F32: 22, Q2_K: 7, Q3_K: 4, Q4_K: 2, Q6_K: 1}
+  execution_provider: "cpu"
+  config_sha256: "25eaa4f5baa4e4725930298aaa921804d1e6f202737a3b10ec32070c4acfcb71"
+  preserve_quantization: false
+  tokenizer:
+    repository: "hyper-accel/tiny-random-starcoder2"
+    revision: "193576733055d2108dc9906d0da6e0806ad9be57"
+    metadata_sha256: "38608a4848dc8535113cff0312858853a0c8e29a5cdc145f258e4a9d84b35113"
+    identity_status: "exact"
+    assets:
+      - {filename: "special_tokens_map.json", size: 1300, sha256: "0fc9ac706a35e6337b19d484bc8f866b6a0ee7ad2509b03f7305dc0838c82d2c"}
+      - {filename: "tokenizer.json", size: 2060947, sha256: "17fa145258b20c18287f1e3bd804e074cc13333f11984a2f5a2f11c5110437aa"}
+      - {filename: "tokenizer_config.json", size: 7877, sha256: "8149d8e6b21275ad2cc346885ad92c0e9b5aa3e28a78bb5d39b7febc7e52545d"}
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "tiny-starcoder2-q2-k-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 71000000
+  released_capabilities:
+    "0.15.2": {generic_decoder: true, state_groups: false}
+
+inputs:
+  prompts: ["The capital of France is"]
+
+level: "L4+L5"
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Tiny source BOS/EOS IDs exceed its model vocabulary; runtime evidence is explicit-float."

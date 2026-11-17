@@ -84,6 +84,11 @@ class _Flags:
          - ``False``
          - Lower the ONNX opset declaration to 23 for non-CPU EPs
            (ORT <=1.24.x workaround). Disabled by default.
+       * - ``experimental_opset29``
+         - ``MOBIUS_EXPERIMENTAL_OPSET29``
+         - ``False``
+         - Build opset-29 standard MoE/QMoE function fallbacks on non-native EPs.
+           Native-capable EPs retain opset 24. No runtime support is implied.
        * - ``tencent_q1_0_use_native_2bit``
          - ``MOBIUS_TENCENT_Q1_0_USE_NATIVE_2BIT``
          - ``False``
@@ -97,6 +102,11 @@ class _Flags:
            block overlay + padding) on the external-KV static-cache
            ``Attention`` path (``is_causal=0``) for float-bias decoders,
            instead of the maskless ``is_causal=1`` default.
+       * - ``gemma4_custom_geglu``
+         - ``MOBIUS_GEMMA4_CUSTOM_GEGLU``
+         - ``False``
+         - Opt in to the experimental custom CUDA GEGLU MoE/QMoE ABI.
+           Ordinary CUDA selection does not imply this runtime support.
     """
 
     suppress_dedup_warning: bool = dataclasses.field(
@@ -127,6 +137,23 @@ class _Flags:
     Lowering the import declaration lets the EP find its existing kernels.
     Set ``MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`` to re-enable if running on
     an older ORT build without opset 24 kernel registration.
+    """
+
+    experimental_opset29: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_EXPERIMENTAL_OPSET29", False)
+    )
+    """Build experimental opset-29 MoE/QMoE function fallbacks, default off.
+
+    Set ``MOBIUS_EXPERIMENTAL_OPSET29=1`` before importing mobius, or use
+    ``override_flags(experimental_opset29=True)`` around the normal build API.
+    EPs without fused MoE support construct new graphs and ordinary functions
+    at opset 29, then register and inline standard MoE/QMoE reference functions.
+    Native-capable EPs keep opset 24 and their native calls without fallback ABI
+    restrictions. Flag-off builds and unrelated generic MoE dispatch are unchanged.
+
+    Existing opset-24 models must be rebuilt, not upgraded or relabeled.
+    This flag does not imply ORT/EP kernel support. Opset 29 may require
+    source-built ONNX schemas and a separately qualified runtime.
     """
 
     tencent_q1_0_use_native_2bit: bool = dataclasses.field(
@@ -176,6 +203,37 @@ class _Flags:
 
     Default ``False``: the maskless ``is_causal=1`` static-cache emission is
     unchanged, so no shipped model's graph changes unless this flag is set.
+    """
+
+    gemma4_custom_geglu: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_GEMMA4_CUSTOM_GEGLU", False)
+    )
+    """Opt in to Gemma4's experimental custom CUDA tanh-GEGLU MoE/QMoE ABI.
+
+    Requires a separately qualified custom runtime, not an unmodified released
+    ORT wheel. Default float exports use the portable exact-activation fallback;
+    quantized experts fail closed without this opt-in. The flag does not enable
+    native dispatch for non-CUDA providers.
+    """
+
+    allow_dense_moe_experts: bool = dataclasses.field(
+        default_factory=lambda: _env_bool("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", False)
+    )
+    """Opt in to exporting routed MoE experts that have no sparse top-k fusion.
+
+    Some quantized MoE checkpoints (notably GLM-5.2 UD-IQ1_{S,M}) lower their
+    routed experts as per-expert native ``pkg.nxrt::BlockQuantizedMatMul`` nodes
+    (IQ1/IQ2/… blocks), for which no sparse ``BlockQuantizedMoE`` fusion exists
+    yet — only the int4 ``MatMulNBits`` dense-fallback → ``com.microsoft::QMoE``
+    rewrite does. Exporting anyway produces a graph that recomputes **every**
+    expert for every token (full expert weight traffic), i.e. dense-all-expert
+    compute with no performance guarantee.
+
+    Default ``False``: :func:`~mobius.integrations.gguf.build_from_gguf` fails
+    closed before export with a typed capability error rather than shipping a
+    silently-dense graph. Set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1`` (or override
+    the flag) only for research / correctness study of the dense fallback. This
+    is **not** a performance path and makes no throughput claim.
     """
 
 

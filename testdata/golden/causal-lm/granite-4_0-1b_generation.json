@@ -1,0 +1,27 @@
+{
+  "model_id": "ibm-granite/granite-4.0-1b",
+  "prompt": "Here is my poem:",
+  "generated_tokens": [
+    330,
+    791,
+    8219,
+    596,
+    35969,
+    685,
+    1,
+    555,
+    35266,
+    98337,
+    1473,
+    791,
+    8219,
+    596,
+    35969,
+    685,
+    198,
+    32,
+    21411,
+    37466
+  ],
+  "generated_text": " \"The Sun's Radiance\" by Emily Dickinson:\n\nThe Sun's Radiance\nA golden orb"
+}

@@ -31,20 +31,24 @@ Reference: BLIP-2 (https://arxiv.org/abs/2301.12597)
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+from mobius._weight_utils import (
+    is_packed_quant_key,
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+)
 from mobius.components import (
     Embedding,
     Linear,
     QFormer,
     VisionModel,
 )
-from mobius.models.base import TextModel
+from mobius.models.base import TextModel, effective_tie_word_embeddings
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -192,6 +196,55 @@ class Blip2Model(nn.Module):
     default_task: str = "vision-language"
     category: str = "Multimodal"
 
+    # Runtime HF ``named_modules()`` paths for decoder-only (OPT) BLIP-2.
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "language_model.model.decoder.embed_positions",
+            "language_model.model.decoder.final_layer_norm",
+            "language_model.model.decoder.layers",
+            "language_model.lm_head",
+        ),
+        "vision_encoder": ("vision_model", "qformer", "language_projection"),
+        "embedding": ("language_model.model.decoder.embed_tokens",),
+    }
+    _T5_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "language_model.encoder.block",
+            "language_model.encoder.final_layer_norm",
+            "language_model.encoder.dropout",
+            "language_model.decoder.block",
+            "language_model.decoder.final_layer_norm",
+            "language_model.decoder.dropout",
+            "language_model.lm_head",
+        ),
+        "vision_encoder": ("vision_model", "qformer", "language_projection"),
+        "embedding": ("language_model.shared",),
+    }
+
+    @classmethod
+    def get_hf_component_sources(
+        cls,
+        *,
+        model_type: str,
+        hf_config: object,
+    ) -> dict[str, tuple[str, ...]]:
+        """Return runtime paths for the decoder-only or encoder-decoder LLM."""
+        del model_type
+        text_config = getattr(hf_config, "text_config", None)
+        text_model_type = getattr(text_config, "model_type", None)
+        decoder_only = getattr(hf_config, "use_decoder_only_language_model", None)
+        if text_model_type == "opt":
+            return cls.HF_COMPONENT_SOURCES
+        if text_model_type == "t5":
+            return cls._T5_COMPONENT_SOURCES
+        if text_model_type is not None:
+            return {}
+        if decoder_only is True:
+            return cls.HF_COMPONENT_SOURCES
+        if decoder_only is False:
+            return cls._T5_COMPONENT_SOURCES
+        return {}
+
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
@@ -208,12 +261,76 @@ class Blip2Model(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        if self.config.tie_word_embeddings:
-            embed_key = "language_model.model.embed_tokens.weight"
-            head_key = "language_model.lm_head.weight"
-            if head_key not in state_dict and embed_key in state_dict:
-                state_dict[head_key] = state_dict[embed_key]
-        return state_dict
+        tied_embeddings = effective_tie_word_embeddings(self.config)
+        if self.config.component_quantization is None:
+            if tied_embeddings:
+                embed_key = "language_model.model.embed_tokens.weight"
+                head_key = "language_model.lm_head.weight"
+                if head_key not in state_dict and embed_key in state_dict:
+                    state_dict[head_key] = state_dict[embed_key]
+            return state_dict
+
+        token_prefixes = (
+            "language_model.model.decoder.embed_tokens.",
+            "language_model.model.embed_tokens.",
+            "language_model.shared.",
+        )
+        if tied_embeddings and any(
+            key.removeprefix("model.").startswith(token_prefixes) and is_packed_quant_key(key)
+            for key in state_dict
+        ):
+            raise NotImplementedError(
+                "Packed tied BLIP-2 embeddings require an explicit LM-head copy; "
+                "the generic component loader cannot synthesize it safely."
+            )
+
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            stripped = key.removeprefix("model.")
+            if stripped.startswith("language_model.model.decoder.embed_tokens."):
+                suffix = stripped[len("language_model.model.decoder.") :]
+                if not is_packed_quant_key(stripped):
+                    renamed[f"decoder.model.{suffix}"] = value
+                renamed[f"embedding.{suffix}"] = value
+            elif stripped.startswith("language_model.model.decoder."):
+                suffix = stripped[len("language_model.model.decoder.") :]
+                renamed[f"decoder.model.{suffix}"] = value
+            elif stripped.startswith("language_model.model.embed_tokens."):
+                suffix = stripped[len("language_model.model.") :]
+                if not is_packed_quant_key(stripped):
+                    renamed[f"decoder.model.{suffix}"] = value
+                renamed[f"embedding.{suffix}"] = value
+            elif stripped.startswith("language_model.shared."):
+                suffix = stripped[len("language_model.shared.") :]
+                if not is_packed_quant_key(stripped):
+                    renamed[f"decoder.model.embed_tokens.{suffix}"] = value
+                renamed[f"embedding.embed_tokens.{suffix}"] = value
+            elif stripped.startswith("language_model.lm_head."):
+                suffix = stripped[len("language_model.") :]
+                renamed[f"decoder.{suffix}"] = value
+            elif stripped.startswith("language_model."):
+                suffix = stripped[len("language_model.") :]
+                renamed[f"decoder.{suffix}"] = value
+            elif stripped.startswith("vision_model."):
+                target = f"vision_encoder.vision_model.{stripped}"
+                target = target.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+                    ".mlp.fc2.", ".mlp.down_proj."
+                )
+                renamed[target] = value
+            elif stripped.startswith("qformer."):
+                target = _rename_qformer_weight(stripped)
+                if target is not None:
+                    renamed[f"vision_encoder.{target}"] = value
+            elif stripped.startswith("language_projection."):
+                renamed[f"vision_encoder.{stripped}"] = value
+            else:
+                renamed[key] = value
+
+        if tied_embeddings:
+            embedding = renamed.get("embedding.embed_tokens.weight")
+            if embedding is not None:
+                renamed.setdefault("decoder.lm_head.weight", embedding)
+        return renamed
 
 
 # ---------------------------------------------------------------------------

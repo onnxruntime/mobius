@@ -1,0 +1,37 @@
+--- a/chat_template.jinja
++++ b/chat_template.jinja
+@@ -58,9 +58,11 @@
+     {%- set nsns = namespace(seen=[]) -%}
+     {%- for tool in tools -%}
+         {%- set fn = tool.function if tool.function is defined else tool -%}
+-        {%- set tns = fn.name.split('.')[0] -%}
+-        {%- if tns not in nsns.seen -%}
+-            {%- set nsns.seen = nsns.seen + [tns] -%}
++        {%- if '.' in fn.name -%}
++            {%- set tns = fn.name.split('.')[0] -%}
++            {%- if tns not in nsns.seen -%}
++                {%- set nsns.seen = nsns.seen + [tns] -%}
++            {%- endif -%}
+         {%- endif -%}
+     {%- endfor -%}
+     {%- set nd = tool_namespace_descriptions if tool_namespace_descriptions is defined else {} -%}
+@@ -89,13 +91,17 @@
+     {%- if tools -%}
+         {%- for tool in tools -%}
+             {%- set fn = tool.function if tool.function is defined else tool -%}
+-            {%- set tns = fn.name.split('.')[0] -%}
++            {%- if '.' in fn.name -%}
++                {%- set tns = '"' + fn.name.split('.')[0] + '.*"' -%}
++            {%- else -%}
++                {%- set tns = '"' + fn.name + '"' -%}
++            {%- endif -%}
+             {%- if tns not in rns.nslist -%}
+                 {%- set rns.nslist = rns.nslist + [tns] -%}
+             {%- endif -%}
+         {%- endfor -%}
+         {%- for tns in rns.nslist -%}
+-            {%- set rns.recipients = rns.recipients + ['"' + tns + '.*"'] -%}
++            {%- set rns.recipients = rns.recipients + [tns] -%}
+         {%- endfor -%}
+     {%- endif -%}
+     {%- set rns.recipients = rns.recipients + ['"user"'] -%}

@@ -15,7 +15,7 @@ Architecture:
 
 Prerequisites::
 
-    pip install mobius-ai[transformers] sounddevice soundfile librosa
+    pip install mobius-onnx[transformers] sounddevice soundfile librosa
 
 Usage::
 

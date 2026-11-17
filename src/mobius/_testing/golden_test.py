@@ -34,6 +34,7 @@ revision: "abc123"
 task_type: "text-generation"
 dtype: "float32"
 level: "L4"
+reference_loader: "multimodal"
 inputs:
   prompts:
     - "Hello world"
@@ -94,10 +95,14 @@ class TestLoadTestCase:
         assert case.level == "L4"
         assert case.prompts == ["Hello world"]
         assert case.images == []
+        assert case.videos == []
+        assert case.video_num_frames is None
+        assert case.media_max_pixels is None
         assert case.audio == []
         assert case.decoder_prompt == ""
         assert case.generation_params == {}
         assert case.trust_remote_code is False
+        assert case.reference_loader == "multimodal"
         assert case.skip_reason is None
 
     def test_load_vl_case(self, tmp_path: Path):
@@ -118,6 +123,7 @@ class TestLoadTestCase:
         case = load_test_case(yaml_path)
 
         assert case.skip_reason == "Model requires gated access"
+        assert case.reference_loader == "causal-lm"
 
     def test_missing_required_field_raises(self, tmp_path: Path):
         bad_yaml = "model_id: test\n"

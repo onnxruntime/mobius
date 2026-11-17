@@ -9,6 +9,8 @@ import pytest
 
 from mobius.functions.causal_conv import causal_conv_nd_with_state
 
+pytestmark = pytest.mark.opset29
+
 
 class TestCausalConvNdWithState:
     """Tests for the causal_conv_nd_with_state ir.Function builder."""
@@ -53,8 +55,10 @@ class TestCausalConvNdWithState:
         )
         op_types = [node.op_type for node in func.graph]
         if activation in ("silu", "swish"):
-            assert "Sigmoid" in op_types
+            assert "Swish" in op_types
+            assert "Sigmoid" not in op_types
         else:
+            assert "Swish" not in op_types
             assert "Sigmoid" not in op_types
 
     def test_invalid_ndim_raises(self):

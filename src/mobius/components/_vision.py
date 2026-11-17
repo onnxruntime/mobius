@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius.components._common import Linear
 from mobius.components._mlp import FCMLP
 
 if TYPE_CHECKING:
@@ -131,7 +132,7 @@ class VisionAttention(nn.Module):
         return self.out_proj(op, attn_output)
 
 
-class _VisionLinear(nn.Module):
+class _VisionLinear(Linear):
     """Linear layer with Transpose+MatMul using standard ONNX ops.
 
     Always includes bias. The ``bias`` kwarg is accepted for API
@@ -139,14 +140,7 @@ class _VisionLinear(nn.Module):
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
-        super().__init__()
-        self.weight = nn.Parameter([out_features, in_features])
-        self.bias = nn.Parameter([out_features])
-
-    def forward(self, op: OpBuilder, x: ir.Value):
-        weight_t = op.Transpose(self.weight, perm=[1, 0])
-        result = op.MatMul(x, weight_t)
-        return op.Add(result, self.bias)
+        super().__init__(in_features, out_features, bias=True)
 
 
 class VisionLayerNorm(nn.Module):

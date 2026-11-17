@@ -1,8 +1,98 @@
 # Model Catalog
 
-**mobius** supports 273 registered model types across 10 categories.
-This catalog lists every supported architecture with its module class, task type,
-and example HuggingFace model IDs.
+## Non-generative decision models
+
+Mobius exports `Contrastive-LM/CLM-v0.1-8B` with one `ModelPackage`
+containing its headless Qwen3 encoder, state/action projection heads, and
+scaled-cosine scorer (`CLMModel` + `CLMTask`). The CLM release did **not** pin a
+Qwen3-8B base revision: generic construction records the base as `unpinned`;
+`build_clm_package(..., base_revision=<sha>)` requires the caller's selected
+revision and records it as reproducible provenance.
+
+The v0.1 heads first L2-normalize each selected Qwen embedding, then use depth
+3: input `Linear + GELU`, one
+`Linear + LayerNorm + GELU` hidden block (optionally residual), output
+`Linear`, then L2 normalization. The headless encoder emits the complete
+`token_hidden_states` tensor, contains no vocabulary projection, and has no
+generation-cache inputs or outputs. CLM uses
+last-token pooling, but neither the upstream padding side nor its EOS behavior
+is pinned. Callers must select the last attended position using their
+attention mask (the deterministic `clm_last_token_indices` helper is provided)
+before passing `[items, 4096]` embeddings to either projection head. Mobius
+does not assume that sequence position `-1` is a real token.
+
+`jaredpalmer/kev-4b` similarly exports its headless Qwen3.5 backbone and grouped
+pointer head (`KevModel` + `KevTask`). Its published Qwen3.5 base revision is
+pinned. The backbone package exposes only input IDs, attention/position inputs,
+and token hidden states; KV, convolution, and recurrent generation caches are
+not part of this scoring export. `build_kev_package` accepts a dense state dict
+after the published PEFT
+adapter has been merged. Mobius does not currently merge arbitrary PEFT LoRA
+artifacts into Qwen3.5: passing separate base/adapter mappings fails with an
+actionable instruction to use PEFT `merge_and_unload()` first, rather than
+silently exporting the unadapted base.
+
+The deterministic request adapters in `mobius.models.decision` implement each
+model's verified structured rendering, candidate mapping, stable grouped
+softmax, confidence, and ranking contracts. They require a caller-provided
+tokenizer and local tensors; export and preprocessing do not use an HTTP or
+session API. Checkpoint mapping helpers accept already-deserialized mappings,
+so applications retain control over pickle deserialization. Production build
+helpers validate the complete published checkpoint metadata, exact head key
+sets, tensor shapes, and scalar calibration before constructing any graph.
+Flexible `synthetic_*_checkpoint` helpers are test fixtures and intentionally
+do not pass these production contracts.
+
+The Kev adapter enforces the published 8,192-token causal-row limit, 1–255
+option bounds, and a non-empty question set. Non-strict mode truncates state
+user tokens to 8,191 before adding the state control token; strict mode rejects
+that overflow. Every question remains an independent state-plus-question row;
+`batch_kev_rows` produces padded backbone inputs and matching local
+decide/option indices for the pointer graph. Score confidence is
+`max(0, 1 - Σ pᵢ|i-mode|/(L-1))`, matching the public adapter.
+
+### Decision-model parity tests
+
+`tests/kev_parity_test.py` and `tests/clm_parity_test.py` contain fast synthetic
+ONNX-versus-PyTorch tests that run in the normal CPU test lane:
+
+```bash
+pytest tests/kev_parity_test.py tests/clm_parity_test.py -m "not integration"
+```
+
+The full tests are opt-in because they load the exported FP32 package and its
+reference model on CUDA. Keep user-site packages disabled when the selected
+Conda environment contains the intended ONNX Runtime GPU build.
+
+```bash
+# Pinned KEV base, adapter, preprocessing, hidden-state readouts, pointer head,
+# probabilities, and typed answers.
+PYTHONNOUSERSITE=1 \
+MOBIUS_DECISION_EXPORT_ROOT=/path/to/kev-4b-fp32 \
+MOBIUS_KEV_ALLOW_DOWNLOAD=1 \
+pytest tests/kev_parity_test.py -m integration
+
+# CLM with an explicitly selected Qwen3 revision.
+PYTHONNOUSERSITE=1 \
+CLM_RUN_FULL_PARITY=1 \
+CLM_BASE_REVISION=<immutable-qwen3-revision> \
+MOBIUS_DECISION_EXPORT_ROOT=/path/to/clm-v0.1-8b-fp32 \
+pytest tests/clm_parity_test.py -m integration -k exported_clm
+```
+
+CLM's official serving path remains a separate qualification because upstream
+did not pin Qwen3, vLLM, or tokenizer/pooling versions. Start and record an
+external `vllm serve ... --runner pooling` instance, then set
+`CLM_RUN_VLLM_PARITY=1`, `CLM_EMBED_URL`, `CLM_EMBED_MODEL`, and
+`CLM_VLLM_METADATA` to compare its normalized embeddings and probabilities
+against the same exported package.
+
+This user-facing catalog groups registered HuggingFace model types by task and lists
+their module classes and example model IDs. Diffusers pipeline components are described
+separately because they are not entries in the model registry. Neither list implies GGUF
+import or runtime support; see the generated
+[GGUF capability and evidence catalog](gguf-capability-catalog.md) for those
+capability-specific verdicts and statistics.
 
 > **Auto-fallback**: Models not explicitly registered but architecturally
 > compatible with Llama (standard CausalLM transformers) are automatically
@@ -79,7 +169,7 @@ Models that route tokens to a subset of expert MLPs.
 | `deepseek_v2` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V2-Lite` |
 | `deepseek_v3` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V3` |
 | `phimoe` | `Phi3MoECausalLMModel` | `microsoft/Phi-3.5-MoE-instruct` |
-| `gptoss` | `GPTOSSCausalLMModel` | — |
+| `gpt_oss` | `GPTOSSCausalLMModel` | `openai/gpt-oss-20b` (native MXFP4/QMoE on CUDA) |
 
 Also registered with `MoECausalLMModel`: `arctic`, `dbrx`,
 `ernie4_5_moe`, `flex_olmo`, `glm4_moe`, `granitemoe`,
@@ -108,6 +198,10 @@ Models combining Mamba/SSM layers with transformer attention layers.
 ## Vision-Language (Multimodal)
 
 Models that process both images and text.
+
+For Gemma4 26B-A4B, see the [draft runtime qualification and FP32 pixel input
+contract](gemma4-runtime.md), including the failed strict parity gate and limits
+of the prior evaluation evidence.
 
 | Model Type | Module Class | Task | Example HuggingFace Model |
 |---|---|---|---|
@@ -182,8 +276,11 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | Model Type | Module Class | Task | Example HuggingFace Model |
 |---|---|---|---|
 | `whisper` | `WhisperForConditionalGeneration` | `speech-to-text` | `openai/whisper-tiny` |
+| `moonshine` | `MoonshineForConditionalGeneration` | `speech-to-text` | `UsefulSensors/moonshine-tiny` |
+| `moonshine_streaming` | `MoonshineStreamingForConditionalGeneration` | `speech-to-text` | `moonshine-ai/moonshine-streaming-tiny` |
 | `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 | `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
+| `VibeVoiceForASRStreamingTraining` | `VibeVoiceASRStreamingForConditionalGeneration` | `vibevoice-asr-streaming` | `microsoft/VibeVoice-ASR-Streaming-1.5B`, `microsoft/VibeVoice-ASR-Streaming-7B` |
 
 ### Text-to-Speech
 
@@ -191,6 +288,8 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 |---|---|---|---|
 | `qwen3_tts` | `Qwen3TTSForConditionalGeneration` | `tts` | — |
 | `qwen3_tts_tokenizer_12hz` | `Qwen3TTSTokenizerV2Model` | `codec` | — |
+| `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `vibevoice/VibeVoice-1.5B-hf` |
+| `vibevoice_asr` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr` | `microsoft/VibeVoice-ASR-HF` |
 
 ### Audio Feature Extraction
 
@@ -243,8 +342,12 @@ Supported component classes include:
 - `ControlNetModel` — ControlNet conditioning
 - `CogVideoXTransformer3DModel` — CogVideoX
 - `VideoAutoencoderModel` — Video VAE
-- `QwenImageTransformer2DModel` — Qwen image generation
-- `AutoencoderKLQwenImageModel` — Qwen image VAE
+- `QwenImageTransformer2DModel` — Qwen image generation and packed-token
+  Qwen-Image-Edit-2509 denoising with source-image conditioning, masks, and 3D RoPE
+- `AutoencoderKLQwenImageModel` — Qwen image VAE, including edit-pipeline latent
+  normalization
+- `Qwen2_5_VLForConditionalGeneration` — image-aware prompt encoder used by
+  Qwen-Image-Edit-2509
 
 ```python
 from mobius import build
@@ -263,21 +366,14 @@ All decoder-only LLMs and MoE models support quantized weight loading:
 | **AWQ** | HuggingFace (e.g. `-AWQ` suffix models) | `build("TheBloke/Llama-2-7B-AWQ")` |
 | **GGUF** | Local `.gguf` files | `build_from_gguf("model.gguf")` |
 
-GGUF support (Phase 1) dequantizes weights to float before building the
-ONNX graph. Phase 2 (`--keep-quantized`) preserves quantization using
-MatMulNBits ops.
+GGUF import uses quantized target storage by default where the selected graph
+supports it. Source blocks may be byte-preserved, losslessly repacked, or
+lossily dequantized/requantized to a target such as INT4 affine block-32.
+Lossy conversion emits one aggregate warning, and every saved package records
+source fidelity, storage, and compute semantics in `quantization_report.json`.
+Use `--dequantize` for an explicitly reported float model.
 
-## Summary
-
-| Category | Count | Primary Classes |
-|---|---|---|
-| Decoder-only LLMs | ~100 | `CausalLMModel`, `GPT2CausalLMModel` |
-| Mixture of Experts | ~25 | `MoECausalLMModel`, `DeepSeekV3CausalLMModel` |
-| SSM / Hybrid | 5 | `MambaCausalLMModel`, `JambaCausalLMModel` |
-| Vision-Language | ~40 | `LLaVAModel`, `Qwen25VLCausalLMModel` |
-| Encoder-only | ~40 | `BertModel`, `DistilBertModel` |
-| Encoder-decoder | ~20 | `BartForConditionalGeneration`, `T5ForConditionalGeneration` |
-| Speech & Audio | ~20 | `WhisperForConditionalGeneration`, `Wav2Vec2Model` |
-| Vision | ~25 | `ViTModel`, `CLIPVisionModel` |
-| Diffusion | ~10 | `UNet2DConditionModel`, `FluxTransformer2DModel` |
-| **Total** | **~273** | |
+Encoder GGUF imports for `bert` and `modern-bert` select
+`feature-extraction` and expose token-level `last_hidden_state` only. Pooling,
+classifier/reranker heads, generative task overrides, and cache options are
+rejected unless their exact output contracts are implemented.

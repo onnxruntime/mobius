@@ -1,0 +1,60 @@
+model_id: "HuggingFaceTB/SmolLM-135M"
+model_type: "llama"
+revision: "1d461723eec654e65efdc40cf49301c89c0c92f4"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "neopolita/smollm-135m-gguf"
+  revision: "22cca988936eafe92908e7558907c3964e10bba7"
+  filename: "ggml-model-f16.gguf"
+  size: 270885504
+  lfs_sha256: "ec8c775c16944a7e4b5251f97b3f848500dcc3e701b0d492ce9055cea42138a2"
+  tensor_count: 272
+  tensor_qtypes:
+    F16: 211
+    F32: 61
+  execution_provider: "cpu"
+  config_sha256: "b999a219ddf6046f1b6e5c082dab2d00b7ba1682169914430b1a3672fc735498"
+  preserve_quantization: false
+  keep_quantized: true
+  tokenizer:
+    repository: "HuggingFaceTB/SmolLM-135M"
+    revision: "1d461723eec654e65efdc40cf49301c89c0c92f4"
+    metadata_sha256: "46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc"
+    identity_status: "exact"
+    assets:
+      - filename: "special_tokens_map.json"
+        size: 831
+        sha256: "e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3"
+      - filename: "tokenizer.json"
+        size: 2104556
+        sha256: "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+      - filename: "tokenizer_config.json"
+        size: 3685
+        sha256: "238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8"
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "smollm-135m-f16-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 300000000
+  released_capabilities:
+    "0.15.2":
+      generic_decoder: true
+      state_groups: false
+
+inputs:
+  prompts:
+    - "Once upon a time,"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Pinned F16 GGUF import; independent HuggingFace reference and tokenizer use the pinned top-level revision."

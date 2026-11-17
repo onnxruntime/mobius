@@ -1,0 +1,25 @@
+model_id: "microsoft/Mage-VL"
+model_type: "mage_vl"
+revision: "d88b153285f1633a61b2f693c59c8576693af185"
+task_type: "image-text-to-text"
+dtype: "bfloat16"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Describe the image and then summarize the main action in the video."
+  images:
+    - "mage-vl-dog.jpg"
+  videos:
+    - "mage-vl-soccer-broadcast.mp4"
+  video_num_frames: 5
+  media_max_pixels: 200704
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 24
+  do_sample: false
+
+ci_skip_reason: "Mage-VL is a 4.7B remote-code model; real-media golden validation requires a large GPU/CPU-offload runner."
+notes: "Microsoft Mage-VL with its upstream Apache-2.0 dog image and soccer video; exercises mixed image/video ordering and explicit sampled-frame patch positions."

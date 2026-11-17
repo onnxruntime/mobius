@@ -8,8 +8,9 @@ PyTorch reference for both prefill and decode steps. Run with::
 
     pytest tests/moe_integration_test.py -m integration -sv
 
-Note: This test is superseded by integration_test.py which includes MoE
-models in the parametrized catalogue. It is kept for backward compatibility.
+Note: This test is superseded by the generic text and generation integration
+suites, which include MoE models in their shared parametrized catalogue. It is
+kept for backward compatibility.
 """
 
 from __future__ import annotations

@@ -10,11 +10,127 @@ Usage::
 
     from mobius.integrations.gguf import build_from_gguf
 
+    # Text-only model
     pkg = build_from_gguf("path/to/model.gguf")
+    # Any local shard discovers and validates its exact sibling set.
+    pkg = build_from_gguf("path/to/model-00002-of-00003.gguf")
+    # Hub shard references resolve and pin the complete immutable set.
+    pkg = build_from_gguf("owner/repo@commit:model-00002-of-00003.gguf")
+    # Quantized target storage is used by default with a fidelity report;
+    # pass keep_quantized=False for explicitly reported float storage.
+
+    # Multimodal (text + companion mmproj vision/audio encoder)
+    pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")
+
+    # Exact evidence emits a validated runtime package. Downstream runtime
+    # limitations preserve an accurate model package marked runtime-unvalidated.
+
+:func:`build_from_gguf` is the single entry point; passing ``mmproj`` delegates
+to the matching architecture-specific multimodal builder.
 """
 
 from __future__ import annotations
 
-from mobius.integrations.gguf._builder import build_from_gguf
+from mobius.integrations.gguf._builder import (
+    SparseMoEExportError,
+    build_from_gguf,
+)
+from mobius.integrations.gguf._config_mapping import (
+    GgufArchResolutionError,
+    resolve_model_type,
+)
+from mobius.integrations.gguf._draft_pair import (
+    build_draft_pair_from_gguf,
+    write_draft_pair_package,
+)
+from mobius.integrations.gguf._draft_runtime import (
+    DraftGenerationResult,
+    DraftGenerationStats,
+    DraftPairRunner,
+)
+from mobius.integrations.gguf._mmproj import (
+    build_audio_projector_from_gguf,
+    build_gemma3_vlm_from_gguf,
+    build_gemma4_vlm_from_gguf,
+    build_mmproj_from_gguf,
+    build_qwen_vlm_from_gguf,
+)
+from mobius.integrations.gguf._preflight import (
+    GgufPreflightReport,
+    GgufTypeStat,
+    preflight_gguf,
+    preflight_hf_gguf,
+    preflight_local_gguf,
+)
+from mobius.integrations.gguf._quantization_report import (
+    GGUFQuantizationReport,
+    QuantizationDisposition,
+    QuantizationDispositionStat,
+    QuantizationTensorRecord,
+    QuantizationTypeStat,
+)
+from mobius.integrations.gguf._reuse import verify_gguf_reuse_manifest
+from mobius.integrations.gguf._runtime_package import write_gguf_runtime_package
+from mobius.integrations.gguf._shard_set import (
+    GgufShardError,
+    GgufShardManifest,
+    GgufShardSet,
+    discover_gguf_shards,
+    open_gguf_model,
+)
+from mobius.integrations.gguf._tokenizer import (
+    GGUFTokenizerAsset,
+    GGUFTokenizerSource,
+    materialize_evidenced_gguf_tokenizer,
+    materialize_gguf_tokenizer,
+    write_gguf_tokenizer_json,
+)
+from mobius.integrations.gguf._tokenizer_census import (
+    GGUFTokenizerRouteAudit,
+    tokenizer_route_census,
+)
 
-__all__ = ["build_from_gguf"]
+__all__ = [
+    "build_from_gguf",
+    "build_audio_projector_from_gguf",
+    "build_draft_pair_from_gguf",
+    "write_draft_pair_package",
+    "DraftGenerationResult",
+    "DraftGenerationStats",
+    "DraftPairRunner",
+    "build_gemma3_vlm_from_gguf",
+    "build_gemma4_vlm_from_gguf",
+    "build_mmproj_from_gguf",
+    "build_qwen_vlm_from_gguf",
+    "GGUFTokenizerAsset",
+    "GGUFTokenizerRouteAudit",
+    "GGUFTokenizerSource",
+    "materialize_evidenced_gguf_tokenizer",
+    "materialize_gguf_tokenizer",
+    "tokenizer_route_census",
+    "write_gguf_runtime_package",
+    "write_gguf_tokenizer_json",
+    "verify_gguf_reuse_manifest",
+    # Multi-shard GGUF import
+    "GgufShardSet",
+    "GgufShardManifest",
+    "GgufShardError",
+    "discover_gguf_shards",
+    "open_gguf_model",
+    # Architecture resolution
+    "resolve_model_type",
+    "GgufArchResolutionError",
+    # Sparse-MoE honesty gate
+    "SparseMoEExportError",
+    # Metadata-only preflight
+    "preflight_gguf",
+    "preflight_local_gguf",
+    "preflight_hf_gguf",
+    "GgufPreflightReport",
+    "GgufTypeStat",
+    "GGUFQuantizationReport",
+    "QuantizationDisposition",
+    "QuantizationDispositionStat",
+    "QuantizationTensorRecord",
+    "QuantizationTypeStat",
+]

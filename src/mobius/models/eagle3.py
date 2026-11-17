@@ -3,18 +3,11 @@
 
 """EAGLE-3 speculative-decoding draft model.
 
-The drafter emits logits over a compressed *draft* vocabulary; a consumer maps
-each draft id back to the target vocabulary via
-``target_id = draft_id + d2t[draft_id]``. The ``d2t`` / ``t2d`` buffers are
-dropped from the ONNX graph (see :meth:`Eagle3DraftModel.preprocess_weights`)
-and applied by the speculative-decoding orchestrator.
-
-TODO(genai): there is no ORT-GenAI integration for the drafters yet. When one is
-added, emit a ``draft_to_target.json`` sidecar from
-``mobius.integrations.ort_genai`` (alongside ``genai_config.json`` /
-``processor_config.json``) holding the resolved draft->target map, read from the
-checkpoint's ``d2t`` tensor, so the artifact is self-contained for downstream
-consumers.
+The drafter emits logits over a compressed *draft* vocabulary. HuggingFace
+checkpoints store ``d2t`` offsets; the llama.cpp GGUF converter resolves those
+to absolute target token IDs. Mobius records the absolute map in
+``draft_manifest.json`` and the direct ONNX Runtime coordinator applies it
+outside the neural graph.
 """
 
 from __future__ import annotations
@@ -25,8 +18,16 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import Eagle3Config
-from mobius.components import MLP, Linear, RMSNorm, create_attention_bias, initialize_rope
+from mobius.components import (
+    MLP,
+    Embedding,
+    Linear,
+    RMSNorm,
+    create_attention_bias,
+    initialize_rope,
+)
 from mobius.components._attention import Attention
+from mobius.models.base import linear_class_for_config
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -35,19 +36,21 @@ if TYPE_CHECKING:
 class Eagle3Attention(Attention):
     """Llama attention with Q/K/V projected from concatenated 2H input."""
 
-    def __init__(self, config: Eagle3Config):
-        super().__init__(config)
-        self.q_proj = Linear(
+    def __init__(self, config: Eagle3Config, linear_class: type | None = None):
+        if linear_class is None:
+            linear_class = Linear
+        super().__init__(config, linear_class=linear_class)
+        self.q_proj = linear_class(
             2 * config.hidden_size,
             config.num_attention_heads * config.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.k_proj = Linear(
+        self.k_proj = linear_class(
             2 * config.hidden_size,
             config.num_key_value_heads * config.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.v_proj = Linear(
+        self.v_proj = linear_class(
             2 * config.hidden_size,
             config.num_key_value_heads * config.head_dim,
             bias=config.attn_qkv_bias,
@@ -68,24 +71,26 @@ class Eagle3DraftModel(nn.Module):
         self._norm_before_residual = bool(getattr(config, "norm_before_residual", False))
         self._norm_before_fc = bool(getattr(config, "norm_before_fc", False))
         self._fc_norm = bool(getattr(config, "fc_norm", False))
-        if config.draft_vocab_size is None:
+        self.embed_tokens = (
+            Embedding(config.vocab_size, config.hidden_size)
+            if config.use_draft_token_embedding
+            else None
+        )
+        draft_vocab_size = config.draft_vocab_size
+        if draft_vocab_size is None and not config.use_target_lm_head:
             raise ValueError("Eagle3Config.draft_vocab_size must be set")
-        target_hidden = getattr(config, "target_hidden_size", None)
-        if target_hidden is not None and target_hidden != config.hidden_size:
-            raise NotImplementedError(
-                f"Eagle3: target_hidden_size ({target_hidden}) != hidden_size "
-                f"({config.hidden_size}) is not supported"
-            )
+        target_hidden = config.target_hidden_size or config.hidden_size
+        linear_class = linear_class_for_config(config) or Linear
         # Number of target aux hidden states fused by fc (3 in every EAGLE-3
         # checkpoint; the fc input is target_hidden_size * num_aux = 3 * hidden).
         self._num_aux = 3
 
-        self.fc = Linear(3 * config.hidden_size, config.hidden_size, bias=False)
+        self.fc = linear_class(3 * target_hidden, config.hidden_size, bias=False)
         # Optional pre-fc norms (vLLM EAGLE-3): a single RMSNorm over the full
         # fused 3H input (norm_before_fc) and/or a per-aux RMSNorm on each H chunk
         # (fc_norm). Both are absent in the AngelSlim / speculators checkpoints.
         if self._norm_before_fc:
-            self.input_norm = RMSNorm(3 * config.hidden_size, eps=config.rms_norm_eps)
+            self.input_norm = RMSNorm(3 * target_hidden, eps=config.rms_norm_eps)
         if self._fc_norm:
             self.fc_norm = nn.ModuleList(
                 [
@@ -95,11 +100,15 @@ class Eagle3DraftModel(nn.Module):
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = Eagle3Attention(config)
+        self.self_attn = Eagle3Attention(config, linear_class=linear_class)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, linear_class=linear_class)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = Linear(config.hidden_size, config.draft_vocab_size, bias=False)
+        self.lm_head = (
+            None
+            if config.use_target_lm_head
+            else linear_class(config.hidden_size, draft_vocab_size, bias=False)
+        )
         self.rotary_emb = initialize_rope(config)
 
     def _project_fused(self, op: OpBuilder, fused_hidden: ir.Value) -> ir.Value:
@@ -124,12 +133,13 @@ class Eagle3DraftModel(nn.Module):
         """Strip the layer prefix and drop borrowed / orchestrator-side weights.
 
         Handles both checkpoint layouts: AngelSlim names the single layer
-        ``midlayer.*``; speculators (RedHat) names it ``layers.0.*`` and also
-        ships an ``embed_tokens`` copy of the target's embedding (we borrow the
-        target's, so drop it). ``d2t`` / ``t2d`` are orchestrator-side remap
-        buffers and are dropped from the graph.
+        ``midlayer.*``; speculators (RedHat) names it ``layers.0.*`` and may
+        ship a draft-owned ``embed_tokens`` table. ``d2t`` / ``t2d`` are
+        orchestrator-side remap buffers and are dropped from the graph.
         """
-        drop = {"d2t", "t2d", "embed_tokens.weight"}
+        drop = {"d2t", "t2d"}
+        if self.embed_tokens is None:
+            drop.add("embed_tokens.weight")
         out = {}
         for key, value in state_dict.items():
             if key in drop:
@@ -150,7 +160,15 @@ class Eagle3DraftModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        input_ids: ir.Value | None = None,
     ):
+        embedding = self.embed_tokens
+        if embedding is not None:
+            if input_ids is None:
+                raise ValueError("draft-owned EAGLE3 embeddings require input_ids")
+            inputs_embeds = embedding(op, input_ids)
+        elif inputs_embeds is None:
+            raise ValueError("target-shared EAGLE3 embeddings require inputs_embeds")
         combined = op.Add(self._project_fused(op, fused_hidden), recycled_hidden)
         embeds = self.input_layernorm(op, inputs_embeds)
         hidden = self.hidden_norm(op, combined)
@@ -180,5 +198,5 @@ class Eagle3DraftModel(nn.Module):
         hidden = self.mlp(op, hidden)
         h_prenorm = op.Add(hidden, residual)
         h_post = self.norm(op, h_prenorm)
-        draft_logits = self.lm_head(op, h_post)
-        return draft_logits, h_prenorm, [present_kv]
+        draft_output = h_post if self.lm_head is None else self.lm_head(op, h_post)
+        return draft_output, h_prenorm, [present_kv]

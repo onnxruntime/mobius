@@ -4,12 +4,22 @@
 from __future__ import annotations
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import onnx_ir as ir
 import pytest
 
-from mobius._build_context import build_context, ep_capabilities, get_build_dtype
-from mobius._execution_providers import EpCapabilities
+from mobius._build_context import (
+    build_context,
+    ep_capabilities,
+    get_build_dtype,
+    get_matmul_nbits_accuracy_level,
+    is_prefill_prefix_pruning_enabled,
+    prefill_prefix_pruning,
+)
+from mobius._execution_providers import EpCapabilities, ep_registry
+
+pytestmark = pytest.mark.opset29
 
 _CUDA_CAPABILITIES = EpCapabilities(
     name="cuda",
@@ -19,6 +29,67 @@ _CPU_CAPABILITIES = EpCapabilities(
     name="cpu",
     gqa_dtypes=frozenset({ir.DataType.FLOAT}),
 )
+
+
+@pytest.mark.parametrize("level", [None, 0, 1, 2, 3, 4])
+def test_matmul_nbits_accuracy_level_scoping(level):
+    def raise_in_inner_context():
+        with build_context(_CUDA_CAPABILITIES, matmul_nbits_accuracy_level=0):
+            assert get_matmul_nbits_accuracy_level() == 0
+            raise RuntimeError("deliberate")
+
+    assert get_matmul_nbits_accuracy_level() is None
+    with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=level):
+        assert get_matmul_nbits_accuracy_level() == level
+        with build_context(_CUDA_CAPABILITIES):
+            assert get_matmul_nbits_accuracy_level() is None
+        assert get_matmul_nbits_accuracy_level() == level
+        with pytest.raises(RuntimeError, match="deliberate"):
+            raise_in_inner_context()
+        assert get_matmul_nbits_accuracy_level() == level
+    assert get_matmul_nbits_accuracy_level() is None
+
+
+@pytest.mark.parametrize("level", [-1, 5, True, False, 4.0, "4"])
+def test_matmul_nbits_accuracy_level_rejects_invalid_values_without_leaking(level):
+    with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=4):
+        with (
+            pytest.raises(ValueError, match="matmul_nbits_accuracy_level"),
+            build_context(_CUDA_CAPABILITIES, matmul_nbits_accuracy_level=level),
+        ):
+            pytest.fail("Invalid context should not be entered")
+        assert get_matmul_nbits_accuracy_level() == 4
+        assert ep_capabilities() is _CPU_CAPABILITIES
+    assert get_matmul_nbits_accuracy_level() is None
+
+
+def test_matmul_nbits_accuracy_level_thread_isolation():
+    barrier = threading.Barrier(2)
+
+    def build(level):
+        with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=level):
+            barrier.wait(timeout=5)
+            return get_matmul_nbits_accuracy_level()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(build, level) for level in (0, 4)]
+        assert [future.result(timeout=10) for future in futures] == [0, 4]
+    assert get_matmul_nbits_accuracy_level() is None
+
+
+def test_matmul_nbits_accuracy_level_async_isolation():
+    import asyncio
+
+    async def build(level):
+        with build_context(_CPU_CAPABILITIES, matmul_nbits_accuracy_level=level):
+            await asyncio.sleep(0)
+            return get_matmul_nbits_accuracy_level()
+
+    async def run():
+        return await asyncio.gather(build(0), build(4))
+
+    assert asyncio.run(run()) == [0, 4]
+    assert get_matmul_nbits_accuracy_level() is None
 
 
 class TestBuildContextDefaults:
@@ -31,11 +102,19 @@ class TestBuildContextDefaults:
         """No context active → returns FLOAT."""
         assert get_build_dtype() == ir.DataType.FLOAT
 
+    def test_prefill_prefix_pruning_is_disabled(self):
+        assert not is_prefill_prefix_pruning_enabled()
+
     def test_default_capabilities_has_no_fusions(self):
         """Default EP has no GQA dtypes (portable ONNX)."""
         capabilities = ep_capabilities()
         assert len(capabilities.gqa_dtypes) == 0
         assert len(capabilities.qkv_pack_dtypes) == 0
+
+    def test_webgpu_capabilities_enable_fp16_gqa(self):
+        capabilities = ep_registry.require("webgpu")
+        assert ir.DataType.FLOAT16 in capabilities.gqa_dtypes
+        assert capabilities.supports_past_present_share_buffer
 
 
 class TestBuildContextScoping:
@@ -59,6 +138,11 @@ class TestBuildContextScoping:
             raise RuntimeError("deliberate")
         assert ep_capabilities().name == "default"
         assert get_build_dtype() == ir.DataType.FLOAT
+
+    def test_prefill_prefix_pruning_restored_after_context(self):
+        with prefill_prefix_pruning(True):
+            assert is_prefill_prefix_pruning_enabled()
+        assert not is_prefill_prefix_pruning_enabled()
 
 
 class TestBuildContextNesting:

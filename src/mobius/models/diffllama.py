@@ -194,12 +194,15 @@ class DiffLlamaAttention(nn.Module):
         # Unsqueeze to [1, 1, S, Sk] and add to scores [B, H, S, Sk]
         attn_scores = op.Add(attn_scores, op.Unsqueeze(causal_bias, [0, 1]))
 
-        # Padding mask (3D bool [B, S, Sk]) → additive bias [B, 1, S, Sk]
+        # Padding mask: ``create_padding_mask`` yields a 4D bool tensor
+        # [B, 1, S, Sk] (the explicit singleton head dim prevents the batch
+        # axis being misread as q_num_heads for batch > 1). Convert to an
+        # additive bias and add directly — it broadcasts across the head axis.
         if attention_bias is not None:
             pad_zero = op.CastLike(0.0, q_4d)
             pad_neg_inf = op.CastLike(float("-inf"), q_4d)
-            pad_bias = op.Where(attention_bias, pad_zero, pad_neg_inf)
-            attn_scores = op.Add(attn_scores, op.Unsqueeze(pad_bias, [1]))
+            pad_bias = op.Where(attention_bias, pad_zero, pad_neg_inf)  # [B, 1, S, Sk]
+            attn_scores = op.Add(attn_scores, pad_bias)
 
         # Softmax and weighted sum with doubled V
         attn_weights = op.Softmax(attn_scores, axis=-1)  # [B, H, S, Sk]

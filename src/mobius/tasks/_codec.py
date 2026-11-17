@@ -81,16 +81,21 @@ class CodecTask(ModelTask):
         """Build encoder: waveform → codes.
 
         Inputs:
-            waveform: (B, 1, audio_samples) float32
+            waveform: (B, audio_channels, audio_samples) float32
         Outputs:
             codes: (B, num_quantizers, T) int64
         """
         batch = ir.SymbolicDim("batch")
         audio_len = ir.SymbolicDim("audio_length")
+        # The first conv is sized from codec_encoder.audio_channels, so the
+        # graph input must declare the same channel count.
+        audio_channels = config.codec_encoder.audio_channels if config.codec_encoder else 1
 
         graph, builder = _make_graph(name="encoder")
         waveform = builder.input(
-            "waveform", dtype=ir.DataType.FLOAT, shape=[batch, 1, audio_len]
+            "waveform",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, audio_channels, audio_len],
         )
 
         codes = encoder(builder.op, waveform)

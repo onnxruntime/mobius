@@ -10,7 +10,7 @@ parent [SKILL.md](../SKILL.md).
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `type` | string | **yes** | Model type identifier (see registry in SKILL.md) |
+| `type` | string | **yes** | `decoder` for graph-representable decoder-only packages; a specialized type only for the explicit runtime/topology exceptions in SKILL.md |
 | `vocab_size` | int | yes | Vocabulary size |
 | `context_length` | int | **yes** | Maximum context length; must be > 0 |
 | `bos_token_id` | int | no | Beginning-of-sequence token |

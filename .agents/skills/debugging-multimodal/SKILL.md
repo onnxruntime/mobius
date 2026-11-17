@@ -261,11 +261,11 @@ via `MOBIUS_ORT_LOWER_OPSET_FOR_EP=1`).  See `src/mobius/_flags.py`.
 
 ### Encoder input dtype alignment
 
-Encoder task inputs should be declared with `dtype=config.dtype` so
-entry tensors match the model compute dtype (float32/float16/bfloat16).
-In the current codebase, multimodal encoder task builders set encoder
-inputs directly to `config.dtype` (there is no `_cast_encoder_input()`
-helper in `src/mobius/tasks/_base.py`).
+Real vision/audio processors emit float32. Encoder graph inputs should
+therefore be float32 even for fp16/bf16 exports, with one Cast to
+`config.dtype` at graph entry. Verify this with an actual processor batch
+and a graph I/O dtype assertion; synthetic feeds can hide the mismatch.
+Some older task builders still use `config.dtype` and are not safe templates.
 
 ### GQA for KV-shared layers
 
@@ -339,8 +339,9 @@ assert_logits_close(onnx_logits, hf_logits, rtol=2e-2, atol=2e-1)
 > extraction, integration test patterns, tolerance guidelines, weight
 > loading verification, and HD multi-crop verification.
 
-- **Integration tests:** `tests/integration_test.py`
-  (`TestVLFullForward`, `TestQwen25VL3Model`),
+- **Integration tests:** `tests/integration/vlm_test.py`
+  (`TestVLTextForward`, `TestQwen25VL3Model`),
+  `tests/integration/multimodal_pipeline_test.py`,
   `tests/phi4mm_integration_test.py`
 - **ORT GenAI tests:** `tests/ort_genai_test.py`
 - **Example scripts:** `examples/qwen25_vl_ort_genai.py`,
