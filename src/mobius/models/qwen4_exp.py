@@ -339,7 +339,12 @@ class Qwen4ExpGatedResidual(nn.Module):
         else:
             read = op.Reshape(read, [0, 0, self._hc_count, self._hidden_size])
             streams = op.Reshape(normalized, [0, 0, self._hc_count, self._hidden_size])
-            mixed = op.ReduceMean(op.Mul(read, streams), [-2], keepdims=False)
+            weighted = op.Mul(read, streams)
+            # Match PyTorch's FP32 reduction accumulator and model-dtype result.
+            mixed = op.CastLike(
+                op.ReduceMean(op.Cast(weighted, to=ir.DataType.FLOAT), [-2], keepdims=False),
+                weighted,
+            )
         if self.block_inject_weight is None:
             return mixed
         inject = self.block_inject_weight(op, normalized)
@@ -800,8 +805,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
         present_index_key = op.Concat(past_index_key, current_key, axis=1)
 
         all_visible = op.Equal(
-            op.Squeeze(attention_bias, [1]),
-            op.CastLike(0.0, attention_bias),
+            op.Squeeze(op.Cast(attention_bias, to=ir.DataType.FLOAT), [1]),
+            op.Constant(value_float=0.0),
         )
         visible_count = op.ReduceSum(
             op.Cast(all_visible, to=ir.DataType.INT64), [2], keepdims=True
@@ -1178,7 +1183,14 @@ class Qwen4ExpExperts(nn.Module):
             axis=-1,
             _outputs=2,
         )
-        activated = aop.Mul(aop.Mul(gate, aop.Sigmoid(gate)), up)
+        # Match Torch SiLU's FP32 opmath, rounding before the model-dtype up product.
+        # A separate low-precision Sigmoid loses tails before gate multiplication.
+        gate_f32 = aop.Cast(gate, to=ir.DataType.FLOAT)
+        silu_f32 = aop.Div(
+            gate_f32,
+            aop.Add(aop.Constant(value_float=1.0), aop.Exp(aop.Neg(gate_f32))),
+        )
+        activated = aop.Mul(aop.Cast(silu_f32, to=self._dtype), up)
         contribution = aop.Mul(
             aop.MatMul(activated, aop.Transpose(down, perm=[1, 0])), route_weights
         )
@@ -1869,6 +1881,15 @@ class Qwen4ExpVisionEncoderModel(Qwen3VLVisionEncoderModel):
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
+        if (
+            ep_capabilities().name == "onnx-standard"
+            and self.visual.patch_embed.weight.dtype == ir.DataType.BFLOAT16
+        ):
+            raise ValueError(
+                "Qwen4-Exp BF16 vision export with execution_provider='onnx-standard' "
+                "is disabled because official-weight vision parity failed; "
+                "use dtype='f32' or dtype='f16', or select text_only=True."
+            )
         # The HF image processor emits float32 packed patches. Cast once to
         # the checkpoint dtype before the Conv3d patch projection.
         pixel_values = op.CastLike(pixel_values, self.visual.patch_embed.weight)
@@ -1906,9 +1927,16 @@ class Qwen4ExpImageOnlyEmbeddingModel(Qwen25VLEmbeddingModel):
             ),
             input_ids,
         )
-        inputs_embeds = super().forward(
-            op,
-            safe_input_ids,
+        inputs_embeds = self.embed_tokens(op, safe_input_ids)
+        # HF replaces image placeholders only when a new image stream is supplied.
+        # Cached decode may emit an image token without supplying any new features.
+        image_mask = op.And(
+            op.Equal(safe_input_ids, op.Constant(value_int=self.image_token_id)),
+            op.Greater(op.Shape(image_features, start=0, end=1), [0]),
+        )
+        inputs_embeds = op.ScatterND(
+            inputs_embeds,
+            op.Transpose(op.NonZero(image_mask), perm=[1, 0]),
             image_features,
         )
 

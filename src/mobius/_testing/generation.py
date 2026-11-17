@@ -258,18 +258,12 @@ class OnnxSeq2SeqGenerator:
         for name in self.dec_session.input_names:
             if not name.startswith("past_key_values."):
                 continue
-            if ".cross." in name:
-                # Cross-attention cache: starts empty, populated on first step
-                past_kv[name] = np.zeros(
-                    (batch_size, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
-                )
-            else:
-                # Self-attention cache: grows each step
-                past_kv[name] = np.zeros(
-                    (batch_size, num_kv_heads, 0, head_dim),
-                    dtype=np.float32,
-                )
+            # Self- and cross-attention caches start empty; each graph input
+            # declares its own storage dtype, independent of model precision.
+            past_kv[name] = np.zeros(
+                (batch_size, num_kv_heads, 0, head_dim),
+                dtype=self.dec_session.get_input_dtype(name) or np.dtype(np.float32),
+            )
 
         # Step 3: Autoregressive decode loop
         cur_dec_ids = np.full((batch_size, 1), decoder_start_token_id, dtype=np.int64)

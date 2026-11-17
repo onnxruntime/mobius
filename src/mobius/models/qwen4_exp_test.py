@@ -15,6 +15,7 @@ import ml_dtypes
 import numpy as np
 import onnx
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 import safetensors.torch
 import torch
@@ -26,10 +27,14 @@ from mobius._build_context import build_context
 from mobius._builder import _cast_module_dtype, build_from_module
 from mobius._configs import Qwen4ExpConfig, VisionConfig
 from mobius._execution_providers import EpCapabilities, ep_registry
-from mobius._optimizations import validate_standard_onnx
+from mobius._optimizations import optimize_model, validate_standard_onnx
 from mobius._registry import registry
 from mobius._testing import create_test_builder, create_test_input
-from mobius._testing.ort_inference import OnnxModelSession
+from mobius._testing.ort_inference import (
+    OnnxModelSession,
+    _numpy_to_ort_value,
+    _ort_value_to_numpy,
+)
 from mobius.integrations._block_quant import BlockQuantScheme
 from mobius.integrations._weight_loading import (
     apply_weights,
@@ -42,6 +47,7 @@ from mobius.models.qwen4_exp import (
     Qwen4ExpExperts,
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpQSAIndexer,
+    Qwen4ExpVisionEncoderModel,
     Qwen4ExpVLDecoderModel,
 )
 from mobius.tasks._qwen4_exp import Qwen4ExpVisionLanguageTask
@@ -135,7 +141,8 @@ def _vl_config(**overrides) -> Qwen4ExpConfig:
     return _config(**values)
 
 
-def test_pinned_config_fields_extract_and_normalize_schedule():
+@pytest.mark.parametrize("qsa_layer_type", ["full_attention", "indexed_attention"])
+def test_pinned_config_fields_extract_and_normalize_schedule(qsa_layer_type):
     text = SimpleNamespace(
         model_type="qwen4_exp_text",
         vocab_size=248320,
@@ -160,7 +167,7 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
             "linear_attention",
             "linear_attention",
             "linear_attention",
-            "full_attention",
+            qsa_layer_type,
         ],
         linear_conv_kernel_dim=4,
         linear_key_head_dim=128,
@@ -269,6 +276,11 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     parent.video_token_id = 42
     with pytest.raises(ValueError, match="video_token_id 248057"):
         Qwen4ExpConfig.from_transformers(parent)
+
+
+def test_direct_config_normalizes_indexed_attention():
+    config = _config(layer_types=["linear_attention", "indexed_attention"])
+    assert config.layer_types == ["linear_attention", "qwen_sparse_attention"]
 
 
 def test_immutable_fp8_schema_fixture_matches_integration_contract():
@@ -513,6 +525,13 @@ def test_multimodal_embedding_preserves_global_image_order():
                 actual = device_actual
             else:
                 np.testing.assert_array_equal(device_actual, actual)
+            text_only = session.run(
+                {
+                    "input_ids": input_ids,
+                    "image_features": np.zeros((0, config.hidden_size), dtype=np.float32),
+                }
+            )["inputs_embeds"]
+            np.testing.assert_array_equal(text_only, weight[input_ids].numpy())
             video_input_ids = input_ids.copy()
             video_input_ids[0, 3] = config.unsupported_video_token_id
             with pytest.raises(
@@ -974,33 +993,6 @@ def test_ple_shard_divisibility_error_reports_remainder():
         _build(_config(split_ngram_parts=5))
 
 
-def test_qsa_indexer_selection_uses_bounded_scatter_mask():
-    model = _build()[2]
-    indexer_nodes = [node for node in model.graph if "/indexer/" in node.name]
-    assert not any(node.op_type == "ReduceMax" for node in indexer_nodes)
-    scatter = [node for node in indexer_nodes if node.op_type == "ScatterElements"]
-    assert len(scatter) == 1
-    assert scatter[0].attributes["reduction"].value == "max"
-
-
-def test_cuda_emits_genai_hyper_connection_and_normalization_ops():
-    from mobius._optimizations import validate_standard_onnx
-
-    config = _config(dtype=ir.DataType.BFLOAT16)
-    native = _build(config, ep="cuda")[2]
-    required = {
-        "BranchwiseRMSNorm",
-        "ScaledSiLU",
-        "HyperConnectionPreMix",
-        "HyperConnectionPostMix",
-        "GatedRMSNorm",
-    }
-    assert required <= {node.op_type for node in native.graph}
-    standard = _build(config, ep="onnx-standard")[2]
-    validate_standard_onnx(standard)
-    assert not required & {node.op_type for node in standard.graph}
-
-
 def test_moe_executes_only_packed_topk_experts():
     _config_value, _module, model = _build()
     moe_nodes = [node for node in model.graph if node.op_type == "MoE"]
@@ -1106,7 +1098,13 @@ def test_standard_moe_sparse_structure(experts, dtype):
     assert route_cast.attributes["to"].value == dtype
     assert route_cast.inputs[0].dtype == ir.DataType.FLOAT
     assert route_cast.inputs[0].producer().op_type == "Div"
-    assert not any(n.op_type in {"Cast", "CastLike"} for n in active)
+    activation_casts = [n for n in active if n.op_type == "Cast"]
+    assert len(activation_casts) == 2
+    assert activation_casts[0].attributes["to"].value == ir.DataType.FLOAT
+    assert activation_casts[0].inputs[0].producer().op_type == "Split"
+    assert activation_casts[1].attributes["to"].value == dtype
+    assert activation_casts[1].inputs[0].producer().op_type == "Div"
+    assert activation_casts[1].outputs[0].uses()[0].node.op_type == "Mul"
     assert (
         topk.inputs[1].const_value is not None
         or topk.inputs[1].producer().op_type == "Constant"
@@ -1191,9 +1189,15 @@ def test_standard_moe_independent_reference(top_k, normalize, shape, routes):
     np.testing.assert_allclose(actual, expected.reshape(shape), rtol=2e-5, atol=1e-7)
 
 
-@pytest.mark.parametrize("multimodal", [False, True])
 @pytest.mark.parametrize(
-    "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
+    "multimodal,dtype",
+    [
+        (False, ir.DataType.FLOAT),
+        (False, ir.DataType.FLOAT16),
+        (False, ir.DataType.BFLOAT16),
+        (True, ir.DataType.FLOAT),
+        (True, ir.DataType.FLOAT16),
+    ],
 )
 def test_standard_all_components_before_after_weights(multimodal, dtype):
     config = (_vl_config if multimodal else _config)(dtype=dtype, num_experts_per_tok=2)
@@ -1227,9 +1231,48 @@ def test_standard_all_components_before_after_weights(multimodal, dtype):
         onnx.checker.check_model(ir.to_proto(model), full_check=True)
 
 
+def test_standard_bfloat16_multimodal_export_rejects_unqualified_vision():
+    config = _vl_config(dtype=ir.DataType.BFLOAT16)
+    module = Qwen4ExpForConditionalGeneration(config)
+    with pytest.raises(ValueError, match=r"BF16 vision export.*official-weight vision parity"):
+        build_from_module(
+            module,
+            config,
+            task="qwen4-exp-vision-language",
+            execution_provider="onnx-standard",
+        )
+
+
+@pytest.mark.parametrize("config_dtype", [ir.DataType.FLOAT, ir.DataType.BFLOAT16])
+@pytest.mark.parametrize("ep", ["onnx-standard", "default", "cuda"])
+def test_bfloat16_vision_export_guard_uses_cast_weight_dtype(config_dtype, ep):
+    config = _vl_config(dtype=config_dtype)
+    module = Qwen4ExpVisionEncoderModel(config)
+    _cast_module_dtype(module, ir.DataType.BFLOAT16)
+    builder, op, _graph = create_test_builder()
+    pixels = create_test_input(builder, "pixel_values", [4, 1536])
+    grid = create_test_input(builder, "image_grid_thw", [1, 3], ir.DataType.INT64)
+    with build_context(ep_registry.require(ep), ir.DataType.BFLOAT16):
+        if ep == "onnx-standard":
+            with pytest.raises(
+                ValueError, match=r"BF16 vision export.*official-weight vision parity"
+            ):
+                module(op, pixels, grid)
+        else:
+            features = module(op, pixels, grid)
+            assert features.producer() is not None
+            assert module.visual.patch_embed.weight.dtype == ir.DataType.BFLOAT16
+
+
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
 @pytest.mark.parametrize("normalize", [False, True])
-def test_standard_moe_low_precision_execution_and_routing(dtype, normalize):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_standard_moe_low_precision_execution_and_routing(dtype, normalize, device):
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA PyTorch and ORT are required")
     np_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else ml_dtypes.bfloat16
     config = _config(dtype=dtype, num_experts_per_tok=1, norm_topk_prob=normalize)
     model = _standard_experts(config, [1, 1, 16])
@@ -1247,20 +1290,26 @@ def test_standard_moe_low_precision_execution_and_routing(dtype, normalize):
     gate_up = torch.full((16, 16), 0.1, dtype=torch_dtype) * 2
     down = torch.full((16, 8), 0.1, dtype=torch_dtype) * 2
     gate, up = (x @ gate_up.T).chunk(2, dim=-1)
-    expected = ((gate * torch.sigmoid(gate) * up) @ down.T) * torch.tensor(
+    expected = ((torch.nn.functional.silu(gate) * up) @ down.T) * torch.tensor(
         1.0 if normalize else 0.50002, dtype=torch_dtype
     )
     try:
-        session = OnnxModelSession(model)
+        session = OnnxModelSession(model, device=device)
     except OrtNotImplemented as error:
-        if dtype != ir.DataType.BFLOAT16 or not re.fullmatch(
-            r"\[ONNXRuntimeError\] : 9 : NOT_IMPLEMENTED : Could not find an "
-            r"implementation for Expand\(13\) node with name 'Expand_node_\d+'",
-            str(error),
+        if (
+            device != "cpu"
+            or dtype != ir.DataType.BFLOAT16
+            or not re.fullmatch(
+                r"\[ONNXRuntimeError\] : 9 : NOT_IMPLEMENTED : Could not find an "
+                r"implementation for Expand\(13\) node with name 'Expand_node_\d+'",
+                str(error),
+            )
         ):
             raise
         pytest.skip(f"ORT CPU BF16 capability gap: {error}")
     try:
+        if device == "cuda":
+            assert "CUDAExecutionProvider" in session.providers
         actual = session.run({"hidden": hidden, "probabilities": probabilities})["output"]
     finally:
         session.close()
@@ -1270,6 +1319,94 @@ def test_standard_moe_low_precision_execution_and_routing(dtype, normalize):
         rtol=2e-3,
         atol=1e-5,
     )
+
+
+@pytest.mark.parametrize(
+    "device,dtype,np_dtype,torch_dtype",
+    [
+        ("cpu", ir.DataType.FLOAT, np.float32, torch.float32),
+        ("cuda", ir.DataType.FLOAT, np.float32, torch.float32),
+        ("cuda", ir.DataType.FLOAT16, np.float16, torch.float16),
+        ("cuda", ir.DataType.BFLOAT16, ml_dtypes.bfloat16, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("optimize", [False, True])
+def test_standard_moe_silu_boundary(
+    tmp_path: Path, device, dtype, np_dtype, torch_dtype, optimize
+):
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA PyTorch and ORT are required")
+    config = _config(dtype=dtype, moe_intermediate_size=16, num_experts_per_tok=1)
+    model = _standard_experts(config, [1, 1, 16])
+    # Cover Exp saturation, negative tails, and ordinary BF16 activation rounding.
+    gates = np.array(
+        [-1000, -100, -90, -20, -18, -17, -16, -6, -1, -0.0, 0, 1, 6, 18, 100, 1000],
+        dtype=np_dtype,
+    )
+    ups = np.ones(16, dtype=np_dtype)
+    ups[3:7] = 65504  # Amplify lost tails while keeping the output finite.
+    gate_up = np.zeros((2, 32, 16), dtype=np_dtype)
+    gate_up[0, :16, 0] = gates
+    gate_up[0, 16:, 0] = ups
+    down = np.zeros((2, 16, 16), dtype=np_dtype)
+    down[0] = np.eye(16, dtype=np_dtype)
+    model.graph.initializers["gate_up_proj"].const_value = ir.tensor(gate_up)
+    model.graph.initializers["down_proj"].const_value = ir.tensor(down)
+    hidden = np.zeros((1, 1, 16), dtype=np_dtype)
+    hidden[0, 0, 0] = 1
+    # Expert 0 exercises SiLU tails; expert 1 exercises the empty If branch.
+    probabilities = np.array([[[1.0, 0.0]]], dtype=np.float32)
+    validate_standard_onnx(model)
+
+    x = torch.tensor(hidden.astype(np.float32), dtype=torch_dtype, device=device)
+    w = torch.tensor(gate_up[0].astype(np.float32), dtype=torch_dtype, device=device)
+    d = torch.tensor(down[0].astype(np.float32), dtype=torch_dtype, device=device)
+    gate, up = (x.reshape(1, 16) @ w.T).chunk(2, dim=-1)
+    expected = ((torch.nn.functional.silu(gate) * up) @ d.T).reshape(1, 1, 16)
+
+    path = tmp_path / "moe.onnx"
+    ir.save(model, path)
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = options.inter_op_num_threads = 1
+    options.graph_optimization_level = (
+        ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if optimize
+        else ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    )
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "moe-profile")
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if device == "cuda"
+        else ["CPUExecutionProvider"]
+    )
+    session = ort.InferenceSession(str(path), options, providers=providers)
+    try:
+        outputs = session.run_with_ort_values(
+            ["output"],
+            {
+                "hidden": _numpy_to_ort_value(hidden),
+                "probabilities": _numpy_to_ort_value(probabilities),
+            },
+        )
+        actual = _ort_value_to_numpy(outputs[0])
+    finally:
+        profile = json.loads(Path(session.end_profiling()).read_text())
+    assert actual.dtype == np.dtype(np_dtype)
+    np.testing.assert_allclose(
+        actual.astype(np.float32), expected.float().cpu().numpy(), rtol=2e-3, atol=1e-5
+    )
+    if device == "cuda":
+        matmuls = [
+            event["args"]
+            for event in profile
+            if event.get("args", {}).get("op_name") in {"MatMul", "FusedMatMul", "Gemm"}
+        ]
+        assert len(matmuls) >= 2
+        assert all(event["provider"] == "CUDAExecutionProvider" for event in matmuls)
 
 
 def test_standard_moe_node_count_independent_of_expert_count():
@@ -2790,25 +2927,10 @@ def test_left_padding_matches_unpadded_prefill_and_following_decode(ep):
             )
 
 
-@pytest.mark.integration
-def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
-    """Compare the complete tiny core when the pinned Qwen4-Exp HF class is installed."""
-    try:
-        from transformers import (
-            DynamicCache,
-            Qwen4ExpForCausalLM,
-            Qwen4ExpTextConfig,
-        )
-    except ImportError:
-        pytest.skip(
-            "Installed transformers does not contain the pinned experimental "
-            "Qwen4-Exp implementation"
-        )
+def _reduced_huggingface_text_config(**overrides):
+    from transformers import Qwen4ExpTextConfig
 
-    from mobius.integrations._weight_loading import apply_weights
-
-    torch.manual_seed(0)
-    hf_config = Qwen4ExpTextConfig(
+    values = dict(
         vocab_size=32,
         hidden_size=16,
         intermediate_size=32,
@@ -2824,7 +2946,7 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
             "rope_theta": 10_000.0,
             "partial_rotary_factor": 0.25,
         },
-        layer_types=["linear_attention", "qwen_sparse_attention"],
+        layer_types=["linear_attention", "full_attention"],
         linear_conv_kernel_dim=2,
         linear_key_head_dim=8,
         linear_value_head_dim=8,
@@ -2853,11 +2975,33 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
         pad_token_id=0,
         mtp_num_hidden_layers=0,
     )
+    values.update(overrides)
+    return Qwen4ExpTextConfig(**values)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("ep", ["default", "onnx-standard"])
+def test_reduced_random_weight_huggingface_prefill_and_decode_parity(ep):
+    """Compare the complete tiny core when the pinned Qwen4-Exp HF class is installed."""
+    try:
+        from transformers import DynamicCache, Qwen4ExpForCausalLM
+    except ImportError:
+        pytest.skip(
+            "Installed transformers does not contain the pinned experimental "
+            "Qwen4-Exp implementation"
+        )
+
+    torch.manual_seed(0)
+    hf_config = _reduced_huggingface_text_config()
     hf_model = Qwen4ExpForCausalLM(hf_config).eval()
     config = Qwen4ExpConfig.from_transformers(hf_config)
     module = Qwen4ExpCausalLMModel(config)
-    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    model = build_from_module(
+        module, config, task="qwen4-exp-text-generation", execution_provider=ep
+    )["model"]
     apply_weights(model, module.preprocess_weights(dict(hf_model.state_dict())))
+    if ep == "onnx-standard":
+        validate_standard_onnx(model)
 
     input_ids = np.array([[2, 3, 4, 5]], dtype=np.int64)
     with torch.no_grad():
@@ -2914,11 +3058,15 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
     # position channels equal (text-only), this route must remain identical.
     vl_config = _vl_config()
     vl_decoder = Qwen4ExpVLDecoderModel(vl_config)
-    vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
+    with build_context(ep_registry.require(ep), vl_config.dtype):
+        vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
+    optimize_model(vl_model, ep=ep, dtype=vl_config.dtype)
     apply_weights(
         vl_model,
         vl_decoder.preprocess_weights(dict(hf_model.state_dict())),
     )
+    if ep == "onnx-standard":
+        validate_standard_onnx(vl_model)
     with torch.no_grad():
         inputs_embeds = hf_model.model.embed_tokens(torch.from_numpy(input_ids)).numpy()
     position_ids_4d = np.broadcast_to(
@@ -2989,3 +3137,438 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
     np.testing.assert_allclose(vl_alternate, vl_logits, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(hf_alternate, hf_positioned, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(hf_decode_alternate, hf_decode_positioned, rtol=1e-3, atol=1e-3)
+
+
+def _reduced_next_states(outputs):
+    return {"past_position_ids": outputs["present_position_ids"]} | {
+        name.replace("present.", "past_key_values.", 1): value
+        for name, value in outputs.items()
+        if name.startswith("present.")
+    }
+
+
+def _reduced_huggingface_numpy(tensor):
+    tensor = tensor.detach().cpu().contiguous()
+    if tensor.dtype == torch.bfloat16:
+        return tensor.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+    return tensor.numpy()
+
+
+def _assert_reduced_float_parity(actual, reference, *, tolerance, err_msg=""):
+    assert actual.shape == reference.shape, err_msg
+    assert actual.dtype == reference.dtype, err_msg
+    np.testing.assert_allclose(
+        actual.astype(np.float32),
+        reference.astype(np.float32),
+        rtol=tolerance,
+        atol=tolerance,
+        err_msg=err_msg,
+        strict=True,
+    )
+
+
+def _reduced_initial_states(dtype):
+    states = _initial_states()
+    if dtype != ir.DataType.FLOAT:
+        np_dtype = {
+            ir.DataType.FLOAT16: np.float16,
+            ir.DataType.BFLOAT16: ml_dtypes.bfloat16,
+        }[dtype]
+        # Recurrent accumulators stay FP32 when convolution and KV caches use low precision.
+        for name, value in states.items():
+            if value.dtype == np.float32 and not name.endswith(".recurrent_state"):
+                states[name] = value.astype(np_dtype)
+    return states
+
+
+@pytest.mark.parametrize(
+    "dtype,np_dtype",
+    [
+        (ir.DataType.FLOAT, np.float32),
+        (ir.DataType.FLOAT16, np.float16),
+        (ir.DataType.BFLOAT16, ml_dtypes.bfloat16),
+    ],
+)
+def test_reduced_initial_state_dtypes(dtype, np_dtype):
+    states = _reduced_initial_states(dtype)
+    for name, value in _initial_states().items():
+        expected_dtype = (
+            np_dtype
+            if value.dtype == np.float32 and not name.endswith(".recurrent_state")
+            else value.dtype
+        )
+        assert states[name].dtype == np.dtype(expected_dtype)
+        assert states[name].shape == value.shape
+
+
+def _assert_reduced_huggingface_states(outputs, cache, *, multimodal=False, tolerance=1e-3):
+    assert outputs["present.0.recurrent_state"].dtype == np.float32
+    linear, attention = cache.layers
+    expected = {
+        "present.0.conv_state": linear.conv_states[0],
+        "present.0.recurrent_state": linear.recurrent_states[0],
+        "present.0.ple_conv_state": linear.conv_states[1],
+        "present.0.ple_context": linear.conv_states[2],
+        "present.1.key": attention.keys,
+        "present.1.value": attention.values,
+        "present.1.index_key": attention.indexer_keys,
+    }
+    assert set(outputs) == {"logits", "present_position_ids", *expected}
+    for name, reference in expected.items():
+        reference = _reduced_huggingface_numpy(reference)
+        if np.issubdtype(reference.dtype, np.integer):
+            np.testing.assert_array_equal(outputs[name], reference, err_msg=name, strict=True)
+        else:
+            _assert_reduced_float_parity(
+                outputs[name], reference, tolerance=tolerance, err_msg=name
+            )
+    positions = outputs["present_position_ids"]
+    reference_positions = (
+        attention.indexer_position_ids
+        if hasattr(attention, "indexer_position_ids")
+        else cache.position_ids
+    )
+    if multimodal:
+        np.testing.assert_array_equal(positions[1:], reference_positions.numpy(), strict=True)
+        np.testing.assert_array_equal(
+            positions[0], np.arange(positions.shape[-1], dtype=np.int64)[None], strict=True
+        )
+    else:
+        np.testing.assert_array_equal(positions, reference_positions[0].numpy(), strict=True)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "device,dtype",
+    [
+        ("cpu", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT16),
+        ("cuda", ir.DataType.BFLOAT16),
+    ],
+    ids=["cpu-f32", "cuda-f32", "cuda-f16", "cuda-bf16"],
+)
+def test_reduced_standard_huggingface_cached_logits_and_states(device, dtype):
+    """Check every cache against HF through prefill, sparse selection, and greedy decode."""
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA PyTorch and ORT are required")
+    try:
+        from transformers import DynamicCache, Qwen4ExpForCausalLM
+    except ImportError:
+        pytest.skip("Installed transformers does not contain Qwen4-Exp")
+
+    torch.manual_seed(17)
+    torch_dtype = {
+        ir.DataType.FLOAT: torch.float32,
+        ir.DataType.FLOAT16: torch.float16,
+        ir.DataType.BFLOAT16: torch.bfloat16,
+    }[dtype]
+    tolerance = 1e-3 if dtype == ir.DataType.FLOAT else 1e-2
+    hf_config = _reduced_huggingface_text_config(num_experts_per_tok=2, dtype=torch_dtype)
+    hf_model = Qwen4ExpForCausalLM(hf_config).to(torch_dtype).eval()
+    config = Qwen4ExpConfig.from_transformers(hf_config)
+    assert config.dtype == dtype
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+        execution_provider="onnx-standard",
+    )["model"]
+    apply_weights(model, module.preprocess_weights(dict(hf_model.state_dict())))
+    validate_standard_onnx(model)
+    cache = DynamicCache(config=hf_config)
+    session = OnnxModelSession(model, device=device)
+    try:
+        if device == "cuda":
+            assert "CUDAExecutionProvider" in session.providers
+        input_ids = np.arange(2, 12, dtype=np.int64)[None]
+        with torch.no_grad():
+            reference = _reduced_huggingface_numpy(
+                hf_model(
+                    torch.from_numpy(input_ids), past_key_values=cache, use_cache=True
+                ).logits
+            )
+        outputs = session.run(
+            _reduced_initial_states(dtype)
+            | {
+                "input_ids": input_ids,
+                "attention_mask": np.ones_like(input_ids),
+                "position_ids": np.arange(input_ids.shape[1], dtype=np.int64)[None],
+            }
+        )
+        _assert_reduced_float_parity(outputs["logits"], reference, tolerance=tolerance)
+        _assert_reduced_huggingface_states(outputs, cache, tolerance=tolerance)
+        # Independent token choices prevent the ONNX driver from hiding a divergence.
+        for step in range(6):
+            token = np.argmax(reference[:, -1], axis=-1)[:, None].astype(np.int64)
+            np.testing.assert_array_equal(
+                np.argmax(outputs["logits"][:, -1], axis=-1)[:, None], token
+            )
+            length = input_ids.shape[1] + step
+            with torch.no_grad():
+                reference = _reduced_huggingface_numpy(
+                    hf_model(
+                        torch.from_numpy(token), past_key_values=cache, use_cache=True
+                    ).logits
+                )
+            outputs = session.run(
+                _reduced_next_states(outputs)
+                | {
+                    "input_ids": token,
+                    "attention_mask": np.ones((1, length + 1), dtype=np.int64),
+                    "position_ids": np.array([[length]], dtype=np.int64),
+                }
+            )
+            _assert_reduced_float_parity(
+                outputs["logits"],
+                reference,
+                tolerance=tolerance,
+                err_msg=f"step {step}",
+            )
+            _assert_reduced_huggingface_states(outputs, cache, tolerance=tolerance)
+    finally:
+        session.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "device,dtype",
+    [
+        ("cpu", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT),
+        ("cuda", ir.DataType.FLOAT16),
+    ],
+    ids=["cpu-f32", "cuda-f32", "cuda-f16"],
+)
+def test_reduced_standard_huggingface_image_pipeline_and_decode(device, dtype):
+    """Compare nonzero two-image vision, fusion, logits, and cached no-image decode."""
+    if device == "cuda" and (
+        not torch.cuda.is_available()
+        or "CUDAExecutionProvider" not in ort.get_available_providers()
+    ):
+        pytest.skip("CUDA PyTorch and ORT are required")
+    try:
+        from transformers import (
+            DynamicCache,
+            Qwen4ExpVisionConfig,
+        )
+        from transformers import (
+            Qwen4ExpConfig as HfConfig,
+        )
+        from transformers import (
+            Qwen4ExpForConditionalGeneration as HfModel,
+        )
+    except ImportError:
+        pytest.skip("Installed transformers does not contain Qwen4-Exp")
+
+    torch.manual_seed(23)
+    torch_dtype = torch.float16 if dtype == ir.DataType.FLOAT16 else torch.float32
+    np_dtype = np.float16 if dtype == ir.DataType.FLOAT16 else np.float32
+    tolerance = 1e-3 if dtype == ir.DataType.FLOAT else 1e-2
+    text_config = _reduced_huggingface_text_config(
+        num_experts_per_tok=2,
+        dtype=torch_dtype,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10_000.0,
+            "partial_rotary_factor": 1.0,
+            "mrope_section": [1, 1, 2],
+            "mrope_interleaved": True,
+        },
+    )
+    hf_config = HfConfig(
+        text_config=text_config,
+        vision_config=Qwen4ExpVisionConfig(
+            depth=1,
+            hidden_size=32,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=16,
+            num_position_embeddings=16,
+            hidden_act="gelu_pytorch_tanh",
+            deepstack_visual_indexes=[],
+        ),
+        image_token_id=30,
+        video_token_id=31,
+        vision_start_token_id=29,
+        vision_end_token_id=28,
+        tie_word_embeddings=False,
+    )
+    hf_model = HfModel(hf_config).to(torch_dtype).eval()
+    # Published-config validation requires the production vision dimensions;
+    # the independent synthetic fixture deliberately uses a matching tiny pair.
+    config = _vl_config(
+        num_experts_per_tok=2,
+        partial_rotary_factor=1.0,
+        mrope_section=[1, 1, 2],
+        dtype=dtype,
+    )
+    module = Qwen4ExpForConditionalGeneration(config)
+    package = build_from_module(
+        module, config, task="qwen4-exp-vision-language", execution_provider="onnx-standard"
+    )
+    weights = module.preprocess_weights(dict(hf_model.state_dict()))
+    for model in package.values():
+        apply_weights(
+            model,
+            {
+                name: value
+                for name, value in weights.items()
+                if name in model.graph.initializers
+            },
+        )
+        assert all(
+            value.const_value is not None for value in model.graph.initializers.values()
+        )
+        validate_standard_onnx(model)
+
+    ids = torch.tensor([[2, 29, 30, 30, 28, 3, 29, 30, 30, 28, 4]])
+    grid = torch.tensor([[1, 2, 4], [1, 4, 2]])
+    pixels = torch.randn(16, 1536) * 0.2
+    mask = torch.ones_like(ids)
+    modality = (ids == hf_config.image_token_id).long()
+    rope_positions, _ = hf_model.model.get_rope_index(ids, modality, grid, attention_mask=mask)
+    positions = torch.cat([torch.arange(ids.shape[1])[None, None], rope_positions], dim=0)
+    fused_embeddings = []
+
+    def capture_fusion(_module, _args, kwargs):
+        fused_embeddings.append(_reduced_huggingface_numpy(kwargs["inputs_embeds"].clone()))
+
+    cache = DynamicCache(config=text_config)
+    hook = hf_model.model.language_model.register_forward_pre_hook(
+        capture_fusion, with_kwargs=True
+    )
+    try:
+        with torch.no_grad():
+            reference_features = _reduced_huggingface_numpy(
+                hf_model.model.visual(pixels.to(torch_dtype), grid_thw=grid).pooler_output
+            )
+            reference = _reduced_huggingface_numpy(
+                hf_model(
+                    input_ids=ids,
+                    pixel_values=pixels,
+                    image_grid_thw=grid,
+                    attention_mask=mask,
+                    position_ids=positions,
+                    past_key_values=cache,
+                    use_cache=True,
+                ).logits
+            )
+    finally:
+        hook.remove()
+    assert len(fused_embeddings) == 1
+
+    vision = OnnxModelSession(package["vision_encoder"], device=device)
+    embedding = OnnxModelSession(package["embedding"], device=device)
+    decoder = OnnxModelSession(package["decoder"], device=device)
+    try:
+        if device == "cuda":
+            assert all(
+                "CUDAExecutionProvider" in session.providers
+                for session in [vision, embedding, decoder]
+            )
+        features = vision.run(
+            {"pixel_values": pixels.numpy(), "image_grid_thw": grid.numpy()}
+        )["image_features"]
+        _assert_reduced_float_parity(features, reference_features, tolerance=tolerance)
+        embeds = embedding.run({"input_ids": ids.numpy(), "image_features": features})[
+            "inputs_embeds"
+        ]
+        _assert_reduced_float_parity(embeds, fused_embeddings[0], tolerance=tolerance)
+        states = _reduced_initial_states(dtype)
+        states["past_position_ids"] = np.zeros((4, 1, 0), dtype=np.int64)
+        outputs = decoder.run(
+            states
+            | {
+                "inputs_embeds": embeds,
+                "ple_input_ids": ids.numpy(),
+                "attention_mask": mask.numpy(),
+                "position_ids": positions.numpy(),
+            }
+        )
+        _assert_reduced_float_parity(outputs["logits"], reference, tolerance=tolerance)
+        _assert_reduced_huggingface_states(
+            outputs, cache, multimodal=True, tolerance=tolerance
+        )
+        for step in range(3):
+            token = np.argmax(reference[:, -1], axis=-1)[:, None].astype(np.int64)
+            np.testing.assert_array_equal(
+                np.argmax(outputs["logits"][:, -1], axis=-1)[:, None], token
+            )
+            next_positions = positions[:, :, -1:] + step + 1
+            next_positions[0] = ids.shape[1] + step
+            decode_mask = np.ones((1, ids.shape[1] + step + 1), dtype=np.int64)
+            with torch.no_grad():
+                reference = _reduced_huggingface_numpy(
+                    hf_model(
+                        input_ids=torch.from_numpy(token),
+                        attention_mask=torch.from_numpy(decode_mask),
+                        position_ids=next_positions,
+                        past_key_values=cache,
+                        use_cache=True,
+                    ).logits
+                )
+            embeds = embedding.run(
+                {
+                    "input_ids": token,
+                    "image_features": np.zeros((0, config.hidden_size), dtype=np_dtype),
+                }
+            )["inputs_embeds"]
+            outputs = decoder.run(
+                _reduced_next_states(outputs)
+                | {
+                    "inputs_embeds": embeds,
+                    "ple_input_ids": token,
+                    "attention_mask": decode_mask,
+                    "position_ids": next_positions.numpy(),
+                }
+            )
+            _assert_reduced_float_parity(
+                outputs["logits"],
+                reference,
+                tolerance=tolerance,
+                err_msg=f"step {step}",
+            )
+            _assert_reduced_huggingface_states(
+                outputs, cache, multimodal=True, tolerance=tolerance
+            )
+    finally:
+        vision.close()
+        embedding.close()
+        decoder.close()
+
+
+@pytest.mark.parametrize(
+    "test,kwargs",
+    [
+        (
+            test_standard_moe_low_precision_execution_and_routing,
+            {"dtype": ir.DataType.FLOAT16, "normalize": True},
+        ),
+        (
+            test_reduced_standard_huggingface_cached_logits_and_states,
+            {"dtype": ir.DataType.FLOAT16},
+        ),
+        (
+            test_reduced_standard_huggingface_image_pipeline_and_decode,
+            {"dtype": ir.DataType.FLOAT16},
+        ),
+    ],
+    ids=["moe", "text", "image-text"],
+)
+@pytest.mark.parametrize("torch_cuda,ort_cuda", [(True, False), (False, True), (False, False)])
+def test_cuda_parity_requires_both_backends(monkeypatch, test, kwargs, torch_cuda, ort_cuda):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: torch_cuda)
+    providers = ["CPUExecutionProvider"]
+    if ort_cuda:
+        providers.append("CUDAExecutionProvider")
+    monkeypatch.setattr(ort, "get_available_providers", lambda: providers)
+    with pytest.raises(pytest.skip.Exception, match="CUDA PyTorch and ORT are required"):
+        test(device="cuda", **kwargs)

@@ -569,6 +569,8 @@ class ArchitectureConfig(BaseModelConfig):
     linear_num_value_heads: int | None = None
     linear_gate_lower_bound: float | None = None
     linear_use_full_rank_gate: bool = False
+    # None preserves model-dtype state for checkpoints without an explicit policy.
+    mamba_ssm_dtype: ir.DataType | None = None
 
     # Double-gated short-convolution config (LFM2-style hybrid layers).
     short_conv_kernel: int = 3
@@ -892,6 +894,15 @@ class ArchitectureConfig(BaseModelConfig):
         model_type = config.model_type
         rope_config = _extract_rope_config(config)
         mrope_fields = _extract_mrope_fields(config)
+        raw_ssm_dtype = getattr(config, "mamba_ssm_dtype", None)
+        ssm_dtype = _resolve_dtype_value(raw_ssm_dtype)
+        if raw_ssm_dtype not in (None, "auto") and ssm_dtype not in {
+            ir.DataType.FLOAT,
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+            ir.DataType.DOUBLE,
+        }:
+            raise ValueError(f"Unrecognized mamba_ssm_dtype: {raw_ssm_dtype!r}")
 
         # Models that use RoPE but don't expose rope_scaling/rope_parameters
         # in their HF config (e.g. loaded without trust_remote_code, or
@@ -1043,6 +1054,7 @@ class ArchitectureConfig(BaseModelConfig):
             linear_value_head_dim=(getattr(config, "linear_value_head_dim", None)),
             linear_num_key_heads=(getattr(config, "linear_num_key_heads", None)),
             linear_num_value_heads=(getattr(config, "linear_num_value_heads", None)),
+            mamba_ssm_dtype=ssm_dtype,
             short_conv_kernel=getattr(config, "conv_L_cache", 3),
             short_conv_bias=getattr(config, "conv_bias", False),
             pad_token_id=(getattr(config, "pad_token_id", 0)),
@@ -1777,7 +1789,9 @@ class Qwen4ExpConfig(CausalLMConfig):
             ]
         else:
             self.layer_types = [
-                "qwen_sparse_attention" if layer_type == "full_attention" else layer_type
+                "qwen_sparse_attention"
+                if layer_type in {"full_attention", "indexed_attention"}
+                else layer_type
                 for layer_type in self.layer_types
             ]
         self._validate_architecture()
@@ -1999,7 +2013,9 @@ class Qwen4ExpConfig(CausalLMConfig):
         layer_types = getattr(text, "layer_types", None)
         if layer_types is not None:
             layer_types = [
-                "qwen_sparse_attention" if value == "full_attention" else value
+                "qwen_sparse_attention"
+                if value in {"full_attention", "indexed_attention"}
+                else value
                 for value in layer_types
             ]
         fields.update(
