@@ -147,10 +147,6 @@ inputs:
 **Optional fields:**
 
 ```yaml
-# Identifier for the test model used in L2 config compatibility check.
-# If set, the dashboard counts this model as L2 (full HF config valid).
-test_model_id: "Qwen/Qwen2.5-1.5B-Instruct"
-
 # Skip this test case entirely (model too large, gated repo, etc.).
 # Dashboard shows the model as 'skipped' rather than counting it toward coverage.
 skip_reason: "Model too large (47B MoE) for CPU golden generation."
@@ -211,11 +207,12 @@ Golden files must be committed alongside new test case YAML files.
 2. Run `python -m pytest tests/build_graph -k "my_model"`.
 
 **L2 — Config compatible:**
-1. Create `testdata/cases/<category>/my-model.yaml`.
-2. Fill in all required fields, including `model_type` (must match the
-   key registered in `src/mobius/_registry.py`) and `test_model_id`.
-3. Run schema validation: `python -m pytest tests/yaml_schema_test.py`.
-4. Run coverage check: `python -m pytest tests/model_coverage_test.py` —
+1. Set registry `test_model_id` (directly or through `_TEST_MODEL_IDS`) and an
+   immutable `test_revision` in `src/mobius/_registry.py`.
+2. Run `python -m pytest tests/arch_validation_test.py -k "<model_type>"`.
+3. Add a schema-valid golden YAML with `model_type` and pinned `revision`;
+   `test_model_id` is not a YAML field.
+4. Run `python -m pytest tests/yaml_schema_test.py tests/model_coverage_test.py` —
    fails if any registered `model_type` lacks a YAML or `_COVERAGE_SKIP` entry.
 
 **L3 — Synthetic parity:**

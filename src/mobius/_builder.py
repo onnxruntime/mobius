@@ -135,6 +135,7 @@ def build_from_module(
     task: str | ModelTask = "text-generation",
     *,
     execution_provider: str = "default",
+    matmul_nbits_accuracy_level: int | None = None,
     trace_optimization: bool = False,
     fp8_kv_cache: bool = False,
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
@@ -150,6 +151,10 @@ def build_from_module(
             precision and its ``validate`` method runs before build.
         task: Task name or :class:`ModelTask` instance.
         execution_provider: Target for EP-aware optimizations.
+        matmul_nbits_accuracy_level: Optional accuracy level (0 through 4) for
+            every emitted ``MatMulNBits``, including 2-, 4-, and 8-bit weights.
+            ``None`` preserves the EP-specific defaults. This does not change
+            weight quantization or ``GatherBlockQuantized``.
         trace_optimization: Log optimization diagnostics when true.
         fp8_kv_cache: Store supported decoder KV caches as FLOAT8E4M3FN.
         kv_cache_scales: Optional per-layer FP8 key/value scales.
@@ -173,7 +178,9 @@ def build_from_module(
     )
     _cast_module_dtype(module, dtype)
     capabilities = ep_registry.require(execution_provider)
-    with build_context(capabilities, dtype):
+    with build_context(
+        capabilities, dtype, matmul_nbits_accuracy_level=matmul_nbits_accuracy_level
+    ):
         package = resolved_task.build(module, config)
 
     for name, model in package.items():
@@ -221,7 +228,7 @@ def _maybe_apply_opset_lowering(package: ModelPackage, execution_provider: str) 
     if execution_provider in ("default", "cpu"):
         return
     for name, model in package.items():
-        if "" not in model.graph.opset_imports:
+        if model.graph.opset_imports.get("") != 24:
             continue
         if _graph_requires_opset24(model.graph):
             logger.info(
