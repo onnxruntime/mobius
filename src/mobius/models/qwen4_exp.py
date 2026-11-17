@@ -25,6 +25,7 @@ from onnxscript import OpBuilder, nn
 from mobius._build_context import ep_capabilities
 from mobius._configs import Qwen4ExpConfig
 from mobius._flags import flags
+from mobius._function_builder import emit_standard_function
 from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
     Embedding,
@@ -38,6 +39,7 @@ from mobius.components import (
     initialize_rope,
 )
 from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
+from mobius.functions.normalization import offset_rms_norm, post_gated_rms_norm
 from mobius.models.base import effective_tie_word_embeddings
 from mobius.models.moe import Qwen2MoELayer
 from mobius.models.qwen_vl import Qwen3VLVisionEncoderModel, Qwen25VLEmbeddingModel
@@ -244,17 +246,7 @@ class Qwen4ExpOffsetRMSNorm(nn.Module):
         self._eps = eps
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
-        variance = op.ReduceMean(op.Mul(hidden_f32, hidden_f32), [-1], keepdims=True)
-        normalized = op.Mul(
-            hidden_f32,
-            op.Reciprocal(op.Sqrt(op.Add(variance, self._eps))),
-        )
-        scale = op.Add(
-            op.Cast(self.weight, to=ir.DataType.FLOAT),
-            op.Constant(value_float=1.0),
-        )
-        return op.CastLike(op.Mul(normalized, scale), hidden_states)
+        return offset_rms_norm(op, hidden_states, self.weight, epsilon=self._eps)
 
 
 class Qwen4ExpGroupedRMSNorm(nn.Module):
@@ -270,26 +262,13 @@ class Qwen4ExpGroupedRMSNorm(nn.Module):
         self._eps = eps
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        original_shape = op.Shape(hidden_states)
-        grouped = op.Reshape(
-            op.Cast(hidden_states, to=ir.DataType.FLOAT),
-            [-1, self._groups, self._group_size],
-        )
-        variance = op.ReduceMean(op.Mul(grouped, grouped), [-1], keepdims=True)
-        normalized = op.Mul(
-            grouped,
-            op.Reciprocal(op.Sqrt(op.Add(variance, self._eps))),
-        )
-        grouped_weight = op.Reshape(
-            op.Add(
-                op.Cast(self.weight, to=ir.DataType.FLOAT),
-                op.Constant(value_float=1.0),
-            ),
-            [self._groups, self._group_size],
-        )
-        return op.CastLike(
-            op.Reshape(op.Mul(normalized, grouped_weight), original_shape),
+        return offset_rms_norm(
+            op,
             hidden_states,
+            self.weight,
+            epsilon=self._eps,
+            groups=self._groups,
+            group_size=self._group_size,
         )
 
 
@@ -315,20 +294,29 @@ class Qwen4ExpGatedResidual(nn.Module):
         normalized = self.hc_norm(op, hyper_input)
         read = self.input_mix_weight_down(op, normalized)
         read = op.Swish(op.Div(read, float(self._hc_count)))
-        read = op.Sigmoid(self.input_mix_weight_up(op, read))
-        read = op.Reshape(read, [0, 0, self._hc_count, self._hidden_size])
-        streams = op.Reshape(normalized, [0, 0, self._hc_count, self._hidden_size])
-        weighted = op.Mul(read, streams)
-        # Match PyTorch's FP32 reduction accumulator and model-dtype result.
-        mixed = op.CastLike(
-            op.ReduceMean(op.Cast(weighted, to=ir.DataType.FLOAT), [-2], keepdims=False),
-            weighted,
+        read = self.input_mix_weight_up(op, read)
+        mixed = emit_standard_function(
+            op,
+            "ResidualStreamRead",
+            self._read_streams,
+            [read, normalized],
+            specialization=(self._hc_count, self._hidden_size),
         )
         if self.block_inject_weight is None:
             return mixed
         inject = self.block_inject_weight(op, normalized)
         inject = op.Mul(op.Sigmoid(op.Div(inject, float(self._hc_count))), 2.0)
         return mixed, hyper_input, inject
+
+    def _read_streams(self, op: OpBuilder, read: ir.Value, normalized: ir.Value) -> ir.Value:
+        read = op.Reshape(op.Sigmoid(read), [0, 0, self._hc_count, self._hidden_size])
+        streams = op.Reshape(normalized, [0, 0, self._hc_count, self._hidden_size])
+        weighted = op.Mul(read, streams)
+        # Match PyTorch's FP32 reduction accumulator and model-dtype result.
+        return op.CastLike(
+            op.ReduceMean(op.Cast(weighted, to=ir.DataType.FLOAT), [-2], keepdims=False),
+            weighted,
+        )
 
     @staticmethod
     def inject(
@@ -358,13 +346,24 @@ class _Qwen4ExpDepthwiseConv1d(nn.Module):
     def forward(
         self, op: OpBuilder, input_val: ir.Value, conv_state: ir.Value
     ) -> tuple[ir.Value, ir.Value]:
+        return emit_standard_function(
+            op,
+            "FullCacheDepthwiseConv1d",
+            self._body,
+            [input_val, conv_state, self.weight],
+            specialization=(self._channels, self._kernel_size, self._activation.__name__),
+        )
+
+    def _body(
+        self, op: OpBuilder, input_val: ir.Value, conv_state: ir.Value, weight: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
         # Upstream caches K values. Convolution consumes the newest K-1 cached
         # values plus the current chunk, while the next state keeps the last K.
         history = op.Concat(conv_state, input_val, axis=2)
         conv_input = op.Slice(history, [1], [_INT64_MAX], [2])
         output = op.Conv(
             conv_input,
-            self.weight,
+            weight,
             group=self._channels,
             kernel_shape=[self._kernel_size],
         )
@@ -382,21 +381,13 @@ class _Qwen4ExpPostGatedRMSNorm(nn.Module):
         self._activation = activation
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value) -> ir.Value:
-        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
-        variance = op.ReduceMean(op.Mul(hidden_f32, hidden_f32), [-1], keepdims=True)
-        normalized_f32 = op.Mul(
-            hidden_f32,
-            op.Reciprocal(op.Sqrt(op.Add(variance, self._eps))),
-        )
-        normalized = op.CastLike(normalized_f32, hidden_states)
-        weighted = op.Mul(normalized, self.weight)
-        gate_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
-        activated = (
-            op.Sigmoid(gate_f32) if self._activation == "sigmoid" else op.Swish(gate_f32)
-        )
-        return op.CastLike(
-            op.Mul(op.Cast(weighted, to=ir.DataType.FLOAT), activated),
+        return post_gated_rms_norm(
+            op,
             hidden_states,
+            self.weight,
+            gate,
+            epsilon=self._eps,
+            activation=self._activation,
         )
 
 
@@ -1115,6 +1106,29 @@ class Qwen4ExpExperts(nn.Module):
     ) -> ir.Value:
         """Exact opset-29 dispatch over the existing packed expert banks."""
         assert self._top_k is not None
+        return emit_standard_function(
+            op,
+            "GroupedSwiGLUExperts",
+            self._grouped_dispatch_body,
+            [hidden, probabilities, self.gate_up_proj, self.down_proj],
+            specialization=(
+                self._top_k,
+                self._normalize,
+                self._intermediate_size,
+                self._hidden_size,
+                int(self._dtype),
+            ),
+        )
+
+    def _grouped_dispatch_body(
+        self,
+        op: OpBuilder,
+        hidden: ir.Value,
+        probabilities: ir.Value,
+        gate_up_proj: ir.Value,
+        down_proj: ir.Value,
+    ) -> ir.Value:
+        assert self._top_k is not None
         weights, selected = op.TopK(
             op.Cast(probabilities, to=ir.DataType.FLOAT),
             op.Constant(value_ints=[self._top_k]),
@@ -1128,7 +1142,7 @@ class Qwen4ExpExperts(nn.Module):
         # gate_up_proj is already [E, 2I, H], exactly the transB=1 bank layout.
         projected = op.GroupedMatMul(
             hidden,
-            self.gate_up_proj,
+            gate_up_proj,
             selected,
             transB=1,
         )  # [T, k, 2I]
@@ -1147,7 +1161,7 @@ class Qwen4ExpExperts(nn.Module):
         activated = op.Mul(op.Cast(silu_f32, to=self._dtype), up)
         down = op.GroupedMatMul(
             op.Reshape(activated, [-1, self._intermediate_size]),
-            self.down_proj,
+            down_proj,
             op.Reshape(selected, [-1, 1]),
             transB=1,
         )

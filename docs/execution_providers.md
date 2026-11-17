@@ -79,10 +79,38 @@ The `onnx-standard` validator accepts official core ONNX operators (`""` /
 `ai.onnx`) and ONNX-ML operators (`ai.onnx.ml`), checking each domain's declared
 opset against its own schemas. ML operators require an explicit `ai.onnx.ml`
 opset import; they do not inherit the core opset. Custom domains, unknown
-operators, and overloaded identifiers remain rejected. Schema validation does
+operators, and overloaded identifiers remain rejected unless they resolve to
+the compact standard-body functions described below. Schema validation does
 not guarantee that a particular runtime or EP implements the operator.
 Retained function identifiers use the model's imports for their versions;
 function bodies use their own imports.
+
+### Compact standard-opset29 functions (opt-in)
+
+Set `MOBIUS_EXPERIMENTAL_OPSET29=1` and
+`MOBIUS_COMPACT_STANDARD_FUNCTIONS=1` before the normal CLI export, or use:
+
+```python
+with mobius.override_flags(
+    experimental_opset29=True, compact_standard_functions=True
+):
+    pkg = mobius.build(model_id, execution_provider="onnx-standard")
+```
+
+This shares explicit offset/grouped/post-gated normalization, full-cache
+depthwise convolution, residual-stream read, grouped SwiGLU expert, and packed
+vision rotary-attention bodies used by Qwen4-Exp and Qwen3-VL. Calls use local
+`com.microsoft` functions with configuration/dtype/rank-specialized overloads,
+not opaque runtime kernels. Parameters remain caller-owned initializers.
+Every retained body and its reachable function closure must resolve to
+schema-valid standard ONNX operators. Sparse `GroupedMatMul` dispatch remains
+grouped; no all-expert dense expansion is introduced.
+
+The default remains flat `onnx-standard` export. The flag has no effect outside
+experimental opset29 `onnx-standard` builds, so existing EP fusions are unchanged.
+For consumers requiring flat graphs, expand the saved functions with
+`onnx_ir.passes.common.InlinePass()(model)`. This is a graph-size optimization,
+not a weight-size reduction, runtime-support claim, or numerical qualification.
 
 ---
 

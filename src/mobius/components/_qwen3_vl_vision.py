@@ -26,6 +26,7 @@ import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities, get_build_dtype
+from mobius._function_builder import emit_standard_function
 from mobius.components._common import LayerNorm, Linear, build_packed_token_offset
 from mobius.components._mlp import FCMLP
 from mobius.components._scan_utils import (
@@ -168,10 +169,25 @@ class Qwen3VLVisionAttention(nn.Module):
         # cu_seqlens: (num_sub_seqs + 1,) — cumulative sequence lengths
         # position_embeddings: (cos, sin) each (total_seq, rotary_dim)
 
-        cos, sin = position_embeddings
-
         qkv = self.qkv(op, hidden_states)
+        attn_output = emit_standard_function(
+            op,
+            "PackedVisionRotaryAttention",
+            self._rotary_attention,
+            [qkv, *position_embeddings, cu_seqlens, hidden_states],
+            specialization=(self.num_heads, self.head_dim),
+        )
+        return self.proj(op, attn_output)
 
+    def _rotary_attention(
+        self,
+        op: OpBuilder,
+        qkv: ir.Value,
+        cos: ir.Value,
+        sin: ir.Value,
+        cu_seqlens: ir.Value,
+        hidden_states: ir.Value,
+    ) -> ir.Value:
         # Split into Q, K, V: each (total_seq, hidden_size)
         q, k, v = op.Split(qkv, axis=-1, num_outputs=3, _outputs=3)
 
@@ -213,7 +229,7 @@ class Qwen3VLVisionAttention(nn.Module):
                 op, q_rot, k_rot, v, cu_seqlens, hidden_states
             )
 
-        return self.proj(op, attn_output)
+        return attn_output
 
     def _emit_packed_mha(self, op, query, key, value, cu_seqlens, hidden_states):
         """Emit com.microsoft.PackedMultiHeadAttention.

@@ -62,6 +62,7 @@ from onnxscript.rewriter import rewrite
 from mobius._constants import LAZY_SOURCE_FILES_META_KEY
 from mobius._execution_providers import EpCapabilities, ep_registry
 from mobius._flags import flags
+from mobius._function_builder import STANDARD_BODY_KEY, STANDARD_BODY_VERSION
 from mobius._passes import (
     FoldConcatInitializersPass,
     FoldTransposedInitializerPass,
@@ -256,7 +257,7 @@ _STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx", "ai.onnx.ml"}
 
 
 def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None:
-    """Reject nonstandard operator identifiers, including lexical subgraphs/functions."""
+    """Validate standard operators and complete compact standard-function closure."""
 
     def get_version(domain: str, imports: dict[str, int]) -> int | None:
         version = imports.get(domain)
@@ -282,12 +283,47 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
             "ONNX schema. Provide a standard-ONNX decomposition before export."
         )
 
+    active: set[ir.OperatorIdentifier] = set()
+    visited: set[ir.OperatorIdentifier] = set()
+
+    def is_compact(function: ir.Function) -> bool:
+        return function.metadata_props.get(STANDARD_BODY_KEY) == STANDARD_BODY_VERSION
+
+    def visit_function(function: ir.Function, path: str) -> None:
+        identifier = function.identifier()
+        if identifier in active:
+            raise ValueError(
+                f"onnx-standard component {component!r} at {path}: recursive local "
+                f"function {identifier!r}. Provide an acyclic standard-ONNX body."
+            )
+        if identifier in visited:
+            return
+        if model.graph.opset_imports.get("") != 29 or function.opset_imports.get("") != 29:
+            raise ValueError(
+                f"onnx-standard component {component!r} at {path}: compact functions "
+                "require model and function opset 29. Rebuild under experimental_opset29."
+            )
+        active.add(identifier)
+        visit(function.graph, dict(function.opset_imports), path)
+        active.remove(identifier)
+        visited.add(identifier)
+
     def visit(graph: ir.Graph, imports: dict[str, int], path: str) -> None:
         # Serialized subgraphs inherit imports from their enclosing model/function.
         for index, node in enumerate(graph):
             node_path = f"{path}/{node.name or index}:{node.op_type}"
             version = get_version(node.domain, imports)
-            check(node.domain, node.op_type, version, node_path, overload=node.overload)
+            function = model.functions.get(node.op_identifier())
+            if function is not None and is_compact(function):
+                if version != 1:
+                    raise ValueError(
+                        f"onnx-standard component {component!r} at {node_path}: "
+                        f"local function domain {node.domain!r} must import version 1; "
+                        f"got {version!r}. Restore the function-domain import."
+                    )
+                visit_function(function, f"{node_path}/function")
+            else:
+                check(node.domain, node.op_type, version, node_path, overload=node.overload)
             for name, attribute in node.attributes.items():
                 if attribute.type == ir.AttributeType.GRAPH:
                     visit(attribute.as_graph(), imports, f"{node_path}/{name}")
@@ -299,6 +335,9 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
     visit(model.graph, model_imports, "graph")
     for function in model.functions.values():
         path = f"function/{function.domain}::{function.name}"
+        if is_compact(function):
+            visit_function(function, path)
+            continue
         imports = dict(function.opset_imports)
         # The model versions the function identifier; its own imports version its body.
         check(
@@ -811,6 +850,11 @@ def optimize_model(
 
     # Build InlinePass criteria: expand custom ops this EP doesn't support.
     def _should_inline(func: ir.Function) -> bool:
+        if (
+            caps.name == "onnx-standard"
+            and func.metadata_props.get(STANDARD_BODY_KEY) == STANDARD_BODY_VERSION
+        ):
+            return False
         # onnx-standard EP: inline every function whose domain is not a standard
         # ONNX domain. This covers both the well-known ops below AND parametric
         # ops like CausalConvWithState and LinearAttention registered per-model.

@@ -11,8 +11,10 @@ They use standard ONNX ops and serve as:
 2. **Fallback implementations** — backends that don't have native kernels
    can expand the function body and execute via standard ops
 
-Each function returns an ``ir.Function`` that can be attached to an
-``ir.Model`` or used as a rewrite target.
+Factories return an ``ir.Function`` that can be attached to an ``ir.Model``
+or used as a rewrite target. The normalization source-body emitters instead
+emit their standard ops directly, or register shared local functions when
+``compact_standard_functions`` is enabled for standard-opset29 builds.
 
 Naming convention:
     Python factory functions are snake_case (e.g. ``causal_conv_nd_with_state``,
@@ -50,6 +52,7 @@ from mobius.functions.matmul_nbits import (
 )
 from mobius.functions.moe import MoEFunctionConfig, moe
 from mobius.functions.moe import validate_call as validate_moe_call
+from mobius.functions.normalization import offset_rms_norm, post_gated_rms_norm
 from mobius.functions.packed_multi_head_attention import (
     packed_multi_head_attention,
 )
@@ -308,6 +311,8 @@ __all__ = [
     "MoEFunctionConfig",
     "QMoEFunctionConfig",
     "moe",
+    "offset_rms_norm",
+    "post_gated_rms_norm",
     "qmoe",
     "matmul_block_quantized_fp4_weight",
     "matmul_nbits",
