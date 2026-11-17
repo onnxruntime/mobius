@@ -7073,11 +7073,6 @@ def build_from_gguf(
         mtp_count == 1
         and f"blk.{block_count - 1}.nextn.eh_proj.weight" in gguf_model.tensor_names
     )
-    if lossless_packed and mtp_count and has_physical_mtp:
-        raise ValueError(
-            "Lossless GGUF MTP external-source packaging is not implemented. "
-            "Use a target-only GGUF; the importer will not omit or requantize the head."
-        )
     if static_cache and mtp_count and has_physical_mtp:
         raise ValueError(
             "static_cache=True cannot represent the GGUF MTP head's independent "
@@ -7559,29 +7554,24 @@ def build_from_gguf(
             preserve_quantization=preserve_quantization,
             execution_provider=execution_provider,
             on_preflight=combine_mtp_report,
+            lossless_packed=lossless_packed,
         )
         if not mtp_preflight_received:
             warning = quantization_report.warning_message()
             if warning is not None:
                 logger.warning("%s", warning)
     if lossless_packed:
-        from mobius.components import MLP, GroupedMoELayer, MoELayer
+        _replace_grouped_moe_layers(module)
+    effective_norms = False
+    original_decay_paths: frozenset[str] = frozenset()
+    if lossless_packed:
+        from mobius.integrations.gguf._packed import (
+            use_original_gguf_decay,
+            use_original_gguf_norms,
+        )
 
-        for name, child in list(module.named_modules()):
-            if (
-                isinstance(child, MoELayer)
-                and type(child) is MoELayer
-                and child.experts
-                and all(
-                    type(expert) is MLP
-                    and all(
-                        getattr(expert, projection).bias is None
-                        for projection in ("gate_proj", "up_proj", "down_proj")
-                    )
-                    for expert in child.experts
-                )
-            ):
-                _replace_child_module(module, name, GroupedMoELayer(child))
+        effective_norms = use_original_gguf_norms(module, gguf_arch)
+        original_decay_paths = use_original_gguf_decay(module, config)
     pkg = build_from_module(
         module, config, resolved_task, execution_provider=execution_provider
     )
@@ -7597,7 +7587,14 @@ def build_from_gguf(
     if lossless_packed:
         from mobius.integrations.gguf._packed import bind_packed_weights
 
-        bind_packed_weights(pkg, gguf_model, module, config)
+        bind_packed_weights(
+            pkg,
+            gguf_model,
+            module,
+            config,
+            effective_norms=effective_norms,
+            original_decay_paths=original_decay_paths,
+        )
         state_dict = {}
     elif preserve_quantization:
         state_dict = _load_quantized_state_dict(
@@ -7951,6 +7948,38 @@ def _replace_child_module(root, path: str, replacement) -> None:
     setattr(parent, child_name, replacement)
 
 
+def _replace_grouped_moe_layers(module) -> list[str]:
+    """Replace only exact, proven float MoE compositions with grouped dispatch."""
+    from mobius.components import (
+        MLP,
+        GroupedGatedSharedMoELayer,
+        GroupedMoELayer,
+        GroupedUngatedSharedMoELayer,
+        MoELayer,
+    )
+    from mobius.models.lfm2 import GroupedLfm2MoEFeedForward, Lfm2MoEFeedForward
+    from mobius.models.moe import Qwen2MoELayer, UngatedSharedMoELayer
+    from mobius.models.qwen35 import Qwen35MoEBlock
+
+    exact_replacements = {
+        MoELayer: GroupedMoELayer,
+        Qwen2MoELayer: GroupedGatedSharedMoELayer,
+        Qwen35MoEBlock: GroupedGatedSharedMoELayer,
+        UngatedSharedMoELayer: GroupedUngatedSharedMoELayer,
+        Lfm2MoEFeedForward: GroupedLfm2MoEFeedForward,
+    }
+    replaced: list[str] = []
+    for name, child in list(module.named_modules()):
+        replacement_type = exact_replacements.get(type(child))
+        if replacement_type is None or not child.experts:
+            continue
+        if any(type(expert) is not MLP for expert in child.experts):
+            continue
+        _replace_child_module(module, name, replacement_type(child))
+        replaced.append(name)
+    return replaced
+
+
 def _replace_native_block_linears(
     module,
     gguf_model,
@@ -8049,6 +8078,9 @@ def _normalize_gguf_weights(
     state_dict: dict,
     gguf_arch: str | None = None,
     config=None,
+    *,
+    effective_norms: bool = False,
+    original_decay_paths: frozenset[str] = frozenset(),
 ) -> dict:
     """Normalize GGUF-specific weight shapes to match HF conventions.
 
@@ -8095,7 +8127,7 @@ def _normalize_gguf_weights(
     """
     import torch
 
-    offset_norms = gguf_arch in _OFFSET_NORM_GGUF_ARCHS
+    offset_norms = gguf_arch in _OFFSET_NORM_GGUF_ARCHS and not effective_norms
 
     result: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
@@ -8224,7 +8256,11 @@ def _normalize_gguf_weights(
         # projection so Mamba/PLaMo SSM modules (which consume ``A = -exp(A_log)``
         # directly) are left untouched.
         if key.endswith(".linear_attn.A_log"):
-            result[key] = torch.log(-value)
+            result[key] = (
+                value
+                if key.removesuffix(".A_log") in original_decay_paths
+                else torch.log(-value)
+            )
             continue
 
         # Zero-centered RMSNorm: undo the converter's baked-in ``+1`` so

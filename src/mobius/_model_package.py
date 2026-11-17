@@ -811,7 +811,10 @@ class ModelPackage(UserDict[str, ir.Model]):
         )
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
-        if getattr(self, "gguf_packed_sources", None) is not None:
+        if getattr(self, "gguf_packed_sources", None) is not None or any(
+            model.metadata_props.get("mobius.gguf.original_external_data") == "1"
+            for model in self.values()
+        ):
             from mobius.integrations.gguf._packed import save_packed_package
 
             if len(component_layout.components) != len(self):
@@ -819,13 +822,17 @@ class ModelPackage(UserDict[str, ir.Model]):
             if check_weights:
                 for name, model in self.items():
                     _check_weights(name, model)
-            if (include_policy_components and self.policy_components) or (
-                include_adapter_artifacts and self.adapter_artifacts
-            ):
-                raise ValueError(
-                    "Lossless GGUF save does not yet package policy/adapter artifacts; "
-                    "save these separately or omit them explicitly."
-                )
+            current = self
+            while current is not None:
+                if (include_policy_components and current.policy_components) or (
+                    include_adapter_artifacts and current.adapter_artifacts
+                ):
+                    raise ValueError(
+                        "Lossless GGUF save does not yet package policy/adapter artifacts "
+                        "in the target or MTP chain; save these separately or omit them "
+                        "explicitly."
+                    )
+                current = current.mtp_head
             save_packed_package(
                 self,
                 directory,
@@ -1425,8 +1432,22 @@ class ModelPackage(UserDict[str, ir.Model]):
             if os.path.dirname(resolved_sidecar) != resolved_directory:
                 raise ValueError("ModelPackage MTP sidecar must remain inside its package.")
 
+        packed_files = None
+        if os.path.lexists(os.path.join(directory, "gguf-packed.json")) or os.path.exists(
+            os.path.join(directory, ".gguf-packed.lock")
+        ):
+            from mobius.integrations.gguf._packed import packed_model_filenames
+
+            packed_files = packed_model_filenames(directory)
         models: dict[str, ir.Model] = {}
+        if packed_files is not None:
+            models = {
+                filename.removesuffix(".onnx"): ir.load(os.path.join(directory, filename))
+                for filename in packed_files
+            }
         for entry in sorted(os.listdir(directory)):
+            if packed_files is not None:
+                break
             subdir = os.path.join(directory, entry)
             if (
                 mtp_dir is not None
@@ -1437,7 +1458,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             model_path = os.path.join(subdir, "model.onnx")
             if os.path.isdir(subdir) and os.path.isfile(model_path):
                 models[entry] = ir.load(model_path)
-        if not models:
+        if not models and packed_files is None:
             for filename in sorted(os.listdir(directory)):
                 if filename.endswith(".onnx"):
                     name = filename.removesuffix(".onnx")

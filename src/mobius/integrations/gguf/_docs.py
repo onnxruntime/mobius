@@ -86,19 +86,19 @@ The [machine-readable survey](../testdata/evidence/gguf_opset29_survey.json) rec
 | Stored codecs | 24 separately tested real tiny GGUF files: original external byte ranges, checker, independent decode | Q2_0 is in ONNX but missing from the installed GGUF reader |
 | Model graphs | {probe["passed_count"]}/{probe["architecture_count"]} architecture fixture groups passed graph/checker; bounded to five files <=1 MiB per group | A blocked fixture group is not proof that every checkpoint of that architecture is unrepresentable |
 | Numerical/state behavior | Llama, Qwen2 shared-expert MoE and Qwen3 grouped MoE: prefill and two cached chunks against independently decoded reference graphs and dense ORT | No full-checkpoint, tokenizer or GPU execution claim |
-| Source packaging | Mixed typed/packed weights, split shards, BF16 and save/load preserve original GGUF files, offsets, lengths and hashes; folding cannot replace bindings | Flat same-directory package only; mmproj/MTP/nested sharing rejected |
-| Optimization/runtime | Selected-row embedding decode; GroupedMatMul for ordinary bias-free experts | GroupedMatMul consumes floating banks; selected-bank decode fusion and required ORT kernels remain runtime work |
+| Source packaging | Original mixed codecs/shards, named components, Qwen MTP shared/dedicated tables and standalone Janus-Pro numerical roundtrip | Immutable unique source filenames beside ONNX; existing one-head MTP policy; broader lossless mmproj/paired assembly not implemented |
+| Optimization/runtime | Grouped ordinary/shared MLPs retain biases/activations; LFM2 retains selection-only bias; Flash-Next uses fused banks with unchanged FP32 routing/SiLU/scaling | Floating banks still need expert-sized decode workspace unless an EP fuses selection; specialized-family coverage remains incomplete |
+| Flash-Next recurrence | Merged [onnx/onnx#8693](https://github.com/onnx/onnx/pull/8693): independent `v_num_heads`; portable optional post-update state trajectory and chunked replay | Pre-merge schemas cannot check this ABI; whole-model rollback is separate |
 
 Individually tested codecs: {formats}. Presets such as Q4_K_M mix tensor codecs; they are not affine INT4.
 Tencent SEQ's custom two-bit Q1_0 differs from mainline's one-bit Q1_0 and is rejected. Q8_1/Q8_K are compute intermediates, not active stored-weight routes.
 
 The flag-on path retains source bytes without export-time dense expansion. Big-endian input, unknown/data-dependent layouts and floating inverse/offset preprocessing are rejected rather than rounded.
-Those models need direct original-parameter graph contracts. Shared/custom experts retain their established ONNX graph. Qwen3.8's mixed PLE/indexed-attention preflight restrictions remain in force.
-
+Already-offset GGUF RMSNorm and negative DeltaNet decay scales are consumed directly. Exact ordinary, Qwen2/Qwen3.5 gated-shared and ungated-shared MoE classes are grouped; specialized experts retain their graph, not an efficiency claim. The bounded inventory identifies 66 MoE candidates/148 census entries and 43/78 fixture groups; per-architecture semantic/efficient-execution closure remains incomplete. Final packed Qwen3MoE node counts are equal at 4/8/64 experts. Selected-route activations avoid token-by-expert expansion; router/storage/full-bank decode workspace still scale with experts. Qwen3.8 PLE/indexed-attention preflight and independent recurrence/conv/PLE rollback restrictions remain.
 DequantizePacked FLOAT decoding and explicit output casts are compute semantics, not replacement weight storage. Former lossy affine/requantization routes are removed; flag-off cases raise actionable errors.
 
 No new ONNX spec gap was established. DequantizePacked-29 satisfies [onnx/onnx#8359](https://github.com/onnx/onnx/issues/8359)'s primary request; it is not an unresolved representation blocker.
-Flat packaging, reader enums, model contracts, inference implementations and runtime kernels are separate implementation gaps. See [usage](api/build_from_gguf.md#original-gguf-external-data-opset-29).
+Reader enums, specialized model contracts, inference implementations and runtime kernels are separate implementation gaps. See [usage](api/build_from_gguf.md#original-gguf-external-data-opset-29).
 """
 
 
