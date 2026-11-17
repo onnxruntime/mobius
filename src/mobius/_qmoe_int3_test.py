@@ -72,6 +72,17 @@ def test_real_overrides_bind_raw_int3_sidecars(bits):
         )
         state[f"{root}.experts.{projection}_qweight"] = packed
         state[f"{root}.experts.{projection}_scales"] = scales
+        if label == "fc1":
+            packed = (
+                packed.reshape(experts, 2, intermediate, -1)
+                .transpose(1, 2)
+                .reshape(experts, 2 * intermediate, -1)
+            )
+            scales = (
+                scales.reshape(experts, 2, intermediate, -1)
+                .transpose(1, 2)
+                .reshape(experts, 2 * intermediate, -1)
+            )
         expected[f"{root}.{label}_experts_weights"] = packed
         expected[f"{root}.{label}_scales"] = scales
     actual = _weight_utils.preprocess_quantized_weights(
@@ -83,6 +94,7 @@ def test_real_overrides_bind_raw_int3_sidecars(bits):
         qmoe_intermediate_size=intermediate,
         qmoe_expected_moe_paths=(root,),
         qmoe_source_moe_paths=(root,),
+        qmoe_activation_dtype=torch.float16,
     )
     for name, tensor in expected.items():
         assert name in actual

@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import torch
+
     from mobius._testing.golden import GoldenTestCase as TestCase
 
 import numpy as np
@@ -265,6 +267,40 @@ def _get_model_device(model: object, device: str):
 # transformers) are deferred to avoid import cost when --dry-run.
 
 
+def _reference_dtype(name: str) -> torch.dtype:
+    """Resolve the selected execution precision without a silent FP32 fallback."""
+    import torch
+
+    dtypes = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    if name not in dtypes:
+        raise ValueError(f"Unsupported reference dtype: {name!r}")
+    return dtypes[name]
+
+
+def _prepare_reference_inputs(processed, device, dtype):
+    """Move processor tensors, casting floating media but not IDs or masks."""
+    import torch
+
+    def move_input(value):
+        if isinstance(value, torch.Tensor):
+            return (
+                value.to(device=device, dtype=dtype)
+                if value.is_floating_point()
+                else value.to(device=device)
+            )
+        if isinstance(value, list):
+            return [move_input(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(move_input(item) for item in value)
+        return value
+
+    return {name: move_input(value) for name, value in processed.items()}
+
+
 def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     """Generate golden data for a causal-lm (text-generation) model."""
     from mobius._testing.golden import save_generation_json, save_golden_ref
@@ -278,20 +314,16 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
     if uses_multimodal_reference:
         import torch
 
-        dtype_map = {
-            "float32": torch.float32,
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-        }
         model, tokenizer, _ = load_torch_multimodal_model(
             case.model_id,
-            dtype=dtype_map[case.dtype],
+            dtype=_reference_dtype(case.dtype),
             device=device,
             revision=case.revision,
         )
     else:
         model, tokenizer = load_torch_model(
             case.model_id,
+            dtype=_reference_dtype(case.dtype),
             device=device,
             trust_remote_code=case.trust_remote_code,
             revision=case.revision,
@@ -391,7 +423,9 @@ def _generate_encoder(case: TestCase, json_path: Path, device: str) -> None:
         torch_encoder_forward,
     )
 
-    model, tokenizer = load_torch_encoder_model(case.model_id, device=device)
+    model, tokenizer = load_torch_encoder_model(
+        case.model_id, dtype=_reference_dtype(case.dtype), device=device
+    )
 
     # CLIP-like multimodal models wrap a text sub-model that can be
     # called with text-only inputs (pixel_values not required).
@@ -433,7 +467,9 @@ def _generate_seq2seq(case: TestCase, json_path: Path, device: str) -> None:
         load_torch_seq2seq_model,
     )
 
-    model, tokenizer = load_torch_seq2seq_model(case.model_id, device=device)
+    model, tokenizer = load_torch_seq2seq_model(
+        case.model_id, dtype=_reference_dtype(case.dtype), device=device
+    )
 
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
     input_ids = encoded["input_ids"]
@@ -502,12 +538,7 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
         load_torch_multimodal_model,
     )
 
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    torch_dtype = dtype_map.get(case.dtype, torch.float32)
+    torch_dtype = _reference_dtype(case.dtype)
     model, _tokenizer, processor = load_torch_multimodal_model(
         case.model_id,
         dtype=torch_dtype,
@@ -573,7 +604,7 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # Accelerate during model loading, but `.to("auto")` is not valid for
     # BatchEncoding or Tensor objects.
     model_device = _get_model_device(model, device)
-    processed = processed.to(model_device)
+    processed = _prepare_reference_inputs(processed, model_device, torch_dtype)
 
     # L4: single forward pass
     with torch.no_grad():
@@ -632,15 +663,11 @@ def _generate_image_to_text(case: TestCase, json_path: Path, device: str) -> Non
 
     from mobius._testing.golden import save_generation_json, save_golden_ref
 
-    dtype_map = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
+    torch_dtype = _reference_dtype(case.dtype)
     model = AutoModel.from_pretrained(
         case.model_id,
         revision=case.revision,
-        torch_dtype=dtype_map[case.dtype],
+        torch_dtype=torch_dtype,
         trust_remote_code=case.trust_remote_code,
     ).to(device)
     model.eval()
@@ -657,7 +684,8 @@ def _generate_image_to_text(case: TestCase, json_path: Path, device: str) -> Non
         text=case.decoder_prompt,
         return_tensors="pt",
         add_special_tokens=False,
-    ).to(device)
+    )
+    processed = _prepare_reference_inputs(processed, device, torch_dtype)
     decoder_input_ids = processed["input_ids"]
 
     with torch.no_grad():
@@ -747,6 +775,7 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
 
     model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
         case.model_id,
+        dtype=_reference_dtype(case.dtype),
         revision=case.revision,
         device_map=device,
         trust_remote_code=case.trust_remote_code,
@@ -762,8 +791,10 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
     audio_path = Path("testdata") / case.audio[0]
     audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
     model_device = _get_model_device(model, device)
-    processed = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt").to(
-        model_device
+    processed = _prepare_reference_inputs(
+        processor(audio_array, sampling_rate=sample_rate, return_tensors="pt"),
+        model_device,
+        _reference_dtype(case.dtype),
     )
     # L4: single decoder step with forced decoder start token
     decoder_start_id = (
@@ -921,7 +952,6 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
     *forward_model* is the module whose ``forward()`` produces logits
     (may differ from *model* for nested architectures like Qwen3-ASR).
     """
-    import torch
     import transformers
 
     # Try to register qwen3_asr classes before loading config,
@@ -945,14 +975,14 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
             model = Qwen3ASRForConditionalGeneration.from_pretrained(
                 case.model_id,
                 revision=case.revision,
-                torch_dtype=torch.float32,
+                torch_dtype=_reference_dtype(case.dtype),
                 device_map=device,
             )
         else:
             model = Qwen3ASRForConditionalGeneration.from_pretrained(
                 case.model_id,
                 revision=case.revision,
-                torch_dtype=torch.float32,
+                torch_dtype=_reference_dtype(case.dtype),
             )
             model = model.to(device)
         model.eval()
@@ -964,17 +994,10 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
         # Qwen3-ASR wraps a thinker; the thinker produces logits.
         forward_model = model.thinker
     elif model_type == "glmasr":
-        dtype = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }.get(case.dtype, torch.float32)
-        if device == "cpu" and dtype != torch.float32:
-            dtype = torch.float32
         model = transformers.GlmAsrForConditionalGeneration.from_pretrained(
             case.model_id,
             revision=case.revision,
-            dtype=dtype,
+            dtype=_reference_dtype(case.dtype),
         )
         if device == "auto":
             model = model.cuda()
@@ -995,6 +1018,7 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
 
         model, _tokenizer, processor = load_torch_multimodal_model(
             case.model_id,
+            dtype=_reference_dtype(case.dtype),
             device=device,
             revision=case.revision,
         )
@@ -1028,7 +1052,10 @@ def _prepare_speech_language_inputs(
             audio_array,
             prompt=case.prompts[0] if case.prompts else None,
             return_tensors="pt",
-        ).to(model_device, dtype=model.dtype)
+        )
+        processed = _prepare_reference_inputs(
+            processed, model_device, _reference_dtype(case.dtype)
+        )
         prompt_for_golden = case.prompts[0] if case.prompts else str(audio_path)
     elif is_qwen3_asr:
         # Qwen3-ASR prompt: system + user with audio placeholder
@@ -1053,7 +1080,10 @@ def _prepare_speech_language_inputs(
             text=text_prompt,
             audio=[audio_array],
             return_tensors="pt",
-        ).to(model_device)
+        )
+        processed = _prepare_reference_inputs(
+            processed, model_device, _reference_dtype(case.dtype)
+        )
         prompt_for_golden = force_prefix or str(audio_path)
     else:
         # Gemma4-style: text prompt + audio
@@ -1076,7 +1106,10 @@ def _prepare_speech_language_inputs(
             text=prompt_text,
             audio=[audio_array],
             return_tensors="pt",
-        ).to(model_device)
+        )
+        processed = _prepare_reference_inputs(
+            processed, model_device, _reference_dtype(case.dtype)
+        )
         prompt_for_golden = case.prompts[0]
 
     return processed, prompt_for_golden
@@ -1097,7 +1130,10 @@ def _generate_audio_feature_extraction(case: TestCase, json_path: Path, device: 
     )
 
     model, processor = load_torch_audio_model(
-        case.model_id, device=device, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        dtype=_reference_dtype(case.dtype),
+        device=device,
+        trust_remote_code=case.trust_remote_code,
     )
 
     # Load and preprocess audio
@@ -1156,7 +1192,7 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
     }
     model_kwargs: dict[str, object] = {
         "revision": case.revision,
-        "torch_dtype": torch.float32,
+        "torch_dtype": _reference_dtype(case.dtype),
         "device_map": device,
         "trust_remote_code": case.trust_remote_code,
     }
@@ -1179,8 +1215,10 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
 
     audio_path = Path("testdata") / case.audio[0]
     audio_array, sample_rate = librosa.load(str(audio_path), sr=16000)
-    processed = processor(audio_array, sampling_rate=sample_rate, return_tensors="pt").to(
-        next(model.parameters()).device
+    processed = _prepare_reference_inputs(
+        processor(audio_array, sampling_rate=sample_rate, return_tensors="pt"),
+        next(model.parameters()).device,
+        _reference_dtype(case.dtype),
     )
 
     with torch.no_grad():
@@ -1188,7 +1226,7 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
 
     # CTC logits: (batch, num_frames, vocab_size). Use last frame for top-K.
     logits = outputs.logits[0]  # (num_frames, vocab_size)
-    last_logits = logits[-1].cpu().numpy()
+    last_logits = logits[-1].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
 
     save_golden_ref(
@@ -1233,7 +1271,10 @@ def _generate_image_classification(case: TestCase, json_path: Path, device: str)
     )
 
     model, processor = load_torch_vision_model(
-        case.model_id, device=device, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        dtype=_reference_dtype(case.dtype),
+        device=device,
+        trust_remote_code=case.trust_remote_code,
     )
 
     # Load and preprocess image
@@ -1315,7 +1356,7 @@ def _generate_object_detection(case: TestCase, json_path: Path, device: str) -> 
     )
     model = transformers.AutoModelForObjectDetection.from_pretrained(
         case.model_id,
-        torch_dtype=torch.float32,
+        torch_dtype=_reference_dtype(case.dtype),
         device_map=device,
         trust_remote_code=case.trust_remote_code,
     ).eval()
@@ -1326,12 +1367,14 @@ def _generate_object_detection(case: TestCase, json_path: Path, device: str) -> 
     if forced_size is not None:
         proc_kwargs["size"] = forced_size
     processed = processor(**proc_kwargs)
-    pixel_values = processed["pixel_values"].to(device)
+    pixel_values = processed["pixel_values"].to(
+        device=_get_model_device(model, device), dtype=_reference_dtype(case.dtype)
+    )
 
     with torch.no_grad():
         outputs = model(pixel_values=pixel_values)
     # logits: [batch, num_queries, num_labels + 1] -> last query's class vector
-    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
 
     save_golden_ref(

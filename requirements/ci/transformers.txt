@@ -1,0 +1,3 @@
+# VibeVoice support requires this source revision. Resolve its dependencies
+# together with the project before installing VibeVoice with --no-deps.
+transformers @ git+https://github.com/huggingface/transformers.git@640a08a597034221ca1c4fc0c129cf0118179225

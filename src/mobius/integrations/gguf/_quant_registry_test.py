@@ -42,24 +42,21 @@ from mobius.integrations.gguf._spec import (
 from mobius.integrations.gguf._upstream import upstream_quant_types
 
 # --------------------------------------------------------------------------
-# Pre-refactor literals, copied verbatim from the tables this registry replaced.
+# Exact legacy layouts retained after removing lossy conversions.
 # --------------------------------------------------------------------------
 
 #: ``_repacker._REPACK_PARAMS``
 _LEGACY_REPACK_PARAMS = {
     2: (4, 32),
-    3: (4, 32),
     8: (8, 32),
-    12: (4, 32),
-    14: (4, 32),
     41: (2, 128),
 }
 
 #: ``_repacker._BLOCK_BYTES``
-_LEGACY_BLOCK_BYTES = {2: 18, 3: 20, 8: 34, 12: 144, 14: 210, 41: 18}
+_LEGACY_BLOCK_BYTES = {2: 18, 8: 34, 41: 18}
 
 #: ``_repacker._GGUF_BLOCK_ELEMENTS``
-_LEGACY_BLOCK_ELEMENTS = {2: 32, 3: 32, 8: 32, 12: 256, 14: 256, 41: 128}
+_LEGACY_BLOCK_ELEMENTS = {2: 32, 8: 32, 41: 128}
 
 #: ``_repacker._NATIVE_BLOCK_SPECS`` as ``id -> (format, elements, bytes)``
 _LEGACY_NATIVE_BLOCKS = {
@@ -77,7 +74,7 @@ _LEGACY_NATIVE_BLOCKS = {
 
 #: ``_builder._detect_quant_params.type_can_omit_zero_points`` — every repack
 #: target emitted zero points explicitly.
-_LEGACY_OMIT_ZERO_POINTS = {2: False, 3: False, 12: False, 14: False, 8: False, 41: False}
+_LEGACY_OMIT_ZERO_POINTS = {2: False, 8: False, 41: False}
 
 #: ``_builder._detect_quant_params.explicit_zero_point_types``
 _LEGACY_EXPLICIT_ZERO_POINT_TYPES = frozenset(
@@ -109,17 +106,17 @@ _LEGACY_FLOAT_TYPE_IDS = frozenset({0, 1, 30, 28})
 
 _PINNED_STORED_ROUTES = {
     "Q4_0": ("affine repack", "exact"),
-    "Q4_1": ("affine repack", "lossy"),
-    "Q5_0": ("dequantize/requantize", None),
-    "Q5_1": ("dequantize/requantize", None),
+    "Q4_1": ("rejected", None),
+    "Q5_0": ("rejected", None),
+    "Q5_1": ("rejected", None),
     "Q8_0": ("affine repack", "exact"),
-    "Q2_K": ("dequantize/requantize", None),
-    "Q3_K": ("dequantize/requantize", None),
-    "Q4_K": ("affine repack", "lossy"),
-    "Q5_K": ("dequantize/requantize", None),
-    "Q6_K": ("affine repack", "lossy"),
-    "TQ1_0": ("dequantize/requantize", None),
-    "TQ2_0": ("dequantize/requantize", None),
+    "Q2_K": ("rejected", None),
+    "Q3_K": ("rejected", None),
+    "Q4_K": ("rejected", None),
+    "Q5_K": ("rejected", None),
+    "Q6_K": ("rejected", None),
+    "TQ1_0": ("rejected", None),
+    "TQ2_0": ("rejected", None),
     "IQ4_NL": ("native byte-preserved", None),
     "IQ4_XS": ("native byte-preserved", None),
     "IQ3_S": ("native byte-preserved", None),
@@ -130,7 +127,7 @@ _PINNED_STORED_ROUTES = {
     "IQ1_S": ("native byte-preserved", None),
     "IQ1_M": ("native byte-preserved", None),
     "MXFP4": ("native byte-preserved", None),
-    "NVFP4": ("dequantize/requantize", None),
+    "NVFP4": ("rejected", None),
     "Q1_0": ("affine repack", "exact"),
     "Q2_0": ("rejected", None),
 }
@@ -327,8 +324,8 @@ class TestStorageInvariants:
         projection = quant_import_decision(20, TensorRole.PROJECTION)
         embedding = quant_import_decision(20, TensorRole.EMBEDDING)
         assert projection[0] is QuantImportRoute.NATIVE_BYTES
-        assert embedding[0] is QuantImportRoute.DEQUANTIZE_REQUANTIZE
-        assert "GatherBlockQuantized" in embedding[2]
+        assert embedding[0] is QuantImportRoute.REJECTED
+        assert "MOBIUS_EXPERIMENTAL_OPSET29" in embedding[2]
 
     def test_native_experts_require_contiguous_expert_major_layout(self) -> None:
         route, exactness, reason = quant_import_decision(39, TensorRole.EXPERT)
@@ -356,16 +353,16 @@ class TestStorageInvariants:
         assert route is QuantImportRoute.REJECTED
         assert "no trusted decoder" in reason
 
-    def test_exact_q8_route_becomes_lossy_for_four_bit_target(self) -> None:
+    def test_exact_q8_route_rejects_four_bit_target(self) -> None:
         route, exactness, reason = quant_import_decision(
             8,
             TensorRole.PROJECTION,
             target_bits=4,
             target_block_size=32,
         )
-        assert route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
-        assert exactness is RepackExactness.LOSSY
-        assert "lossy" in reason
+        assert route is QuantImportRoute.REJECTED
+        assert exactness is None
+        assert "MOBIUS_EXPERIMENTAL_OPSET29" in reason
 
     def test_q1_route_rejects_an_incompatible_target_without_decoder(self) -> None:
         route, _, reason = quant_import_decision(
@@ -388,15 +385,15 @@ class TestStorageInvariants:
         assert exactness is None
         assert "only the affine (4, 32) target" in reason
 
-    def test_native_to_affine_conversion_is_explicitly_lossy(self) -> None:
+    def test_native_to_affine_conversion_is_rejected(self) -> None:
         route, exactness, _ = quant_import_decision(
             20,
             TensorRole.EMBEDDING,
             target_bits=4,
             target_block_size=32,
         )
-        assert route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
-        assert exactness is RepackExactness.LOSSY
+        assert route is QuantImportRoute.REJECTED
+        assert exactness is None
 
     @pytest.mark.parametrize("name", ["Q4_0", "Q8_0", "Q1_0"])
     def test_exact_affine_routes_are_declared(self, name: str) -> None:
@@ -406,11 +403,11 @@ class TestStorageInvariants:
         assert spec.repack_exactness is RepackExactness.EXACT
 
     @pytest.mark.parametrize("name", ["Q4_K", "Q6_K"])
-    def test_lossy_affine_target_storage_is_never_source_preservation(self, name: str) -> None:
+    def test_lossy_affine_target_storage_is_rejected(self, name: str) -> None:
         spec = quant_spec_by_name(name)
         assert spec is not None
-        assert spec.import_route is QuantImportRoute.AFFINE_REPACK
-        assert spec.repack_exactness is RepackExactness.LOSSY
+        assert spec.import_route is QuantImportRoute.REJECTED
+        assert spec.repack_exactness is None
         assert not spec.preserves_values
 
 
