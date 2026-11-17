@@ -53,6 +53,36 @@ def test_offset_rms_norm_learned_scale_precision(tmp_path, dtype, unknown_input_
     np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7, strict=True)
 
 
+def test_offset_rms_norm_model_dtype_flag(tmp_path):
+    """The opt-in path normalizes FP16 activations directly with a folded FP16 scale."""
+    from mobius._flags import override_flags
+
+    values = np.asarray([[1.0, 3.0, 6.0, 10.0]], dtype=np.float16)
+    weight = np.asarray([0.25, -0.0004, 0.0003, -0.5], dtype=np.float16)
+    norm = OffsetRMSNorm(4, eps=1e-6)
+    _cast_module_dtype(norm, ir.DataType.FLOAT16)
+    norm.weight = nn.Parameter([4], data=ir.Tensor(weight))
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 4], ir.DataType.FLOAT16)
+    with override_flags(offset_rmsnorm_model_dtype=True):
+        result = norm(op, x)
+    result.type = ir.TensorType(ir.DataType.FLOAT16)
+    graph.outputs.append(result)
+    rms_norm = result.producer()
+    assert rms_norm.op_type == "RMSNormalization"
+    assert rms_norm.inputs[0] is x
+    assert count_op_type(graph, "CastLike") == 0
+    path = tmp_path / "offset-norm-model-dtype.onnx"
+    ir.save(ir.Model(graph, ir_version=11), path)
+    actual = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"]).run(
+        None, {"x": values}
+    )[0]
+    values_f32 = values.astype(np.float32)
+    scale = (1.0 + weight.astype(np.float32)).astype(np.float16).astype(np.float32)
+    expected = values_f32 / np.sqrt(np.mean(values_f32**2, axis=-1, keepdims=True) + 1e-6)
+    np.testing.assert_allclose(actual, (expected * scale).astype(np.float16), rtol=2e-3)
+
+
 class TestRMSNorm:
     def test_rms_norm_creates_parameters(self):
         norm = RMSNorm(64, eps=1e-6)

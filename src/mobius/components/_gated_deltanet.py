@@ -32,9 +32,16 @@ from __future__ import annotations
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities
 from mobius._configs import ArchitectureConfig
+from mobius._flags import flags
 from mobius.components._common import Linear
 from mobius.components._rms_norm import PostGatedRMSNorm
+
+
+def uses_fused_cuda_deltanet() -> bool:
+    """Whether the active build emits the native fused CUDA DeltaNet path."""
+    return flags.cuda_fused_deltanet and ep_capabilities().name == "cuda"
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -183,6 +190,7 @@ class GatedDeltaNet(nn.Module):
             new_conv_state: (batch, conv_dim, kernel_size-1)
             new_recurrent_state: (batch, num_v_heads, k_dim, v_dim)
         """
+        fused = uses_fused_cuda_deltanet()
         batch_dim = op.Shape(hidden_states, start=0, end=1)
         if conv_state is None:
             conv_state = op.Expand(
@@ -229,6 +237,9 @@ class GatedDeltaNet(nn.Module):
         conv_out, new_conv_state = self.conv1d(op, mixed_qkv_t, conv_state)
         # Transpose back: (batch, seq_len, conv_dim)
         conv_out = op.Transpose(conv_out, perm=[0, 2, 1])
+        if fused and self._stash_type != self._dtype:
+            # One conversion feeds both the Q/K norms and the recurrence.
+            conv_out = op.Cast(conv_out, to=self._stash_type)
 
         # === Split into Q, K, V ===
         query, key, value = op.Split(
@@ -240,43 +251,55 @@ class GatedDeltaNet(nn.Module):
         # query, key: [B, T, key_dim] (3D)
         # value: [B, T, value_dim] (3D)
 
-        # === L2 normalize Q and K (per-head, along d_k) ===
-        # Reshape to 4D for per-head normalization, then back to 3D.
-        seq_dim = op.Shape(hidden_states, start=1, end=2)
-        qk_4d_shape = op.Concat(
-            batch_dim,
-            seq_dim,
-            op.Constant(value_ints=[self.num_k_heads, self.head_k_dim]),
-            axis=0,
-        )
-        qk_3d_shape = op.Concat(
-            batch_dim,
-            seq_dim,
-            op.Constant(value_ints=[self.key_dim]),
-            axis=0,
-        )
-        # L2-normalize query and key per head along head_k_dim (axis=-1).
-        # Decomposed form of op.LpNormalization(x, axis=-1, p=2).
-        # TODO: Use op.LpNormalization directly once ORT >=1.25 supports it.
-        q_4d = op.Reshape(query, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
-        q_norm_squared = op.ReduceSumSquare(q_4d, [-1], keepdims=1)
-        if self._qk_l2norm_eps:
-            q_norm_squared = op.Add(
-                q_norm_squared,
-                op.CastLike(self._qk_l2norm_eps, q_4d),
+        if fused:
+            qk_4d_shape = op.Constant(value_ints=[0, 0, self.num_k_heads, self.head_k_dim])
+            qk_3d_shape = op.Constant(value_ints=[0, 0, self.key_dim])
+            query = op.Reshape(
+                op.LpNormalization(op.Reshape(query, qk_4d_shape), axis=-1, p=2),
+                qk_3d_shape,
             )
-        q_l2 = op.Sqrt(q_norm_squared)  # (B, T, num_k_heads, 1) — L2 norm per head
-        query = op.Reshape(op.Div(q_4d, q_l2), qk_3d_shape)  # (B, T, key_dim)
+            key = op.Reshape(
+                op.LpNormalization(op.Reshape(key, qk_4d_shape), axis=-1, p=2),
+                qk_3d_shape,
+            )
+        else:
+            # === L2 normalize Q and K (per-head, along d_k) ===
+            # Reshape to 4D for per-head normalization, then back to 3D.
+            seq_dim = op.Shape(hidden_states, start=1, end=2)
+            qk_4d_shape = op.Concat(
+                batch_dim,
+                seq_dim,
+                op.Constant(value_ints=[self.num_k_heads, self.head_k_dim]),
+                axis=0,
+            )
+            qk_3d_shape = op.Concat(
+                batch_dim,
+                seq_dim,
+                op.Constant(value_ints=[self.key_dim]),
+                axis=0,
+            )
+            # L2-normalize query and key per head along head_k_dim (axis=-1).
+            # Decomposed form of op.LpNormalization(x, axis=-1, p=2) that keeps
+            # the reference epsilon; the fused CUDA path uses the native op.
+            q_4d = op.Reshape(query, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
+            q_norm_squared = op.ReduceSumSquare(q_4d, [-1], keepdims=1)
+            if self._qk_l2norm_eps:
+                q_norm_squared = op.Add(
+                    q_norm_squared,
+                    op.CastLike(self._qk_l2norm_eps, q_4d),
+                )
+            q_l2 = op.Sqrt(q_norm_squared)  # (B, T, num_k_heads, 1) — L2 norm per head
+            query = op.Reshape(op.Div(q_4d, q_l2), qk_3d_shape)  # (B, T, key_dim)
 
-        k_4d = op.Reshape(key, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
-        k_norm_squared = op.ReduceSumSquare(k_4d, [-1], keepdims=1)
-        if self._qk_l2norm_eps:
-            k_norm_squared = op.Add(
-                k_norm_squared,
-                op.CastLike(self._qk_l2norm_eps, k_4d),
-            )
-        k_l2 = op.Sqrt(k_norm_squared)  # (B, T, num_k_heads, 1)
-        key = op.Reshape(op.Div(k_4d, k_l2), qk_3d_shape)  # (B, T, key_dim)
+            k_4d = op.Reshape(key, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
+            k_norm_squared = op.ReduceSumSquare(k_4d, [-1], keepdims=1)
+            if self._qk_l2norm_eps:
+                k_norm_squared = op.Add(
+                    k_norm_squared,
+                    op.CastLike(self._qk_l2norm_eps, k_4d),
+                )
+            k_l2 = op.Sqrt(k_norm_squared)  # (B, T, num_k_heads, 1)
+            key = op.Reshape(op.Div(k_4d, k_l2), qk_3d_shape)  # (B, T, key_dim)
 
         # === Compute gating parameters ===
         # beta: (B, T, num_v_heads)
@@ -303,9 +326,10 @@ class GatedDeltaNet(nn.Module):
         #   matches (B, T, kv_num_heads * 1) = (B, T, kv_num_heads)
 
         if self._stash_type != self._dtype:
-            query = op.Cast(query, to=self._stash_type)
-            key = op.Cast(key, to=self._stash_type)
-            value = op.Cast(value, to=self._stash_type)
+            if not fused:
+                query = op.Cast(query, to=self._stash_type)
+                key = op.Cast(key, to=self._stash_type)
+                value = op.Cast(value, to=self._stash_type)
             recurrent_state = op.Cast(recurrent_state, to=self._stash_type)
             g = op.Cast(g, to=self._stash_type)
             beta = op.Cast(beta, to=self._stash_type)
@@ -326,6 +350,16 @@ class GatedDeltaNet(nn.Module):
         output_3d.type = ir.TensorType(self._stash_type)
         new_recurrent_state.type = ir.TensorType(self._stash_type)
         # output_3d: (B, T, num_v_heads * d_v) — already 3D
+        if fused:
+            # The gated norm consumes the recurrence output without rounding it.
+            head_shape = op.Constant(value_ints=[0, 0, self.num_v_heads, self.head_v_dim])
+            normed = self.norm(
+                op, op.Reshape(output_3d, head_shape), op.Reshape(z, head_shape)
+            )
+            if self._stash_type != self._dtype:
+                normed = op.Cast(normed, to=self._dtype)
+            output = op.Reshape(normed, op.Constant(value_ints=[0, 0, self.value_dim]))
+            return self.out_proj(op, output), new_conv_state, new_recurrent_state
         if self._stash_type != self._dtype:
             output_3d = op.CastLike(output_3d, hidden_states)
 

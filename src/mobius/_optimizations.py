@@ -816,12 +816,14 @@ def optimize_model(
         # ops like CausalConvWithState and LinearAttention registered per-model.
         if caps.name == "onnx-standard" and func.domain not in _STANDARD_ONNX_DOMAINS:
             return True
-        # ORT's CUDA EP has no CausalConvWithState kernel. Keeping the local
+        # Older ORT CUDA EPs have no CausalConvWithState kernel. Keeping the local
         # function call causes TransformerMemcpy to inspect a node without a
         # provider assignment and abort session initialization. Inline its
-        # standard Conv-based body so hybrid decoders run on CUDA.
+        # standard Conv-based body so hybrid decoders run on CUDA, unless the
+        # build opts into runtimes with the native kernel (ORT >= 1.25).
         if (
             caps.name == "cuda"
+            and not flags.cuda_fused_deltanet
             and func.domain == "com.microsoft"
             and func.name == "CausalConvWithState"
         ):
