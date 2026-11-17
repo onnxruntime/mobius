@@ -47,7 +47,7 @@ jobs:
       - name: Install released dependencies
         run: |
           # Test-only dependencies allow source collection before marker selection.
-          pip install -e . pytest httpx "gguf>=0.10.0" "jsonschema>=4.0" \
+          pip install -e . pytest pytest-cov httpx "gguf>=0.10.0" "jsonschema>=4.0" \
             onnx==1.19.0 onnxruntime==1.31.1 onnxruntime-easy==0.1.2 \
             onnxscript==0.7.2 onnx_ir==1.1.0
       - name: Test with released ONNX 1.19 schemas
@@ -57,11 +57,36 @@ jobs:
       - name: Install pinned opset-29 schemas
         run: |
           pip install --no-cache-dir --no-deps --force-reinstall \
-            https://github.com/onnx/onnx/archive/82721c0908fa965dd84e674c006147791313f3e1.tar.gz
-          python -c "import onnx; assert onnx.defs.has('GroupedMatMul', 29)"
+            https://github.com/onnx/onnx/archive/c7609c4ad5445c548e0e18a465666dd0f4084215.tar.gz
+          python -c "import onnx; assert onnx.defs.has('GroupedMatMul', 29); assert onnx.defs.has('DequantizePacked', 29)"
       - name: Test with pinned opset-29 schemas
         run: |
-          python -m pytest src/mobius tests/ep_optimization_test.py -m opset29 -q -rs
+          python -m pytest src/mobius tests/ep_optimization_test.py -m opset29 -q -rs \
+            --cov=src --cov-report=xml:coverage-opset29.xml --cov-branch \
+            --junitxml=junit-opset29.xml
+      - name: Upload opset-29 coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage-opset29.xml
+          flags: unittests
+      - name: Save opset-29 coverage and test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: opset29-coverage
+          path: |
+            coverage-opset29.xml
+            junit-opset29.xml
+      - name: Upload opset-29 test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: junit-opset29.xml
+          flags: unittests
+          report_type: test_results
 
   detect-affected:
     name: Detect affected models
