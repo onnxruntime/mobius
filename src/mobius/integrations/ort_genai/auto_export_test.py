@@ -116,6 +116,42 @@ def _make_fake_llm_pkg(model_type: str = "qwen2"):
     )
 
 
+def _make_fake_kev_pkg():
+    """Build a minimal KEV component package with a Qwen configuration."""
+    from mobius._model_package import ModelPackage
+
+    config = _make_fake_llm_pkg("qwen3_5").config
+    return ModelPackage(
+        {
+            "backbone": _mock_model(),
+            "pointer_head": _mock_model(),
+        },
+        config=config,
+    )
+
+
+@pytest.mark.parametrize(("ep", "threads"), [("cpu", 16), ("cuda", 1)])
+def test_kev_export_writes_default_component_session_options(tmp_path, ep, threads):
+    result = write_ort_genai_config(
+        _make_fake_kev_pkg(),
+        str(tmp_path),
+        ep=ep,
+        context_length=8192,
+    )
+
+    assert result["genai_config"] == str(tmp_path / "genai_config.json")
+    config = json.loads((tmp_path / "genai_config.json").read_text())
+    assert config["model"]["type"] == "component"
+    assert config["model"]["decoder"]["filename"] == "backbone/model.onnx"
+    assert config["model"]["context_length"] == 8192
+    assert config["model"]["decoder"]["session_options"] == {
+        "intra_op_num_threads": threads,
+        "inter_op_num_threads": 1,
+        "session.intra_op.allow_spinning": "0",
+        "session.inter_op.allow_spinning": "0",
+    }
+
+
 class TestResolveOrtGenaiModelType:
     def test_known_model_type(self):
         assert _resolve_ort_genai_model_type("qwen3") == "qwen2"

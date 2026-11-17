@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
@@ -446,6 +447,8 @@ class MoELayer(nn.Module):
     and compatibility path, not the grouped-expert performance representation.
     """
 
+    _qmoe_activation_type: ClassVar[str] = "swiglu"
+
     def __init__(
         self,
         config: ArchitectureConfig,
@@ -637,7 +640,7 @@ class MoELayer(nn.Module):
             self.fc2_experts_zero_points,
             None,
             router_weights,
-            activation_type="swiglu",
+            activation_type=self._qmoe_activation_type,
             normalize_routing_weights=int(normalize),
             k=self.top_k,
             # A uniform override can use the global attribute directly.
@@ -689,3 +692,111 @@ class MoELayer(nn.Module):
                 result = op.Add(result, contribution)
 
         return result
+
+
+class GroupedMoELayer(MoELayer):
+    """Ordinary gated experts with unchanged routing and GroupedMatMul-29.
+
+    Keeps the loop representation's parameter names, but computes only selected
+    experts. Custom expert classes are rejected rather than approximated.
+    """
+
+    def __init__(self, source: MoELayer):
+        nn.Module.__init__(self)
+        if source.experts is None or any(type(e) is not MLP for e in source.experts):
+            raise ValueError("GroupedMoELayer requires ordinary unquantized MLP experts.")
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            bias_presence = {getattr(e, name).bias is not None for e in source.experts}
+            if len(bias_presence) != 1:
+                raise ValueError(
+                    f"GroupedMoELayer requires consistent {name} bias presence across experts."
+                )
+        self.num_experts = source.num_experts
+        self.top_k = source.top_k
+        self.gate = source.gate
+        self.experts = source.experts
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, *gate_args):
+        routing_weights, selected_experts = self.gate(op, hidden_states, *gate_args)
+        # Calls realize each child in its original scope. Unused loop nodes are
+        # removed by the normal exporter; only these qualified weights survive.
+        experts = self.experts
+        if experts is None or not isinstance(experts[0], MLP):
+            raise ValueError("GroupedMoELayer requires ordinary MLP experts.")
+        banks: dict[str, list] = {name: [] for name in ("gate_proj", "up_proj", "down_proj")}
+        biases: dict[str, list] = {name: [] for name in banks}
+        for expert in experts:
+            op.builder.push_module(expert.name or "expert", type(expert).__qualname__)
+            try:
+                for name in banks:
+                    projection = getattr(expert, name)
+                    op.builder.push_module(
+                        projection.name or name, type(projection).__qualname__
+                    )
+                    try:
+                        for parameter in projection.parameters(recurse=False):
+                            parameter._realize(op.builder)  # pylint: disable=protected-access
+                    finally:
+                        op.builder.pop_module()
+                    banks[name].append(op.Unsqueeze(projection.weight, [0]))
+                    if projection.bias is not None:
+                        biases[name].append(op.Unsqueeze(projection.bias, [0]))
+            finally:
+                op.builder.pop_module()
+        weights = {name: op.Concat(*bank, axis=0) for name, bank in banks.items()}
+        bias_banks = {
+            name: op.Concat(*bank, axis=0) if bank else None for name, bank in biases.items()
+        }
+        width = op.Shape(hidden_states, start=-1)
+        flat = op.Reshape(hidden_states, op.Concat([-1], width, axis=0))
+        ids = op.Reshape(selected_experts, [-1, self.top_k])
+        gate = op.GroupedMatMul(flat, weights["gate_proj"], ids, transB=1)
+        up = op.GroupedMatMul(flat, weights["up_proj"], ids, transB=1)
+        if bias_banks["gate_proj"] is not None:
+            gate = op.Add(gate, op.Gather(bias_banks["gate_proj"], ids, axis=0))
+        if bias_banks["up_proj"] is not None:
+            up = op.Add(up, op.Gather(bias_banks["up_proj"], ids, axis=0))
+        activated = experts[0].act_fn(op, gate)
+        selected_hidden = op.Mul(activated, up)
+        expert_width = op.Shape(selected_hidden, start=-1)
+        selected_flat = op.Reshape(selected_hidden, op.Concat([-1], expert_width, axis=0))
+        projected = op.GroupedMatMul(
+            selected_flat, weights["down_proj"], op.Reshape(ids, [-1, 1]), transB=1
+        )
+        projected = op.Reshape(
+            projected, op.Concat([-1, self.top_k], width, axis=0)
+        )  # (tokens, top_k, hidden)
+        if bias_banks["down_proj"] is not None:
+            projected = op.Add(projected, op.Gather(bias_banks["down_proj"], ids, axis=0))
+        routing = op.Reshape(routing_weights, [-1, self.top_k, 1])
+        combined = op.ReduceSum(op.Mul(projected, routing), [1], keepdims=False)
+        return op.Reshape(combined, op.Shape(hidden_states))
+
+
+class GroupedGatedSharedMoELayer(GroupedMoELayer):
+    """Grouped routed experts plus a sigmoid-gated ordinary shared MLP."""
+
+    def __init__(self, source: MoELayer):
+        super().__init__(source)
+        self.shared_expert = source.shared_expert
+        self.shared_expert_gate = source.shared_expert_gate
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, *gate_args):
+        routed = super().forward(op, hidden_states, *gate_args)
+        shared = self.shared_expert(op, hidden_states)
+        scale = op.Sigmoid(self.shared_expert_gate(op, hidden_states))
+        return op.Add(routed, op.Mul(shared, scale))
+
+
+class GroupedUngatedSharedMoELayer(GroupedMoELayer):
+    """Grouped routed experts plus an ordinary always-active shared MLP."""
+
+    def __init__(self, source: MoELayer):
+        super().__init__(source)
+        self.shared_expert = source.shared_expert
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, *gate_args):
+        return op.Add(
+            super().forward(op, hidden_states, *gate_args),
+            self.shared_expert(op, hidden_states),
+        )

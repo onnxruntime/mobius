@@ -1162,33 +1162,6 @@ class TestBuildQuantizedGguf:
             is not None
         )
 
-    def test_decoder_backed_qtype_warns_and_persists_lossy_report(
-        self, q5_1_gguf: Path, tmp_path: Path, caplog
-    ) -> None:
-        """A Q5_1 source stays packed but is reported as lossy target quantization."""
-        from mobius._model_package import ModelPackage
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        output_dir = tmp_path / "saved_q5_1"
-        with caplog.at_level("WARNING"):
-            package = build_from_gguf(q5_1_gguf)
-        assert caplog.text.count("GGUF QUANTIZATION FIDELITY WARNING") == 1
-        assert "Q5_1: 7 tensor(s)" in caplog.text
-        assert "Losslessly preserved/repacked qtypes in this artifact: none" in caplog.text
-        report = package.gguf_quantization_report
-        assert report.target_storage_format == "INT4 affine block-32"
-        assert report.storage_quantized is True
-        assert report.source_fidelity is False
-        assert {
-            record.disposition for record in report.tensor_records if record.qtype == "Q5_1"
-        } == {QuantizationDisposition.LOSSY_REQUANTIZE}
-        assert any(node.op_type == "MatMulNBits" for node in package["model"].graph)
-        package.save(str(output_dir), progress_bar=False)
-        reloaded = ModelPackage.load(str(output_dir))
-        assert (output_dir / "quantization_report.json").is_file()
-        assert reloaded.gguf_quantization_report == report
-        assert any(node.op_type == "MatMulNBits" for node in reloaded["model"].graph)
-
     def test_dequantize_reports_float_without_quantized_claim(self, q5_1_gguf: Path) -> None:
         from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
 
@@ -1201,45 +1174,6 @@ class TestBuildQuantizedGguf:
             record.disposition for record in report.tensor_records if record.qtype == "Q5_1"
         } == {QuantizationDisposition.DEQUANTIZED_FLOAT}
         assert all(node.op_type != "MatMulNBits" for node in package["model"].graph)
-
-    def test_mixed_k_quant_census_warns_once_and_remains_packed(
-        self, tmp_path: Path, caplog
-    ) -> None:
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        path = tmp_path / "mixed.gguf"
-        _write_quantized_gguf(
-            path,
-            hidden_size=256,
-            intermediate_size=256,
-            vocab_size=256,
-            num_heads=8,
-            num_kv_heads=2,
-            projection_quantization="q4_k",
-            value_projection_quantization="q6_k",
-            embedding_quantization="q5_k",
-            output_quantization="q4_0",
-        )
-        with caplog.at_level("WARNING"):
-            package = build_from_gguf(path)
-        report = package.gguf_quantization_report
-        assert caplog.text.count("GGUF QUANTIZATION FIDELITY WARNING") == 1
-        assert all(name in caplog.text for name in ("Q4_K:", "Q5_K:", "Q6_K:"))
-        assert "Losslessly preserved/repacked qtypes in this artifact: Q4_0:" in caplog.text
-        assert report.converted_from == "Q4_K_M-like mixed GGUF"
-        assert {
-            record.qtype
-            for record in report.tensor_records
-            if record.disposition is QuantizationDisposition.LOSSY_REQUANTIZE
-        } == {"Q4_K", "Q5_K", "Q6_K"}
-        assert report.storage_quantized is True
-        packed = [
-            initializer
-            for model in package.values()
-            for initializer in model.graph.initializers.values()
-            if initializer.dtype == ir.DataType.UINT8
-        ]
-        assert packed
 
     def test_float_only_default_uses_float_path(self, float_only_gguf: Path):
         """F32/BF16-only GGUFs do not fail when preservation is the default."""
@@ -2022,23 +1956,6 @@ class TestBuildQuantizedGguf:
         imports = {opset.domain: opset.version for opset in proto.opset_import}
         assert imports["pkg.nxrt"] == 1
 
-    def test_mixed_native_quantization_reports_lossy_affine_normalization(
-        self, mixed_native_q5_q8_gguf: Path, caplog
-    ):
-        """Native IQ bytes coexist with explicitly reported Q5/Q8 normalization."""
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        with caplog.at_level("WARNING"):
-            package = build_from_gguf(mixed_native_q5_q8_gguf, keep_quantized=True)
-        report = package.gguf_quantization_report
-        assert caplog.text.count("GGUF QUANTIZATION FIDELITY WARNING") == 1
-        assert {
-            record.qtype
-            for record in report.tensor_records
-            if record.disposition is QuantizationDisposition.LOSSY_REQUANTIZE
-        } == {"Q5_1", "Q8_0"}
-        assert "native GGUF block storage" in report.target_storage_format
-
     def test_quantized_embedding_uses_gatherblockquantized(self, q4_0_embedding_gguf: Path):
         """A quantized GGUF embedding remains packed in the ONNX graph."""
         import onnx_ir as ir
@@ -2077,26 +1994,6 @@ class TestBuildQuantizedGguf:
         wrong = _run_gather_block_quantized(tmp_path, zero_point=0x00).astype(np.float32)
         assert not np.allclose(wrong, expected)
 
-    def test_native_projection_abi_embedding_is_lossily_normalized(
-        self, iq4_nl_embedding_gguf: Path, caplog
-    ) -> None:
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        with caplog.at_level("WARNING"):
-            package = build_from_gguf(iq4_nl_embedding_gguf)
-        report = package.gguf_quantization_report
-        assert "IQ4_NL:" in caplog.text
-        assert any(
-            record.qtype == "IQ4_NL"
-            and record.disposition is QuantizationDisposition.LOSSY_REQUANTIZE
-            for record in report.tensor_records
-        )
-        assert any(node.op_type == "GatherBlockQuantized" for node in package["model"].graph)
-
-        model = build_from_gguf(iq4_nl_embedding_gguf, keep_quantized=False)["model"]
-        assert all(node.op_type != "GatherBlockQuantized" for node in model.graph)
-        assert "model.embed_tokens.weight" in model.graph.initializers
-
     def test_tied_quantized_embedding_drives_matmulnbits_head(
         self, q4_0_tied_embedding_gguf: Path
     ):
@@ -2110,68 +2007,6 @@ class TestBuildQuantizedGguf:
         assert "model.embed_tokens.qweight" in model.graph.initializers
         assert "model.embed_tokens.zero_points" in model.graph.initializers
         assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
-
-    def test_untied_head_with_incompatible_affine_target_is_reported(
-        self, q4_0_embedding_q8_head_gguf: Path, caplog
-    ):
-        """An untied Q8 head is visibly requantized to the graph's Q4 layout."""
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        with caplog.at_level("WARNING"):
-            package = build_from_gguf(q4_0_embedding_q8_head_gguf, keep_quantized=True)
-        assert "Q8_0: 1 tensor(s)" in caplog.text
-        assert any(
-            record.name == "output.weight"
-            and record.disposition is QuantizationDisposition.LOSSY_REQUANTIZE
-            for record in package.gguf_quantization_report.tensor_records
-        )
-
-    def test_mixed_affine_targets_select_supported_int4_normalization(
-        self, q8_0_projection_q4_head_gguf: Path, caplog
-    ):
-        """Mixed affine targets normalize to the supported INT4 target."""
-        from mobius.integrations.gguf import build_from_gguf
-
-        with caplog.at_level("WARNING"):
-            package = build_from_gguf(q8_0_projection_q4_head_gguf, keep_quantized=True)
-        assert package.gguf_quantization_report.target_storage_format == (
-            "INT4 affine block-32"
-        )
-        assert "Q8_0:" in caplog.text
-
-    def test_quantized_source_float_output_head_dequantizes_consistently(
-        self, tmp_path: Path
-    ) -> None:
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
-
-        path = tmp_path / "olmo2-q6-output.gguf"
-        _write_quantized_gguf(
-            path,
-            architecture="olmo2",
-            hidden_size=256,
-            intermediate_size=256,
-            vocab_size=256,
-            num_heads=8,
-            num_kv_heads=2,
-            projection_quantization="q4_k",
-            output_quantization="q6_k",
-        )
-
-        package = build_from_gguf(path, keep_quantized=True)
-        report_record = next(
-            record
-            for record in package.gguf_quantization_report.tensor_records
-            if record.name == "output.weight"
-        )
-        assert report_record.disposition is QuantizationDisposition.DEQUANTIZED_FLOAT
-        assert report_record.target_storage == "float"
-        head_initializers = [
-            value
-            for name, value in package["model"].graph.initializers.items()
-            if name.startswith("lm_head.weight")
-        ]
-        assert len(head_initializers) == 1
-        assert head_initializers[0].dtype == ir.DataType.FLOAT
 
     @pytest.mark.parametrize(
         ("native_2bit", "expected_bits"),
@@ -2427,7 +2262,7 @@ class TestBuildQuantizedGguf:
 
         assert not _can_quantize_embedding(model, "llama", bits=4, block_size=128)
 
-    def test_decoder_backed_embedding_uses_affine_gather_target(self, monkeypatch):
+    def test_decoder_backed_embedding_cannot_requantize_to_affine_gather(self, monkeypatch):
         from gguf import GGMLQuantizationType
 
         from mobius.integrations.gguf import _tencent_q1_0
@@ -2444,7 +2279,7 @@ class TestBuildQuantizedGguf:
             reader_tensors=lambda: [tensor],
         )
 
-        assert _can_quantize_embedding(model, "llama", bits=4, block_size=32)
+        assert not _can_quantize_embedding(model, "llama", bits=4, block_size=32)
 
     def test_decoder_backed_output_head_is_not_claimed_as_preserved(self):
         from mobius.integrations.gguf._builder import _can_quantize_lm_head
@@ -2488,23 +2323,6 @@ class TestBuildQuantizedGguf:
             _MixedModel(), "llama", preserve_quantization=True
         )
 
-    def test_decoder_backed_qtype_selects_explicit_requantization_target(self):
-        """A decoder-backed qtype takes the declared 4-bit requantization route."""
-        from gguf import GGMLQuantizationType
-
-        from mobius.integrations.gguf._builder import _detect_quant_params
-
-        class _UnsupportedModel:
-            def tensor_items_raw(self):
-                yield (
-                    "blk.0.ffn_down.weight",
-                    np.empty(0, dtype=np.uint8),
-                    GGMLQuantizationType.Q5_K,
-                    (64, 128),
-                )
-
-        assert _detect_quant_params(_UnsupportedModel(), "llama") == (4, 32, False)
-
     def test_qtype_without_decoder_or_kernel_is_rejected_actionably(self):
         import enum
 
@@ -2524,7 +2342,7 @@ class TestBuildQuantizedGguf:
 
         with pytest.raises(
             ValueError,
-            match=r"Q2_0: gguf-py ships no Python dequantizer.*Re-quantize",
+            match=r"Q2_0: gguf-py ships no Python dequantizer.*MOBIUS_EXPERIMENTAL_OPSET29",
         ):
             _detect_quant_params(_Q20Model(), "llama")
 

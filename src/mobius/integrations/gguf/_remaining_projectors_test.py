@@ -3,14 +3,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnx_ir as ir
 import pytest
 
 from mobius._configs import ArchitectureConfig
+from mobius._flags import override_flags
+from mobius._model_package import ModelPackage
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations.gguf._mmproj import build_mmproj_from_gguf
 from mobius.integrations.gguf._mmproj_mapping import (
@@ -160,6 +164,82 @@ def test_public_standalone_dispatch_builds_and_runs_janus(tmp_path: Path) -> Non
     session.close()
     assert output.shape == (4, 6)
     assert np.isfinite(output).all()
+
+
+@pytest.mark.opset29
+@pytest.mark.skipif(
+    not onnx.defs.has("DequantizePacked", 29),
+    reason="Lossless GGUF binding requires current ONNX opset-29 schemas.",
+)
+def test_lossless_janus_preserves_source_bytes_and_roundtrips(tmp_path: Path) -> None:
+    from onnx.reference import ReferenceEvaluator
+
+    source_dir = tmp_path / "lossless"
+    source_dir.mkdir()
+    source = source_dir / "janus.gguf"
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir()
+    baseline_source = baseline_dir / "janus.gguf"
+    _write_tiny_janus(source)
+    _write_tiny_janus(baseline_source)
+    pixel_values = np.random.default_rng(3).normal(size=(1, 3, 4, 4)).astype(np.float32)
+
+    float_package = build_mmproj_from_gguf(
+        baseline_source,
+        projector_type="janus_pro",
+        target_architecture="llama",
+        dtype="f32",
+    )
+    float_session = OnnxModelSession(float_package["vision_encoder"])
+    expected = float_session.run({"pixel_values": pixel_values})["image_features"]
+    float_session.close()
+
+    with override_flags(experimental_opset29=True):
+        package = build_mmproj_from_gguf(
+            source,
+            projector_type="janus_pro",
+            target_architecture="llama",
+            dtype="f32",
+            execution_provider="onnx-standard",
+        )
+
+    model = package["vision_encoder"]
+    assert model.opset_imports[""] == 29
+    assert model.metadata_props["mobius.gguf.original_external_data"] == "1"
+    assert not any(value.const_value is None for value in model.graph.initializers.values())
+
+    original_bytes = source.read_bytes()
+    output_dir = source_dir
+    package.save(output_dir, progress_bar=False)
+    model_paths = list(output_dir.glob("*.onnx"))
+    assert len(model_paths) == 1
+    model_path = model_paths[0]
+    assert source.read_bytes() == original_bytes
+    assert (
+        hashlib.sha256(source.read_bytes()).digest() == hashlib.sha256(original_bytes).digest()
+    )
+
+    restored = ModelPackage.load(output_dir)
+    restored_model = restored["vision_encoder"]
+    assert restored_model.metadata_props["mobius.gguf.original_external_data"] == "1"
+    actual = ReferenceEvaluator(str(model_path)).run(None, {"pixel_values": pixel_values})[0]
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_lossless_standalone_rejects_unimplemented_route(tmp_path: Path) -> None:
+    source = tmp_path / "meralion.gguf"
+    _write_tiny_meralion(source)
+
+    with (
+        override_flags(experimental_opset29=True),
+        pytest.raises(NotImplementedError, match="only the exact 'janus_pro' route"),
+    ):
+        build_mmproj_from_gguf(
+            source,
+            projector_type="meralion",
+            target_architecture="gemma2",
+            execution_provider="onnx-standard",
+        )
 
 
 def test_source_only_minimax_component_builds_with_explicit_positions() -> None:

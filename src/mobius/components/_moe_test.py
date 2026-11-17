@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import onnx_ir as ir
 import pytest
 import torch
+import torch.nn.functional as torch_functional
 
 from mobius._builder import _cast_module_dtype
 from mobius._configs import QuantizationConfig
@@ -16,6 +18,7 @@ from mobius._testing import (
     create_test_input,
     make_config,
 )
+from mobius._testing.ort_inference import OnnxModelSession
 from mobius._weight_utils import (
     pack_qmoe_expert_weights,
     preprocess_gptq_weights,
@@ -23,10 +26,16 @@ from mobius._weight_utils import (
     supported_qmoe_quantization,
 )
 from mobius.components._moe import (
+    GroupedMoELayer,
     MoELayer,
     SparseMixerGate,
     TopKGate,
 )
+from mobius.functions._lowering_test_utils import expand_grouped_matmul
+from mobius.integrations._weight_loading import apply_weights
+from mobius.tasks._base import _make_graph, _make_model
+
+pytestmark = pytest.mark.opset29
 
 
 class TestTopKGate:
@@ -152,6 +161,101 @@ class TestMoELayer:
         result = layer(op, hidden)
         builder._adapt_outputs([result], "")
         assert graph.num_nodes() > 0
+
+    @pytest.mark.parametrize(("activation", "bias"), [("silu", False), ("gelu", True)])
+    def test_grouped_dispatch_matches_independent_dense_reference(self, activation, bias):
+        config = make_config(
+            hidden_size=4,
+            intermediate_size=6,
+            moe_intermediate_size=6,
+            num_local_experts=3,
+            num_experts_per_tok=2,
+            hidden_act=activation,
+            mlp_bias=bias,
+        )
+        grouped = GroupedMoELayer(MoELayer(config))
+        graph, builder = _make_graph(name="grouped_moe")
+        hidden = builder.input("hidden", dtype=ir.DataType.FLOAT, shape=[2, 3, 4])
+        builder.add_output(grouped(builder.op, hidden), "output")
+        model = _make_model(graph)
+        model.graph.opset_imports[""] = 29
+
+        rng = np.random.default_rng(0)
+        state = {}
+        for name, initializer in model.graph.initializers.items():
+            if name.startswith("const"):
+                continue
+            values = rng.normal(0.0, 0.2, tuple(initializer.shape)).astype(np.float32)
+            state[name] = values
+        apply_weights(model, {name: torch.from_numpy(value) for name, value in state.items()})
+
+        values = rng.normal(0.0, 0.5, (2, 3, 4)).astype(np.float32)
+        actual = OnnxModelSession(expand_grouped_matmul(model), device="cpu").run(
+            {"hidden": values}
+        )["output"]
+        x = torch.from_numpy(values)
+        router_weight = next(
+            torch.from_numpy(value)
+            for name, value in state.items()
+            if name.endswith("gate.weight") and ".experts." not in name
+        )
+        router = x @ router_weight.T
+        route_weights, route_ids = torch.topk(router, 2, dim=-1)
+        route_weights = torch.softmax(route_weights, dim=-1)
+        expected = torch.zeros_like(x)
+
+        def activate(tensor):
+            if activation == "silu":
+                return torch_functional.silu(tensor)
+            return torch_functional.gelu(tensor, approximate="tanh")
+
+        def state_value(name):
+            matches = [value for key, value in state.items() if key.endswith(name)]
+            assert len(matches) == 1
+            return torch.from_numpy(matches[0])
+
+        for expert in range(3):
+            prefix = f"experts.{expert}."
+
+            def linear(name, tensor, prefix=prefix):
+                weight = state_value(prefix + name + ".weight")
+                bias_value = state_value(prefix + name + ".bias") if bias else None
+                return torch_functional.linear(tensor, weight, bias_value)
+
+            expert_output = linear(
+                "down_proj",
+                activate(linear("gate_proj", x)) * linear("up_proj", x),
+            )
+            weight = (route_weights * (route_ids == expert).to(route_weights.dtype)).sum(
+                dim=-1, keepdim=True
+            )
+            expected += expert_output * weight
+        np.testing.assert_allclose(actual, expected.numpy(), rtol=2e-5, atol=2e-6)
+
+    def test_grouped_dispatch_selected_compute_does_not_unroll_by_expert(self):
+        counts = []
+        for experts in (2, 16):
+            config = make_config(
+                num_local_experts=experts,
+                num_experts_per_tok=2,
+                mlp_bias=True,
+            )
+            layer = GroupedMoELayer(MoELayer(config))
+            builder, op, graph = create_test_builder()
+            hidden = create_test_input(builder, "hidden", [1, 8, 64])
+            builder._adapt_outputs([layer(op, hidden)], "")
+            counts.append(
+                (
+                    graph.num_nodes(),
+                    sum(n.op_type == "GroupedMatMul" for n in graph),
+                    sum(n.op_type == "MatMul" for n in graph),
+                    sum(n.op_type in {"Gelu", "Swish", "Relu"} for n in graph),
+                )
+            )
+        # Pre-binding bank assembly remains O(E); the packed binder separately
+        # collapses source-bank Gather/Unsqueeze/Concat identities.
+        assert counts[1][0] > counts[0][0]
+        assert counts[0][1:] == counts[1][1:] == (3, 1, 1)
 
     def test_int4_olive_moe_emits_expert_major_qmoe(self):
         """Olive (blk32 int4) MoE emits a fused QMoE node, not per-expert MLPs."""

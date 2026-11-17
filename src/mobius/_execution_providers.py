@@ -53,11 +53,19 @@ class EpCapabilities:
     Attributes:
         name: Canonical EP name (e.g. ``"cuda"``).
         gqa_dtypes: dtypes for which GroupQueryAttention fusion is supported.
-        qkv_pack_dtypes: dtypes for which QKV weight packing for
-            GroupQueryAttention is supported (PackQKV fusion).  Set to an
-            empty frozenset for EPs that do not support packed QKV inputs
-            (e.g. DML, which always unpacks via UnpackQKV in the lowering
-            stage).
+        qkv_pack_dtypes: Dtypes enabling the existing decoder-only GQA-input
+            packing stage (PackQKV). Does not enable the separate projection-only
+            float or INT4 stages. Set to an empty frozenset for EPs that do not
+            support packed QKV inputs (e.g. DML, which always unpacks via
+            UnpackQKV in the lowering stage).
+        matmul_nbits_qkv_pack_dtypes: Activation dtypes for projection-only INT4
+            packing, which preserves separate normalization/attention branches.
+            Experimental: empty on every built-in EP, including CUDA. Explicit
+            opt-in does not waive the unresolved large-model numerical gate.
+        qkv_projection_pack_dtypes: Dtypes for projection-only float packing
+            (PackQKVProjections) for decoder and masked-decoder roles, independent
+            of qkv_pack_dtypes and matmul_nbits_qkv_pack_dtypes. Experimental:
+            empty on every built-in EP until numerical execution is qualified.
         supports_fused_rope: ``False`` triggers SeparateRoPE + UnpackQKV
             lowering (DML).
         supports_skip_layer_norm: ``False`` expands SkipLayerNormalization /
@@ -104,6 +112,10 @@ class EpCapabilities:
             ``MatMul`` (QDQ) pair via MatMulNBitsToQDQ.  ``True`` leaves the
             contrib op unchanged.  Set ``False`` only for runtimes that lack a
             ``MatMulNBits`` kernel but can consume QDQ weights (QNN HTP).
+        requires_power_of_two_matmul_nbits_blocks: Reject native ``MatMulNBits``
+            blocks that are not powers of two >= 16 during optimization.
+            Enabled for CPU; target-neutral ``default`` exports leave native
+            layout compatibility to the selected runtime.
         default_int4_accuracy_level: Default accuracy level for INT4
             quantization (0 = highest accuracy, 4 = fastest).
         provider_options: Default ORT GenAI provider options dict for this EP.
@@ -171,6 +183,14 @@ class EpCapabilities:
     max_buffer_size: int | None = None
     layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
+    requires_power_of_two_matmul_nbits_blocks: bool = False
+    # Append new capabilities to preserve all existing positional arguments.
+    matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
+        default_factory=frozenset
+    )
+    qkv_projection_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
+        default_factory=frozenset
+    )
 
     def __post_init__(self) -> None:
         if not self.supports_fused_rope and self.qkv_pack_dtypes:
@@ -309,6 +329,7 @@ def _register_builtins() -> None:
             qkv_pack_dtypes=frozenset({ir.DataType.FLOAT}),
             default_int4_accuracy_level=4,
             supports_past_present_share_buffer=True,
+            requires_power_of_two_matmul_nbits_blocks=True,
         ),
         EpCapabilities(
             name="cuda",
@@ -380,6 +401,7 @@ def _register_builtins() -> None:
         # soc_model and the EP-context binary path are set per-device at build time.
         EpCapabilities(
             name="qnn",
+            supports_fused_moe=False,  # no ORT contrib MoE/QMoE kernels
             gqa_dtypes=frozenset(),  # no GroupQueryAttention (no QNN GQA builder)
             qkv_pack_dtypes=frozenset(),  # no PackQKV
             supports_fused_rope=False,  # SeparateRoPE + UnpackQKV

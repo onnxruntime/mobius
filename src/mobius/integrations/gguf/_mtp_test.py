@@ -423,19 +423,14 @@ class TestBuildMtpHead:
         ]
         assert not missing, f"initializers missing weights: {missing}"
 
-    def test_quantized_head_preserves_all_projection_weights(self, tmp_path: Path):
+    def test_quantized_head_rejects_nonpacked_fallback(self, tmp_path: Path):
         from mobius.integrations.gguf import build_from_gguf
 
         path = tmp_path / "tiny_qwen35_quantized_mtp.gguf"
         _write_qwen35_mtp_gguf(path, quantized=True)
 
-        pkg = build_from_gguf(str(path), keep_quantized=True)
-        head = pkg.mtp_head["model"]
-        op_types = [node.op_type for node in head.graph]
-
-        assert op_types.count("MatMulNBits") == 8
-        assert "fc.weight" in head.graph.initializers
-        assert "fc.scales" in head.graph.initializers
+        with pytest.raises(ValueError, match=r"non-MatMul|MOBIUS_EXPERIMENTAL_OPSET29"):
+            build_from_gguf(str(path), keep_quantized=True)
 
     def test_multiple_mtp_heads_reject_before_any_package_is_built(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -475,7 +470,7 @@ class TestBuildMtpHead:
         tied_output: bool,
         quantized: bool,
     ) -> None:
-        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
+        from mobius.integrations.gguf import build_from_gguf
         from mobius.integrations.gguf._reader import GGUFModel
 
         path = tmp_path / "mtp-tables.gguf"
@@ -488,22 +483,11 @@ class TestBuildMtpHead:
             tied_output=tied_output,
         )
         preserve_quantization = quantized
-        package = build_from_gguf(path, keep_quantized=preserve_quantization)
         if quantized:
-            records = {
-                record.name: record
-                for record in package.gguf_quantization_report.tensor_records
-            }
-            if dedicated_embedding:
-                assert (
-                    records["blk.1.nextn.embed_tokens.weight"].disposition
-                    is QuantizationDisposition.DEQUANTIZED_FLOAT
-                )
-            if dedicated_head:
-                assert (
-                    records["blk.1.nextn.shared_head_head.weight"].disposition
-                    is QuantizationDisposition.DEQUANTIZED_FLOAT
-                )
+            with pytest.raises(ValueError, match=r"non-MatMul|MOBIUS_EXPERIMENTAL_OPSET29"):
+                build_from_gguf(path, keep_quantized=True)
+            return
+        package = build_from_gguf(path, keep_quantized=False)
         head = package.mtp_head
         assert head is not None
         target_initializers = package["model"].graph.initializers
@@ -557,7 +541,7 @@ class TestBuildMtpHead:
             is None
         )
 
-    def test_tied_quantized_target_head_uses_embedding_initializers(self, tmp_path):
+    def test_explicit_float_tied_target_head_uses_embedding_initializers(self, tmp_path):
         from mobius.integrations.gguf import build_from_gguf
 
         path = tmp_path / "tied-quantized-tables.gguf"
@@ -567,17 +551,11 @@ class TestBuildMtpHead:
             tied_output=True,
             quantized_backbone_embedding=True,
         )
-        package = build_from_gguf(path, keep_quantized=True)
+        package = build_from_gguf(path, keep_quantized=False)
         assert package.config.tie_word_embeddings
-        assert package.config.quantization is not None
-        assert package.config.quantization.quantize_embeddings
-        assert package.config.quantization.quantize_lm_head
+        assert package.config.quantization is None
         initializers = package["model"].graph.initializers
-        assert {
-            "model.embed_tokens.qweight",
-            "model.embed_tokens.scales",
-            "model.embed_tokens.zero_points",
-        }.issubset(initializers)
+        assert "model.embed_tokens.weight" in initializers
         assert not any(name.startswith("lm_head.") for name in initializers)
 
     def test_target_and_sidecar_save_with_weight_checks_and_reload(
@@ -706,8 +684,8 @@ class TestBuildMtpHead:
             dedicated_head=True,
             asymmetric_dedicated_head=True,
         )
-        shared = build_from_gguf(shared_path, keep_quantized=True).mtp_head
-        dedicated_package = build_from_gguf(dedicated_path, keep_quantized=True)
+        shared = build_from_gguf(shared_path, keep_quantized=False).mtp_head
+        dedicated_package = build_from_gguf(dedicated_path, keep_quantized=False)
         dedicated = dedicated_package.mtp_head
         assert dedicated_package.gguf_quantization_report.source_fidelity is False
         assert any(

@@ -616,6 +616,7 @@ def build_mtp_head_from_gguf(
     preserve_quantization: bool,
     execution_provider: str = "default",
     on_preflight: Callable[[GGUFQuantizationReport], None] | None = None,
+    lossless_packed: bool = False,
 ) -> ModelPackage | None:
     """Build the Qwen3.5/3.8 MTP head sidecar :class:`ModelPackage` from GGUF.
 
@@ -668,6 +669,12 @@ def build_mtp_head_from_gguf(
         )
         mtp_config.use_expert_bias = f"blk.{mtp_block_index}.exp_probs_b" in tensor_names
     module = HyV3MtpModel(mtp_config) if is_hy_v3 else Qwen35MtpModel(mtp_config)
+    if lossless_packed:
+        from mobius.integrations.gguf._builder import _replace_grouped_moe_layers
+        from mobius.integrations.gguf._packed import use_original_gguf_norms
+
+        _replace_grouped_moe_layers(module)
+        effective_norms = use_original_gguf_norms(module, gguf_arch)
 
     def _mapper(gguf_name: str, _arch: str) -> str | None:
         if not use_dedicated_norm and gguf_name == "output_norm.weight":
@@ -705,6 +712,27 @@ def build_mtp_head_from_gguf(
         execution_provider=execution_provider,
     )
     pkg.gguf_quantization_report = quantization_report
+    if lossless_packed:
+        from mobius.integrations.gguf._packed import bind_packed_weights
+
+        def preprocess_original(state):
+            state = process_tensors(state, mtp_config)
+            state = _normalize_gguf_weights(
+                state, gguf_arch, mtp_config, effective_norms=effective_norms
+            )
+            if is_hy_v3:
+                state = module.preprocess_weights(state)
+            return state
+
+        bind_packed_weights(
+            pkg,
+            gguf_model,
+            module,
+            mtp_config,
+            name_mapper=_mapper,
+            preprocess=preprocess_original,
+        )
+        return pkg
 
     if preserve_quantization:
         state_dict = _load_quantized_state_dict(

@@ -108,6 +108,8 @@ class VisionConfig:
     window_kernel_size: tuple[int, int] = (2, 2)
     merge_kernel_size: tuple[int, int] = (2, 2)
     merger_times: int = 1
+    # Gemma4 post-pooling checkpoint affine transform, computed in FP32.
+    standardize: bool = False
 
 
 @dataclasses.dataclass
