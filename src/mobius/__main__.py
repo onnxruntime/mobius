@@ -465,13 +465,17 @@ def _cmd_build(args: argparse.Namespace) -> None:
                     "Error: PersonaPlex does not support --features static-cache."
                 )
             # Detect model type to resolve the correct static cache task.
-            import transformers
+            from mobius.integrations.transformers._builder import _load_transformers_config
 
-            hf_config = transformers.AutoConfig.from_pretrained(
+            hf_config, _ = _load_transformers_config(
                 model_id_or_path,
-                trust_remote_code=trust_remote_code,
                 revision=revision,
+                trust_remote_code=trust_remote_code,
             )
+            if hf_config is None:
+                raise ValueError(
+                    f"Could not load a Transformers config from {model_id_or_path!r}."
+                )
             task = _resolve_static_cache_task(getattr(hf_config, "model_type", ""))
 
         pkg = build(
