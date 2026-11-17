@@ -9,10 +9,28 @@ import contextlib
 import logging
 from pathlib import Path
 
+import ml_dtypes
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _tensor_to_numpy(value: torch.Tensor) -> np.ndarray:
+    """Preserve tensor storage dtype, including BF16, at the NumPy boundary."""
+    value = value.detach().cpu().contiguous()
+    if value.dtype == torch.bfloat16:
+        return value.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+    return value.numpy()
+
+
+def _numpy_to_tensor(value: np.ndarray) -> torch.Tensor:
+    """Invert the BF16 bridge without numerically converting the stored bits."""
+    # np.ascontiguousarray promotes scalars to rank one; reshape preserves rank.
+    contiguous = np.ascontiguousarray(value).reshape(value.shape)
+    if value.dtype == np.dtype(ml_dtypes.bfloat16):
+        return torch.from_numpy(contiguous.view(np.uint16)).view(torch.bfloat16)
+    return torch.from_numpy(contiguous)
 
 
 @contextlib.contextmanager
@@ -376,17 +394,15 @@ def torch_forward(
         attention_mask: [batch, total_seq_len] int64 numpy array.
         position_ids: [batch, seq_len] int64 numpy array.
         past_key_values: Optional list of (key, value) numpy array tuples, or
-            an opaque HuggingFace Cache for hybrid recurrent models.
+            an opaque model-specific cache for hybrid recurrent models.
 
     Returns:
         Tuple of logits and either a list of KV numpy tuples or an opaque
-        HuggingFace Cache when model-specific recurrent state must be retained.
+        model-specific cache when recurrent state must be retained.
     """
     import inspect
 
     device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
-
     ids_t = torch.from_numpy(input_ids).to(device)
     mask_t = torch.from_numpy(attention_mask).to(device)
     pos_t = torch.from_numpy(position_ids).to(device)
@@ -403,21 +419,21 @@ def torch_forward(
         kwargs["position_ids"] = pos_t
 
     if past_key_values is not None:
-        from transformers.cache_utils import Cache, DynamicCache
+        if isinstance(past_key_values, (tuple, list)):
+            from transformers.cache_utils import DynamicCache
 
-        if isinstance(past_key_values, Cache):
-            # Hybrid caches carry model-specific recurrent state (for example
-            # LFM2 conv windows) that cannot be reconstructed from KV pairs.
-            kwargs["past_key_values"] = past_key_values
-        else:
-            cache = DynamicCache()
+            input_cache = DynamicCache()
             for layer_idx, (k, v) in enumerate(past_key_values):
-                cache.update(
-                    torch.from_numpy(k).to(device=device, dtype=dtype),
-                    torch.from_numpy(v).to(device=device, dtype=dtype),
+                input_cache.update(
+                    _numpy_to_tensor(k).to(device=device),
+                    _numpy_to_tensor(v).to(device=device),
                     layer_idx,
                 )
-            kwargs["past_key_values"] = cache
+            kwargs["past_key_values"] = input_cache
+        else:
+            # Model-specific caches can be iterable without being legacy KV
+            # tuples. Retain opaque recurrent state rather than enumerating it.
+            kwargs["past_key_values"] = past_key_values
 
     try:
         outputs = model(**kwargs)
@@ -431,24 +447,29 @@ def torch_forward(
             raise
         kwargs["use_cache"] = False
         outputs = model(**kwargs)
-    logits = outputs.logits.cpu().numpy()
+    logits = _tensor_to_numpy(outputs.logits)
 
     # Extract KV cache if available (Mamba models don't have it)
     present_kv: list[tuple[np.ndarray, np.ndarray]] = []
-    cache = getattr(outputs, "past_key_values", None)
+    output_cache = getattr(outputs, "past_key_values", None)
     layer_types = getattr(model.config, "layer_types", None) or []
-    if "conv" in layer_types:
-        return logits, cache
+    if any(
+        kind in ("conv", "mamba", "mamba2", "linear_attention", "lightning_attention")
+        for kind in layer_types
+    ):
+        return logits, output_cache
 
-    if cache is not None and hasattr(cache, "layers"):
-        for layer_idx in range(len(cache.layers)):
-            layer_cache = cache.layers[layer_idx]
-            # Mamba layers use LinearAttentionLayer without keys/values
-            if not hasattr(layer_cache, "keys"):
-                continue
-            k = layer_cache.keys.cpu().numpy()
-            v = layer_cache.values.cpu().numpy()
-            present_kv.append((k, v))
+    if output_cache is not None and hasattr(output_cache, "layers"):
+        for layer_cache in output_cache.layers:
+            keys = getattr(layer_cache, "keys", None)
+            values = getattr(layer_cache, "values", None)
+            if not isinstance(keys, torch.Tensor) or not isinstance(values, torch.Tensor):
+                return logits, output_cache
+            present_kv.append((_tensor_to_numpy(keys), _tensor_to_numpy(values)))
+    elif isinstance(output_cache, (tuple, list)):
+        present_kv = [(_tensor_to_numpy(k), _tensor_to_numpy(v)) for k, v in output_cache]
+    elif output_cache is not None:
+        return logits, output_cache
 
     return logits, present_kv
 
@@ -481,7 +502,7 @@ def torch_multimodal_forward(
     ids_t = torch.from_numpy(input_ids).to(device)
     mask_t = torch.from_numpy(attention_mask).to(device)
     pos_t = torch.from_numpy(position_ids).to(device)
-    pv_t = torch.from_numpy(pixel_values).to(device=device, dtype=dtype)
+    pv_t = _numpy_to_tensor(pixel_values).to(device=device, dtype=dtype)
 
     kwargs: dict = {
         "input_ids": ids_t,
@@ -497,20 +518,20 @@ def torch_multimodal_forward(
         cache = DynamicCache()
         for layer_idx, (k, v) in enumerate(past_key_values):
             cache.update(
-                torch.from_numpy(k).to(device=device, dtype=dtype),
-                torch.from_numpy(v).to(device=device, dtype=dtype),
+                _numpy_to_tensor(k).to(device=device),
+                _numpy_to_tensor(v).to(device=device),
                 layer_idx,
             )
         kwargs["past_key_values"] = cache
 
     outputs = model(**kwargs)
-    logits = outputs.logits.cpu().numpy()
+    logits = _tensor_to_numpy(outputs.logits)
 
     present_kv = []
     cache = outputs.past_key_values
     for layer_idx in range(len(cache.layers)):
-        k = cache.layers[layer_idx].keys.cpu().numpy()
-        v = cache.layers[layer_idx].values.cpu().numpy()
+        k = _tensor_to_numpy(cache.layers[layer_idx].keys)
+        v = _tensor_to_numpy(cache.layers[layer_idx].values)
         present_kv.append((k, v))
 
     return logits, present_kv
@@ -570,7 +591,7 @@ def torch_encoder_forward(
     if token_type_ids is not None:
         kwargs["token_type_ids"] = torch.from_numpy(token_type_ids).to(device)
     outputs = model(**kwargs)
-    return outputs.last_hidden_state.cpu().numpy()
+    return _tensor_to_numpy(outputs.last_hidden_state)
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +641,7 @@ def torch_seq2seq_encoder_forward(
     ids_t = torch.from_numpy(input_ids).to(device)
     mask_t = torch.from_numpy(attention_mask).to(device)
     encoder_out = model.get_encoder()(input_ids=ids_t, attention_mask=mask_t)
-    return encoder_out.last_hidden_state.cpu().numpy()
+    return _tensor_to_numpy(encoder_out.last_hidden_state)
 
 
 @torch.no_grad()
@@ -642,7 +663,7 @@ def torch_seq2seq_decoder_forward(
     kwargs: dict = {
         "decoder_input_ids": torch.from_numpy(decoder_input_ids).to(device),
         "encoder_outputs": (
-            torch.from_numpy(encoder_hidden_states).to(device=device, dtype=dtype),
+            _numpy_to_tensor(encoder_hidden_states).to(device=device, dtype=dtype),
         ),
         "use_cache": True,
     }
@@ -652,7 +673,7 @@ def torch_seq2seq_decoder_forward(
         kwargs["past_key_values"] = past_key_values
 
     outputs = model(**kwargs)
-    logits = outputs.logits.cpu().numpy()
+    logits = _tensor_to_numpy(outputs.logits)
     return logits, outputs.past_key_values
 
 
@@ -733,19 +754,19 @@ def torch_vision_forward(
     """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
-    pv = torch.from_numpy(pixel_values).to(device=device, dtype=dtype)
+    pv = _numpy_to_tensor(pixel_values).to(device=device, dtype=dtype)
     outputs = model(pixel_values=pv)
     # Prefer last_hidden_state; fall back to logits or first tensor output.
     if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
-        return outputs.last_hidden_state.cpu().numpy()
+        return _tensor_to_numpy(outputs.last_hidden_state)
     if hasattr(outputs, "logits") and outputs.logits is not None:
-        return outputs.logits.cpu().numpy()
+        return _tensor_to_numpy(outputs.logits)
     # Some models (DepthAnything) return predicted_depth or similar.
     if hasattr(outputs, "predicted_depth") and outputs.predicted_depth is not None:
-        return outputs.predicted_depth.cpu().numpy()
+        return _tensor_to_numpy(outputs.predicted_depth)
     # Generic fallback: accept dict-like ModelOutput, tuple, or list returns.
     if hasattr(outputs, "cpu"):
-        return outputs.cpu().numpy()
+        return _tensor_to_numpy(outputs)
     values = None
     if hasattr(outputs, "values"):
         values = outputs.values()
@@ -754,7 +775,7 @@ def torch_vision_forward(
     if values is not None:
         for v in values:
             if hasattr(v, "cpu"):
-                return v.cpu().numpy()
+                return _tensor_to_numpy(v)
     raise ValueError(f"No usable tensor in model outputs: {type(outputs)}")
 
 
@@ -813,9 +834,9 @@ def torch_audio_forward(
     """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
-    iv = torch.from_numpy(input_values).to(device=device, dtype=dtype)
+    iv = _numpy_to_tensor(input_values).to(device=device, dtype=dtype)
     outputs = model(input_values=iv)
-    return outputs.last_hidden_state.cpu().numpy()
+    return _tensor_to_numpy(outputs.last_hidden_state)
 
 
 # ---------------------------------------------------------------------------
@@ -864,9 +885,9 @@ def torch_whisper_encoder_forward(
     """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
-    feats = torch.from_numpy(input_features).to(device=device, dtype=dtype)
+    feats = _numpy_to_tensor(input_features).to(device=device, dtype=dtype)
     encoder_out = model.model.encoder(feats)
-    return encoder_out.last_hidden_state.cpu().numpy()
+    return _tensor_to_numpy(encoder_out.last_hidden_state)
 
 
 @torch.no_grad()
@@ -893,7 +914,7 @@ def torch_whisper_decoder_forward(
     dtype = next(model.parameters()).dtype
 
     ids_t = torch.from_numpy(decoder_input_ids).to(device)
-    enc_t = torch.from_numpy(encoder_hidden_states).to(device=device, dtype=dtype)
+    enc_t = _numpy_to_tensor(encoder_hidden_states).to(device=device, dtype=dtype)
 
     kwargs: dict = {
         "input_ids": ids_t,
@@ -910,8 +931,8 @@ def torch_whisper_decoder_forward(
         self_cache = DynamicCache()
         for layer_idx, (k, v) in enumerate(past_key_values):
             self_cache.update(
-                torch.from_numpy(k).to(device=device, dtype=dtype),
-                torch.from_numpy(v).to(device=device, dtype=dtype),
+                _numpy_to_tensor(k).to(device=device),
+                _numpy_to_tensor(v).to(device=device),
                 layer_idx,
             )
         # Whisper decoder expects EncoderDecoderCache wrapping self + cross caches
@@ -922,7 +943,7 @@ def torch_whisper_decoder_forward(
     hidden_states = outputs.last_hidden_state
 
     # Project to vocab
-    logits = model.proj_out(hidden_states).cpu().numpy()
+    logits = _tensor_to_numpy(model.proj_out(hidden_states))
 
     # Extract self-attention KV cache (Whisper decoder uses EncoderDecoderCache)
     present_kv = []
@@ -930,8 +951,8 @@ def torch_whisper_decoder_forward(
     # EncoderDecoderCache wraps self_attention_cache + cross_attention_cache
     self_cache = getattr(cache, "self_attention_cache", cache)
     for layer_idx in range(len(self_cache.layers)):
-        k = self_cache.layers[layer_idx].keys.cpu().numpy()
-        v = self_cache.layers[layer_idx].values.cpu().numpy()
+        k = _tensor_to_numpy(self_cache.layers[layer_idx].keys)
+        v = _tensor_to_numpy(self_cache.layers[layer_idx].values)
         present_kv.append((k, v))
 
     return logits, present_kv

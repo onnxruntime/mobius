@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Qwen3.8-27B standard-only multimodal qualification
+
+#### Added
+
+- Corrected-RGB native ORT GenAI CUDA first-200 AI2D execution completes at
+  174/200, versus frozen HF 175/200 and raw ORT 174/200 references. Native
+  smart-resize tie rounding differs from HF for 28 examples; task accuracy
+  and token agreement do not establish preprocessing or logit parity.
+- Offline tiny standard VLM CLI tests cover ordinary and existing
+  `--runtime ort-genai` packaging, sparse global cache indices, and FP16
+  convolution/FP32 recurrent state. A separate opt-in native hybrid probe
+  checks state-dependent tokens and fresh-generator reset; a metadata-only
+  qualification example selects CUDA through `og.Config`, without a new
+  Mobius CLI flag or rebuilding existing ONNX weights.
+- Dense Qwen3.5-family composites, including Qwen3.8-27B, support text-only
+  export through the public Transformers builder. Offline tests cover the
+  pinned full-size text and complete VLM graphs, plus reduced random-weight
+  CUDA FP32/FP16 text/image/video/mixed-media prefill/decode parity, not the
+  official 27B checkpoint weights.
+
+#### Fixed
+
+- Native Qwen image processor metadata no longer swaps red/blue after RGB
+  decode. Ordinary normalization preserves checkpoint mean/std, while
+  `PatchImage` retains patch packing. Static contracts and an opt-in toy native
+  before-prefill RGB regression cover the correction; existing metadata must
+  be regenerated. Real-image resize and numerical parity remain unqualified.
+- ORT-GenAI processor generation uses local `--config` HF assets instead of
+  silently retaining CLIP defaults. Unwrapped `qwen3_5_text` VLM packages
+  retain Qwen patch preprocessing and vision metadata.
+- Explicit `mamba_ssm_dtype` is retained in DeltaNet computation and exported
+  recurrent-state inputs/outputs. Re-exported FP16/BF16 hybrid models whose
+  config requests FP32 state now expose FP32 recurrent slots; callers must
+  allocate state from graph input/output types, not the model weight dtype.
+  Existing saved models are unchanged. Missing or `auto` policies preserve
+  the previous model-dtype state behavior.
+- Shared Qwen3.5 dense/MoE/VL DeltaNet layers use the HF reference's fixed
+  `1e-6` Q/K L2 normalization epsilon. Native GenAI and other variants'
+  official-checkpoint qualification remain separate.
+- Shared Qwen3/Qwen3.5 split vision graphs cast processor FLOAT32 pixels to
+  model dtype before reduced-precision convolution.
+- Shared Qwen3/Qwen3.5 split embedding graphs recognize both image and video
+  placeholders and use feature offsets across the entire batch. Their
+  existing `image_features` input carries visual rows in flattened
+  batch/token placeholder order; no new graph input is required.
+- Learned offset RMS normalization keeps normalization and `1 + weight`
+  scaling in FP32 until the final model-dtype cast, avoiding premature
+  rounding of small trained offsets.
+
+#### Qualification status
+
+- Installed GenAI `0.16.0-dev` passed native sparse hybrid state progression
+  and fresh-generator reset with FP16 convolution/FP32 recurrent state and
+  non-shared caches. The unchanged real standard graphs then passed bounded
+  native text/reset and single-/two-image four-token generation. The CUDA
+  qualification overlay sets matching providers on all three sessions before
+  the required `og.Config` execution override: explicit CPU auxiliary sessions
+  did not follow that override and segfaulted during prefill. This is bounded
+  execution evidence, not numerical parity or full-checkpoint accuracy.
+- The complete real-weight FP16 vision/embedding/hybrid-decoder package was
+  exported, saved and reloaded with standard ONNX operators only. Official
+  image vision and text prefill comparisons still exceed the unchanged
+  FP16 tolerance; this is not a full-checkpoint accuracy or numerical-parity pass.
+
 ### GPT-OSS MXFP4 export
 
 #### Added

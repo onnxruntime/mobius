@@ -81,6 +81,7 @@ def test_new_cohort_fields_preserve_existing_route_fingerprint_bytes(
         *_SPECIALIZED_ENCODER_FINGERPRINT_FIELDS,
         "attention_clamp",
         "component_quantization",
+        "mamba_ssm_dtype",
         "moe_layer_frequency",
         "qmoe_source_paths",
         "routing_weight_normalization_floor",

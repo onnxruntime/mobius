@@ -23,6 +23,7 @@ import onnx_ir as ir
 import torch
 import tqdm
 
+from mobius._build_context import validate_matmul_nbits_accuracy_level
 from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
 from mobius._optimizations import fold_initializers_after_weights
@@ -486,6 +487,7 @@ def build_diffusers_pipeline(
     unet_loras: dict | None = None,
     components: set[str] | None = None,
     execution_provider: str = "default",
+    matmul_nbits_accuracy_level: int | None = None,
     workflow_config: HierarchicalAudioWorkflowConfig | None = None,
 ) -> ModelPackage:
     """Build ONNX models for all supported components in a diffusers pipeline.
@@ -510,6 +512,8 @@ def build_diffusers_pipeline(
         components: Optional component-name allowlist. Non-neural pipeline metadata
             is still retained so a single-component export preserves its contract.
         execution_provider: Target execution provider for EP-aware graph optimization.
+        matmul_nbits_accuracy_level: Optional accuracy level (0 through 4) for
+            every emitted ``MatMulNBits``. ``None`` preserves EP defaults.
         workflow_config: Optional typed, model-agnostic workflow description for
             pipelines whose ONNX GenAI execution cannot be derived from the graphs
             alone (currently hierarchical audio). When omitted, mobius supplies the
@@ -526,6 +530,7 @@ def build_diffusers_pipeline(
     Raises:
         ValueError: If the model does not have a ``model_index.json``.
     """
+    validate_matmul_nbits_accuracy_level(matmul_nbits_accuracy_level)
     _init_diffusers_class_map()
 
     pipeline_index = _load_diffusers_pipeline_index(model_id, revision=revision)
@@ -606,6 +611,7 @@ def build_diffusers_pipeline(
             config,
             task_name,
             execution_provider=execution_provider,
+            matmul_nbits_accuracy_level=matmul_nbits_accuracy_level,
         )
 
         # Flatten sub-package into the top-level package

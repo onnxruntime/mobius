@@ -325,7 +325,7 @@ def _make_hybrid_cache_inputs(
             )
             rec_state = builder.input(
                 f"{prefix}.{i}.recurrent_state",
-                dtype=dtype,
+                dtype=getattr(config, "mamba_ssm_dtype", None) or dtype,
                 shape=[batch, dims.num_v_heads, dims.head_k_dim, dims.head_v_dim],
             )
             pairs.append((conv_state, rec_state))
@@ -470,17 +470,19 @@ def _register_linear_attention_functions(
     if has_deltanet:
         dims = linear_attention_dims(config)
         conv_func = causal_conv_nd_with_state(
+            opset_version=model.graph.opset_imports[""],
             kernel_size=dims.conv_kernel,
             channels=dims.conv_dim,
             ndim=1,
             activation="silu",
         )
         attn_func = linear_attention(
+            opset_version=model.graph.opset_imports[""],
             q_num_heads=dims.num_k_heads,
             kv_num_heads=dims.num_v_heads,
             update_rule="gated_delta",
             scale=1.0 / (dims.head_k_dim**0.5),
-            stash_type=getattr(config, "mamba_ssm_dtype", config.dtype),
+            stash_type=getattr(config, "mamba_ssm_dtype", None) or config.dtype,
         )
         model.functions[conv_func.identifier()] = conv_func
         model.functions[attn_func.identifier()] = attn_func
@@ -488,6 +490,7 @@ def _register_linear_attention_functions(
     if has_lightning:
         head_dim = config.head_dim
         attn_func_gated = linear_attention(
+            opset_version=model.graph.opset_imports[""],
             q_num_heads=config.num_attention_heads,
             kv_num_heads=config.num_attention_heads,
             update_rule="gated",
@@ -499,12 +502,14 @@ def _register_linear_attention_functions(
     if has_mamba:
         d_inner = config.hidden_size * getattr(config, "mamba_expand", 2)
         conv_func = causal_conv_nd_with_state(
+            opset_version=model.graph.opset_imports[""],
             kernel_size=getattr(config, "mamba_d_conv", 4),
             channels=d_inner,
             ndim=1,
             activation="silu",
         )
         attn_func = linear_attention(
+            opset_version=model.graph.opset_imports[""],
             q_num_heads=d_inner,
             kv_num_heads=d_inner,
             update_rule="gated",
@@ -528,12 +533,14 @@ def _register_linear_attention_functions(
         )
         mamba2_conv_dim = mamba2_d_inner + 2 * mamba2_n_groups * mamba2_d_state
         conv_func = causal_conv_nd_with_state(
+            opset_version=model.graph.opset_imports[""],
             kernel_size=mamba2_d_conv,
             channels=mamba2_conv_dim,
             ndim=1,
             activation="silu",
         )
         attn_func = linear_attention(
+            opset_version=model.graph.opset_imports[""],
             q_num_heads=mamba2_n_heads,
             kv_num_heads=mamba2_n_heads,
             update_rule="gated",
@@ -545,6 +552,7 @@ def _register_linear_attention_functions(
 
     if has_short_conv:
         conv_func = causal_conv_nd_with_state(
+            opset_version=model.graph.opset_imports[""],
             kernel_size=getattr(config, "short_conv_kernel", 3),
             channels=config.hidden_size,
             ndim=1,
@@ -581,12 +589,14 @@ def _register_linear_attention_functions_for_ssm2(
     conv_dim = d_inner + 2 * n_groups * d_state
 
     conv_func = causal_conv_nd_with_state(
+        opset_version=model.graph.opset_imports[""],
         kernel_size=d_conv,
         channels=conv_dim,
         ndim=1,
         activation="silu",
     )
     attn_func = linear_attention(
+        opset_version=model.graph.opset_imports[""],
         q_num_heads=n_heads,
         kv_num_heads=n_heads,
         update_rule="gated",

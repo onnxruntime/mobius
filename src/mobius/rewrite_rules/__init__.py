@@ -40,6 +40,8 @@ __all__ = [
     "htp_rank4_rmsnorm_rules",
     "layer_norm_fusion_rules",
     "pack_qkv_for_gqa_rules",
+    "pack_matmul_nbits_qkv_pass",
+    "pack_qkv_projections_pass",
     "packed_attention_rules",
     "separate_rope_rules",
     "skip_layer_norm_rules",
@@ -64,6 +66,10 @@ from mobius.rewrite_rules._layer_norm_fusion import (
     layer_norm_fusion_rules,
 )
 from mobius.rewrite_rules._packed_attention import packed_attention_rules
+from mobius.rewrite_rules._qkv_projection_packing import (
+    pack_matmul_nbits_qkv_pass,
+    pack_qkv_projections_pass,
+)
 from mobius.rewrite_rules._qmoe_fusion import fuse_dense_moe_to_qmoe
 from mobius.rewrite_rules._scatternd import tensor_scatter_to_scatternd_rules
 from mobius.rewrite_rules._separate_rope import separate_rope_rules

@@ -14,6 +14,7 @@ output index 3, not collapse into the optional ``mean`` slot at index 1.
 from __future__ import annotations
 
 import onnx_ir as ir
+import pytest
 from onnx_ir.passes.common import InlinePass
 
 from mobius._builder import build_from_module
@@ -24,6 +25,8 @@ from mobius.functions.skip_layer_normalization import (
     skip_layer_normalization,
     skip_simplified_layer_normalization,
 )
+
+pytestmark = pytest.mark.opset29
 
 
 def _tiny_config() -> ArchitectureConfig:
