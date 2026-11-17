@@ -2,6 +2,8 @@
 # Licensed under the MIT License.
 
 __all__ = [
+    "create_body_graph",
+    "rename_subgraph_values",
     "AdaLayerNormOutput",
     "AdaLayerNormZero",
     "Attention",
@@ -113,6 +115,7 @@ __all__ = [
     "Cosmos3EdgeMultiModalProjector",
     "MobileNetV5Encoder",
     "MoELayer",
+    "GroupedMoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
     "packed_row_tiles",
@@ -191,6 +194,7 @@ from mobius.components._attention import (
     Qwen35Attention as Qwen35Attention,
 )
 from mobius.components._audio import ConformerEncoder
+from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
 from mobius.components._chunked_mamba import ChunkedPrefillMamba2Block, validate_cache_phase
 from mobius.components._chunked_prefill import ChunkedPrefillScan
 from mobius.components._clip_sidecars import (
@@ -324,6 +328,7 @@ from mobius.components._mimo_minimax_vision import (
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 from mobius.components._mobilenetv5 import MobileNetV5Encoder
 from mobius.components._moe import (
+    GroupedMoELayer,
     MoELayer,
     SigmoidTopKGate,
     SoftmaxTopKGate,

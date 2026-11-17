@@ -1789,7 +1789,9 @@ class Qwen4ExpConfig(CausalLMConfig):
             ]
         else:
             self.layer_types = [
-                "qwen_sparse_attention" if layer_type == "full_attention" else layer_type
+                "qwen_sparse_attention"
+                if layer_type in {"full_attention", "indexed_attention"}
+                else layer_type
                 for layer_type in self.layer_types
             ]
         self._validate_architecture()
@@ -2011,7 +2013,9 @@ class Qwen4ExpConfig(CausalLMConfig):
         layer_types = getattr(text, "layer_types", None)
         if layer_types is not None:
             layer_types = [
-                "qwen_sparse_attention" if value == "full_attention" else value
+                "qwen_sparse_attention"
+                if value in {"full_attention", "indexed_attention"}
+                else value
                 for value in layer_types
             ]
         fields.update(

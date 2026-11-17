@@ -47,6 +47,7 @@ def causal_conv_nd_with_state(
     channels: int,
     ndim: int = 1,
     activation: str = "silu",
+    opset_version: int = OPSET_VERSION,
 ) -> ir.Function:
     """Build an ``ir.Function`` for the ``CausalConvWithState`` ONNX operator.
 
@@ -170,7 +171,7 @@ def causal_conv_nd_with_state(
         attributes=[
             ir.Attr("activation", ir.AttributeType.STRING, activation),
         ],
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": opset_version},
     )
 
 
@@ -179,6 +180,7 @@ def causal_conv1d_with_state(
     kernel_size: int,
     channels: int,
     activation: str = "silu",
+    opset_version: int = OPSET_VERSION,
 ) -> ir.Function:
     """Build an ``ir.Function`` for 1-D ``CausalConvWithState``.
 
@@ -191,4 +193,5 @@ def causal_conv1d_with_state(
         channels=channels,
         ndim=1,
         activation=activation,
+        opset_version=opset_version,
     )

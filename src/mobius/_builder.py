@@ -216,7 +216,7 @@ def _maybe_apply_opset_lowering(package: ModelPackage, execution_provider: str) 
     if execution_provider in ("default", "cpu"):
         return
     for name, model in package.items():
-        if "" not in model.graph.opset_imports:
+        if model.graph.opset_imports.get("") != 24:
             continue
         if _graph_requires_opset24(model.graph):
             logger.info(
