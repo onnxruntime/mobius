@@ -175,6 +175,9 @@ def _try_load_config_json(model_id: str, revision: str | None = None):
         )
         config_dict = {**config_dict, "model_type": model_type}
 
+    if model_type == "nemotron_h_omni" and isinstance(config_dict.get("llm_config"), dict):
+        # Generic Transformers configs also inject incompatible layer proxy properties.
+        return _as_attribute_config(config_dict)
     return _dict_to_pretrained_config(config_dict)
 
 

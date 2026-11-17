@@ -21,17 +21,13 @@ Mixer:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
+import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius.components._common import LayerNorm, Linear
 from mobius.components._conv import Conv2d, Conv2dNoBias
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._vision import VisionLayerNorm
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 
 class Gemma3MultiModalProjector(nn.Module):
@@ -668,3 +664,39 @@ class InputMixer(nn.Module):
         # Mix: where mask, use vision; else use text
         mixed = op.Where(mask_expanded, scattered_vision, text_embeddings)
         return mixed
+
+
+class FlatInputMixer(InputMixer):
+    """Scatter a flat feature stream into batch-major placeholder positions.
+
+    Unlike ``InputMixer``, features have shape ``(total_media_tokens, hidden)``.
+    With media present, the reshape enforces exact placeholder/feature
+    accounting. Without media, every token retains its ordinary embedding,
+    including a placeholder ID emitted during cached decoding.
+    """
+
+    def forward(
+        self,
+        op: OpBuilder,
+        text_embeddings: ir.Value,
+        vision_embeddings: ir.Value,
+        input_ids: ir.Value,
+    ) -> ir.Value:
+        has_features = op.Greater(op.Size(vision_embeddings), 0)
+        mask = op.And(op.Equal(input_ids, self.image_token_id), has_features)
+        flat_mask = op.Reshape(mask, [-1])
+        mask_int = op.Cast(flat_mask, to=ir.DataType.INT64)
+        feature_shape = op.Concat(
+            op.ReduceSum(mask_int, keepdims=1),
+            op.Shape(text_embeddings, start=2, end=3),
+            axis=0,
+        )
+        features = op.Reshape(vision_embeddings, feature_shape, allowzero=1)
+        padding = op.Expand(
+            op.CastLike(0.0, text_embeddings),
+            op.Concat([1], op.Shape(text_embeddings, start=2, end=3), axis=0),
+        )
+        indices = op.Where(flat_mask, op.CumSum(mask_int, 0), 0)
+        gathered = op.Gather(op.Concat(padding, features, axis=0), indices, axis=0)
+        gathered = op.Reshape(gathered, op.Shape(text_embeddings))
+        return op.Where(op.Unsqueeze(mask, [-1]), gathered, text_embeddings)

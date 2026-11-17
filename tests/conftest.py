@@ -7,9 +7,13 @@ from __future__ import annotations
 
 import os
 import random
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
+
+if TYPE_CHECKING:
+    from _pytest.terminal import TerminalReporter
 
 # Disable TF32 for all test runs.  On Ampere+/Hopper GPUs the ORT CUDA EP
 # uses TF32 for fp32 matmuls by default, while the PyTorch reference computes
@@ -71,8 +75,30 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Collection hooks
+# Reporting and collection hooks
 # ---------------------------------------------------------------------------
+class _ImmediateCIFailureReporter:
+    def __init__(self, terminal: TerminalReporter) -> None:
+        self.terminal = terminal
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.failed:
+            self.terminal.write_sep(
+                "=", f"Immediate CI failure: {report.nodeid} ({report.when})", red=True
+            )
+            self.terminal.write_line(report.longreprtext)
+            self.terminal.flush()
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    if os.environ.get("GITHUB_ACTIONS") != "true" or hasattr(session.config, "workerinput"):
+        return
+    terminal = session.config.pluginmanager.getplugin("terminalreporter")
+    # Only the xdist controller prints the reports it receives from workers.
+    if terminal is not None:
+        session.config.pluginmanager.register(_ImmediateCIFailureReporter(terminal))
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config,
     items: list[pytest.Item],

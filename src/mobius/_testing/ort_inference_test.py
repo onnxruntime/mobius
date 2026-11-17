@@ -29,6 +29,32 @@ from mobius._testing.ort_inference import (
 )
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        ir.DataType.BOOL,
+        ir.DataType.BFLOAT16,
+        ir.DataType.FLOAT16,
+        ir.DataType.FLOAT,
+        ir.DataType.INT64,
+    ],
+)
+@pytest.mark.parametrize("shape", [(), (2, 0, 3), (2, 3), (2, 3, 2)])
+def test_ort_value_roundtrip_preserves_scalar_empty_and_strided_shapes(
+    dtype: ir.DataType, shape: tuple[int, ...]
+) -> None:
+    array = np.arange(int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    array = array.astype(dtype.numpy())
+    if array.ndim > 1:
+        array = array.swapaxes(0, 1)
+    value = _numpy_to_ort_value(array)
+    assert value.shape() == list(array.shape)
+    result = _ort_value_to_numpy(value)
+    assert result.shape == array.shape
+    assert result.dtype == array.dtype
+    np.testing.assert_array_equal(result, array)
+
+
 @pytest.mark.parametrize("dtype", ["float32", "float16", "int64", "bool", "bfloat16"])
 def test_numpy_feed_preserves_dtype_shape_and_values(dtype: str) -> None:
     if dtype == "bfloat16":

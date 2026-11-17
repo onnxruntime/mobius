@@ -58,6 +58,7 @@ from mobius.components import (
     get_activation,
     initialize_rope,
 )
+from mobius.components import realize_parameters as _prerealize_parameters
 
 # LayerNorm epsilon used throughout the HuggingFace reference (``nn.LayerNorm``
 # defaults), not exposed as a config field.
@@ -313,33 +314,6 @@ class _ClassificationHead(nn.Module):
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         hidden_states = self.dense(op, op.Relu(hidden_states))
         return self.out_proj(op, op.Relu(hidden_states))
-
-
-def _prerealize_parameters(builder, module: nn.Module, prefix: str) -> None:
-    """Registers every parameter under ``module`` as a root-graph initializer.
-
-    Uses ``named_parameters()``'s pre-computed dotted names directly.
-
-    ``Parameter._realize`` normally qualifies a name via the *root* graph
-    builder's current module-scope stack (``push_module``/``pop_module``)
-    -- but that scope stack belongs to whichever builder happens to call
-    ``_realize`` first, which is wrong when a parameter is first referenced
-    from *inside* a ``Loop``/``If`` subgraph's own separate sub-builder (its
-    scope-stack pushes never touch the *root* builder's stack that
-    ``_realize`` actually reads). Bypassing that mechanism here -- while
-    still at plain root scope, before any subgraph is built -- realizes
-    every descendant parameter up front with the exact same fully-qualified
-    name ``Module.__call__``'s automatic realization would have produced.
-    ``_realize`` is idempotent, so every later (redirect) call becomes a
-    no-op regardless of which builder performs it.
-    """
-    root = builder.root
-    for name, param in module.named_parameters(prefix=prefix):
-        if param._realized:  # pylint: disable=protected-access
-            continue
-        param.name = name
-        root.graph.initializers[name] = param
-        param._realized = True  # pylint: disable=protected-access
 
 
 def _scalar(op: OpBuilder, value: ir.Value) -> ir.Value:

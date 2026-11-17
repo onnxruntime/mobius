@@ -154,11 +154,16 @@ def test_model_has_attention_residual_latent_moe_and_untied_head() -> None:
     assert model.lm_head.weight is not model.model.embed_tokens.weight
 
 
-def test_half_precision_routing_weights_match_expert_output_dtype() -> None:
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_half_precision_routing_weights_match_expert_output_dtype(dtype) -> None:
     config = _config()
-    config.dtype = ir.DataType.FLOAT16
+    config.dtype = dtype
     module = KimiK3CausalLMModel(config)
     _cast_module_dtype(module, config.dtype)
+    scores = [module.model.output_res_score]
+    for layer in module.model.layers:
+        scores.extend((layer.attn_res_score, layer.ffn_res_score))
+    assert all(score.weight.dtype == ir.DataType.FLOAT for score in scores)
     model = KimiK3CausalLMTask().build(module, config)["model"]
     SymbolicShapeInferencePass()(model)
     graph = model.graph
@@ -178,7 +183,7 @@ def test_half_precision_routing_weights_match_expert_output_dtype() -> None:
 
     assert routed_muls
     assert all(
-        {value.dtype for value in node.inputs if value is not None} == {ir.DataType.FLOAT16}
+        {value.dtype for value in node.inputs if value is not None} == {dtype}
         for node in routed_muls
     )
     mixed_muls = [
@@ -188,6 +193,12 @@ def test_half_precision_routing_weights_match_expert_output_dtype() -> None:
         and len({value.dtype for value in node.inputs if value is not None}) > 1
     ]
     assert not mixed_muls
+    assert not [
+        node.name
+        for node in graph
+        if node.op_type == "MatMul"
+        and len({value.dtype for value in node.inputs if value is not None}) > 1
+    ]
 
 
 def test_preprocess_strips_multimodal_prefix_and_aligns_experts() -> None:

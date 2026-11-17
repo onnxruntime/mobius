@@ -57,10 +57,10 @@ def _ort_value_to_numpy(value: ort.OrtValue) -> np.ndarray:
     target_dtype = np.dtype(getattr(ml_dtypes, ml_name))
     bytes_per_elem = target_dtype.itemsize
     tensor = torch.utils.dlpack.from_dlpack(value._ortvalue.to_dlpack())
-    raw = tensor.contiguous().view(torch.uint8).cpu().numpy()
+    raw = tensor.contiguous().reshape(-1).view(torch.uint8).cpu().numpy()
     arr = raw.view(target_dtype)
     shape = tuple(value.shape())
-    if bytes_per_elem * int(np.prod(shape) or 1) != raw.size:
+    if bytes_per_elem * int(np.prod(shape)) != raw.size:
         # 4-bit types pack 2 elements per byte — keep packed view.
         return arr
     return arr.reshape(shape)
@@ -74,7 +74,11 @@ def _numpy_to_ort_value(value: np.ndarray) -> ort.OrtValue:
     element types retain support for non-standard ml_dtypes scalars.
     """
     if isinstance(value, np.ndarray):
-        value = np.require(value, requirements=["C"])
+        value = np.asarray(value, order="C")
+        if value.dtype == np.bool_:
+            # ORT supports tensor(bool) natively but DLPack does not, so
+            # bypass ort_easy's DLPack-first path.
+            return ort.OrtValue.ortvalue_from_numpy(value)
         try:
             import ml_dtypes
         except ImportError:  # pragma: no cover

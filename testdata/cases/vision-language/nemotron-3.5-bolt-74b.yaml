@@ -1,0 +1,20 @@
+model_id: "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"
+model_type: "nemotron_h_omni"
+revision: "c6cc2e8ffa353403213d6b9b18aaf8eb684d705a"
+task_type: "image-to-text"
+dtype: "bfloat16"
+level: "L4+L5"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Describe this image."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+generation:
+  max_new_tokens: 8
+  do_sample: false
+
+ci_skip_reason: "Full native mixed-format CUDA validation requires the IQ2/Q8 runtime and the 24 GB packed checkpoint; full-model L4/L5 goldens are not yet qualified."
+notes: "Pinned C-RADIOv4, image/video projector and heterogeneous Puzzle decoder. No built-in MTP. Export and component checks alone do not establish decoder, generation, vision, or native 24 GB deployment readiness."
