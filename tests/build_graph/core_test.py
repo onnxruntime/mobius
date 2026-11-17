@@ -27,6 +27,7 @@ from build_graph._support import (
     _assert_outputs_have_shapes_and_dtypes,
     _make_params,
     _run_onnx_checker,
+    _with_component_quantization,
     known_untested_model_types,
     specialized_test_model_types,
 )
@@ -331,6 +332,19 @@ class TestBuildSeq2SeqGraph:
 
         dec_outputs = {out.name for out in pkg["decoder"].graph.outputs}
         assert "logits" in dec_outputs
+
+    def test_component_quantization_builds(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        task = get_task(_default_task_for_model(model_type))
+        config = _with_component_quantization(config, task)
+
+        package = build_from_module(
+            registry.get(model_type)(config),
+            config,
+            task=task,
+        )
+
+        assert set(package) == {"encoder", "decoder"}
 
     def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
         """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
@@ -783,8 +797,8 @@ class TestBuildGraphDtype:
         "dtype_str",
         ["f16", "bf16"],
     )
-    def test_gemma4_encoder_inputs_match_model_dtype(self, dtype_str):
-        """Gemma4 vision/audio encoder inputs match the model's compute dtype."""
+    def test_gemma4_encoder_input_dtypes(self, dtype_str):
+        """Vision takes FP32 processor pixels; audio keeps the compute dtype."""
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
 
         config = Gemma4Config(
@@ -832,11 +846,11 @@ class TestBuildGraphDtype:
         task = get_task("gemma4")
         pkg = task.build(module, config)
 
-        # Vision encoder pixel_values must match config.dtype
+        # Normalize processor pixels in FP32 before casting to the projection dtype.
         vision_model = pkg["vision_encoder"]
         pv_input = vision_model.graph.inputs[0]
         assert pv_input.name == "pixel_values"
-        assert pv_input.dtype == config.dtype
+        assert pv_input.dtype == ir.DataType.FLOAT
 
         # Audio encoder input_features must match config.dtype
         audio_model = pkg["audio_encoder"]

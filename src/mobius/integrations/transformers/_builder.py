@@ -13,14 +13,17 @@ from typing import Any
 import onnx_ir as ir
 from onnxscript import nn
 
+from mobius._build_context import validate_matmul_nbits_accuracy_level
 from mobius._builder import build_from_module, resolve_dtype
 from mobius._component_quantization import (
     attach_hf_component_sources,
-    preprocess_component_quantized_state_dict,
+    normalize_component_quantized_weights,
+    validate_quantized_component_bindings,
 )
 from mobius._configs import QuantizedWeightFormat
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
+from mobius._weight_utils import WeightTransform
 from mobius.integrations._weight_loading import (
     _download_weights,
     stream_preprocessed_safetensors_to_model,
@@ -31,6 +34,7 @@ from mobius.integrations.compressed_tensors import (
     stream_compressed_tensors_to_package,
 )
 from mobius.tasks import ModelTask
+from mobius.weights import adapt_model_weights
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +337,7 @@ def build_transformers_model(
     keep_quantized: bool = True,
     trust_remote_code: bool = False,
     execution_provider: str = "default",
+    matmul_nbits_accuracy_level: int | None = None,
     trace_optimization: bool = False,
     text_only: bool = False,
     fp8_kv_cache: bool = False,
@@ -357,7 +362,14 @@ def build_transformers_model(
     ``keep_quantized`` preserves supported compressed-tensors checkpoints in
     their native block-weight representation. Set it to ``False`` only to
     request explicit dense reconstruction.
+
+    ``matmul_nbits_accuracy_level`` optionally overrides the accuracy level of
+    every exported ``MatMulNBits`` (0 through 4), independently of weight bit
+    width. ``None`` preserves existing EP defaults. It does not affect
+    ``GatherBlockQuantized`` or requantize weights. PersonaPlex and RE-USE
+    bespoke builders do not support this option.
     """
+    validate_matmul_nbits_accuracy_level(matmul_nbits_accuracy_level)
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 
@@ -374,6 +386,7 @@ def build_transformers_model(
             "output_layer_indices": output_layer_indices is not None,
             "trace_optimization": trace_optimization,
             "dequantize": not keep_quantized,
+            "matmul_nbits_accuracy_level": matmul_nbits_accuracy_level is not None,
             "text_only": text_only,
             "fp8_kv_cache": fp8_kv_cache,
             "kv_cache_scales": kv_cache_scales is not None,
@@ -402,7 +415,6 @@ def build_transformers_model(
         _config_from_hf,
         _default_task_for_model,
     )
-    from mobius.models.vibevoice import VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS
 
     detection_revision = revision
     vibevoice_sources = None
@@ -437,9 +449,6 @@ def build_transformers_model(
         # processor contract. Keep config detection and weight loading pinned.
         revision = VIBEVOICE_ASR_REVISION
         detection_revision = VIBEVOICE_ASR_REVISION
-    if model_id in VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS and detection_revision is None:
-        revision = VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS[model_id]
-        detection_revision = revision
     if model_id == "nvidia/RE-USE" and detection_revision is None:
         # Pin the very first AutoConfig/raw-JSON probe, not only the later
         # bespoke loader. Otherwise mutable Hub main could change dispatch
@@ -464,6 +473,7 @@ def build_transformers_model(
             ):
                 raise ValueError("RE-USE checkpoints only support task='speech-enhancement'.")
             unsupported = {
+                "matmul_nbits_accuracy_level": matmul_nbits_accuracy_level is not None,
                 "output_layer_indices": output_layer_indices is not None,
                 "text_only": text_only,
                 "fp8_kv_cache": fp8_kv_cache,
@@ -510,6 +520,7 @@ def build_transformers_model(
             dtype=dtype,
             load_weights=load_weights,
             execution_provider=execution_provider,
+            matmul_nbits_accuracy_level=matmul_nbits_accuracy_level,
         )
 
     if input_sampling_rate is not None or bwe_sampling_rate is not None:
@@ -700,6 +711,14 @@ def build_transformers_model(
     if task is None:
         task = _default_task_for_model(model_type)
 
+    from mobius.tasks import get_task
+
+    resolved_task = get_task(task)
+    component_manifest = resolved_task.component_manifest(
+        module_class=module_class,
+        model_type=model_type,
+        hf_config=parent_config,
+    )
     model_module = module_class(config)
     if dequantize_gptoss_mxfp4:
         model_module._dequantize_mxfp4_checkpoint = True
@@ -713,10 +732,12 @@ def build_transformers_model(
         config,
         task,
         execution_provider=execution_provider,
+        matmul_nbits_accuracy_level=matmul_nbits_accuracy_level,
         trace_optimization=trace_optimization,
         fp8_kv_cache=fp8_kv_cache,
         kv_cache_scales=kv_cache_scales,
         prune_prefill_prefix=prune_prefill_prefix,
+        component_manifest=component_manifest,
     )
     graph_source_name = (
         model_type if is_gptoss_mxfp4_source and pathlib.Path(model_id).is_dir() else model_id
@@ -805,6 +826,7 @@ def build_transformers_model(
                 keep_quantized=keep_quantized,
             )
         else:
+            weight_transforms: dict[str, WeightTransform] = {}
             if dequantize_gptoss_mxfp4:
                 logger.warning(
                     "Explicit dense GPT-OSS MXFP4 reconstruction eagerly loads and "
@@ -812,25 +834,42 @@ def build_transformers_model(
                     "memory. The default native MXFP4 streaming path is bounded."
                 )
             state_dict = _download_weights(model_id, revision=revision)
-            if hasattr(model_module, "preprocess_weights"):
-                if vibevoice_sources is not None:
-                    state_dict = model_module.preprocess_weights(
-                        state_dict,
-                        checkpoint_layout=vibevoice_sources.weight_layout,
-                    )
-                else:
-                    state_dict = model_module.preprocess_weights(state_dict)
-            state_dict = preprocess_component_quantized_state_dict(
+            if (
+                vibevoice_sources is not None
+                and vibevoice_sources.weight_layout is not None
+                and hasattr(model_module, "preprocess_weights")
+            ):
+                state_dict = model_module.preprocess_weights(
+                    state_dict,
+                    checkpoint_layout=vibevoice_sources.weight_layout,
+                )
+            else:
+                state_dict = adapt_model_weights(
+                    model_module,
+                    state_dict,
+                    config=config,
+                    manifest=component_manifest,
+                    weight_transforms=weight_transforms,
+                )
+            state_dict = normalize_component_quantized_weights(
                 state_dict,
                 model_module,
                 config,
-                task,
                 package.keys(),
+                manifest=component_manifest,
+                task=resolved_task,
             )
             package.apply_weights(
                 state_dict,
                 prefix_map=getattr(model_module, "weight_prefix_map", None),
+                weight_transforms=weight_transforms,
             )
+        validate_quantized_component_bindings(package, config)
+    if execution_provider == "onnx-standard":
+        from mobius._optimizations import validate_standard_onnx
+
+        for name, model in package.items():
+            validate_standard_onnx(model, component=name)
     return package
 
 

@@ -29,6 +29,7 @@ from mobius.components import (
     Gemma3MultiModalProjector,
     Linear,
     OffsetRMSNorm,
+    ScaledQuantizedEmbedding,
     VisionModel,
 )
 from mobius.models.base import effective_tie_word_embeddings
@@ -128,12 +129,36 @@ class _Gemma3EmbeddingModel(nn.Module):
         super().__init__()
         self.config = config
         embed_scale = float(__import__("numpy").float16(config.hidden_size**0.5))
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            config.pad_token_id,
-            embed_scale=embed_scale,
+        quantization = (
+            config.quantization_for_source_paths(
+                "embedding",
+                ("embed_tokens", *Gemma3MultiModalModel.HF_COMPONENT_SOURCES["embedding"]),
+            )
+            if config.component_quantization is not None
+            else None
         )
+        self.embed_tokens: Gemma3TextScaledWordEmbedding | ScaledQuantizedEmbedding
+        if (
+            quantization is not None
+            and quantization.quant_method != "none"
+            and quantization.quantize_embeddings
+        ):
+            self.embed_tokens = ScaledQuantizedEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                config.pad_token_id,
+                embed_scale=embed_scale,
+                bits=quantization.bits,
+                block_size=quantization.group_size,
+                has_zero_point=not quantization.sym,
+            )
+        else:
+            self.embed_tokens = Gemma3TextScaledWordEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                config.pad_token_id,
+                embed_scale=embed_scale,
+            )
         self.image_token_id = config.image_token_id or 0
 
     def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
@@ -234,8 +259,13 @@ class Gemma3MultiModalModel(nn.Module):
                 state_dict,
                 embed_key="language_model.model.embed_tokens.weight",
                 head_key="language_model.lm_head.weight",
-                embedding_quantization=self.config.quantization_for("embedding"),
-                head_quantization=self.config.quantization_for("decoder"),
+                embedding_quantization=self.config.quantization_for_source_paths(
+                    "embedding",
+                    ("embed_tokens", *self.HF_COMPONENT_SOURCES["embedding"]),
+                ),
+                head_quantization=self.config.quantization_for_source_paths(
+                    "decoder", ("lm_head",)
+                ),
             )
         if tied_embeddings:
             embed_key = "language_model.model.embed_tokens.weight"

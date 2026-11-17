@@ -8,15 +8,25 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable
+from typing import ClassVar
 
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._weight_utils import (
-    supported_qmoe_quantization as _supported_qmoe_quantization,
+    QMoEQuantizationLayout,
+    resolve_qmoe_quantization,
+    supported_qmoe_quantization,
 )
 from mobius.components._mlp import MLP
+
+
+def _supported_qmoe_quantization(
+    quantization: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Preserve the legacy predicate imported by model-specific MoE modules."""
+    return supported_qmoe_quantization(quantization)
 
 
 def _interleave_gate_up_rows(
@@ -437,6 +447,8 @@ class MoELayer(nn.Module):
     and compatibility path, not the grouped-expert performance representation.
     """
 
+    _qmoe_activation_type: ClassVar[str] = "swiglu"
+
     def __init__(
         self,
         config: ArchitectureConfig,
@@ -452,11 +464,20 @@ class MoELayer(nn.Module):
         assert config.num_experts_per_tok is not None
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
-        self._qmoe_quantization = (
+        quantization = (
+            config.quantization_for("decoder")
+            if config.component_quantization is not None
+            else config.quantization
+        )
+        quantization_layout = (
             None
             if getattr(config, "disable_qmoe", False)
-            else _supported_qmoe_quantization(config.quantization)
+            else resolve_qmoe_quantization(
+                quantization,
+                config.qmoe_source_paths,
+            )
         )
+        self._qmoe_quantization: QMoEQuantizationLayout | None = quantization_layout
         # Clipped-SwiGLU attributes (QMoE's ``activation_alpha``/``activation_beta``/
         # ``swiglu_limit``). Left ``None`` by default so existing callers get a
         # byte-identical QMoE call (the attributes are simply omitted, even though
@@ -500,8 +521,14 @@ class MoELayer(nn.Module):
         assert quantization is not None
         hidden_size = expert_config.hidden_size
         intermediate_size = expert_config.intermediate_size
-        block_size = quantization.group_size
-        bits = quantization.bits
+        block_size = quantization.fc1.group_size
+        fc1_bits = quantization.fc1.bits
+        fc2_bits = quantization.fc2.bits
+        if quantization.has_int3 and expert_config.dtype not in (
+            ir.DataType.FLOAT16,
+            ir.DataType.BFLOAT16,
+        ):
+            raise ValueError("Draft INT3 QMoE requires FP16 or BF16 activations.")
         fc1_out = 2 * intermediate_size
         self._fc1_out = fc1_out
         if hidden_size % block_size or intermediate_size % block_size:
@@ -510,34 +537,36 @@ class MoELayer(nn.Module):
             )
 
         self.fc1_experts_weights = nn.Parameter(
-            [self.num_experts, fc1_out, hidden_size * bits // 8],
+            [self.num_experts, fc1_out, (hidden_size * fc1_bits + 7) // 8],
             dtype=ir.DataType.UINT8,
         )
         self.fc1_scales = nn.Parameter([self.num_experts, fc1_out, hidden_size // block_size])
         self.fc2_experts_weights = nn.Parameter(
-            [self.num_experts, hidden_size, intermediate_size * bits // 8],
+            [self.num_experts, hidden_size, (intermediate_size * fc2_bits + 7) // 8],
             dtype=ir.DataType.UINT8,
         )
         self.fc2_scales = nn.Parameter(
             [self.num_experts, hidden_size, intermediate_size // block_size]
         )
-        if quantization.sym:
+        if quantization.fc1.sym:
             self.fc1_experts_zero_points = None
-            self.fc2_experts_zero_points = None
         else:
             self.fc1_experts_zero_points = nn.Parameter(
                 [
                     self.num_experts,
                     fc1_out,
-                    math.ceil((hidden_size // block_size) * bits / 8),
+                    math.ceil((hidden_size // block_size) * fc1_bits / 8),
                 ],
                 dtype=ir.DataType.UINT8,
             )
+        if quantization.fc2.sym:
+            self.fc2_experts_zero_points = None
+        else:
             self.fc2_experts_zero_points = nn.Parameter(
                 [
                     self.num_experts,
                     hidden_size,
-                    math.ceil((intermediate_size // block_size) * bits / 8),
+                    math.ceil((intermediate_size // block_size) * fc2_bits / 8),
                 ],
                 dtype=ir.DataType.UINT8,
             )
@@ -553,19 +582,28 @@ class MoELayer(nn.Module):
         if router_weights is not None:
             router_weights = _flatten_to_2d(op, router_weights)
 
-        fc1_experts_weights = _interleave_gate_up_rows(
-            op, self.fc1_experts_weights, self.num_experts, self._fc1_out
-        )
-        fc1_scales = _interleave_gate_up_rows(
-            op, self.fc1_scales, self.num_experts, self._fc1_out
-        )
-        fc1_experts_zero_points = (
-            _interleave_gate_up_rows(
-                op, self.fc1_experts_zero_points, self.num_experts, self._fc1_out
+        fc1_experts_weights: ir.Value
+        fc1_scales: ir.Value
+        fc1_experts_zero_points: ir.Value | None
+        if quantization.has_int3:
+            # The draft checkpoint adapter binds already-interleaved raw tensors.
+            fc1_experts_weights = self.fc1_experts_weights
+            fc1_scales = self.fc1_scales
+            fc1_experts_zero_points = self.fc1_experts_zero_points
+        else:
+            fc1_experts_weights = _interleave_gate_up_rows(
+                op, self.fc1_experts_weights, self.num_experts, self._fc1_out
             )
-            if self.fc1_experts_zero_points is not None
-            else None
-        )
+            fc1_scales = _interleave_gate_up_rows(
+                op, self.fc1_scales, self.num_experts, self._fc1_out
+            )
+            fc1_experts_zero_points = (
+                _interleave_gate_up_rows(
+                    op, self.fc1_experts_zero_points, self.num_experts, self._fc1_out
+                )
+                if self.fc1_experts_zero_points is not None
+                else None
+            )
         # ``activation_alpha``/``activation_beta``/``swiglu_limit`` are only
         # passed when a caller explicitly set them (e.g. DeepSeek-V4's
         # clipped-SwiGLU expert); omitting them for every other existing
@@ -577,6 +615,15 @@ class MoELayer(nn.Module):
             activation_kwargs["activation_beta"] = self.activation_beta
         if self.swiglu_limit is not None:
             activation_kwargs["swiglu_limit"] = self.swiglu_limit
+        bit_width_kwargs = {}
+        if quantization.is_mixed_width or quantization.has_int3:
+            bit_width_kwargs = {
+                "fc1_expert_weight_bits": quantization.fc1.bits,
+                "fc2_expert_weight_bits": quantization.fc2.bits,
+                # Fused SwiGLU stores FC3 in FC1. ORT requires the effective
+                # FC3 width to match FC1; omission would inherit fallback INT4.
+                "fc3_expert_weight_bits": quantization.fc1.bits,
+            }
         result = op.QMoE(
             hidden_states,
             router_probs,
@@ -593,17 +640,33 @@ class MoELayer(nn.Module):
             self.fc2_experts_zero_points,
             None,
             router_weights,
-            activation_type="swiglu",
+            activation_type=self._qmoe_activation_type,
             normalize_routing_weights=int(normalize),
             k=self.top_k,
-            expert_weight_bits=quantization.bits,
-            block_size=quantization.group_size,
+            # A uniform override can use the global attribute directly.
+            # Differing widths retain the model-wide INT4 fallback and FC attrs.
+            expert_weight_bits=(
+                quantization.fallback.bits
+                if quantization.is_mixed_width
+                else quantization.fc1.bits
+            ),
+            block_size=quantization.fc1.group_size,
             swiglu_fusion=1,
             quant_type="int",
             weights_prepacked=0,
             _domain="com.microsoft",
             **activation_kwargs,
+            **bit_width_kwargs,
         )
+        if quantization.has_int3:
+            node = result.producer()
+            assert node is not None
+            node.metadata_props["mobius.int3_qmoe.format"] = (
+                "draft-2026-10-08:row-local-lsb-first-uint8"
+            )
+            node.metadata_props["mobius.int3_qmoe.runtime_support"] = (
+                "unqualified; requires reviewed INT3 QMoE schema and kernels"
+            )
         if output_scale != 1.0:  # noqa: RUF069
             result = op.Mul(result, op.CastLike(output_scale, result))
         return result
@@ -629,3 +692,58 @@ class MoELayer(nn.Module):
                 result = op.Add(result, contribution)
 
         return result
+
+
+class GroupedMoELayer(MoELayer):
+    """Bias-free gated experts with unchanged routing and GroupedMatMul-29.
+
+    Keeps the loop representation's parameter names, but computes only selected
+    experts. Custom expert classes are rejected rather than approximated.
+    """
+
+    def __init__(self, source: MoELayer):
+        nn.Module.__init__(self)
+        if source.experts is None or any(type(e) is not MLP for e in source.experts):
+            raise ValueError("GroupedMoELayer requires ordinary unquantized MLP experts.")
+        if any(
+            getattr(e, name).bias is not None
+            for e in source.experts
+            for name in ("gate_proj", "up_proj", "down_proj")
+        ):
+            raise ValueError("GroupedMoELayer does not support expert projection biases.")
+        self.num_experts = source.num_experts
+        self.top_k = source.top_k
+        self.gate = source.gate
+        self.experts = source.experts
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, *gate_args):
+        routing_weights, selected_experts = self.gate(op, hidden_states, *gate_args)
+        # Calls realize each child in its original scope. Unused loop nodes are
+        # removed by the normal exporter; only these qualified weights survive.
+        experts = self.experts
+        if experts is None or not isinstance(experts[0], MLP):
+            raise ValueError("GroupedMoELayer requires ordinary MLP experts.")
+        banks: dict[str, list] = {name: [] for name in ("gate_proj", "up_proj", "down_proj")}
+        for expert in experts:
+            expert(op, hidden_states)
+            for name in banks:
+                banks[name].append(op.Unsqueeze(getattr(expert, name).weight, [0]))
+        weights = {name: op.Concat(*bank, axis=0) for name, bank in banks.items()}
+        width = op.Shape(hidden_states, start=-1)
+        flat = op.Reshape(hidden_states, op.Concat([-1], width, axis=0))
+        ids = op.Reshape(selected_experts, [-1, self.top_k])
+        gate = op.GroupedMatMul(flat, weights["gate_proj"], ids, transB=1)
+        up = op.GroupedMatMul(flat, weights["up_proj"], ids, transB=1)
+        activated = experts[0].act_fn(op, gate)
+        selected_hidden = op.Mul(activated, up)
+        expert_width = op.Shape(selected_hidden, start=-1)
+        selected_flat = op.Reshape(selected_hidden, op.Concat([-1], expert_width, axis=0))
+        projected = op.GroupedMatMul(
+            selected_flat, weights["down_proj"], op.Reshape(ids, [-1, 1]), transB=1
+        )
+        projected = op.Reshape(
+            projected, op.Concat([-1, self.top_k], width, axis=0)
+        )  # (tokens, top_k, hidden)
+        routing = op.Reshape(routing_weights, [-1, self.top_k, 1])
+        combined = op.ReduceSum(op.Mul(projected, routing), [1], keepdims=False)
+        return op.Reshape(combined, op.Shape(hidden_states))

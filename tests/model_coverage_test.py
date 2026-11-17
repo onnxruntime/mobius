@@ -319,9 +319,14 @@ _COVERAGE_SKIP: dict[str, str] = {
     "whisper": "Speech-to-text — requires audio inputs",
     "mms": "CTC ASR model — tested via TestBuildMMSGraph",
     "fastconformer_rnnt": "NeMo .nemo RNN-T ASR — tested via tests/nemo_rnnt_integration_test.py",
-    "sortformer": "NeMo .nemo speaker diarization — tested via tests/sortformer_integration_test.py",
+    "sortformer": "NeMo .nemo checkpoint has no HuggingFace config.json, so it cannot use "
+    "the generic L1-L3 config-based build test or L2 test_model_id validation (same "
+    "limitation as fastconformer_rnnt). L4/L5 golden coverage IS provided generically via "
+    "testdata/cases/diarization/sortformer.yaml + scripts/generate_golden.py + "
+    "tests/e2e_golden_test.py (see load_diarization_golden/compare_diarization_golden) — "
+    "this skip covers L1-L3 only, not L4/L5.",
     "VibeVoiceForASRStreamingTraining": "Streaming ASR has host-owned dual-convolution "
-    "state, arbitrary-mask decoder, hotword, and speaker-attribution orchestration that "
+    "state, arbitrary-mask decoder, hotword, and speaker-attribution orchestration that  "
     "the generic L4/L5 runner cannot drive. Pinned L1-L3 graph/config/source-parity and "
     "complete checkpoint-index routing are covered for the 1.5B and 7B checkpoints; "
     "real-weight goldens require a dedicated GPU workflow.",

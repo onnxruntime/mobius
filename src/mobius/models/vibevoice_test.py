@@ -26,6 +26,7 @@ from mobius._pipeline_contract import (
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.vibevoice import (
+    VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS,
     VIBEVOICE_EXECUTABLE_MODEL_ID,
     VIBEVOICE_EXECUTABLE_REVISION,
     VIBEVOICE_MODEL_ID,
@@ -125,6 +126,29 @@ def test_official_vibevoice_sources_normalize_hub_id_case():
     assert sources.model_id == "Microsoft/VibeVoice-1.5B"
     with pytest.raises(NotImplementedError, match="unsupported"):
         resolve_vibevoice_sources("Microsoft/VibeVoice-ASR-BitNet", None)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "revision"),
+    tuple(VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS.items()),
+)
+def test_streaming_asr_sources_pin_checkpoint_assets(model_id, revision):
+    sources = resolve_vibevoice_sources(model_id, None)
+
+    assert sources is not None
+    assert sources.model_id == model_id
+    assert sources.weight_revision == revision
+    assert sources.config_model_id == model_id
+    assert sources.config_revision == revision
+    assert sources.processor_model_id == model_id
+    assert sources.processor_revision == revision
+    assert sources.weight_layout is None
+
+
+@pytest.mark.parametrize("model_id", VIBEVOICE_ASR_STREAMING_MODEL_REVISIONS)
+def test_streaming_asr_sources_reject_unverified_revisions(model_id):
+    with pytest.raises(ValueError, match="only verified"):
+        resolve_vibevoice_sources(model_id, "different-streaming-asr-revision")
 
 
 @pytest.mark.parametrize(

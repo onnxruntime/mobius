@@ -34,6 +34,7 @@ from mobius._constants import (
 )
 from mobius._model_package import ModelPackage
 from mobius._pipeline_contract import (
+    declare_arbitrary_attention_mask,
     declare_component_presence,
     declare_optional_input,
 )
@@ -272,6 +273,9 @@ class Gemma4TextCausalLMTask(ModelTask):
     Supports ``static_cache=True`` for pre-allocated TensorScatter-based
     KV cache (requires ORT ≥ 1.25.0).
 
+    Configs retaining vision-overlay attention preserve explicit masks during
+    optimization; stripped text-only configs remain eligible for GQA fusion.
+
     Inputs (dynamic cache):
         - input_ids: [batch, sequence_len] INT64
         - attention_mask: [batch, past_seq_len + seq_len] INT64
@@ -326,6 +330,12 @@ class Gemma4TextCausalLMTask(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
 
         graph, builder = _make_graph()
+        if (
+            config.use_bidirectional_attention == "vision"
+            and config.image_token_id is not None
+        ):
+            # Prefix-length GQA fusion cannot preserve internal mask holes.
+            declare_arbitrary_attention_mask(graph)
         op = builder.op
 
         input_ids = builder.input(
@@ -512,7 +522,9 @@ class Gemma4Task(ModelTask):
         When ``hidden_size_per_layer_input > 0`` (e.g. Gemma4 E2B), the decoder
         accepts precomputed ``per_layer_inputs`` from the embedding model instead
         of ``input_ids``.  This moves the per-layer embedding computation to the
-        embedding model, simplifying the decoder graph.
+        embedding model, simplifying the decoder graph. The execution provider
+        determines whether the layer and projection dimensions remain separate
+        or are flattened together.
 
         Exception: When the EP's ``max_buffer_size`` is set and the fused table
         would exceed it, split per-layer tables are used in the decoder instead,
@@ -535,6 +547,13 @@ class Gemma4Task(ModelTask):
         seq_len = ir.SymbolicDim("sequence_len")
 
         graph, builder = _make_graph(name="decoder")
+        if (
+            config.use_bidirectional_attention == "vision"
+            and config.image_token_id is not None
+        ):
+            # A causal global bias still carries arbitrary padding positions.
+            # Prefix-length GQA fusion cannot preserve internal mask holes.
+            declare_arbitrary_attention_mask(graph)
         op = builder.op
 
         inputs_embeds = builder.input(
@@ -567,11 +586,16 @@ class Gemma4Task(ModelTask):
         per_layer_inputs_val: ir.Value | None = None
         per_layer_dim = getattr(config, "hidden_size_per_layer_input", 0)
         if per_layer_dim and not config.split_per_layer_embedding:
-            total_per_layer = config.num_hidden_layers * per_layer_dim
+            caps = ep_capabilities()
+            per_layer_shape = (
+                [batch, seq_len, config.num_hidden_layers, per_layer_dim]
+                if caps.layered_per_layer_inputs
+                else [batch, seq_len, config.num_hidden_layers * per_layer_dim]
+            )
             per_layer_inputs_val = builder.input(
                 "per_layer_inputs",
                 dtype=config.dtype,
-                shape=[batch, seq_len, total_per_layer],
+                shape=per_layer_shape,
             )
 
         # Vision-block bidirectional attention: the decoder receives the raw
@@ -636,7 +660,7 @@ class Gemma4Task(ModelTask):
         """Build vision encoder: pixel_values + pixel_position_ids -> image_features.
 
         Inputs:
-        - ``pixel_values [1, N, 3*P^2]``: one pre-patchified image with ``N``
+        - ``pixel_values [1, N, 3*P^2]``: FP32 patches in ``[0, 1]``, with ``N``
           patches (padded to ``max_soft_tokens``, typically 280).
         - ``pixel_position_ids [1, N, 2]``: (x, y) patch coordinates.
           Unused patch slots (from images smaller than the maximum) use
@@ -659,7 +683,7 @@ class Gemma4Task(ModelTask):
 
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[1, num_patches, pixel_dim],
         )
         pixel_position_ids = builder.input(

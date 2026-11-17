@@ -47,6 +47,60 @@ across **40+ task types** and **100+ reusable components**.
 
 See the [model documentation](https://onnxruntime.github.io/mobius/models/index.html) for the complete list.
 
+## Projection-specific QMoE export
+
+Olive's integer-affine, fused, K-last expert checkpoints can independently
+use INT2, INT3, INT4, or INT8 for FC1 and FC2, with a supported model-wide
+INT4 fallback for non-expert projections. All 16 bit-width pairs are accepted
+when their layouts satisfy the checks below; no experimental flag is required. INT3
+uses the proposed raw QMoE contract from `microsoft/onnxruntime#32657`.
+
+```python
+from mobius import build
+
+package = build("./local-olive-qwen3-moe", dtype="f16")
+package.save("./qmoe-export")
+```
+
+Use an Olive model-wide INT4 configuration with exact source-name overrides for
+`model.layers.<i>.mlp.experts.gate_up_proj` and
+`model.layers.<i>.mlp.experts.down_proj`. The generic MoE adapter, including Qwen3-MoE,
+validates fused checkpoint dimensions and binds packed bytes without
+requantization. INT3 is symmetric unsigned offset-4, row-local LSB-first
+`uint8`; FC1 gate/up rows and scales are interleaved together, while FC2
+retains its K-last down-projection layout. Explicit all-4 INT3 zero points are
+validated and omitted in the graph.
+
+Both projections require a shared power-of-two block size of at least 16,
+dividing hidden and intermediate sizes. Pairs containing INT3 require block
+size 32/64/128, symmetric INT3, and FP16/BF16 activations. For these pairs both
+FC scale dtypes must match the activations. Every projection's scales must be
+finite and nonnegative. When the adapter supplies the activation dtype,
+scales must remain finite after conversion. Non-INT3 layouts retain the
+standard weight loader's dtype conversion.
+The legacy uniform INT4 path receives the same numeric scale checks.
+INT2, INT4, and INT8 projections retain their existing zero-point
+semantics; asymmetric zero points must be packed `uint8` sidecars.
+Dense INT3 `MatMulNBits`, embeddings, other source layouts, and schema-unapproved
+tails are not enabled. Keep non-expert projections at supported precisions.
+
+`build()` defers INT3-layout FC1 interleaving to initializer serialization,
+using uncached lazy tensors instead of retaining a second complete FC1 payload.
+The original checkpoint is still loaded eagerly; this bounds additional
+interleaving storage, not total checkpoint memory. Direct `preprocess_weights()`
+calls retain eager behavior unless an output `weight_transforms` mapping is
+provided. Pass that mapping to `ModelPackage.apply_weights()` with the returned
+weights to preserve the deferred transformations.
+
+**Export support is not a runtime qualification matrix.** INT3 QMoE nodes
+carry a draft-format/runtime-warning marker; they do not invent an
+approved schema version. Execution of every pair depends on the target ORT
+version and execution provider. Tests cover bytes, interleaving, binding, and external
+data save/reload, not INT3 kernel execution, model quality, or speed. Final
+schema/version review, a complete quantization provenance manifest, and
+checkpoint-to-ORT parity remain necessary before production use. This is not
+completion of the runtime plan's P5 acceptance gate.
+
 ## Installation
 
 ```bash

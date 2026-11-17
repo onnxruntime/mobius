@@ -6,6 +6,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
+import pytest
 import torch
 from onnxscript import GraphBuilder
 
@@ -14,6 +15,7 @@ from mobius._component_quantization import (
     preprocess_component_quantized_state_dict,
 )
 from mobius._configs import ArchitectureConfig, VisionConfig
+from mobius._testing.ort_inference import OnnxModelSession
 from mobius.components import Gemma3MultiModalProjector, OffsetRMSNorm
 from mobius.models.gemma3 import Gemma3MultiModalModel, _Gemma3EmbeddingModel
 from mobius.tasks import Gemma3VisionLanguageTask
@@ -146,8 +148,13 @@ class TestGemma3Embedding:
         assert "embedding.embed_tokens.weight_scales" in result
         assert not any(name.startswith("decoder.model.embed_tokens.") for name in result)
 
-    def test_packed_tied_table_materializes_split_decoder_head(self) -> None:
-        from mobius._configs import QuantizationConfig
+    @pytest.mark.parametrize(
+        "mismatched_head_override", [False, True], ids=["matching-layout", "head-override"]
+    )
+    def test_packed_tied_table_materializes_split_decoder_head(
+        self, mismatched_head_override
+    ) -> None:
+        from mobius._configs import QuantizationConfig, QuantizationOverride
 
         decoder_quantization = QuantizationConfig(
             bits=4,
@@ -163,6 +170,8 @@ class TestGemma3Embedding:
             quantize_embeddings=True,
             tie_word_embeddings=True,
         )
+        if mismatched_head_override:
+            decoder_quantization.overrides["lm_head"] = QuantizationOverride(sym=False)
         config = ArchitectureConfig(
             vocab_size=32,
             hidden_size=16,
@@ -198,14 +207,17 @@ class TestGemma3Embedding:
         )
         model = Gemma3MultiModalModel(config)
         configure_component_quantization(model, config, model.default_task)
-        qweight = torch.zeros(32, 8, dtype=torch.uint8)
+        qweight = torch.arange(256).reshape(32, 8).to(torch.uint8)
         scales = torch.ones(32, 1)
-        routed = model.preprocess_weights(
-            {
-                "language_model.model.embed_tokens.weight_qweight": qweight,
-                "language_model.model.embed_tokens.weight_scales": scales,
-            }
-        )
+        state_dict = {
+            "language_model.model.embed_tokens.weight_qweight": qweight,
+            "language_model.model.embed_tokens.weight_scales": scales,
+        }
+        if mismatched_head_override:
+            with pytest.raises(ValueError, match="must use the same quantization layout"):
+                model.preprocess_weights(state_dict)
+            return
+        routed = model.preprocess_weights(state_dict)
 
         assert routed["decoder.lm_head.weight_qweight"] is qweight
         result = preprocess_component_quantized_state_dict(
@@ -217,7 +229,21 @@ class TestGemma3Embedding:
         )
 
         assert result["decoder.lm_head.weight"].shape == (32, 1, 8)
+        torch.testing.assert_close(result["decoder.lm_head.weight"], qweight.reshape(32, 1, 8))
         assert result["embedding.embed_tokens.qweight"] is qweight
+        package = Gemma3VisionLanguageTask().build(model, config)
+        package.apply_weights(result, fold_constants=False)
+        session = OnnxModelSession(package["embedding"])
+        input_ids = np.array([[1, 2, 3]], dtype=np.int64)
+        actual = session.run(
+            {
+                "input_ids": input_ids,
+                "image_features": np.empty((0, config.hidden_size), dtype=np.float32),
+            }
+        )["inputs_embeds"]
+        unpacked = torch.stack((qweight & 15, qweight >> 4), dim=-1).reshape(32, 16)
+        expected = (unpacked.to(torch.float32) - 8) * config.hidden_size**0.5
+        np.testing.assert_array_equal(actual, expected.numpy()[input_ids])
 
 
 class TestGemma3VisionEncoder:

@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
 from mobius._configs import QuantizationConfig
 from mobius._weight_utils import (
     is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
     merge_lora_weights,
     preprocess_awq_weights,
     preprocess_gptq_weights,
@@ -28,6 +31,43 @@ from mobius._weight_utils import (
     vlm_embedding_weights,
     vlm_vision_weights,
 )
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("float_head", NotImplementedError, "requires quantize_lm_head=True"),
+        ("different_layout", ValueError, "must use the same quantization layout"),
+        ("missing_scales", ValueError, "missing Olive sidecars"),
+    ],
+)
+def test_split_tied_table_rejects_unsupported_materialization(case, error, message):
+    embedding = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_embeddings=True
+    )
+    head = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_lm_head=True
+    )
+    state_dict = {
+        "embedding.embed_tokens.weight_qweight": torch.zeros(32, 8, dtype=torch.uint8),
+        "embedding.embed_tokens.weight_scales": torch.ones(32, 1),
+    }
+    if case == "float_head":
+        head.quantize_lm_head = False
+    elif case == "different_layout":
+        head.bits = 8
+    else:
+        del state_dict["embedding.embed_tokens.weight_scales"]
+
+    with pytest.raises(error, match=message):
+        materialize_split_tied_olive_lm_head(
+            state_dict,
+            embed_key="embedding.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+            embedding_quantization=embedding,
+            head_quantization=head,
+        )
+    assert "decoder.lm_head.weight_qweight" not in state_dict
 
 
 class TestSplitFusedQKV:
@@ -564,6 +604,131 @@ class TestPreprocessGptqWeights:
         with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
             preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
 
+    def test_per_channel_zero_group_indices_are_trivial(self, caplog):
+        result = preprocess_gptq_weights(
+            {"proj.g_idx": torch.zeros(96, dtype=torch.int32)}, group_size=-1
+        )
+        assert result == {}
+        assert "desc_act" not in caplog.text
+
+
+@pytest.mark.parametrize("preprocess", [preprocess_gptq_weights, preprocess_awq_weights])
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("prefix", [(), (2,)])
+@pytest.mark.parametrize(
+    ("k", "group_size"),
+    [(7, -1), (9, -1), (33, -1), (96, -1), (1536, -1), (6144, -1), (33, 33)],
+)
+def test_per_channel_dotted_weights_preserve_codes_and_scales(
+    preprocess, bits, prefix, k, group_size
+):
+    n = 8
+    packed = (
+        torch.arange(math.prod(prefix) * math.ceil(k * bits / 32) * n)
+        .reshape(*prefix, -1, n)
+        .to(torch.int32)
+    )
+    scales = torch.arange(1, math.prod(prefix) * n + 1).reshape(*prefix, 1, n).float()
+    raw = {
+        "proj.qweight": packed,
+        "proj.scales": scales,
+        "proj.qzeros": torch.full((*prefix, 1, n), 0x55555555, dtype=torch.int32),
+    }
+    result = preprocess(raw, bits=bits, group_size=group_size, in_features=k)
+    weight = result["proj.weight"]
+    blob_size = math.ceil(k * bits / 8)
+    assert weight.shape == (*prefix, n, 1, blob_size)
+    expected = (
+        packed.transpose(-1, -2)
+        .contiguous()
+        .reshape(-1)
+        .view(torch.uint8)
+        .reshape(*prefix, n, -1)
+    )
+    torch.testing.assert_close(weight[..., 0, :], expected[..., :blob_size])
+    torch.testing.assert_close(result["proj.scales"], scales.transpose(-1, -2))
+    assert result["proj.zero_points"].shape == (*prefix, n, 1)
+    expected_zero = (
+        0x44
+        if preprocess is preprocess_awq_weights and bits == 4
+        else (0x54 if preprocess is preprocess_awq_weights else 0x55)
+    )
+    assert (result["proj.zero_points"] == expected_zero).all()
+
+
+@pytest.mark.parametrize("bits", [2, 4, 8])
+@pytest.mark.parametrize("prefix", [(), (2,)])
+@pytest.mark.parametrize(
+    ("k", "group_size"),
+    [(7, -1), (9, -1), (33, -1), (96, -1), (1536, -1), (6144, -1), (33, 33)],
+)
+def test_per_channel_olive_weights_preserve_codes_and_scales(bits, prefix, k, group_size):
+    n = 8
+    blob_size = math.ceil(k * bits / 8)
+    packed = (
+        torch.arange(math.prod(prefix) * n * blob_size)
+        .reshape(*prefix, n, blob_size)
+        .to(torch.uint8)
+    )
+    scales = torch.arange(1, math.prod(prefix) * n + 1).reshape(*prefix, n, 1).float()
+    zeros = torch.full((*prefix, n, 1), 3, dtype=torch.uint8)
+    result = preprocess_olive_weights(
+        {
+            "proj.weight_qweight": packed,
+            "proj.weight_scales": scales,
+            "proj.weight_qzeros": zeros,
+        },
+        bits=bits,
+        group_size=group_size,
+        in_features=k,
+    )
+    weight = result["proj.weight"]
+    assert weight.shape == (*prefix, n, 1, blob_size)
+    torch.testing.assert_close(weight[..., 0, :], packed)
+    assert result["proj.scales"] is scales
+    assert result["proj.zero_points"] is zeros
+
+
+@pytest.mark.parametrize("packed_bytes", [16, 18])
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_olive_rejects_mismatched_logical_width(packed_bytes, group_size):
+    with pytest.raises(ValueError, match="Per-channel packed width"):
+        preprocess_olive_weights(
+            {"proj.weight_qweight": torch.zeros(8, packed_bytes, dtype=torch.uint8)},
+            bits=4,
+            group_size=group_size,
+            in_features=33,
+        )
+
+
+@pytest.mark.parametrize("preprocess", [preprocess_gptq_weights, preprocess_awq_weights])
+@pytest.mark.parametrize("packed_words", [4, 6])
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_dotted_rejects_mismatched_logical_width(
+    preprocess, packed_words, group_size
+):
+    with pytest.raises(ValueError, match="Per-channel packed width"):
+        preprocess(
+            {"proj.qweight": torch.zeros(packed_words, 8, dtype=torch.int32)},
+            bits=4,
+            group_size=group_size,
+            in_features=33,
+        )
+
+
+@pytest.mark.parametrize(
+    ("preprocess", "scales_key", "shape"),
+    [
+        (preprocess_olive_weights, "proj.weight_scales", (8, 2)),
+        (preprocess_gptq_weights, "proj.scales", (2, 8)),
+        (preprocess_awq_weights, "proj.scales", (2, 8)),
+    ],
+)
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_rejects_multiple_scale_groups(preprocess, scales_key, shape, group_size):
+    with pytest.raises(ValueError, match="must have one group"):
+        preprocess({scales_key: torch.ones(shape)}, group_size=group_size, in_features=33)
+
 
 class TestPreprocessOliveWeights:
     """Tests for Olive uint8-packed weight preprocessing."""
@@ -943,6 +1108,43 @@ class TestPreprocessAwqWeights:
 
 class TestPreprocessQuantizedWeights:
     @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
+    def test_defers_ordinary_sidecars_without_changing_float_tying(self, quant_method):
+        quantization = QuantizationConfig(
+            bits=4, group_size=16, quant_method=quant_method, sym=False
+        )
+        if quant_method == "olive":
+            weight_key, scales_key = "layer.weight_qweight", "layer.weight_scales"
+            zeros_key = "layer.weight_qzeros"
+            packed = torch.arange(256).reshape(16, 16).to(torch.uint8)
+            scales = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+            zeros = torch.ones(16, 1, dtype=torch.uint8)
+        else:
+            weight_key, scales_key = "layer.qweight", "layer.scales"
+            zeros_key = "layer.qzeros"
+            shape = (4, 16) if quant_method == "gptq" else (32, 2)
+            packed = torch.arange(64, dtype=torch.int32).reshape(shape)
+            scales = torch.arange(32, dtype=torch.float32).reshape(2, 16)
+            zeros = torch.arange(4, dtype=torch.int32).reshape(2, 2)
+        embedding = torch.ones(8, 32)
+        state_dict = {
+            weight_key: packed,
+            scales_key: scales,
+            zeros_key: zeros,
+            "model.embed_tokens.weight": embedding,
+        }
+
+        result = preprocess_quantized_weights(
+            state_dict, quantization, tie_embeddings=True, defer_non_expert_sidecars=True
+        )
+
+        assert result[weight_key] is packed
+        assert result[scales_key] is scales
+        assert result[zeros_key] is zeros
+        assert result["lm_head.weight"] is embedding
+        assert "layer.weight" not in result
+        assert "lm_head.weight" not in state_dict
+
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
     def test_dispatches_quantization_method(self, quant_method):
         quantization = QuantizationConfig(bits=4, group_size=16, quant_method=quant_method)
         if quant_method == "olive":
@@ -958,7 +1160,8 @@ class TestPreprocessQuantizedWeights:
         "suffix",
         ["_qweight", "_scales", "_qzeros", ".qweight", ".scales", ".qzeros"],
     )
-    def test_rejects_packed_experts_for_unsupported_qmoe_abi(self, suffix):
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_rejects_packed_experts_for_unsupported_qmoe_abi(self, suffix, defer):
         quantization = QuantizationConfig(bits=8, group_size=16, quant_method="olive")
         state_dict = {
             f"decoder.model.layers.0.mlp.experts.gate_up_proj{suffix}": torch.zeros(1)
@@ -969,6 +1172,7 @@ class TestPreprocessQuantizedWeights:
                 state_dict,
                 quantization,
                 qmoe_target_path=".mlp",
+                defer_non_expert_sidecars=defer,
             )
 
     def test_rejects_unsupported_qmoe_quantization_method(self):
@@ -981,7 +1185,8 @@ class TestPreprocessQuantizedWeights:
                 qmoe_quant_methods=("olive",),
             )
 
-    def test_per_expert_gptq_moe_produces_populated_fused_qmoe(self):
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_per_expert_gptq_moe_produces_populated_fused_qmoe(self, defer):
         """Per-expert GPTQ experts stack+pack into non-empty fused QMoE params.
 
         This is the end-to-end guard for the per-expert -> fused-QMoE path:
@@ -1009,7 +1214,10 @@ class TestPreprocessQuantizedWeights:
                 state_dict[f"{prefix}.{e}.{proj}.scales"] = torch.randn(n_groups, n)
 
         result = preprocess_quantized_weights(
-            state_dict, quantization, qmoe_target_path=".mlp"
+            state_dict,
+            quantization,
+            qmoe_target_path=".mlp",
+            defer_non_expert_sidecars=defer,
         )
 
         fc1 = result["model.layers.0.mlp.fc1_experts_weights"]
@@ -1024,7 +1232,8 @@ class TestPreprocessQuantizedWeights:
         assert not any(".experts." in k and ".down_proj" in k for k in result)
 
     @pytest.mark.parametrize("flag", ["quantize_embeddings", "quantize_lm_head"])
-    def test_rejects_quantized_embedding_or_lm_head(self, flag):
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_rejects_quantized_embedding_or_lm_head(self, flag, defer):
         quantization = QuantizationConfig(
             bits=4,
             group_size=16,
@@ -1036,6 +1245,7 @@ class TestPreprocessQuantizedWeights:
                 {},
                 quantization,
                 reject_quantized_embeddings_lm_head=True,
+                defer_non_expert_sidecars=defer,
             )
 
     @pytest.mark.parametrize(
