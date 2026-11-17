@@ -33,6 +33,8 @@ execution_providers
 api/index
 gguf-capability-catalog
 feature-flags
+qmoe-lowering
+moe-lowering
 ```
 
 ```{toctree}

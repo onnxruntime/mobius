@@ -22,6 +22,7 @@ from onnxscript import nn
 
 from mobius._component_manifest import ComponentDescriptor, ComponentManifest
 from mobius._configs import BaseModelConfig, QuantizationConfig
+from mobius._quantization_utils import resolve_matmul_nbits_block_size
 from mobius._weight_utils import is_packed_quant_key
 from mobius.components import (
     ClippableLinear,
@@ -153,7 +154,8 @@ def _linear_layout_matches(
     )
     return (
         module._bits == quantization.bits
-        and module._block_size == quantization.group_size
+        and module._block_size
+        == resolve_matmul_nbits_block_size(quantization.group_size, module._k)
         and (module.zero_points is None) is quantization.sym
         and (
             module.zero_points is None or module.zero_points.dtype == expected_zero_point_dtype
@@ -626,7 +628,17 @@ def normalize_component_quantized_weights(
     component_names = tuple(component_names)
     manifest = manifest or _default_manifest(module, config, task)
     mapping = getattr(config, "component_quantization", None)
-    if mapping is None and not _uses_global_module_rules(config, manifest):
+    quantization = getattr(config, "quantization", None)
+    global_per_channel = (
+        quantization is not None
+        and quantization.quant_method in {"gptq", "awq"}
+        and quantization.group_size == -1
+    )
+    if (
+        mapping is None
+        and not _uses_global_module_rules(config, manifest)
+        and not global_per_channel
+    ):
         return state_dict
     routed = _route_component_weights(state_dict, manifest, component_names)
     result = dict(state_dict)
@@ -726,6 +738,9 @@ def normalize_component_quantized_weights(
                     kind="embedding"
                     if isinstance(local_module, QuantizedEmbedding)
                     else "linear",
+                    in_features=local_module._k
+                    if isinstance(local_module, QuantizedLinear)
+                    else None,
                 )
             )
 
@@ -754,7 +769,7 @@ def validate_quantized_component_bindings(
     models: Mapping[str, ir.Model],
     config: BaseModelConfig,
 ) -> None:
-    """Require every affine quantized op input to carry a bound value."""
+    """Require bound affine parameters, including deferred axis-0 Concat leaves."""
     quantized_input_slots = {
         "MatMulNBits": (1, 2, 3),
         "GatherBlockQuantized": (0, 2, 3),
@@ -768,13 +783,30 @@ def validate_quantized_component_bindings(
                 if index >= len(node.inputs):
                     continue
                 value = node.inputs[index]
-                if value is None or value.producer() is not None:
+                if value is None:
                     continue
-                if value.const_value is None:
-                    raise ValueError(
-                        f"Quantized component {component!r} has unbound "
-                        f"{node.op_type} parameter {value.name!r}"
-                    )
+                pending = [value]
+                visited: set[ir.Value] = set()
+                while pending:
+                    parameter = pending.pop()
+                    if parameter in visited:
+                        continue
+                    visited.add(parameter)
+                    producer = parameter.producer()
+                    if producer is not None:
+                        if (
+                            producer.domain in ("", "ai.onnx")
+                            and producer.op_type == "Concat"
+                            and not producer.overload
+                            and producer.attributes.get_int("axis", None) == 0
+                        ):
+                            pending.extend(v for v in producer.inputs if v is not None)
+                        continue
+                    if parameter.const_value is None:
+                        raise ValueError(
+                            f"Quantized component {component!r} has unbound "
+                            f"{node.op_type} parameter {parameter.name!r}"
+                        )
 
 
 def attach_hf_component_sources(

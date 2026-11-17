@@ -589,6 +589,12 @@ class GGUFModel:
             str(getattr(tensor.tensor_type, "name", tensor.tensor_type)),
         )
 
+    def tensor_source_model(self, name: str) -> GGUFModel:
+        """Return the file owning a tensor, without reading its payload."""
+        if name not in self._tensor_index:
+            raise KeyError(f"Tensor {name!r} not found in GGUF file.")
+        return self
+
     def get_tensor_shape(self, name: str) -> tuple[int, ...]:
         """Get a tensor's logical numpy shape without reading its payload."""
         if name not in self._tensor_index:
