@@ -104,6 +104,8 @@ __all__ = [
     "MoELayer",
     "GroupedMoELayer",
     "OffsetRMSNorm",
+    "PagedAttentionState",
+    "PagedHybridContext",
     "PatchEmbed",
     "PatchEmbedding",
     "ParakeetFastConformerEncoder",
@@ -351,6 +353,7 @@ from mobius.components._ocr_projectors import (
     PaddleOCRProjector,
     YouTuVLProjector,
 )
+from mobius.components._paged_attention import PagedAttentionState, PagedHybridContext
 from mobius.components._paged_mla import (
     PagedCacheState as PagedCacheState,
 )

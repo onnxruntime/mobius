@@ -221,6 +221,8 @@ class GenaiConfigGenerator:
         sliding_window: dict[str, Any] | None = None,
         uses_longrope: bool = False,
         has_specialized_topology: bool = False,
+        state_groups: list[dict[str, Any]] | None = None,
+        dynamic_batching: dict[str, Any] | None = None,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -252,6 +254,8 @@ class GenaiConfigGenerator:
         self._sliding_window = sliding_window
         self._uses_longrope = uses_longrope
         self._has_specialized_topology = has_specialized_topology
+        self._state_groups = state_groups
+        self._dynamic_batching = dynamic_batching
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
@@ -283,6 +287,9 @@ class GenaiConfigGenerator:
         num_cache_layer_slots: int | None = None,
         sliding_window: dict[str, Any] | None = None,
         has_specialized_topology: bool = False,
+        decoder_graph_capture: bool | None = None,
+        state_groups: list[dict[str, Any]] | None = None,
+        dynamic_batching: dict[str, Any] | None = None,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -331,6 +338,7 @@ class GenaiConfigGenerator:
             decoder_outputs=decoder_outputs,
             decoder_filename=decoder_filename,
             supports_in_place_kv_cache=supports_in_place_kv_cache,
+            decoder_graph_capture=decoder_graph_capture,
             layer_types=getattr(config, "layer_types", None),
             conv_cache_size=(
                 getattr(config, "short_conv_kernel", 1) - 1
@@ -343,6 +351,8 @@ class GenaiConfigGenerator:
                 and getattr(config, "rope_type", None) == "longrope"
             ),
             has_specialized_topology=has_specialized_topology,
+            state_groups=state_groups,
+            dynamic_batching=dynamic_batching,
         )
 
     def with_vision(
@@ -627,6 +637,8 @@ class GenaiConfigGenerator:
             decoder["outputs"].setdefault("present_conv_names", "present.%d.conv_state")
         if self._sliding_window is not None:
             decoder["sliding_window"] = self._sliding_window
+        if self._state_groups is not None:
+            decoder["state_groups"] = self._state_groups
 
         # Model section
         model: dict[str, Any] = {
@@ -658,10 +670,13 @@ class GenaiConfigGenerator:
             model["speech"] = self._audio
         model.update(self._vlm_token_ids)
 
-        return {
+        result = {
             "model": model,
             "search": search,
         }
+        if self._dynamic_batching is not None:
+            result["engine"] = {"dynamic_batching": self._dynamic_batching}
+        return result
 
     def write(self, output_dir: str) -> str:
         """Write genai_config.json to the output directory.

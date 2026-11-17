@@ -16,6 +16,38 @@ from mobius.integrations.ort_genai.genai_config import (
 )
 
 
+def test_packed_state_groups_and_dynamic_batching_are_explicit():
+    config = GenaiConfigGenerator(
+        "qwen3_5_text",
+        vocab_size=100,
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        ep="cuda",
+        supports_in_place_kv_cache=True,
+        decoder_graph_capture=False,
+        state_groups=[
+            {"kind": "paged_kv", "layer_ids": [3]},
+            {"kind": "fixed_conv", "layer_ids": [0, 1, 2]},
+            {"kind": "fixed_recurrent", "layer_ids": [0, 1, 2]},
+        ],
+        dynamic_batching={
+            "block_size": 256,
+            "max_batch_size": 100,
+            "gpu_utilization_factor": 0.6,
+        },
+    ).generate()
+    assert config["model"]["type"] == "decoder"
+    assert config["model"]["decoder"]["state_groups"][0] == {
+        "kind": "paged_kv",
+        "layer_ids": [3],
+    }
+    assert config["engine"]["dynamic_batching"]["block_size"] == 256
+    assert config["search"]["past_present_share_buffer"] is True
+
+
 class TestGenaiConfigGeneratorLLM:
     """Test genai_config generation for decoder-only LLMs."""
 

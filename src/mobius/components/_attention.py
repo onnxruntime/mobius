@@ -11,6 +11,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._common import Linear
+from mobius.components._paged_attention import PagedAttentionState, paged_attention
 from mobius.components._rms_norm import OffsetRMSNorm, RMSNorm
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 
@@ -592,7 +593,18 @@ class Qwen35Attention(nn.Module):
         position_embeddings: tuple,
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
+        paged_state: PagedAttentionState | None = None,
     ):
+        if paged_state is not None:
+            if past_key_value is not None or static_cache is not None:
+                raise ValueError(
+                    "Paged attention state cannot be combined with dense cache state"
+                )
+            return self.forward_paged(op, hidden_states, position_embeddings, paged_state)
+        if isinstance(past_key_value, PagedAttentionState):
+            raise TypeError(
+                "PagedAttentionState must be passed through paged_state, not past_key_value"
+            )
         # Q projection (doubled) → split into Q and gate per head
         q_gate = self.q_proj(op, hidden_states)
         # Reshape to per-head view so split separates Q/gate within each head
@@ -650,3 +662,59 @@ class Qwen35Attention(nn.Module):
 
         attn_output = self.o_proj(op, attn_output)
         return attn_output, (present_key, present_value)
+
+    def forward_paged(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        position_embeddings: tuple,
+        state: PagedAttentionState,
+    ):
+        """Packed Qwen attention with external Q/K norm and partial M-RoPE."""
+        q_gate = self.q_proj(op, hidden_states)
+        q_gate = op.Reshape(q_gate, [-1, self.num_attention_heads, self.head_dim * 2])
+        query_states, gate = op.Split(q_gate, num_outputs=2, axis=-1, _outputs=2)
+        key_states = op.Reshape(
+            self.k_proj(op, hidden_states), [-1, self.num_key_value_heads, self.head_dim]
+        )
+        value_states = self.v_proj(op, hidden_states)
+
+        query_states = self.q_norm(op, query_states)
+        key_states = self.k_norm(op, key_states)
+        # RotaryEmbedding's rank-3 ABI is (batch,sequence,hidden), not (N,H,D).
+        # A singleton batch is safe here: only RoPE, never attention, sees it.
+        query_states = op.Reshape(
+            query_states, [1, -1, self.num_attention_heads * self.head_dim]
+        )
+        key_states = op.Reshape(key_states, [1, -1, self.num_key_value_heads * self.head_dim])
+        position_embeddings = tuple(op.Unsqueeze(x, [0]) for x in position_embeddings)
+        query_states = apply_rotary_pos_emb(
+            op,
+            query_states,
+            position_embeddings,
+            self.num_attention_heads,
+            self.rotary_embedding_dim,
+            self._rope_interleave,
+        )
+        key_states = apply_rotary_pos_emb(
+            op,
+            key_states,
+            position_embeddings,
+            self.num_key_value_heads,
+            self.rotary_embedding_dim,
+            self._rope_interleave,
+        )
+        query_states = op.Reshape(query_states, [-1, self.num_attention_heads * self.head_dim])
+        key_states = op.Reshape(key_states, [-1, self.num_key_value_heads * self.head_dim])
+        output, key_cache, value_cache = paged_attention(
+            op,
+            query_states,
+            key_states,
+            value_states,
+            state,
+            num_heads=self.num_attention_heads,
+            kv_num_heads=self.num_key_value_heads,
+        )
+        q_width = self.num_attention_heads * self.head_dim
+        output = op.Mul(output, op.Sigmoid(op.Reshape(gate, [-1, q_width])))
+        return self.o_proj(op, output), (key_cache, value_cache)

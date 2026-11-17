@@ -77,12 +77,15 @@ def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTas
         Gemma4Task,
         Gemma4TextCausalLMTask,
         HybridCausalLMTask,
+        PagedHybridCausalLMTask,
     )
 
     if task == "text-generation":
         return CausalLMTask(prune_prefill_prefix=True)
     if task == "hybrid-text-generation":
         return HybridCausalLMTask(prune_prefill_prefix=True)
+    if task == "paged-hybrid-text-generation":
+        return PagedHybridCausalLMTask(prune_prefill_prefix=True)
     if task == "gemma4-text-generation":
         return Gemma4TextCausalLMTask(prune_prefill_prefix=True)
     if task == "gemma4":
@@ -95,6 +98,11 @@ def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTas
         )
     if isinstance(task, HybridCausalLMTask):
         return HybridCausalLMTask(prune_prefill_prefix=True)
+    if isinstance(task, PagedHybridCausalLMTask):
+        return PagedHybridCausalLMTask(
+            paged_block_size=task._paged_block_size,
+            prune_prefill_prefix=True,
+        )
     if isinstance(task, Gemma4TextCausalLMTask):
         return Gemma4TextCausalLMTask(
             static_cache=getattr(task, "_static_cache", False),
@@ -109,7 +117,8 @@ def _enable_prefill_prefix_pruning_task(task: str | ModelTask) -> str | ModelTas
         )
     raise ValueError(
         "prune_prefill_prefix=True is only supported for text-generation, "
-        "hybrid-text-generation, gemma4-text-generation, and gemma4 tasks."
+        "hybrid-text-generation, paged-hybrid-text-generation, "
+        "gemma4-text-generation, and gemma4 tasks."
     )
 
 
@@ -169,6 +178,29 @@ def build_from_module(
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)
     resolved_task = get_task(task)
+    from mobius.tasks import PagedHybridCausalLMTask
+
+    if (
+        getattr(config, "export_paged_attention", False)
+        and getattr(config, "model_type", None) == "qwen3_5_text"
+        and not isinstance(resolved_task, PagedHybridCausalLMTask)
+    ):
+        raise ValueError("Qwen paged attention requires PagedHybridCausalLMTask")
+    if isinstance(resolved_task, PagedHybridCausalLMTask):
+        if execution_provider != "cuda":
+            raise ValueError("PagedHybridCausalLMTask requires execution_provider='cuda'")
+        if fp8_kv_cache or kv_cache_scales is not None:
+            raise ValueError("PagedHybridCausalLMTask supports only unquantized KV caches")
+        # Direct task selection must preserve raw native gate precision too,
+        # even when the model was constructed without the feature flag.
+        from mobius.components import GatedDeltaNet
+
+        for child in module.modules():
+            if isinstance(child, GatedDeltaNet):
+                child.A_log._keep_float32 = True
+                child.dt_bias._keep_float32 = True
+    if component_manifest is None:
+        component_manifest = resolved_task.component_manifest()
     component_manifest = configure_component_quantization(
         module,
         config,
