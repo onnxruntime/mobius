@@ -13,6 +13,7 @@ from typing import Any
 import onnx_ir as ir
 from onnxscript import nn
 
+from mobius._build_context import validate_matmul_nbits_accuracy_level
 from mobius._builder import build_from_module, resolve_dtype
 from mobius._component_quantization import (
     attach_hf_component_sources,
@@ -22,6 +23,7 @@ from mobius._component_quantization import (
 from mobius._configs import QuantizedWeightFormat
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
+from mobius._weight_utils import WeightTransform
 from mobius.integrations._weight_loading import (
     _download_weights,
     stream_preprocessed_safetensors_to_model,
@@ -335,6 +337,7 @@ def build_transformers_model(
     keep_quantized: bool = True,
     trust_remote_code: bool = False,
     execution_provider: str = "default",
+    matmul_nbits_accuracy_level: int | None = None,
     trace_optimization: bool = False,
     text_only: bool = False,
     fp8_kv_cache: bool = False,
@@ -359,7 +362,14 @@ def build_transformers_model(
     ``keep_quantized`` preserves supported compressed-tensors checkpoints in
     their native block-weight representation. Set it to ``False`` only to
     request explicit dense reconstruction.
+
+    ``matmul_nbits_accuracy_level`` optionally overrides the accuracy level of
+    every exported ``MatMulNBits`` (0 through 4), independently of weight bit
+    width. ``None`` preserves existing EP defaults. It does not affect
+    ``GatherBlockQuantized`` or requantize weights. PersonaPlex and RE-USE
+    bespoke builders do not support this option.
     """
+    validate_matmul_nbits_accuracy_level(matmul_nbits_accuracy_level)
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 
@@ -376,6 +386,7 @@ def build_transformers_model(
             "output_layer_indices": output_layer_indices is not None,
             "trace_optimization": trace_optimization,
             "dequantize": not keep_quantized,
+            "matmul_nbits_accuracy_level": matmul_nbits_accuracy_level is not None,
             "text_only": text_only,
             "fp8_kv_cache": fp8_kv_cache,
             "kv_cache_scales": kv_cache_scales is not None,
@@ -462,6 +473,7 @@ def build_transformers_model(
             ):
                 raise ValueError("RE-USE checkpoints only support task='speech-enhancement'.")
             unsupported = {
+                "matmul_nbits_accuracy_level": matmul_nbits_accuracy_level is not None,
                 "output_layer_indices": output_layer_indices is not None,
                 "text_only": text_only,
                 "fp8_kv_cache": fp8_kv_cache,
@@ -508,6 +520,7 @@ def build_transformers_model(
             dtype=dtype,
             load_weights=load_weights,
             execution_provider=execution_provider,
+            matmul_nbits_accuracy_level=matmul_nbits_accuracy_level,
         )
 
     if input_sampling_rate is not None or bwe_sampling_rate is not None:
@@ -664,6 +677,7 @@ def build_transformers_model(
         config,
         task,
         execution_provider=execution_provider,
+        matmul_nbits_accuracy_level=matmul_nbits_accuracy_level,
         trace_optimization=trace_optimization,
         fp8_kv_cache=fp8_kv_cache,
         kv_cache_scales=kv_cache_scales,
@@ -757,6 +771,7 @@ def build_transformers_model(
                 keep_quantized=keep_quantized,
             )
         else:
+            weight_transforms: dict[str, WeightTransform] = {}
             if dequantize_gptoss_mxfp4:
                 logger.warning(
                     "Explicit dense GPT-OSS MXFP4 reconstruction eagerly loads and "
@@ -779,6 +794,7 @@ def build_transformers_model(
                     state_dict,
                     config=config,
                     manifest=component_manifest,
+                    weight_transforms=weight_transforms,
                 )
             state_dict = normalize_component_quantized_weights(
                 state_dict,
@@ -791,8 +807,14 @@ def build_transformers_model(
             package.apply_weights(
                 state_dict,
                 prefix_map=getattr(model_module, "weight_prefix_map", None),
+                weight_transforms=weight_transforms,
             )
         validate_quantized_component_bindings(package, config)
+    if execution_provider == "onnx-standard":
+        from mobius._optimizations import validate_standard_onnx
+
+        for name, model in package.items():
+            validate_standard_onnx(model, component=name)
     return package
 
 

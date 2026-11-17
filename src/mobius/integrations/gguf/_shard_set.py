@@ -476,6 +476,12 @@ class GgufShardSet:
             raise KeyError(f"Tensor {name!r} not found in split set.")
         return shard.tensor_storage_range(name)
 
+    def tensor_source_model(self, name: str) -> GGUFModel:
+        """Return the original shard owning a tensor."""
+        if name not in self._owner:
+            raise KeyError(f"Tensor {name!r} not found in split set.")
+        return self._owner[name]
+
     def _tensor_source(self, name: str) -> tuple[Callable[[int, int], bytes], int, Any]:
         """Return the owning pinned range reader, data offset, and tensor record."""
         shard = self._owner.get(name)

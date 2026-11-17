@@ -10,6 +10,8 @@ import pytest
 import mobius
 from mobius._inspect import (
     ComponentInfo,
+    SharedWeightEndpoint,
+    SharedWeightInfo,
     _get_hf_component_sources,
     _resolve_task_model_type_and_config,
     inspect_components,
@@ -98,6 +100,112 @@ def test_qwen3_vl_returns_hf_source_paths(monkeypatch):
     )
     assert components["vision_encoder"].source_paths == ("model.visual",)
     assert components["embedding"].source_paths == ("model.language_model.embed_tokens",)
+
+
+def test_gemma4_reports_cross_component_tied_word_embeddings(monkeypatch):
+    _patch_autoconfig(
+        monkeypatch,
+        SimpleNamespace(
+            model_type="gemma4",
+            tie_word_embeddings=True,
+            text_config=SimpleNamespace(tie_word_embeddings=True),
+        ),
+    )
+
+    components = {component.name: component for component in inspect_components("fake/gemma4")}
+    shared_weight = SharedWeightInfo(
+        name="word_embeddings",
+        kind="tied_word_embeddings",
+        canonical=SharedWeightEndpoint(
+            component="embedding",
+            parameter="model.language_model.embed_tokens.weight",
+        ),
+        aliases=(
+            SharedWeightEndpoint(
+                component="decoder",
+                parameter="lm_head.weight",
+            ),
+        ),
+    )
+
+    assert components["decoder"].shared_weights == (shared_weight,)
+    assert components["embedding"].shared_weights == (shared_weight,)
+    assert components["vision_encoder"].shared_weights == ()
+    assert components["audio_encoder"].shared_weights == ()
+
+
+@pytest.mark.parametrize(
+    "quantization",
+    [
+        {"tie_word_embeddings": True},
+        SimpleNamespace(tie_word_embeddings=True),
+    ],
+)
+def test_gemma4_inspection_honors_quantization_only_tie(monkeypatch, quantization):
+    _patch_autoconfig(
+        monkeypatch,
+        SimpleNamespace(
+            model_type="gemma4",
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(tie_word_embeddings=False),
+            quantization_config=quantization,
+        ),
+    )
+
+    components = {component.name: component for component in inspect_components("fake/gemma4")}
+
+    assert components["embedding"].shared_weights
+    assert components["decoder"].shared_weights == components["embedding"].shared_weights
+
+
+def test_gemma4_inspection_honors_parsed_quantization_only_tie(monkeypatch):
+    _patch_autoconfig(
+        monkeypatch,
+        SimpleNamespace(
+            model_type="gemma4",
+            tie_word_embeddings=False,
+            text_config=SimpleNamespace(tie_word_embeddings=False),
+            quantization=SimpleNamespace(tie_word_embeddings=True),
+        ),
+    )
+
+    components = {component.name: component for component in inspect_components("fake/gemma4")}
+
+    assert components["decoder"].shared_weights
+
+
+@pytest.mark.parametrize("model_type", ["gemma4", "gemma4_unified"])
+@pytest.mark.parametrize(
+    ("parent_tie", "text_tie", "expected"),
+    [
+        (True, False, False),
+        (False, True, True),
+        (True, None, True),
+        (False, None, False),
+    ],
+)
+def test_gemma4_inspection_respects_text_tie_precedence(
+    monkeypatch, model_type, parent_tie, text_tie, expected
+):
+    from mobius._configs import Gemma4Config
+
+    hf_config = SimpleNamespace(
+        model_type=model_type,
+        tie_word_embeddings=parent_tie,
+        text_config=SimpleNamespace(model_type="gemma4_text", tie_word_embeddings=text_tie),
+    )
+    _patch_autoconfig(monkeypatch, hf_config)
+
+    components = {component.name: component for component in inspect_components("fake/gemma4")}
+
+    assert bool(components["decoder"].shared_weights) is expected
+    assert components["decoder"].shared_weights == components["embedding"].shared_weights
+    assert (
+        Gemma4Config.from_transformers(
+            hf_config.text_config, parent_config=hf_config
+        ).tie_word_embeddings
+        is expected
+    )
 
 
 def test_qwen3_tts_embedders_return_shared_hf_source_paths(monkeypatch):

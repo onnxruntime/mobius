@@ -100,13 +100,16 @@ class QuantizationConfig:
     # Full HuggingFace module paths (including descendants) or ``re:``-prefixed
     # full-match regexes that remain floating point inside this component.
     modules_to_not_convert: tuple[str, ...] = ()
-    # The same path/regex matching rules apply to per-module overrides.
-    # Insertion order is significant: the first matching override wins.
+    # Generic component collapse treats a plain path as a subtree. Producer-
+    # specific adapters may apply stricter matching (Olive uses literal
+    # equality); insertion order remains significant in either case.
     overrides: dict[str, QuantizationOverride] = dataclasses.field(default_factory=dict)
     # Keep this field last: QuantizationConfig has historically supported
     # positional construction, so inserting a field earlier would silently
     # change the meaning of existing callers' arguments.
     weight_format: QuantizedWeightFormat = QuantizedWeightFormat.INTEGER_AFFINE
+    # Olive explicitly opts fused expert tensors into native QMoE packing.
+    quantize_moe: bool = False
 
     def __post_init__(self) -> None:
         """Normalize serialized enum values without inferring storage semantics."""
@@ -248,6 +251,7 @@ class QuantizationConfig:
             quantize_embeddings=bool(qc.get("embeds")),
             quantize_lm_head=bool(qc.get("lm_head")),
             quantize_vision=bool(qc.get("quantize_vision")),
+            quantize_moe=bool(qc.get("quantize_moe", qc.get("moe", False))),
             tie_word_embeddings=bool(qc.get("tie_word_embeddings")),
             modules_to_not_convert=exclusions,
             overrides=overrides,

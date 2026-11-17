@@ -69,8 +69,9 @@ _LOSSY_TARGET_ARTIFACTS: tuple[dict[str, object], ...] = (
             "Q8_0": 15,
         },
         "disposition": (
-            "keep_quantized produces INT4 affine block-32 target storage with "
-            "source_fidelity=false; the output must not be labeled Q4_K_M"
+            "The former lossy INT4 normalization route is removed. Use "
+            "opset29 original-GGUF external data; full-checkpoint execution "
+            "of this mixed-format artifact is not qualified."
         ),
         "runtime_disposition": (
             "runtime support deferred pending full-logit heterogeneous-state "
@@ -90,20 +91,12 @@ _TRANSFORM_EVIDENCE: dict[str, tuple[str, ...]] = {
             "TestRepackQ40::test_nibble_ordering_reordered",
         ),
         _test_ref(
-            "src/mobius/integrations/gguf/_repacker_test.py",
-            "TestRepackQ41::test_zp_clamped_to_15",
+            "src/mobius/integrations/gguf/_packed_test.py",
+            "test_all_stored_reader_formats",
         ),
         _test_ref(
             "src/mobius/integrations/gguf/_repacker_test.py",
             "TestRepackQ80::test_int8_to_uint8_conversion",
-        ),
-        _test_ref(
-            "src/mobius/integrations/gguf/_repacker_test.py",
-            "TestRepackQ4K::test_requantized_values_stay_within_half_scale",
-        ),
-        _test_ref(
-            "src/mobius/integrations/gguf/_repacker_test.py",
-            "TestRepackQ6K::test_dequantization_matches_gguf_reference_exactly",
         ),
         _test_ref(
             "src/mobius/integrations/gguf/_repacker_test.py",
@@ -120,8 +113,8 @@ _TRANSFORM_EVIDENCE: dict[str, tuple[str, ...]] = {
             "test_quantized_minicpm_loader_permutes_packed_rows_scales_and_zero_points",
         ),
         _test_ref(
-            "src/mobius/integrations/gguf/_kimi_k3_test.py",
-            "test_fused_kv_b_float_values_and_quantized_import",
+            "src/mobius/integrations/gguf/_packed_test.py",
+            "test_packed_next_token_matches_float_source",
         ),
     ),
     "transpose-and-concat": (
@@ -169,24 +162,11 @@ def _transform(
     if route is QuantImportRoute.NATIVE_BYTES:
         return "mobius.integrations.gguf._repacker.preserve_native_blocks"
     if route is QuantImportRoute.AFFINE_REPACK:
-        if qtype_name == "Q4_1":
-            return (
-                "mobius.integrations.gguf._repacker.repack_gguf_tensor -> "
-                "_repack_q4_1 (rounded integer zero point)"
-            )
-        if qtype_name in {"Q4_K", "Q6_K"}:
-            return (
-                "mobius.integrations.gguf._repacker.repack_gguf_tensor -> "
-                f"_repack_{qtype_name.lower()} -> repack_dequantized_tensor"
-            )
         if exactness is RepackExactness.LOSSY:
-            raise ValueError(f"{qtype_name} has no declared lossy affine transform")
+            raise ValueError(f"{qtype_name} has no lossless affine transform; use opset29.")
         return "mobius.integrations.gguf._repacker.repack_gguf_tensor"
     if route is QuantImportRoute.DEQUANTIZE_REQUANTIZE:
-        return (
-            "mobius.integrations.gguf._reader.GGUFModel.dequantize_raw_tensor -> "
-            "mobius.integrations.gguf._repacker.repack_dequantized_tensor"
-        )
+        raise ValueError("Lossy GGUF requantization routes were removed; use opset29.")
     if route is QuantImportRoute.DEQUANTIZE_FLOAT:
         return "mobius.integrations.gguf._reader.GGUFModel.dequantize_raw_tensor"
     return None

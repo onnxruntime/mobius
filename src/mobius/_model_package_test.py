@@ -20,8 +20,8 @@ from mobius._configs import VisionConfig
 from mobius._export_report import ComponentExportDisposition, ComponentExportReport
 from mobius._model_package import (
     ModelPackage,
+    _anonymized_intermediate_symbolic_dimensions,
     _make_progress_callback,
-    _namespaced_symbolic_dimensions,
     _save_safetensors,
 )
 from mobius._testing import make_config
@@ -1328,7 +1328,10 @@ class TestModelPackageSaveLoad:
         loaded = ModelPackage.load(str(tmp_path))
         assert loaded.policy_components["sample"].contract_id == "onnx-genai.token-sampler@1"
 
-    def test_save_namespaces_component_symbols_without_mutating_package(self, tmp_path):
+    @pytest.mark.parametrize("component_names", [("decoder",), ("decoder", "encoder")])
+    def test_save_preserves_component_symbols_without_mutating_package(
+        self, tmp_path, component_names
+    ):
         input_value = ir.Value(
             name="input",
             type=ir.TensorType(ir.DataType.FLOAT),
@@ -1357,23 +1360,34 @@ class TestModelPackageSaveLoad:
             ),
             ir_version=10,
         )
-        pkg = ModelPackage({"decoder": model})
+        pkg = ModelPackage({name: model.clone() for name in component_names})
+        original_shapes = [
+            (value, value.shape)
+            for component in pkg.values()
+            for value in (
+                *component.graph.inputs,
+                *component.graph.outputs,
+                *(node.outputs[0] for node in component.graph),
+            )
+        ]
 
         pkg.save(str(tmp_path))
 
-        saved = ir.load(tmp_path / "model.onnx")
-        assert [str(dimension) for dimension in saved.graph.inputs[0].shape] == [
-            "component.decoder.batch",
-            "component.decoder.sequence",
-        ]
-        assert saved.graph.inputs[0].shape.get_denotation(0) == "DATA_BATCH"
-        assert all(
-            dimension.value is None for dimension in next(iter(saved.graph)).outputs[0].shape
+        loaded = ModelPackage.load(str(tmp_path))
+        assert set(loaded) == (
+            {"model"} if len(component_names) == 1 else set(component_names)
         )
-        assert [str(dimension) for dimension in model.graph.inputs[0].shape] == [
-            "batch",
-            "sequence",
-        ]
+        for saved in loaded.values():
+            for value in (*saved.graph.inputs, *saved.graph.outputs):
+                assert [str(dimension) for dimension in value.shape] == ["batch", "sequence"]
+            assert saved.graph.inputs[0].shape.get_denotation(0) == "DATA_BATCH"
+            assert all(
+                dimension.value is None
+                for dimension in next(iter(saved.graph)).outputs[0].shape
+            )
+        for value, shape in original_shapes:
+            assert value.shape is shape
+            assert [str(dimension) for dimension in value.shape] == ["batch", "sequence"]
 
     def test_save_anonymizes_nested_graph_intermediate_symbols(self):
         condition = ir.Value(
@@ -1421,7 +1435,7 @@ class TestModelPackageSaveLoad:
             ir_version=10,
         )
 
-        with _namespaced_symbolic_dimensions(model, "component.decoder"):
+        with _anonymized_intermediate_symbolic_dimensions(model):
             assert all(dimension.value is None for dimension in branch_output.shape)
 
         assert str(branch_output.shape[1]) == "branch_sequence"
@@ -1440,6 +1454,107 @@ class TestModelPackageSaveLoad:
 
 
 class TestModelPackageApplyWeights:
+    @pytest.mark.parametrize("second_has_initializer", [False, True])
+    def test_weight_transform_accounting_separates_component_local_names(
+        self, second_has_initializer
+    ):
+        values = {}
+        models = {}
+        for component in ("text", "vision"):
+            graph = ir.Graph([], [], nodes=[], name=component)
+            if component == "text" or second_has_initializer:
+                value = ir.Value(
+                    name="weight",
+                    type=ir.TensorType(ir.DataType.FLOAT),
+                    shape=ir.Shape([2, 3]),
+                    const_value=ir.tensor(torch.zeros(2, 3)),
+                )
+                graph.register_initializer(value)
+                values[component] = value
+            models[component] = ir.Model(graph, ir_version=10)
+        package = ModelPackage(models)
+        weights = {"text.weight": torch.zeros(2, 3), "vision.weight": torch.ones(2, 3)}
+        transforms = {
+            "text.weight": lambda tensor: tensor + 2,
+            "vision.weight": lambda tensor: tensor + 3,
+        }
+        if not second_has_initializer:
+            with pytest.raises(ValueError, match=r"not bound.*vision\.weight"):
+                package.apply_weights(
+                    weights,
+                    prefix_map={"text.": "text", "vision.": "vision"},
+                    weight_transforms={"vision.weight": transforms["vision.weight"]},
+                    fold_constants=False,
+                )
+        else:
+            package.apply_weights(
+                weights,
+                prefix_map={"text.": "text", "vision.": "vision"},
+                weight_transforms=transforms,
+                fold_constants=False,
+            )
+            for component in ("text", "vision"):
+                actual = torch.from_numpy(values[component].const_value.numpy())
+                expected = transforms[component + ".weight"](weights[component + ".weight"])
+                assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("routed", [False, True])
+    def test_weight_transforms_are_lazy_and_follow_prefix_routing(self, routed):
+        value = ir.Value(
+            name="weight",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([2, 3]),
+            const_value=ir.tensor(torch.zeros(2, 3)),
+        )
+        graph = ir.Graph([], [], nodes=[], name="text")
+        graph.register_initializer(value)
+        package = ModelPackage(
+            {"text": ir.Model(graph, ir_version=10), "other": _make_simple_model()}
+        )
+        calls = []
+        source = torch.arange(6).reshape(2, 3).float()
+
+        def transform(tensor):
+            calls.append(tensor.data_ptr())
+            return tensor + 1
+
+        name = "text.weight" if routed else "weight"
+        package.apply_weights(
+            {name: source},
+            prefix_map={"text.": "text"} if routed else None,
+            weight_transforms={name: transform},
+            fold_constants=False,
+        )
+        assert calls == []
+        assert isinstance(value.const_value, ir.LazyTensor)
+        assert not value.const_value.cache
+        for count in (1, 2):
+            assert torch.equal(torch.from_numpy(value.const_value.numpy()), source + 1)
+            assert len(calls) == count
+
+    def test_unbound_weight_transform_raises(self):
+        package = ModelPackage({"model": _make_simple_model()})
+        with pytest.raises(ValueError, match="Weight transforms were not bound"):
+            package.apply_weights({}, weight_transforms={"missing": lambda tensor: tensor})
+
+    def test_weight_transform_changed_shape_raises(self):
+        value = ir.Value(
+            name="weight",
+            type=ir.TensorType(ir.DataType.FLOAT),
+            shape=ir.Shape([2, 3]),
+            const_value=ir.tensor(torch.zeros(2, 3)),
+        )
+        graph = ir.Graph([], [], nodes=[], name="model")
+        graph.register_initializer(value)
+        package = ModelPackage({"model": ir.Model(graph, ir_version=10)})
+        package.apply_weights(
+            {"weight": torch.zeros(2, 3)},
+            weight_transforms={"weight": lambda tensor: tensor.reshape(3, 2)},
+            fold_constants=False,
+        )
+        with pytest.raises(ValueError, match="changed shape"):
+            value.const_value.numpy()
+
     def test_single_component(self):
         config = make_config()
         module = CausalLMModel(config)
@@ -1476,6 +1591,26 @@ class TestModelPackageApplyWeights:
             prefix_map={"text.": "text", "vision_encoder.": "vision_encoder"},
         )
         assert model1.graph.initializers[init_name].const_value is not None
+
+    def test_prefix_routes_report_colliding_stripped_names(self):
+        config = make_config()
+        pkg1 = build_from_module(CausalLMModel(config), config)
+        pkg2 = build_from_module(CausalLMModel(config), config)
+        model1 = pkg1["model"]
+        model2 = pkg2["model"]
+        pkg = ModelPackage({"text": model1, "vision": model2})
+
+        init_name = next(iter(model1.graph.initializers.keys()))
+        shape = list(model1.graph.initializers[init_name].shape)
+        applied = pkg.apply_weights(
+            {
+                f"text.{init_name}": torch.ones(shape),
+                f"vision.{init_name}": torch.zeros(shape),
+            },
+            prefix_map={"text.": "text", "vision.": "vision"},
+        )
+
+        assert applied == {f"text.{init_name}", f"vision.{init_name}"}
 
 
 class TestBuildPackageFromModule:
