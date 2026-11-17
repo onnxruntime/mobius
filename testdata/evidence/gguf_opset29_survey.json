@@ -1,0 +1,2919 @@
+{
+  "schema_version": 1,
+  "scope": "Pinned Mobius/llama.cpp architecture census and active stored codecs; not every public HuggingFace checkpoint.",
+  "sources": {
+    "architecture_census_llama_cpp": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+    "onnx_schema_version": "1.24.0",
+    "onnx_main_inspected": "c7609c4ad5445c548e0e18a465666dd0f4084215",
+    "onnx_shape_inference_main": "842eee99f5a3abd84fb03df0fc82ff744c7c168e",
+    "latest_llama_cpp_inspected": "75fd7f9ec95b64aef628a709c18cbd4fcbd732cf"
+  },
+  "format_tests": [
+    {
+      "name": "Q4_0",
+      "gguf_type_id": 2,
+      "block_elements": 32,
+      "block_bytes": 18,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q4_1",
+      "gguf_type_id": 3,
+      "block_elements": 32,
+      "block_bytes": 20,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q5_0",
+      "gguf_type_id": 6,
+      "block_elements": 32,
+      "block_bytes": 22,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q5_1",
+      "gguf_type_id": 7,
+      "block_elements": 32,
+      "block_bytes": 24,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q8_0",
+      "gguf_type_id": 8,
+      "block_elements": 32,
+      "block_bytes": 34,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q2_K",
+      "gguf_type_id": 10,
+      "block_elements": 256,
+      "block_bytes": 84,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q3_K",
+      "gguf_type_id": 11,
+      "block_elements": 256,
+      "block_bytes": 110,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q4_K",
+      "gguf_type_id": 12,
+      "block_elements": 256,
+      "block_bytes": 144,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q5_K",
+      "gguf_type_id": 13,
+      "block_elements": 256,
+      "block_bytes": 176,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q6_K",
+      "gguf_type_id": 14,
+      "block_elements": 256,
+      "block_bytes": 210,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ2_XXS",
+      "gguf_type_id": 16,
+      "block_elements": 256,
+      "block_bytes": 66,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ2_XS",
+      "gguf_type_id": 17,
+      "block_elements": 256,
+      "block_bytes": 74,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ3_XXS",
+      "gguf_type_id": 18,
+      "block_elements": 256,
+      "block_bytes": 98,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ1_S",
+      "gguf_type_id": 19,
+      "block_elements": 256,
+      "block_bytes": 50,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ4_NL",
+      "gguf_type_id": 20,
+      "block_elements": 32,
+      "block_bytes": 18,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ3_S",
+      "gguf_type_id": 21,
+      "block_elements": 256,
+      "block_bytes": 110,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ2_S",
+      "gguf_type_id": 22,
+      "block_elements": 256,
+      "block_bytes": 82,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ4_XS",
+      "gguf_type_id": 23,
+      "block_elements": 256,
+      "block_bytes": 136,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "IQ1_M",
+      "gguf_type_id": 29,
+      "block_elements": 256,
+      "block_bytes": 56,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "TQ1_0",
+      "gguf_type_id": 34,
+      "block_elements": 256,
+      "block_bytes": 54,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "TQ2_0",
+      "gguf_type_id": 35,
+      "block_elements": 256,
+      "block_bytes": 66,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "MXFP4",
+      "gguf_type_id": 39,
+      "block_elements": 32,
+      "block_bytes": 17,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "NVFP4",
+      "gguf_type_id": 40,
+      "block_elements": 64,
+      "block_bytes": 36,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    },
+    {
+      "name": "Q1_0",
+      "gguf_type_id": 41,
+      "block_elements": 128,
+      "block_bytes": 18,
+      "fixture_file_external_ranges_checker_independent_decode": "passed",
+      "full_checkpoint_runtime": "not-tested"
+    }
+  ],
+  "additional_stored_format": {
+    "name": "Q2_0",
+    "gguf_type_id": 42,
+    "onnx_schema": "present",
+    "installed_gguf_reader": "missing enum",
+    "new_file_importer_test": "blocked"
+  },
+  "reduced_model_parity": {
+    "llama": "prefill and two cached chunks, logits and KV outputs",
+    "qwen2moe": "prefill and two cached chunks, shared expert/routing and KV outputs",
+    "qwen3moe": "prefill and two cached chunks, GroupedMatMul routing and KV outputs",
+    "references": "independently decoded dense ONNX reference and dense-source ORT",
+    "packed_ort_execution": "not available: installed ORT has no required opset29 kernels"
+  },
+  "architecture_probe": {
+    "universe": "At most five <=1 MiB real GGUF fixtures per architecture created by the network-free GGUF test suite; no Hub weights.",
+    "architecture_count": 78,
+    "passed_count": 37,
+    "results": [
+      {
+        "architecture": "arcee",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "arcee-q4_0.gguf",
+            "size": 149024,
+            "sha256": "7f9899a2c3d8bd1829f1cf9c755d77e8c293e12dd646ec1349d22140a917a578",
+            "result": "graph-and-checker-passed",
+            "nodes": 47,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "bailingmoe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "bailingmoe-q4_0.gguf",
+            "size": 119744,
+            "sha256": "bb9423348d046fbb7127facf0ba6caf3a26aa71dd57edf60c06927b3f36dc663",
+            "result": "graph-and-checker-passed",
+            "nodes": 138,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "bailingmoe3",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "bailingmoe3.gguf",
+            "size": 153760,
+            "sha256": "f00c81d3a5379e38478e865844ebf0333073cd556cc5c756b9b08390b667a284",
+            "result": "blocked",
+            "error": "GGUF architecture 'bailingmoe3' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_0\\\\bailingmoe3.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. BailingMoE3 alternates head-wise KDA recurrent layers with gated MLA layers, so each sequence carries three causal-convolution histories plus a matrix state alongside attention cache. Its routed sigmoid/correction-bias experts, always-on shared experts, and optional single NextN block also require tensor and task contracts Mobius does not implement. Ordinary KV or Mamba state would be wrong. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "bert",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "bert-invalid-fused-qkv.gguf",
+            "size": 30496,
+            "sha256": "b5199719607697a3f58e007dd67edaf969e35f021438cc4e160f25c5f2cde72a",
+            "result": "blocked",
+            "error": "Quantized fused BERT attn_qkv.weight cannot be split losslessly; use a GGUF with split Q/K/V tensors or float fused QKV"
+          },
+          {
+            "filename": "bert-fused-qkv-mixed.gguf",
+            "size": 72736,
+            "sha256": "fc2f692f2239738f6851254cc4c696d55061904df5352f6c88f177ebcc4d34dc",
+            "result": "graph-and-checker-passed",
+            "nodes": 72,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "chameleon",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "chameleon.gguf",
+            "size": 153760,
+            "sha256": "8960df9602f8de40d034f8944ac6c954d790b18b084b40bf391abdf25bb81df3",
+            "result": "blocked",
+            "error": "GGUF architecture 'chameleon' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_3\\\\chameleon.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The pinned Chameleon converter deliberately omits the VQ image tokenizer while the text graph still requires bias-bearing Q/K norms, an additional swin_norm, and image-vocabulary logit suppression. Mobius's similarly named Hugging Face VLM graph does not prove that text-only GGUF contract, and full multimodal generation cannot be reconstructed from the serialized file. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "clip",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "mmproj-00001-of-00002.gguf",
+            "size": 256,
+            "sha256": "0997d4cd737c94a579dfc467f0309ace50dd94417d3d9cf611127c0949128f40",
+            "result": "blocked",
+            "error": "Incomplete GGUF split set 'mmproj': declared 2 shards but 1 missing (indices ['00002']). Fetch the whole set before building."
+          },
+          {
+            "filename": "mmproj-quantized-patch.gguf",
+            "size": 512,
+            "sha256": "267ad2a65d0dad0436745eb6abe4f7c47df3491500fa430e21ff1133b275ab5e",
+            "result": "blocked",
+            "error": "Direct GGUF conversion for architecture 'clip' is intentionally disabled for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_quantized_mmproj_tensor_d0\\\\mmproj-quantized-patch.gguf'. This is a multimodal projector sidecar, not a language model. Upstream it is a quant-only stub whose runtime lives outside libllama. Pass it to `build_from_gguf(text_gguf, mmproj=...)` alongside its text backbone rather than building it directly. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "janus.gguf",
+            "size": 5472,
+            "sha256": "d4e649a37370ef4538016f912b230b3d99cdaa8c8552debde6413bd204d79294",
+            "result": "blocked",
+            "error": "Direct GGUF conversion for architecture 'clip' is intentionally disabled for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_public_standalone_dispatc0\\\\janus.gguf'. This is a multimodal projector sidecar, not a language model. Upstream it is a quant-only stub whose runtime lives outside libllama. Pass it to `build_from_gguf(text_gguf, mmproj=...)` alongside its text backbone rather than building it directly. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "gemma4u.gguf",
+            "size": 12192,
+            "sha256": "49fdf1b194fdd0fd69b6653fce9b9138631b5989b0ae438c8a51f530eb68be2c",
+            "result": "blocked",
+            "error": "Direct GGUF conversion for architecture 'clip' is intentionally disabled for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_gemma4_unified_roles_buil0\\\\gemma4u.gguf'. This is a multimodal projector sidecar, not a language model. Upstream it is a quant-only stub whose runtime lives outside libllama. Pass it to `build_from_gguf(text_gguf, mmproj=...)` alongside its text backbone rather than building it directly. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "gemma4u.gguf",
+            "size": 12192,
+            "sha256": "49fdf1b194fdd0fd69b6653fce9b9138631b5989b0ae438c8a51f530eb68be2c",
+            "result": "blocked",
+            "error": "Direct GGUF conversion for architecture 'clip' is intentionally disabled for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_gemma4_unified_roles_buil1\\\\gemma4u.gguf'. This is a multimodal projector sidecar, not a language model. Upstream it is a quant-only stub whose runtime lives outside libllama. Pass it to `build_from_gguf(text_gguf, mmproj=...)` alongside its text backbone rather than building it directly. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "cogvlm",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "cogvlm.gguf",
+            "size": 153728,
+            "sha256": "80a09b580e01d202620a5f59cb4c6563ef32d5e79a93eed28efa1e3863f9bdfa",
+            "result": "blocked",
+            "error": "GGUF architecture 'cogvlm' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_4\\\\cogvlm.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The pinned CogVLM text graph has modality-routed visual-expert Q/K/V/output and FFN banks in addition to the language projections. Its required cogvlm clip sidecar and feature-selection contract are also deferred, so aliasing a generic LLaVA or Llama graph would drop model-owned tensors and build the wrong package. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "cohere2",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "cohere2-q4_0.gguf",
+            "size": 87936,
+            "sha256": "6b4659a765da4a3181dc35676b44873ff76330e8c4590c841fce75a846238d7a",
+            "result": "graph-and-checker-passed",
+            "nodes": 54,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "deepseek",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "deepseek-tied-q4.gguf",
+            "size": 54112,
+            "sha256": "b6f448e7e069c6f9df5109f3e4d4d5874f7573cf01e22d38b1cfa927bfb95b8a",
+            "result": "graph-and-checker-passed",
+            "nodes": 131,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "deepseek2-ocr",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "deepseek2-ocr.gguf",
+            "size": 153792,
+            "sha256": "8495328f8e938cce18a826d081881f85095c242cd7fe3f3ed7507fad9bb6d5db",
+            "result": "blocked",
+            "error": "GGUF architecture 'deepseek2-ocr' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_5\\\\deepseek2-ocr.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. DeepSeek-OCR2 is a paired text-plus-vision package, not a generic DeepSeek text model. The text loader, deepseekocr/deepseekocr2 clip sidecars, SAM/projector stages, special token mixing, and cache contract have no single suffix-exact Mobius ownership map. Existing Hugging Face components therefore cannot justify partial GGUF construction. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "deepseek4",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "deepseek4.gguf",
+            "size": 153760,
+            "sha256": "a77a1be15c210afd57e57fcf97a9aaa5a14625745c5893b053f079c7e4e487f2",
+            "result": "blocked",
+            "error": "GGUF architecture 'deepseek4' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_1\\\\deepseek4.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The pinned DeepSeek-V4 GGUF runtime uses a dedicated raw sliding-window, CSA, HCA, and indexer compressed-cache ABI with persistent compressor state, rollback snapshots, four-stream hyper-connections, hash/sqrt-softplus routing, and optional MTP storage. Mobius's Hugging Face DeepSeek-V4 graph intentionally exports a dense attention fallback with ordinary KV state, so it is not an exact GGUF runtime graph. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "dflash",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "dflash-True.gguf",
+            "size": 31392,
+            "sha256": "af28b4278e038712b7eb21f23dcc3a799c33b5c6965f3e6ec6857cd4c0ce9419",
+            "result": "blocked",
+            "error": "dflash GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          },
+          {
+            "filename": "dflash.gguf",
+            "size": 200320,
+            "sha256": "28fec663237bc41283826ba11358416f99db30701c808520296c0a9aa444ca7d",
+            "result": "blocked",
+            "error": "dflash GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          },
+          {
+            "filename": "dflash.gguf",
+            "size": 200352,
+            "sha256": "6fcb8e36f0858ef9575e56a840a6e20ed80c536366fb1002bc8e5bf75130b3a5",
+            "result": "blocked",
+            "error": "dflash GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          },
+          {
+            "filename": "dflash.gguf",
+            "size": 200352,
+            "sha256": "6fcb8e36f0858ef9575e56a840a6e20ed80c536366fb1002bc8e5bf75130b3a5",
+            "result": "blocked",
+            "error": "dflash GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          },
+          {
+            "filename": "dflash.gguf",
+            "size": 200352,
+            "sha256": "6fcb8e36f0858ef9575e56a840a6e20ed80c536366fb1002bc8e5bf75130b3a5",
+            "result": "blocked",
+            "error": "dflash GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "dots1",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "dots1-q4_0.gguf",
+            "size": 122240,
+            "sha256": "cf7b85fa1cdbb3c58f321fc6d569f297b96785841b8f2244f24fb35b874f16ec",
+            "result": "graph-and-checker-passed",
+            "nodes": 111,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "dream",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "dream-q4_0.gguf",
+            "size": 41120,
+            "sha256": "edaa76c9d48e8ebaaf72f31eb9837a7609e99225b1398c114a8c91d65ed25cb2",
+            "result": "graph-and-checker-passed",
+            "nodes": 68,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "eagle3",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "eagle3-True.gguf",
+            "size": 35776,
+            "sha256": "0b0609e5c65f86831eb1b3697334b985665c3d3cac266842bb73912a04e60c51",
+            "result": "blocked",
+            "error": "eagle3 GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          },
+          {
+            "filename": "eagle3-cross-width.gguf",
+            "size": 208320,
+            "sha256": "ddf98f9831d32a10570566c6dc68b96be67ca04541f5319f02f9f5ffdc683c9b",
+            "result": "blocked",
+            "error": "eagle3 GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          },
+          {
+            "filename": "eagle3-cross-width-owned.gguf",
+            "size": 226976,
+            "sha256": "1e9c70044b4e757e24e6063a290ec377b4a54b2c6e74523790408f2a5cbce56f",
+            "result": "blocked",
+            "error": "eagle3 GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          },
+          {
+            "filename": "eagle3-hidden-state-indices.gguf",
+            "size": 232896,
+            "sha256": "8ff9d38bcb6d45e54a5f4da6a99face95e5cbba0237cae041d5c642916264b4d",
+            "result": "blocked",
+            "error": "eagle3 GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          },
+          {
+            "filename": "eagle3-False.gguf",
+            "size": 232896,
+            "sha256": "13905e836a00930bf0824b4cf04c6513cc27aab20422b2503a5ee3dc951e559a",
+            "result": "blocked",
+            "error": "eagle3 GGUF is a speculative draft, not a standalone language model. Pass target_config (CLI: --target-config) for the exact paired target."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "exaone",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "exaone-q4_0.gguf",
+            "size": 153728,
+            "sha256": "7ff50f19be52906f078f6c0c5606ba46d907dc188ec7fa8c0b29704f3833c8c3",
+            "result": "graph-and-checker-passed",
+            "nodes": 44,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "falcon-h1",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "falcon-h1-cli.gguf",
+            "size": 32672,
+            "sha256": "57ff1158fad36b1dd640ef2a3afbda2ad982f826a6794f08047cdc96cd1b1708",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "falcon-h1-q4.gguf",
+            "size": 32672,
+            "sha256": "57ff1158fad36b1dd640ef2a3afbda2ad982f826a6794f08047cdc96cd1b1708",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "falcon-h1-incomplete.gguf",
+            "size": 67232,
+            "sha256": "7bf8e346d06518d1e74d18e02e262cdc7d6d8a7be5b5db2504f146f6bca923d1",
+            "result": "blocked",
+            "error": "Invalid falcon-h1 GGUF tensor closure: missing=['blk.0.ssm_out.weight'], unexpected=[], malformed={}"
+          },
+          {
+            "filename": "falcon-h1-f32.gguf",
+            "size": 71392,
+            "sha256": "43d9f93d5ea2b72d95b6abed54a61eda7578b9650ecede62786ecdb34fefae3d",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "falcon-h1-invalid-decay.gguf",
+            "size": 71392,
+            "sha256": "226d8dd376dd87a8466c8af57acd3829fd2b15d5aca1218884cd9d868c9db2d2",
+            "result": "blocked",
+            "error": "Malformed Falcon-H1 GGUF Mamba decay tensor 'blk.0.ssm_a': ssm_a must contain only finite negative -exp(A_log) values"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "gemma3",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "gemma3.gguf",
+            "size": 160,
+            "sha256": "58b24b6e92ae1f3ce990208d5c26d3b3cd581ea2ef53ed154bdfc76f5c1fb1f7",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma3"
+          },
+          {
+            "filename": "gemma3.gguf",
+            "size": 160,
+            "sha256": "58b24b6e92ae1f3ce990208d5c26d3b3cd581ea2ef53ed154bdfc76f5c1fb1f7",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma3"
+          },
+          {
+            "filename": "gemma3.gguf",
+            "size": 160,
+            "sha256": "58b24b6e92ae1f3ce990208d5c26d3b3cd581ea2ef53ed154bdfc76f5c1fb1f7",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma3"
+          },
+          {
+            "filename": "gemma3.gguf",
+            "size": 160,
+            "sha256": "58b24b6e92ae1f3ce990208d5c26d3b3cd581ea2ef53ed154bdfc76f5c1fb1f7",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma3"
+          },
+          {
+            "filename": "gemma3.gguf",
+            "size": 160,
+            "sha256": "58b24b6e92ae1f3ce990208d5c26d3b3cd581ea2ef53ed154bdfc76f5c1fb1f7",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma3"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "gemma3n",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "gemma3n.gguf",
+            "size": 153728,
+            "sha256": "c88a70b382ccfcb6599dbe00461c6ca6eb503de8572fbb5dfb3f1c80a275b22f",
+            "result": "blocked",
+            "error": "GGUF architecture 'gemma3n' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_6\\\\gemma3n.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. Gemma3n GGUF is the text member of a vision-and-audio package whose gemma3nv and gemma3na clip companions carry distinct encoders and projectors. The text graph's per-layer embeddings, multimodal token replacement, processor assumptions, and package roles have not been validated against those pinned sidecar ABIs. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "gemma4",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "gemma4.gguf",
+            "size": 352,
+            "sha256": "1c52a5e1da2ba7ae7d1d7780a83797ca78e5b7bc21a31c0deefd4477e4f91a58",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma4"
+          },
+          {
+            "filename": "gemma4.gguf",
+            "size": 352,
+            "sha256": "1c52a5e1da2ba7ae7d1d7780a83797ca78e5b7bc21a31c0deefd4477e4f91a58",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma4"
+          },
+          {
+            "filename": "gemma4.gguf",
+            "size": 352,
+            "sha256": "1c52a5e1da2ba7ae7d1d7780a83797ca78e5b7bc21a31c0deefd4477e4f91a58",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma4"
+          },
+          {
+            "filename": "gemma4.gguf",
+            "size": 352,
+            "sha256": "1c52a5e1da2ba7ae7d1d7780a83797ca78e5b7bc21a31c0deefd4477e4f91a58",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma4"
+          },
+          {
+            "filename": "gemma4.gguf",
+            "size": 352,
+            "sha256": "1c52a5e1da2ba7ae7d1d7780a83797ca78e5b7bc21a31c0deefd4477e4f91a58",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: gemma4"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "glm-dsa",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "glm-dsa-static.gguf",
+            "size": 8416,
+            "sha256": "a93060189b09d78891f7a42eb899849bf94ba6a0c7f2edc4ba24b3008719fa22",
+            "result": "blocked",
+            "error": "onnx-standard component 'glm_moe_dsa' at graph/model/layers.0/self_attn/IndexShare_node_120:IndexShare: domain='pkg.nxrt', op='IndexShare', overload='', opset=1 has no standard ONNX schema. Provide a standard-ONNX decomposition before export."
+          },
+          {
+            "filename": "glm-dsa.gguf",
+            "size": 8416,
+            "sha256": "a93060189b09d78891f7a42eb899849bf94ba6a0c7f2edc4ba24b3008719fa22",
+            "result": "blocked",
+            "error": "onnx-standard component 'glm_moe_dsa' at graph/model/layers.0/self_attn/IndexShare_node_120:IndexShare: domain='pkg.nxrt', op='IndexShare', overload='', opset=1 has no standard ONNX schema. Provide a standard-ONNX decomposition before export."
+          },
+          {
+            "filename": "GLM-5.2-UD-IQ1_S-00001-of-00003.gguf",
+            "size": 10912,
+            "sha256": "afc84d3427d44b807056aece34746dd0f4bd7d18ac6650cf303a10eeb89c9419",
+            "result": "blocked",
+            "error": "Malformed glm-dsa GGUF tensor name(s): ['blk.0.attn_q.weight']. The suffixes do not match the pinned llama.cpp tensor creation sites."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "glm_dsa",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "glm_dsa-alias.gguf",
+            "size": 8416,
+            "sha256": "5ab0cfa15c300da90e3b813f81a388fdf1281b2264d0b6bdff21fe961036e4ea",
+            "result": "blocked",
+            "error": "onnx-standard component 'glm_moe_dsa' at graph/model/layers.0/self_attn/IndexShare_node_120:IndexShare: domain='pkg.nxrt', op='IndexShare', overload='', opset=1 has no standard ONNX schema. Provide a standard-ONNX decomposition before export."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "gpt-oss",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "gpt-oss.gguf",
+            "size": 153728,
+            "sha256": "847c05a5fc4abdd39e0b7153e527e361ea00753b18f070fb86a5794f7c49db30",
+            "result": "blocked",
+            "error": "GGUF architecture 'gpt-oss' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_2\\\\gpt-oss.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The pinned GPT-OSS converter splits interleaved gate/up expert rows and repacks checkpoint block+scale tensors into expert-major MXFP4 values. Its loader additionally consumes expert biases, router bias, attention sinks, output bias, post-attention RMSNorm, and sliding-window RoPE metadata. Mobius does not yet own that complete GGUF transform and packed-expert ABI, so partial float or MXFP4 import is deferred. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "granite",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "granite-dense-q4.gguf",
+            "size": 13376,
+            "sha256": "5ef6f8023985086a600924e89d09d17602666fda73451446a099f38c2ccd2292",
+            "result": "graph-and-checker-passed",
+            "nodes": 61,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "granitehybrid",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "granitehybrid-moe-q4.gguf",
+            "size": 72288,
+            "sha256": "6036fb9d227f114e0a2b913b70a98b3b5e0f08292ce500d7331aaebb2ce543f9",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "granitehybrid-moe-invalid.gguf",
+            "size": 76544,
+            "sha256": "1dcec68df903de8bd002513f1f38e6939ae74fe04d7b21ac56d13a911290ef21",
+            "result": "blocked",
+            "error": "GraniteHybrid expert_count and expert_used_count must both be zero or both positive"
+          },
+          {
+            "filename": "granitehybrid-dense-biased.gguf",
+            "size": 77536,
+            "sha256": "80e80edd35f6db683e00d35ba54100ca61209acbb74ba199686d610bcf21251d",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "granitehybrid-moe-invalid.gguf",
+            "size": 89696,
+            "sha256": "7ce04dc301a7a2f8a8f31363431a32b1a54d7fe80bab468ed0bc225e2b0e5736",
+            "result": "blocked",
+            "error": "GraniteHybrid expert_count=1 is not a routed-MoE layout; use the dense shared-MLP tensors"
+          },
+          {
+            "filename": "granitehybrid-moe-no-shared.gguf",
+            "size": 101760,
+            "sha256": "22caa6ac3fcc0c0b4471f1b92a58b6f68d35fa04cff6bef85e3f65beee189003",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "granitemoe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "granitemoe-dense.gguf",
+            "size": 31872,
+            "sha256": "89a5d9d5a84408c61169decc21ea8f10cf54c163e545dbaa7211262ef6a59e84",
+            "result": "graph-and-checker-passed",
+            "nodes": 80,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "grok",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "grok-ungated-dense.gguf",
+            "size": 12640,
+            "sha256": "c94c1b81cf92c950204087e5a59862e706bbd86b9ed689fc9633cb0f378472d3",
+            "result": "graph-and-checker-passed",
+            "nodes": 171,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "grovemoe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "grovemoe.gguf",
+            "size": 12736,
+            "sha256": "7d253274c6636c6f82065344b048547a15e62fa0ff1c768625058047ade5eafb",
+            "result": "graph-and-checker-passed",
+            "nodes": 304,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "hunyuan-moe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "hunyuan-moe.gguf",
+            "size": 18080,
+            "sha256": "7c45597c0a7cbf516823d4607cfd258489602392e68ba91962dfff2a55cc40a4",
+            "result": "graph-and-checker-passed",
+            "nodes": 232,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "hunyuan_vl",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "hunyuan_vl.gguf",
+            "size": 153760,
+            "sha256": "ec942392555bb1b2ee503cafb389f6ef81c1bdb72aab12165caa7ae57965eee3",
+            "result": "blocked",
+            "error": "GGUF architecture 'hunyuan_vl' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_7\\\\hunyuan_vl.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The pinned Hunyuan-VL decoder uses its own M-RoPE and Q/K-normalized text contract and pairs with a hunyuanvl clip sidecar. Mobius's Hunyuan-VL-MoT registration is a different dual-path architecture, so neither it nor the dense Hunyuan text model is a valid alias. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "hy_v3",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "tiny-hy-v3-target.gguf",
+            "size": 26432,
+            "sha256": "5a35920fffc3edcac49d0ece74fe736891db54f7885021445a3e5944d435afc4",
+            "result": "graph-and-checker-passed",
+            "nodes": 163,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "internlm2",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "internlm2_q4_0.gguf",
+            "size": 153760,
+            "sha256": "d1f6f7314de5c63e8bf280a292d1129125810ecd3c354be42182c0517e4d7f77",
+            "result": "blocked",
+            "error": "Lossless GGUF is missing model parameters: ['model.layers.0.attention_norm.weight', 'model.layers.0.attention.q_proj.weight', 'model.layers.0.attention.k_proj.weight', 'model.layers.0.attention.v_proj.weight', 'model.layers.0.attention.o_proj.weight', 'model.layers.0.ffn_norm.weight', 'model.layers.0.feed_forward.w1.weight', 'model.layers.0.feed_forward.w3.weight', 'model.layers.0.feed_forward.w2.weight']. Fix the exact tensor mapping; no fabricated/default weights are allowed."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "jamba",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "jamba-invalid.gguf",
+            "size": 78656,
+            "sha256": "65c67244c6bbddeaaf420fb5e694887b8993537876e5337275af3bb4fd84b0b7",
+            "result": "blocked",
+            "error": "Jamba expert_count and expert_used_count must both be zero or both positive"
+          },
+          {
+            "filename": "jamba-invalid.gguf",
+            "size": 103360,
+            "sha256": "ddeda21491d2ecff49ea261adc82271817ad6160f91b11a05f6a89a1b2f928c8",
+            "result": "blocked",
+            "error": "Jamba expert_count=1 is not a routed-MoE layout; use dense FFN tensors"
+          },
+          {
+            "filename": "jamba-invalid.gguf",
+            "size": 111584,
+            "sha256": "ae8ea81e7eae786cbb2233651efdbaa5bbb800990b53f93ced9d2eaac53cf3e3",
+            "result": "blocked",
+            "error": "Invalid jamba GGUF tensor closure: missing=['blk.1.ffn_up_exps.weight'], unexpected=[], out_of_range=[]"
+          },
+          {
+            "filename": "jamba-f32.gguf",
+            "size": 128064,
+            "sha256": "ba9e66204c682203414cec66d0728713b2056bfea5ed9a7772d7df9aadc9a03d",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "jamba-invalid.gguf",
+            "size": 128064,
+            "sha256": "17268482f3f2139339908f0df196e005fbb17456ba9cadfd629899bca3d8fda0",
+            "result": "blocked",
+            "error": "Jamba expert_used_count must be in [1, 2], got 3"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "jina-bert-v3",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "jina-v3.gguf",
+            "size": 8256,
+            "sha256": "42f2a5ede6d4e020b39dc38c92e51d02eff13858f40044137e7b613f680e4e29",
+            "result": "graph-and-checker-passed",
+            "nodes": 62,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "kimi-k3",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "kimi-k3-fused-kv-q4.gguf",
+            "size": 74624,
+            "sha256": "5dc934c2c13c3e738f109c21da57bd0ed9ba419aba02e61fa1f377ffc4b16211",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.abs.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "kimi-k3-invalid.gguf",
+            "size": 339584,
+            "sha256": "a4692d1c93ddf720b10491d91b5ad7c9ae932277d84304a4c217edd503383956",
+            "result": "blocked",
+            "error": "Kimi-K3 GGUF has inconsistent pinned architecture metadata"
+          },
+          {
+            "filename": "kimi-k3-invalid.gguf",
+            "size": 361856,
+            "sha256": "41b36c9effac29a33e146ed96d63fd067f8c43ad0ccb2d359dc37afda0c3e0a6",
+            "result": "blocked",
+            "error": "Kimi-K3 GGUF has inconsistent pinned architecture metadata"
+          },
+          {
+            "filename": "kimi-k3-invalid.gguf",
+            "size": 363840,
+            "sha256": "e011dddf7ddaea3e3b08dd351679d651e40a2ffe6b8a66be180a10e1d18ba913",
+            "result": "blocked",
+            "error": "Invalid Kimi-K3 GGUF tensor closure: missing=['output_res_score.weight'], unexpected=[], out_of_range=[]"
+          },
+          {
+            "filename": "kimi-k3-fused-kv-f32.gguf",
+            "size": 364096,
+            "sha256": "b66299c53c708d08a9cd32d8fab39f5cbb04d316067602bafb7fa9c9dc014356",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.abs.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "kimi-linear",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "kimi-linear-invalid.gguf",
+            "size": 330752,
+            "sha256": "5f2ec10e4ae953aac65c4e233a060a0b650c8b942ac80ab3f29148bd24b6e6f7",
+            "result": "blocked",
+            "error": "Kimi Linear GGUF has inconsistent pinned architecture metadata"
+          },
+          {
+            "filename": "kimi-linear-invalid.gguf",
+            "size": 332960,
+            "sha256": "f4fcadf1e3b4e2fcfb87321b21678a279bccf976c05005b4dce1ad699176e511",
+            "result": "blocked",
+            "error": "Invalid Kimi Linear GGUF tensor closure: missing=['blk.0.ssm_a'], unexpected=[], out_of_range=[]"
+          },
+          {
+            "filename": "kimi-linear-cli.gguf",
+            "size": 333056,
+            "sha256": "1905562e7b632712cff3869fed6e1eba140cf4b68eada90fa7b58550702dac22",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.abs.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "kimi-linear-f32.gguf",
+            "size": 333056,
+            "sha256": "1905562e7b632712cff3869fed6e1eba140cf4b68eada90fa7b58550702dac22",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.abs.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "kimi-linear-task.gguf",
+            "size": 333056,
+            "sha256": "1905562e7b632712cff3869fed6e1eba140cf4b68eada90fa7b58550702dac22",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.abs.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "lfm2",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "lfm2-misdispatch.gguf",
+            "size": 88864,
+            "sha256": "54916eff8a98a5ab68041145161b0393b62f2ff03c76ad820becc1e5c6719ac5",
+            "result": "graph-and-checker-passed",
+            "nodes": 85,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "lfm2moe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "lfm2moe-q4.gguf",
+            "size": 26400,
+            "sha256": "4c8eec4891f751d9952f3061738d8209b982fa0429f2ee322d6f191c4a726f96",
+            "result": "graph-and-checker-passed",
+            "nodes": 168,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "llada-moe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "llada-moe-fused-native.gguf",
+            "size": 110272,
+            "sha256": "14a1ec360c964d0d027c3e6d180a2411e204c1f2fd2d1d8ffc143c44d2cccdd1",
+            "result": "graph-and-checker-passed",
+            "nodes": 90,
+            "formats": [
+              "gguf:mxfp4"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "llama",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "selected-file.gguf",
+            "size": 160,
+            "sha256": "8934eda5de3bc1c5d257086d4c7beb0b2e8db43326dceffc17ae80abe7eda550",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: llama"
+          },
+          {
+            "filename": "manual-00001-of-00002.gguf",
+            "size": 256,
+            "sha256": "c056f134c7c72451b18b96f3382fb2705631d153b149d4238d4a2635d3c7d588",
+            "result": "blocked",
+            "error": "Duplicate tensor 'duplicate' across shards (manual-00001-of-00002.gguf and manual-00002-of-00002.gguf); refusing to build from an ambiguous split set."
+          },
+          {
+            "filename": "manual-00002-of-00002.gguf",
+            "size": 256,
+            "sha256": "b80c4abc9067e703aefd6ad2c43b7b83652e48567c6b9729245948ab1115415c",
+            "result": "blocked",
+            "error": "Duplicate tensor 'duplicate' across shards (manual-00001-of-00002.gguf and manual-00002-of-00002.gguf); refusing to build from an ambiguous split set."
+          },
+          {
+            "filename": "manual-00001-of-00002.gguf",
+            "size": 256,
+            "sha256": "38f2a2c7146b306278ec01a7bc3535bb09440b2aa10133b2a5613d10be16d2e9",
+            "result": "blocked",
+            "error": "GGUF split.count metadata [2, 3] disagrees with the 2-shard filenames; mixed or corrupt split set."
+          },
+          {
+            "filename": "manual-00002-of-00002.gguf",
+            "size": 256,
+            "sha256": "54230bc6b9ebf2b897ddbae76ed5ee21cd885414bd0d1eba1ccdabe2eeb71982",
+            "result": "blocked",
+            "error": "GGUF split.count metadata [2, 3] disagrees with the 2-shard filenames; mixed or corrupt split set."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "llama4",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "llama4.gguf",
+            "size": 153728,
+            "sha256": "d40e168fb42654403f8da31b3caeb20c3bd86ed4096bac5e68b704cd6c4538e1",
+            "result": "blocked",
+            "error": "GGUF architecture 'llama4' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_8\\\\llama4.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. Llama4 GGUF is the text member of a paired multimodal package and may contain routed experts and architecture-specific cross-modal layer scheduling. The llama4 clip vision tower, token mixing, position IDs, and package ABI remain deferred; text-backbone similarity is not evidence that the complete GGUF tensor closure is owned. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "maincoder",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "maincoder.gguf",
+            "size": 3968,
+            "sha256": "082c9358532feef674759c60bb46798abddda35e8ba398f786e8dd4e57e44e2f",
+            "result": "graph-and-checker-passed",
+            "nodes": 43,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "mamba",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "mamba-q4.gguf",
+            "size": 26944,
+            "sha256": "8a68cdac45bd3ab2e1c97753e85a04a6e2dab1bc9fc45eaf77c73288ee5fd2eb",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "mamba-f32.gguf",
+            "size": 52448,
+            "sha256": "1ef79ab0fa47f15c4878d24d111a9d79552f58d03705fd5cb079ba62fcb925f4",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "mamba-multitoken.gguf",
+            "size": 52448,
+            "sha256": "1ef79ab0fa47f15c4878d24d111a9d79552f58d03705fd5cb079ba62fcb925f4",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "mamba-static.gguf",
+            "size": 52448,
+            "sha256": "1ef79ab0fa47f15c4878d24d111a9d79552f58d03705fd5cb079ba62fcb925f4",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "mamba-sidecar.gguf",
+            "size": 52544,
+            "sha256": "d81aa8e6fcf0ea4360fcbc84ca8604925079be0f8e52d21e3d1bef9cfcb0de52",
+            "result": "blocked",
+            "error": "GGUF auxiliary quantization tensor 'blk.0.ssm_in.scale' maps to 'model.layers.0.mixer.in_proj.scale', but Mobius cannot represent GGUF scale/input_scale sidecars (including NVFP4 scale2) in its expert/projection quantization ABI. This file is rejected before graph construction to avoid silently dropping required quantization data."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "mamba2",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "mamba2-q4.gguf",
+            "size": 23648,
+            "sha256": "c9f4794ddbcddbf89baf03dddc9c09dfc23d291004c112c2a518e96e61bbdd4d",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "mamba2-f32.gguf",
+            "size": 46944,
+            "sha256": "899dce203304e24b02a5ed9d1600a1dcf6188313124ad15deb6d75f84e1ac2df",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "mamba2-static.gguf",
+            "size": 46944,
+            "sha256": "899dce203304e24b02a5ed9d1600a1dcf6188313124ad15deb6d75f84e1ac2df",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "mamba2-sidecar.gguf",
+            "size": 47008,
+            "sha256": "2845a9c094fb24a6fdca06a98a9d72e9749811f49d666035f5d8c002939725d8",
+            "result": "blocked",
+            "error": "GGUF auxiliary quantization tensor 'blk.0.ssm_in.scale' maps to 'backbone.layers.0.mixer.in_proj.scale', but Mobius cannot represent GGUF scale/input_scale sidecars (including NVFP4 scale2) in its expert/projection quantization ABI. This file is rejected before graph construction to avoid silently dropping required quantization data."
+          },
+          {
+            "filename": "mamba2-bad-suffix.gguf",
+            "size": 47008,
+            "sha256": "0147a6a1148d95097161d68c482be0ee11ea82b70c616e8ae5d31ef549fde67f",
+            "result": "blocked",
+            "error": "Malformed mamba2 GGUF tensor name(s): ['blk.0.ssm_a.weight']. The suffixes do not match the pinned llama.cpp tensor creation sites."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "minicpm",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "minicpm.gguf",
+            "size": 4960,
+            "sha256": "ce406e62c510bba3948d921e846d9f7e51106d62785aa0713687c29959bc969e",
+            "result": "graph-and-checker-passed",
+            "nodes": 52,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "minicpm3",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "minicpm3.gguf",
+            "size": 5760,
+            "sha256": "53e99def7e0408955b607ead5298db5e29bf306ef167da8b226e003418c32b08",
+            "result": "graph-and-checker-passed",
+            "nodes": 66,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "minimax-01",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "minimax-q4-tied.gguf",
+            "size": 39328,
+            "sha256": "d81685754ac19bc0486211fac2b09484cdf5c84167f390c7bd64b9639874a029",
+            "result": "graph-and-checker-passed",
+            "nodes": 218,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "minimax-m2",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "minimax-m2.gguf",
+            "size": 6368,
+            "sha256": "71fc3b069ce1a80be7e3012fae46dc7b01b71ad99fc27a399460e2d62ce0d799",
+            "result": "graph-and-checker-passed",
+            "nodes": 77,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "mistral3",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "mistral3.gguf",
+            "size": 153728,
+            "sha256": "99d8b75775b4c93d6eccab06450a4bc8b5cbddf75408c19414fc7996e694b310",
+            "result": "blocked",
+            "error": "GGUF architecture 'mistral3' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_9\\\\mistral3.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The pinned Mistral3 loader selects dense or routed-expert text blocks from metadata and applies architecture-specific output temperature scaling. A VLM package additionally requires the deferred Pixtral clip sidecar and exact patch/merge/token contract. The existing Hugging Face Mistral3 graph does not cover that conditional GGUF closure. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "mistral4",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "mistral4-reference.gguf",
+            "size": 7264,
+            "sha256": "db211d4561b57f3a0c5c2e3347d84442be3862cfca19c3273482f0f798a3e4b7",
+            "result": "graph-and-checker-passed",
+            "nodes": 162,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "modern-bert",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "modern-bert-missing.gguf",
+            "size": 84864,
+            "sha256": "16a9bdfa74fe803fda6fcb06c1b811ed875bcb620b288ec7862586a9323b2612",
+            "result": "blocked",
+            "error": "modern-bert GGUF is missing required encoder tensor(s): ['blk.0.attn_qkv.weight']"
+          },
+          {
+            "filename": "modern-bert-kv-None.gguf",
+            "size": 134016,
+            "sha256": "e9dd18130661a1325d50869b5603226c3c3a426d7cf7dac07d5460a0880cb96a",
+            "result": "graph-and-checker-passed",
+            "nodes": 45,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "muse-glimmer",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "text.gguf",
+            "size": 224,
+            "sha256": "dc7a0fa6095c4619fa4b2dfc7d533a1e2895d288fdd738fbc1f6fc884db014c5",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: muse-glimmer"
+          },
+          {
+            "filename": "text.gguf",
+            "size": 224,
+            "sha256": "dc7a0fa6095c4619fa4b2dfc7d533a1e2895d288fdd738fbc1f6fc884db014c5",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: muse-glimmer"
+          },
+          {
+            "filename": "muse-glimmer.gguf",
+            "size": 352,
+            "sha256": "263ffaa198195ab47225a9c5916e9ed5815e8ea7f9136fd11eff507dac198d00",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: muse-glimmer"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "muse_glimmer",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "text.gguf",
+            "size": 224,
+            "sha256": "b0301cad51150ceb73f1eeed8766b299db9fb0125b58d3fe841d8d21d522fa5b",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: muse_glimmer"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "nemotron_h_moe",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "nemotron-h-moe.gguf",
+            "size": 160,
+            "sha256": "2d0a2a8378a5e0d6dee9665fdcb49319548d2b072d9444d9431f9cb58c5b0745",
+            "result": "blocked",
+            "error": "'nemotron_h_moe.block_count'"
+          },
+          {
+            "filename": "nemotron-h-moe-q4.gguf",
+            "size": 29408,
+            "sha256": "11452a2e484ecc58bd6075fb21113f16d8c0b6fd6cfc2473fafc2841fee7c87a",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "nemotron-h-moe-invalid.gguf",
+            "size": 109312,
+            "sha256": "5b3b9b150a58a83b9f358e97585f4c1af56e29abb23f1501f650c8271e0ab261",
+            "result": "blocked",
+            "error": "Invalid nemotron_h_moe GGUF tensor closure: missing=['blk.1.ffn_up_exps.weight'], unexpected=[], out_of_range=[]"
+          },
+          {
+            "filename": "nemotron-h-moe-expert-q4.gguf",
+            "size": 111680,
+            "sha256": "e19a0d62b836941f499e4c6c97e536595c125b490de39922ffb84e320c516ad1",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.lt.Scalar. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "nemotron-h-moe-invalid.gguf",
+            "size": 125696,
+            "sha256": "00f252b5449c041148a1d96ed6c43150a11ee5d6653ebb94426979cac2447321",
+            "result": "blocked",
+            "error": "Invalid nemotron_h_moe GGUF tensor closure: missing=['blk.1.exp_probs_b.bias'], unexpected=[], out_of_range=[]"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "olmo",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "olmo-q4_0.gguf",
+            "size": 152768,
+            "sha256": "78af66d8ca799fdb8a25e5e327299bdd93d03891375fa78cb5cea081a2f15841",
+            "result": "graph-and-checker-passed",
+            "nodes": 57,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "olmo2",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "olmo2-q4_0.gguf",
+            "size": 154208,
+            "sha256": "14582c2dc2c99c7a5549c6ef4916ecdf0718b33d78c0fcfb534e98245649d0a3",
+            "result": "graph-and-checker-passed",
+            "nodes": 53,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "olmoe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "olmoe-q4_0.gguf",
+            "size": 140608,
+            "sha256": "c33dcb5ece151cc3b5c288f9b8bb0c6e9a8ffeeddb58b52ddf5d214915207039",
+            "result": "graph-and-checker-passed",
+            "nodes": 93,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "paddleocr",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "paddleocr.gguf",
+            "size": 153760,
+            "sha256": "39bbbc6b81c6107f9fce0d2f57d7f151f0e47334da4635cc888238f64b68c3c1",
+            "result": "blocked",
+            "error": "GGUF architecture 'paddleocr' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_10\\\\paddleocr.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. PaddleOCR-VL uses an ERNIE-derived GGUF loader with an optional bias on attention output closure and a required paddleocr clip vision/projector sidecar. Its processor ranks, image-token counts, offsets, and package identity have no pinned Mobius GGUF parity evidence, so it cannot be accepted as an ordinary Qwen2 text file. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "phimoe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "phimoe-fused-q4_0.gguf",
+            "size": 142848,
+            "sha256": "cfeff00d723a4a9218c30052a32bd03a1f8e4bece1208019dd5b05755c98b9c2",
+            "result": "graph-and-checker-passed",
+            "nodes": 105,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "plamo2",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "plamo2-q4-embedding.gguf",
+            "size": 18400,
+            "sha256": "e6752aa3abe2f2e56e0a6f955b75190f9b9402f2e5d2f139f5f62b5b2604bdf8",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.log.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "plamo2-cli.gguf",
+            "size": 25440,
+            "sha256": "be0ed378d40d67780f96d01efb33b0ba438e5761482b8d0c111c95eede07d03f",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.log.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "plamo2-q4.gguf",
+            "size": 25440,
+            "sha256": "be0ed378d40d67780f96d01efb33b0ba438e5761482b8d0c111c95eede07d03f",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.log.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "plamo2-q4-output.gguf",
+            "size": 26656,
+            "sha256": "0be2c632858802ae9b01410173e66e9d1a0671ebdb84f449193631625fbf3c35",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.log.default. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "plamo2-invalid.gguf",
+            "size": 92544,
+            "sha256": "c6f06a37b027c9f19dd12bd1c78460d72305b19b666913b08e72aa7f1b6e94e9",
+            "result": "blocked",
+            "error": "Invalid PLaMo2 GGUF tensor closure: missing=['blk.0.ssm_out.weight'], unexpected=[], malformed={}"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "plm",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "plm-q4.gguf",
+            "size": 7872,
+            "sha256": "558fc1c018d642caaa3dac188cb3302d6a701ef2a4b5eac2c0f4ad86c1006180",
+            "result": "graph-and-checker-passed",
+            "nodes": 84,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "pockettts",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "pockettts-q4_0.gguf",
+            "size": 153760,
+            "sha256": "ceb8793075694bf2053a59b4e891b8789d29eb093a50ef3603f93d2f07852368",
+            "result": "blocked",
+            "error": "GGUF architecture 'pockettts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu1\\\\pockettts-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only PocketTTS's transformed causal CALM backbone: its embedding table contains folded learned conditioning rows and its duplicated embedding output is not a semantic LM head. Voice encoding, continuous 32-D flow generation, EOS scoring, and the stateful 24-kHz Mimi decoder live in a required pockettts_spkenc/pockettts_gen mmproj bundle that Mobius cannot import. Registering the backbone as text generation or TTS would expose the wrong I/O contract, so standalone conversion is refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "pockettts-q4_0.gguf",
+            "size": 153760,
+            "sha256": "641147cbe64f311acd5f3bf988672bafca518446189cac5242c9df7298af5013",
+            "result": "blocked",
+            "error": "GGUF architecture 'pockettts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu13\\\\pockettts-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only PocketTTS's transformed causal CALM backbone: its embedding table contains folded learned conditioning rows and its duplicated embedding output is not a semantic LM head. Voice encoding, continuous 32-D flow generation, EOS scoring, and the stateful 24-kHz Mimi decoder live in a required pockettts_spkenc/pockettts_gen mmproj bundle that Mobius cannot import. Registering the backbone as text generation or TTS would expose the wrong I/O contract, so standalone conversion is refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "pockettts-q4_0.gguf",
+            "size": 153760,
+            "sha256": "259a35aac2b8f999eeb9cdcb20c86dc1d070bcc399b2fb22d77ded1514a3c8be",
+            "result": "blocked",
+            "error": "GGUF architecture 'pockettts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu19\\\\pockettts-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only PocketTTS's transformed causal CALM backbone: its embedding table contains folded learned conditioning rows and its duplicated embedding output is not a semantic LM head. Voice encoding, continuous 32-D flow generation, EOS scoring, and the stateful 24-kHz Mimi decoder live in a required pockettts_spkenc/pockettts_gen mmproj bundle that Mobius cannot import. Registering the backbone as text generation or TTS would expose the wrong I/O contract, so standalone conversion is refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "pockettts-q4_0.gguf",
+            "size": 153760,
+            "sha256": "a0efb2ccf55dd0527efeb013c209de55cfaa83f02f3b7bb59096acc4cd8c3fd1",
+            "result": "blocked",
+            "error": "GGUF architecture 'pockettts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu7\\\\pockettts-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only PocketTTS's transformed causal CALM backbone: its embedding table contains folded learned conditioning rows and its duplicated embedding output is not a semantic LM head. Voice encoding, continuous 32-D flow generation, EOS scoring, and the stateful 24-kHz Mimi decoder live in a required pockettts_spkenc/pockettts_gen mmproj bundle that Mobius cannot import. Registering the backbone as text generation or TTS would expose the wrong I/O contract, so standalone conversion is refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "pockettts-f32.gguf",
+            "size": 280480,
+            "sha256": "cace0719c37a925348ef221d763d1d604d114ec73b99e380a2f06b96ca4c332f",
+            "result": "blocked",
+            "error": "GGUF architecture 'pockettts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu0\\\\pockettts-f32.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only PocketTTS's transformed causal CALM backbone: its embedding table contains folded learned conditioning rows and its duplicated embedding output is not a semantic LM head. Voice encoding, continuous 32-D flow generation, EOS scoring, and the stateful 24-kHz Mimi decoder live in a required pockettts_spkenc/pockettts_gen mmproj bundle that Mobius cannot import. Registering the backbone as text generation or TTS would expose the wrong I/O contract, so standalone conversion is refused before graph construction. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen2",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "weights.gguf",
+            "size": 192,
+            "sha256": "22f4c89ee6fc9d2eacc805ef7e55bfcf19da6e4110be62987f2f74d41ed17ac9",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: qwen2"
+          },
+          {
+            "filename": "weights.gguf",
+            "size": 192,
+            "sha256": "c6432c3cab3c4e10d5f85e8fcc9c637f9c09216861ec13ff1610fdfb5d4d388e",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: qwen2"
+          },
+          {
+            "filename": "weights.gguf",
+            "size": 192,
+            "sha256": "a48a920a125cb0c64e38949d178d6dd79f17f3f6bdc30356e03421d93c67ff77",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: qwen2"
+          },
+          {
+            "filename": "weights.gguf",
+            "size": 192,
+            "sha256": "5f7af22805be0ea3c2900bc432bbef30f251fa027bdaebe1e593d5369e6a36ef",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: qwen2"
+          },
+          {
+            "filename": "weights.gguf",
+            "size": 192,
+            "sha256": "6f897e63c062a17e1a9e0867def03adf1557b72601353a68ac0b7cd1ae78f0b1",
+            "result": "blocked",
+            "error": "GGUF file missing required metadata for 'hidden_size'. Architecture: qwen2"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen2_moe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "shared-moe.gguf",
+            "size": 830656,
+            "sha256": "943d4e6916f856f6ece314cf5715b739c304226b23b8b6baa7e748a64d4c9a95",
+            "result": "graph-and-checker-passed",
+            "nodes": 135,
+            "formats": [
+              "gguf:iq1_s",
+              "gguf:iq4_xs"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen2moe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "qwen2moe-q4_0.gguf",
+            "size": 126944,
+            "sha256": "803c002913e7b74335bbea9fe6f9a2aed28ea0b10dcf0346238e85a39c7117a7",
+            "result": "graph-and-checker-passed",
+            "nodes": 137,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen2vl",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "text.gguf",
+            "size": 25952,
+            "sha256": "7033524decc24d0e55b751736ba586c4a25806ac5d8240bd95b4a0d1f3e67689",
+            "result": "graph-and-checker-passed",
+            "nodes": 87,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen35",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "qwen35-narrow-q4.gguf",
+            "size": 39616,
+            "sha256": "b76efe42f59bf6929d34a8a0e5ed6529b3c64e43ac3d94ab590d8c48eee62633",
+            "result": "blocked",
+            "error": "GGUF lossless layout conversion cannot represent aten.sub.Tensor. Consume original GGUF parameters directly in the model graph. Floating inverse/offset reparameterization can round source values; no dense/requantized fallback is permitted."
+          },
+          {
+            "filename": "tied-quantized-tables.gguf",
+            "size": 59136,
+            "sha256": "62cac59cf2132fdfc3645ff18c5107e5cded0504000d63afc2499f48bd8236e6",
+            "result": "blocked",
+            "error": "Lossless GGUF MTP external-source packaging is not implemented. Use a target-only GGUF; the importer will not omit or requantize the head."
+          },
+          {
+            "filename": "mtp-tables.gguf",
+            "size": 80768,
+            "sha256": "61220aed4d9b1057ef63d50eb68f49af87a97ac68b85f350923539bde4c5fea0",
+            "result": "blocked",
+            "error": "Lossless GGUF MTP external-source packaging is not implemented. Use a target-only GGUF; the importer will not omit or requantize the head."
+          },
+          {
+            "filename": "shared-head-q4_1.gguf",
+            "size": 81120,
+            "sha256": "82a3257cfa856f83116616149387d31255f519a2fbe959446f69e40605946424",
+            "result": "blocked",
+            "error": "Lossless GGUF MTP external-source packaging is not implemented. Use a target-only GGUF; the importer will not omit or requantize the head."
+          },
+          {
+            "filename": "mtp-tables.gguf",
+            "size": 81120,
+            "sha256": "36ba255e7d0cbc23b36ad67e66412cfc8347984060862d40ee82472b9efc3731",
+            "result": "blocked",
+            "error": "Lossless GGUF MTP external-source packaging is not implemented. Use a target-only GGUF; the importer will not omit or requantize the head."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen35moe",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "qwen35moe-scale-q4.gguf",
+            "size": 81248,
+            "sha256": "25e4d62da38a54c779e51215d05b902c8ceaf1130260709849ce365795d48f93",
+            "result": "blocked",
+            "error": "['blk.1.nextn.eh_proj.scale']: Mobius cannot represent GGUF scale/input_scale sidecars in the MTP quantization ABI"
+          },
+          {
+            "filename": "qwen35moe-input_scale-q4.gguf",
+            "size": 81248,
+            "sha256": "fae6973fdfb620e92066ff18d740f9a9272b462db0eb02c253234cc5626a0ecf",
+            "result": "blocked",
+            "error": "['blk.1.nextn.eh_proj.input_scale']: Mobius cannot represent GGUF scale/input_scale sidecars in the MTP quantization ABI"
+          },
+          {
+            "filename": "qwen35moe-mtp.gguf",
+            "size": 390912,
+            "sha256": "326fca756ebd6e7fa2b2990b4cebfb975af22201338f0ae7d133095999da9ee3",
+            "result": "blocked",
+            "error": "qwen35moe GGUF MTP is rejected: MTP blocks use routed experts and a shared expert that are not represented; pinned loader behavior=executed-sidecar, block kind=routed-full-attention"
+          },
+          {
+            "filename": "qwen35moe-scale-f32.gguf",
+            "size": 391008,
+            "sha256": "dd6801ccc16def829b3f05d058f6984fbff32c3b2b86e9693b63d42f80f02f50",
+            "result": "blocked",
+            "error": "['blk.1.nextn.eh_proj.scale']: Mobius cannot represent GGUF scale/input_scale sidecars in the MTP quantization ABI"
+          },
+          {
+            "filename": "qwen35moe-input_scale-f32.gguf",
+            "size": 391008,
+            "sha256": "d904961cb8788ca95522d94e61661f629bdfdb67a3585009d7794d767d3a214f",
+            "result": "blocked",
+            "error": "['blk.1.nextn.eh_proj.input_scale']: Mobius cannot represent GGUF scale/input_scale sidecars in the MTP quantization ABI"
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen3_moe",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "uniform-moe.gguf",
+            "size": 790912,
+            "sha256": "98572979f4c6242838c20e337202ec725ddb02befe1bd934c62a60116e4bff63",
+            "result": "blocked",
+            "error": "Lossless GGUF is missing model parameters: ['model.layers.0.self_attn.q_norm.weight', 'model.layers.0.self_attn.k_norm.weight']. Fix the exact tensor mapping; no fabricated/default weights are allowed."
+          },
+          {
+            "filename": "mixed-moe-dense.gguf",
+            "size": 878976,
+            "sha256": "89b35e3bec6aa8b291859d9b6ba63713a7913b6bc92933a8f6ad4bf0cc0af54a",
+            "result": "blocked",
+            "error": "Lossless GGUF is missing model parameters: ['model.layers.0.self_attn.q_norm.weight', 'model.layers.0.self_attn.k_norm.weight']. Fix the exact tensor mapping; no fabricated/default weights are allowed."
+          },
+          {
+            "filename": "mixed-moe-env.gguf",
+            "size": 878976,
+            "sha256": "6d6115c8508726d689f2fcc7c796cdc86743c09f99c6d995750da74c4eebeb33",
+            "result": "blocked",
+            "error": "Lossless GGUF is missing model parameters: ['model.layers.0.self_attn.q_norm.weight', 'model.layers.0.self_attn.k_norm.weight']. Fix the exact tensor mapping; no fabricated/default weights are allowed."
+          },
+          {
+            "filename": "mixed-moe.gguf",
+            "size": 878976,
+            "sha256": "5440f00bae9f064ffbf1eba0a2ab0d4ebeb29fece4ce3997925f75cdbaeaca01",
+            "result": "blocked",
+            "error": "Lossless GGUF is missing model parameters: ['model.layers.0.self_attn.q_norm.weight', 'model.layers.0.self_attn.k_norm.weight']. Fix the exact tensor mapping; no fabricated/default weights are allowed."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen3moe",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "qwen3moe-tied-q4.gguf",
+            "size": 47200,
+            "sha256": "c36ef36a5aaa50860379373921cd76c6e5e6142cf5e002722f39db5cdf0635fa",
+            "result": "graph-and-checker-passed",
+            "nodes": 119,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen3tts",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "qwen3tts-q4_0.gguf",
+            "size": 153728,
+            "sha256": "44d2794c68b3f4a521b685b7cfcbd19db3fce7ef5b066d6fc22fce0d4fdd7ddf",
+            "result": "blocked",
+            "error": "GGUF architecture 'qwen3tts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu15\\\\qwen3tts-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only a transformed Qwen3-TTS talker backbone, not the existing Mobius Qwen3TTS conditional-generation or codec model. The converter folds the text projection into an extended text+codec embedding table and emits a 3072-row codec head whose logits are shifted into that combined vocabulary. The required speaker encoder, 15-codebook predictor, and stateful 24-kHz code-to-wave decoder live in a qwen3tts_spkenc/qwen3tts_gen mmproj bundle that Mobius cannot import. Standalone conversion is therefore refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "qwen3tts-q4_0.gguf",
+            "size": 153728,
+            "sha256": "a17fe0ee7dec8cb4a4f91ec56004bc8c50fdfa3159df1f3a10615e8ad444f513",
+            "result": "blocked",
+            "error": "GGUF architecture 'qwen3tts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu21\\\\qwen3tts-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only a transformed Qwen3-TTS talker backbone, not the existing Mobius Qwen3TTS conditional-generation or codec model. The converter folds the text projection into an extended text+codec embedding table and emits a 3072-row codec head whose logits are shifted into that combined vocabulary. The required speaker encoder, 15-codebook predictor, and stateful 24-kHz code-to-wave decoder live in a qwen3tts_spkenc/qwen3tts_gen mmproj bundle that Mobius cannot import. Standalone conversion is therefore refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "qwen3tts-q4_0.gguf",
+            "size": 153728,
+            "sha256": "5408d8ab96cf1328d646c9ae3be4b42ef397122c80b8788b3bdc3ea5340ac45c",
+            "result": "blocked",
+            "error": "GGUF architecture 'qwen3tts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu3\\\\qwen3tts-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only a transformed Qwen3-TTS talker backbone, not the existing Mobius Qwen3TTS conditional-generation or codec model. The converter folds the text projection into an extended text+codec embedding table and emits a 3072-row codec head whose logits are shifted into that combined vocabulary. The required speaker encoder, 15-codebook predictor, and stateful 24-kHz code-to-wave decoder live in a qwen3tts_spkenc/qwen3tts_gen mmproj bundle that Mobius cannot import. Standalone conversion is therefore refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "qwen3tts-q4_0.gguf",
+            "size": 153728,
+            "sha256": "f5a5e00606f7c412e5fc97d1297e349efcfa2262a613715ed5d3d1c358ce7a5b",
+            "result": "blocked",
+            "error": "GGUF architecture 'qwen3tts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu9\\\\qwen3tts-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only a transformed Qwen3-TTS talker backbone, not the existing Mobius Qwen3TTS conditional-generation or codec model. The converter folds the text projection into an extended text+codec embedding table and emits a 3072-row codec head whose logits are shifted into that combined vocabulary. The required speaker encoder, 15-codebook predictor, and stateful 24-kHz code-to-wave decoder live in a qwen3tts_spkenc/qwen3tts_gen mmproj bundle that Mobius cannot import. Standalone conversion is therefore refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "qwen3tts-f32.gguf",
+            "size": 280448,
+            "sha256": "289d569f3878b9d408c18ef9a2fa73ecccd2c6bab69b36061f374a53e3414ce7",
+            "result": "blocked",
+            "error": "GGUF architecture 'qwen3tts' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu14\\\\qwen3tts-f32.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. The primary GGUF is only a transformed Qwen3-TTS talker backbone, not the existing Mobius Qwen3TTS conditional-generation or codec model. The converter folds the text projection into an extended text+codec embedding table and emits a 3072-row codec head whose logits are shifted into that combined vocabulary. The required speaker encoder, 15-codebook predictor, and stateful 24-kHz code-to-wave decoder live in a qwen3tts_spkenc/qwen3tts_gen mmproj bundle that Mobius cannot import. Standalone conversion is therefore refused before graph construction. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen3vl",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "qwen3vl.gguf",
+            "size": 153728,
+            "sha256": "1786e3ef3de669bc960fff8532f5cbcd5e3a17a366b41796824f13e668f83f00",
+            "result": "blocked",
+            "error": "GGUF architecture 'qwen3vl' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_11\\\\qwen3vl.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. Qwen3-VL text GGUF requires multimodal position IDs and an exact qwen3vl_merger clip companion, including deep-stack vision features and architecture-specific token placement. The existing Hugging Face text graph alone does not establish sidecar tensor closure, processor parity, or a safe text-only fallback. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "qwen3vlmoe",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "qwen3vlmoe.gguf",
+            "size": 153760,
+            "sha256": "3ecf30c9c88ceb84ae1dc1e459ec41be2f0288316c254f15fdab8caf7bd24174",
+            "result": "blocked",
+            "error": "GGUF architecture 'qwen3vlmoe' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audited_cohorts_12\\\\qwen3vlmoe.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. Qwen3-VL-MoE combines the Qwen3-VL multimodal position/token contract and merger sidecar with routed experts in the text backbone. Generic Qwen3-MoE tensor similarity does not cover the paired vision package, expert sidecars, effective tied head ownership, or multimodal cache ABI. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "rnd1",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "rnd1-fused-native.gguf",
+            "size": 110176,
+            "sha256": "e0f9e52a5f847e5218ff4aa14a322bc39eb6dfd54ef8d89111f302d5ef4d8df5",
+            "result": "graph-and-checker-passed",
+            "nodes": 95,
+            "formats": [
+              "gguf:mxfp4"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "smollm3",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "smollm3-q4_0.gguf",
+            "size": 153728,
+            "sha256": "16aedef0dc767a8c1f93f2774a850d6ba61be5eaf22fc9a45e27622d0f38c5f7",
+            "result": "graph-and-checker-passed",
+            "nodes": 57,
+            "formats": [
+              "gguf:q4_0"
+            ]
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "t5",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "t5-missing.gguf",
+            "size": 90464,
+            "sha256": "2a799fbf4c5407ab2000f6a59b4e040cd6bd35b24150238513129df52aa19999",
+            "result": "blocked",
+            "error": "t5 GGUF is missing required T5 tensor(s): ['enc.blk.0.attn_q.weight']"
+          },
+          {
+            "filename": "t5-rank.gguf",
+            "size": 94624,
+            "sha256": "7b9f2cca78fcccfc4b8ed5e43f34305d97838acc100c63c65b5ab45eec579b86",
+            "result": "blocked",
+            "error": "t5 GGUF has invalid T5 tensor shape(s): {'enc.blk.0.attn_q.weight': ((32, 32), (32, 32, 1))}"
+          },
+          {
+            "filename": "t5-task.gguf",
+            "size": 94624,
+            "sha256": "44b6eb1a211bbf417fa10cecc8a124f49cd31b711ad4bb9bba3eb720972eee3f",
+            "result": "blocked",
+            "error": "Lossless GGUF opset29 export currently requires one flat model. Multi-component external-source packaging is not implemented."
+          },
+          {
+            "filename": "t5-scale.gguf",
+            "size": 94720,
+            "sha256": "329688cc4ac66397eb775ecf980b768e323f73affb71148523e29896949b3dc3",
+            "result": "blocked",
+            "error": "GGUF auxiliary quantization tensor 'enc.blk.0.attn_q.scale' maps to 'encoder.block.0.layer.0.SelfAttention.q.scale', but Mobius cannot represent GGUF scale/input_scale sidecars (including NVFP4 scale2) in its expert/projection quantization ABI. This file is rejected before graph construction to avoid silently dropping required quantization data."
+          },
+          {
+            "filename": "t5-input_scale.gguf",
+            "size": 94720,
+            "sha256": "c827eee89409511c8e70610d32862463e00bc87c085ceb135c89d7cb1de33ce1",
+            "result": "blocked",
+            "error": "GGUF auxiliary quantization tensor 'enc.blk.0.attn_q.input_scale' maps to 'encoder.block.0.layer.0.SelfAttention.q.input_scale', but Mobius cannot represent GGUF scale/input_scale sidecars (including NVFP4 scale2) in its expert/projection quantization ABI. This file is rejected before graph construction to avoid silently dropping required quantization data."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "t5encoder",
+        "result": "passed",
+        "attempts": [
+          {
+            "filename": "t5encoder-missing.gguf",
+            "size": 39712,
+            "sha256": "0cc236abe1553d972e929950b899a0d8fd3c5c0e51a509a0ab1a72d149be5659",
+            "result": "blocked",
+            "error": "t5encoder GGUF is missing required T5 tensor(s): ['enc.blk.0.attn_q.weight']"
+          },
+          {
+            "filename": "t5encoder-relative-bias.gguf",
+            "size": 43872,
+            "sha256": "7b805f5c0f60abf1af65cc70baa6149f9acd04497226c7394b4c7e44205dcee9",
+            "result": "graph-and-checker-passed",
+            "nodes": 56,
+            "formats": []
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      },
+      {
+        "architecture": "wavtokenizer-dec",
+        "result": "blocked",
+        "attempts": [
+          {
+            "filename": "wavtokenizer-dec-q4_0.gguf",
+            "size": 153824,
+            "sha256": "ed1a5729235cc773cf0e24423dc7118e041eb3faa08b2188dcd76932414e441c",
+            "result": "blocked",
+            "error": "GGUF architecture 'wavtokenizer-dec' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu11\\\\wavtokenizer-dec-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. wavtokenizer-dec is a stateless non-causal code-token to ISTFT-parameter network, not a waveform codec decoder. Its metadata overloads features_length as the 512-wide codebook feature input and embedding_length as the 1282-wide output, while 768-wide PosNet and ConvNeXt stacks provide the hidden width. The GGUF graph stops before the required magnitude/phase reconstruction and ISTFT processor, so mapping it to CodecTask would falsely promise waveform output. Dedicated graph, processor, quantization guards, and independent F16/Q5_1 parity remain deferred; standalone runtime packaging is refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "wavtokenizer-dec-q4_0.gguf",
+            "size": 153824,
+            "sha256": "8ab9f698c87b663279e0d8861b130fe2379b325192cf7ea6addbe445128167c5",
+            "result": "blocked",
+            "error": "GGUF architecture 'wavtokenizer-dec' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu17\\\\wavtokenizer-dec-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. wavtokenizer-dec is a stateless non-causal code-token to ISTFT-parameter network, not a waveform codec decoder. Its metadata overloads features_length as the 512-wide codebook feature input and embedding_length as the 1282-wide output, while 768-wide PosNet and ConvNeXt stacks provide the hidden width. The GGUF graph stops before the required magnitude/phase reconstruction and ISTFT processor, so mapping it to CodecTask would falsely promise waveform output. Dedicated graph, processor, quantization guards, and independent F16/Q5_1 parity remain deferred; standalone runtime packaging is refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "wavtokenizer-dec-q4_0.gguf",
+            "size": 153824,
+            "sha256": "a2311607f17708b4fc475917212c2b071eb9e0b1b729737d2030a2e53c4a7577",
+            "result": "blocked",
+            "error": "GGUF architecture 'wavtokenizer-dec' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu23\\\\wavtokenizer-dec-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. wavtokenizer-dec is a stateless non-causal code-token to ISTFT-parameter network, not a waveform codec decoder. Its metadata overloads features_length as the 512-wide codebook feature input and embedding_length as the 1282-wide output, while 768-wide PosNet and ConvNeXt stacks provide the hidden width. The GGUF graph stops before the required magnitude/phase reconstruction and ISTFT processor, so mapping it to CodecTask would falsely promise waveform output. Dedicated graph, processor, quantization guards, and independent F16/Q5_1 parity remain deferred; standalone runtime packaging is refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "wavtokenizer-dec-q4_0.gguf",
+            "size": 153824,
+            "sha256": "86041353e6da5364e1a63f76d36e2b9c620e8aeb00ec92abe9f7394d6506df70",
+            "result": "blocked",
+            "error": "GGUF architecture 'wavtokenizer-dec' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu5\\\\wavtokenizer-dec-q4_0.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. wavtokenizer-dec is a stateless non-causal code-token to ISTFT-parameter network, not a waveform codec decoder. Its metadata overloads features_length as the 512-wide codebook feature input and embedding_length as the 1282-wide output, while 768-wide PosNet and ConvNeXt stacks provide the hidden width. The GGUF graph stops before the required magnitude/phase reconstruction and ISTFT processor, so mapping it to CodecTask would falsely promise waveform output. Dedicated graph, processor, quantization guards, and independent F16/Q5_1 parity remain deferred; standalone runtime packaging is refused before graph construction. No ONNX artifacts were emitted."
+          },
+          {
+            "filename": "wavtokenizer-dec-f32.gguf",
+            "size": 280544,
+            "sha256": "dfce813a74ccdd349f36f23fd0fc9a3cb70f4af96e6fa9d7586d3202107e1ea6",
+            "result": "blocked",
+            "error": "GGUF architecture 'wavtokenizer-dec' is deferred for 'C:\\\\Users\\\\justinchu\\\\AppData\\\\Local\\\\Temp\\\\pytest-of-justinchu\\\\pytest-182\\\\test_deferred_audio_architectu10\\\\wavtokenizer-dec-f32.gguf' before config extraction because these import capabilities are unavailable: config, tensor_map, graph. wavtokenizer-dec is a stateless non-causal code-token to ISTFT-parameter network, not a waveform codec decoder. Its metadata overloads features_length as the 512-wide codebook feature input and embedding_length as the 1282-wide output, while 768-wide PosNet and ConvNeXt stacks provide the hidden width. The GGUF graph stops before the required magnitude/phase reconstruction and ISTFT processor, so mapping it to CodecTask would falsely promise waveform output. Dedicated graph, processor, quantization guards, and independent F16/Q5_1 parity remain deferred; standalone runtime packaging is refused before graph construction. No ONNX artifacts were emitted."
+          }
+        ],
+        "numerical_parity": "not-tested-by-this-probe",
+        "full_checkpoint_runtime": "not-tested"
+      }
+    ]
+  },
+  "census_architectures": [
+    {
+      "architecture": "afmoe",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "apertus",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "arcee",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "arctic",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "arwkv7",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "baichuan",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "bailingmoe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "bailingmoe2",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "bailingmoe3",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "bert",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "bitnet",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "bloom",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "chameleon",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "chatglm",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "clip",
+      "legacy_graph_verdict": "rejected",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "codeshell",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "cogvlm",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "cohere2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "cohere2moe",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "command-r",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "dbrx",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "deci",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "deepseek",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "deepseek2",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "deepseek2-ocr",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "deepseek32",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "deepseek4",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "dflash",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "dots1",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "dots3note",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "dream",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "eagle3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "ernie4_5",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "ernie4_5-moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "eurobert",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "exaone",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "exaone-moe",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "exaone4",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "falcon",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "falcon-h1",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "gemma",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "gemma-embedding",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "gemma2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "gemma3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "gemma3n",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "gemma4",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "gemma4-assistant",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "glm-dsa",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "glm4",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "glm4moe",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "gpt-oss",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "gpt2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "gptj",
+      "legacy_graph_verdict": "rejected",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "gptneox",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "granite",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "granite_swa",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "granitehybrid",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "granitemoe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "graniteswitch",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "grok",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "grovemoe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "hunyuan-dense",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "hunyuan-moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "hunyuan_vl",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "hy_v3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "internlm2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "jais",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "jais2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "jamba",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "jina-bert-v2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "jina-bert-v3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "kimi-k3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "kimi-linear",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "laguna",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "lfm2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "lfm2moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "llada",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "llada-moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "llama",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "llama-embed",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "llama4",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "maincoder",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "mamba",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "mamba2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "mellum",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "mimo2",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "minicpm",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "minicpm3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "minimax-01",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "minimax-m2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "minimax-m3",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "mistral3",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "mistral4",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "modern-bert",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "mpt",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "muse-glimmer",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "nanbeige",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "nemotron",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "nemotron_h",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "nemotron_h_moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "neo-bert",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "nomic-bert",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "nomic-bert-moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "olmo",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "olmo2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "olmoe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "openelm",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "orion",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "paddleocr",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "pangu-embedded",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "phi2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "phi3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "phimoe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "plamo",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "plamo2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "plamo3",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "plm",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "pockettts",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "qwen",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "qwen2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "qwen2moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "qwen2vl",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "qwen3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "qwen35",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "qwen35moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "qwen3moe",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "qwen3next",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "qwen3tts",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "qwen3vl",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "qwen3vlmoe",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "qwen4exp",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "refact",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "rnd1",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "rwkv6",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "rwkv6qwen2",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "rwkv7",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "seed_oss",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "smallthinker",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "smollm3",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "stablelm",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "starcoder",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "starcoder2",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "step35",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "t5",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "t5encoder",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "passed"
+    },
+    {
+      "architecture": "talkie",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    },
+    {
+      "architecture": "wavtokenizer-dec",
+      "legacy_graph_verdict": "deferred",
+      "opset29_fixture_graph_checker": "blocked"
+    },
+    {
+      "architecture": "xverse",
+      "legacy_graph_verdict": "supported",
+      "opset29_fixture_graph_checker": "not-probed"
+    }
+  ],
+  "explicit_gaps": [
+    "Q2_0 missing from installed gguf reader, despite ONNX schema support.",
+    "Tencent SEQ custom 2-bit Q1_0 is not mainline 1-bit Q1_0.",
+    "Big-endian input is rejected; no runtime byte-order adapter implemented.",
+    "Floating inverse/offset preprocessing is rejected; models need direct original-parameter graph contracts rather than rounded reparameterization.",
+    "Unsupported/data-dependent layout operations and architecture preflights remain explicit errors.",
+    "Flat same-directory package only; no mmproj/MTP/multi-component packaging.",
+    "GroupedMatMul consumes floating banks: production selected-bank decode fusion and opset29 execution kernels remain runtime work.",
+    "No full Qwen3.8 checkpoint, production tokenizer package or GPU execution claim."
+  ],
+  "onnx_specification_gap": "None established. DequantizePacked29 satisfies onnx/onnx#8359's primary encoded-weight representation request; it is not an unresolved representation blocker."
+}

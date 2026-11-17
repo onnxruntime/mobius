@@ -28,6 +28,8 @@ from mobius.components._moe import (
     TopKGate,
 )
 
+pytestmark = pytest.mark.opset29
+
 
 class TestTopKGate:
     def test_gate_has_weight_parameter(self):

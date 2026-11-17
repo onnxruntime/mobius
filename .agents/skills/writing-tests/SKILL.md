@@ -73,8 +73,8 @@ python -m pytest tests/build_graph -k "phi4mm"
 python -m pytest tests/integration/text_test.py -m integration -k "qwen2.5-0.5b"
 
 # L4/L5 golden tests
-python -m pytest tests/e2e_golden_test.py -m golden --level L4 -v
-python -m pytest tests/e2e_golden_test.py -m golden --level L5 -v
+python -m pytest tests/e2e_golden_test.py -m golden -v
+python -m pytest tests/e2e_golden_test.py -m generation -v
 
 # Generate golden data
 python scripts/generate_golden.py --level L4 --filter 'my-model*'
@@ -152,6 +152,8 @@ are present.
 
 Models with dedicated test methods are tracked in
 `tests/build_graph/_support.py::specialized_test_model_types()`.
+Also update the specialized-test inventory in `tests/model_coverage_test.py`;
+one inventory does not satisfy the other.
 
 ### Weight alignment tests
 
@@ -196,6 +198,26 @@ Compare ONNX outputs against pre-computed golden files in `testdata/golden/`.
 |-------|-------------|----------|
 | L4 | `<model>.json` | Prefill top-1/top-2 token IDs + logit summary |
 | L5 | `<model>_generation.json` | Prompt + generated token IDs + text |
+
+These are causal-LM examples, not mandatory output contracts. For embeddings,
+L5 checks semantic retrieval/rankings (including supported truncated dimensions).
+For continuous outputs, compare the full horizon and postprocessing against an
+independent pinned reference across multiple host feedback blocks. Greedy
+refinement can still draw random permutations: record upstream draw orders when
+a seed alone cannot reproduce CPU/CUDA execution.
+
+Before GPU runs, inspect actual device VRAM (a pool name may hide a small vGPU
+partition), bound fixtures without removing their semantics, and close staged
+component sessions. Apply the same TF32 policy to reference generators and replay.
+Prove padding is present and exercise sequences beyond the real sliding radius.
+Test OOV media placeholders before lookup, separate export dtype configs, and
+malformed-prefill cache preservation. Cast boolean masks to integers before
+`np.diff` when checking descending transitions.
+
+For multi-component exports, test `package.save` -> `ModelPackage.load` -> actual
+inference using restored metadata; arbitrary `ArchitectureConfig` fields are not
+automatically reconstructed. Separate codec checkpoints need their own immutable
+revision, config-layout checks, and exact initializer-binding evidence.
 
 > Read [`references/test-examples.md`](references/test-examples.md) for
 > YAML format, golden file format, and step-by-step coverage instructions.
@@ -262,6 +284,9 @@ integration test alongside any new custom function or Scan op.**
   features, mixed modality order, and a decode step with zero new media
 - **Hybrid caches** — include left-padded batch > 1, cached multi-token chunks
   crossing a sliding-window boundary, and full logits at every reused-state step.
+- **Absent attention history** — omit optional past inputs (`None, None`) rather
+  than supplying zero-length KV tensors while discarding present outputs; CPU
+  acceptance does not prove CUDA validity, so check the graph and both providers.
 
 ### Golden tests must be reproducible and exact
 
