@@ -2143,6 +2143,7 @@ def _write_moe_gguf(
     include_output: bool = True,
     expert_scale_suffix: str | None = None,
     malformed_expert_scale: bool = False,
+    num_experts: int = 4,
 ) -> None:
     """Write a one-layer conventional-attention MoE GGUF with exact families."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -2156,7 +2157,6 @@ def _write_moe_gguf(
         else 128
     )
     shared_size = 128 if architecture == "qwen2moe" else 32
-    num_experts = 4
     num_heads = 4
     num_kv_heads = num_heads if architecture == "dots1" else 2
     head_dim = 16

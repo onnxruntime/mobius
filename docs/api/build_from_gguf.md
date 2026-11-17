@@ -40,10 +40,36 @@ layout operations, with `GroupedMatMul` for ordinary routed experts. It does not
 repack, requantize, copy payloads into a new blob, or materialize a dense vocabulary
 at export time. Row-aligned packed embeddings decode only requested rows.
 
-Current packaging is one flat model with its original, little-endian GGUF shards,
-`gguf-packed.json`, and reports. Multi-component/mmproj/MTP packages, transcoded
-safetensors output, and new weight sharding are rejected. Treat source files as
-immutable; load/save verifies source digests and original external bindings.
+Multi-component and MTP packages share immutable, little-endian GGUF shards.
+Keep uniquely named sources in the output directory; load/save verifies their
+digests and bindings. Multi-component saves publish atomically through
+`gguf-packed.json`. Transcoding, new weight sharding, and included policy/adapter
+artifacts are unsupported.
+The manifest records source filenames, sizes and hashes for integrity, plus each
+component's graph file and MTP depth for loading.
+
+Standalone lossless mmproj supports `janus_pro`:
+
+```python
+from mobius.integrations.gguf import build_mmproj_from_gguf
+
+vision = build_mmproj_from_gguf(
+    "weights/mmproj.gguf",
+    projector_type="janus_pro",
+    target_architecture="llama",
+    execution_provider="onnx-standard",
+)
+vision.save("weights")
+```
+
+Other lossless projectors and paired `mmproj=` insertion are unsupported.
+MTP retains its architecture-specific sharing contract, one physical prediction
+block and independent dynamic cache; speculative acceptance policy is not included.
+
+Grouped dispatch covers ordinary/shared MLP experts, LFM2MoE and Flash-Next,
+not every specialized MoE. Unfused dequantization still needs full-bank workspace.
+Flash-Next uses the merged `LinearAttention-29` value-head ABI (onnx/onnx#8693);
+optional recurrence trajectories do not provide whole-model state rollback.
 The flag does **not** add runtime kernels. See the
 [opset-29 survey](../gguf-capability-catalog.md#lossless-opset-29-survey).
 

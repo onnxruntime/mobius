@@ -476,10 +476,12 @@ def _register_linear_attention_functions(
             ndim=1,
             activation="silu",
         )
+        linear_opset = model.graph.opset_imports[""]
         attn_func = linear_attention(
-            opset_version=model.graph.opset_imports[""],
+            opset_version=linear_opset,
             q_num_heads=dims.num_k_heads,
-            kv_num_heads=dims.num_v_heads,
+            kv_num_heads=(dims.num_k_heads if linear_opset >= 29 else dims.num_v_heads),
+            v_num_heads=dims.num_v_heads if linear_opset >= 29 else 0,
             update_rule="gated_delta",
             scale=1.0 / (dims.head_k_dim**0.5),
             stash_type=getattr(config, "mamba_ssm_dtype", None) or config.dtype,
