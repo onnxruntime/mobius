@@ -16,6 +16,7 @@ import math
 import os
 import re
 import tempfile
+import uuid
 from pathlib import Path
 from typing import TypedDict
 
@@ -79,6 +80,63 @@ _PACKED_FORMATS = {
 }
 
 
+def use_original_gguf_norms(module, architecture: str) -> bool:
+    """Consume already-offset GGUF scales without a rounded subtract/add pair."""
+    from mobius.components._rms_norm import OffsetRMSNorm
+    from mobius.integrations.gguf._builder import (
+        _OFFSET_NORM_GGUF_ARCHS,
+        _replace_child_module,
+    )
+
+    if architecture not in _OFFSET_NORM_GGUF_ARCHS:
+        return False
+
+    class EffectiveRMSNorm(OffsetRMSNorm):
+        def forward(self, op, hidden_states):
+            hidden = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+            weight = op.Cast(self.weight, to=ir.DataType.FLOAT)
+            result = op.RMSNormalization(
+                hidden, weight, epsilon=self.variance_epsilon, axis=-1
+            )
+            return op.CastLike(result, hidden_states)
+
+    for name, child in list(module.named_modules()):
+        if type(child) is OffsetRMSNorm:
+            _replace_child_module(
+                module,
+                name,
+                EffectiveRMSNorm(int(child.weight.shape[0]), child.variance_epsilon),
+            )
+    return True
+
+
+def use_original_gguf_decay(module, config) -> frozenset[str]:
+    """Replace proven DeltaNet classes with direct negative-decay consumers."""
+    from mobius.components import GatedDeltaNet, OriginalDecayGatedDeltaNet
+    from mobius.integrations.gguf._builder import _replace_child_module
+    from mobius.models.qwen4_exp import Qwen4ExpGatedDeltaNet
+    from mobius.models.qwen35 import Qwen35GatedDeltaNet
+
+    class OriginalDecayQwen35(OriginalDecayGatedDeltaNet, Qwen35GatedDeltaNet):
+        """Retain the source model's per-head Q/K normalization epsilon."""
+
+    class OriginalDecayQwen4Exp(OriginalDecayGatedDeltaNet, Qwen4ExpGatedDeltaNet):
+        """Retain the source model's convolution and output-gate normalization."""
+
+    replacements = {
+        GatedDeltaNet: OriginalDecayGatedDeltaNet,
+        Qwen35GatedDeltaNet: OriginalDecayQwen35,
+        Qwen4ExpGatedDeltaNet: OriginalDecayQwen4Exp,
+    }
+    paths = set()
+    for name, child in list(module.named_modules()):
+        replacement = replacements.get(type(child))
+        if replacement is not None:
+            _replace_child_module(module, name, replacement(config))
+            paths.add(name)
+    return frozenset(paths)
+
+
 class _PackedSource(TypedDict):
     path: str
     size: int
@@ -128,6 +186,61 @@ def _validate_source_initializers(model: ir.Model) -> None:
                 f"Original GGUF binding for {name!r} was changed by a transform. "
                 "Rebuild without weight folding/transcoding; preserve source shape and bytes."
             )
+
+
+def _restore_expert_banks(model: ir.Model) -> None:
+    """Cancel source-bank splitting followed by ordered graph bank assembly."""
+    for node in list(model.graph):
+        if node.domain or node.op_type != "Concat" or node.outputs[0] in model.graph.outputs:
+            continue
+        if node.attributes.get_int("axis", 0) != 0 or not node.inputs:
+            continue
+        source = None
+        for index, value in enumerate(node.inputs):
+            unsqueeze = None if value is None else value.producer()
+            if (
+                unsqueeze is None
+                or unsqueeze.domain
+                or unsqueeze.op_type != "Unsqueeze"
+                or len(unsqueeze.inputs) != 2
+            ):
+                break
+            axes = unsqueeze.inputs[1]
+            if (
+                axes is None
+                or axes.const_value is None
+                or axes.const_value.numpy().tolist() != [0]
+            ):
+                break
+            selected = unsqueeze.inputs[0]
+            gather = None if selected is None else selected.producer()
+            if (
+                gather is None
+                or gather.domain
+                or gather.op_type != "Gather"
+                or gather.attributes.get_int("axis", 0) != 0
+            ):
+                break
+            bank, selection = gather.inputs
+            if (
+                bank is None
+                or selection is None
+                or selection.const_value is None
+                or selection.const_value.numpy().shape != ()
+                or selection.const_value.numpy().item() != index
+                or (source is not None and bank is not source)
+            ):
+                break
+            source = bank
+        else:
+            if (
+                source is not None
+                and source.shape is not None
+                and len(source.shape)
+                and source.shape[0] == len(node.inputs)
+            ):
+                node.outputs[0].replace_all_uses_with(source, replace_graph_outputs=True)
+                model.graph.remove(node, safe=True)
 
 
 def _select_packed_rows(model: ir.Model) -> None:
@@ -498,17 +611,65 @@ class _LayoutGraph(TorchDispatchMode):
         return result
 
 
-def bind_packed_weights(package, source, module, config) -> None:
-    """Bind a flat graph to original typed/packed GGUF tensors and exact layouts."""
+def bind_packed_weights(
+    package,
+    source,
+    module,
+    config,
+    *,
+    name_mapper=None,
+    preprocess=None,
+    effective_norms=False,
+    original_decay_paths=frozenset(),
+) -> None:
+    """Bind each component to the same immutable GGUF source payloads."""
+    from mobius import ModelPackage
+
+    sources = dict(getattr(package, "gguf_packed_sources", {}))
+    for model in package.values():
+        component = ModelPackage({"model": model})
+        _bind_packed_model(
+            component,
+            source,
+            module,
+            config,
+            name_mapper=name_mapper,
+            preprocess=preprocess,
+            effective_norms=effective_norms,
+            original_decay_paths=original_decay_paths,
+        )
+        for location, record in component.gguf_packed_sources.items():
+            if location in sources and sources[location] != record:
+                raise ValueError(
+                    f"GGUF source filename {location!r} identifies different files. "
+                    "Rename the original sources uniquely before composing components."
+                )
+            sources[location] = record
+        package.gguf_quantization_report = component.gguf_quantization_report
+    package.gguf_packed_sources = sources
+    package.register_lazy_source_artifacts(
+        files=[record["path"] for record in sources.values()],
+        directories=[Path(record["path"]).parent for record in sources.values()],
+    )
+
+
+def _bind_packed_model(
+    package,
+    source,
+    module,
+    config,
+    *,
+    name_mapper=None,
+    preprocess=None,
+    effective_norms=False,
+    original_decay_paths=frozenset(),
+) -> None:
+    """Bind one graph to original typed/packed GGUF tensors and exact layouts."""
     from mobius.integrations.gguf._builder import _normalize_gguf_weights
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
     from mobius.integrations.gguf._tensor_processors import process_tensors
 
-    if len(package) != 1:
-        raise ValueError(
-            "Lossless GGUF opset29 export currently requires one flat model. "
-            "Multi-component external-source packaging is not implemented."
-        )
+    mapper = name_mapper or map_gguf_to_hf_names
     if not source.is_little_endian:
         raise ValueError(
             "Lossless GGUF external data requires little-endian input. "
@@ -532,7 +693,7 @@ def bind_packed_weights(package, source, module, config) -> None:
     records = []
     sources: dict[str, _PackedSource] = {}
     for name in source.tensor_names:
-        target = map_gguf_to_hf_names(name, source.architecture)
+        target = mapper(name, source.architecture)
         if target is None:
             continue
         owner = source.tensor_source_model(name)
@@ -626,9 +787,18 @@ def bind_packed_weights(package, source, module, config) -> None:
                 "path": str(path),
             }
     with layout:
-        state = process_tensors(state, config)
-        state = _normalize_gguf_weights(state, source.architecture, config)
-        state = module.preprocess_weights(state)
+        if preprocess is None:
+            state = process_tensors(state, config)
+            state = _normalize_gguf_weights(
+                state,
+                source.architecture,
+                config,
+                effective_norms=effective_norms,
+                original_decay_paths=original_decay_paths,
+            )
+            state = module.preprocess_weights(state)
+        else:
+            state = preprocess(state)
     bound = set()
     for name, tensor in state.items():
         initializer = model.graph.initializers.get(name)
@@ -661,11 +831,19 @@ def bind_packed_weights(package, source, module, config) -> None:
     model.graph.initializers.update(layout.initializers)
     model.graph.extend(layout.nodes)
     model.graph.sort()
+    _restore_expert_banks(model)
     _select_packed_rows(model)
     from onnxscript import optimizer
 
     optimizer.remove_unused_nodes(model)
     model.metadata_props["mobius.gguf.original_external_data"] = "1"
+    model.metadata_props["mobius.gguf.sources"] = json.dumps(
+        {
+            name: {key: value for key, value in info.items() if key != "path"}
+            for name, info in sources.items()
+        },
+        sort_keys=True,
+    )
     model.metadata_props["mobius.gguf.external_initializers"] = json.dumps(
         {
             name: _binding(value.const_value)
@@ -736,19 +914,96 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
             "Lossless GGUF requires external_data='onnx' without shard-size conversion. "
             "Original GGUF shards are already the external data."
         )
-    if len(package) != 1 or package.mtp_head is not None:
-        raise ValueError("Lossless GGUF save currently requires one flat model without MTP.")
     root = Path(directory).resolve()
+    models = []
+    sources = {}
+    current = package
+    depth = 0
+    while current is not None:
+        for location, record in getattr(current, "gguf_packed_sources", {}).items():
+            if location in sources and sources[location] != record:
+                raise ValueError(
+                    f"GGUF filename {location!r} refers to different source files. "
+                    "Rename the original files uniquely before saving."
+                )
+            sources[location] = record
+        models.extend((depth, name, model) for name, model in current.items())
+        current = current.mtp_head
+        depth += 1
+    for _, _, model in models:
+        encoded = model.metadata_props.get("mobius.gguf.sources")
+        if encoded is None:
+            continue
+        try:
+            records = json.loads(encoded)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "GGUF model source records are malformed; restore the model or rebuild."
+            ) from error
+        if not isinstance(records, dict):
+            raise TypeError("GGUF model source records must be a map; rebuild the model.")
+        for location, record in records.items():
+            if (
+                not isinstance(location, str)
+                or not location
+                or location in {".", ".."}
+                or any(character in location for character in "/\\:")
+                or not isinstance(record, dict)
+                or set(record) != {"size", "sha256"}
+                or type(record["size"]) is not int
+                or record["size"] < 0
+                or not isinstance(record["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is None
+            ):
+                raise ValueError(
+                    "GGUF model source record is invalid; restore its original metadata."
+                )
+            previous = sources.get(location)
+            if previous is not None and any(
+                previous[key] != record[key] for key in ("size", "sha256")
+            ):
+                raise ValueError(
+                    f"Components disagree about GGUF source {location!r}. "
+                    "Use uniquely named original files before composing components."
+                )
+            if previous is None:
+                sources[location] = {**record, "path": str(root / location)}
+    if not sources:
+        raise ValueError(
+            "Original GGUF source records are missing; compose packages with intact "
+            "source metadata or rebuild from the original files."
+        )
+    if not models:
+        raise ValueError("Cannot save an empty GGUF package; build at least one component.")
+    generation = uuid.uuid4().hex
+    filenames = [f"component-{generation}-{index}.onnx" for index in range(len(models))]
+    reserved = {
+        *filenames,
+        _MANIFEST,
+        "quantization_report.json",
+        "export_report.json",
+        ".gguf-packed.lock",
+    }
+    if reserved & sources.keys() or any(name.startswith(".gguf-packed-") for name in sources):
+        raise ValueError(
+            "An original GGUF filename conflicts with an ONNX component filename. "
+            "Rename the original source before saving."
+        )
     allowed = {
-        *package.gguf_packed_sources,
-        "model.onnx",
+        *sources,
+        *filenames,
         _MANIFEST,
         "quantization_report.json",
         "export_report.json",
         ".gguf-packed.lock",
     }
     if root.exists():
-        unexpected = {p.name for p in root.iterdir()} - allowed
+        unexpected = {
+            p.name
+            for p in root.iterdir()
+            if p.name not in allowed
+            and re.fullmatch(r"component-[0-9a-f]{32}-[0-9]+\.onnx", p.name) is None
+        }
         if unexpected:
             raise ValueError(
                 f"Lossless GGUF output contains unrelated/stale artifacts: "
@@ -756,7 +1011,7 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
             )
         if any(p.is_symlink() or not p.is_file() for p in root.iterdir()):
             raise ValueError("GGUF package artifacts must be regular, non-symlinked files.")
-    for location, info in package.gguf_packed_sources.items():
+    for location, info in sources.items():
         source = Path(info["path"])
         if source.parent.resolve() != root:
             raise ValueError(
@@ -775,13 +1030,45 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
             raise ValueError(
                 f"GGUF external source {location!r} bytes changed; rebuild the package."
             )
-    model = next(iter(package.values()))
-    _validate_source_initializers(model)
+    for _, _, model in models:
+        _validate_source_initializers(model)
+        _validate_external_ranges(model, sources)
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=root, prefix=".gguf-packed-") as staging:
+        stage = Path(staging)
+        for (_, _, model), filename in zip(models, filenames, strict=True):
+            ir.save(model, stage / filename)
+        manifest = {
+            "format": "mobius.gguf-packed.v1",
+            "sources": {
+                name: {k: v for k, v in info.items() if k != "path"}
+                for name, info in sources.items()
+            },
+        }
+        manifest["models"] = [
+            {"depth": level, "component": name, "file": filename}
+            for (level, name, _), filename in zip(models, filenames, strict=True)
+        ]
+        (stage / _MANIFEST).write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if package.gguf_quantization_report is not None:
+            package.gguf_quantization_report.write_json(stage / "quantization_report.json")
+        if package.export_report is not None:
+            package.export_report.write_json(stage / "export_report.json")
+        for artifact in stage.iterdir():
+            if artifact.name != _MANIFEST:
+                os.replace(artifact, root / artifact.name)
+        os.replace(stage / _MANIFEST, root / _MANIFEST)
+
+
+def _validate_external_ranges(model, sources) -> None:
     for graph in model.graphs():
         for value in graph.initializers.values():
             tensor = value.const_value
             if isinstance(tensor, ir.ExternalTensor):
-                info = package.gguf_packed_sources.get(tensor.location)
+                info = sources.get(str(tensor.location))
                 if (
                     info is None
                     or tensor.offset is None
@@ -790,33 +1077,58 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
                     or tensor.length < 0
                     or tensor.offset + tensor.length > info["size"]
                 ):
-                    raise ValueError(f"Invalid original GGUF range for {value.name!r}.")
-    root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=root, prefix=".gguf-packed-") as staging:
-        stage = Path(staging)
-        ir.save(model, stage / "model.onnx")
-        (stage / _MANIFEST).write_text(
-            json.dumps(
-                {
-                    "format": "mobius.gguf-packed.v1",
-                    "sources": {
-                        name: {k: v for k, v in info.items() if k != "path"}
-                        for name, info in package.gguf_packed_sources.items()
-                    },
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+                    raise ValueError(
+                        f"GGUF initializer {value.name!r} has an invalid source range. "
+                        "Restore the original binding or rebuild the component."
+                    )
+
+
+def packed_model_filenames(directory) -> list[str] | None:
+    """Select only graphs committed by the packed manifest, ignoring orphan generations."""
+    root = Path(directory)
+    if (root / ".gguf-packed.lock").exists():
+        raise ValueError(
+            "GGUF save is in progress or interrupted; finish recovery before loading."
         )
-        if package.gguf_quantization_report is not None:
-            package.gguf_quantization_report.write_json(stage / "quantization_report.json")
-        if package.export_report is not None:
-            package.export_report.write_json(stage / "export_report.json")
-        for artifact in stage.iterdir():
-            if artifact.name != "model.onnx":
-                os.replace(artifact, root / artifact.name)
-        os.replace(stage / "model.onnx", root / "model.onnx")
+    manifest = root / _MANIFEST
+    if not manifest.exists():
+        return None
+    if not manifest.is_file() or manifest.is_symlink():
+        raise ValueError(
+            "GGUF manifest must be a regular file; restore the original manifest."
+        )
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "GGUF manifest is invalid JSON; restore the original manifest."
+        ) from error
+    if isinstance(payload, dict) and payload.get("format") == "mobius.gguf-packed.v1":
+        records = payload.get("models")
+        if not isinstance(records, list) or not records:
+            raise ValueError(
+                "GGUF component manifest is empty or invalid; rebuild the package."
+            )
+        filenames = []
+        for record in records:
+            filename = record.get("file") if isinstance(record, dict) else None
+            if (
+                not isinstance(filename, str)
+                or re.fullmatch(r"component-[0-9a-f]{32}-[0-9]+\.onnx", filename) is None
+            ):
+                raise ValueError("Invalid GGUF component filename; restore the manifest.")
+            if filename in filenames:
+                raise ValueError("GGUF component manifest contains missing/duplicate models.")
+            filenames.append(filename)
+    else:
+        raise ValueError("Invalid GGUF packed manifest; rebuild from the original GGUF.")
+    for filename in filenames:
+        path = root / filename
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(
+                f"GGUF manifest component {filename!r} is missing/unsafe; restore the package."
+            )
+    return filenames
 
 
 def restore_packed_sources(package, directory) -> None:
@@ -877,33 +1189,73 @@ def restore_packed_sources(package, directory) -> None:
                 f"GGUF source {location!r} bytes changed; restore the original file."
             )
         sources[location] = {**info, "path": str(source)}
-    models = list(package.values())
-    if (
-        len(models) != 1
-        or models[0].metadata_props.get("mobius.gguf.original_external_data") != "1"
+    _restore_components(package, payload.get("models"))
+    models = []
+    current = package
+    while current is not None:
+        models.extend(current.values())
+        current = current.mtp_head
+    if not models or any(
+        model.metadata_props.get("mobius.gguf.original_external_data") != "1"
+        for model in models
     ):
         raise ValueError(
-            "GGUF manifest requires one original-external-data model; rebuild the package."
+            "GGUF manifest requires original-external-data components; rebuild the package."
         )
-    for graph in models[0].graphs():
-        for value in graph.initializers.values():
-            tensor = value.const_value
-            if isinstance(tensor, ir.ExternalTensor):
-                info = sources.get(str(tensor.location))
-                if (
-                    info is None
-                    or tensor.offset is None
-                    or tensor.length is None
-                    or tensor.offset < 0
-                    or tensor.length < 0
-                    or tensor.offset + tensor.length > info["size"]
-                ):
-                    raise ValueError(
-                        f"GGUF initializer {value.name!r} has an invalid source range."
-                    )
-    _validate_source_initializers(models[0])
-    package.gguf_packed_sources = sources
-    package.register_lazy_source_artifacts(
-        files=[info["path"] for info in sources.values()],
-        directories=[Path(info["path"]).parent for info in sources.values()],
-    )
+    for model in models:
+        _validate_external_ranges(model, sources)
+        _validate_source_initializers(model)
+    current = package
+    while current is not None:
+        current.gguf_packed_sources = sources
+        current.register_lazy_source_artifacts(
+            files=[info["path"] for info in sources.values()],
+            directories=[Path(info["path"]).parent for info in sources.values()],
+        )
+        current = current.mtp_head
+
+
+def _restore_components(package, records) -> None:
+    from mobius import ModelPackage
+
+    if not isinstance(records, list) or not records:
+        raise ValueError("GGUF component manifest is empty or invalid; rebuild the package.")
+    components = {}
+    used = set()
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"depth", "component", "file"}
+            or type(record["depth"]) is not int
+            or record["depth"] < 0
+            or not isinstance(record["component"], str)
+            or not record["component"]
+            or not isinstance(record["file"], str)
+            or re.fullmatch(r"component-[0-9a-f]{32}-[0-9]+\.onnx", record["file"]) is None
+        ):
+            raise ValueError("Invalid GGUF component record; restore the manifest or rebuild.")
+        name = record["file"].removesuffix(".onnx")
+        key = (record["depth"], record["component"])
+        if name not in package or name in used or key in components:
+            raise ValueError(
+                "GGUF component manifest contains missing/duplicate models; "
+                "restore all original ONNX components and the manifest."
+            )
+        used.add(name)
+        components[key] = package[name]
+    if used != set(package) or {level for level, _ in components} != set(
+        range(max(level for level, _ in components) + 1)
+    ):
+        raise ValueError(
+            "GGUF component manifest does not match the saved package; "
+            "restore its original components and contiguous MTP chain."
+        )
+    package.clear()
+    current = package
+    for level in range(max(depth for depth, _ in components) + 1):
+        if level:
+            current.mtp_head = ModelPackage({})
+            current = current.mtp_head
+        current.update(
+            (name, model) for (depth, name), model in components.items() if depth == level
+        )

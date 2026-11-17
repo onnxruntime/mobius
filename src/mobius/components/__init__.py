@@ -45,6 +45,7 @@ __all__ = [
     "FCMLP",
     "FusedGateUpMLP",
     "GatedDeltaNet",
+    "OriginalDecayGatedDeltaNet",
     "GatedMLP",
     "GatedRMSNorm",
     "KimiDeltaAttention",
@@ -102,7 +103,9 @@ __all__ = [
     "Cosmos3EdgeMultiModalProjector",
     "MobileNetV5Encoder",
     "MoELayer",
+    "GroupedGatedSharedMoELayer",
     "GroupedMoELayer",
+    "GroupedUngatedSharedMoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
@@ -265,7 +268,7 @@ from mobius.components._fixed_siglip_sidecar import (
     FixedResolutionSiglipMLPSidecar,
     map_fixed_siglip_sidecar_weight,
 )
-from mobius.components._gated_deltanet import GatedDeltaNet
+from mobius.components._gated_deltanet import GatedDeltaNet, OriginalDecayGatedDeltaNet
 from mobius.components._gemma3n_audio import Gemma3nAudioEncoder
 from mobius.components._gemma3n_embedder import Gemma3nMultimodalEmbedder
 from mobius.components._gemma4_audio import ClippableLinear
@@ -305,7 +308,9 @@ from mobius.components._mimo_minimax_vision import (
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 from mobius.components._mobilenetv5 import MobileNetV5Encoder
 from mobius.components._moe import (
+    GroupedGatedSharedMoELayer,
     GroupedMoELayer,
+    GroupedUngatedSharedMoELayer,
     MoELayer,
     SigmoidTopKGate,
     SoftmaxTopKGate,

@@ -57,8 +57,8 @@ jobs:
       - name: Install pinned opset-29 schemas
         run: |
           pip install --no-cache-dir --no-deps --force-reinstall \
-            https://github.com/onnx/onnx/archive/c7609c4ad5445c548e0e18a465666dd0f4084215.tar.gz
-          python -c "import onnx; assert onnx.defs.has('GroupedMatMul', 29); assert onnx.defs.has('DequantizePacked', 29)"
+            https://github.com/onnx/onnx/archive/cb7fbbff6b743c379d715386ee1a8c09c48bf99a.tar.gz
+          python -c "import onnx; assert onnx.defs.has('GroupedMatMul', 29); assert onnx.defs.has('DequantizePacked', 29); assert 'v_num_heads' in onnx.defs.get_schema('LinearAttention', 29).attributes"
       - name: Test with pinned opset-29 schemas
         run: |
           python -m pytest src/mobius tests/ep_optimization_test.py -m opset29 -q -rs \
