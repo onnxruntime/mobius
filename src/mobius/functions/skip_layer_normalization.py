@@ -27,7 +27,7 @@ from mobius._constants import OPSET_VERSION
 DOMAIN = "com.microsoft"
 
 
-def skip_layer_normalization() -> ir.Function:
+def skip_layer_normalization(*, opset_version: int = OPSET_VERSION) -> ir.Function:
     """Build an ``ir.Function`` for ``SkipLayerNormalization``.
 
     Standard-ONNX body::
@@ -81,11 +81,11 @@ def skip_layer_normalization() -> ir.Function:
         attributes=[
             ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5),
         ],
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": opset_version},
     )
 
 
-def skip_simplified_layer_normalization() -> ir.Function:
+def skip_simplified_layer_normalization(*, opset_version: int = OPSET_VERSION) -> ir.Function:
     """Build an ``ir.Function`` for ``SkipSimplifiedLayerNormalization``.
 
     Standard-ONNX body::
@@ -145,5 +145,5 @@ def skip_simplified_layer_normalization() -> ir.Function:
         attributes=[
             ir.Attr("epsilon", ir.AttributeType.FLOAT, 1e-5),
         ],
-        opset_imports={"": OPSET_VERSION},
+        opset_imports={"": opset_version},
     )

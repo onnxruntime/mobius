@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
+import pytest
 
 from mobius._testing import count_op_type, create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
@@ -140,7 +141,7 @@ class TestCreateAttentionBias:
                     op,
                     input_ids,
                     attention_mask,
-                    sliding_window=4,
+                    sliding_window=2,
                     block_sequence_ids=block_sequence_ids,
                 )
             bias.name = "bias"
@@ -165,12 +166,61 @@ class TestCreateAttentionBias:
         qnn_bias = OnnxModelSession(qnn_model, device="cpu").run(feeds)["bias"]
         np.testing.assert_array_equal(openvino_bias, qnn_bias)
 
+        # Exercise a same-image block wider than the window on both code paths.
+        feeds["attention_mask"] = np.ones((1, 8), dtype=np.int64)
+        feeds["block_sequence_ids"] = np.zeros((1, 4), dtype=np.int64)
+        for model in (openvino_model, qnn_model):
+            bias = OnnxModelSession(model, device="cpu").run(feeds)["bias"]
+            assert bias[0, 0, 0, 7] == 0  # Same-image future key.
+            assert bias[0, 0, 3, 4] < -1  # Old same-image key.
+            assert bias[0, 0, 3, 5] < -1  # Strict window boundary.
+            assert bias[0, 0, 3, 6] == 0
+
+    @pytest.mark.parametrize("execution_provider", ["default", "openvino"])
+    @pytest.mark.parametrize("query_length", [1, 2, 1025])
+    def test_internal_padding_hole_does_not_shrink_physical_window(
+        self, execution_provider, query_length
+    ):
+        from mobius._build_context import build_context
+        from mobius._execution_providers import get_ep
+
+        builder, op, graph = create_test_builder()
+        ii = create_test_input(
+            builder, "input_ids", [1, query_length], dtype=ir.DataType.INT64
+        )
+        am = create_test_input(builder, "attention_mask", [1, 1025], dtype=ir.DataType.INT64)
+        bk = create_test_input(
+            builder, "block_sequence_ids", [1, query_length], dtype=ir.DataType.INT64
+        )
+        with build_context(get_ep(execution_provider)):
+            bias = create_attention_bias(
+                op, ii, am, sliding_window=1024, block_sequence_ids=bk
+            )
+        bias.name = "bias"
+        graph.outputs.append(bias)
+        mask = np.ones((1, 1025), dtype=np.int64)
+        mask[0, 1] = 0
+        actual = OnnxModelSession(ir.Model(graph, ir_version=10), device="cpu").run(
+            {
+                "input_ids": np.zeros((1, query_length), dtype=np.int64),
+                "attention_mask": mask,
+                "block_sequence_ids": np.zeros((1, query_length), dtype=np.int64),
+            }
+        )["bias"]
+        assert actual[0, 0, -1, 0] < -1  # q=1024, k=0: exact left boundary.
+        assert actual[0, 0, -1, 1] < -1  # Invalid key stays masked.
+        assert actual[0, 0, -1, 2] == 0
+        if query_length > 1:
+            assert actual[0, 0, -2, 0] == 0  # q=1023: boundary not yet reached.
+        if query_length == 1025:
+            assert actual[0, 0, 0, 1024] == 0  # Same-image future key.
+
 
 class TestBlockwiseAttentionBias:
     """Numerically verify the Gemma4 vision-block bidirectional overlay.
 
     ``create_attention_bias(block_sequence_ids=...)`` must bake the FULL mask
-    (causal [+ sliding] OR same-block, AND padding) so the Attention op can be
+    ((causal OR same-block) AND sliding AND padding) so the Attention op can be
     called with ``is_causal=0``. We build the graph, run it via ORT, and
     compare the attended pattern (bias == 0) against a numpy reference.
     """
@@ -195,15 +245,15 @@ class TestBlockwiseAttentionBias:
 
     @staticmethod
     def _ref(block_ids, attn, sliding):
-        cumsum = np.cumsum(attn)
-        qi = cumsum[:, None]
-        ki = cumsum[None, :]
+        slots = np.arange(len(attn))
+        qi = slots[:, None]
+        ki = slots[None, :]
         m = qi >= ki
-        if sliding is not None:
-            m = m & ((qi - ki) < sliding)
         qg = np.array(block_ids)[:, None]
         kg = np.array(block_ids)[None, :]
         m = m | ((qg == kg) & (qg >= 0))
+        if sliding is not None:
+            m = m & ((qi - ki) < sliding)
         return m & (np.array(attn)[None, :].astype(bool))
 
     def _run(self, sliding, block_ids, attn):
@@ -231,17 +281,17 @@ class TestBlockwiseAttentionBias:
         assert not attended[3, 4]
 
     def test_block_wider_than_sliding_window(self):
-        # Single block spanning positions 1..4 with a window of 2: the block
-        # must escape the sliding window (same-block OR overrides the window).
+        # Same-image future keys are visible, but the strict left boundary applies.
         attended, expected = self._run(2, [-1, 0, 0, 0, 0, -1, -1, -1], [1] * 8)
         assert np.array_equal(attended, expected)
-        assert attended[4, 1]  # distance 3 >= window, allowed via same block
+        assert attended[1, 4]
+        assert not attended[4, 1]
+        assert not attended[4, 2]  # key == query - window is masked.
+        assert attended[4, 3]
 
     def test_padding_still_masked(self):
-        # Last two positions are padding (attention_mask == 0).
-        attended, expected = self._run(
-            2, [-1, 0, 0, -1, -1, -1, -1, -1], [1, 1, 1, 1, 1, 1, 0, 0]
-        )
+        # Padding must stay masked even when it carries the same image-block ID.
+        attended, expected = self._run(2, [-1, 0, 0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0])
         assert np.array_equal(attended, expected)
         assert not attended[:, 6:].any()  # nothing attends to padding
 
