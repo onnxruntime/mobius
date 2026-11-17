@@ -518,6 +518,10 @@ def test_granite_tiny_gguf_builds_complete_graph(
         fused_qkv=fused_qkv,
         quantized=quantized,
     )
+    if quantized and moe and fused_qkv:
+        with pytest.raises(ValueError, match="MOBIUS_EXPERIMENTAL_OPSET29"):
+            build_from_gguf(path, keep_quantized=True)
+        return
     package = build_from_gguf(path, keep_quantized=quantized)
     model = package["model"]
     names = set(model.graph.initializers)

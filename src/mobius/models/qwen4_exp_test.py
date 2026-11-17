@@ -141,7 +141,8 @@ def _vl_config(**overrides) -> Qwen4ExpConfig:
     return _config(**values)
 
 
-def test_pinned_config_fields_extract_and_normalize_schedule():
+@pytest.mark.parametrize("qsa_layer_type", ["full_attention", "indexed_attention"])
+def test_pinned_config_fields_extract_and_normalize_schedule(qsa_layer_type):
     text = SimpleNamespace(
         model_type="qwen4_exp_text",
         vocab_size=248320,
@@ -166,7 +167,7 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
             "linear_attention",
             "linear_attention",
             "linear_attention",
-            "full_attention",
+            qsa_layer_type,
         ],
         linear_conv_kernel_dim=4,
         linear_key_head_dim=128,
@@ -275,6 +276,11 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     parent.video_token_id = 42
     with pytest.raises(ValueError, match="video_token_id 248057"):
         Qwen4ExpConfig.from_transformers(parent)
+
+
+def test_direct_config_normalizes_indexed_attention():
+    config = _config(layer_types=["linear_attention", "indexed_attention"])
+    assert config.layer_types == ["linear_attention", "qwen_sparse_attention"]
 
 
 def test_immutable_fp8_schema_fixture_matches_integration_contract():
@@ -3217,13 +3223,18 @@ def _assert_reduced_huggingface_states(outputs, cache, *, multimodal=False, tole
                 outputs[name], reference, tolerance=tolerance, err_msg=name
             )
     positions = outputs["present_position_ids"]
+    reference_positions = (
+        attention.indexer_position_ids
+        if hasattr(attention, "indexer_position_ids")
+        else cache.position_ids
+    )
     if multimodal:
-        np.testing.assert_array_equal(positions[1:], cache.position_ids.numpy(), strict=True)
+        np.testing.assert_array_equal(positions[1:], reference_positions.numpy(), strict=True)
         np.testing.assert_array_equal(
             positions[0], np.arange(positions.shape[-1], dtype=np.int64)[None], strict=True
         )
     else:
-        np.testing.assert_array_equal(positions, cache.position_ids[0].numpy(), strict=True)
+        np.testing.assert_array_equal(positions, reference_positions[0].numpy(), strict=True)
 
 
 @pytest.mark.integration
