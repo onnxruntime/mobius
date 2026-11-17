@@ -47,6 +47,36 @@ _FLOAT_TYPES = {
     "I64": ir.DataType.INT64,
 }
 _MANIFEST = "gguf-packed.json"
+# DequantizePacked-29's fixed GGUF layouts: (elements per block, bytes per block).
+_PACKED_FORMATS = {
+    "gguf:q4_0": (32, 18),
+    "gguf:q4_1": (32, 20),
+    "gguf:q5_0": (32, 22),
+    "gguf:q5_1": (32, 24),
+    "gguf:q8_0": (32, 34),
+    "gguf:q8_1": (32, 36),
+    "gguf:q2_k": (256, 84),
+    "gguf:q3_k": (256, 110),
+    "gguf:q4_k": (256, 144),
+    "gguf:q5_k": (256, 176),
+    "gguf:q6_k": (256, 210),
+    "gguf:q8_k": (256, 292),
+    "gguf:iq2_xxs": (256, 66),
+    "gguf:iq2_xs": (256, 74),
+    "gguf:iq3_xxs": (256, 98),
+    "gguf:iq1_s": (256, 50),
+    "gguf:iq4_nl": (32, 18),
+    "gguf:iq3_s": (256, 110),
+    "gguf:iq2_s": (256, 82),
+    "gguf:iq4_xs": (256, 136),
+    "gguf:iq1_m": (256, 56),
+    "gguf:tq1_0": (256, 54),
+    "gguf:tq2_0": (256, 66),
+    "gguf:mxfp4": (32, 17),
+    "gguf:nvfp4": (64, 36),
+    "gguf:q1_0": (128, 18),
+    "gguf:q2_0": (64, 18),
+}
 
 
 class _PackedSource(TypedDict):
@@ -558,23 +588,13 @@ def bind_packed_weights(package, source, module, config) -> None:
         proxy = torch.empty(shape, device="meta", dtype=torch.float32)
         if dtype is None:
             format_name = f"gguf:{qtype.lower()}"
-            import onnx
-
-            schema = onnx.defs.get_schema("DequantizePacked", 29)
-            formats = {
-                fmt: (int(elements), int(size))
-                for fmt, elements, size in re.findall(
-                    r"\| (gguf:[a-z0-9_]+) \| [^|]+ \| (\d+) \| (\d+) \|",
-                    schema.doc or "",
-                )
-            }
-            if format_name not in formats:
+            if format_name not in _PACKED_FORMATS:
                 raise ValueError(
-                    f"GGUF tensor {name!r} uses {qtype}, absent from installed "
-                    "DequantizePacked-29. Install current ONNX schemas or add exact "
-                    "standard support; requantization is forbidden."
+                    f"GGUF tensor {name!r} uses {qtype}, not supported by this "
+                    "DequantizePacked-29 importer. Add its exact standardized layout "
+                    "before exporting; requantization is forbidden."
                 )
-            block, block_bytes = formats[format_name]
+            block, block_bytes = _PACKED_FORMATS[format_name]
             elements = math.prod(shape)
             if not shape or elements % block or length != elements // block * block_bytes:
                 raise ValueError(
