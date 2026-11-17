@@ -45,6 +45,8 @@ Keep uniquely named sources in the output directory; load/save verifies their
 digests and bindings. Multi-component saves publish atomically through
 `gguf-packed.json`. Transcoding, new weight sharding, and included policy/adapter
 artifacts are unsupported.
+The manifest records source filenames, sizes and hashes for integrity, plus each
+component's graph file and MTP depth for loading.
 
 Standalone lossless mmproj supports `janus_pro`:
 

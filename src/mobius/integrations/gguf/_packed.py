@@ -975,12 +975,8 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
         )
     if not models:
         raise ValueError("Cannot save an empty GGUF package; build at least one component.")
-    legacy = len(models) == 1 and package.mtp_head is None and models[0][1] == "model"
     generation = uuid.uuid4().hex
-    filenames = [
-        "model.onnx" if legacy else f"component-{generation}-{index}.onnx"
-        for index in range(len(models))
-    ]
+    filenames = [f"component-{generation}-{index}.onnx" for index in range(len(models))]
     reserved = {
         *filenames,
         _MANIFEST,
@@ -1006,7 +1002,7 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
             p.name
             for p in root.iterdir()
             if p.name not in allowed
-            and re.fullmatch(r"component-(?:[0-9a-f]{32}-)?[0-9]+\.onnx", p.name) is None
+            and re.fullmatch(r"component-[0-9a-f]{32}-[0-9]+\.onnx", p.name) is None
         }
         if unexpected:
             raise ValueError(
@@ -1043,17 +1039,16 @@ def _save_packed_package(package, directory, *, external_data, max_shard_size_by
         for (_, _, model), filename in zip(models, filenames, strict=True):
             ir.save(model, stage / filename)
         manifest = {
-            "format": "mobius.gguf-packed.v1" if legacy else "mobius.gguf-packed.v2",
+            "format": "mobius.gguf-packed.v1",
             "sources": {
                 name: {k: v for k, v in info.items() if k != "path"}
                 for name, info in sources.items()
             },
         }
-        if not legacy:
-            manifest["models"] = [
-                {"depth": level, "component": name, "file": filename}
-                for (level, name, _), filename in zip(models, filenames, strict=True)
-            ]
+        manifest["models"] = [
+            {"depth": level, "component": name, "file": filename}
+            for (level, name, _), filename in zip(models, filenames, strict=True)
+        ]
         (stage / _MANIFEST).write_text(
             json.dumps(manifest, indent=2) + "\n",
             encoding="utf-8",
@@ -1109,8 +1104,6 @@ def packed_model_filenames(directory) -> list[str] | None:
             "GGUF manifest is invalid JSON; restore the original manifest."
         ) from error
     if isinstance(payload, dict) and payload.get("format") == "mobius.gguf-packed.v1":
-        filenames = ["model.onnx"]
-    elif isinstance(payload, dict) and payload.get("format") == "mobius.gguf-packed.v2":
         records = payload.get("models")
         if not isinstance(records, list) or not records:
             raise ValueError(
@@ -1121,7 +1114,7 @@ def packed_model_filenames(directory) -> list[str] | None:
             filename = record.get("file") if isinstance(record, dict) else None
             if (
                 not isinstance(filename, str)
-                or re.fullmatch(r"component-(?:[0-9a-f]{32}-)?[0-9]+\.onnx", filename) is None
+                or re.fullmatch(r"component-[0-9a-f]{32}-[0-9]+\.onnx", filename) is None
             ):
                 raise ValueError("Invalid GGUF component filename; restore the manifest.")
             if filename in filenames:
@@ -1157,7 +1150,7 @@ def restore_packed_sources(package, directory) -> None:
         ) from error
     if (
         not isinstance(payload, dict)
-        or payload.get("format") not in {"mobius.gguf-packed.v1", "mobius.gguf-packed.v2"}
+        or payload.get("format") != "mobius.gguf-packed.v1"
         or not isinstance(payload.get("sources"), dict)
         or not payload["sources"]
     ):
@@ -1196,13 +1189,7 @@ def restore_packed_sources(package, directory) -> None:
                 f"GGUF source {location!r} bytes changed; restore the original file."
             )
         sources[location] = {**info, "path": str(source)}
-    if payload["format"] == "mobius.gguf-packed.v2":
-        _restore_components(package, payload.get("models"))
-    elif len(package) != 1:
-        raise ValueError(
-            "GGUF v1 manifest requires one model; restore the original package "
-            "or rebuild a multi-component v2 package."
-        )
+    _restore_components(package, payload.get("models"))
     models = []
     current = package
     while current is not None:
@@ -1244,8 +1231,7 @@ def _restore_components(package, records) -> None:
             or not isinstance(record["component"], str)
             or not record["component"]
             or not isinstance(record["file"], str)
-            or re.fullmatch(r"component-(?:[0-9a-f]{32}-)?[0-9]+\.onnx", record["file"])
-            is None
+            or re.fullmatch(r"component-[0-9a-f]{32}-[0-9]+\.onnx", record["file"]) is None
         ):
             raise ValueError("Invalid GGUF component record; restore the manifest or rebuild.")
         name = record["file"].removesuffix(".onnx")

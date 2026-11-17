@@ -20,6 +20,11 @@ from mobius.integrations.gguf._builder_test_utils import _write_quantized_gguf
 pytestmark = pytest.mark.opset29
 
 
+def _saved_model(directory: Path) -> Path:
+    manifest = json.loads((directory / "gguf-packed.json").read_text())
+    return directory / manifest["models"][0]["file"]
+
+
 def _has_schema29(name: str) -> bool:
     return onnx.defs.has(name, 29) and onnx.defs.get_schema(name, 29).since_version == 29
 
@@ -235,8 +240,8 @@ def test_all_stored_reader_formats(tmp_path: Path, qtype: str, validate_schema: 
     assert any(n.op_type == "Scan" for n in model.graph.all_nodes())
     if not validate_schema:
         return
-    onnx.checker.check_model(str(tmp_path / "model.onnx"), full_check=True)
-    evaluator = ReferenceEvaluator(str(tmp_path / "model.onnx"))
+    onnx.checker.check_model(str(_saved_model(tmp_path)), full_check=True)
+    evaluator = ReferenceEvaluator(str(_saved_model(tmp_path)))
     indices = np.array([[1, 0, 1], [-1, -2, 0]], dtype=np.int64)
     actual = evaluator.run(["out"], {"ids": indices})[0]
     if qtype == "Q4_0":
@@ -319,7 +324,8 @@ def test_manifest_integrity_and_failed_save_preserve_model(
     with override_flags(experimental_opset29=True):
         package = build_from_gguf(source, execution_provider="onnx-standard")
     package.save(str(root))
-    original_model = (root / "model.onnx").read_bytes()
+    original_model_path = _saved_model(root)
+    original_model = original_model_path.read_bytes()
     manifest = root / "gguf-packed.json"
     original_manifest = manifest.read_text(encoding="utf-8")
     corrupt = json.loads(original_manifest)
@@ -338,7 +344,7 @@ def test_manifest_integrity_and_failed_save_preserve_model(
     initializer.const_value = ir.tensor(np.zeros(1, dtype=np.uint8))
     with pytest.raises(ValueError, match="binding"):
         package.save(str(root))
-    assert (root / "model.onnx").read_bytes() == original_model
+    assert original_model_path.read_bytes() == original_model
     assert not (root / ".gguf-packed.lock").exists()
 
 
@@ -418,7 +424,7 @@ def test_packed_model_schema(packed_sources: dict[str, Path], architecture: str)
     with override_flags(experimental_opset29=True):
         package = build_from_gguf(source, execution_provider="onnx-standard")
     package.save(str(source.parent))
-    onnx.checker.check_model(str(source.parent / "model.onnx"), full_check=True)
+    onnx.checker.check_model(str(_saved_model(source.parent)), full_check=True)
 
 
 @requires_packed_schema
@@ -440,7 +446,7 @@ def test_packed_next_token_matches_float_source(
     dense = build_from_gguf(source, keep_quantized=False, execution_provider="onnx-standard")
     dense_dir = tmp_path / "dense"
     dense.save(str(dense_dir))
-    reference = ReferenceEvaluator(str(tmp_path / "model.onnx"))
+    reference = ReferenceEvaluator(str(_saved_model(tmp_path)))
     dense_reference = ReferenceEvaluator(str(dense_dir / "model.onnx"))
     runtime = ort.InferenceSession(str(dense_dir / "model.onnx"))
     state = {}
@@ -496,7 +502,7 @@ def test_original_mtp_composition_roundtrip(
     restored.save(source.parent, progress_bar=False)
     assert source.read_bytes() == before
     manifest = json.loads((source.parent / "gguf-packed.json").read_text())
-    assert manifest["format"] == "mobius.gguf-packed.v2"
+    assert manifest["format"] == "mobius.gguf-packed.v1"
     assert len(manifest["sources"]) == 1
     assert {row["depth"] for row in manifest["models"]} == {0, 1}
     for model in (restored["model"], restored.mtp_head["model"]):
@@ -761,9 +767,7 @@ def test_original_deltanet_decay_needs_no_inverse_reparameterization(
                 result.append(np.einsum("bhk,bhkm->bhm", q[:, step], state) * scale)
             return np.stack(result, axis=1).reshape(batch, length, 64), state
 
-    reference = ReferenceEvaluator(
-        str(source.parent / "model.onnx"), new_ops=[LinearAttention]
-    )
+    reference = ReferenceEvaluator(str(_saved_model(source.parent)), new_ops=[LinearAttention])
     dense = build_from_gguf(source, keep_quantized=False, execution_provider="onnx-standard")
     dense_dir = source.parent / "dense"
     dense.save(dense_dir, progress_bar=False)
