@@ -40,16 +40,14 @@ Any surrounding **shared expert** is left untouched: only the routed per-expert
 storm and its router/mask are fused, and the final ``Add(routed_sum, shared)``
 is rewired to consume the ``BlockQuantizedMoE`` output.
 
-The rewrite is **property-gated and fails closed**: a layer that is not a native
+The rewrite is **property-gated**: a layer that is not a native
 dense-expert storm is skipped, and a *routed native-block* storm whose experts
 cannot be expressed as one expert-major bank (mixed native formats, per-expert
-bias, an incomplete/untraceable expert group, ...) raises
-:class:`~mobius.integrations.gguf.SparseMoEExportError` -- the same typed
-capability error the GGUF builder's sparse-MoE honesty gate raises -- so export
-fails closed rather than silently shipping a dense-all-expert graph. Pass
-``allow_dense_moe=True`` (or set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1``) to instead
-log the reason and leave the runnable dense fallback in place for
-research/correctness study; this makes no throughput claim.
+bias, an incomplete/untraceable expert group, ...) logs the reason and leaves
+the existing dense graph unchanged by default, without a throughput claim.
+Pass ``allow_dense_moe=False`` (or set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=0``)
+to require sparse fusion and raise
+:class:`~mobius.integrations.gguf.SparseMoEExportError` instead.
 
 Example::
 
@@ -678,8 +676,9 @@ def _plan_layer(
                 f"{sorted(distinct)} can only be expressed with the "
                 "block_layout_version=2 per-projection BlockQuantizedMoE ABI, "
                 "which no shipped onnx-genai runtime implements -- emitting a v2 "
-                "node would build an unrunnable graph (overclaim), so export "
-                "fails closed. There is no production, CLI, or environment opt-in; "
+                "node would build an unrunnable graph. Sparse fusion is unavailable; "
+                "the existing dense graph does not require that ABI. There is no "
+                "production, CLI, or environment opt-in to v2; "
                 "v2 stays a schema-construction test path until a typed runtime "
                 "capability handshake ships"
             )
@@ -825,7 +824,7 @@ def _fail_closed(layer: _DenseMoELayer, reason: _UnfusableError, *, allow_dense:
         f"Sparse-MoE export blocker: {detail}. No sparse top-k BlockQuantizedMoE "
         "fusion was applied, so exporting would build a dense-all-expert graph "
         "(every expert evaluated for every token) with no performance guarantee, "
-        "so the build fails closed. To study the dense fallback, re-run with "
+        "but sparse-only export was requested. To allow the dense fallback, re-run with "
         "allow_dense_moe=True (or set MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this "
         "makes no throughput claim."
     ) from reason
@@ -852,9 +851,9 @@ def fuse_block_quantized_moe(
     an unrelated ``Equal`` pattern) is skipped silently. A *routed native-block*
     storm that cannot be collapsed into one expert-major bank -- mixed native
     formats across experts, a per-expert bias, an incomplete/untraceable expert
-    group, ragged packed shapes -- fails closed by raising
-    :class:`~mobius.integrations.gguf.SparseMoEExportError`, matching the GGUF
-    builder's sparse-MoE honesty gate.
+    group, ragged packed shapes -- retains its dense graph with a warning by
+    default. Explicitly requiring sparse fusion raises
+    :class:`~mobius.integrations.gguf.SparseMoEExportError` instead.
 
     Args:
         model: The IR model to rewrite in place.
@@ -862,16 +861,17 @@ def fuse_block_quantized_moe(
             left as the runnable dense fallback (with a loud warning) instead of
             failing closed. When ``None`` (default), the value of the
             ``allow_dense_moe_experts`` flag / ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS``
-            environment variable is used. This is a research/correctness path
-            only and makes no throughput claim.
+            environment variable is used (default ``True``). This makes no
+            throughput claim and never enables an unsupported fused ABI.
         _allow_perproj_v2_schema: Private, test-only switch. A layer that mixes
             native formats across its fc1/fc2/fc3 banks (e.g. GLM-5.2 UD-IQ1 with
             an iq1 gate/up and a higher-bit down) can only be expressed with the
             ``block_layout_version=2`` per-projection ``BlockQuantizedMoE`` ABI.
             No shipped onnx-genai runtime implements that ABI, so this defaults to
             ``False`` (fail closed): the production ``build_from_gguf`` path never
-            sets it, and a mixed-format layer typed-rejects rather than emitting an
-            unrunnable v2 node. It is ``True`` only in schema-construction tests
+            sets it, and a mixed-format layer retains its dense graph (or rejects
+            an explicit sparse-only request) rather than emitting an unrunnable
+            v2 node. It is ``True`` only in schema-construction tests
             that assert the v2 node's shape; that node is not runnable and must
             never be shipped. Until a real typed runtime-capability handshake
             exists there is no production, CLI, or environment path to v2.
@@ -881,7 +881,7 @@ def fuse_block_quantized_moe(
 
     Raises:
         SparseMoEExportError: A routed native-block MoE layer cannot be sparse
-            fused and ``allow_dense_moe`` is not set.
+            fused and ``allow_dense_moe=False`` was explicitly requested.
     """
     if allow_dense_moe is None:
         from mobius._flags import flags

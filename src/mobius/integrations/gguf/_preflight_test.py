@@ -334,21 +334,38 @@ def test_report_json_roundtrip_is_resumable(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def test_assess_sparse_moe_blocks_iq1_moe():
-    ok, blockers = _assess_sparse_moe(
+def test_assess_sparse_moe_warns_for_iq1_moe():
+    ok, blockers, warnings = _assess_sparse_moe(
         model_type="glm_moe_dsa",
         num_experts=160,
         quantization="IQ1_S",
         source="unsloth/GLM-5.2-GGUF",
     )
     assert ok is False
+    assert blockers == []
+    assert len(warnings) == 1
+    assert "sparse" in warnings[0].lower()
+    assert "dense-all-expert" in warnings[0]
+
+
+def test_assess_sparse_moe_preserves_explicit_sparse_requirement():
+    from mobius._flags import override_flags
+
+    with override_flags(allow_dense_moe_experts=False):
+        ok, blockers, warnings = _assess_sparse_moe(
+            model_type="glm_moe_dsa",
+            num_experts=160,
+            quantization="IQ1_S",
+            source="synthetic.gguf",
+        )
+    assert ok is False
     assert len(blockers) == 1
-    assert "sparse" in blockers[0].lower()
-    assert "dense-all-expert" in blockers[0]
+    assert "Sparse-only export was explicitly requested" in blockers[0]
+    assert warnings == []
 
 
 def test_assess_sparse_moe_allows_non_moe():
-    ok, blockers = _assess_sparse_moe(
+    ok, blockers, warnings = _assess_sparse_moe(
         model_type="llama",
         num_experts=None,
         quantization="IQ1_S",
@@ -356,11 +373,12 @@ def test_assess_sparse_moe_allows_non_moe():
     )
     assert ok is True
     assert blockers == []
+    assert warnings == []
 
 
 def test_assess_sparse_moe_allows_int4_moe():
     # int4 experts repack to MatMulNBits and fuse into QMoE.
-    ok, blockers = _assess_sparse_moe(
+    ok, blockers, warnings = _assess_sparse_moe(
         model_type="glm_moe_dsa",
         num_experts=160,
         quantization=None,  # no native-block quant detected
@@ -368,11 +386,12 @@ def test_assess_sparse_moe_allows_int4_moe():
     )
     assert ok is True
     assert blockers == []
+    assert warnings == []
 
 
 @pytest.mark.parametrize("quantization", [None, "IQ2_XXS"])
 def test_assess_sparse_moe_rejects_every_nemotron_h_quantized_route(quantization):
-    ok, blockers = _assess_sparse_moe(
+    ok, blockers, warnings = _assess_sparse_moe(
         architecture="nemotron_h_moe",
         model_type="nemotron_h",
         num_experts=None,
@@ -386,10 +405,11 @@ def test_assess_sparse_moe_rejects_every_nemotron_h_quantized_route(quantization
     assert "separate router_probs/router_weights can represent" in blockers[0]
     assert "are not incompatibilities" in blockers[0]
     assert "keep_quantized=False" in blockers[0]
+    assert warnings == []
 
 
 def test_assess_sparse_moe_does_not_misclassify_dense_nemotron_h():
-    ok, blockers = _assess_sparse_moe(
+    ok, blockers, warnings = _assess_sparse_moe(
         architecture="nemotron_h",
         model_type="nemotron_h",
         num_experts=None,
@@ -398,6 +418,7 @@ def test_assess_sparse_moe_does_not_misclassify_dense_nemotron_h():
     )
     assert ok is True
     assert blockers == []
+    assert warnings == []
 
 
 @pytest.mark.parametrize(
@@ -510,9 +531,8 @@ def test_hf_preflight_metadata_only(monkeypatch):
     assert report.total_files == 6
     assert report.total_bytes == sum(sizes.values())
     assert all(f.sha256 for f in report.files)
-    # The IQ1 MoE honesty blocker must be present.
-    assert not report.exportable
-    assert any("sparse-MoE" in b for b in report.blockers)
+    assert report.exportable
+    assert any("sparse-MoE" in warning for warning in report.warnings)
     # And nothing was downloaded.
     assert fake.downloaded == []
 
@@ -612,15 +632,10 @@ def test_budget_reflects_real_artifacts_only_no_second_copy(tmp_path):
     assert _json.loads(report.to_json())["output_bytes"] == report.output_bytes
 
 
-def test_sparse_iq1_moe_is_the_remaining_blocker_not_sharding(tmp_path):
+def test_sparse_iq1_moe_is_advisory_not_export_blocker(tmp_path):
     # Flagship GLM-5.2 UD-IQ1_S composition: a *sharded*, MoE, IQ1_S set whose
-    # ONLY honesty blocker must be sparse-MoE fusion — never sharding or the
-    # architecture. The fixture is faithful to the three signals production
-    # actually consumes, so the gate is exercised end-to-end and the positive
-    # assertions below fail if either filename quant detection or the
-    # sparse-MoE gate is bypassed (a fixture that put IQ1_S into no
-    # production-consumed candidate — the prior bug — leaves quantization=None,
-    # fusion_supported=True and no blocker, failing this test).
+    # Sparse-fusion uncertainty belongs in warnings, not hard export blockers.
+    # Keep real metadata/filename detection exercised through the report.
     shards = _write_glm_moe_iq1_sharded_gguf(tmp_path, num_experts=8)
 
     # -- Preconditions, proved explicitly (not assumed) ----------------------
@@ -650,15 +665,15 @@ def test_sparse_iq1_moe_is_the_remaining_blocker_not_sharding(tmp_path):
     assert all(s.disposition == "native-preserve" for s in iq1_stats)
     assert report.unsupported_types == []
 
-    # -- The gate under test: sparse-MoE fusion is the remaining blocker ------
+    # Sparse fusion is not promised, but missing performance evidence is advisory.
     assert report.sparse_moe_fusion_supported is False
-    assert len(report.blockers) == 1
-    blocker = report.blockers[0]
-    assert "sparse-MoE fusion blocker" in blocker
-    assert "dense-all-expert" in blocker
-    assert "BlockQuantizedMoE" in blocker
-    assert "glm_moe_dsa" in blocker
-    assert "IQ1_S" in blocker
+    assert report.exportable
+    assert report.blockers == []
+    advisory = next(w for w in report.warnings if "sparse-MoE fusion advisory" in w)
+    assert "dense-all-expert" in advisory
+    assert "BlockQuantizedMoE" in advisory
+    assert "glm_moe_dsa" in advisory
+    assert "IQ1_S" in advisory
 
     # -- Sharding is explicitly NOT the blocker ------------------------------
     joined = " ".join(report.blockers).lower()

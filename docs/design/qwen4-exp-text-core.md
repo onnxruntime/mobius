@@ -90,13 +90,14 @@ Other EPs retain the existing fused `com.microsoft::MoE` route, parameter
 layouts, tasks, and cache ABI. No additional model alias or configuration flag
 is needed.
 
-BF16 image-text export with `onnx-standard` is rejected at the Qwen4-Exp
-vision component, including when that component is built independently.
+BF16 image-text export with `onnx-standard` is permitted, including when the
+vision component is built independently, and logs a numerical caveat.
 Official-weight production-size vision parity failed all four tested cases
 at `rtol=atol=1e-2`, with maximum absolute error `0.04052734375`; the cause
-remains unresolved. Use FP32/FP16 for image-text export, or `text_only=True`
-for a BF16 decoder. BF16 text-only exports and other EPs are unchanged.
-This guard does not establish numerical qualification for those alternatives.
+remains unresolved. The exported graph retains BF16 weights and features,
+with the existing float32 processor input boundary. Validate image-text outputs
+before deployment, or select FP32/FP16. BF16 text-only exports and other EPs
+are unchanged. Successful export does not establish numerical qualification.
 
 The standard expert dispatch selects TopK from float32 router probabilities
 with a one-dimensional INT64 K tensor. When requested, it divides the selected
@@ -131,7 +132,7 @@ fallback. This global guard may expose previously unresolved exports in other
 architectures; it does not change other EPs.
 
 Local evidence uses tiny synthetic text/image-text graphs, ONNX full checker
-validation in FP32/FP16 (plus BF16 text-only), independent FP32 expert parity
+validation in FP32/FP16/BF16, independent FP32 expert parity
 (K=1/intermediate/E, ties, near ties, saturated logits, normalization, scaling,
 mixed/unused experts, batches and single tokens), FP16 routing execution,
 complete cache/logit prefill/decode comparisons across the QSA boundary, left padding, multimodal
@@ -177,8 +178,9 @@ cases run CPU FP32 and CUDA FP32/FP16 and compare two nonzero, differently shape
 image grids through the actual ONNX vision-to-embedding-to-decoder pipeline,
 independently checking vision features and HF-fused embeddings, then three
 decode steps with no new images.
-BF16 image-text regression tests verify export rejection rather than running
-the unqualified pipeline. Shapes and dtypes are checked alongside numerical
+BF16 image-text regression tests verify schema-valid graph construction and
+preserved BF16 types, not numerical qualification of the pipeline.
+Shapes and dtypes are checked alongside numerical
 values; tolerances are `rtol=atol=1e-3` for FP32 and `1e-2` for FP16/BF16.
 Recurrent state remains FP32
 even when weights, embeddings, and convolution/KV caches are FP16/BF16. The expert

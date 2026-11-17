@@ -1896,10 +1896,12 @@ class Qwen4ExpVisionEncoderModel(Qwen3VLVisionEncoderModel):
             ep_capabilities().name == "onnx-standard"
             and self.visual.patch_embed.weight.dtype == ir.DataType.BFLOAT16
         ):
-            raise ValueError(
+            logger.warning(
                 "Qwen4-Exp BF16 vision export with execution_provider='onnx-standard' "
-                "is disabled because official-weight vision parity failed; "
-                "use dtype='f32' or dtype='f16', or select text_only=True."
+                "has known official-weight numerical discrepancies (maximum absolute "
+                "error 0.04052734375 at rtol=atol=1e-2). Exporting the requested BF16 "
+                "graph; validate image-text outputs before deployment, or use "
+                "dtype='f32' or dtype='f16'."
             )
         # The HF image processor emits float32 packed patches. Cast once to
         # the checkpoint dtype before the Conv3d patch projection.

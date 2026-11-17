@@ -1252,6 +1252,7 @@ def test_standard_moe_independent_reference(top_k, normalize, shape, routes):
         (False, ir.DataType.BFLOAT16),
         (True, ir.DataType.FLOAT),
         (True, ir.DataType.FLOAT16),
+        (True, ir.DataType.BFLOAT16),
     ],
 )
 def test_standard_all_components_before_after_weights(multimodal, dtype):
@@ -1286,21 +1287,43 @@ def test_standard_all_components_before_after_weights(multimodal, dtype):
         onnx.checker.check_model(ir.to_proto(model), full_check=True)
 
 
-def test_standard_bfloat16_multimodal_export_rejects_unqualified_vision():
+def test_standard_bfloat16_multimodal_export_preserves_dtype(caplog):
     config = _vl_config(dtype=ir.DataType.BFLOAT16)
     module = Qwen4ExpForConditionalGeneration(config)
-    with pytest.raises(ValueError, match=r"BF16 vision export.*official-weight vision parity"):
-        build_from_module(
-            module,
-            config,
-            task="qwen4-exp-vision-language",
-            execution_provider="onnx-standard",
+    package = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-vision-language",
+        execution_provider="onnx-standard",
+    )
+    assert set(package) == {"decoder", "vision_encoder", "embedding"}
+    assert "known official-weight numerical discrepancies" in caplog.text
+    vision = package["vision_encoder"]
+    pixels = next(value for value in vision.graph.inputs if value.name == "pixel_values")
+    assert pixels.dtype == ir.DataType.FLOAT
+    cast = next(
+        node for node in vision.graph if node.op_type == "Cast" and node.inputs[0] is pixels
+    )
+    assert cast.outputs[0].dtype == ir.DataType.BFLOAT16
+    for component, output in (
+        ("decoder", "logits"),
+        ("vision_encoder", "image_features"),
+        ("embedding", "inputs_embeds"),
+    ):
+        model = package[component]
+        assert next(value for value in model.graph.outputs if value.name == output).dtype == (
+            ir.DataType.BFLOAT16
         )
+        weights = [
+            value for value in model.graph.initializers.values() if value.const_value is None
+        ]
+        assert weights
+        assert all(value.dtype == ir.DataType.BFLOAT16 for value in weights)
 
 
 @pytest.mark.parametrize("config_dtype", [ir.DataType.FLOAT, ir.DataType.BFLOAT16])
 @pytest.mark.parametrize("ep", ["onnx-standard", "default", "cuda"])
-def test_bfloat16_vision_export_guard_uses_cast_weight_dtype(config_dtype, ep):
+def test_bfloat16_vision_export_caveat_uses_cast_weight_dtype(config_dtype, ep, caplog):
     config = _vl_config(dtype=config_dtype)
     module = Qwen4ExpVisionEncoderModel(config)
     _cast_module_dtype(module, ir.DataType.BFLOAT16)
@@ -1308,15 +1331,12 @@ def test_bfloat16_vision_export_guard_uses_cast_weight_dtype(config_dtype, ep):
     pixels = create_test_input(builder, "pixel_values", [4, 1536])
     grid = create_test_input(builder, "image_grid_thw", [1, 3], ir.DataType.INT64)
     with build_context(ep_registry.require(ep), ir.DataType.BFLOAT16):
-        if ep == "onnx-standard":
-            with pytest.raises(
-                ValueError, match=r"BF16 vision export.*official-weight vision parity"
-            ):
-                module(op, pixels, grid)
-        else:
-            features = module(op, pixels, grid)
-            assert features.producer() is not None
-            assert module.visual.patch_embed.weight.dtype == ir.DataType.BFLOAT16
+        features = module(op, pixels, grid)
+    assert features.producer() is not None
+    assert module.visual.patch_embed.weight.dtype == ir.DataType.BFLOAT16
+    assert ("known official-weight numerical discrepancies" in caplog.text) == (
+        ep == "onnx-standard"
+    )
 
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])

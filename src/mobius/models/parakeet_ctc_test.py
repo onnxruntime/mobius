@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import dataclasses
 
+import ml_dtypes
 import numpy as np
+import onnx
 import onnx_ir as ir
 import pytest
 import torch
@@ -75,12 +77,30 @@ def test_parakeet_config_extracts_nested_encoder_fields():
     assert config.dtype == ir.DataType.FLOAT
 
 
-def test_parakeet_rejects_bfloat16():
+@pytest.mark.parametrize("ep", ["default", "onnx-standard"])
+def test_parakeet_bfloat16_graph_preserves_dtype(ep, caplog):
     config = ParakeetCTCConfig.from_transformers(_hf_config())
     config.dtype = ir.DataType.BFLOAT16
 
-    with pytest.raises(ValueError, match="bf16 is disabled"):
-        ParakeetForCTCModel(config)
+    model = build_from_module(
+        ParakeetForCTCModel(config),
+        config,
+        task=FeatureCTCAsrTask(),
+        execution_provider=ep,
+    )["model"]
+    assert "known numerical discrepancies" in caplog.text
+    assert model.graph.inputs[0].dtype == ir.DataType.BFLOAT16
+    assert model.graph.outputs[0].dtype == ir.DataType.BFLOAT16
+    weights = [
+        value for value in model.graph.initializers.values() if value.const_value is None
+    ]
+    assert weights
+    assert all(value.dtype == ir.DataType.BFLOAT16 for value in weights)
+    for value in weights:
+        value.const_value = ir.tensor(
+            np.zeros([int(dim) for dim in value.shape], dtype=ml_dtypes.bfloat16)
+        )
+    onnx.checker.check_model(ir.to_proto(model), full_check=True)
 
 
 def test_parakeet_graph_io_and_hf_weight_names_align():

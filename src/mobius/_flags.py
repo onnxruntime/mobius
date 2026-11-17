@@ -217,23 +217,17 @@ class _Flags:
     """
 
     allow_dense_moe_experts: bool = dataclasses.field(
-        default_factory=lambda: _env_bool("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", False)
+        default_factory=lambda: _env_bool("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", True)
     )
-    """Opt in to exporting routed MoE experts that have no sparse top-k fusion.
+    """Allow faithful dense MoE fallbacks when sparse top-k fusion is unavailable.
 
-    Some quantized MoE checkpoints (notably GLM-5.2 UD-IQ1_{S,M}) lower their
-    routed experts as per-expert native ``pkg.nxrt::BlockQuantizedMatMul`` nodes
-    (IQ1/IQ2/… blocks), for which no sparse ``BlockQuantizedMoE`` fusion exists
-    yet — only the int4 ``MatMulNBits`` dense-fallback → ``com.microsoft::QMoE``
-    rewrite does. Exporting anyway produces a graph that recomputes **every**
-    expert for every token (full expert weight traffic), i.e. dense-all-expert
-    compute with no performance guarantee.
+    Default ``True``: an unfusable native-block MoE retains its existing dense
+    graph and logs the reason. Every expert runs for every token; no throughput
+    claim is made. This does not enable an unsupported fused operator ABI or
+    relax source tensor, layout, or architecture validation.
 
-    Default ``False``: :func:`~mobius.integrations.gguf.build_from_gguf` fails
-    closed before export with a typed capability error rather than shipping a
-    silently-dense graph. Set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1`` (or override
-    the flag) only for research / correctness study of the dense fallback. This
-    is **not** a performance path and makes no throughput claim.
+    Set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=0`` or pass ``allow_dense_moe=False``
+    to require sparse fusion explicitly and reject a dense fallback.
     """
 
 
