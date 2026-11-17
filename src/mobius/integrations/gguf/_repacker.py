@@ -3,7 +3,7 @@
 
 """Preserve or repack GGUF quantized blocks for ORT custom operators.
 
-Converts raw GGUF block data for Q4_0, Q4_1, Q8_0, Q4_K, and Q1_0
+Converts raw GGUF block data for exact legacy Q4_0, Q8_0, and Q1_0
 quantization types into the (weight, scales, zero_points) tensors
 expected by the ``com.microsoft.MatMulNBits`` operator.
 
@@ -196,6 +196,12 @@ def repack_gguf_tensor(
         raise ValueError(
             f"Unsupported GGUF type {gguf_type}. Supported: {sorted(_SUPPORTED_TYPES)}"
         )
+    if gguf_type in {_GGUF_Q4_1, _GGUF_Q4_K, _GGUF_Q6_K}:
+        raise ValueError(
+            f"GGUF type {gguf_type} cannot be losslessly repacked to MatMulNBits. "
+            "Enable MOBIUS_EXPERIMENTAL_OPSET29=1 and use --ep onnx-standard "
+            "to preserve original bytes with DequantizePacked; lossy conversion was removed."
+        )
 
     if len(shape) != 2:
         raise ValueError(f"Expected 2D shape (N, K), got {shape}")
@@ -227,12 +233,6 @@ def repack_gguf_tensor(
 
     if gguf_type == _GGUF_Q4_0:
         return _repack_q4_0(blocks, n_out, n_blocks_per_row)
-    elif gguf_type == _GGUF_Q4_1:
-        return _repack_q4_1(blocks, n_out, n_blocks_per_row)
-    elif gguf_type == _GGUF_Q4_K:
-        return _repack_q4_k(blocks, n_out, k_in)
-    elif gguf_type == _GGUF_Q6_K:
-        return _repack_q6_k(blocks, n_out, k_in)
     elif gguf_type == _GGUF_Q1_0:
         return _repack_q1_0(blocks, n_out, n_blocks_per_row)
     else:
@@ -313,61 +313,6 @@ def _repack_q4_0(
     )
 
 
-def _repack_q4_1(
-    blocks: np.ndarray,
-    n_out: int,
-    n_blocks_per_row: int,
-) -> RepackedTensor:
-    """Repack Q4_1 blocks.
-
-    Q4_1 block (20 bytes): [fp16 scale (2B)][fp16 min (2B)][16B quants]
-    Dequant: nibble * scale + min  ->  asymmetric.
-
-    MatMulNBits dequant: (nibble - zp) * scale
-    So: zp = round(-min / scale), clamped to [0, 15].
-    """
-    raw_scales = blocks[:, :2].copy()
-    raw_mins = blocks[:, 2:4].copy()
-    raw_quants = blocks[:, 4:]  # (total_blocks, 16)
-
-    scales_flat = raw_scales.view(np.float16).astype(np.float32).ravel()
-    mins_flat = raw_mins.view(np.float16).astype(np.float32).ravel()
-
-    # Compute zero points: zp = round(-min / scale), clamp to [0, 15]
-    # Guard against division by zero: where scale == 0, zp = 0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        zp_float = np.where(
-            scales_flat != 0,
-            np.round(-mins_flat / scales_flat),
-            0.0,
-        )
-    zp_uint4 = np.clip(zp_float, 0, 15).astype(np.uint8)
-
-    # Reshape to (N, n_blocks)
-    scales = scales_flat.astype(np.float16).reshape(n_out, n_blocks_per_row)
-    # Reorder nibbles from GGUF order to MatMulNBits order
-    ort_quants = _reorder_nibbles_gguf_to_ort(raw_quants)
-    weight = ort_quants.reshape(n_out, n_blocks_per_row, 16)
-
-    # Pack two 4-bit zero points per byte (vectorized, matching Q4_K)
-    zp_2d = zp_uint4.reshape(n_out, n_blocks_per_row)
-    zp_cols = math.ceil(n_blocks_per_row / 2)
-    zp_padded = zp_2d
-    if n_blocks_per_row % 2 == 1:
-        zp_padded = np.zeros((n_out, n_blocks_per_row + 1), dtype=np.uint8)
-        zp_padded[:, :n_blocks_per_row] = zp_2d
-    zp_pairs = zp_padded.reshape(n_out, zp_cols, 2)
-    zero_points = zp_pairs[:, :, 0] | (zp_pairs[:, :, 1] << 4)
-
-    return RepackedTensor(
-        weight=weight,
-        scales=scales,
-        zero_points=zero_points,
-        block_size=_BLOCK_SIZE,
-        bits=4,
-    )
-
-
 def _repack_q8_0(
     blocks: np.ndarray,
     n_out: int,
@@ -403,203 +348,6 @@ def _repack_q8_0(
     )
 
 
-def _unpack_q4_k_scales(
-    scales_raw: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Unpack Q4_K 6-bit packed scales into sub-block scales and mins.
-
-    Each Q4_K super-block stores 8 sub-block scales and 8 sub-block mins
-    packed into 12 bytes using 6-bit encoding.  The packing layout (from
-    llama.cpp) uses three 4-byte groups::
-
-        Bytes 0-3 (d):   low 6 bits -> sub_scale[0..3],
-                         high 2 bits -> sub_scale[4..7] bits 4-5
-        Bytes 4-7 (m):   low 6 bits -> sub_min[0..3],
-                         high 2 bits -> sub_min[4..7] bits 4-5
-        Bytes 8-11 (md): low 4 bits -> sub_scale[4..7] bits 0-3,
-                         high 4 bits -> sub_min[4..7] bits 0-3
-
-    Args:
-        scales_raw: uint8 array, shape ``(n_super_blocks, 12)``.
-
-    Returns:
-        Tuple of ``(sub_scales, sub_mins)``, each ``(n_super_blocks, 8)``
-        as uint8 in range [0, 63].
-    """
-    n = scales_raw.shape[0]
-    s = scales_raw.reshape(n, 3, 4)
-    d = s[:, 0, :]  # (n, 4) — bytes 0-3
-    m = s[:, 1, :]  # (n, 4) — bytes 4-7
-    md = s[:, 2, :]  # (n, 4) — bytes 8-11
-
-    # Sub-scales: lower 4 from d[0..3] bits 0-5, upper 4 from md+d
-    sc = np.concatenate([d & 0x3F, (md & 0x0F) | ((d >> 2) & 0x30)], axis=-1)
-    # Sub-mins: lower 4 from m[0..3] bits 0-5, upper 4 from md+m
-    mn = np.concatenate([m & 0x3F, (md >> 4) | ((m >> 2) & 0x30)], axis=-1)
-    return sc.reshape(n, 8), mn.reshape(n, 8)
-
-
-def _repack_q4_k(
-    blocks: np.ndarray,
-    n_out: int,
-    k_in: int,
-) -> RepackedTensor:
-    """Dequantize Q4_K super-blocks and requantize to MatMulNBits.
-
-    Q4_K uses 256-element super-blocks with a two-level scale hierarchy:
-    ``value = d * sub_scale[i] * nibble - dmin * sub_min[i]``. Its
-    fractional effective zero-points cannot generally be represented by
-    MatMulNBits' packed uint4 zero-points. We therefore reference-dequantize
-    the super-blocks, restore the logical row layout, and affine-requantize
-    each 32-element MatMulNBits block.
-
-    Requantization is lossy, but every source value is represented within
-    half of the emitted block scale (apart from floating-point roundoff).
-    Unlike directly rounding Q4_K's effective zero-point, this never clamps
-    a large source offset to 15 while keeping an incompatible source scale.
-
-    Args:
-        blocks: uint8 array, shape ``(total_super_blocks, 144)``.
-        n_out: Number of output rows (N dimension).
-        k_in: Number of input columns (K dimension).
-
-    Returns:
-        A ``RepackedTensor`` with ``block_size=32`` and ``bits=4``.
-    """
-    total = blocks.shape[0]
-
-    # Parse super-block fields (144 bytes each):
-    # [d: 2B fp16][dmin: 2B fp16][scales: 12B][quants: 128B]
-    d_raw = blocks[:, :2].copy()
-    dmin_raw = blocks[:, 2:4].copy()
-    scales_raw = blocks[:, 4:16]
-    qs_raw = blocks[:, 16:]  # (total, 128)
-
-    d = d_raw.view(np.float16).astype(np.float32).ravel()  # (total,)
-    dmin = dmin_raw.view(np.float16).astype(np.float32).ravel()  # (total,)
-
-    # Unpack 6-bit sub-block scales and mins
-    sub_scales, sub_mins = _unpack_q4_k_scales(scales_raw)
-    sub_scales_f = sub_scales.astype(np.float32)  # (total, 8)
-    sub_mins_f = sub_mins.astype(np.float32)  # (total, 8)
-
-    # Effective per-sub-block scale and minimum.
-    eff_scales = d[:, None] * sub_scales_f  # (total, 8)
-    eff_mins = dmin[:, None] * sub_mins_f  # (total, 8)
-
-    # Unpack 4-bit quants from Q4_K layout.
-    # 128 bytes = 4 groups of 32 bytes. Each group encodes two sub-blocks:
-    #   byte[j] low nibble  -> even sub-block element j
-    #   byte[j] high nibble -> odd sub-block element j
-    qs = qs_raw.reshape(total, 4, 1, 32)
-    shifts = np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)
-    qs = (qs >> shifts) & np.uint8(0x0F)  # (total, 4, 2, 32)
-    qs = qs.reshape(total, 8, 32)  # (total, 8, 32) — 8 sub-blocks
-
-    dequantized = (
-        eff_scales[:, :, None] * qs.astype(np.float32) - eff_mins[:, :, None]
-    ).reshape(-1)
-    logical_elements = n_out * k_in
-    if dequantized.size < logical_elements:
-        raise ValueError(
-            f"Q4_K data has {dequantized.size} elements, "
-            f"but shape ({n_out}, {k_in}) requires {logical_elements}"
-        )
-
-    values = dequantized[:logical_elements].reshape(n_out, k_in)
-    return repack_dequantized_tensor(values, bits=4, block_size=_BLOCK_SIZE)
-
-
-def _dequantize_q6_k(blocks: np.ndarray) -> np.ndarray:
-    """Reconstruct float values from Q6_K super-blocks.
-
-    Q6_K stores 256-element super-blocks as
-    ``[ql: 128B][qh: 64B][scales: 16B int8][d: 2B fp16]`` and reconstructs
-    ``value = d * scales[is] * (q - 32)`` where the 6-bit ``q`` is assembled
-    from a low nibble in ``ql`` and a high 2-bit field in ``qh``.
-
-    The element interleave follows ggml's ``dequantize_row_q6_K`` exactly: each
-    128-element half consumes 64 ``ql`` bytes, 32 ``qh`` bytes and 8 scales,
-    and emits four 32-element groups whose scales are ``sc[is], sc[is+2],
-    sc[is+4], sc[is+6]`` with ``is = l // 16``.
-
-    Split out from [`_repack_q6_k`] so the interleave can be compared against
-    the reference dequantizer *exactly*. Every plausible-but-wrong permutation
-    of this layout still yields finite values of the right magnitude, so an
-    approximate check cannot tell a correct unpack from a transposed one, and
-    the lossy requantization that follows would mask the difference.
-
-    Args:
-        blocks: uint8 array, shape ``(total_super_blocks, 210)``.
-
-    Returns:
-        Flat float32 array of ``total_super_blocks * 256`` values.
-    """
-    total = blocks.shape[0]
-
-    ql = blocks[:, :128]  # (total, 128)
-    qh = blocks[:, 128:192]  # (total, 64)
-    scales = blocks[:, 192:208].copy().view(np.int8).astype(np.float32)
-    d = blocks[:, 208:210].copy().view(np.float16).astype(np.float32).ravel()
-
-    # Two 128-element halves per super-block; each takes 64 ql, 32 qh, 8 scales.
-    ql_h = ql.reshape(total, 2, 64)
-    qh_h = qh.reshape(total, 2, 32)
-    sc_h = scales.reshape(total, 2, 8)
-
-    lo = ql_h[:, :, :32]  # ql[l +  0]
-    hi = ql_h[:, :, 32:]  # ql[l + 32]
-
-    q1 = (lo & 0x0F) | (((qh_h >> 0) & 0x03) << 4)
-    q2 = (hi & 0x0F) | (((qh_h >> 2) & 0x03) << 4)
-    q3 = (lo >> 4) | (((qh_h >> 4) & 0x03) << 4)
-    q4 = (hi >> 4) | (((qh_h >> 6) & 0x03) << 4)
-
-    # (total, 2, 4, 32) in emission order y[l+0], y[l+32], y[l+64], y[l+96].
-    q = np.stack([q1, q2, q3, q4], axis=2).astype(np.float32) - 32.0
-
-    # `is = l // 16` splits each 32-element group into two 16-element halves
-    # taking consecutive scales; group g uses sc[is + 2*g].
-    sc_idx = np.array([[0, 1], [2, 3], [4, 5], [6, 7]], dtype=np.intp)
-    sub_scales = np.repeat(sc_h[:, :, sc_idx], 16, axis=3)  # (total, 2, 4, 32)
-
-    return (d[:, None, None, None] * sub_scales * q).reshape(-1)
-
-
-def _repack_q6_k(
-    blocks: np.ndarray,
-    n_out: int,
-    k_in: int,
-) -> RepackedTensor:
-    """Dequantize Q6_K super-blocks and requantize to MatMulNBits.
-
-    The 6-bit width has no MatMulNBits equivalent, and a mixed preset such as
-    Q4_K_M must use one MatMulNBits configuration across the whole graph, so
-    the super-blocks are reference-dequantized (see [`_dequantize_q6_k`]) and
-    affine-requantized to the model's common 4-bit/32 layout — the same
-    treatment Q4_K already receives. The requantization is lossy.
-
-    Args:
-        blocks: uint8 array, shape ``(total_super_blocks, 210)``.
-        n_out: Number of output rows (N dimension).
-        k_in: Number of input columns (K dimension).
-
-    Returns:
-        A ``RepackedTensor`` with ``block_size=32`` and ``bits=4``.
-    """
-    dequantized = _dequantize_q6_k(blocks)
-
-    logical_elements = n_out * k_in
-    if dequantized.size < logical_elements:
-        raise ValueError(
-            f"Q6_K data has {dequantized.size} elements, "
-            f"but shape ({n_out}, {k_in}) requires {logical_elements}"
-        )
-
-    values = dequantized[:logical_elements].reshape(n_out, k_in)
-    return repack_dequantized_tensor(values, bits=4, block_size=_BLOCK_SIZE)
-
-
 def repack_dequantized_tensor(
     values: np.ndarray,
     *,
@@ -607,68 +355,12 @@ def repack_dequantized_tensor(
     block_size: int = _BLOCK_SIZE,
     symmetric: bool = False,
 ) -> RepackedTensor:
-    """Affine-quantize a float matrix into MatMulNBits layout.
-
-    This is used for mixed GGUF presets such as Q4_K_M, where projection
-    tensors may use Q4_K, Q5_0, Q6_K, and Q8_0 within one model while the
-    ONNX graph must use one MatMulNBits configuration throughout.
-    """
-    if values.ndim != 2:
-        raise ValueError(f"Expected 2D values (N, K), got shape {values.shape}")
-    if bits != 4 or block_size != _BLOCK_SIZE:
-        raise ValueError(
-            "Float requantization currently supports only "
-            f"bits=4, block_size={_BLOCK_SIZE}; got bits={bits}, "
-            f"block_size={block_size}"
-        )
-
-    n_out, k_in = values.shape
-    n_blocks = math.ceil(k_in / block_size)
-    padded_k = n_blocks * block_size
-    padded = np.zeros((n_out, padded_k), dtype=np.float32)
-    padded[:, :k_in] = values.astype(np.float32, copy=False)
-    blocks = padded.reshape(n_out, n_blocks, block_size)
-
-    if symmetric:
-        # MatMulNBits' implicit uint4 zero-point is 8. Choose a scale that
-        # covers the asymmetric signed code range [-8, 7].
-        block_min = blocks.min(axis=-1)
-        block_max = blocks.max(axis=-1)
-        scales = np.maximum(-block_min / 8.0, block_max / 7.0)
-        zero_points = np.full_like(scales, 8, dtype=np.uint8)
-    else:
-        # Include zero in the representable range so the rounded zero-point
-        # always fits in uint4 without changing the selected scale.
-        block_min = np.minimum(blocks.min(axis=-1), 0.0)
-        block_max = np.maximum(blocks.max(axis=-1), 0.0)
-        scales = (block_max - block_min) / 15.0
-        safe_scales = np.where(scales != 0, scales, 1.0)
-        zero_points = np.clip(np.rint(-block_min / safe_scales), 0, 15).astype(np.uint8)
-
-    safe_scales = np.where(scales != 0, scales, 1.0)
-    quants = np.rint(blocks / safe_scales[:, :, None])
-    quants += zero_points[:, :, None]
-    quants = np.clip(quants, 0, 15).astype(np.uint8)
-    quants = np.where(scales[:, :, None] != 0, quants, 0).astype(np.uint8)
-
-    pairs = quants.reshape(n_out, n_blocks, block_size // 2, 2)
-    weight = (pairs[..., 1] << 4) | pairs[..., 0]
-
-    if symmetric:
-        packed_zero_points = None
-    else:
-        zp_cols = math.ceil(n_blocks / 2)
-        zp_padded = np.zeros((n_out, zp_cols * 2), dtype=np.uint8)
-        zp_padded[:, :n_blocks] = zero_points
-        zp_pairs = zp_padded.reshape(n_out, zp_cols, 2)
-        packed_zero_points = zp_pairs[:, :, 0] | (zp_pairs[:, :, 1] << 4)
-
-    return RepackedTensor(
-        weight=weight,
-        scales=scales.astype(np.float32),
-        zero_points=packed_zero_points,
-        block_size=block_size,
-        bits=bits,
+    """Reject the removed lossy GGUF requantization path."""
+    raise ValueError(
+        "Lossy GGUF dequantize/requantize conversion was removed. Enable "
+        "MOBIUS_EXPERIMENTAL_OPSET29=1 and use --ep onnx-standard for original "
+        f"GGUF external weights (requested INT{bits}/block-{block_size}, "
+        f"source shape={values.shape})."
     )
 
 

@@ -2,6 +2,8 @@
 # Licensed under the MIT License.
 
 __all__ = [
+    "create_body_graph",
+    "rename_subgraph_values",
     "AdaLayerNormOutput",
     "AdaLayerNormZero",
     "Attention",
@@ -100,6 +102,7 @@ __all__ = [
     "Cosmos3EdgeMultiModalProjector",
     "MobileNetV5Encoder",
     "MoELayer",
+    "GroupedMoELayer",
     "OffsetRMSNorm",
     "PatchEmbed",
     "PatchEmbedding",
@@ -302,6 +305,7 @@ from mobius.components._mimo_minimax_vision import (
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 from mobius.components._mobilenetv5 import MobileNetV5Encoder
 from mobius.components._moe import (
+    GroupedMoELayer,
     MoELayer,
     SigmoidTopKGate,
     SoftmaxTopKGate,
@@ -470,6 +474,7 @@ from mobius.components._sanm_attention import (
 from mobius.components._sanm_attention import (
     SANMEncoderLayer as SANMEncoderLayer,
 )
+from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
 from mobius.components._short_conv import GatedShortConv
 from mobius.components._siglip2_naflex import (
     Siglip2NaFlexVisionEmbeddings,

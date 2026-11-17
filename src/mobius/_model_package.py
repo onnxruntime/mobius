@@ -29,7 +29,7 @@ import shutil
 import tempfile
 import threading
 from collections import UserDict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -41,6 +41,7 @@ import rfc8785
 import torch
 import tqdm
 
+from mobius._constants import LAZY_SOURCE_FILES_META_KEY
 from mobius._export_report import ComponentExportReport
 from mobius._optimizations import fold_initializers_after_weights
 from mobius._weight_utils import WeightTransform
@@ -202,6 +203,8 @@ def _validate_streaming_safetensors_destination(
     *,
     external_data: str,
     component_layout: _ComponentSaveLayout,
+    include_policy_components: bool = True,
+    include_adapter_artifacts: bool = True,
 ) -> None:
     """Defensively reject known aliases to files read by a streaming package.
 
@@ -263,13 +266,46 @@ def _validate_streaming_safetensors_destination(
                 _QUANTIZATION_REPORT,
                 _EXPORT_REPORT,
                 _WEIGHT_LOADING_REPORT,
+                "draft_manifest.json",
+                "gguf-reuse.json",
             )
         )
+        if include_policy_components:
+            output_files.update(
+                current_directory / "policies" / f"{name}.onnx"
+                for name in current_package.policy_components
+            )
+        if include_adapter_artifacts:
+            output_files.update(
+                _adapter_artifact_destinations(current_package, current_directory)
+            )
 
         source_directories.update(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_directories", ())
         )
+        # Derived lazy slices may own an external source that is no longer an
+        # initializer after graph cleanup (e.g. restored packed projections).
+        # Register that ownership before any output can be opened/truncated.
+        models = chain(
+            current_package.values(),
+            (
+                component.model
+                for component in current_package.policy_components.values()
+                if include_policy_components
+            ),
+        )
+        for model in models:
+            current_package.register_lazy_source_artifacts(
+                files=model.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+            )
+            for graph in model.graphs():
+                for initializer in graph.initializers.values():
+                    tensor = initializer.const_value
+                    if isinstance(tensor, ir.LazyTensor):
+                        current_package.register_lazy_source_artifacts(
+                            files=tensor.meta.get(LAZY_SOURCE_FILES_META_KEY, ())
+                        )
         source_files.update(
             Path(path).resolve()
             for path in getattr(current_package, "_native_streaming_source_files", ())
@@ -307,6 +343,21 @@ def _validate_streaming_safetensors_destination(
                     f"{str(source_file)!r} through the same path, a hard link, or "
                     "a symlink. Remove the alias or choose a separate output path."
                 )
+
+
+def _adapter_artifact_destinations(package: ModelPackage, directory: Path) -> Iterator[Path]:
+    """Inventory the actual files emitted by save_adapter_artifacts, without writes."""
+    options = package.adapter_service_options
+    for alias, artifact in package.adapter_artifacts.items():
+        root = directory / "adapters" / alias
+        if options.portable_fallback:
+            yield root / "adapter.json"
+        if options.preserve_source_format:
+            if artifact.source.format == "onnx_adapter":
+                yield root / "adapter.onnx_adapter"
+            elif artifact.source.format == "peft_safetensors":
+                yield root / "adapter_model.safetensors"
+                yield root / "adapter_config.json"
 
 
 def _validate_output_directory(
@@ -371,6 +422,7 @@ def _validate_mtp_save_paths(
     if (
         package.export_report is not None
         and package.gguf_reuse_plan is None
+        and getattr(package, "gguf_packed_sources", None) is None
         and (
             package.export_report.status == "partial"
             or package.export_report.runtime_validation_status == "unvalidated"
@@ -673,6 +725,10 @@ class ModelPackage(UserDict[str, ir.Model]):
         :attr:`mtp_head` package is saved under a collision-free directory named
         by ``.mobius-package.json``.
 
+        Interface symbolic dimension names are preserved within each model.
+        Non-contractual intermediate symbols are anonymized during serialization;
+        in-memory shapes remain unchanged.
+
         .. note::
             This method writes ONNX files only.  If you need a directory that
             ``onnxruntime-genai`` can load (i.e. with ``genai_config.json`` and
@@ -742,6 +798,8 @@ class ModelPackage(UserDict[str, ir.Model]):
             directory,
             external_data=external_data,
             component_layout=component_layout,
+            include_policy_components=include_policy_components,
+            include_adapter_artifacts=include_adapter_artifacts,
         )
         _validate_mtp_save_paths(
             self,
@@ -753,6 +811,28 @@ class ModelPackage(UserDict[str, ir.Model]):
         )
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
+        if getattr(self, "gguf_packed_sources", None) is not None:
+            from mobius.integrations.gguf._packed import save_packed_package
+
+            if len(component_layout.components) != len(self):
+                raise ValueError("Lossless GGUF save does not support component filtering.")
+            if check_weights:
+                for name, model in self.items():
+                    _check_weights(name, model)
+            if (include_policy_components and self.policy_components) or (
+                include_adapter_artifacts and self.adapter_artifacts
+            ):
+                raise ValueError(
+                    "Lossless GGUF save does not yet package policy/adapter artifacts; "
+                    "save these separately or omit them explicitly."
+                )
+            save_packed_package(
+                self,
+                directory,
+                external_data=external_data,
+                max_shard_size_bytes=max_shard_size_bytes,
+            )
+            return
         reuse_plan = getattr(self, "gguf_reuse_plan", None)
         streaming_external_data = False
         current_package = self
@@ -892,7 +972,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             if use_subfolders:
                 os.makedirs(model_dir, exist_ok=True)
             path = os.path.join(model_dir, "model.onnx")
-            with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
+            with _anonymized_intermediate_symbolic_dimensions(model) as saved_model:
                 if reuse_plan is not None:
                     from mobius.integrations.gguf._reuse import save_reuse_package
 
@@ -1363,6 +1443,13 @@ class ModelPackage(UserDict[str, ir.Model]):
                     name = filename.removesuffix(".onnx")
                     models[name] = ir.load(os.path.join(directory, filename))
         package = cls(models)
+        if os.path.exists(os.path.join(directory, "gguf-packed.json")) or any(
+            model.metadata_props.get("mobius.gguf.original_external_data") == "1"
+            for model in models.values()
+        ):
+            from mobius.integrations.gguf._packed import restore_packed_sources
+
+            restore_packed_sources(package, directory)
         quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
         if os.path.lexists(quantization_report_path):
             if os.path.islink(quantization_report_path) or not os.path.isfile(
@@ -1508,11 +1595,10 @@ class ModelPackage(UserDict[str, ir.Model]):
 
 
 @contextmanager
-def _namespaced_symbolic_dimensions(
+def _anonymized_intermediate_symbolic_dimensions(
     model: ir.Model,
-    namespace: str,
-) -> Iterator[ir.Model]:
-    """Namespace interface symbols and discard non-contractual intermediate aliases."""
+) -> Generator[ir.Model, None, None]:
+    """Discard non-contractual intermediate aliases, preserving interface symbols."""
     interface_values = {id(value) for value in (*model.graph.inputs, *model.graph.outputs)}
     values: dict[int, ir.Value] = {}
     graphs: list[ir.GraphProtocol] = []
@@ -1526,10 +1612,9 @@ def _namespaced_symbolic_dimensions(
             values[id(value)] = value
 
     originals: list[tuple[ir.Value, ir.Shape]] = []
-    symbols: dict[str, str] = {}
     try:
         for value in values.values():
-            if value.shape is None:
+            if value.shape is None or id(value) in interface_values:
                 continue
             dimensions: list[int | str | ir.SymbolicDim] = []
             changed = False
@@ -1540,12 +1625,7 @@ def _namespaced_symbolic_dimensions(
                 if dimension.value is None:
                     dimensions.append(dimension)
                     continue
-                if id(value) not in interface_values:
-                    dimensions.append(ir.SymbolicDim(None))
-                    changed = True
-                    continue
-                text = str(dimension)
-                dimensions.append(symbols.setdefault(text, f"{namespace}.{text}"))
+                dimensions.append(ir.SymbolicDim(None))
                 changed = True
             if changed:
                 originals.append((value, value.shape))
