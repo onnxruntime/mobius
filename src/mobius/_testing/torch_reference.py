@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import logging
 from pathlib import Path
 from unittest import mock
@@ -25,7 +26,7 @@ def lfm3_reference_compatibility():
     Its decorated convolution functions contain the full PyTorch implementation;
     only optional Hub-kernel registration is bypassed, never model math.
     """
-    import transformers.integrations as integrations
+    integrations = importlib.import_module("transformers.integrations")
 
     name = "use_kernel_func_from_hub_with_fallback"
     if hasattr(integrations, name):

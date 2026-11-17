@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import contextlib
-import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
 
@@ -304,10 +303,8 @@ def test_load_torch_model_pins_every_huggingface_resource(model_type) -> None:
 
 @pytest.mark.parametrize("raise_inside", [False, True])
 def test_lfm3_optional_kernel_registration_is_scoped(monkeypatch, raise_inside):
-    # A real lazy module can re-import a deleted attribute through __getattr__.
     integrations = ModuleType("transformers.integrations")
-    monkeypatch.setitem(sys.modules, "transformers.integrations", integrations)
-    monkeypatch.setattr(transformers, "integrations", integrations)
+    monkeypatch.setattr(torch_reference.importlib, "import_module", lambda name: integrations)
     name = "use_kernel_func_from_hub_with_fallback"
 
     def function(value):

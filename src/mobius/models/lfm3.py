@@ -53,24 +53,6 @@ class Lfm3Attention(Attention):
         )
         self.gate_proj = Linear(config.hidden_size, config.num_attention_heads, bias=False)
 
-    def _apply_rotary(
-        self, op: OpBuilder, x: ir.Value, position_embeddings: tuple, num_heads: int
-    ) -> ir.Value:
-        del num_heads
-        cos, sin = position_embeddings
-        # Tables have D/2 frequencies. Duplicate across the FULL head halves,
-        # including zero-frequency tails (identity in both corresponding halves).
-        cos = op.Unsqueeze(op.Concat(cos, cos, axis=-1), [2])  # (B, T, 1, D)
-        sin = op.Unsqueeze(op.Concat(sin, sin, axis=-1), [2])
-        cos = op.Cast(op.CastLike(cos, x), to=ir.DataType.FLOAT)
-        sin = op.Cast(op.CastLike(sin, x), to=ir.DataType.FLOAT)
-        heads = op.Reshape(x, [0, 0, -1, self.head_dim])  # (B, T, heads, D)
-        heads_f32 = op.Cast(heads, to=ir.DataType.FLOAT)
-        first, second = op.Split(heads_f32, num_outputs=2, axis=-1, _outputs=2)
-        rotated = op.Concat(op.Neg(second), first, axis=-1)
-        result = op.Add(op.Mul(heads_f32, cos), op.Mul(rotated, sin))
-        return op.Reshape(op.CastLike(result, x), [0, 0, -1])
-
     def forward(
         self,
         op: OpBuilder,

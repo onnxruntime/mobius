@@ -194,20 +194,18 @@ def test_lfm3_zero_tail_rope_keeps_full_dimension_frequencies():
     assert np.count_nonzero(sliding.sin_cache.const_value.numpy()[3]) == 8
 
 
-def test_lfm3_rotary_layout_splits_full_head_and_uses_fp32():
+def test_lfm3_rotary_layout_uses_native_full_head_operator():
     attention = Lfm3Attention(tiny_lfm3_config(dtype=ir.DataType.FLOAT16))
     builder, op, graph = create_test_builder()
     x = create_test_input(builder, "x", [1, 3, 64], dtype=ir.DataType.FLOAT16)
-    cos = create_test_input(builder, "cos", [1, 3, 8], dtype=ir.DataType.FLOAT16)
-    sin = create_test_input(builder, "sin", [1, 3, 8], dtype=ir.DataType.FLOAT16)
+    cos = create_test_input(builder, "cos", [1, 3, 16], dtype=ir.DataType.FLOAT16)
+    sin = create_test_input(builder, "sin", [1, 3, 16], dtype=ir.DataType.FLOAT16)
     result = attention._apply_rotary(op, x, (cos, sin), 4)
     builder._adapt_outputs([result], "")
-    assert not any(node.op_type == "RotaryEmbedding" for node in graph)
-    split = next(node for node in graph if node.op_type == "Split")
-    assert split.inputs[0].producer().op_type == "Cast"
-    assert split.inputs[0].producer().attributes.get_int("to") == ir.DataType.FLOAT
-    reshape = split.inputs[0].producer().inputs[0].producer()
-    np.testing.assert_array_equal(reshape.inputs[1].const_value.numpy(), [0, 0, -1, 16])
+    rotary = next(node for node in graph if node.op_type == "RotaryEmbedding")
+    assert rotary.attributes.get_int("num_heads") == 4
+    assert rotary.attributes.get_int("rotary_embedding_dim") == 0
+    assert not any(node.op_type in {"Split", "Reshape"} for node in graph)
 
 
 @pytest.mark.parametrize(
@@ -236,7 +234,7 @@ def test_lfm3_portable_cuda_cache_graph(ep, dtype):
     ]
     assert len(attention_nodes) == 2
     assert all(node.op_type == "Attention" for node in attention_nodes)
-    assert not any(node.op_type == "RotaryEmbedding" for node in graph)
+    assert sum(node.op_type == "RotaryEmbedding" for node in graph) == 4
     if ep == "cuda":
         assert not any(node.op_type == "CausalConvWithState" for node in graph)
     if ep == "onnx-standard":
