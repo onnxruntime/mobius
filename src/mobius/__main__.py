@@ -186,6 +186,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Error: --features gqa-cache only applies to a static cache; "
             "pass --features static-cache,gqa-cache."
         )
+    # The onnx-genai metadata describes a TensorScatter cache, and its CPU
+    # GroupQueryAttention wants the logical length, not the capacity.
+    if args.gqa_cache and args.runtime == "onnx-genai":
+        raise SystemExit(
+            "Error: --features gqa-cache is not supported with --runtime onnx-genai."
+        )
 
     # Validate --max-seq-len requires the static-cache feature.
     if args.max_seq_len is not None and not args.static_cache:

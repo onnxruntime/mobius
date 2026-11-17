@@ -695,7 +695,7 @@ class TestCLIBuild:
         task = mock_build.call_args.kwargs["task"]
         assert isinstance(task, Gemma4TextCausalLMTask)
 
-    def _resolved_static_task(self, model_type, features):
+    def _resolved_static_task(self, model_type, features, *extra_args):
         hf_config = mock.MagicMock()
         hf_config.model_type = model_type
         with (
@@ -713,6 +713,7 @@ class TestCLIBuild:
                     "--no-weights",
                     "--features",
                     features,
+                    *extra_args,
                 ]
             )
         return mock_build.call_args.kwargs["task"]
@@ -729,6 +730,12 @@ class TestCLIBuild:
     def test_gqa_cache_requires_static_cache(self):
         with pytest.raises(SystemExit, match="static-cache,gqa-cache"):
             self._resolved_static_task("llama", "gqa-cache")
+
+    def test_gqa_cache_rejects_onnx_genai_runtime(self):
+        with pytest.raises(SystemExit, match="onnx-genai"):
+            self._resolved_static_task(
+                "llama", "static-cache,gqa-cache", "--runtime", "onnx-genai"
+            )
 
     def test_gqa_cache_rejects_gemma4(self):
         with pytest.raises(ValueError, match="Gemma 4"):

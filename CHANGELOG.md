@@ -20,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the buffer capacity, a constant, so the decode step has no
   device-to-host copy and can be captured in a CUDA graph. Only models whose
   decoder layers use the shared `Attention` qualify; sliding-window and
-  softcapped models, and Gemma 4, are refused. The ONNX GenAI metadata
-  describes a static cache without `write_indices`. On an A100 the GQA cache
+  softcapped models, and Gemma 4, are refused, and so is `--runtime
+  onnx-genai`. On an A100 the GQA cache
   is 5-10% faster per decode step than the `TensorScatter` one from about 1k
   tokens of context; on Blackwell the two are the same.
 
