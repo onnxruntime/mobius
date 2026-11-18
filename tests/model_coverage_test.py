@@ -145,6 +145,9 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #   - CausalLM / other models without YAML
 #
 _COVERAGE_SKIP: dict[str, str] = {
+    "nemotron_labs_sigma": "Continuous dual-head ABI: dedicated L1 and L3 in "
+    "build_graph/nemotron_sigma_test.py and integration/nemotron_sigma_test.py; "
+    "pinned L4/L5 use the nemotron-sigma golden task.",
     # --- Specialized-test models (covered by a co-located test class) ---
     "neo_chat": "SenseNova U1.5 is a 17.5B (~50 GB) five-component package; "
     "L1-L3 use the tiny config and co-located tests, while pinned L4/L5 text, "

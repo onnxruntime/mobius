@@ -1,0 +1,22 @@
+model_id: "nvidia/Nemotron-Labs-Sigma-distill-spec-3B"
+model_type: "nemotron_labs_sigma"
+revision: "9769b2d388000e0ff61736d26359074efbf0dc9d"
+task_type: "nemotron-sigma"
+dtype: "float32"
+trust_remote_code: true
+inputs:
+  prompts:
+    - "Here is my poem:"
+level: "L4+L5"
+generation:
+  max_new_tokens: 65
+  do_sample: false
+notes: >
+  Both continuous diffusion and causal AR verification heads are required.
+  L4 compares full FP32 prefill logits. L5 replays exact recorded CUDA Gaussian
+  draws through one-call self-speculation and native fresh-x0 diffusion over
+  multiple 32-token blocks. Dedicated integration tests additionally compare
+  full denoiser logits/means, padded batches, reused caches and rejected-prefix
+  rollback against pinned upstream math, and verify exact greedy AR equivalence.
+  Upstream meta loading loses its nonpersistent RoPE buffer; the reference
+  loader reconstructs only that buffer with its own unchanged constructor.
