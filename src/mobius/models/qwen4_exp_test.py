@@ -27,6 +27,7 @@ from mobius._build_context import build_context
 from mobius._builder import _cast_module_dtype, build_from_module
 from mobius._configs import Qwen4ExpConfig, VisionConfig
 from mobius._execution_providers import EpCapabilities, ep_registry
+from mobius._flags import override_flags
 from mobius._optimizations import optimize_model, validate_standard_onnx
 from mobius._registry import registry
 from mobius._testing import create_test_builder, create_test_input
@@ -35,6 +36,7 @@ from mobius._testing.ort_inference import (
     _numpy_to_ort_value,
     _ort_value_to_numpy,
 )
+from mobius.functions._lowering_test_utils import expand_grouped_matmul
 from mobius.integrations._block_quant import BlockQuantScheme
 from mobius.integrations._weight_loading import (
     apply_weights,
@@ -1056,6 +1058,59 @@ def _standard_experts(config, shape):
     output.shape = ir.Shape(shape)
     graph.outputs.append(output)
     return ir.Model(graph, ir_version=11)
+
+
+def _grouped_experts(config, shape):
+    with override_flags(experimental_opset29=True):
+        model = _standard_experts(config, shape)
+    model.graph.opset_imports[""] = 29
+    return model
+
+
+def test_opset29_standard_moe_uses_exact_grouped_banks():
+    model = _grouped_experts(_config(num_local_experts=8), [2, 3, 16])
+    nodes = list(model.graph.all_nodes())
+    grouped = [node for node in nodes if node.op_type == "GroupedMatMul"]
+    assert len(grouped) == 2
+    assert all(node.attributes["transB"].value == 1 for node in grouped)
+    assert grouped[0].inputs[1].name == "gate_up_proj"
+    assert grouped[1].inputs[1].name == "down_proj"
+    assert not any(node.op_type in {"Scan", "NonZero"} for node in nodes)
+
+
+def test_opset29_grouped_moe_matches_existing_standard_dispatch():
+    config = _config(
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.7,
+    )
+    shape = [2, 3, 16]
+    standard = _standard_experts(config, shape)
+    grouped = _grouped_experts(config, shape)
+    rng = np.random.default_rng(42)
+    state = {
+        "gate_up_proj": rng.normal(0, 0.2, (4, 16, 16)).astype(np.float32),
+        "down_proj": rng.normal(0, 0.2, (4, 16, 8)).astype(np.float32),
+    }
+    for model in (standard, grouped):
+        for name, values in state.items():
+            model.graph.initializers[name].const_value = ir.tensor(values)
+    hidden = rng.normal(0, 0.2, shape).astype(np.float32)
+    logits = rng.normal(0, 1.0, [*shape[:-1], 4]).astype(np.float32)
+    exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    feeds = {"hidden": hidden, "probabilities": exp / exp.sum(axis=-1, keepdims=True)}
+    session = OnnxModelSession(standard)
+    try:
+        expected = session.run(feeds)["output"]
+    finally:
+        session.close()
+    session = OnnxModelSession(expand_grouped_matmul(grouped))
+    try:
+        actual = session.run(feeds)["output"]
+    finally:
+        session.close()
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=1e-7)
 
 
 @pytest.mark.parametrize("experts", [2, 512])

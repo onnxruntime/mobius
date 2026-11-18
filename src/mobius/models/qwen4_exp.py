@@ -24,6 +24,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities
 from mobius._configs import Qwen4ExpConfig
+from mobius._flags import flags
 from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
     Embedding,
@@ -1064,7 +1065,11 @@ class Qwen4ExpExperts(nn.Module):
             [-1, self._num_experts],
         )
         if not ep_capabilities().supports_fused_moe:
-            output = self._standard_dispatch(op, flat_hidden, router_probs)
+            output = (
+                self._grouped_dispatch(op, flat_hidden, router_probs)
+                if flags.experimental_opset29
+                else self._standard_dispatch(op, flat_hidden, router_probs)
+            )
             if self._routing_scale != 1.0:  # noqa: RUF069
                 output = op.Mul(output, op.CastLike(self._routing_scale, output))
             return op.Reshape(output, original_shape)
@@ -1104,6 +1109,50 @@ class Qwen4ExpExperts(nn.Module):
         if self._routing_scale != 1.0:  # noqa: RUF069
             output = op.Mul(output, op.CastLike(self._routing_scale, output))
         return op.Reshape(output, original_shape)
+
+    def _grouped_dispatch(
+        self, op: OpBuilder, hidden: ir.Value, probabilities: ir.Value
+    ) -> ir.Value:
+        """Exact opset-29 dispatch over the existing packed expert banks."""
+        assert self._top_k is not None
+        weights, selected = op.TopK(
+            op.Cast(probabilities, to=ir.DataType.FLOAT),
+            op.Constant(value_ints=[self._top_k]),
+            axis=-1,
+            _outputs=2,
+        )
+        if self._normalize:
+            weights = op.Div(weights, op.ReduceSum(weights, [-1], keepdims=1))
+        weights = op.Cast(weights, to=self._dtype)
+
+        # gate_up_proj is already [E, 2I, H], exactly the transB=1 bank layout.
+        projected = op.GroupedMatMul(
+            hidden,
+            self.gate_up_proj,
+            selected,
+            transB=1,
+        )  # [T, k, 2I]
+        gate, up = op.Split(
+            projected,
+            [self._intermediate_size, self._intermediate_size],
+            axis=-1,
+            _outputs=2,
+        )
+        # Preserve Flash-Next's FP32 SiLU opmath and model-dtype product.
+        gate_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
+        silu_f32 = op.Div(
+            gate_f32,
+            op.Add(op.Constant(value_float=1.0), op.Exp(op.Neg(gate_f32))),
+        )
+        activated = op.Mul(op.Cast(silu_f32, to=self._dtype), up)
+        down = op.GroupedMatMul(
+            op.Reshape(activated, [-1, self._intermediate_size]),
+            self.down_proj,
+            op.Reshape(selected, [-1, 1]),
+            transB=1,
+        )
+        down = op.Reshape(down, [-1, self._top_k, self._hidden_size])
+        return op.ReduceSum(op.Mul(down, op.Unsqueeze(weights, [2])), [1], keepdims=0)
 
     def _standard_dispatch(
         self, op: OpBuilder, hidden: ir.Value, probabilities: ir.Value

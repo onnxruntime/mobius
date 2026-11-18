@@ -18,6 +18,7 @@ from mobius.components import (
     Attention,
     Embedding,
     GatedShortConv,
+    GroupedMoELayer,
     MoELayer,
     RMSNorm,
     create_padding_mask,
@@ -218,6 +219,17 @@ class Lfm2MoEFeedForward(MoELayer):
         )
         if self.expert_bias is not None:
             self.expert_bias._keep_float32 = True
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        return super().forward(op, hidden_states, self.expert_bias)
+
+
+class GroupedLfm2MoEFeedForward(GroupedMoELayer):
+    """Selected-expert dispatch retaining LFM2's selection-only correction bias."""
+
+    def __init__(self, source: Lfm2MoEFeedForward):
+        super().__init__(source)
+        self.expert_bias = source.expert_bias
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         return super().forward(op, hidden_states, self.expert_bias)

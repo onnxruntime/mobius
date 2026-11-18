@@ -196,11 +196,39 @@ class TextModel(nn.Module):
         inputs_embeds: ir.Value | None = None,
         deepstack_embeds: list | None = None,
     ):
+        from mobius.components._paged_attention import DensePagedState
+
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
 
+        paged = bool(past_key_values and isinstance(past_key_values[0], DensePagedState))
+        attention_bias: GQAContext | ir.Value | None
+        if paged:
+            rope = self.rotary_emb
+            if not isinstance(rope, BaseRope) or isinstance(rope, _MRopeBase):
+                raise ValueError("Dense PagedAttention requires standard 1D RoPE tables.")
+            # Realize the parameter tables without gathering per-token embeddings.
+            rope(op, op.Unsqueeze(op.Constant(value_ints=[0]), [0]))
+            cos = op.Cast(rope.cos_cache, to=self._dtype)
+            sin = op.Cast(rope.sin_cache, to=self._dtype)
+            assert past_key_values is not None
+            past_key_values = [
+                DensePagedState(
+                    state.key_cache,
+                    state.value_cache,
+                    state.cumulative_sequence_lengths,
+                    state.past_sequence_lengths,
+                    state.block_table,
+                    state.attention_metadata,
+                    cos,
+                    sin,
+                )
+                for state in past_key_values
+            ]
+            position_embeddings = None
+            attention_bias = None
         # Determine whether to emit GroupQueryAttention directly.
         # Conditions:
         #  - attention_mask present: static-cache mode passes None; GQA requires seqlens_k.
@@ -216,7 +244,8 @@ class TextModel(nn.Module):
         caps = ep_capabilities()
         dtype = get_build_dtype()
         use_gqa = (
-            attention_mask is not None
+            not paged
+            and attention_mask is not None
             and dtype in caps.gqa_dtypes
             and caps.supports_fused_rope
             and isinstance(self.rotary_emb, BaseRope)
@@ -247,7 +276,7 @@ class TextModel(nn.Module):
                 to=ir.DataType.INT32,
             )  # scalar INT32
 
-            attention_bias: GQAContext | ir.Value | None = GQAContext(
+            attention_bias = GQAContext(
                 seqlens_k=seqlens_k,
                 total_seq_len=total_seq_len,
                 cos_cache=self.rotary_emb.cos_cache,  # [max_seq, rotary_dim]
@@ -258,7 +287,7 @@ class TextModel(nn.Module):
             # internally via do_rotary=1. Passing None skips apply_rotary_pos_emb
             # in Attention.forward() (which checks `if position_embeddings is not None`).
             position_embeddings = None
-        else:
+        elif not paged:
             # This path (CPU fp32, DML, non-fused RoPE, mRoPE, static cache)
             # builds at most a bool padding mask; it has no way to express a
             # sliding window. Warn if the model expects one so the divergence
