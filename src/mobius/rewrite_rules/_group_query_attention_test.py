@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import numpy as np
 import onnx_ir as ir
 import pytest
 from onnxscript.rewriter import rewrite
@@ -851,34 +852,36 @@ class TestGroupQueryAttentionRules:
             sc = node.attributes.get("softcap")
             assert sc is None, f"Unexpected softcap attribute on GQA node for Llama: {sc}"
 
-    def test_partial_rotary_embedding_dim_propagated(self):
-        """Partial-RoPE models must forward rotary_embedding_dim to the GQA.
+    def test_partial_rotary_width_comes_from_cos_cache(self):
+        """Partial RoPE is carried by the cos/sin cache width, not a GQA attribute.
 
-        Qwen3.5/3.8 rotate only the first ``head_dim * partial_rotary_factor``
-        head elements (e.g. 64 of 256). If the fusion drops the dimension the
-        fused GQA defaults to the full head_dim and reads past the partial
-        cos/sin cache, corrupting every full-attention layer's output.
+        GroupQueryAttention has no ``rotary_embedding_dim`` attribute (ORT rejects
+        such a model) and rotates ``cos_cache.shape[-1] * 2`` head elements. The
+        fused model must match the unfused RotaryEmbedding + Attention graph.
         """
-        cfg = dataclasses.replace(_QWEN3_CONFIG, partial_rotary_factor=0.5)
+        cfg = dataclasses.replace(_QWEN3_CONFIG, head_dim=32, partial_rotary_factor=0.5)
         model = registry.get("qwen3")(cfg)
         pkg = build_from_module(model, cfg)
         m = pkg["model"]
+        fill_random_weights(m)
+        unfused = OnnxModelSession(ir.from_proto(ir.to_proto(m)))
 
         rewrite(m, pattern_rewrite_rules=group_query_attention_rules())
 
         gqa_nodes = [n for n in m.graph if n.op_type == "GroupQueryAttention"]
         assert len(gqa_nodes) > 0, "Expected GQA nodes after fusion"
-
-        expected = int(cfg.head_dim * 0.5)
+        rotary_dim = int(cfg.head_dim * 0.5)
         for node in gqa_nodes:
-            val = node.attributes.get("rotary_embedding_dim")
-            assert val is not None, (
-                "rotary_embedding_dim missing on GQA node — partial RoPE would "
-                "silently rotate the full head_dim and corrupt attention"
-            )
-            assert val.value == expected, (
-                f"Expected rotary_embedding_dim={expected}, got {val.value}"
-            )
+            assert node.attributes.get("rotary_embedding_dim") is None
+            assert node.inputs[7].shape[-1] == rotary_dim // 2
+
+        fused = OnnxModelSession(m)
+        feeds = make_prefill_feeds(fused)
+        np.testing.assert_allclose(
+            fused.run(feeds)["logits"], unfused.run(feeds)["logits"], rtol=1e-4, atol=1e-4
+        )
+        fused.close()
+        unfused.close()
 
     def test_full_rotary_omits_rotary_embedding_dim(self):
         """Full-RoPE models (Qwen3 default) must not carry rotary_embedding_dim.
