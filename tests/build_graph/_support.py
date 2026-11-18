@@ -159,6 +159,8 @@ def _make_params(configs: list[tuple[str, dict, bool]]) -> list:
 
 
 _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
+    # CLM has an embedding-in/ranking-out contract, covered by clm_test.py.
+    "clm",
     # Internal GGUF-only graph covered by _exact_legacy_decoder_test.py.
     "gguf_legacy",
     # Mistral4 owns a K-only latent cache, covered by _remaining_dense_test.py.

@@ -21,6 +21,7 @@ from mobius._configs import (
     ArchitectureConfig,
     AudioConfig,
     BambaConfig,
+    CLMConfig,
     CodecDecoderConfig,
     CodecEncoderConfig,
     DepthAnythingConfig,
@@ -3970,6 +3971,21 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
 ]
+CONTRASTIVE_RANKING_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "clm",
+        {
+            "_config_cls": CLMConfig,
+            "hidden_size": 8,
+            "width": 6,
+            "depth": 3,
+            "projection_dim": 4,
+        },
+        True,
+    ),
+]
+
+
 ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     CAUSAL_LM_CONFIGS
     + ENCODER_CONFIGS
@@ -3979,6 +3995,7 @@ ALL_CONFIGS: list[tuple[str, dict, bool]] = (
     + SSM_CONFIGS
     + VL_CONFIGS
     + SPEECH_CONFIGS
+    + CONTRASTIVE_RANKING_CONFIGS
 )
 
 # Model types explicitly declared in configs above (may have duplicates —

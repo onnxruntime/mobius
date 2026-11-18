@@ -57,6 +57,7 @@ if str(_TESTS_DIR) not in sys.path:
 
 from _test_configs import (  # noqa: E402
     ALL_CAUSAL_LM_CONFIGS,
+    CONTRASTIVE_RANKING_CONFIGS,
     DETECTION_CONFIGS,
     ENCODER_CONFIGS,
     SEQ2SEQ_CONFIGS,
@@ -83,6 +84,7 @@ def _l1_l3_model_types() -> set[str]:
         + SSM_CONFIGS
         + VL_CONFIGS
         + SPEECH_CONFIGS
+        + CONTRASTIVE_RANKING_CONFIGS
     )
     for mt, _, _ in all_configs:
         types.add(mt)
@@ -145,6 +147,10 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #   - CausalLM / other models without YAML
 #
 _COVERAGE_SKIP: dict[str, str] = {
+    "clm": "Projection-head-only embedding-in/ranking-out task: dedicated L1/L3 "
+    "and opt-in real-head CPU parity run in models/clm_test.py; pinned config-only "
+    "L2 uses the registry test_model_id/revision. Generic text-prefill/generation "
+    "goldens cannot drive this ABI, and the frozen encoder is outside scope.",
     # --- Specialized-test models (covered by a co-located test class) ---
     "neo_chat": "SenseNova U1.5 is a 17.5B (~50 GB) five-component package; "
     "L1-L3 use the tiny config and co-located tests, while pinned L4/L5 text, "
