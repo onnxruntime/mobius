@@ -336,6 +336,135 @@ def _codec_hf_config(**encoder_overrides):
     )
 
 
+def _k2_horizon_dense_hf_config(**overrides):
+    """Matches IFM/K2-Horizon-0.9B/-7B's real published config.json shape."""
+    values = {
+        "model_type": "k2_horizon",
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rope_head_dim": 16,
+        "vocab_size": 64,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "hidden_act": "silu",
+        "mlp_only_layers": [0, 1, 2, 3],
+        "layernorm_num_groups": 1,
+        "query_key_norm": False,
+        "attention_gate_func": None,
+        "mova_num_experts": 0,
+        "mova_num_experts_per_tok": 0,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def test_k2_horizon_dense_config_disables_qk_norm_and_mova_by_default():
+    """All three released checkpoints set ``query_key_norm: false``."""
+    from mobius._configs import K2HorizonConfig
+
+    out = K2HorizonConfig.from_transformers(_k2_horizon_dense_hf_config())
+
+    assert not out.has_qk_norm
+    assert not out.has_attn_output_gate
+    assert out.n_value_expert == 0
+    assert out.n_value_expert_used == 0
+    assert out.first_k_dense_replace == 4
+    assert out.partial_rotary_factor == pytest.approx(1.0)
+    assert out.n_norm_groups == 1
+    # llama.cpp's routing-weight-normalization floor is set unconditionally,
+    # even for a dense (no-MoE) checkpoint, since it also feeds the MoVA
+    # value router's gate on MoE layers.
+    assert out.routing_weight_normalization_floor == pytest.approx(6.103515625e-5)
+
+
+def test_k2_horizon_config_honors_published_qk_norm_field():
+    from mobius._configs import K2HorizonConfig
+
+    out = K2HorizonConfig.from_transformers(_k2_horizon_dense_hf_config(query_key_norm=True))
+
+    assert out.has_qk_norm
+
+
+def _k2_horizon_mova_hf_config(**overrides):
+    """Matches IFM/K2-Horizon-MoVA-36B-A4B's real published config.json shape."""
+    values = {
+        "model_type": "k2_horizon",
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rope_head_dim": 16,
+        "vocab_size": 64,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "hidden_act": "silu",
+        "mlp_only_layers": [0, 1, 2],
+        "layernorm_num_groups": 2,
+        "query_key_norm": False,
+        "attention_gate_func": "softplus",
+        "moe_gate_bias": True,
+        "num_experts": 100,
+        "num_experts_per_tok": 8,
+        "num_shared_experts": 1,
+        "moe_intermediate_size": 32,
+        "router_scaling_factor": 2.5,
+        "router_score_func": "sigmoid",
+        "mova_num_experts": 64,
+        "mova_num_experts_per_tok": 4,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def test_k2_horizon_mova_config_extracts_real_published_fields():
+    from mobius._configs import K2HorizonConfig
+
+    out = K2HorizonConfig.from_transformers(_k2_horizon_mova_hf_config())
+
+    assert out.first_k_dense_replace == 3
+    assert out.n_norm_groups == 2
+    assert out.has_attn_output_gate
+    assert not out.has_qk_norm
+    assert out.use_expert_bias
+    assert out.scoring_func == "sigmoid"
+    assert out.routed_scaling_factor == pytest.approx(2.5)
+    assert out.n_value_expert == 64
+    assert out.n_value_expert_used == 4
+    assert out.routing_weight_normalization_floor == pytest.approx(6.103515625e-5)
+
+
+def test_k2_horizon_config_requires_mova_fields_set_together():
+    from mobius._configs import K2HorizonConfig
+
+    with pytest.raises(ValueError, match="mova_num_experts"):
+        K2HorizonConfig.from_transformers(
+            _k2_horizon_mova_hf_config(mova_num_experts_per_tok=0)
+        )
+    with pytest.raises(ValueError, match="mova_num_experts"):
+        K2HorizonConfig.from_transformers(_k2_horizon_mova_hf_config(mova_num_experts=0))
+
+
+def test_k2_horizon_config_rope_head_dim_drives_partial_rotary_factor():
+    """``rope_head_dim < head_dim`` should yield a fractional rotary factor.
+
+    No released checkpoint currently exercises this (all three set
+    ``rope_head_dim == head_dim``).
+    """
+    from mobius._configs import K2HorizonConfig
+
+    out = K2HorizonConfig.from_transformers(
+        _k2_horizon_dense_hf_config(head_dim=32, rope_head_dim=16)
+    )
+
+    assert out.partial_rotary_factor == pytest.approx(0.5)
+
+
 def test_codec_encoder_conv_fields_extracted_from_nested_config():
     """Nested ``encoder_config`` values drive the derived conv stack.
 

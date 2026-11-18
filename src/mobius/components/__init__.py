@@ -48,6 +48,8 @@ __all__ = [
     "OriginalDecayGatedDeltaNet",
     "GatedMLP",
     "GatedRMSNorm",
+    "GroupRMSNorm",
+    "PerHeadRMSNorm",
     "KimiDeltaAttention",
     "KimiMLAAttention",
     "Gemma3nAudioEncoder",
@@ -457,7 +459,9 @@ from mobius.components._qwenlike_clip_vision import (
 from mobius.components._radio_vision import RadioVisionModel
 from mobius.components._rms_norm import (
     GatedRMSNorm,
+    GroupRMSNorm,
     OffsetRMSNorm,
+    PerHeadRMSNorm,
     PostGatedRMSNorm,
     RMSNorm,
     RMSNormBias,
