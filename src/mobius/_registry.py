@@ -37,6 +37,7 @@ from mobius._configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    Lfm3Config,
     MiniMaxConfig,
     MMSConfig,
     MoonshineConfig,
@@ -111,6 +112,7 @@ from mobius.models import (
     Lfm2CausalLMModel,
     Lfm2MoECausalLMModel,
     Lfm2VlForConditionalGeneration,
+    Lfm3CausalLMModel,
     LLaDAModel,
     LLaDAMoEModel,
     Llama4CausalLMModel,
@@ -627,6 +629,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
     "lfm2": ModelRegistration(Lfm2CausalLMModel, config_class=Lfm2Config),
+    "lfm3": ModelRegistration(
+        Lfm3CausalLMModel,
+        config_class=Lfm3Config,
+        test_revision="875094441ea6517efc0f44a5685f05e381b72b14",
+    ),
     "lfm2_moe": ModelRegistration(Lfm2MoECausalLMModel, config_class=Lfm2MoeConfig),
     "dream": ModelRegistration(DreamModel, task="masked-diffusion"),
     "Dream": ModelRegistration(DreamModel, task="masked-diffusion"),
@@ -1371,6 +1378,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "jamba": "ai21labs/Jamba-v0.1",
     "bamba": "ibm-fms/Bamba-9B",
     "lfm2": "LiquidAI/LFM2.5-230M",
+    "lfm3": "LiquidAI/LFM3-1.7B",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",
@@ -1635,6 +1643,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "code_llama": "llama",
     "llama4_text": "llama",
     "lfm2": "lfm",
+    "lfm3": "lfm",
     "lfm2_vl": "lfm",
     "mllama": "llama",
     "mistral": "mistral",
@@ -1707,6 +1716,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
     "lfm2": "hybrid-conv+attn",
+    "lfm3": "hybrid-conv+full/sliding-attn",
     "lfm2_vl": "siglip2-naflex+hybrid-conv+attn",
     "qwen3_next": "moe+linear-attn",
 }

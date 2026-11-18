@@ -27,6 +27,72 @@ def audio_stub(monkeypatch):
     return audio
 
 
+def test_causal_golden_preserves_repetition_penalty_and_revision(monkeypatch, tmp_path):
+    import json
+
+    import torch
+
+    from mobius._testing import torch_reference
+
+    calls = []
+
+    class Reference(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def generate(self, input_ids, **kwargs):
+            calls.append(kwargs)
+            return torch.cat([input_ids, torch.tensor([[2, 3]])], dim=-1)
+
+    class Tokenizer:
+        def __call__(self, *args, **kwargs):
+            return {
+                "input_ids": np.array([[0, 1]], dtype=np.int64),
+                "attention_mask": np.ones((1, 2), dtype=np.int64),
+            }
+
+        def decode(self, *args, **kwargs):
+            return "reference text"
+
+    def load_reference(model_id, **kwargs):
+        assert model_id == "owner/pinned-model"
+        assert kwargs["revision"] == "a" * 40
+        assert kwargs["trust_remote_code"]
+        return Reference(), Tokenizer()
+
+    monkeypatch.setattr(torch_reference, "load_torch_model", load_reference)
+    monkeypatch.setattr(
+        torch_reference,
+        "torch_forward",
+        lambda *args: (np.ones((1, 2, 4), dtype=np.float32), None),
+    )
+    monkeypatch.setattr(
+        generate_golden, "_apply_nemotron_h_generate_patch", lambda model: None
+    )
+    case = SimpleNamespace(
+        model_id="owner/pinned-model",
+        revision="a" * 40,
+        trust_remote_code=True,
+        dtype="float32",
+        reference_loader=None,
+        gguf_source=None,
+        prompts=["Here is my poem:"],
+        level="L4+L5",
+        generation_params={"max_new_tokens": 2, "repetition_penalty": 1.1},
+    )
+    path = tmp_path / "model.json"
+    generate_golden._generate_causal_lm(case, path, "cpu")
+    assert calls == [{"max_new_tokens": 2, "do_sample": False, "repetition_penalty": 1.1}]
+    generation = json.loads((tmp_path / "model_generation.json").read_text())
+    assert generation["generated_tokens"] == [2, 3]
+    for data in (json.loads(path.read_text()), generation):
+        assert data["provenance"]["reference"] == {
+            "repository": case.model_id,
+            "revision": case.revision,
+        }
+
+
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize(

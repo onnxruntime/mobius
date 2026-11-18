@@ -109,6 +109,8 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "mistral": "mistral",
     "mistral3": "mistral3",
     "lfm2": "lfm2",
+    # LFM3 changes operator math, but retains LFM2's sparse KV + conv-state ABI.
+    "lfm3": "lfm2",
     "lfm2_vl": "lfm2_vl",
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
@@ -150,6 +152,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
 # model decoder packages use ORT GenAI's released generic DecoderOnly_Model.
 _ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
     "lfm2": "lfm2",
+    "lfm3": "lfm2",
     "lfm2_vl": "lfm2",
 }
 # Composite configs are unwrapped to their text sub-config during config-mode

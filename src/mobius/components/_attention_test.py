@@ -20,6 +20,25 @@ from mobius.components._attention import Attention, FusedQKVAttention, Qwen35Att
 class TestAttention:
     """Tests for the standard multi-head Attention module."""
 
+    @pytest.mark.parametrize("use_gate", [False, True])
+    def test_positional_call_compatibility_with_optional_output_gate(self, use_gate):
+        attention = Attention(make_config())
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 3, 64])
+        gate = create_test_input(builder, "gate", [1, 3, 64])
+        # Preserve every pre-existing positional argument, including static_cache.
+        args = (op, x, None, None, None, None)
+        output, _ = attention(*args, gate) if use_gate else attention(*args)
+        builder._adapt_outputs([output], "")
+        if not use_gate:
+            assert count_op_type(graph, "Attention") == 1
+            return
+        mul = next(node for node in graph if node.op_type == "Mul" and gate in node.inputs)
+        assert mul.inputs[0].producer().op_type == "Attention"
+        assert any(
+            node.op_type == "MatMul" and mul.outputs[0] in node.inputs for node in graph
+        )
+
     def test_projection_weight_shapes(self):
         config = make_config()
         attn = Attention(config)
