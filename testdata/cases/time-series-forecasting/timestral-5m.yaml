@@ -1,0 +1,13 @@
+model_id: mistralai/Timestral-5M
+model_type: timestral
+revision: bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f
+task_type: time-series-forecasting
+dtype: float32
+level: L4+L5
+inputs:
+  prompts: []
+generation:
+  seed: 42
+  prediction_length: 97
+  per_shot_horizon_patches: 2
+  do_sample: false

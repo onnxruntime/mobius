@@ -213,6 +213,8 @@ __all__ = [
     "SenseVoiceSmallModel",
     "ReUseConfig",
     "SEMambaSpeechEnhancementModel",
+    "TimestralConfig",
+    "TimestralModel",
     "SortformerConfig",
     "SortformerDiarizationModel",
     "Nemotron3DiarizationModel",
@@ -522,6 +524,7 @@ from mobius.models.sortformer import SortformerConfig, SortformerDiarizationMode
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.talkie import TalkieForCausalLM
+from mobius.models.timestral import TimestralConfig, TimestralModel
 from mobius.models.unet import (
     UNet2DConditionModel,
     load_unet_lora_safetensors,

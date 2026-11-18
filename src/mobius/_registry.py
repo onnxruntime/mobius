@@ -163,6 +163,8 @@ from mobius.models import (
     SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
+    TimestralConfig,
+    TimestralModel,
     VibeVoiceASRForConditionalGeneration,
     VibeVoiceASRStreamingForConditionalGeneration,
     VibeVoiceForConditionalGeneration,
@@ -478,6 +480,13 @@ def _detect_fallback_registration(hf_config) -> ModelRegistration | None:
 # ---------------------------------------------------------------------------
 _REGISTRATIONS: dict[str, ModelRegistration] = {
     # --- Text Generation (Llama-compatible) ---
+    "timestral": ModelRegistration(
+        TimestralModel,
+        task="time-series-forecasting",
+        config_class=TimestralConfig,
+        test_model_id="mistralai/Timestral-5M",
+        test_revision="bdd20cfc15a3fea0e4cb5ccef37f8d3ca7aa335f",
+    ),
     "baichuan": ModelRegistration(CausalLMModel),
     "code_llama": ModelRegistration(CausalLMModel),
     "codegen2": ModelRegistration(CausalLMModel),

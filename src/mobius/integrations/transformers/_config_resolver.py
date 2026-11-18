@@ -164,6 +164,23 @@ def _try_load_config_json(model_id: str, revision: str | None = None):
 
     model_type = config_dict.get("model_type")
     if not model_type:
+        # Native Timestral configs have neither HF discriminator. Require its
+        # complete distinctive inference signature, not a Hub-name substring.
+        timestral_fields = {
+            "patch_size",
+            "d_model",
+            "num_heads",
+            "mlp_hidden_dim",
+            "block_schedule",
+            "quantile_knots",
+            "block_size",
+            "context_length",
+            "time_attn_gate",
+            "variate_attn_gate",
+            "split_context_horizon_attn",
+        }
+        if timestral_fields <= config_dict.keys():
+            return _dict_to_pretrained_config({**config_dict, "model_type": "timestral"})
         model_type = _model_type_from_architectures(config_dict.get("architectures"))
         if not model_type:
             return None
