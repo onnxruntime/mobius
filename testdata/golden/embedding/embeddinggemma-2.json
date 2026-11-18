@@ -1,0 +1,74 @@
+{
+  "model_id": "google/embeddinggemma-2",
+  "revision": "f9972ac22e696a105c482202646979e33e4b5a1e",
+  "dtype": "float32",
+  "transformers_revision": "f210a32fbf2e3213a143dad8c587935216088b38",
+  "transformers_version": "5.23.0.dev0",
+  "torch_version": "2.11.0+cu128",
+  "device": "NVIDIA A10-4Q",
+  "device_memory_bytes": 4107993088,
+  "image_max_soft_tokens": 70,
+  "video_max_soft_tokens": 70,
+  "samples": [
+    {
+      "name": "text",
+      "input_names": [
+        "input_ids",
+        "attention_mask"
+      ]
+    },
+    {
+      "name": "sliding_boundary",
+      "input_names": [
+        "input_ids",
+        "attention_mask"
+      ]
+    },
+    {
+      "name": "image",
+      "input_names": [
+        "input_ids",
+        "attention_mask",
+        "pixel_values",
+        "image_position_ids"
+      ]
+    },
+    {
+      "name": "audio",
+      "input_names": [
+        "input_ids",
+        "attention_mask",
+        "input_features",
+        "input_features_mask"
+      ]
+    },
+    {
+      "name": "video",
+      "input_names": [
+        "input_ids",
+        "attention_mask",
+        "pixel_values_videos",
+        "video_position_ids",
+        "num_frames_per_video"
+      ]
+    },
+    {
+      "name": "mixed",
+      "input_names": [
+        "input_ids",
+        "attention_mask",
+        "pixel_values",
+        "image_position_ids",
+        "input_features",
+        "input_features_mask"
+      ]
+    },
+    {
+      "name": "retrieval",
+      "input_names": [
+        "input_ids",
+        "attention_mask"
+      ]
+    }
+  ]
+}

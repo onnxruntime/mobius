@@ -49,6 +49,7 @@
         "diarization",
         "diarization-streaming",
         "dflash-draft",
+        "embedding-gemma2",
         "feature-extraction",
         "feature-ctc-asr",
         "fun-asr-speech-language",

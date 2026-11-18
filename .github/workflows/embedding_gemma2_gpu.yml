@@ -1,0 +1,95 @@
+name: EmbeddingGemma 2 GPU qualification
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/embedding_gemma2_gpu.yml"
+      - "src/mobius/models/embedding_gemma2*"
+      - "src/mobius/tasks/_embedding_gemma2.py"
+      - "src/mobius/_configs/per_model/_embedding_gemma2.py"
+      - "src/mobius/_testing/embedding_gemma2.py"
+      - "scripts/generate_embeddinggemma2_golden.py"
+      - "requirements/ci/embedding_gemma2.txt"
+      - "testdata/cases/embedding/embeddinggemma-2.yaml"
+      - "testdata/golden/embedding/embeddinggemma-2*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NVIDIA_TF32_OVERRIDE: "0"
+
+concurrency:
+  group: embedding-gemma2-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  embedding-parity:
+    runs-on:
+      - self-hosted
+      - "1ES.Pool=onnxruntime-ep-mobius-github-linux-a10"
+      - "JobId=embedding-gemma2-${{ github.run_id }}-${{ github.run_attempt }}"
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure isolated model cache
+        run: |
+          echo "HF_HOME=$RUNNER_TEMP/embeddinggemma-hf-cache" >> "$GITHUB_ENV"
+          echo "HF_HUB_CACHE=$RUNNER_TEMP/embeddinggemma-hf-cache/hub" >> "$GITHUB_ENV"
+          echo "HF_XET_CACHE=$RUNNER_TEMP/embeddinggemma-hf-cache/xet" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install isolated reference environment
+        env:
+          PIP_INDEX_URL: https://packagefeedproxy.microsoft.io/pypi/simple
+        run: |
+          "$pythonLocation/bin/python" -m venv "$RUNNER_TEMP/embedding-venv"
+          source "$RUNNER_TEMP/embedding-venv/bin/activate"
+          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+          python -m pip install -e . -r requirements/ci/embedding_gemma2.txt onnxruntime-easy pytest pytest-timeout Pillow librosa soundfile
+          python -m pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
+      - name: Verify native CUDA and synthetic pipeline
+        run: |
+          source "$RUNNER_TEMP/embedding-venv/bin/activate"
+          nvidia-smi
+          python -c "import torch, onnxruntime as ort; assert torch.cuda.is_available(); assert 'CUDAExecutionProvider' in ort.get_available_providers(); print(torch.__version__, ort.__version__, torch.cuda.get_device_name())"
+          python -m pytest src/mobius/models/embedding_gemma2_test.py -v --junitxml="$RUNNER_TEMP/embedding-l3.xml"
+      - name: Generate independent reference goldens
+        id: reference
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          source "$RUNNER_TEMP/embedding-venv/bin/activate"
+          python scripts/generate_embeddinggemma2_golden.py --output "$RUNNER_TEMP/embedding-goldens"
+      - name: GPU L4 full-checkpoint parity
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOBIUS_TEST_DEVICE: cuda
+          MOBIUS_EMBEDDING_GOLDEN_DIR: ${{ runner.temp }}/embedding-goldens
+        run: |
+          source "$RUNNER_TEMP/embedding-venv/bin/activate"
+          python -m pytest tests/embedding_gemma2_golden_test.py -m golden -v -s --junitxml="$RUNNER_TEMP/embedding-l4.xml"
+      - name: GPU L5 semantic retrieval
+        if: ${{ !cancelled() && steps.reference.outcome == 'success' }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MOBIUS_TEST_DEVICE: cuda
+          MOBIUS_EMBEDDING_GOLDEN_DIR: ${{ runner.temp }}/embedding-goldens
+        run: |
+          source "$RUNNER_TEMP/embedding-venv/bin/activate"
+          python -m pytest tests/embedding_gemma2_golden_test.py -m generation -v -s --junitxml="$RUNNER_TEMP/embedding-l5.xml"
+      - name: Retain reference goldens and exact test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: embeddinggemma-2-gpu-evidence
+          path: |
+            ${{ runner.temp }}/embedding-goldens
+            ${{ runner.temp }}/embedding-l*.xml
+      - name: Clean model download cache
+        if: always()
+        run: |
+          source "$RUNNER_TEMP/embedding-venv/bin/activate"
+          python -c "import os, shutil; from pathlib import Path; cache=Path(os.environ['RUNNER_TEMP']) / 'embeddinggemma-hf-cache'; shutil.rmtree(cache) if cache.exists() else None"
