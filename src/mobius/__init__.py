@@ -72,6 +72,7 @@ __all__ = [
     "build_context",
     "build_diffusers_pipeline",
     "build_from_gguf",
+    "build_mattergen",
     "build_from_module",
     "build_from_nemo",
     "build_kev_package",
@@ -167,6 +168,7 @@ from mobius.adapters import (
 from mobius.integrations._weight_loading import apply_weights, stream_safetensors_to_model
 from mobius.integrations.diffusers import build_diffusers_pipeline
 from mobius.integrations.gguf import build_from_gguf
+from mobius.integrations.mattergen import build_mattergen
 from mobius.integrations.nemo import build_from_nemo
 from mobius.integrations.transformers import build
 from mobius.models import (
