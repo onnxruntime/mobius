@@ -34,8 +34,11 @@ __all__ = [
     "CogVideoXVAEConfig",
     "CohereCausalLMModel",
     "ControlNetModel",
+    "Cosmos3AVAEAudioDecoderOnlyTokenizer",
+    "Cosmos3AVAEAudioTokenizer",
     "Cosmos3EdgeTextModel",
     "Cosmos3EdgeVLModel",
+    "Cosmos3OmniGeneratorModel",
     "Cosmos3OmniReasonerModel",
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
@@ -149,6 +152,7 @@ __all__ = [
     "Lfm2VlForConditionalGeneration",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
+    "MLPLatentDynamicsModel",
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MaincoderCausalLMModel",
@@ -245,6 +249,7 @@ __all__ = [
     "remap_diffusers_unet_lora",
     "ViTModel",
     "VideoAutoencoderModel",
+    "AutoencoderKLWanModel",
     "VibeVoiceForConditionalGeneration",
     "VibeVoiceStreamingForConditionalGeneration",
     "VibeVoiceASRForConditionalGeneration",
@@ -285,7 +290,12 @@ from mobius.models.cogvideox_vae import (
 from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.controlnet import ControlNetModel
 from mobius.models.cosmos import Cosmos3EdgeTextModel, Cosmos3EdgeVLModel
+from mobius.models.cosmos3_audio import (
+    Cosmos3AVAEAudioDecoderOnlyTokenizer,
+    Cosmos3AVAEAudioTokenizer,
+)
 from mobius.models.cosmos3_omni import Cosmos3OmniReasonerModel
+from mobius.models.cosmos3_omni_generator import Cosmos3OmniGeneratorModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.decision import (
     CLM_PROVENANCE,
@@ -536,9 +546,10 @@ from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
 from mobius.models.vibevoice_streaming import VibeVoiceStreamingForConditionalGeneration
 from mobius.models.video_vae import VideoAutoencoderModel
 from mobius.models.vit import ViTModel
+from mobius.models.wan_vae import AutoencoderKLWanModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
 from mobius.models.whisper import WhisperForConditionalGeneration
-from mobius.models.world_model import MLPWorldModel
+from mobius.models.world_model import MLPLatentDynamicsModel, MLPWorldModel
 from mobius.models.xlm import XLMCausalLMModel
 from mobius.models.zamba2 import Zamba2CausalLMModel

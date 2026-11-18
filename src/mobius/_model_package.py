@@ -30,7 +30,7 @@ import tempfile
 import threading
 from collections import UserDict
 from collections.abc import Callable, Generator, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -702,6 +702,10 @@ class ModelPackage(UserDict[str, ir.Model]):
 
     # -- Persistence -------------------------------------------------------
 
+    def _model_for_save(self, name: str, model: ir.Model) -> AbstractContextManager[ir.Model]:
+        """Prepare component-local symbolic dimensions for serialization."""
+        return _anonymized_intermediate_symbolic_dimensions(model)
+
     def save(
         self,
         directory: str,
@@ -979,7 +983,7 @@ class ModelPackage(UserDict[str, ir.Model]):
             if use_subfolders:
                 os.makedirs(model_dir, exist_ok=True)
             path = os.path.join(model_dir, "model.onnx")
-            with _anonymized_intermediate_symbolic_dimensions(model) as saved_model:
+            with self._model_for_save(name, model) as saved_model:
                 if reuse_plan is not None:
                     from mobius.integrations.gguf._reuse import save_reuse_package
 
@@ -1389,6 +1393,11 @@ class ModelPackage(UserDict[str, ir.Model]):
             artifacts[name] = relative_path
         return artifacts
 
+    def validate_weights(self) -> None:
+        """Raise if any component initializer has no assigned tensor data."""
+        for name, model in self.data.items():
+            _check_weights(name, model)
+
     @classmethod
     def load(cls, directory: str) -> ModelPackage:
         """Load all ``.onnx`` files from a directory into a package.
@@ -1549,6 +1558,38 @@ class ModelPackage(UserDict[str, ir.Model]):
         Returns:
             The original state-dict names that matched package initializers.
         """
+        applied = self.apply_weights_partial(
+            state_dict,
+            prefix_map=prefix_map,
+            weight_transforms=weight_transforms,
+        )
+        if weight_transforms is not None:
+            unused = set(weight_transforms) - applied
+            if unused:
+                raise ValueError(f"Weight transforms were not bound: {sorted(unused)!r}.")
+        _log_weight_mapping(state_dict, applied)
+        if fold_constants:
+            self.finalize_weights()
+        return applied
+
+    def apply_weights_partial(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix_map: dict[str, str] | None = None,
+        *,
+        weight_transforms: dict[str, WeightTransform] | None = None,
+    ) -> set[str]:
+        """Apply one weight shard without folding partially populated graphs.
+
+        This is the streaming counterpart of :meth:`apply_weights`. Call it
+        once for each checkpoint shard, then call :meth:`finalize_weights`
+        after the final shard. It intentionally does not log unmapped weights:
+        a shard shared by heterogeneous pipeline components is expected to
+        contain tensors that do not belong to every component.
+
+        Returns:
+            Original state-dict names that matched graph initializers.
+        """
         applied: set[str] = set()
 
         if len(self.data) == 1:
@@ -1598,28 +1639,23 @@ class ModelPackage(UserDict[str, ir.Model]):
                 for model in self.data.values():
                     applied |= _apply_weights_to_model(model, unmatched, weight_transforms)
 
-        if weight_transforms is not None:
-            unused = set(weight_transforms) - applied
-            if unused:
-                raise ValueError(f"Weight transforms were not bound: {sorted(unused)!r}.")
-        _log_weight_mapping(state_dict, applied)
+        return applied
 
-        if not fold_constants:
-            return applied
-
+    def finalize_weights(self) -> None:
+        """Fold initializer-only subgraphs after all weight shards are applied."""
         # Fold constants now that weights have been loaded.
         # PackQKV emits Concat(w_q, w_k, w_v) in the graph; those nodes can only
         # be constant-folded once the weight tensors carry their const_value.
         for model in self.data.values():
             fold_initializers_after_weights(model)
-        return applied
 
 
 @contextmanager
-def _anonymized_intermediate_symbolic_dimensions(
+def _namespaced_symbolic_dimensions(
     model: ir.Model,
+    namespace: str | None,
 ) -> Generator[ir.Model, None, None]:
-    """Discard non-contractual intermediate aliases, preserving interface symbols."""
+    """Namespace interface symbols and discard non-contractual intermediate aliases."""
     interface_values = {id(value) for value in (*model.graph.inputs, *model.graph.outputs)}
     values: dict[int, ir.Value] = {}
     graphs: list[ir.GraphProtocol] = []
@@ -1633,9 +1669,10 @@ def _anonymized_intermediate_symbolic_dimensions(
             values[id(value)] = value
 
     originals: list[tuple[ir.Value, ir.Shape]] = []
+    symbols: dict[str, str] = {}
     try:
         for value in values.values():
-            if value.shape is None or id(value) in interface_values:
+            if value.shape is None:
                 continue
             dimensions: list[int | str | ir.SymbolicDim] = []
             changed = False
@@ -1646,7 +1683,15 @@ def _anonymized_intermediate_symbolic_dimensions(
                 if dimension.value is None:
                     dimensions.append(dimension)
                     continue
-                dimensions.append(ir.SymbolicDim(None))
+                if id(value) not in interface_values:
+                    dimensions.append(ir.SymbolicDim(None))
+                    changed = True
+                    continue
+                if namespace is None:
+                    dimensions.append(dimension)
+                    continue
+                text = str(dimension)
+                dimensions.append(symbols.setdefault(text, f"{namespace}.{text}"))
                 changed = True
             if changed:
                 originals.append((value, value.shape))
@@ -1658,6 +1703,15 @@ def _anonymized_intermediate_symbolic_dimensions(
     finally:
         for value, shape in originals:
             value.shape = shape
+
+
+@contextmanager
+def _anonymized_intermediate_symbolic_dimensions(
+    model: ir.Model,
+) -> Generator[ir.Model, None, None]:
+    """Discard non-contractual intermediate aliases, preserving interface symbols."""
+    with _namespaced_symbolic_dimensions(model, None) as saved_model:
+        yield saved_model
 
 
 def _make_progress_callback():

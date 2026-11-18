@@ -99,8 +99,10 @@ __all__ = [
     "MobileLDPProjector",
     "MobileLDPV2Projector",
     "MuseGlimmerVisionModel",
+    "Cosmos3EdgePatchMerger",
+    "Cosmos3EdgeVisionEmbeddings",
+    "Cosmos3EdgeVisionTower",
     "NVFP4QuantizedLinear",
-    "Cosmos3EdgeMultiModalProjector",
     "MobileNetV5Encoder",
     "MoELayer",
     "GroupedGatedSharedMoELayer",
@@ -239,6 +241,15 @@ from mobius.components._core_vlm_projector import (
     PixtralProjector,
     SpatialPixelUnshuffle,
 )
+from mobius.components._cosmos3_edge_vision import (
+    Cosmos3EdgePatchMerger as Cosmos3EdgePatchMerger,
+)
+from mobius.components._cosmos3_edge_vision import (
+    Cosmos3EdgeVisionEmbeddings as Cosmos3EdgeVisionEmbeddings,
+)
+from mobius.components._cosmos3_edge_vision import (
+    Cosmos3EdgeVisionTower as Cosmos3EdgeVisionTower,
+)
 from mobius.components._decoder import (
     DecoderLayer,
     PostNormDecoderLayer,
@@ -315,9 +326,6 @@ from mobius.components._moe import (
     SoftmaxTopKGate,
     SparseMixerGate,
     TopKGate,
-)
-from mobius.components._multimodal import (
-    Cosmos3EdgeMultiModalProjector as Cosmos3EdgeMultiModalProjector,
 )
 from mobius.components._multimodal import (
     Gemma3MultiModalProjector as Gemma3MultiModalProjector,
