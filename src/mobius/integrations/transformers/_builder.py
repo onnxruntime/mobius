@@ -345,6 +345,7 @@ def build_transformers_model(
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
+    embedding_bits: int | None = None,
     input_sampling_rate: int | None = None,
     bwe_sampling_rate: int | None = None,
 ) -> ModelPackage:
@@ -368,6 +369,9 @@ def build_transformers_model(
     width. ``None`` preserves existing EP defaults. It does not affect
     ``GatherBlockQuantized`` or requantize weights. PersonaPlex and RE-USE
     bespoke builders do not support this option.
+
+    ``embedding_bits`` selects 4- or 8-bit RTN quantization for Gemma4 split
+    per-layer embedding tables without changing ordinary token embeddings.
     """
     validate_matmul_nbits_accuracy_level(matmul_nbits_accuracy_level)
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
@@ -393,6 +397,7 @@ def build_transformers_model(
             "prune_prefill_prefix": prune_prefill_prefix,
             "glm_full_attention": glm_full_attention,
             "export_paged_attention": export_paged_attention,
+            "embedding_bits": embedding_bits is not None,
             "input_sampling_rate": input_sampling_rate is not None,
             "bwe_sampling_rate": bwe_sampling_rate is not None,
         }
@@ -481,6 +486,7 @@ def build_transformers_model(
                 "prune_prefill_prefix": prune_prefill_prefix,
                 "glm_full_attention": glm_full_attention,
                 "export_paged_attention": export_paged_attention,
+                "embedding_bits": embedding_bits is not None,
             }
             selected = sorted(name for name, enabled in unsupported.items() if enabled)
             if selected:
@@ -635,6 +641,20 @@ def build_transformers_model(
             config,
             output_layer_indices=list(output_layer_indices),
         )
+    if embedding_bits is not None:
+        if embedding_bits not in (4, 8):
+            raise ValueError(f"embedding_bits must be 4 or 8, got {embedding_bits}")
+        if (
+            hasattr(config, "per_layer_embedding_bits")
+            and getattr(config, "hidden_size_per_layer_input", 0)
+            and getattr(config, "vocab_size_per_layer_input", 0)
+        ):
+            config = dataclasses.replace(
+                config,
+                per_layer_embedding_bits=embedding_bits,
+                per_layer_embedding_group_size=32,
+                per_layer_embedding_sym=False,
+            )
     if glm_full_attention:
         if model_type != "glm_moe_dsa":
             raise ValueError(
