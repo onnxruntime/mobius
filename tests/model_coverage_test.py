@@ -74,6 +74,9 @@ def _l1_l3_model_types() -> set[str]:
     detection, SSM, vision-language, and speech.
     """
     types: set[str] = set()
+    # TIPS has image and text batches, covered by models/tips_test.py and
+    # integration/tips_test.py rather than the single-modality harness.
+    types.add("tipsv2")
     all_configs = (
         ALL_CAUSAL_LM_CONFIGS
         + ENCODER_CONFIGS

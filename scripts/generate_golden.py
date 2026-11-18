@@ -2177,8 +2177,16 @@ def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str
 
 # ---- Dispatcher ----
 
+
+def _generate_tips(case: TestCase, json_path: Path, device: str) -> None:
+    from mobius._testing.tips import generate_golden
+
+    generate_golden(case, json_path, device)
+
+
 # Map task_type strings to generator functions.
 _GENERATORS = {
+    "tips-feature-extraction": _generate_tips,
     "text-generation": _generate_causal_lm,
     "feature-extraction": _generate_encoder,
     "seq2seq": _generate_seq2seq,
