@@ -16,6 +16,7 @@ from typing import ClassVar
 import onnx_ir as ir
 from onnxscript import nn
 
+from mobius._build_context import prefill_prefix_pruning
 from mobius._configs import ArchitectureConfig, MllamaConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import (
@@ -197,17 +198,45 @@ class QwenVLTask(VisionLanguageTask):
     MRoPE 3D position_ids for the decoder.
     """
 
+    _supports_prefill_prefix_pruning: ClassVar[bool] = True
+
+    def __init__(
+        self,
+        *,
+        prune_prefill_prefix: bool = False,
+        runtime_last_token_indices: bool = False,
+    ):
+        if runtime_last_token_indices and not prune_prefill_prefix:
+            raise ValueError("runtime_last_token_indices requires prune_prefill_prefix=True")
+        if prune_prefill_prefix and not self._supports_prefill_prefix_pruning:
+            raise ValueError(
+                f"{type(self).__name__} does not support prune_prefill_prefix "
+                "or runtime_last_token_indices"
+            )
+        self._prune_prefill_prefix = prune_prefill_prefix
+        self._runtime_last_token_indices = runtime_last_token_indices
+
     def build(
         self,
         module: nn.Module,
         config: ArchitectureConfig,
     ) -> ModelPackage:
         self._validate_components(module)
+        if self._prune_prefill_prefix and config.model_type not in {
+            "qwen3_vl",
+            "qwen3_vl_text",
+        }:
+            raise ValueError("Qwen VL prefill-prefix pruning currently requires Qwen3-VL")
         deepstack = bool(getattr(config, "deepstack_visual_indexes", None))
         models: dict[str, ir.Model] = {}
-        models["decoder"] = build_decoder_from_embeds(
-            module.decoder, config, mrope=True, deepstack=deepstack
-        )
+        with prefill_prefix_pruning(self._prune_prefill_prefix):
+            models["decoder"] = build_decoder_from_embeds(
+                module.decoder,
+                config,
+                mrope=True,
+                deepstack=deepstack,
+                runtime_last_token_indices=self._runtime_last_token_indices,
+            )
         models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
         models["embedding"] = build_embedding_from_features(
             module.embedding,
@@ -272,6 +301,8 @@ class QwenVLTask(VisionLanguageTask):
 
 class Qwen2VLMultimediaTask(QwenVLTask):
     """Qwen2/Qwen2.5 task preserving independent image and video streams."""
+
+    _supports_prefill_prefix_pruning = False
 
     def build(
         self,
@@ -366,6 +397,8 @@ class GlmOcrVLTask(QwenVLTask):
 class MuseGlimmerVLTask(QwenVLTask):
     """Muse Glimmer packed vision pipeline with standard 1D text RoPE."""
 
+    _supports_prefill_prefix_pruning = False
+
     def build(
         self,
         module: nn.Module,
@@ -432,6 +465,8 @@ class HybridQwenVLTask(QwenVLTask):
     models are identical to :class:`QwenVLTask`; only the decoder
     uses hybrid cache inputs/outputs.
     """
+
+    _supports_prefill_prefix_pruning = False
 
     def build(
         self,

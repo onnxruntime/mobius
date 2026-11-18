@@ -377,6 +377,7 @@ def build_decoder_from_embeds(
     mrope: bool = False,
     hybrid: bool = False,
     deepstack: bool = False,
+    runtime_last_token_indices: bool = False,
 ) -> ir.Model:
     """Build an ``inputs_embeds → logits + KV cache`` decoder ONNX graph.
 
@@ -397,6 +398,8 @@ def build_decoder_from_embeds(
             ``deepstack_visual_indexes``), adds a ``per_layer_inputs`` input
             ``[batch, seq_len, D * hidden_size]`` that the decoder reshapes and
             injects into its first ``D`` layers.
+        runtime_last_token_indices: Add INT32 ``[batch, 1, 1]`` indices for
+            selecting each sequence's final valid hidden state before the LM head.
 
     Returns:
         A built :class:`ir.Model` for the decoder.
@@ -467,6 +470,12 @@ def build_decoder_from_embeds(
         )
 
     decoder_kwargs = {}
+    if runtime_last_token_indices:
+        decoder_kwargs["last_token_indices"] = builder.input(
+            "last_token_indices",
+            dtype=ir.DataType.INT32,
+            shape=[batch, 1, 1],
+        )
     if per_layer_inputs is not None:
         decoder_kwargs["per_layer_inputs"] = per_layer_inputs
 
