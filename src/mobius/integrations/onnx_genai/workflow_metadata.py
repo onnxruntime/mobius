@@ -18,8 +18,6 @@ import onnx_ir as ir
 
 from mobius._constants import (
     STATIC_CACHE_KV_SEQUENCE_LENGTH,
-    STATIC_CACHE_LAYOUT,
-    STATIC_CACHE_SEQUENCE_AXIS,
     STATIC_CACHE_WRITE_INDICES,
 )
 from mobius.generation import (
@@ -2056,33 +2054,46 @@ def _static_cache_ports(model: ir.Model) -> dict[str, Any] | None:
             "no paired cache buffer to scatter into; regenerate the package with "
             "updated_<buffer> outputs for every static cache input"
         )
-    axes = {
-        node.attributes.get_int("axis", 0)
+    scatters = [
+        node
         for node in ir.traversal.RecursiveGraphIterator(model.graph)
         if node.op_type == "TensorScatter"
-    }
-    if axes - {STATIC_CACHE_SEQUENCE_AXIS}:
-        raise ValueError(
-            f"static cache buffers are addressed on axes {sorted(axes)}, but the mobius "
-            f"static-cache ABI scatters along axis {STATIC_CACHE_SEQUENCE_AXIS}; the "
-            "declared capacity axis and the graph disagree"
-        )
+    ]
     capacities = set()
+    layouts = set()
     for buffer in buffers.values():
         shape = list(buffer.shape or [])
-        if len(shape) <= STATIC_CACHE_SEQUENCE_AXIS:
+        geometry = {3: (1, "bsh"), 4: (2, "bnsh")}.get(len(shape))
+        if geometry is None:
             raise ValueError(
-                f"static cache buffer {buffer.name!r} has rank {len(shape)}, which cannot "
-                f"carry a capacity on axis {STATIC_CACHE_SEQUENCE_AXIS}"
+                f"static cache buffer {buffer.name!r} has unsupported rank {len(shape)}; "
+                "expected flattened [B, S, H*D] or heads-first [B, H, S, D]"
             )
-        capacity = _constant_extent(shape[STATIC_CACHE_SEQUENCE_AXIS])
+        sequence_axis, layout = geometry
+        layouts.add(geometry)
+        axes = {
+            node.attributes.get_int("axis", 0)
+            for node in scatters
+            if node.inputs and node.inputs[0] is buffer
+        }
+        if axes - {sequence_axis, sequence_axis - len(shape)}:
+            raise ValueError(
+                f"static cache buffer {buffer.name!r} is addressed on axes {sorted(axes)}, "
+                f"but its declared capacity axis is {sequence_axis} for layout {layout}"
+            )
+        capacity = _constant_extent(shape[sequence_axis])
         if capacity is None:
             raise ValueError(
                 f"static cache buffer {buffer.name!r} declares a symbolic extent "
-                f"{shape[STATIC_CACHE_SEQUENCE_AXIS]!r} on its capacity axis; an "
+                f"{shape[sequence_axis]!r} on its capacity axis; an "
                 "indexed scatter is only meaningful against one constant capacity"
             )
         capacities.add(capacity)
+    if len(layouts) != 1:
+        raise ValueError(
+            "static cache buffers declare conflicting layouts; "
+            "one indexed-scatter group requires a consistent sequence axis and layout"
+        )
     if len(capacities) != 1:
         raise ValueError(
             f"static cache buffers declare conflicting capacities {sorted(capacities)}; "
@@ -2093,6 +2104,8 @@ def _static_cache_ports(model: ir.Model) -> dict[str, Any] | None:
         "kv_sequence_length": STATIC_CACHE_KV_SEQUENCE_LENGTH,
         "buffers": buffers,
         "capacity": capacities.pop(),
+        "sequence_axis": sequence_axis,
+        "layout": layout,
     }
 
 
@@ -2416,8 +2429,10 @@ def _state_service_groups(
         name = names[(kind, update)]
         group: dict[str, Any] = {
             "kind": kind,
-            "sequence_axis": (STATIC_CACHE_SEQUENCE_AXIS if is_scattered else sequence_axis),
-            "layout": STATIC_CACHE_LAYOUT if is_scattered else "bnsh",
+            "sequence_axis": (
+                indexed_scatter["sequence_axis"] if is_scattered else sequence_axis
+            ),
+            "layout": indexed_scatter["layout"] if is_scattered else "bnsh",
         }
         group_lengths = indexed_scatter["logical_lengths"] if is_scattered else logical_lengths
         if group_lengths:
@@ -6620,6 +6635,8 @@ def build_vlm_workflow_metadata(
         indexed_scatter=(
             {
                 "buffers": static_cache["buffers"],
+                "sequence_axis": static_cache["sequence_axis"],
+                "layout": static_cache["layout"],
                 "capacity": "package.cache_capacity",
                 # The write cursor and the logical length are one quantity: a
                 # row's next write lands exactly where its valid prefix ends.
@@ -8855,6 +8872,8 @@ def _build_autoregressive_workflow_metadata(
         indexed_scatter=(
             {
                 "buffers": static_cache["buffers"],
+                "sequence_axis": static_cache["sequence_axis"],
+                "layout": static_cache["layout"],
                 "capacity": "package.cache_capacity",
                 # The write cursor and the logical length are the same quantity:
                 # a row's next write lands exactly where its valid prefix ends.

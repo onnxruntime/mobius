@@ -55,4 +55,5 @@ ai-model-support-strategy
 :caption: Research
 
 research/testing-strategy-analysis
+research/tensorrt-static-cache-debugging
 ```

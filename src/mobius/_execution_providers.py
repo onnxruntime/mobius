@@ -31,6 +31,7 @@ __all__ = [
 
 import dataclasses
 import logging
+from typing import Literal
 
 import onnx_ir as ir
 
@@ -85,6 +86,10 @@ class EpCapabilities:
             DecomposeAttention.  ``True`` leaves the fused op unchanged.  Set
             ``False`` only for runtimes without an ``Attention`` kernel (QNN
             HTP), where the fused op would otherwise be forced onto CPU.
+        supports_attention_nonpad_kv_seqlen: Whether native Attention consumes
+            valid static-cache lengths. When ``False``, static-cache exports
+            require an explicit causal/valid-length bias and omit Attention's
+            nonpad input. Standalone TensorRT 11.3 ignores that native input.
         supports_rotary_embedding: ``False`` decomposes the opset-24
             ``RotaryEmbedding`` op into rotate-half primitives (Reshape/Slice/
             Mul/Sub/Add/Concat) via DecomposeRotaryEmbedding.  ``True`` leaves
@@ -183,6 +188,8 @@ class EpCapabilities:
     max_buffer_size: int | None = None
     layered_per_layer_inputs: bool = False
     requires_graph_capture_rewrite: bool = False
+    static_cache_layout: Literal["flattened", "heads_first"] = "flattened"
+    supports_attention_nonpad_kv_seqlen: bool = True
     requires_power_of_two_matmul_nbits_blocks: bool = False
     # Append new capabilities to preserve all existing positional arguments.
     matmul_nbits_qkv_pack_dtypes: frozenset[ir.DataType] = dataclasses.field(
@@ -391,6 +398,15 @@ def _register_builtins() -> None:
             supports_matmul_nbits=False,
             enable_graph_capture=True,
             supports_past_present_share_buffer=True,
+        ),
+        EpCapabilities(
+            name="tensorrt",
+            static_cache_layout="heads_first",
+            supports_attention_nonpad_kv_seqlen=False,
+            gqa_dtypes=frozenset(),
+            qkv_pack_dtypes=frozenset(),
+            supports_skip_layer_norm=False,
+            supports_matmul_nbits=False,
         ),
         # Qualcomm Hexagon NPU via the QNN EP (onnxruntime-qnn QAIRT plugin),
         # HTP backend. The HTP runs a static-shaped, QDQ-quantized QNN context
