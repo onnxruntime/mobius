@@ -204,14 +204,20 @@ class Lfm3TextModel(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        input_ids: ir.Value,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list,
+        inputs_embeds: ir.Value | None = None,
     ):
-        hidden_states = self.embed_tokens(op, input_ids)
+        hidden_states = (
+            self.embed_tokens(op, input_ids) if inputs_embeds is None else inputs_embeds
+        )
         if hidden_states.dtype != ir.DataType.FLOAT:
             raise ValueError(_FLOAT32_ONLY)
+        # The masks read only dims 0 and 1, which token IDs and embeddings share.
+        if input_ids is None:
+            input_ids = inputs_embeds
         embeddings = {
             kind: rope(op, position_ids)
             for kind, rope in zip(self._rope_types, self.rotary_emb, strict=True)
