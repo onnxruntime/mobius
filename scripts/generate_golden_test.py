@@ -19,6 +19,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import generate_golden
 
 
+def test_gnm_generator_preserves_explicit_gpu(monkeypatch, tmp_path):
+    from mobius._testing import gnm_reference
+    from mobius.models.gnm import GNM_MODEL_ID, GNM_REVISION
+
+    calls = []
+    monkeypatch.setenv("GNM_REFERENCE_ROOT", str(tmp_path / "upstream"))
+    monkeypatch.setattr(
+        gnm_reference, "generate", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    case = SimpleNamespace(model_id=GNM_MODEL_ID, revision=GNM_REVISION, case_id="gnm-v3")
+    generate_golden._generate_mesh(case, tmp_path / "gnm-v3.json", "cuda:7")
+    assert calls == [
+        (
+            (tmp_path / "upstream",),
+            {"output_dir": tmp_path, "case_id": "gnm-v3", "device": "cuda:7"},
+        )
+    ]
+
+
 @pytest.fixture
 def audio_stub(monkeypatch):
     """Loader probes must not depend on optional audio decoding packages."""

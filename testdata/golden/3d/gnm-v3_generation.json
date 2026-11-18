@@ -1,0 +1,18 @@
+{
+  "model_id": "google/gnm-v3",
+  "revision": "c01e90d298d82301f9fd18f54806be751775cb7c",
+  "checkpoint_sha256": "61d78bbfb4ad8e0b38495804a4caef3214d3df00f8c3f68761e63b41ce3747eb",
+  "reference_revision": "dfd3e4b96bda2f0061c6013a458b435cf3cb519f",
+  "reference_device": "cuda:0",
+  "device_name": "NVIDIA A100-SXM4-80GB",
+  "torch_version": "2.9.0+cu126",
+  "numpy_version": "2.3.4",
+  "fixture_sha256": "d0ef1cdea3e64d9083924cde69d86f7cfa70f68b6a3dd81351ea9ac046cf57a2",
+  "level": "L5",
+  "shape": [
+    24,
+    17821,
+    3
+  ],
+  "contract": "full articulated mesh; no vertices, basis rows or joints pruned"
+}

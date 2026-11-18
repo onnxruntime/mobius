@@ -2177,8 +2177,30 @@ def _generate_diarization_streaming(case: TestCase, json_path: Path, device: str
 
 # ---- Dispatcher ----
 
+
+def _generate_mesh(case: TestCase, json_path: Path, device: str) -> None:
+    """Delegate continuous GNM goldens to the independently pinned upstream reference."""
+    import os
+
+    from mobius._testing.gnm_reference import generate
+    from mobius.models.gnm import GNM_MODEL_ID, GNM_REVISION
+
+    if not device.startswith("cuda"):
+        raise ValueError("GNM reference generation requires --device cuda.")
+    if case.model_id != GNM_MODEL_ID or case.revision != GNM_REVISION:
+        raise ValueError("GNM goldens require the pinned google/gnm-v3 release.")
+    root = os.environ.get("GNM_REFERENCE_ROOT")
+    if not root:
+        raise ValueError(
+            "Set GNM_REFERENCE_ROOT to a clean google/gnm checkout at "
+            "dfd3e4b96bda2f0061c6013a458b435cf3cb519f before generating GNM goldens."
+        )
+    generate(Path(root), output_dir=json_path.parent, case_id=case.case_id, device=device)
+
+
 # Map task_type strings to generator functions.
 _GENERATORS = {
+    "mesh-generation": _generate_mesh,
     "text-generation": _generate_causal_lm,
     "feature-extraction": _generate_encoder,
     "seq2seq": _generate_seq2seq,
