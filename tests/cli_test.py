@@ -695,6 +695,72 @@ class TestCLIBuild:
         task = mock_build.call_args.kwargs["task"]
         assert isinstance(task, Gemma4TextCausalLMTask)
 
+    def test_static_cache_resolves_speech_language_task(self):
+        """``static-cache`` on a speech-language model keeps the 3-model split."""
+        from mobius.tasks import SpeechLanguageTask
+
+        hf_config = mock.MagicMock()
+        hf_config.model_type = "qwen3_asr"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch("transformers.AutoConfig.from_pretrained", return_value=hf_config),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen3-ASR-0.6B",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "static-cache",
+                    "--max-seq-len",
+                    "128",
+                ]
+            )
+
+        task = mock_build.call_args.kwargs["task"]
+        assert isinstance(task, SpeechLanguageTask)
+        assert task._static_cache
+        assert task._max_seq_len == 128
+
+    def test_static_cache_reads_unregistered_config_json(self):
+        """A model type Transformers does not know still resolves from config.json."""
+        from mobius.tasks import SpeechLanguageTask
+
+        raw_config = mock.MagicMock()
+        raw_config.model_type = "qwen3_asr"
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                side_effect=ValueError("unrecognized model type"),
+            ),
+            mock.patch(
+                "mobius.integrations.transformers._config_resolver._try_load_config_json",
+                return_value=raw_config,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "Qwen/Qwen3-ASR-0.6B",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "static-cache",
+                    "--max-seq-len",
+                    "128",
+                ]
+            )
+
+        assert isinstance(mock_build.call_args.kwargs["task"], SpeechLanguageTask)
+
     def test_build_static_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             main(
