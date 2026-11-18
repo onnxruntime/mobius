@@ -38,7 +38,12 @@ from mobius.integrations.transformers._config_resolver import _default_task_for_
 from mobius.tasks import (
     Phi4MMMultiModalTask,
     Qwen3VLVisionLanguageTask,
+    Qwen4ExpVisionLanguageTask,
     get_task,
+)
+from mobius.tasks._vision_language_3model import (
+    MuseGlimmerVLTask,
+    Qwen2VLMultimediaTask,
 )
 
 _VL_MODEL_PARAMS = _make_params(VL_CONFIGS)
@@ -48,6 +53,130 @@ _VL_TWO_MODEL_TASKS = {"vision-encoder-decoder"}
 
 class TestBuildGraphVisionLanguage:
     """Verify multimodal models build correctly."""
+
+    @pytest.mark.parametrize(
+        "task_class",
+        [
+            Qwen2VLMultimediaTask,
+            MuseGlimmerVLTask,
+            Qwen4ExpVisionLanguageTask,
+        ],
+    )
+    @pytest.mark.parametrize("runtime_indices", [False, True])
+    def test_qwen_vl_subclasses_reject_pruning(self, task_class, runtime_indices):
+        with pytest.raises(ValueError, match="does not support prune_prefill_prefix"):
+            task_class(
+                prune_prefill_prefix=True,
+                runtime_last_token_indices=runtime_indices,
+            )
+
+    @pytest.mark.parametrize(
+        "prune,runtime_indices", [(False, False), (True, False), (True, True)]
+    )
+    def test_qwen35_vl_last_token_contract(self, prune, runtime_indices):
+        config = _base_config(
+            model_type="qwen3_5",
+            attn_qk_norm=True,
+            partial_rotary_factor=0.5,
+            layer_types=["linear_attention", "full_attention"],
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=16,
+                in_channels=3,
+                out_hidden_size=64,
+                num_position_embeddings=16,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            image_token_id=248056,
+            mrope_section=[8, 12, 12],
+        )
+        package = build_from_module(
+            registry.get("qwen3_5")(config),
+            config,
+            task="hybrid-qwen-vl",
+            execution_provider="cpu",
+            prune_prefill_prefix=prune,
+            runtime_last_token_indices=runtime_indices,
+        )
+        decoder = package["decoder"]
+        inputs = {value.name: value for value in decoder.graph.inputs}
+        outputs = {value.name for value in decoder.graph.outputs}
+        assert ("last_token_indices" in inputs) is runtime_indices
+        assert (decoder.graph.outputs[0].shape[1] == 1) is prune
+        assert {"present.0.conv_state", "present.0.recurrent_state"} <= outputs
+        assert {"present.1.key", "present.1.value"} <= outputs
+        if runtime_indices:
+            indices = inputs["last_token_indices"]
+            assert indices.dtype == ir.DataType.INT32
+            assert list(indices.shape)[1:] == [1, 1]
+            gather = decoder.graph.outputs[0].producer().inputs[0].producer()
+            assert gather.op_type == "GatherND"
+            assert gather.attributes["batch_dims"].value == 1
+
+    @pytest.mark.parametrize(
+        "prune,runtime_indices", [(False, False), (True, False), (True, True)]
+    )
+    @pytest.mark.parametrize("deepstack", [False, True])
+    def test_qwen3_vl_last_token_contract(self, prune, runtime_indices, deepstack):
+        config = _base_config(
+            model_type="qwen3_vl",
+            attn_qk_norm=True,
+            vision=VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=16,
+                in_channels=3,
+                out_hidden_size=64,
+                num_position_embeddings=16,
+            ),
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            deepstack_visual_indexes=[0] if deepstack else None,
+            image_token_id=151655,
+            mrope_section=[8, 12, 12],
+        )
+        module = registry.get("qwen3_vl")(config)
+        package = build_from_module(
+            module,
+            config,
+            task="qwen-vl",
+            execution_provider="cpu",
+            prune_prefill_prefix=prune,
+            runtime_last_token_indices=runtime_indices,
+        )
+        decoder = package["decoder"]
+        inputs = {value.name: value for value in decoder.graph.inputs}
+        assert ("last_token_indices" in inputs) is runtime_indices
+        assert ("per_layer_inputs" in inputs) is deepstack
+        assert (decoder.graph.outputs[0].shape[1] == 1) is prune
+        assert (
+            package["vision_encoder"].graph.outputs[0].shape[-1]
+            == (2 if deepstack else 1) * config.hidden_size
+        )
+        embedding_outputs = {value.name for value in package["embedding"].graph.outputs}
+        assert embedding_outputs == (
+            {"inputs_embeds", "per_layer_inputs"} if deepstack else {"inputs_embeds"}
+        )
+        if runtime_indices:
+            indices = inputs["last_token_indices"]
+            assert indices.dtype == ir.DataType.INT32
+            assert list(indices.shape)[1:] == [1, 1]
+            head = decoder.graph.outputs[0].producer()
+            assert head.op_type == "MatMul"
+            gather = head.inputs[0].producer()
+            assert gather.op_type == "GatherND"
+            assert gather.attributes["batch_dims"].value == 1
 
     def test_phi4mm_multimodal_graph(self):
         """Build Phi4MM with Phi4MMMultiModalTask and verify 4-model split."""

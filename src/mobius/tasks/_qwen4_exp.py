@@ -263,6 +263,8 @@ class Qwen4ExpCausalLMTask(ModelTask):
 class Qwen4ExpVisionLanguageTask(QwenVLTask):
     """Build the Qwen4-Exp decoder, shared Qwen vision tower, and embedding mixer."""
 
+    _supports_prefill_prefix_pruning = False
+
     def build(self, module: nn.Module, config: Qwen4ExpConfig) -> ModelPackage:
         self._validate_components(module)
         if config.deepstack_visual_indexes or (
