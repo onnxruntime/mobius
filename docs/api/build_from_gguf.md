@@ -108,7 +108,7 @@ def build_from_gguf(
 | `mmproj` | Companion projector GGUF for a registry-evidenced multimodal route. |
 | `image_token_id` | Processor-owned image placeholder ID for an `mmproj` package. |
 | `static_cache`, `max_seq_len` | Request a fixed-width KV cache and optionally set its length. |
-| `allow_dense_moe` | Opt in to a dense fallback for supported MoE imports. |
+| `allow_dense_moe` | Opt in to inefficient all-expert dense fallbacks (default `False`). Standard opset-29 grouped top-k dispatch does not require this opt-in; packed-bank decoding can still materialize the full weight bank. |
 | `reuse_gguf_weights` | Reuse compatible source tensor byte ranges in the saved package. |
 | `target_config` | Exact target configuration for a supported speculative draft model. |
 | `output_layer_indices` | Optional hidden-layer outputs to expose. |

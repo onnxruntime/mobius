@@ -12,9 +12,9 @@ export decision:
   sha256 checksums.
 * The GGUF ``general.architecture`` and the canonical Mobius model type it
   bridges to (e.g. ``glm-dsa`` → ``glm_moe_dsa``).
-* Whether the export is *blocked* — most importantly the sparse-MoE honesty
-  blocker: routed IQ/MXFP4 experts have no sparse ``BlockQuantizedMoE`` fusion,
-  so a build would be dense-all-expert.
+* Whether the export is blocked by an all-expert fallback or an unsupported
+  contract. Standard opset-29 grouped top-k dispatch is not dense execution;
+  decoding a full packed weight bank is a separate materialization cost.
 
 Everything here is **metadata only**. For a Hub reference it uses
 ``HfApi.model_info(expand=["gguf"])`` for the architecture/expert counts and
@@ -76,9 +76,8 @@ _MOE_MODEL_TYPES = frozenset(
     }
 )
 
-# GGUF quantization tokens whose routed experts lower to native
-# ``pkg.nxrt::BlockQuantizedMatMul`` blocks (no sparse top-k fusion exists yet).
-# Only int4 ``MatMulNBits`` experts fuse into ``com.microsoft::QMoE``.
+# GGUF quantization tokens whose legacy routed experts use native block ops.
+# The standard opset-29 path instead preserves packed source weight banks.
 _NATIVE_BLOCK_QUANT_RE = re.compile(
     r"(IQ1_[SM]|IQ2_(XXS|XS|S)|IQ3_(XXS|S)|IQ4_(NL|XS)|MXFP4|TQ1_0|TQ2_0)",
     re.IGNORECASE,
@@ -151,8 +150,8 @@ class GgufPreflightReport:
         total_params: Total parameter count when the Hub exposes it (``None``
             for a local-only metadata read).
         num_experts: Routed-expert count when known (MoE detection signal).
-        sparse_moe_fusion_supported: False when routed experts would lower to
-            native block ``BlockQuantizedMatMul`` nodes with no sparse fusion.
+        sparse_moe_fusion_supported: False when sparse fusion cannot be
+            established from metadata alone; the final graph may still fuse.
         files: Per-file metadata (sizes + checksums).
         blockers: Hard export blockers (each is a human-readable reason).
         warnings: Non-fatal advisories.
@@ -298,18 +297,17 @@ def _assess_sparse_moe(
     num_experts: int | None,
     quantization: str | None,
     source: str,
-) -> tuple[bool, list[str]]:
-    """Return ``(fusion_supported, blockers)`` for the routed-expert stack.
+) -> tuple[bool, list[str], list[str]]:
+    """Return ``(fusion_supported, blockers, warnings)`` for routed experts.
 
-    Mobius has exactly one sparse MoE path: int4 ``MatMulNBits`` experts fused
-    into ``com.microsoft::QMoE``. GGUF always tags ``quant_method="gguf"``, so
-    routed experts follow the dense per-expert loop; when their block format is
-    a native IQ/MXFP4 layout they lower to ``pkg.nxrt::BlockQuantizedMatMul``
-    with no fusion, i.e. dense-all-expert compute. Report that as a blocker.
+    Native-block sparse fusion depends on the final per-projection layouts.
+    Metadata alone cannot establish grouped lowering. The opset-29 builder
+    checks actual modules after replacement; legacy all-expert execution
+    remains blocked unless explicitly opted in.
     """
     is_nemotron_h_moe = architecture == "nemotron_h_moe"
     if not is_nemotron_h_moe and not _is_moe(model_type, num_experts):
-        return True, []
+        return True, [], []
 
     if is_nemotron_h_moe:
         blocker = (
@@ -322,24 +320,43 @@ def _assess_sparse_moe(
             "and are not incompatibilities. build_from_gguf fails closed unless "
             "keep_quantized=False explicitly selects the loop-over-experts float graph."
         )
-        return False, [blocker]
+        return False, [blocker], []
 
     native_block = _NATIVE_BLOCK_QUANT_RE.search(quantization or "") is not None
     if not native_block:
         # int4-class MoE experts can be repacked to MatMulNBits and fused.
-        return True, []
+        return True, [], []
 
-    blocker = (
-        f"sparse-MoE fusion blocker: {source} is a MoE architecture "
+    from mobius._flags import flags
+
+    if flags.experimental_opset29:
+        return (
+            False,
+            [],
+            [
+                (
+                    f"opset-29 MoE dispatch assessment for {source}: the standard packed "
+                    "route checks actual expert modules after grouped replacement. "
+                    "GroupedMatMul computes only selected experts and needs no dense "
+                    "opt-in; remaining all-expert modules are rejected by default. "
+                    "DequantizePacked may still materialize the full weight bank; "
+                    "grouped dispatch alone is not a quantized-kernel throughput claim."
+                )
+            ],
+        )
+
+    advisory = (
+        f"sparse-MoE fusion advisory: {source} is a MoE architecture "
         f"('{model_type}') whose routed experts use '{quantization}' native "
-        "blocks. No sparse top-k BlockQuantizedMoE fusion exists for these "
-        "block formats — only int4 MatMulNBits experts fuse into "
-        "com.microsoft::QMoE. A default export would build a dense-all-expert "
-        "graph (every expert evaluated for every token) with no performance "
-        "guarantee, so build_from_gguf fails closed. Next slice: sparse IQ-block "
-        "BlockQuantizedMoE fusion (top-k gather over native-block expert weights)."
+        "blocks. Sparse BlockQuantizedMoE fusion depends on the final expert "
+        "layouts. An unfused fallback performs dense-all-expert compute "
+        "(every expert evaluated for every token) and requires explicit "
+        "allow_dense_moe=True or MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1."
     )
-    return False, [blocker]
+
+    if not flags.allow_dense_moe_experts:
+        return False, [advisory + " Dense fallback is disabled by default."], []
+    return False, [], [advisory]
 
 
 def _matmulnbits_output_bytes(np_shape: tuple[int, ...], bits: int, block_size: int) -> int:
@@ -504,14 +521,13 @@ def preflight_local_gguf(
             )
         )
 
-    fusion_ok, blockers = _assess_sparse_moe(
+    fusion_ok, blockers, warnings = _assess_sparse_moe(
         architecture=architecture,
         model_type=model_type,
         num_experts=num_experts,
         quantization=quantization,
         source=str(path),
     )
-    warnings: list[str] = []
     if architecture is None:
         warnings.append("architecture metadata missing from primary shard")
 
@@ -611,7 +627,7 @@ def preflight_hf_gguf(
     model_type = resolve_model_type(architecture) if architecture else None
     quantization = _detect_quantization(filename, *shard_files)
 
-    fusion_ok, blockers = _assess_sparse_moe(
+    fusion_ok, blockers, warnings = _assess_sparse_moe(
         architecture=architecture,
         model_type=model_type,
         num_experts=num_experts,
@@ -619,7 +635,6 @@ def preflight_hf_gguf(
         source=f"{repo_id}{('/' + filename) if filename else ''}",
     )
 
-    warnings: list[str] = []
     if architecture is None:
         warnings.append(
             "architecture not exposed by Hub metadata; resolve after a "

@@ -528,18 +528,18 @@ def test_core_attributes_match_bqmoe_abi() -> None:
 # --------------------------------------------------------------------------- #
 # Per-projection (block_layout_version=2): fail-closed default + schema hook   #
 # --------------------------------------------------------------------------- #
-def test_mixed_format_rejects_v2_by_default() -> None:
-    """A direct public call rejects a mixed-format (v2-only) layer by default.
+def test_mixed_format_sparse_requirement_rejects_v2() -> None:
+    """A sparse-only call rejects a mixed-format (v2-only) layer.
 
     No shipped onnx-genai runtime executes the ``block_layout_version=2``
-    per-projection ABI, so ``fuse_block_quantized_moe`` fails closed for a
-    mixed-format layer with no opt-in of any kind. The reject is atomic: the
+    per-projection ABI, so a sparse-only export fails closed for a
+    mixed-format layer. The reject is atomic: the
     dense graph is left untouched.
     """
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
     graph = model.graph
     with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        fuse_block_quantized_moe(model)
+        fuse_block_quantized_moe(model, allow_dense_moe=False)
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E  # dense graph left untouched
 
@@ -601,7 +601,7 @@ def test_mixed_format_across_experts_fails_closed() -> None:
     model, _ = _build_dense_graph(corrupt_expert_gate_fmt=(1, "iq1_m"))
     graph = model.graph
     with pytest.raises(SparseMoEExportError):
-        fuse_block_quantized_moe(model)
+        fuse_block_quantized_moe(model, allow_dense_moe=False)
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E  # dense graph left untouched
 
@@ -610,7 +610,7 @@ def test_biased_expert_fails_closed() -> None:
     model, _ = _build_dense_graph(bias_expert=2)
     graph = model.graph
     with pytest.raises(SparseMoEExportError):
-        fuse_block_quantized_moe(model)
+        fuse_block_quantized_moe(model, allow_dense_moe=False)
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E
 
@@ -620,7 +620,7 @@ def test_incomplete_expert_group_fails_closed() -> None:
     model, _ = _build_dense_graph(break_expert=2)
     graph = model.graph
     with pytest.raises(SparseMoEExportError):
-        fuse_block_quantized_moe(model)
+        fuse_block_quantized_moe(model, allow_dense_moe=False)
     assert _count(graph, "BlockQuantizedMoE") == 0
 
 
@@ -635,7 +635,7 @@ def test_dropped_trailing_expert_fails_closed() -> None:
     model, _ = _build_dense_graph(break_expert=E - 1)
     graph = model.graph
     with pytest.raises(SparseMoEExportError):
-        fuse_block_quantized_moe(model)
+        fuse_block_quantized_moe(model, allow_dense_moe=False)
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E  # dense graph left untouched
 
@@ -645,23 +645,33 @@ def test_alien_routing_weights_expert_fails_closed() -> None:
     model, _ = _build_dense_graph(alien_routing_expert=E - 1)
     graph = model.graph
     with pytest.raises(SparseMoEExportError):
-        fuse_block_quantized_moe(model)
+        fuse_block_quantized_moe(model, allow_dense_moe=False)
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E  # dense graph left untouched
 
 
-def test_allow_dense_moe_opt_in_keeps_dense_fallback() -> None:
-    """``allow_dense_moe=True`` downgrades a fail-closed layer to a dense keep.
+def test_default_rejects_all_expert_dense_fallback() -> None:
+    model, _ = _build_dense_graph(corrupt_expert_gate_fmt=(1, "iq1_m"))
+    nodes_before = list(model.graph)
+    with pytest.raises(SparseMoEExportError, match="fails closed by default"):
+        fuse_block_quantized_moe(model)
+    assert list(model.graph) == nodes_before
 
-    The honesty opt-in (mirroring ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS``) must not
-    raise and must leave the runnable per-expert dense fallback intact.
+
+def test_allow_dense_moe_keeps_dense_fallback(caplog) -> None:
+    """Explicit dense exports retain the original graph.
+
+    Sparse-fusion failure must not change the original dense computation.
     """
     model, _ = _build_dense_graph(corrupt_expert_gate_fmt=(1, "iq1_m"))
     graph = model.graph
+    nodes_before = list(graph)
     fused = fuse_block_quantized_moe(model, allow_dense_moe=True)
     assert fused == 0
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E  # dense fallback preserved, not fused
+    assert list(graph) == nodes_before
+    assert "every expert runs for every token" in caplog.text
 
 
 def test_no_moe_is_a_noop() -> None:

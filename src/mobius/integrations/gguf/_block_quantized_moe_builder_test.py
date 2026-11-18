@@ -7,8 +7,8 @@ These tests exercise the ``build_from_gguf`` post-export integration points
 (:func:`_fuse_native_block_moe`, :func:`_assert_sparse_moe_graph`) on synthetic
 exported packages -- i.e. the graph state the builder hands to the fusion after
 ``pkg.apply_weights``. They are distinct from the rewrite-rule unit tests: the
-focus here is the *builder's* honesty policy (default fail-closed for
-mixed-format per-projection v2 with no environment opt-in, opt-in dense
+focus here is the *builder's* fallback policy (no unsupported
+mixed-format per-projection v2 emission, opt-in dense
 retention, and the final-graph-state backstop), byte-preserving expert banks,
 and deterministic external data.
 
@@ -17,8 +17,8 @@ correctness is proven structurally (the routed expert storm collapses; the share
 expert is untouched) and by byte-preservation (the native blocks are stacked
 verbatim). GLM-5.2 UD-IQ1 layers mix native formats across their fc1/fc2/fc3
 banks, so they require the ``block_layout_version=2`` per-projection ABI; until
-that ships in the runtime the builder must typed-reject them rather than emit an
-unrunnable node.
+that ships in the runtime the builder typed-rejects by default, or retains the
+dense graph with explicit opt-in, rather than emit an unrunnable node.
 """
 
 from __future__ import annotations
@@ -148,7 +148,7 @@ def test_builder_allow_dense_retains_dense_fallback(monkeypatch) -> None:
     equal_before = _count(pkg, "Equal")
 
     fused = _fuse_native_block_moe(pkg, allow_dense=True)
-    # The gate is a no-op under the opt-in (the fusion already warned).
+    # The backstop reports the surviving dense graph without rejecting it.
     _assert_sparse_moe_graph(pkg, source="mixed.gguf", allow_dense=True)
 
     assert fused == 0
@@ -228,10 +228,11 @@ def test_gate_ignores_shared_expert() -> None:
     _assert_sparse_moe_graph(pkg, source="shared.gguf", allow_dense=False)  # no raise
 
 
-def test_gate_opt_in_allows_leftover_storm() -> None:
-    """Under the dense opt-in the backstop stays silent (fusion already warned)."""
+def test_gate_allows_and_reports_unrecognized_dense_fallback(caplog) -> None:
+    """Unrecognized routed experts also receive a performance advisory."""
     pkg = _graph_with_named_bqmatmul("model.layers.0.mlp.experts.0.gate_proj.weight")
     _assert_sparse_moe_graph(pkg, source="storm.gguf", allow_dense=True)  # no raise
+    assert "Every routed expert may run for every token" in caplog.text
 
 
 # --------------------------------------------------------------------------- #
@@ -362,7 +363,9 @@ def test_e2e_uniform_native_moe_fuses_through_builder(monkeypatch, tmp_path) -> 
     assert attrs["format"].value == "iq1_s"
 
 
-def test_e2e_mixed_format_typed_rejects_through_builder(monkeypatch, tmp_path) -> None:
+def test_e2e_mixed_format_sparse_requirement_rejects_through_builder(
+    monkeypatch, tmp_path
+) -> None:
     """A GLM-5.2-style per-projection mixed GGUF fails closed end-to-end.
 
     Without the v2 runtime the builder must raise ``SparseMoEExportError`` rather
@@ -393,11 +396,11 @@ def test_e2e_env_flag_cannot_force_v2_through_builder(monkeypatch, tmp_path) -> 
     _write_native_moe_gguf(path, down_fmt="iq4_xs")
 
     with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        build_from_gguf(path, keep_quantized=True)
+        build_from_gguf(path, keep_quantized=True, allow_dense_moe=False)
 
 
-def test_e2e_allow_dense_retains_storm_through_builder(monkeypatch, tmp_path) -> None:
-    """``allow_dense_moe=True`` keeps the runnable per-expert dense fallback.
+def test_e2e_allow_dense_retains_storm_through_builder(monkeypatch, tmp_path, caplog) -> None:
+    """Explicit dense exports keep the per-expert fallback.
 
     It must warn+retain, never count as a fused success: the 12 routed expert
     matmuls stay, so no BlockQuantizedMoE is produced.
@@ -413,6 +416,7 @@ def test_e2e_allow_dense_retains_storm_through_builder(monkeypatch, tmp_path) ->
     assert moe == 0
     # 4 attention + 4 experts * 3 projections all remain as dense BlockQuantizedMatMul.
     assert matmul == 16
+    assert "every expert runs for every token" in caplog.text
 
 
 def test_e2e_shared_expert_survives_fusion_through_builder(monkeypatch, tmp_path) -> None:
