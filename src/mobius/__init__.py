@@ -61,6 +61,9 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "WhisperConfig",
+    "WeatherNextConfig",
+    "WeatherNextForecastTask",
+    "WeatherNextModel",
     "WorldModelConfig",
     "WorldModelTask",
     "YolosConfig",
@@ -123,6 +126,7 @@ from mobius._configs import (
     SpeechToTextConfig,
     VisionConfig,
     VisionLanguageConfig,
+    WeatherNextConfig,
     WhisperConfig,
     WorldModelConfig,
     YolosConfig,
@@ -178,6 +182,7 @@ from mobius.models import (
     KevPointerHead,
     KevVariant,
     MLPWorldModel,
+    WeatherNextModel,
     build_clm_package,
     build_kev_package,
 )
@@ -190,5 +195,6 @@ from mobius.tasks import (
     KevTask,
     ModelTask,
     MultiComponentModelTask,
+    WeatherNextForecastTask,
     WorldModelTask,
 )

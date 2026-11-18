@@ -111,6 +111,7 @@ from mobius._configs._sub_configs import (
     TTSConfig,
     VisionConfig,
 )
+from mobius._configs._weathernext import WeatherNextConfig
 from mobius._configs._world_model import WorldModelConfig
 from mobius._configs.vibevoice import (
     VibeVoiceASRStreamingConfig,
@@ -196,6 +197,7 @@ __all__ = [
     "VibeVoiceStreamingTokenizerConfig",
     "VibeVoiceTokenizerConfig",
     "WhisperConfig",
+    "WeatherNextConfig",
     "XverseConfig",
     "WorldModelConfig",
     "YolosConfig",
