@@ -114,6 +114,22 @@ class _LegacyAffineCodec:
             raise ValueError(
                 f"codec {self.method!r} cannot group quant_method {config.quant_method!r}"
             )
+        if self.method == "quark":
+            # ``normalize`` below handles Quark, but this grouper keys off
+            # ``_qweight``/``.qweight`` and Quark has neither -- its payload sits
+            # on the bare ``.weight``. Grouping would silently emit three
+            # FloatWeight records instead of one PackedWeight (and the orphan
+            # sidecar check would not catch it either), so fail closed rather
+            # than build a float graph over packed data.
+            raise NotImplementedError(
+                "AMD Quark checkpoints cannot be grouped by this codec: Quark "
+                "stores its packed payload on the canonical '.weight' key, which "
+                "this grouper cannot distinguish from a float weight. Reached "
+                "either from an explicit component_quantization plan or from a "
+                "single-component build whose root config carries module rules. "
+                "Quark projections are unpacked by preprocess_quark_weights "
+                "during preprocess_weights instead."
+            )
 
         records: dict[str, WeightRecord] = {}
         consumed: set[str] = set()
@@ -201,7 +217,7 @@ class _LegacyAffineCodec:
             in_features=in_features,
             defer_per_channel_sidecars=False,
         )
-        if kind == "embedding" and self.method in {"gptq", "awq"}:
+        if kind == "embedding" and self.method in {"gptq", "awq", "quark"}:
             # The affine packers produce [rows, blocks, bytes]; Gather consumes
             # the same packed bytes as a [rows, packed_columns] table.
             weight = normalized.pop(record.name)
@@ -210,5 +226,5 @@ class _LegacyAffineCodec:
 
 
 codec_registry = QuantizationCodecRegistry()
-for _method in ("olive", "gptq", "awq"):
+for _method in ("olive", "gptq", "awq", "quark"):
     codec_registry.register(_LegacyAffineCodec(_method))

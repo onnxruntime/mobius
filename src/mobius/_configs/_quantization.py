@@ -226,6 +226,16 @@ class QuantizationConfig:
                 sym=True,
                 weight_format=QuantizedWeightFormat.MXFP4,
             )
+        # AMD Quark nests its layout under ``global_quant_config.weight`` and
+        # names its exclusion list ``exclude``. The generic affine tail below
+        # reads top-level ``bits``/``group_size``/``sym``/``modules_to_not_convert``,
+        # so letting a Quark config fall through would silently substitute the
+        # defaults (group_size=128 instead of 32, sym=True instead of False, no
+        # exclusions) and mis-dequantize every weight without raising.
+        from mobius.integrations.quark import is_quark_quant_config, parse_quark_config
+
+        if is_quark_quant_config(qc):
+            return parse_quark_config(qc)
         raw_exclusions = qc.get("modules_to_not_convert") or ()
         if not isinstance(raw_exclusions, (list, tuple)):
             raise TypeError(

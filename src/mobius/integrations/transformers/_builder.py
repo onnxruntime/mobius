@@ -56,7 +56,8 @@ def _uses_affine_checkpoint_loader(config: object) -> bool:
         else (getattr(config, "quantization", None),)
     )
     return any(
-        quantization is not None and quantization.quant_method in {"olive", "gptq", "awq"}
+        quantization is not None
+        and quantization.quant_method in {"olive", "gptq", "awq", "quark"}
         for quantization in quantizations
     )
 

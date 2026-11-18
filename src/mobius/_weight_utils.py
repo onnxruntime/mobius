@@ -42,10 +42,19 @@ WeightTransform = Callable[[torch.Tensor], torch.Tensor]
 # in raw HF checkpoints.
 OLIVE_PACKED_QUANT_SUFFIXES: frozenset[str] = frozenset({"_qweight", "_scales", "_qzeros"})
 DOTTED_PACKED_QUANT_SUFFIXES: frozenset[str] = frozenset({".qweight", ".scales", ".qzeros"})
+# AMD Quark keeps the packed payload on the canonical ``<proj>.weight`` key and
+# hangs its per-group parameters off sibling keys. ``.weight`` is deliberately
+# absent here: it is indistinguishable by name from an ordinary float weight, so
+# a Quark projection is identified by the presence of its ``.weight_scale``
+# sibling instead (see :mod:`mobius.integrations.quark`). Kept here rather than
+# in that package so this module-level predicate needs no vendor import.
+QUARK_PACKED_QUANT_SUFFIXES: frozenset[str] = frozenset(
+    {".weight_scale", ".weight_zero_point"}
+)
 # str.endswith() requires a tuple (not a set), so the combined predicate below
 # needs a tuple even though the two suffix sets above are otherwise unordered.
 PACKED_QUANT_SUFFIXES: tuple[str, ...] = tuple(
-    OLIVE_PACKED_QUANT_SUFFIXES | DOTTED_PACKED_QUANT_SUFFIXES
+    OLIVE_PACKED_QUANT_SUFFIXES | DOTTED_PACKED_QUANT_SUFFIXES | QUARK_PACKED_QUANT_SUFFIXES
 )
 
 
@@ -145,7 +154,7 @@ def supported_qmoe_quantization(
 
     Accepts the integer-affine int4 block schemes whose ``(q - zero_point) *
     scale`` dequantization is byte-identical to ``MatMulNBits`` and to the
-    ``com.microsoft::QMoE`` kernel: GPTQ, AWQ, and Olive RTN. The CUDA QMoE
+    ``com.microsoft::QMoE`` kernel: GPTQ, AWQ, Quark, and Olive RTN. The CUDA QMoE
     kernel requires a power-of-two ``block_size >= 16``; unsupported configs
     fall back to the portable dense representation instead of emitting an
     unrunnable node.
@@ -155,7 +164,7 @@ def supported_qmoe_quantization(
         or quantization.bits != 4
         or quantization.weight_format is not QuantizedWeightFormat.INTEGER_AFFINE
         or quantization.float_zero_point
-        or quantization.quant_method not in {"gptq", "awq", "olive"}
+        or quantization.quant_method not in {"gptq", "awq", "olive", "quark"}
     ):
         return None
     block_size = quantization.group_size
@@ -1732,13 +1741,14 @@ def preprocess_quantized_weights(
     head_key: str = "lm_head.weight",
     in_features: int | None = None,
     qmoe_target_path: str | None = None,
-    qmoe_quant_methods: Collection[str] = ("gptq", "awq", "olive"),
+    qmoe_quant_methods: Collection[str] = ("gptq", "awq", "olive", "quark"),
     qmoe_num_experts: int | None = None,
     qmoe_hidden_size: int | None = None,
     qmoe_intermediate_size: int | None = None,
     qmoe_expected_moe_paths: tuple[str, ...] = (),
     qmoe_source_moe_paths: tuple[str, ...] = (),
-    reject_quantized_embeddings_lm_head: bool = False,
+    reject_quantized_embeddings: bool = False,
+    reject_quantized_lm_head: bool = False,
     defer_non_expert_sidecars: bool = False,
     defer_per_channel_sidecars: bool = True,
     qmoe_activation_dtype: torch.dtype | None = None,
@@ -1765,8 +1775,13 @@ def preprocess_quantized_weights(
             When any mixed expert sidecar is present, every path is required.
         qmoe_source_moe_paths: Authoritative Hugging Face module paths aligned
             with ``qmoe_expected_moe_paths`` for override resolution.
-        reject_quantized_embeddings_lm_head: Reject packed embedding/head
-            weights because the caller's graph requires float parameters.
+        reject_quantized_embeddings: Reject a packed embedding table because
+            the caller's graph requires float parameters. Quantized embeddings
+            need ``GatherBlockQuantized`` in the embedding component.
+        reject_quantized_lm_head: Reject a packed LM head for the same reason.
+            Independent of ``reject_quantized_embeddings``: a decoder that can
+            build a ``MatMulNBits`` head may still require a float embedding
+            table.
         defer_non_expert_sidecars: Keep ordinary packed sidecars raw for the
             component loader to resolve per-projection layouts. Expert packing
             and float weight tying still run here.
@@ -1855,39 +1870,45 @@ def preprocess_quantized_weights(
         this matches the *exact* sidecar keys of one named float parameter.
         """
         owner = float_key.removesuffix(".weight")
-        return any(key == float_key + suffix for suffix in OLIVE_PACKED_QUANT_SUFFIXES) or any(
-            key == owner + suffix for suffix in DOTTED_PACKED_QUANT_SUFFIXES
+        return (
+            any(key == float_key + suffix for suffix in OLIVE_PACKED_QUANT_SUFFIXES)
+            or any(key == owner + suffix for suffix in DOTTED_PACKED_QUANT_SUFFIXES)
+            # Quark's payload sits on ``float_key`` itself, so only the sidecars
+            # can reveal it. Without these the guard below is a no-op for Quark:
+            # ``quantize_embeddings`` is never derived from ``exclude``, so a
+            # packed table would pass both tests and reach a float initializer.
+            or any(key == owner + suffix for suffix in QUARK_PACKED_QUANT_SUFFIXES)
         )
 
-    packed_embedding_or_head = (
-        next(
-            (
-                key
-                for key in state_dict
-                if _is_packed_sidecar_of(key, embed_key)
-                or _is_packed_sidecar_of(key, head_key)
-            ),
+    # The embedding table and the LM head are gated independently. A decoder
+    # that builds a MatMulNBits head can accept a packed head while still
+    # requiring a float embedding table, which needs GatherBlockQuantized in
+    # the embedding component to be quantized.
+    def _reject_packed(float_key: str, configured: bool, what: str) -> None:
+        packed = next(
+            (key for key in state_dict if _is_packed_sidecar_of(key, float_key)),
             None,
         )
-        if reject_quantized_embeddings_lm_head
-        else None
-    )
-    configured_quantized_table = quantization is not None and (
-        quantization.quantize_embeddings or quantization.quantize_lm_head
-    )
-    if reject_quantized_embeddings_lm_head and (
-        configured_quantized_table or packed_embedding_or_head is not None
-    ):
-        packed_key_detail = (
-            f" Packed checkpoint key {packed_embedding_or_head!r} was found."
-            if packed_embedding_or_head is not None
-            else ""
-        )
+        if not configured and packed is None:
+            return
+        detail = f" Packed checkpoint key {packed!r} was found." if packed else ""
         raise NotImplementedError(
-            "Quantized embeddings and LM heads are not yet supported by "
-            f"this model: {embed_key.removesuffix('.weight')}, "
-            f"{head_key.removesuffix('.weight')}, and related embedding "
-            f"initializers currently require float weights.{packed_key_detail}"
+            f"Quantized {what} are not yet supported by this model: "
+            f"{float_key.removesuffix('.weight')} and related initializers "
+            f"currently require float weights.{detail}"
+        )
+
+    if reject_quantized_embeddings:
+        _reject_packed(
+            embed_key,
+            quantization is not None and quantization.quantize_embeddings,
+            "embeddings",
+        )
+    if reject_quantized_lm_head:
+        _reject_packed(
+            head_key,
+            quantization is not None and quantization.quantize_lm_head,
+            "LM heads",
         )
 
     deferred = {}
@@ -1920,6 +1941,14 @@ def preprocess_quantized_weights(
             bits=quantization.bits,
             group_size=quantization.group_size,
             in_features=in_features,
+        )
+    elif quantization is not None and quantization.quant_method == "quark":
+        # Imported here to keep this core module independent of the
+        # per-vendor integrations packages (cf. modelopt/compressed-tensors).
+        from mobius.integrations.quark import preprocess_quark_weights
+
+        state_dict = preprocess_quark_weights(
+            state_dict, bits=quantization.bits, group_size=quantization.group_size
         )
     elif quantization is not None and quantization.quant_method == "olive":
         projection_layouts = {

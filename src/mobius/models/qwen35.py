@@ -763,7 +763,8 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 embed_key="decoder.model.embed_tokens.weight",
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=None,
-                reject_quantized_embeddings_lm_head=True,
+                reject_quantized_embeddings=True,
+                reject_quantized_lm_head=True,
                 defer_non_expert_sidecars=True,
             )
             result.update(other_weights)
@@ -775,7 +776,8 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 embed_key="decoder.model.embed_tokens.weight",
                 head_key="decoder.lm_head.weight",
                 qmoe_target_path=None,
-                reject_quantized_embeddings_lm_head=True,
+                reject_quantized_embeddings=True,
+                reject_quantized_lm_head=True,
             )
         if tie:
             if (
@@ -1061,7 +1063,8 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                     f"model.language_model.layers.{layer_idx}.mlp"
                     for layer_idx in range(self.config.num_hidden_layers)
                 ),
-                reject_quantized_embeddings_lm_head=True,
+                reject_quantized_embeddings=True,
+                reject_quantized_lm_head=True,
                 defer_non_expert_sidecars=True,
             )
             result.update(other_weights)
@@ -1087,7 +1090,8 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                     f"model.language_model.layers.{layer_idx}.mlp"
                     for layer_idx in range(self.config.num_hidden_layers)
                 ),
-                reject_quantized_embeddings_lm_head=True,
+                reject_quantized_embeddings=True,
+                reject_quantized_lm_head=True,
             )
         if tie:
             if (

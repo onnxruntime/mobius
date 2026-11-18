@@ -19,7 +19,12 @@ from mobius._configs import (
     QuantizationConfig,
     QuantizationOverride,
 )
-from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
+from mobius.models.gemma4 import (
+    Gemma4CausalLMModel,
+    Gemma4EmbeddingModel,
+    Gemma4Model,
+    _split_per_layer_projection_weight,
+)
 from mobius.weights import adapt_model_weights
 
 
@@ -390,31 +395,16 @@ class TestGemma4ModelPreprocessWeights:
 
         assert result["decoder.lm_head.weight"] is weight
 
-    @pytest.mark.parametrize(
-        ("quantize_embeddings", "quantize_lm_head", "state_dict"),
-        [
-            (
-                True,
-                False,
-                {
-                    "model.language_model.embed_tokens.weight_qweight": torch.zeros(
-                        256, 32, dtype=torch.uint8
-                    )
-                },
-            ),
-            (
-                False,
-                True,
-                {"lm_head.weight_qweight": torch.zeros(256, 32, dtype=torch.uint8)},
-            ),
-        ],
-    )
-    def test_quantized_embedding_or_lm_head_fails_closed(
-        self,
-        quantize_embeddings,
-        quantize_lm_head,
-        state_dict,
-    ):
+    def test_quantized_embedding_fails_closed(self):
+        """A packed embedding table is still rejected.
+
+        The embedding component would need GatherBlockQuantized to consume it.
+        """
+        state_dict = {
+            "model.language_model.embed_tokens.weight_qweight": torch.zeros(
+                256, 32, dtype=torch.uint8
+            )
+        }
         config = _tiny_gemma4_config(
             tie_word_embeddings=False,
             quantization=QuantizationConfig(
@@ -422,16 +412,57 @@ class TestGemma4ModelPreprocessWeights:
                 group_size=16,
                 quant_method="olive",
                 sym=True,
-                quantize_embeddings=quantize_embeddings,
-                quantize_lm_head=quantize_lm_head,
+                quantize_embeddings=True,
+                quantize_lm_head=False,
             ),
         )
 
         with pytest.raises(
             NotImplementedError,
-            match="Quantized embeddings and LM heads are not yet supported",
+            match="Quantized embeddings are not yet supported",
         ):
             Gemma4Model(config).preprocess_weights(state_dict)
+
+    def test_quantized_lm_head_is_accepted(self):
+        """A packed LM head is kept packed for the decoder's MatMulNBits head.
+
+        Gemma4 opts out of the head guard (reject_quantized_lm_head=False)
+        because the decoder builds a MatMulNBits head exactly as the text-only
+        monolith does. The packed sidecars must survive preprocess_weights
+        rather than raising, and no float head may be synthesized over them.
+        """
+        vocab, bits, group_size = 256, 4, 16
+        # 32 packed bytes == 4 blocks of 16 four-bit codes (8 bytes each).
+        blocks, blob_bytes = 4, group_size * bits // 8
+        state_dict = {
+            "lm_head.weight_qweight": torch.zeros(
+                vocab, blocks * blob_bytes, dtype=torch.uint8
+            ),
+        }
+        config = _tiny_gemma4_config(
+            tie_word_embeddings=False,
+            quantization=QuantizationConfig(
+                bits=bits,
+                group_size=group_size,
+                quant_method="olive",
+                sym=True,
+                quantize_embeddings=False,
+                quantize_lm_head=True,
+            ),
+        )
+
+        result = Gemma4Model(config).preprocess_weights(state_dict)
+
+        head_keys = [key for key in result if "lm_head" in key]
+        assert head_keys == ["decoder.lm_head.weight"], (
+            f"expected exactly one canonical head key, got {head_keys}"
+        )
+        head = result["decoder.lm_head.weight"]
+        # The packed codes must reach the graph in MatMulNBits' B layout
+        # [N, n_blocks_per_col, blob_size], not be dequantized to float and not
+        # be overwritten by a synthesized float head.
+        assert head.dtype is torch.uint8, f"head was dequantized to {head.dtype}"
+        assert tuple(head.shape) == (vocab, blocks, blob_bytes), tuple(head.shape)
 
     def test_gguf_quantized_tables_keep_canonical_weight_path(self):
         config = _tiny_gemma4_config(
@@ -830,6 +861,75 @@ class TestGemma4PerComponentQuantization:
         )
 
 
+class TestSplitPerLayerProjectionWeight:
+    """The PLE split must pick its layout by sidecar, not by shape alone."""
+
+    LAYERS = 4
+    PER_LAYER = 16
+    SHARED = 1
+
+    def _config(self):
+        return _tiny_gemma4_config(
+            num_hidden_layers=self.LAYERS,
+            num_kv_shared_layers=self.SHARED,
+            hidden_size_per_layer_input=self.PER_LAYER,
+            layer_types=["full_attention"] * self.LAYERS,
+        )
+
+    def test_normalized_layout_splits_scales_and_zero_points(self):
+        """MatMulNBits-layout input: sidecars split with the payload.
+
+        The split-embedding path runs after preprocess_quantized_weights, so
+        the payload is already [N, n_blocks, blob] and dim 0 equals the dense
+        ``expected``. Splitting only the payload leaves .scales/.zero_points at
+        full N and the consumer parameter cannot bind.
+        """
+        config = self._config()
+        expected = self.LAYERS * self.PER_LAYER
+        producer = (self.LAYERS - self.SHARED) * self.PER_LAYER
+        consumer = expected - producer
+        blocks, blob = 4, 8
+        base = "decoder.model.per_layer_model_projection"
+        sd = {
+            f"{base}.weight": torch.zeros(expected, blocks, blob, dtype=torch.uint8),
+            f"{base}.scales": torch.ones(expected, blocks),
+            f"{base}.zero_points": torch.zeros(expected, blocks // 2, dtype=torch.uint8),
+        }
+
+        _split_per_layer_projection_weight(sd, "decoder.model.", config)
+
+        cons = f"{base}_consumer"
+        assert sd[f"{base}.weight"].shape == (producer, blocks, blob)
+        assert sd[f"{cons}.weight"].shape == (consumer, blocks, blob)
+        assert sd[f"{base}.scales"].shape == (producer, blocks)
+        assert sd[f"{cons}.scales"].shape == (consumer, blocks)
+        assert sd[f"{base}.zero_points"].shape == (producer, blocks // 2)
+        assert sd[f"{cons}.zero_points"].shape == (consumer, blocks // 2)
+
+    def test_packed_quark_not_taken_for_dense_when_shapes_collide(self):
+        """A raw Quark payload must not fall into the dense branch.
+
+        ``hidden_size == num_layers * per_layer_dim`` makes the packed tensor's
+        dim 0 equal ``expected``, so shape alone cannot tell the layouts apart.
+        """
+        config = self._config()
+        assert config.hidden_size == self.LAYERS * self.PER_LAYER, "collision setup"
+        expected = self.LAYERS * self.PER_LAYER
+        producer = (self.LAYERS - self.SHARED) * self.PER_LAYER
+        base = "model.per_layer_model_projection"
+        sd = {
+            # Quark layout: [K, N / 8] with K == expected by construction.
+            f"{base}.weight": torch.zeros(expected, expected // 8, dtype=torch.int32),
+            f"{base}.weight_scale": torch.ones(2, expected),
+        }
+
+        _split_per_layer_projection_weight(sd, "model.", config)
+
+        # Split along the packed output axis, not dim 0 as a dense weight.
+        assert sd[f"{base}.weight"].shape == (expected, producer // 8)
+        assert sd[f"{base}.weight_scale"].shape == (2, producer)
+
+
 def test_component_regex_keeps_per_layer_decoder_projections_float():
     from mobius._component_quantization import configure_component_quantization
     from mobius.components import Linear, QuantizedLinear
@@ -861,6 +961,117 @@ def test_component_regex_keeps_per_layer_decoder_projections_float():
     assert isinstance(layer.self_attn.q_proj, QuantizedLinear)
     assert type(layer.per_layer_input_gate) is Linear
     assert type(layer.per_layer_projection) is Linear
+
+
+def test_per_layer_projections_quantize_when_not_excluded():
+    """PLE projections quantize like any other decoder projection when eligible.
+
+    When the checkpoint does not exclude them, per_layer_input_gate/
+    per_layer_projection become QuantizedLinear like every other decoder
+    projection -- matching a checkpoint that genuinely supplies quantized
+    weights for them (e.g. AMD Quark AWQ), instead of being hardcoded float
+    regardless of what the checkpoint declares.
+    """
+    from mobius.components import QuantizedLinear
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="quark",
+        sym=False,
+        modules_to_not_convert=("lm_head",),
+    )
+    config = _tiny_gemma4_config(
+        enable_moe_block=False,
+        hidden_size_per_layer_input=16,
+        vocab_size_per_layer_input=256,
+        quantization=quantization,
+    )
+    module = Gemma4Model(config)
+
+    layer = module.decoder.model.layers[0]
+    assert isinstance(layer.self_attn.q_proj, QuantizedLinear)
+    assert isinstance(layer.per_layer_input_gate, QuantizedLinear)
+    assert isinstance(layer.per_layer_projection, QuantizedLinear)
+
+
+def _quark_pack_test_tensor(codes: torch.Tensor) -> torch.Tensor:
+    """Pack ``[R, C]`` uint4 codes the way AMD Quark does.
+
+    8 codes per int32, interleaved order (see
+    ``mobius.integrations.quark._weights_test._quark_pack``).
+    """
+    order = [0, 2, 4, 6, 1, 3, 5, 7]
+    rows, cols = codes.shape
+    packed = torch.zeros(rows, cols // 8, dtype=torch.int32)
+    for block in range(cols // 8):
+        for slot, logical in enumerate(order):
+            packed[:, block] |= (codes[:, block * 8 + logical].to(torch.int32) & 0xF) << (
+                slot * 4
+            )
+    return packed
+
+
+def test_dequantize_float_only_projections_gates_per_layer():
+    """Dequantization gating matches the per-layer construction decision.
+
+    Only the layer whose per_layer_input_gate the checkpoint excludes gets
+    dequantized to dense float; a layer where it's genuinely quantized keeps
+    its packed sidecars untouched for preprocess_quantized_weights to consume
+    -- construction and weight loading must agree on which is which.
+    """
+    from mobius.models.gemma4 import _dequantize_float_only_projections
+
+    k, n, group_size = 32, 8, 16  # 2 groups, n/8 = 1 packed column
+    # Quark packs along the output axis: raw on-disk .weight is [k, n/8],
+    # .weight_zero_point is [k/gs, n/8] -- both packed directly from dense
+    # [*, n] shape with no transpose (see dequantize_quark_weight).
+    codes = torch.randint(0, 16, (k, n))
+    zeros = torch.randint(0, 16, (k // group_size, n))
+    scale = torch.rand(k // group_size, n)
+    packed_weight = _quark_pack_test_tensor(codes)
+    packed_zero = _quark_pack_test_tensor(zeros)
+
+    def sidecars(stem: str) -> dict[str, torch.Tensor]:
+        return {
+            f"{stem}.weight": packed_weight.clone(),
+            f"{stem}.weight_scale": scale.clone(),
+            f"{stem}.weight_zero_point": packed_zero.clone(),
+        }
+
+    state_dict: dict[str, torch.Tensor] = {}
+    state_dict.update(sidecars("model.layers.0.per_layer_input_gate"))
+    state_dict.update(sidecars("model.layers.1.per_layer_input_gate"))
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=group_size,
+        quant_method="quark",
+        sym=False,
+        # Layer 0 excluded (checkpoint says "not quantized"); layer 1 is not.
+        modules_to_not_convert=("re:.*\\.layers\\.0\\.per_layer_input_gate",),
+    )
+    config = _tiny_gemma4_config(
+        enable_moe_block=False,
+        hidden_size_per_layer_input=n,
+        vocab_size_per_layer_input=256,
+        quantization=quantization,
+    )
+
+    _dequantize_float_only_projections(state_dict, config)
+
+    # Excluded layer: dequantized to a single dense float weight, sidecars gone.
+    assert "model.layers.0.per_layer_input_gate.weight_scale" not in state_dict
+    assert "model.layers.0.per_layer_input_gate.weight_zero_point" not in state_dict
+    assert state_dict["model.layers.0.per_layer_input_gate.weight"].shape == (n, k)
+    assert state_dict["model.layers.0.per_layer_input_gate.weight"].dtype == torch.float32
+
+    # Quantized layer: packed sidecars pass through untouched.
+    assert torch.equal(state_dict["model.layers.1.per_layer_input_gate.weight"], packed_weight)
+    assert torch.equal(state_dict["model.layers.1.per_layer_input_gate.weight_scale"], scale)
+    assert torch.equal(
+        state_dict["model.layers.1.per_layer_input_gate.weight_zero_point"], packed_zero
+    )
 
 
 class TestGemma4ComponentWeightAdapters:
