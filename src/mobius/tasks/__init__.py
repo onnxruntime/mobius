@@ -90,6 +90,7 @@ __all__ = [
     "MiniMaxMusic3RVQTask",
     "MiniMaxMusic3VocoderTask",
     "MultiModalTask",
+    "MultiTalkerRNNTTask",
     "OPSET_VERSION",
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
@@ -197,6 +198,7 @@ from mobius.tasks._minimax_music3 import (
 from mobius.tasks._mistral4_gguf import Mistral4GGUFCausalLMTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
+from mobius.tasks._multitalker_rnnt import MultiTalkerRNNTTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
 from mobius.tasks._plamo import PlamoCausalLMTask
@@ -320,6 +322,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "hunyuan-vl-mot": HunYuanVLMoTTask,
     "sensenova-u1": SenseNovaU1Task,
     "multimodal": MultiModalTask,
+    "multitalker-rnnt": MultiTalkerRNNTTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
     "glmasr-speech-language": GlmAsrSpeechLanguageTask,

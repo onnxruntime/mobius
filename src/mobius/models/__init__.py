@@ -15,6 +15,7 @@ __all__ = [
     "BitNetCausalLMModel",
     "Blip2Model",
     "BloomCausalLMModel",
+    "build_parakeet_multitalker",
     "CLIPVisionModel",
     "SigLIPVisionModel",
     "CTRLCausalLMModel",
@@ -236,6 +237,8 @@ __all__ = [
     "SD3Transformer2DModel",
     "SmallThinkerGGUFCausalLMModel",
     "SmolLM3CausalLMModel",
+    "ParakeetMultiTalkerConfig",
+    "ParakeetMultiTalkerModel",
     "StarCoder2CausalLMModel",
     "T2IAdapterModel",
     "T5ForConditionalGeneration",
@@ -447,6 +450,11 @@ from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.models.nemotron_parse import NemotronParseForConditionalGeneration
 from mobius.models.olmo import OLMo2CausalLMModel, OLMoCausalLMModel
 from mobius.models.opt import OPTCausalLMModel
+from mobius.models.parakeet_multitalker import (
+    ParakeetMultiTalkerConfig,
+    ParakeetMultiTalkerModel,
+    build_parakeet_multitalker,
+)
 from mobius.models.parakeet_ctc import ParakeetForCTCModel
 from mobius.models.persimmon import PersimmonCausalLMModel
 from mobius.models.phi import (

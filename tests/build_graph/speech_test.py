@@ -38,6 +38,152 @@ from mobius._configs import (
     TTSConfig,
 )
 from mobius._registry import registry
+
+
+class TestBuildGraphParakeetMultiTalker:
+    """Verify streaming multi-talker Parakeet RNN-T builds three graphs."""
+
+    def _config(self):
+        from mobius.models.parakeet_multitalker import ParakeetMultiTalkerConfig
+
+        return ParakeetMultiTalkerConfig(
+            feat_in=32,
+            d_model=32,
+            num_layers=2,
+            num_heads=4,
+            ff_expansion=2,
+            conv_kernel=9,
+            subsampling_conv_channels=16,
+            subsampling_factor=8,
+            att_left_context=8,
+            att_right_context=3,
+            pred_hidden=16,
+            pred_rnn_layers=2,
+            joint_hidden=16,
+            vocab_size=20,
+        )
+
+    @staticmethod
+    def _sub_len(mel_len: int) -> int:
+        length = mel_len
+        for _ in range(3):
+            length = length // 2 + 1
+        return length - 2
+
+    def _build(self):
+        from mobius.models.parakeet_multitalker import ParakeetMultiTalkerModel
+
+        config = self._config()
+        return config, build_from_module(
+            ParakeetMultiTalkerModel(config), config, task="multitalker-rnnt"
+        )
+
+    def test_package_builds(self):
+        _config, package = self._build()
+        assert set(package) == {"encoder", "decoder", "joint"}
+
+    def test_encoder_io(self):
+        _config, package = self._build()
+        model = package["encoder"]
+        assert {
+            "audio_signal",
+            "length",
+            "cache_last_channel",
+            "cache_last_time",
+            "cache_last_channel_len",
+            "spk_mask",
+            "bg_mask",
+        } <= {value.name for value in model.graph.inputs}
+        assert {value.name for value in model.graph.outputs} == {
+            "outputs",
+            "encoded_lengths",
+            "cache_last_channel_next",
+            "cache_last_time_next",
+            "cache_last_channel_len_next",
+        }
+
+    def test_task_registry_lookup(self):
+        from mobius.tasks import MultiTalkerRNNTTask, get_task
+
+        assert isinstance(get_task("multitalker-rnnt"), MultiTalkerRNNTTask)
+
+    def test_runs_with_random_weights(self, tmp_path):
+        import onnxruntime as ort
+
+        config, package = self._build()
+
+        def session(model, name):
+            for initializer in model.graph.initializers.values():
+                if initializer.const_value is None:
+                    shape = [dimension if isinstance(dimension, int) else 1 for dimension in initializer.shape]
+                    initializer.const_value = ir.tensor(
+                        (np.random.randn(*shape) * 0.05).astype(np.float32),
+                        name=initializer.name,
+                    )
+            path = tmp_path / f"{name}.onnx"
+            ir.save(model, path, external_data=f"{name}.onnx.data")
+            return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+
+        hidden = config.d_model
+        layers = config.num_layers
+        channel_cache = config.last_channel_cache_size
+        time_cache = config.conv_cache_size
+        predictor_hidden = config.pred_hidden
+        predictor_layers = config.pred_rnn_layers
+        mel_length = 32
+        encoded_length = self._sub_len(mel_length)
+
+        encoder = session(package["encoder"], "encoder")
+        encoder_outputs = dict(
+            zip(
+                [output.name for output in encoder.get_outputs()],
+                encoder.run(
+                    None,
+                    {
+                        "audio_signal": np.random.randn(1, mel_length, config.feat_in).astype(np.float32),
+                        "length": np.array([mel_length], dtype=np.int64),
+                        "cache_last_channel": (
+                            np.random.randn(1, layers, channel_cache, hidden) * 0.05
+                        ).astype(np.float32),
+                        "cache_last_time": (
+                            np.random.randn(1, layers, hidden, time_cache) * 0.05
+                        ).astype(np.float32),
+                        "cache_last_channel_len": np.array([0], dtype=np.int64),
+                        "spk_mask": np.ones((1, encoded_length), dtype=np.float32),
+                        "bg_mask": np.zeros((1, encoded_length), dtype=np.float32),
+                    },
+                ),
+            )
+        )
+        assert encoder_outputs["outputs"].shape == (1, encoded_length, hidden)
+        assert int(encoder_outputs["encoded_lengths"][0]) == encoded_length
+
+        target_length = 4
+        decoder = session(package["decoder"], "decoder")
+        decoder_outputs = dict(
+            zip(
+                [output.name for output in decoder.get_outputs()],
+                decoder.run(
+                    None,
+                    {
+                        "targets": np.array([[1, 3, 5, 2]], dtype=np.int64),
+                        "h_in": np.zeros((predictor_layers, 1, predictor_hidden), np.float32),
+                        "c_in": np.zeros((predictor_layers, 1, predictor_hidden), np.float32),
+                    },
+                ),
+            )
+        )
+        assert decoder_outputs["decoder_output"].shape == (1, predictor_hidden, target_length)
+
+        joint = session(package["joint"], "joint")
+        joint_output = joint.run(
+            None,
+            {
+                "encoder_output": np.random.randn(1, encoded_length, hidden).astype(np.float32),
+                "decoder_output": np.random.randn(1, target_length, predictor_hidden).astype(np.float32),
+            },
+        )[0]
+        assert joint_output.shape == (1, encoded_length, target_length, config.vocab_size)
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.tasks import (
     get_task,
