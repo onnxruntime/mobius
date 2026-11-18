@@ -6,6 +6,11 @@ on:
     - cron: '0 4 * * *'
   workflow_dispatch:
     inputs:
+      update_lfm3_audio_goldens:
+        description: Explicitly regenerate the fixed, pinned LFM3 Audio L4/L5 references
+        required: false
+        type: boolean
+        default: false
       affected_models:
         description: >-
           JSON array of model types.
@@ -107,10 +112,21 @@ jobs:
           MOBIUS_TEST_DEVICE: cuda
           AFFECTED_MODELS: ${{ inputs.affected_models }}
           AFFECTED_CASES: ${{ inputs.affected_cases }}
+          UPDATE_LFM3_AUDIO_GOLDENS: ${{ inputs.update_lfm3_audio_goldens || false }}
         run: |
           source "$RUNNER_TEMP/mobius-venv/bin/activate"
           AFFECTED="$AFFECTED_MODELS"
           CASES="$AFFECTED_CASES"
+          if [ "$UPDATE_LFM3_AUDIO_GOLDENS" = true ]; then
+            if [ "$AFFECTED" != '["lfm3_audio"]' ] || [ "$CASES" != '["lfm3-audio-2b"]' ]; then
+              echo "Reference regeneration requires exactly lfm3_audio and lfm3-audio-2b."
+              exit 1
+            fi
+            MOBIUS_LFM3_AUDIO_UPDATE_GOLDEN=1 MOBIUS_GOLDEN_CASES="$CASES" \
+              python -m pytest tests/e2e_golden_test.py --models lfm3_audio \
+              -m 'golden or generation' -v -s --timeout=1800 \
+              --basetemp=lfm3-audio-artifacts --junitxml=junit-l4-lfm3-audio-reference.xml --tb=short
+          fi
           run_vibevoice_l4() {
             if [ "$1" = all ]; then
               python -m pytest tests/vibevoice_golden_test.py \
@@ -199,6 +215,16 @@ jobs:
         with:
           name: gpu-l4-test-results
           path: junit-l4*.xml
+          retention-days: 30
+
+      - name: Upload explicitly regenerated LFM3 Audio references
+        if: always() && inputs.update_lfm3_audio_goldens
+        uses: actions/upload-artifact@v7
+        with:
+          name: lfm3-audio-references-${{ github.sha }}
+          path: |
+            testdata/golden/audio/lfm3-audio-2b*.json
+            lfm3-audio-artifacts/**/lfm3_audio_synthesis.wav
           retention-days: 30
 
       - name: Clean up virtual environment

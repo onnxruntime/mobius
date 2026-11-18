@@ -37,6 +37,7 @@ from mobius._configs import (
     Lfm2Config,
     Lfm2MoeConfig,
     Lfm2VlConfig,
+    Lfm3AudioConfig,
     Lfm3Config,
     MiniMaxConfig,
     MMSConfig,
@@ -112,6 +113,7 @@ from mobius.models import (
     Lfm2CausalLMModel,
     Lfm2MoECausalLMModel,
     Lfm2VlForConditionalGeneration,
+    Lfm3AudioForConditionalGeneration,
     Lfm3CausalLMModel,
     LLaDAModel,
     LLaDAMoEModel,
@@ -633,6 +635,12 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         Lfm3CausalLMModel,
         config_class=Lfm3Config,
         test_revision="875094441ea6517efc0f44a5685f05e381b72b14",
+    ),
+    "lfm3_audio": ModelRegistration(
+        Lfm3AudioForConditionalGeneration,
+        task="lfm3-audio",
+        config_class=Lfm3AudioConfig,
+        test_revision="2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1",
     ),
     "lfm2_moe": ModelRegistration(Lfm2MoECausalLMModel, config_class=Lfm2MoeConfig),
     "dream": ModelRegistration(DreamModel, task="masked-diffusion"),
@@ -1379,6 +1387,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "bamba": "ibm-fms/Bamba-9B",
     "lfm2": "LiquidAI/LFM2.5-230M",
     "lfm3": "LiquidAI/LFM3-1.7B",
+    "lfm3_audio": "LiquidAI/LFM3-Audio-2B",
 
     # --- Multimodal ---
     "qwen2_vl": "Qwen/Qwen2-VL-2B-Instruct",

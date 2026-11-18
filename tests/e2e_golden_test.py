@@ -471,12 +471,14 @@ def _discover_cases(
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
         test_id = f"{case.task_type}/{case.case_id}"
+        if case.task_type == "lfm3-audio":
+            marks.append(pytest.mark.timeout(1800))
 
         if case.skip_reason:
             marks.append(pytest.mark.skip(reason=case.skip_reason))
         elif case.ci_skip_reason and _IN_CI:
             marks.append(pytest.mark.skip(reason=f"[CI] {case.ci_skip_reason}"))
-        elif not has_golden(case):
+        elif not has_golden(case) and case.task_type != "lfm3-audio":
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))
             )
@@ -2371,7 +2373,12 @@ class TestL4CheckpointVerified:
     """
 
     @pytest.mark.parametrize("case", _L4_CASES)
-    def test_prefill_argmax_matches_golden(self, case: GoldenTestCase) -> None:
+    def test_prefill_argmax_matches_golden(self, case: GoldenTestCase, tmp_path) -> None:
+        if case.task_type == "lfm3-audio":
+            from tests._lfm3_audio_golden import run_lfm3_audio_l4
+
+            run_lfm3_audio_l4(tmp_path)
+            return
         if case.task_type == "text-to-speech":
             pytest.skip(
                 "Continuous-token TTS uses tests/vibevoice_golden_test.py "
@@ -3188,7 +3195,12 @@ class TestL5GenerationE2E:
     """
 
     @pytest.mark.parametrize("case", _L5_CASES)
-    def test_generation_matches_golden(self, case: GoldenTestCase) -> None:
+    def test_generation_matches_golden(self, case: GoldenTestCase, tmp_path) -> None:
+        if case.task_type == "lfm3-audio":
+            from tests._lfm3_audio_golden import run_lfm3_audio_l5
+
+            run_lfm3_audio_l5(tmp_path)
+            return
         # --- Guard: skip unsupported task types ---
         if case.task_type not in _GENERATION_SUPPORTED_TASKS:
             pytest.skip(
