@@ -956,9 +956,17 @@ def test_qwen4_probability_dispatch_is_not_replaced_or_softmaxed_again():
             probabilities = create_test_input(builder, "probabilities", [2, 3, 2])
             output = Qwen4ExpExperts(config)(builder.op, hidden, probabilities)
             graph.outputs.append(output)
-        assert any(node.op_type == ("GroupedMatMul" if enabled else "Scan") for node in graph)
+        assert any(
+            node.op_type == ("GroupedSwiGLUExperts" if enabled else "Scan") for node in graph
+        )
         if enabled:
-            assert sum(node.op_type == "GroupedMatMul" for node in graph) == 2
+            model = ir.Model(graph, ir_version=12)
+            register_function_bodies(model)
+            body = next(
+                fn for fn in model.functions.values() if fn.name == "GroupedSwiGLUExperts"
+            )
+            assert sum(node.op_type == "GroupedMatMul" for node in body) == 2
+            assert not any(node.op_type in {"MoE", "QMoE", "Softmax"} for node in body)
             assert not any(node.op_type == "Scan" for node in graph)
         assert not any(
             node.op_type in {"MoE", "QMoE", "Softmax"} for node in graph.all_nodes()

@@ -70,6 +70,10 @@ from mobius._passes import (
 )
 from mobius._pipeline_contract import requires_arbitrary_attention_mask
 from mobius.functions import register_function_bodies
+from mobius.functions._component_functions import (
+    is_component_function,
+    register_component_bodies,
+)
 from mobius.rewrite_rules import (
     clip_to_min_max_rules,
     decompose_attention_pass,
@@ -256,7 +260,7 @@ _STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx", "ai.onnx.ml"}
 
 
 def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None:
-    """Reject nonstandard operator identifiers, including lexical subgraphs/functions."""
+    """Validate standard operators and complete registered component-function closure."""
 
     def get_version(domain: str, imports: dict[str, int]) -> int | None:
         version = imports.get(domain)
@@ -282,12 +286,39 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
             "ONNX schema. Provide a standard-ONNX decomposition before export."
         )
 
+    active: set[ir.OperatorIdentifier] = set()
+    visited: set[ir.OperatorIdentifier] = set()
+
+    def visit_function(function: ir.Function, path: str) -> None:
+        identifier = function.identifier()
+        if identifier in active:
+            raise ValueError(
+                f"onnx-standard component {component!r} at {path}: recursive local "
+                f"function {identifier!r}. Provide an acyclic standard-ONNX body."
+            )
+        if identifier in visited:
+            return
+        active.add(identifier)
+        visit(function.graph, dict(function.opset_imports), path)
+        active.remove(identifier)
+        visited.add(identifier)
+
     def visit(graph: ir.Graph, imports: dict[str, int], path: str) -> None:
         # Serialized subgraphs inherit imports from their enclosing model/function.
         for index, node in enumerate(graph):
             node_path = f"{path}/{node.name or index}:{node.op_type}"
             version = get_version(node.domain, imports)
-            check(node.domain, node.op_type, version, node_path, overload=node.overload)
+            function = model.functions.get(node.op_identifier())
+            if function is not None and is_component_function(function):
+                if version != 1:
+                    raise ValueError(
+                        f"onnx-standard component {component!r} at {node_path}: "
+                        f"local function domain {node.domain!r} must import version 1; "
+                        f"got {version!r}. Restore the function-domain import."
+                    )
+                visit_function(function, f"{node_path}/function")
+            else:
+                check(node.domain, node.op_type, version, node_path, overload=node.overload)
             for name, attribute in node.attributes.items():
                 if attribute.type == ir.AttributeType.GRAPH:
                     visit(attribute.as_graph(), imports, f"{node_path}/{name}")
@@ -299,6 +330,9 @@ def validate_standard_onnx(model: ir.Model, *, component: str = "model") -> None
     visit(model.graph, model_imports, "graph")
     for function in model.functions.values():
         path = f"function/{function.domain}::{function.name}"
+        if is_component_function(function):
+            visit_function(function, path)
+            continue
         imports = dict(function.opset_imports)
         # The model versions the function identifier; its own imports version its body.
         check(
@@ -747,6 +781,18 @@ def optimize_model(
         ValueError: If *ep* is not a registered execution provider or a native
             ``MatMulNBits`` block size is incompatible with its capabilities.
     """
+    # Register source component bodies just like other contrib fallbacks. Expose
+    # their standard patterns before hardware-EP fusion; portable exports retain
+    # the shared calls. No additional export mode or flag is needed.
+    caps = ep_registry.get(ep)
+    if caps is None:
+        raise ValueError(
+            f"Unknown execution provider {ep!r}. Supported: {sorted(ep_registry)}"
+        )
+    if caps.name not in {"default", "onnx-standard"}:
+        register_component_bodies(model)
+        _inline_function_bodies(model, is_component_function)
+
     # Stage 1: Base cleanup (EP-agnostic — always applied).
     if trace:
         before_total = sum(_count_all_ops(model).values())
@@ -811,6 +857,8 @@ def optimize_model(
 
     # Build InlinePass criteria: expand custom ops this EP doesn't support.
     def _should_inline(func: ir.Function) -> bool:
+        if is_component_function(func):
+            return False
         # onnx-standard EP: inline every function whose domain is not a standard
         # ONNX domain. This covers both the well-known ops below AND parametric
         # ops like CausalConvWithState and LinearAttention registered per-model.

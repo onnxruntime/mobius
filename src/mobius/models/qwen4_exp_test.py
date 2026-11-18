@@ -19,6 +19,7 @@ import onnxruntime as ort
 import pytest
 import safetensors.torch
 import torch
+from onnx_ir.passes import common
 from onnxruntime.capi.onnxruntime_pybind11_state import (
     NotImplemented as OrtNotImplemented,
 )
@@ -36,6 +37,7 @@ from mobius._testing.ort_inference import (
     _numpy_to_ort_value,
     _ort_value_to_numpy,
 )
+from mobius.functions import register_function_bodies
 from mobius.functions._lowering_test_utils import expand_grouped_matmul
 from mobius.integrations._block_quant import BlockQuantScheme
 from mobius.integrations._weight_loading import (
@@ -1064,11 +1066,15 @@ def _grouped_experts(config, shape):
     with override_flags(experimental_opset29=True):
         model = _standard_experts(config, shape)
     model.graph.opset_imports[""] = 29
+    model.graph.opset_imports["com.microsoft"] = 1
+    register_function_bodies(model)
     return model
 
 
 def test_opset29_standard_moe_uses_exact_grouped_banks():
     model = _grouped_experts(_config(num_local_experts=8), [2, 3, 16])
+    assert any(fn.name == "GroupedSwiGLUExperts" for fn in model.functions.values())
+    common.InlinePass()(model)
     nodes = list(model.graph.all_nodes())
     grouped = [node for node in nodes if node.op_type == "GroupedMatMul"]
     assert len(grouped) == 2
@@ -1105,6 +1111,7 @@ def test_opset29_grouped_moe_matches_existing_standard_dispatch():
         expected = session.run(feeds)["output"]
     finally:
         session.close()
+    common.InlinePass()(grouped)
     session = OnnxModelSession(expand_grouped_matmul(grouped))
     try:
         actual = session.run(feeds)["output"]
@@ -1267,7 +1274,8 @@ def test_standard_all_components_before_after_weights(multimodal, dtype):
     )
     for name, model in package.items():
         validate_standard_onnx(model, component=name)
-        assert not model.functions
+        if name != "embedding":
+            assert model.functions
         # Unbound parameters have no payload yet; checking the serialized graph
         # uses tiny synthetic payloads, never checkpoint downloads.
         for value in model.graph.initializers.values():
@@ -2804,6 +2812,7 @@ def test_multimodal_decoder_matches_text_route_with_identical_positions(ep):
     vl_decoder = Qwen4ExpVLDecoderModel(vl_config)
     with build_context(ep_registry.require(ep), vl_config.dtype):
         vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
+    optimize_model(vl_model, ep=ep, dtype=vl_config.dtype)
 
     rng = np.random.default_rng(7)
     values: dict[str, np.ndarray] = {}

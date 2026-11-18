@@ -11,8 +11,9 @@ They use standard ONNX ops and serve as:
 2. **Fallback implementations** — backends that don't have native kernels
    can expand the function body and execute via standard ops
 
-Each function returns an ``ir.Function`` that can be attached to an
-``ir.Model`` or used as a rewrite target.
+Factories return an ``ir.Function`` that can be attached to an ``ir.Model``
+or used as a rewrite target. Parametric component calls receive specialized
+bodies through the same ``register_function_bodies`` entry point.
 
 Naming convention:
     Python factory functions are snake_case (e.g. ``causal_conv_nd_with_state``,
@@ -32,6 +33,7 @@ import onnx_ir as ir
 
 from mobius._constants import OPSET_VERSION
 from mobius._flags import flags
+from mobius.functions._component_functions import register_component_bodies
 from mobius.functions._moe_utils import float32_parameters
 from mobius.functions.causal_conv import (
     causal_conv1d_with_state,
@@ -50,6 +52,7 @@ from mobius.functions.matmul_nbits import (
 )
 from mobius.functions.moe import MoEFunctionConfig, moe
 from mobius.functions.moe import validate_call as validate_moe_call
+from mobius.functions.normalization import offset_rms_norm, post_gated_rms_norm
 from mobius.functions.packed_multi_head_attention import (
     packed_multi_head_attention,
 )
@@ -73,6 +76,7 @@ _MATMUL_NBITS_DEFAULT_ZERO_POINTS_ID = (_DOMAIN, "MatMulNBits", "default_zero_po
 # ``CausalConvWithState`` and ``LinearAttention`` are **parametric** factories
 # (kernel_size, channels, num_heads are baked into the function body) and are
 # registered per-model by ``tasks._base._register_linear_attention_functions``.
+# Other component factories are specialized from call attributes below.
 _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, Callable[..., ir.Function]] = {
     (
         _DOMAIN,
@@ -262,6 +266,10 @@ def register_function_bodies(model: ir.Model, *, moe_fallback: bool = False) -> 
     concurrent builds in different threads (or sequential builds in the same
     process) cannot corrupt each other's function bodies.
 
+    Source component calls receive configuration-specialized bodies by default.
+    Registration reuses compatible definitions and rejects caller-owned
+    specialization conflicts before changing any component calls or bodies.
+
     MatMulNBits calls without zero points select an overload implementing the
     operator's default. Native op inputs and packed weights are left unchanged,
     and caller-provided MatMulNBits function definitions are preserved.
@@ -284,6 +292,7 @@ def register_function_bodies(model: ir.Model, *, moe_fallback: bool = False) -> 
     opset_version = _core_opset_version(model.graph.opset_imports)
     if opset_version is None:
         opset_version = OPSET_VERSION
+    register_component_bodies(model)
     _specialize_matmul_nbits_calls(model)
     for op_id in _FUNCTION_BUILDERS:
         if op_id in model.functions:
@@ -308,6 +317,8 @@ __all__ = [
     "MoEFunctionConfig",
     "QMoEFunctionConfig",
     "moe",
+    "offset_rms_norm",
+    "post_gated_rms_norm",
     "qmoe",
     "matmul_block_quantized_fp4_weight",
     "matmul_nbits",
