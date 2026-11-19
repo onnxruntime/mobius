@@ -228,7 +228,7 @@ def _build_graph(model_type: str, model_id: str, *, revision: str | None = None)
         parent_config=parent_config,
         module_class=registration.module_class,
     )
-    if model_type == "lfm3":
+    if model_type in {"lfm3", "lfm3_vl"}:
         # L2 validates a supported export dtype, not the checkpoint storage dtype.
         config.dtype = ir.DataType.FLOAT
 

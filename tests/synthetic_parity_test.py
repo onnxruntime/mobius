@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 
 _LFM3_MODEL_ID = "LiquidAI/LFM3-1.7B"
 _LFM3_REVISION = "875094441ea6517efc0f44a5685f05e381b72b14"
+_LFM3_VL_MODEL_ID = "LiquidAI/LFM3-VL-2B"
+_LFM3_VL_REVISION = "23387beda43c60310348e83e25f78f33c3140d3a"
 
 
 def _lfm3_reference_classes():
@@ -1524,6 +1526,218 @@ def test_lfm3_synthetic_cached_chunked_parity(device, dtype, sandwich, conv_bias
                 offset += size
     finally:
         session.close()
+
+
+def _lfm3_vl_reference_classes():
+    """Load the pinned LFM3-VL remote config and model classes."""
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    from mobius._testing.torch_reference import lfm3_reference_compatibility
+
+    with lfm3_reference_compatibility():
+        return tuple(
+            get_class_from_dynamic_module(name, _LFM3_VL_MODEL_ID, revision=_LFM3_VL_REVISION)
+            for name in (
+                "configuration_lfm3_vl.Lfm3VlConfig",
+                "modeling_lfm3_vl.Lfm3VlForConditionalGeneration",
+            )
+        )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_lfm3_vl_synthetic_parity(device):
+    """Vision features, left-padded two-image prefill past the window, cached decode."""
+    from mobius import build_from_module
+    from mobius._configs import Lfm3VlConfig
+    from mobius._testing.ort_inference import OnnxModelSession
+    from mobius._testing.torch_reference import (
+        lfm3_vl_reference_compatibility,
+        restore_lfm3_reference_layer_types,
+    )
+    from mobius.models.lfm3_vl import Lfm3VlForConditionalGeneration
+
+    if device == "cuda":
+        import onnxruntime as ort
+
+        if (
+            not torch.cuda.is_available()
+            or "CUDAExecutionProvider" not in ort.get_available_providers()
+        ):
+            pytest.skip("CUDA is unavailable")
+    config_class, model_class = _lfm3_vl_reference_classes()
+    hf_config = config_class(
+        text_config=dict(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=256,
+            max_position_embeddings=128,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            layer_types=["conv", "full_attention", "sliding_attention"],
+            sliding_window=8,
+            conv_L_cache=7,
+        ),
+        vision_config=dict(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            layer_types=["conv", "full_attention", "conv"],
+            patch_size=4,
+            rope_parameters={"rope_type": "axial", "rope_theta": 1e6},
+        ),
+        image_token_id=250,
+        video_token_id=249,
+        projector_hidden_size=96,
+    )
+    hf_config._attn_implementation = "eager"
+    restore_lfm3_reference_layer_types(hf_config.text_config)
+    config = Lfm3VlConfig.from_transformers(hf_config.text_config, parent_config=hf_config)
+    config.dtype = ir.DataType.FLOAT
+    torch.manual_seed(42)
+    with lfm3_vl_reference_compatibility(_LFM3_VL_MODEL_ID, _LFM3_VL_REVISION):
+        reference = model_class(hf_config)
+    with torch.no_grad():
+        # Norm weights and biases start at constants; vary them so misuse shows.
+        for parameter in reference.parameters():
+            if parameter.ndim == 1:
+                parameter.uniform_(0.5, 1.5)
+        # At the 0.02 init the gated conv branch (2e-6) and a tanh GELU stay under atol.
+        for parameter in [
+            *reference.model.vision_tower.parameters(),
+            *reference.model.multi_modal_projector.parameters(),
+        ]:
+            if parameter.ndim > 1:
+                parameter.normal_(0.0, parameter[0].numel() ** -0.5)
+    reference = reference.to(device).eval()
+
+    module = Lfm3VlForConditionalGeneration(config)
+    np.testing.assert_array_equal(
+        module.vision_encoder.vision_tower.inv_freq,
+        reference.model.vision_tower.rotary_pos_emb.inv_freq.cpu().numpy(),
+    )
+    pkg = build_from_module(
+        module,
+        config,
+        task="lfm3-vl",
+        execution_provider="cuda" if device == "cuda" else "default",
+    )
+    weights = module.preprocess_weights(dict(reference.state_dict()))
+    for model in pkg.values():
+        apply_weights(
+            model,
+            {
+                name: value
+                for name, value in weights.items()
+                if name in model.graph.initializers
+            },
+        )
+    sessions = {name: OnnxModelSession(model, device=device) for name, model in pkg.items()}
+    rng = np.random.default_rng(42)
+
+    def image(grid):
+        pixels = rng.standard_normal((int(np.prod(grid)), 96)).astype(np.float32)
+        return pixels, np.array([grid], dtype=np.int64)
+
+    try:
+        # Grids are [t, h, w] in patches; t = 2 runs two frames through one call.
+        for grid in ([1, 4, 4], [1, 2, 6], [1, 6, 4], [2, 4, 2]):
+            pixels, grid_thw = image(grid)
+            with torch.no_grad():
+                expected = reference.model.get_image_features(
+                    torch.from_numpy(pixels).to(device), torch.from_numpy(grid_thw).to(device)
+                ).pooler_output[0]
+            actual = sessions["vision_encoder"].run(
+                {"pixel_values": pixels, "image_grid_thw": grid_thw}
+            )["image_features"]
+            np.testing.assert_allclose(
+                actual, expected.cpu().numpy(), rtol=1e-4, atol=1e-4, err_msg=f"grid {grid}"
+            )
+
+        # Row 0 holds 12 image tokens (more than the 8-token window), row 1 is left-padded.
+        images = [image([1, 8, 6]), image([1, 4, 4])]
+        input_ids = np.array(
+            [
+                [1, 5, *[250] * 12, 7, 8],
+                [0, 0, 0, 1, *[250] * 4, 9, 10, 11, 12, 13, 14, 15, 16],
+            ],
+            dtype=np.int64,
+        )
+        mask = (np.arange(16) >= np.array([[0], [3]])).astype(np.int64)
+        features = np.concatenate(
+            [
+                sessions["vision_encoder"].run(
+                    {"pixel_values": pixels, "image_grid_thw": grid_thw}
+                )["image_features"]
+                for pixels, grid_thw in images
+            ]
+        )
+        embeds = sessions["embedding"].run(
+            {"input_ids": input_ids, "image_features": features}
+        )["inputs_embeds"]
+        cache = {}
+        for value in pkg["decoder"].graph.inputs:
+            if value.name.startswith("past_key_values."):
+                shape = [
+                    dim if isinstance(dim, int) else 0 if "past" in str(dim) else 2
+                    for dim in value.shape
+                ]
+                cache[value.name] = np.zeros(shape, dtype=np.float32)
+        hf_cache = None
+        tokens = input_ids
+        hf_inputs = {
+            "pixel_values": torch.from_numpy(np.concatenate([p for p, _ in images])).to(
+                device
+            ),
+            "image_grid_thw": torch.from_numpy(np.concatenate([g for _, g in images])).to(
+                device
+            ),
+        }
+        for step in range(4):
+            positions = (np.cumsum(mask, axis=1) - 1).clip(0)[:, -tokens.shape[1] :]
+            with torch.no_grad():
+                expected = reference(
+                    input_ids=torch.from_numpy(tokens).to(device),
+                    attention_mask=torch.from_numpy(mask).to(device),
+                    position_ids=torch.from_numpy(positions).to(device),
+                    past_key_values=hf_cache,
+                    use_cache=True,
+                    **hf_inputs,
+                )
+            actual = sessions["decoder"].run(
+                {
+                    "inputs_embeds": embeds,
+                    "attention_mask": mask,
+                    "position_ids": positions,
+                    **cache,
+                }
+            )
+            kept = mask[:, -tokens.shape[1] :].astype(bool)
+            np.testing.assert_allclose(
+                actual["logits"][kept],
+                expected.logits.cpu().numpy()[kept],
+                rtol=1e-3,
+                atol=1e-3,
+                err_msg=f"{device}: step {step}",
+            )
+            cache = {
+                name: actual[name.replace("past_key_values.", "present.")] for name in cache
+            }
+            hf_cache, hf_inputs = expected.past_key_values, {}
+            tokens = expected.logits[:, -1:].argmax(-1).cpu().numpy()
+            mask = np.concatenate([mask, np.ones_like(tokens)], axis=1)
+            embeds = sessions["embedding"].run(
+                {"input_ids": tokens, "image_features": np.zeros((0, 64), dtype=np.float32)}
+            )["inputs_embeds"]
+    finally:
+        for session in sessions.values():
+            session.close()
 
 
 # ===========================================================================

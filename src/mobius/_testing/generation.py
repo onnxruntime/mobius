@@ -19,6 +19,26 @@ from mobius._configs import ArchitectureConfig
 from mobius._testing.ort_inference import OnnxModelSession
 
 
+def apply_repetition_penalty(
+    scores: np.ndarray, sequences: np.ndarray, repetition_penalty: float
+) -> np.ndarray:
+    """Penalize each row's already-seen tokens in place, as HF's sign-aware processor does.
+
+    Args:
+        scores: [batch, vocab] float32 next-token scores.
+        sequences: [batch, seq_len] token IDs seen so far, prompt included.
+        repetition_penalty: Divides positive and multiplies negative scores.
+    """
+    if repetition_penalty != 1.0:  # noqa: RUF069
+        for row, sequence in zip(scores, sequences, strict=True):
+            token_ids = np.unique(sequence)
+            seen = row[token_ids]
+            row[token_ids] = np.where(
+                seen < 0, seen * repetition_penalty, seen / repetition_penalty
+            )
+    return scores
+
+
 class OnnxGenerator:
     """Greedy autoregressive text generator backed by an ONNX model.
 
@@ -139,14 +159,9 @@ class OnnxGenerator:
 
             # Extract logits and take argmax of last token
             logits = outputs["logits"]  # [batch, cur_seq_len, vocab]
-            scores = logits[:, -1, :].astype(np.float32, copy=True)
-            if repetition_penalty != 1.0:  # noqa: RUF069
-                for batch_idx in range(batch_size):
-                    token_ids = np.unique(all_ids[batch_idx])
-                    seen = scores[batch_idx, token_ids]
-                    scores[batch_idx, token_ids] = np.where(
-                        seen < 0, seen * repetition_penalty, seen / repetition_penalty
-                    )
+            scores = apply_repetition_penalty(
+                logits[:, -1, :].astype(np.float32, copy=True), all_ids, repetition_penalty
+            )
             next_token = np.argmax(scores, axis=-1, keepdims=True)
             # next_token: [batch, 1]
 

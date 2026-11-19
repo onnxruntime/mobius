@@ -27,6 +27,63 @@ def audio_stub(monkeypatch):
     return audio
 
 
+def test_vision_language_golden_passes_repetition_penalty(monkeypatch, tmp_path):
+    import contextlib
+
+    import torch
+    from PIL import Image
+
+    from mobius._testing import golden, torch_reference
+
+    calls, entered = [], []
+
+    class Reference(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, **kwargs):
+            return SimpleNamespace(logits=torch.tensor([[[1.0, -1.0, 0.5]]]))
+
+        def generate(self, **kwargs):
+            calls.append({k: v for k, v in kwargs.items() if not torch.is_tensor(v)})
+            return torch.tensor([[1, 2, 3]])
+
+    class Processor:
+        def __call__(self, *args, **kwargs):
+            return {"input_ids": torch.tensor([[1, 2]]), "pixel_values": torch.ones(4, 6)}
+
+    @contextlib.contextmanager
+    def compatibility(model_id, revision):
+        entered.append((model_id, revision))
+        yield
+
+    monkeypatch.setattr(
+        torch_reference,
+        "load_torch_multimodal_model",
+        lambda *args, **kwargs: (Reference(), None, Processor()),
+    )
+    monkeypatch.setattr(torch_reference, "lfm3_vl_reference_compatibility", compatibility)
+    monkeypatch.setattr(Image, "open", lambda *args: None)
+    monkeypatch.setattr(golden, "save_golden_ref", lambda *args, **kwargs: None)
+    monkeypatch.setattr(golden, "save_generation_json", lambda *args, **kwargs: None)
+    case = SimpleNamespace(
+        model_id="owner/pinned-vl",
+        model_type="lfm3_vl",
+        dtype="float32",
+        revision="a" * 40,
+        prompts=["prompt"],
+        images=["unused.png"],
+        videos=[],
+        media_max_pixels=None,
+        level="L4+L5",
+        generation_params={"max_new_tokens": 2, "repetition_penalty": 1.1},
+    )
+    generate_golden._generate_vision_language(case, tmp_path / "model.json", "cpu")
+    assert calls == [{"max_new_tokens": 2, "do_sample": False, "repetition_penalty": 1.1}]
+    assert entered == [("owner/pinned-vl", "a" * 40)]
+
+
 def test_causal_golden_preserves_repetition_penalty_and_revision(monkeypatch, tmp_path):
     import json
 

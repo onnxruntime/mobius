@@ -538,6 +538,7 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
 
     from mobius._testing.golden import save_generation_json, save_golden_ref
     from mobius._testing.torch_reference import (
+        lfm3_vl_reference_compatibility,
         load_torch_multimodal_model,
     )
 
@@ -622,12 +623,21 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # L5: greedy generation
     generated_ids = None
     if "L5" in case.level:
-        with torch.no_grad():
-            gen = model.generate(
-                **processed,
-                max_new_tokens=case.generation_params.get("max_new_tokens", 30),
-                do_sample=False,
-            )
+        generation_kwargs: dict[str, object] = {
+            "max_new_tokens": case.generation_params.get("max_new_tokens", 30),
+            "do_sample": False,
+        }
+        if "repetition_penalty" in case.generation_params:
+            generation_kwargs["repetition_penalty"] = case.generation_params[
+                "repetition_penalty"
+            ]
+        compatibility = (
+            lfm3_vl_reference_compatibility(case.model_id, case.revision)
+            if case.model_type == "lfm3_vl"
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), compatibility:
+            gen = model.generate(**processed, **generation_kwargs)
         input_len = processed["input_ids"].shape[1]
         generated_ids = gen[0, input_len:].cpu().numpy()
 

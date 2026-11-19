@@ -331,3 +331,31 @@ def test_lfm3_preserves_available_kernel_registration(monkeypatch):
     with torch_reference.lfm3_reference_compatibility():
         assert getattr(integrations, name) is sentinel
     assert getattr(integrations, name) is sentinel
+
+
+def test_lfm3_vl_axial_rope_and_prefill_only_grids_are_scoped(monkeypatch):
+    import transformers.dynamic_module_utils as dynamic_module_utils
+    import transformers.generation.utils as generation_utils
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    def axial(config):
+        return torch.ones(2), 1.0
+
+    requested = []
+
+    def load_class(name, model_id, revision=None):
+        requested.append((name, model_id, revision))
+        return SimpleNamespace(compute_axial_rope_parameters=axial)
+
+    monkeypatch.setattr(dynamic_module_utils, "get_class_from_dynamic_module", load_class)
+    prefill_only = generation_utils.MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL
+    initializers = dict(ROPE_INIT_FUNCTIONS)
+    with torch_reference.lfm3_vl_reference_compatibility("owner/vl", "a" * 40):
+        assert ROPE_INIT_FUNCTIONS["axial"] is axial
+        dropped = set(generation_utils.MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL)
+        assert {"pixel_values", "image_grid_thw", "video_grid_thw"} <= dropped
+    assert requested == [
+        ("modeling_lfm3_vl.Lfm3VlVisionRotaryEmbedding", "owner/vl", "a" * 40)
+    ]
+    assert generation_utils.MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL is prefill_only
+    assert initializers == ROPE_INIT_FUNCTIONS

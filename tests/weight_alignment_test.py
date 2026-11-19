@@ -478,6 +478,78 @@ def test_lfm2_vl_huggingface_weight_alignment() -> None:
     assert not missing, f"LFM2-VL preprocessing missed: {sorted(missing)}"
 
 
+def test_lfm3_vl_huggingface_weight_alignment() -> None:
+    """Checkpoint names map to initializers by prefix only, and lm_head is tied."""
+    config = _base_config(**vl_overrides("lfm3_vl"))
+    module = registry.get("lfm3_vl")(config)
+    pkg = get_task(_default_task_for_model("lfm3_vl")).build(module, config)
+    parameter_names = _collect_parameter_names(pkg)
+
+    hf_prefixes = {
+        "vision_encoder.vision_tower.": "model.vision_tower.",
+        "vision_encoder.multi_modal_projector.": "model.multi_modal_projector.",
+        "decoder.model.": "model.language_model.",
+    }
+    tied = {"decoder.lm_head.weight", "embedding.embed_tokens.weight"}
+    hf_names = {
+        "model.language_model.embed_tokens.weight"
+        if name in tied
+        else next(
+            hf + name[len(onnx) :] for onnx, hf in hf_prefixes.items() if name.startswith(onnx)
+        )
+        for name in parameter_names
+    }
+
+    # Tiny vision layer types are ["conv", "full_attention"].
+    vision = {
+        "model.vision_tower.patchifier.weight",
+        "model.vision_tower.embedding_norm.weight",
+        *(
+            f"model.vision_tower.layers.{i}.{name}.weight"
+            for i in (0, 1)
+            for name in ["operator_norm", "ffn_norm", "feed_forward.w1", "feed_forward.w2"]
+        ),
+        "model.vision_tower.layers.0.feed_forward.w3.weight",
+        "model.vision_tower.layers.1.feed_forward.w3.weight",
+        *(
+            f"model.vision_tower.layers.0.conv.{name}.weight"
+            for name in ["in_proj", "spatial_conv", "out_proj"]
+        ),
+        *(
+            f"model.vision_tower.layers.1.self_attn.{name}.weight"
+            for name in [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "out_proj",
+                "q_layernorm",
+                "k_layernorm",
+            ]
+        ),
+    }
+    projector = {
+        f"model.multi_modal_projector.{name}.{kind}"
+        for name in ["layer_norm", "linear_1", "linear_2"]
+        for kind in ["weight", "bias"]
+    }
+    text_overrides = next(o for mt, o, _ in ALL_CAUSAL_LM_CONFIGS if mt == "lfm3")
+    text_config = _base_config(**text_overrides)
+    text_package = get_task("hybrid-text-generation").build(
+        registry.get("lfm3")(text_config), text_config
+    )
+    text = {
+        "model.language_model." + name[len("model.") :]
+        for name in _collect_parameter_names(text_package)
+    }
+    assert hf_names == vision | projector | text
+
+    source = {name: torch.ones(1) for name in hf_names}
+    aligned = module.preprocess_weights(source)
+    assert parameter_names <= set(aligned)
+    embed = source["model.language_model.embed_tokens.weight"]
+    assert all(aligned[name] is embed for name in tied)
+
+
 def _lfm2moe_module():
     overrides = next(
         overrides for mt, overrides, _ in ALL_CAUSAL_LM_CONFIGS if mt == "lfm2_moe"

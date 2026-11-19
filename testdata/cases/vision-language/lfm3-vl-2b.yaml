@@ -1,0 +1,22 @@
+model_id: "LiquidAI/LFM3-VL-2B"
+model_type: "lfm3_vl"
+revision: "23387beda43c60310348e83e25f78f33c3140d3a"
+trust_remote_code: true
+task_type: "image-text-to-text"
+dtype: "float32"
+level: "L4+L5"
+
+inputs:
+  prompts:
+    - "Describe this image in one short sentence."
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  eos_token_id: 124900
+  repetition_penalty: 1.1
+
+min_token_match_ratio: 1.0
+notes: "Pinned LFM3-VL checkpoint with a real 960x686 image (42x60 patch grid, 630 image tokens, longer than the 256-token sliding window); exercises the gated 3x3 conv and GQA vision tower, 2D RoPE on a non-square grid, the 2x2-merge projector, and the LFM3 hybrid decoder with exact greedy generation under the checkpoint's 1.1 repetition penalty."
