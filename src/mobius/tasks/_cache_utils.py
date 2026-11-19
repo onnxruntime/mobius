@@ -248,7 +248,7 @@ def _make_hybrid_cache_inputs(
     Uses ``builder.input()`` to create and register graph inputs directly.
 
     Supported layer types:
-        ``"full_attention"`` — standard KV cache (key + value).
+        ``"full_attention"`` / ``"sliding_attention"`` — growing KV cache (key + value).
         ``"lightning_attention"`` — single recurrent state only; no conv_state.
         ``"conv"`` — ShortConv conv_state only; no SSM state.
         ``"linear_attention"`` (DeltaNet) — conv_state + recurrent_state.
@@ -266,6 +266,7 @@ def _make_hybrid_cache_inputs(
         raise ValueError("Hybrid layer_types must contain exactly num_hidden_layers entries")
     supported_layer_types = {
         "full_attention",
+        "sliding_attention",
         "lightning_attention",
         "conv",
         "linear_attention",
@@ -366,7 +367,7 @@ def _make_hybrid_cache_inputs(
                 shape=[batch, mamba2_n_heads, mamba2_d_state, mamba2_d_head],
             )
             pairs.append((conv_state, ssm_state))
-        elif ltype == "full_attention":
+        elif ltype in ("full_attention", "sliding_attention"):
             past_key = builder.input(
                 f"{prefix}.{i}.key",
                 dtype=dtype,
@@ -428,7 +429,7 @@ def _register_hybrid_cache_outputs(
             elif ltype in ("mamba", "mamba2"):
                 builder.add_output(state_a, f"{prefix}.{i}.conv_state")
                 builder.add_output(state_b, f"{prefix}.{i}.ssm_state")
-            elif ltype == "full_attention":
+            elif ltype in ("full_attention", "sliding_attention"):
                 builder.add_output(state_a, f"{prefix}.{i}.key")
                 builder.add_output(state_b, f"{prefix}.{i}.value")
             else:

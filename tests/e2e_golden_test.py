@@ -43,7 +43,11 @@ import pytest
 
 from mobius import build
 from mobius._model_package import ModelPackage
-from mobius._testing.generation import OnnxGenerator, OnnxSeq2SeqGenerator
+from mobius._testing.generation import (
+    OnnxGenerator,
+    OnnxSeq2SeqGenerator,
+    apply_repetition_penalty,
+)
 from mobius._testing.golden import (
     GoldenRef,
     GoldenTestCase,
@@ -1353,6 +1357,7 @@ def _run_vl_generation(
     config: object,
     max_new_tokens: int = 30,
     eos_token_id: int | None = None,
+    repetition_penalty: float = 1.0,
 ) -> np.ndarray:
     """Run greedy generation for a VL model.
 
@@ -1463,8 +1468,13 @@ def _run_vl_generation(
                 dec_feeds[name] = emb_out[name]
 
         prefill_out = dec_session.run(dec_feeds)
+        seen_ids = processed["input_ids"].astype(np.int64)
         logits = _suppress_logits(prefill_out["logits"], suppress_ids)
-        next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+        scores = apply_repetition_penalty(
+            logits[:, -1, :].astype(np.float32), seen_ids, repetition_penalty
+        )
+        next_token = np.argmax(scores, axis=-1, keepdims=True).astype(np.int64)
+        seen_ids = np.concatenate([seen_ids, next_token], axis=1)
         _update_vl_cache(past_cache, prefill_out, config)
 
         generated = [next_token]
@@ -1529,7 +1539,11 @@ def _run_vl_generation(
 
             step_out = dec_session.run(step_feeds)
             logits = _suppress_logits(step_out["logits"], suppress_ids)
-            next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+            scores = apply_repetition_penalty(
+                logits[:, -1, :].astype(np.float32), seen_ids, repetition_penalty
+            )
+            next_token = np.argmax(scores, axis=-1, keepdims=True).astype(np.int64)
+            seen_ids = np.concatenate([seen_ids, next_token], axis=1)
             generated.append(next_token)
             _update_vl_cache(past_cache, step_out, config)
             past_seq_len = total_len
@@ -2576,6 +2590,7 @@ def _run_causal_lm_generation(
             input_ids,
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
+            repetition_penalty=case.generation_params.get("repetition_penalty", 1.0),
         )
     finally:
         session.close()
@@ -3238,6 +3253,7 @@ class TestL5GenerationE2E:
                 config,
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
+                repetition_penalty=case.generation_params.get("repetition_penalty", 1.0),
             )
         elif case.task_type == "image-to-text":
             new_tokens = _run_image_to_text_generation(pkg, case, config)

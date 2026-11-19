@@ -29,6 +29,7 @@ from mobius.tasks._base import (
 from mobius.tasks._cache_utils import (
     _register_kv_cache_outputs,
 )
+from mobius.tasks._causal_lm import _LFM3_INPUT_CONTRACT, _preserve_standard_attention
 
 
 class VisionLanguageTask(ModelTask):
@@ -521,6 +522,55 @@ class Lfm2VlTask(VisionLanguageTask):
             pixel_values=pixel_values,
             pixel_attention_mask=pixel_attention_mask,
             spatial_shapes=spatial_shapes,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
+class Lfm3VlTask(Lfm2VlTask):
+    """LFM3-VL split: packed native-resolution patches with an LFM3 hybrid decoder.
+
+    The vision encoder takes one image per call: the processor's
+    ``pixel_values`` rows for it and its ``[t, h, w]`` grid row, and returns the
+    ``[t*h*w/4, text_hidden]`` features. The decoder keeps standard Attention
+    on every EP, as the LFM3 text task does.
+    """
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        package = super().build(module, config)
+        decoder = package["decoder"]
+        decoder.metadata_props["mobius.input_contract"] = _LFM3_INPUT_CONTRACT
+        _preserve_standard_attention(decoder)
+        return package
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        vision_config = config.vision
+        assert vision_config is not None
+        pixel_dim = (
+            vision_config.in_channels
+            * vision_config.temporal_patch_size
+            * vision_config.patch_size**2
+        )
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[ir.SymbolicDim("num_patches"), pixel_dim],
+        )
+        image_grid_thw = builder.input("image_grid_thw", dtype=ir.DataType.INT64, shape=[1, 3])
+        image_features = vision(
+            builder.op,
+            pixel_values=builder.op.Cast(pixel_values, to=config.dtype),
+            image_grid_thw=image_grid_thw,
         )
         builder.add_output(image_features, "image_features")
         return _make_model(graph)

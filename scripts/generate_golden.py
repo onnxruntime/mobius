@@ -360,9 +360,17 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         model_device = _get_model_device(model, device)
         gen_ids = torch.from_numpy(input_ids).to(model_device)
         max_new = case.generation_params.get("max_new_tokens", 20)
+        generation_kwargs: dict[str, object] = {
+            "max_new_tokens": max_new,
+            "do_sample": False,
+        }
+        if "repetition_penalty" in case.generation_params:
+            generation_kwargs["repetition_penalty"] = case.generation_params[
+                "repetition_penalty"
+            ]
         with torch.no_grad():
             try:
-                gen_output = model.generate(gen_ids, max_new_tokens=max_new, do_sample=False)
+                gen_output = model.generate(gen_ids, **generation_kwargs)
             except ValueError as e:
                 # All-attention GraniteMoeHybrid variants (e.g. granite-4.0-1b)
                 # trip transformers' hybrid Mamba/attention generation cache,
@@ -372,19 +380,14 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
                 # the (slower) cache-free path.
                 if "has_previous_state" not in str(e):
                     raise
-                gen_output = model.generate(
-                    gen_ids, max_new_tokens=max_new, do_sample=False, use_cache=False
-                )
+                gen_output = model.generate(gen_ids, **generation_kwargs, use_cache=False)
         generated_ids = gen_output[0, seq_len:].cpu().numpy()
 
-    provenance = (
-        {
-            "reference": {"repository": case.model_id, "revision": case.revision},
-            "gguf": case.gguf_source,
-        }
-        if case.gguf_source is not None
-        else None
-    )
+    provenance: dict[str, object] = {
+        "reference": {"repository": case.model_id, "revision": case.revision},
+    }
+    if case.gguf_source is not None:
+        provenance["gguf"] = case.gguf_source
     save_golden_ref(
         json_path,
         top1_id=golden["top1_id"],
@@ -535,6 +538,7 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
 
     from mobius._testing.golden import save_generation_json, save_golden_ref
     from mobius._testing.torch_reference import (
+        lfm3_vl_reference_compatibility,
         load_torch_multimodal_model,
     )
 
@@ -619,12 +623,21 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     # L5: greedy generation
     generated_ids = None
     if "L5" in case.level:
-        with torch.no_grad():
-            gen = model.generate(
-                **processed,
-                max_new_tokens=case.generation_params.get("max_new_tokens", 30),
-                do_sample=False,
-            )
+        generation_kwargs: dict[str, object] = {
+            "max_new_tokens": case.generation_params.get("max_new_tokens", 30),
+            "do_sample": False,
+        }
+        if "repetition_penalty" in case.generation_params:
+            generation_kwargs["repetition_penalty"] = case.generation_params[
+                "repetition_penalty"
+            ]
+        compatibility = (
+            lfm3_vl_reference_compatibility(case.model_id, case.revision)
+            if case.model_type == "lfm3_vl"
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), compatibility:
+            gen = model.generate(**processed, **generation_kwargs)
         input_len = processed["input_ids"].shape[1]
         generated_ids = gen[0, input_len:].cpu().numpy()
 

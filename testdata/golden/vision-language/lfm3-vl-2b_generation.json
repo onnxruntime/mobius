@@ -1,0 +1,27 @@
+{
+  "model_id": "LiquidAI/LFM3-VL-2B",
+  "prompt": "Describe this image in one short sentence.",
+  "generated_tokens": [
+    597,
+    4695,
+    10966,
+    267,
+    55911,
+    8818,
+    302,
+    278,
+    4145,
+    20,
+    5734,
+    310,
+    734,
+    2789,
+    12683,
+    22,
+    358,
+    1094,
+    310,
+    13895
+  ],
+  "generated_text": "The user wants a concise description of the image, limited to one short sentence. I need to observe"
+}

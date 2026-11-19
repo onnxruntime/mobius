@@ -282,6 +282,13 @@ class RotaryAttentionToGQA(RewriteRuleClassBase):
     ):
         result = MatchResult()
 
+        if (
+            attn_out.producer().metadata_props.get("mobius.attention.preserve_standard")
+            == "true"
+        ):
+            return result.fail(
+                "Attention requires the standard batched/chunked cache contract"
+            )
         if not local_window_from_attention_bias(attention_bias).recognized:
             return result.fail(
                 "Attention bias is not a plain causal/sliding mask; GroupQueryAttention "
@@ -737,6 +744,13 @@ class AttentionToGQA(RewriteRuleClassBase):
     def check(self, context, attn_out, k, v, attention_bias, past_key, past_value, **_):
         result = MatchResult()
 
+        if (
+            attn_out.producer().metadata_props.get("mobius.attention.preserve_standard")
+            == "true"
+        ):
+            return result.fail(
+                "Attention requires the standard batched/chunked cache contract"
+            )
         if not local_window_from_attention_bias(attention_bias).recognized:
             return result.fail(
                 "Attention bias is not a plain causal/sliding mask; GroupQueryAttention "
