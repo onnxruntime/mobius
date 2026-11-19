@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import ClassVar
 
 import onnx_ir as ir
-from onnxscript import nn
+from onnxscript import GraphBuilder, nn
 
 from mobius._configs.lfm3_audio import Lfm3AudioConfig
 from mobius._model_package import ModelPackage
@@ -66,15 +66,15 @@ class Lfm3AudioTask(ModelTask):
 
         graph, builder = _make_graph(name="embedding")
         ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, sequence])
-        audio = builder.input(
-            "audio_features", dtype=config.dtype, shape=["audio_tokens", config.hidden_size]
-        )
+        features = self._embedding_features(builder, config)
         codes = builder.input(
             "audio_out_codes",
             dtype=ir.DataType.INT64,
             shape=["audio_frames", config.num_codebooks],
         )
-        builder.add_output(module.embedding(builder.op, ids, audio, codes), "inputs_embeds")
+        builder.add_output(
+            module.embedding(builder.op, ids, *features, codes), "inputs_embeds"
+        )
         models["embedding"] = _make_model(graph)
 
         graph, builder = _make_graph(name="decoder")
@@ -117,3 +117,15 @@ class Lfm3AudioTask(ModelTask):
         builder.add_output(module.depth_decoder(builder.op, hidden, codes, masked), "logits")
         models["depth_decoder"] = _make_model(graph)
         return ModelPackage(models, config=config)
+
+    def _embedding_features(
+        self, builder: GraphBuilder, config: Lfm3AudioConfig
+    ) -> list[ir.Value]:
+        """Feature inputs the embedding scatters, in its argument order."""
+        return [
+            builder.input(
+                "audio_features",
+                dtype=config.dtype,
+                shape=["audio_tokens", config.hidden_size],
+            )
+        ]

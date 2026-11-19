@@ -1,15 +1,17 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Portable greedy offline inference over LFM3 Audio's exported components."""
+"""Portable offline inference over LFM3 Audio's exported components."""
 
 from __future__ import annotations
 
+import functools
 import json
-from collections.abc import Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import numpy as np
 import onnx_ir as ir
@@ -24,11 +26,12 @@ def build_lfm3_audio_package(
     revision: str = "2d6c1f99c129b3ef07a8d168bc0ff08e2bdb93f1",
     execution_provider: str = "cpu",
 ) -> ModelPackage:
-    """Build all five offline components, including the separately stored codec.
+    """Build the offline components, including the separately stored codec.
 
-    Unlike the four-component core ``mobius.build`` export, this also binds
-    ``audio_tokenizer/`` weights to ``audio_decoder``. No upstream Python code
-    is executed: both configurations are read as data.
+    Unlike the core ``mobius.build`` export, this also binds
+    ``audio_tokenizer/`` weights to ``audio_decoder``. LFM3-Omni checkpoints
+    ship the same codec. No upstream Python code is executed: both
+    configurations are read as data.
     """
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
@@ -98,6 +101,35 @@ def build_lfm3_audio_package(
     return package
 
 
+def load_generation_config(model_id: str, *, revision: str) -> dict[str, object]:
+    """Read the checkpoint's ``generation_config.json``: stop ids and sampling settings."""
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(model_id, filename="generation_config.json", revision=revision)
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _penalize(scores: np.ndarray, history: np.ndarray, penalty: float | None) -> np.ndarray:
+    """Transformers' repetition penalty: divide positive, multiply negative seen scores."""
+    if penalty is None or penalty == 1.0 or not history.size:  # noqa: RUF069
+        return scores
+    seen = np.unique(history)
+    scores = scores.copy()
+    scores[seen] = np.where(scores[seen] < 0, scores[seen] * penalty, scores[seen] / penalty)
+    return scores
+
+
+def _sample(
+    scores: np.ndarray, rng: np.random.Generator, temperature: float, top_k: int | None
+) -> int:
+    """Temperature, then top-k, then one multinomial draw, as the reference warpers."""
+    scores = scores.astype(np.float64) / temperature
+    if top_k:
+        scores[scores < np.sort(scores)[-min(top_k, scores.size)]] = -np.inf
+    probs = np.exp(scores - scores.max())
+    return int(rng.choice(scores.size, p=probs / probs.sum()))
+
+
 class AudioComponentSession(Protocol):
     def run(self, feeds: dict[str, np.ndarray]) -> dict[str, np.ndarray]: ...
 
@@ -105,15 +137,27 @@ class AudioComponentSession(Protocol):
 class Lfm3AudioPipeline:
     """Run offline ASR or speech-code generation with reusable hybrid caches.
 
-    Sessions use the named-array ``run(feeds) -> outputs`` contract. Speech
-    uses greedy MaskGIT with an explicit permutation for every frame; supplying
-    recorded upstream permutations makes reference replay reproducible.
+    Sessions use the named-array ``run(feeds) -> outputs`` contract.
+    :meth:`generate_speech` reveals codebooks greedily in an explicit permutation
+    for every frame; supplying recorded upstream permutations makes reference
+    replay reproducible.
     Prefill and cache steps support batches; generation requires one prompt.
+    :meth:`generate` follows the checkpoint's own ``generate`` with the
+    settings of ``generation_config``, its ``generation_config.json``.
     """
 
-    def __init__(self, config: Lfm3AudioConfig, sessions: Mapping[str, AudioComponentSession]):
+    # Extra embedding inputs, each with the config field naming its placeholder token.
+    _feature_tokens: ClassVar[dict[str, str]] = {}
+
+    def __init__(
+        self,
+        config: Lfm3AudioConfig,
+        sessions: Mapping[str, AudioComponentSession],
+        generation_config: Mapping[str, object] | None = None,
+    ):
         self.config = config
         self.sessions = sessions
+        self.generation_config = generation_config
         self._mask: np.ndarray | None = None
         self._cache: dict[str, np.ndarray] = {}
         self.logits: np.ndarray | None = None
@@ -143,6 +187,7 @@ class Lfm3AudioPipeline:
         features: np.ndarray,
         codes: np.ndarray,
         cache: dict[str, np.ndarray],
+        **media: np.ndarray,
     ) -> dict[str, np.ndarray]:
         if (
             codes.ndim != 2
@@ -157,9 +202,20 @@ class Lfm3AudioPipeline:
                 f"audio_out_codes must be int64 with shape (frames, {self.config.num_codebooks}) "
                 f"and codes in [0, {self.config.codebook_size})."
             )
+        unknown = set(media) - set(self._feature_tokens)
+        if unknown:
+            raise TypeError(f"Unexpected media inputs: {sorted(unknown)}.")
+        media = {
+            name: media.get(name, np.empty((0, self.config.hidden_size), dtype=np.float32))
+            for name in self._feature_tokens
+        }
         for token_id, count, name in (
             (self.config.audio_token_id, features.shape[0], "audio_features"),
             (self.config.audio_out_token_id, codes.shape[0], "audio_out_codes"),
+            *(
+                (getattr(self.config, field), media[name].shape[0], name)
+                for name, field in self._feature_tokens.items()
+            ),
         ):
             actual = int(np.count_nonzero(ids == token_id))
             if actual != count:
@@ -168,7 +224,7 @@ class Lfm3AudioPipeline:
                     "use the pinned processor and trim encoder padding before fusion."
                 )
         embeds = self.sessions["embedding"].run(
-            {"input_ids": ids, "audio_features": features, "audio_out_codes": codes}
+            {"input_ids": ids, **media, "audio_features": features, "audio_out_codes": codes}
         )["inputs_embeds"]
         positions = np.maximum(np.cumsum(mask, axis=1) - 1, 0)[:, -ids.shape[1] :]
         outputs = self.sessions["decoder"].run(
@@ -196,6 +252,7 @@ class Lfm3AudioPipeline:
         feature_lengths: np.ndarray | None = None,
         attention_mask: np.ndarray | None = None,
         audio_out_codes: np.ndarray | None = None,
+        **media: np.ndarray,
     ) -> dict[str, np.ndarray]:
         if input_ids.ndim != 2 or not input_ids.size or input_ids.dtype != np.int64:
             raise ValueError("input_ids must be a nonempty int64 (batch, sequence) array.")
@@ -253,6 +310,7 @@ class Lfm3AudioPipeline:
             features,
             codes,
             self._empty_cache(input_ids.shape[0]),
+            **media,
         )
 
     def step(
@@ -301,7 +359,19 @@ class Lfm3AudioPipeline:
             self.step(np.array([[token]], dtype=np.int64))
         return np.asarray(generated, dtype=np.int64)
 
-    def sample_frame(self, order: Sequence[int]) -> np.ndarray:
+    def sample_frame(
+        self,
+        order: Sequence[int],
+        draw: Callable[[np.ndarray], int] | None = None,
+        history: np.ndarray | None = None,
+        penalty: float | None = None,
+    ) -> np.ndarray:
+        """Reveal the codebooks in ``order`` over the MaskGIT passes.
+
+        Each code is the argmax, or ``draw``, of its logits after the
+        repetition ``penalty`` over that codebook's codes in ``history``
+        (frames, codebooks).
+        """
         if self.hidden_states is None or self.hidden_states.shape[0] != 1:
             raise ValueError("Speech frame generation requires a single prefilled prompt.")
         if sorted(order) != list(range(self.config.num_codebooks)):
@@ -316,7 +386,11 @@ class Lfm3AudioPipeline:
                 {"hidden_states": self.hidden_states[:, -1], "codes": codes, "masked": masked}
             )["logits"]
             indices = list(order[offset : offset + count])
-            codes[:, indices] = np.argmax(logits[:, indices], axis=-1)
+            for index in indices:
+                scores = logits[0, index]
+                if history is not None:
+                    scores = _penalize(scores, history[:, index], penalty)
+                codes[0, index] = np.argmax(scores) if draw is None else draw(scores)
             masked[:, indices] = False
             offset += count
         return codes
@@ -352,6 +426,170 @@ class Lfm3AudioPipeline:
             if frames
             else np.empty((1, self.config.num_codebooks, 0), dtype=np.int64)
         )
+
+    def generate(
+        self,
+        input_ids: np.ndarray,
+        max_new_tokens: int,
+        *,
+        generation_mode: str | None = None,
+        rng: np.random.Generator | None = None,
+        codebook_orders: Sequence[Sequence[int]] | None = None,
+        draw: Callable[[np.ndarray], int] | None = None,
+        **inputs: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Generate text, speech or interleaved text and speech for one prompt.
+
+        Follows the checkpoint's ``generate``: ``generation_mode`` ``"audio"`` or
+        ``"interleaved"`` appends the opening marker, ``"text"`` forbids both
+        markers, and without a mode the prompt's last token picks it and the
+        model may switch. An end-of-speech frame is fed back and text resumes.
+        Text is greedy; speech uses the ``generation_config`` settings and
+        reveals codebooks in ``rng`` permutations, or in ``codebook_orders``.
+        ``draw`` replaces the speech sampler: it gets one codebook's scores
+        after the repetition penalty and returns its code. ``inputs`` go to
+        :meth:`prefill`; ``max_new_tokens`` counts text tokens and speech frames.
+
+        Returns the generated ids, one ``audio_out_token_id`` per speech frame,
+        and the speech codes ``(1, num_codebooks, frames)``.
+        """
+        settings = self.generation_config
+        if settings is None:
+            raise ValueError(
+                "generate needs the checkpoint's generation_config.json; load it with "
+                "load_generation_config and pass it as generation_config."
+            )
+        if settings.get("do_sample"):
+            raise ValueError(
+                "Text sampling is not supported; LFM3 checkpoints decode greedily."
+            )
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive; provide a generation budget.")
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("generate takes one (1, sequence) prompt.")
+        config = self.config
+        markers = {
+            "audio": (config.audio_start_token_id, config.audio_out_token_id),
+            "interleaved": (config.mixed_start_token_id,),
+            "text": (),
+        }
+        last = int(input_ids[0, -1])
+        mode = generation_mode
+        if mode is None:
+            mode = next((name for name, ids in markers.items() if last in ids), "text")
+        elif mode not in markers:
+            raise ValueError(
+                f"generation_mode must be one of {sorted(markers)}, got {mode!r}."
+            )
+        elif markers[mode] and last not in markers[mode]:
+            input_ids = np.concatenate([input_ids, [[markers[mode][0]]]], axis=1)
+            if inputs.get("attention_mask") is not None:
+                inputs["attention_mask"] = np.concatenate(
+                    [inputs["attention_mask"], [[1]]], axis=1
+                )
+        self.prefill(input_ids, **inputs)
+        prompt_codes = inputs.get("audio_out_codes")
+        if (
+            generation_mode is None
+            and last == config.audio_out_token_id
+            and prompt_codes is not None
+            and (prompt_codes[-1] == config.audio_eos_code).any()
+        ):
+            mode = "text"
+
+        def setting(name: str, default: object = None) -> object:
+            value = settings.get(name)
+            return default if value is None else value
+
+        eos = setting("eos_token_id", config.eos_token_id)
+        eos_ids = set(eos) if isinstance(eos, (list, tuple)) else {eos}
+        never = [
+            token
+            for token in (
+                config.audio_token_id,
+                config.audio_out_token_id,
+                config.image_token_id,
+                config.video_token_id,
+            )
+            if token is not None
+        ]
+        if generation_mode == "text":
+            never += [config.mixed_start_token_id, config.audio_start_token_id]
+        temperature, top_k = setting("audio_temperature"), setting("audio_top_k")
+        rng = np.random.default_rng() if rng is None else rng
+        if draw is None and not (temperature == 0 or (temperature is None and not top_k)):
+            draw = functools.partial(
+                _sample, rng=rng, temperature=temperature or 1.0, top_k=top_k
+            )
+
+        # Window defaults are the reference generate's.
+        text_history = deque(maxlen=setting("text_repetition_window", 32))
+        audio_history = deque(maxlen=setting("audio_repetition_window", 64))
+        slots, speaking, text_done = config.interleaved_n_text, False, False
+        tokens, frames, sampled = [], [], 0
+        for step in range(max_new_tokens):
+            interleaving, finished = mode == "interleaved", False
+            if mode == "audio" or (interleaving and speaking):
+                if codebook_orders is None:
+                    order = rng.permutation(config.num_codebooks).tolist()
+                elif sampled < len(codebook_orders):
+                    order = codebook_orders[sampled]
+                else:
+                    raise ValueError("Provide one codebook order per sampled speech frame.")
+                sampled += 1
+                frame = self.sample_frame(
+                    order,
+                    draw,
+                    np.stack(audio_history) if audio_history else None,
+                    setting("audio_repetition_penalty"),
+                )[0]
+                if (frame == config.audio_eos_code).any():
+                    frame[:] = config.audio_eos_code
+                    mode = "text"
+                else:
+                    audio_history.append(frame)
+                    frames.append(frame)
+                    tokens.append(config.audio_out_token_id)
+                next_token, next_codes = config.audio_out_token_id, frame[None]
+            else:
+                scores = _penalize(
+                    self.logits[0, -1],
+                    np.array(text_history, dtype=np.int64),
+                    setting("repetition_penalty"),
+                ).copy()
+                scores[never] = -np.inf
+                next_token, next_codes = int(np.argmax(scores)), None
+                text_history.append(next_token)
+                tokens.append(next_token)
+                if next_token == config.text_end_token_id:
+                    # Inside an interleaved block it ends the text; the speech tail continues.
+                    if interleaving:
+                        text_done = speaking = True
+                    else:
+                        finished = True
+                elif next_token in eos_ids:
+                    finished = True
+                elif not interleaving and next_token == config.audio_start_token_id:
+                    mode = "audio"
+                elif not interleaving and next_token == config.mixed_start_token_id:
+                    mode, speaking, text_done = "interleaved", False, False
+                    slots = config.interleaved_n_text
+            if interleaving and not text_done:
+                slots -= 1
+                if not slots:
+                    speaking = not speaking
+                    slots = (
+                        config.interleaved_n_audio if speaking else config.interleaved_n_text
+                    )
+            if finished or step == max_new_tokens - 1:
+                break
+            self.step(np.array([[next_token]], dtype=np.int64), next_codes)
+        codes = (
+            np.stack(frames, axis=-1)[None]
+            if frames
+            else np.empty((1, config.num_codebooks, 0), dtype=np.int64)
+        )
+        return np.asarray(tokens, dtype=np.int64), codes
 
     def synthesize(self, codes: np.ndarray) -> np.ndarray:
         """Decode nonterminal speech codes into a 24-kHz mono waveform."""

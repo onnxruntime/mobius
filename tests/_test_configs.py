@@ -44,6 +44,7 @@ from mobius._configs import (
     Lfm2VlConfig,
     Lfm3AudioConfig,
     Lfm3Config,
+    Lfm3OmniConfig,
     Lfm3VlConfig,
     LongcatFlashConfig,
     Mamba2Config,
@@ -3637,8 +3638,35 @@ def lfm3_audio_config():
     )
 
 
+def lfm3_omni_config():
+    return Lfm3OmniConfig(
+        **{
+            **vars(lfm3_audio_config()),
+            "model_type": "lfm3_omni",
+            "image_token_id": 245,
+            "video_token_id": 246,
+            "projector_hidden_size": 64,
+            "vision_num_key_value_heads": 2,
+            "vision_layer_types": ["conv", "full_attention"],
+            "vision": VisionConfig(
+                model_type="lfm3_vl_vision",
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                patch_size=4,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                norm_eps=1e-5,
+                rope_theta=1e6,
+            ),
+        }
+    )
+
+
 SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
     ("lfm3_audio", {"_config_cls": Lfm3AudioConfig, **vars(lfm3_audio_config())}, True),
+    ("lfm3_omni", {"_config_cls": Lfm3OmniConfig, **vars(lfm3_omni_config())}, True),
     # --- Parakeet CTC (feature-input offline FastConformer) ---
     (
         "parakeet_ctc",

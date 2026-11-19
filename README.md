@@ -30,7 +30,7 @@ multi-component export for pipelines.
 | **Text Generation** | Llama 2/3/4, Mistral, Qwen 2/2.5/3/3.5/3.6, Phi-3/3.5, Gemma 1/2/3/4, Granite, GPT-2, OPT, OLMo, SmolLM3, and many more |
 | **Hybrid Convolution+Attention** | LiquidAI LFM2/2.5 and LFM3 (gated convolution, full/sliding attention, and sandwich norms) |
 | **Mixture of Experts** | PhiMoE, GPTOSS, Mixtral, OLMoE, DeepSeek-V2/V3, Qwen2-MoE, Qwen3-MoE, Qwen3-Next, GLM-4-MoE, Arctic, DBRX, Jamba |
-| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), Nemotron Parse, LLaVA, InternVL2, Mage-VL (image + streaming video), MiniCPM-V 4.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral, LFM3-VL |
+| **Multimodal** | Gemma 3/4, Phi-4MM (vision + audio + LoRA), Nemotron Parse, LLaVA, InternVL2, Mage-VL (image + streaming video), MiniCPM-V 4.6, Qwen2.5-VL, Qwen3-VL, Qwen3.5/3.6-VL, Pixtral, LFM3-VL, LFM3-Omni (image + audio in, text + speech out) |
 | **Encoder-only** | BERT, RoBERTa, ALBERT, DeBERTa, DistilBERT, ELECTRA, XLNet |
 | **Encoder-Decoder** | BART, T5/mT5, Marian, M2M-100, Pegasus, BigBird-Pegasus |
 | **Speech-to-Text** | Whisper, Moonshine, Moonshine Streaming, FastConformer-RNNT, FunASR, GLM-ASR, Qwen3-ASR, SenseVoice |
@@ -56,6 +56,10 @@ For int4, quantize `decoder/model.onnx` after export, for example with
 onnxruntime's MatMulNBits quantizer. Large images make long prompts: on CUDA a
 12 MP photo (11,864 tokens) peaks at about 62 GB of GPU memory under GenAI, and
 at about 27 GB with the `chunk_size` search option set to 2048.
+
+LFM3-Omni is float32 only and runs through
+`mobius.integrations.lfm3_omni.Lfm3OmniPipeline`; no ORT GenAI release has an
+`lfm3_omni` model type, so it has no GenAI package.
 
 Supports **290+ Transformers model types** and **10 Diffusers component types**
 across **40+ task types** and **100+ reusable components**.

@@ -550,6 +550,42 @@ def test_lfm3_vl_huggingface_weight_alignment() -> None:
     assert all(aligned[name] is embed for name in tied)
 
 
+@pytest.mark.arch_validation
+def test_lfm3_omni_pinned_checkpoint_binds_every_initializer_once():
+    """Every tensor of the pinned checkpoint routes to one initializer of its shape."""
+    from huggingface_hub import get_safetensors_metadata
+
+    from mobius import build
+
+    model_id = "LiquidAI/LFM3-Omni-2B"
+    revision = "21d75123f86c1f7ffb4bef1ea202710c4e7ebe67"
+    metadata = get_safetensors_metadata(model_id, revision=revision)
+    shapes = {
+        name: info.shape
+        for file in metadata.files_metadata.values()
+        for name, info in file.tensors.items()
+    }
+    package = build(model_id, revision=revision, dtype="f32", load_weights=False)
+    module = registry.get("lfm3_omni")(package.config)
+    routed = module.preprocess_weights(
+        {name: torch.empty(shape, device="meta") for name, shape in shapes.items()}
+    )
+    initializers = {
+        name: value
+        for model in package.values()
+        for name, value in model.graph.initializers.items()
+        if value.const_value is None
+    }
+
+    assert len(shapes) == 665
+    # The LM head is tied to the token embedding, which the checkpoint stores once.
+    assert len(routed) == len(shapes) + 1
+    assert set(routed) == set(initializers)
+    assert {name: list(value.shape) for name, value in routed.items()} == {
+        name: list(value.shape) for name, value in initializers.items()
+    }
+
+
 def _lfm2moe_module():
     overrides = next(
         overrides for mt, overrides, _ in ALL_CAUSAL_LM_CONFIGS if mt == "lfm2_moe"

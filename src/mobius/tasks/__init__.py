@@ -74,6 +74,7 @@ __all__ = [
     "KimiLinearCausalLMTask",
     "KevTask",
     "Lfm2VlTask",
+    "Lfm3OmniTask",
     "Lfm3VlTask",
     "ModelTask",
     "MultiComponentModelTask",
@@ -188,6 +189,7 @@ from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._kimi_k3 import KimiK3CausalLMTask
 from mobius.tasks._kimi_linear import KimiLinearCausalLMTask
 from mobius.tasks._lfm3_audio import Lfm3AudioTask
+from mobius.tasks._lfm3_omni import Lfm3OmniTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
 from mobius.tasks._minimax_music3 import (
     MiniMaxMusic3ConditionTask,
@@ -331,6 +333,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "speech-enhancement": SpeechEnhancementTask,
     "speech-language": SpeechLanguageTask,
     "lfm3-audio": Lfm3AudioTask,
+    "lfm3-omni": Lfm3OmniTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,
     "ssm2-text-generation": SSM2CausalLMTask,

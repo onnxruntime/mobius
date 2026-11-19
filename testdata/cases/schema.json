@@ -59,6 +59,7 @@
         "image-to-image",
         "image-to-text",
         "lfm3-audio",
+        "lfm3-omni",
         "object-detection",
         "phi4mm-multimodal",
         "qwen35-mtp",

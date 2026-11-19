@@ -5,14 +5,23 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import onnx_ir as ir
 import pytest
-from _test_configs import lfm3_audio_config
 
 from mobius import build_from_module
 from mobius._configs import Lfm2Config
 from mobius._testing import create_test_builder, create_test_input
 from mobius.models.lfm3_audio import Lfm3AudioEncoder, Lfm3AudioForConditionalGeneration
+
+# tests/_test_configs.py provides the tiny LFM3-Audio config.
+_TESTS_DIR = Path(__file__).resolve().parents[3] / "tests"
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+
+from _test_configs import lfm3_audio_config  # noqa: E402
 
 
 def _config(**kwargs):

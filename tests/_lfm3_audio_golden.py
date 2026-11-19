@@ -349,19 +349,19 @@ def run_lfm3_audio_l5(tmp_path):
             torch.cuda.empty_cache()
 
 
-def _verify_codec(codes, device, tmp_path, session):
+def _verify_codec(codes, device, tmp_path, session, model_id=MODEL_ID, revision=REVISION):
     config_class = get_class_from_dynamic_module(
-        "configuration_liquid_codec.LiquidCodecConfig", MODEL_ID, revision=REVISION
+        "configuration_liquid_codec.LiquidCodecConfig", model_id, revision=revision
     )
     codec_class = get_class_from_dynamic_module(
-        "modeling_liquid_codec.LiquidCodecModel", MODEL_ID, revision=REVISION
+        "modeling_liquid_codec.LiquidCodecModel", model_id, revision=revision
     )
     config = config_class.from_pretrained(
-        MODEL_ID, revision=REVISION, subfolder="audio_tokenizer"
+        model_id, revision=revision, subfolder="audio_tokenizer"
     )
     reference = codec_class.from_pretrained(
-        MODEL_ID,
-        revision=REVISION,
+        model_id,
+        revision=revision,
         subfolder="audio_tokenizer",
         config=config,
         dtype=torch.float32,
