@@ -41,6 +41,7 @@ def build_lfm3_audio_package(
         LiquidCodecDecoder,
         build_liquid_codec_decoder,
     )
+    from mobius.tasks._causal_lm import _preserve_standard_attention
 
     package = build(
         model_id,
@@ -90,6 +91,8 @@ def build_lfm3_audio_package(
             f"LiquidCodec checkpoint {model_id}@{revision} is missing decoder weights: "
             f"{missing[:5]}; use the matching audio_tokenizer checkpoint."
         )
+    # The codec's attention has no KV cache; keep it out of the GQA rewrite.
+    _preserve_standard_attention(decoder)
     optimize_model(decoder, ep=execution_provider, model_role="decoder")
     package["audio_decoder"] = decoder
     return package

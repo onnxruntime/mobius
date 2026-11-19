@@ -25,6 +25,7 @@ from mobius.tasks._cache_utils import (
     _register_hybrid_cache_outputs,
     _register_linear_attention_functions,
 )
+from mobius.tasks._causal_lm import _preserve_standard_attention
 
 
 class Lfm3AudioTask(ModelTask):
@@ -99,6 +100,8 @@ class Lfm3AudioTask(ModelTask):
         _register_hybrid_cache_outputs(builder, present, config.layer_types or [])
         decoder = _make_model(graph)
         _register_linear_attention_functions(decoder, config)
+        if module.preserve_standard_attention:
+            _preserve_standard_attention(decoder)
         models["decoder"] = decoder
 
         graph, builder = _make_graph(name="depth_decoder")

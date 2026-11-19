@@ -76,3 +76,16 @@ def test_audio_builds_four_component_package():
     ]
     assert len(depth_attention) == 1
     assert depth_attention[0].attributes.get_int("is_causal") == 0
+
+
+def test_audio_decoder_keeps_standard_attention_on_cpu():
+    config = lfm3_audio_config()
+    package = build_from_module(
+        Lfm3AudioForConditionalGeneration(config),
+        config,
+        task="lfm3-audio",
+        execution_provider="cpu",
+    )
+    ops = [node.op_type for node in package["decoder"].graph]
+    assert ops.count("Attention") == 2
+    assert "GroupQueryAttention" not in ops
