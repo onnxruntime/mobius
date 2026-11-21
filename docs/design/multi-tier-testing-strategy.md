@@ -393,7 +393,6 @@ Rather than a single `atol`/`rtol` check, comparisons use a
 | **Push to main** | L1 + L3 + selective L4 (fast golden) | < 10 min | Post-merge verification |
 | **Nightly** | L2 (architecture validation) | ~30 min | Config compatibility |
 | **Weekly (GPU)** | L4 (all golden) + L5 (generation) | ~60 min | Full checkpoint verification |
-| **Weekly (Sun)** | Golden file regeneration | ~90 min | Keep golden data current |
 
 ### CI workflow mapping
 
@@ -402,7 +401,6 @@ Rather than a single `atol`/`rtol` check, comparisons use a
 | `main.yml` | L1, L3, selective L4/L5 | PR + push to main |
 | `gpu_tests.yml` | L4, L5 | Push to main + weekly |
 | `nightly_l2.yml` | L2 | Nightly (3 AM UTC) |
-| `golden_regen.yml` | — | Weekly (Sun 2 AM UTC) + manual |
 | `benchmark.yml` | Performance | PR + manual |
 
 ### Feedback timing targets
@@ -585,7 +583,7 @@ is detected from its own data source.
 |-----|--------|------|
 | L3 covers only causal LM | Encoder/seq2seq/audio models lack parity tests | Extend `synthetic_parity_test.py` to other task types |
 | ~40 L3 models are xfail | MoE routing, GPT-2 family, Gemma softcapping diverge | Fix per-model; track in xfail list |
-| L4/L5 golden files need periodic refresh | HF Transformers updates may change reference outputs | Weekly `golden_regen.yml` workflow |
+| L4/L5 golden files need periodic refresh | HF Transformers updates may change reference outputs | Regenerate under explicit human review |
 | Performance CI not wired | No regression detection for node count / build time | Wire `benchmark.yml` (see perf-benchmarking.md) |
 | No cross-platform golden tolerance | CPU vs GPU golden files may differ | Store platform tolerance bands |
 

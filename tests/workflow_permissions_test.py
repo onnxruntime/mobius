@@ -58,28 +58,3 @@ def test_privileged_reporter_only_processes_downloaded_text() -> None:
     assert "isSymbolicLink" in script
     assert "60000-byte limit" in script
     assert ".replace(/@/g" in script
-
-
-def test_golden_write_permissions_are_isolated_to_publish_job() -> None:
-    golden = _load_workflow("golden_regen.yml")
-    regenerate = golden["jobs"]["regenerate"]
-    publish = golden["jobs"]["create-pr"]
-
-    assert golden["permissions"] == {"contents": "read"}
-    assert regenerate["permissions"] == {"contents": "read"}
-    assert publish["permissions"] == {
-        "actions": "read",
-        "contents": "write",
-        "pull-requests": "write",
-    }
-    regenerate_steps = _steps(regenerate)
-    regenerate_checkout = regenerate_steps[0]
-    assert regenerate_checkout["with"]["persist-credentials"] == "false"
-    assert all("git push" not in step.get("run", "") for step in regenerate_steps)
-    assert all("gh pr create" not in step.get("run", "") for step in regenerate_steps)
-
-    publish_steps = _steps(publish)
-    checkout = publish_steps[0]
-    assert checkout["uses"] == "actions/checkout@v7"
-    assert checkout["with"]["ref"] == "${{ github.event.repository.default_branch }}"
-    assert all("pip install" not in step.get("run", "") for step in publish_steps)
