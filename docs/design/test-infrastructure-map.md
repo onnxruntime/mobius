@@ -13,7 +13,7 @@ Last Updated: 2025-03-09
 | **Test Methods** | 237 | in `/tests/` (79) + `src/` (1003) |
 | **Test Fixtures** | 1 | `conftest.py` (deterministic_seed) |
 | **Pytest Markers** | 7 | `integration`, `integration_fast`, `integration_slow`, `arch_validation`, `golden`, `generation`, `benchmark` |
-| **CI Workflows** | 7 | main, gpu_tests, nightly_l2, golden_regen, arch_diff, benchmark, pages |
+| **CI Workflows** | 6 | main, gpu_tests, nightly_l2, arch_diff, benchmark, pages |
 | **Test Dependencies** | 10 | pytest, pytest-xdist, pytest-timeout, onnxruntime-easy, transformers, safetensors, gguf, Pillow, librosa, onnxruntime-genai |
 
 ---
@@ -145,14 +145,13 @@ def deterministic_seed():
 
 ## 4. CI CONFIGURATION & WORKFLOWS
 
-### `.github/workflows/` (7 files)
+### `.github/workflows/` (6 files)
 
 | File | Trigger | Level | Test Command | Purpose |
 |------|---------|-------|--------------|---------|
 | **main.yml** | PR + push to main | L1–L3, selective L4 | `pytest tests/build_graph -n auto` (L1); `pytest tests/synthetic_parity_test.py -n auto` (L3); `pytest -m 'not integration'` (coverage); selective L4 + L5 | Fast PR feedback; runs on every push |
 | **gpu_tests.yml** | push to main + weekly (Mon 4am UTC) | L4–L5 | `pytest tests/e2e_golden_test.py -m golden` (L4); `pytest tests/e2e_golden_test.py -m generation` (L5) | GPU-only golden/generation tests (requires checkpoint verification) |
 | **nightly_l2.yml** | nightly (3am UTC) + l2-* tags | L2 | `pytest tests/arch_validation_test.py -m arch_validation` | Architecture validation with real HF configs |
-| **golden_regen.yml** | weekly (Sun 2am UTC) + manual | — | Regenerates golden files | Updates L4/L5 reference data (before nightly_l2) |
 | **arch_diff.yml** | Manual dispatch | — | Detects architecture differences | Custom diff detection (details TBD) |
 | **benchmark.yml** | Manual dispatch + scheduled | — | Benchmark reporting | Performance tracking |
 | **pages.yml** | Push to main | — | Docs build | GitHub Pages deployment |
@@ -327,7 +326,6 @@ def [fixture_name_2]  # Implementation details TBD
 1. **PR CI (main.yml):** L1 (smoke) + L3 (synthetic parity) + selective L4 (fast golden)
 2. **Weekly GPU (gpu_tests.yml):** L4 (golden) + L5 (generation) on GPU
 3. **Nightly (nightly_l2.yml):** L2 (architecture validation)
-4. **Weekly Regen (golden_regen.yml):** Update L4/L5 golden data
 
 ---
 

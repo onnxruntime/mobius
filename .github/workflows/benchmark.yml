@@ -123,7 +123,6 @@ jobs:
     needs: [benchmark-base, benchmark-head]
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v7
 
@@ -151,38 +150,6 @@ jobs:
 
       - name: Write to job summary
         run: cat comparison.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Comment on PR
-        if: >-
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('comparison.md', 'utf8');
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const marker = 'Performance Comparison';
-            const existing = comments.find(c => c.body.includes(marker));
-            const params = {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body,
-            };
-            if (existing) {
-              await github.rest.issues.updateComment({
-                ...params, comment_id: existing.id,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                ...params, issue_number: context.issue.number,
-              });
-            }
 
       - name: Upload comparison
         uses: actions/upload-artifact@v7
