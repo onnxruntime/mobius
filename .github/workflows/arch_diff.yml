@@ -16,8 +16,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
-  pull-requests: write
 
 concurrency:
   group: arch-diff-${{ github.event.pull_request.number }}
@@ -60,38 +58,6 @@ jobs:
             --base-ref ${{ env.BASE_REF }} \
             --head-ref ${{ env.HEAD_REF }} \
             --output arch_diff.md
-
-      - name: Comment on PR
-        if: >-
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('arch_diff.md', 'utf8');
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const marker = 'arch-diff-bot';
-            const existing = comments.find(c => c.body.includes(marker));
-            const params = {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: body,
-            };
-            if (existing) {
-              await github.rest.issues.updateComment({
-                ...params, comment_id: existing.id,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                ...params, issue_number: context.issue.number,
-              });
-            }
 
       - name: Upload results artifact
         uses: actions/upload-artifact@v7
