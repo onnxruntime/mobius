@@ -210,9 +210,12 @@ class Lfm3TextModel(nn.Module):
         past_key_values: list,
         inputs_embeds: ir.Value | None = None,
     ):
-        hidden_states = (
-            self.embed_tokens(op, input_ids) if inputs_embeds is None else inputs_embeds
-        )
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("LFM3 requires input_ids or precomputed inputs_embeds.")
+            hidden_states = self.embed_tokens(op, input_ids)
+        else:
+            hidden_states = inputs_embeds
         if hidden_states.dtype != ir.DataType.FLOAT:
             raise ValueError(_FLOAT32_ONLY)
         # The masks read only dims 0 and 1, which token IDs and embeddings share.

@@ -47,6 +47,7 @@ _SPEECH_MODEL_PARAMS = _make_params(SPEECH_CONFIGS)
 _SPEECH_TASK_KEYS: dict[str, set[str]] = {
     "speech-to-text": {"encoder", "decoder"},
     "speech-language": {"audio_encoder", "embedding", "decoder"},
+    "lfm3-audio": {"audio_encoder", "embedding", "decoder", "depth_decoder"},
     "codec": {"decoder", "encoder"},
     "audio-feature-extraction": {"model"},
     "feature-ctc-asr": {"model"},
