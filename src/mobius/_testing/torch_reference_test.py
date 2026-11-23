@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import contextlib
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import ml_dtypes
@@ -237,10 +238,14 @@ def test_bfloat16_media_decoder_logits_and_kv_reuse(wrapper):
     torch.testing.assert_close(reused.layers[0].values, value)
 
 
-def test_load_torch_model_pins_every_huggingface_resource() -> None:
+@pytest.mark.parametrize("model_type", ["llama", "lfm3"])
+def test_load_torch_model_pins_every_huggingface_resource(model_type) -> None:
     revision = "a" * 40
     tokenizer = SimpleNamespace(pad_token="<pad>", eos_token="</s>")
-    config = SimpleNamespace(model_type="llama")
+    config = SimpleNamespace(
+        model_type=model_type,
+        layer_types=["linear_attention", "full_attention", "sliding_attention"],
+    )
     model = mock.Mock()
 
     with (
@@ -289,3 +294,68 @@ def test_load_torch_model_pins_every_huggingface_resource() -> None:
     )
     fix_weights.assert_called_once_with(model, "owner/model", revision)
     model.eval.assert_called_once_with()
+    assert config.layer_types == [
+        "conv" if model_type == "lfm3" else "linear_attention",
+        "full_attention",
+        "sliding_attention",
+    ]
+
+
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_lfm3_optional_kernel_registration_is_scoped(monkeypatch, raise_inside):
+    integrations = ModuleType("transformers.integrations")
+    monkeypatch.setattr(torch_reference.importlib, "import_module", lambda name: integrations)
+    name = "use_kernel_func_from_hub_with_fallback"
+
+    def function(value):
+        return value + 1
+
+    with contextlib.ExitStack() as stack:
+        if raise_inside:
+            stack.enter_context(pytest.raises(RuntimeError, match="reference failure"))
+        with torch_reference.lfm3_reference_compatibility():
+            decorated = getattr(integrations, name)("unused-kernel")(function)
+            assert decorated is function
+            assert decorated(3) == 4
+            if raise_inside:
+                raise RuntimeError("reference failure")
+    assert not hasattr(integrations, name)
+
+
+def test_lfm3_preserves_available_kernel_registration(monkeypatch):
+    import transformers.integrations as integrations
+
+    sentinel = object()
+    name = "use_kernel_func_from_hub_with_fallback"
+    monkeypatch.setattr(integrations, name, sentinel, raising=False)
+    with torch_reference.lfm3_reference_compatibility():
+        assert getattr(integrations, name) is sentinel
+    assert getattr(integrations, name) is sentinel
+
+
+def test_lfm3_vl_axial_rope_and_prefill_only_grids_are_scoped(monkeypatch):
+    import transformers.dynamic_module_utils as dynamic_module_utils
+    import transformers.generation.utils as generation_utils
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    def axial(config):
+        return torch.ones(2), 1.0
+
+    requested = []
+
+    def load_class(name, model_id, revision=None):
+        requested.append((name, model_id, revision))
+        return SimpleNamespace(compute_axial_rope_parameters=axial)
+
+    monkeypatch.setattr(dynamic_module_utils, "get_class_from_dynamic_module", load_class)
+    prefill_only = generation_utils.MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL
+    initializers = dict(ROPE_INIT_FUNCTIONS)
+    with torch_reference.lfm3_vl_reference_compatibility("owner/vl", "a" * 40):
+        assert ROPE_INIT_FUNCTIONS["axial"] is axial
+        dropped = set(generation_utils.MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL)
+        assert {"pixel_values", "image_grid_thw", "video_grid_thw"} <= dropped
+    assert requested == [
+        ("modeling_lfm3_vl.Lfm3VlVisionRotaryEmbedding", "owner/vl", "a" * 40)
+    ]
+    assert generation_utils.MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL is prefill_only
+    assert initializers == ROPE_INIT_FUNCTIONS

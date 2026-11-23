@@ -109,7 +109,10 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "mistral": "mistral",
     "mistral3": "mistral3",
     "lfm2": "lfm2",
+    # LFM3 changes operator math, but retains LFM2's sparse KV + conv-state ABI.
+    "lfm3": "lfm2",
     "lfm2_vl": "lfm2_vl",
+    "lfm3_vl": "lfm3_vl",
     # HunYuan-V1 dense / Hy-MT1.5 — generic decoder LLM type accepted by
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
@@ -150,6 +153,7 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
 # model decoder packages use ORT GenAI's released generic DecoderOnly_Model.
 _ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
     "lfm2": "lfm2",
+    "lfm3": "lfm2",
     "lfm2_vl": "lfm2",
 }
 # Composite configs are unwrapped to their text sub-config during config-mode
@@ -209,6 +213,7 @@ _GEMMA4_UNIFIED_MODEL_TYPES = frozenset({"gemma4_unified", "gemma4_unified_text"
 _GLMASR_MODEL_TYPES = frozenset({"glmasr"})
 _MINICPM_MODEL_TYPES = frozenset({"minicpmv4_6"})
 _LFM2_VL_MODEL_TYPES = frozenset({"lfm2_vl"})
+_LFM3_VL_MODEL_TYPES = frozenset({"lfm3_vl"})
 # gemma-3 multimodal. build() unwraps the composite HF config to its text
 # sub-config, so at export time ``config.model_type`` is "gemma3_text" (not
 # "gemma3").
@@ -1073,6 +1078,87 @@ def _build_vision_transform_pipeline(
     ]
 
 
+def _write_lfm3_vl_processor_config(vision: Any, output_dir: str) -> str | None:
+    """Replace the copied HF ``processor_config.json`` with ORT GenAI's lfm3_vl pipeline.
+
+    The steps and values match onnxruntime-genai's model builder
+    (``LFM3VLModel.make_processor_config``) and come from the checkpoint's own
+    ``image_processor`` section, so GenAI's native image processor can feed the
+    package.
+    """
+    path = os.path.join(output_dir, "processor_config.json")
+    if not os.path.exists(path):
+        logger.warning(
+            "No HF processor_config.json in %s; skipping the LFM3-VL image pipeline",
+            output_dir,
+        )
+        return None
+    with open(path, encoding="utf-8") as f:
+        existing = json.load(f)
+    if "processor" in existing:  # Converted by an earlier call into the same folder.
+        return path
+    image_processor = existing["image_processor"]
+    expected = {
+        "resample": 3,  # Bicubic, the pipeline's CUBIC resize.
+        "do_resize": True,
+        "do_rescale": True,
+        "do_normalize": True,
+        "do_convert_rgb": True,
+        "patch_size": vision.patch_size,
+        "merge_size": vision.spatial_merge_size,
+        # GenAI's PatchImage writes each image as a clip of two frames.
+        "temporal_patch_size": 2,
+    }
+    unsupported = {
+        key: image_processor.get(key)
+        for key, value in expected.items()
+        if image_processor.get(key) != value
+    }
+    if unsupported or {"min_pixels", "max_pixels"} & image_processor.keys():
+        raise ValueError(
+            f"Unsupported LFM3-VL image processor settings {unsupported}: expected {expected}, "
+            "with the pixel limits only in size."
+        )
+
+    def step(name: str, kind: str, **attrs: Any) -> dict[str, Any]:
+        return {"operation": {"name": name, "type": kind, "attrs": attrs}}
+
+    patch_size, merge_size = image_processor["patch_size"], image_processor["merge_size"]
+    transforms = [
+        step("decode_image", "DecodeImage", color_space="RGB"),
+        step(
+            "resize",
+            "Resize",
+            interpolation="CUBIC",
+            smart_resize=1,
+            min_pixels=image_processor["size"]["shortest_edge"],
+            max_pixels=image_processor["size"]["longest_edge"],
+            patch_size=patch_size,
+            merge_size=merge_size,
+        ),
+        step("rescale", "Rescale", rescale_factor=image_processor["rescale_factor"]),
+        step(
+            "normalize",
+            "Normalize",
+            mean=image_processor["image_mean"],
+            std=image_processor["image_std"],
+        ),
+        step(
+            "patch_image",
+            "PatchImage",
+            patch_size=patch_size,
+            temporal_patch_size=image_processor["temporal_patch_size"],
+            merge_size=merge_size,
+        ),
+    ]
+    processor_config = {
+        "processor": {"name": "lfm3_vl_image_processor", "transforms": transforms}
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(processor_config, f, indent=4)
+    return path
+
+
 def _write_vision_processor_config(
     config: Any,
     output_dir: str,
@@ -1110,6 +1196,9 @@ def _write_vision_processor_config(
       Permute3D → PixtralImageSizes).
     - **Mage-VL**: Writes ``image_processor.json`` with Qwen-style smart resize,
       CLIP normalization, and packed patch extraction.
+    - **LFM3-VL**: Replaces the copied HF ``processor_config.json`` with ORT
+      GenAI's 5-step lfm3_vl pipeline (DecodeImage → Resize[smart, CUBIC] →
+      Rescale → Normalize → PatchImage).
     - **Other VLMs**: Writes ``processor_config.json`` with a 4-step pipeline
       (DecodeImage → Resize → Rescale → Normalize).
 
@@ -1149,6 +1238,8 @@ def _write_vision_processor_config(
             model_type,
         )
         return None
+    if model_type in _LFM3_VL_MODEL_TYPES:
+        return _write_lfm3_vl_processor_config(vision, output_dir)
 
     vision_model_type = getattr(vision, "model_type", None)
     is_pixtral = vision_model_type == "pixtral" or model_type in _PIXTRAL_MODEL_TYPES
@@ -1834,6 +1925,12 @@ def _write_genai_config(
                 # Pixel unshuffle is already part of the ONNX vision encoder;
                 # ORT GenAI must not perform another spatial merge.
                 vision_kwargs["spatial_merge_size"] = None
+                vision_kwargs["config_filename"] = "processor_config.json"
+            elif model_type in _LFM3_VL_MODEL_TYPES:
+                # The graph merges patch blocks itself; ORT GenAI's lfm3_vl vision
+                # state still reads the merge size to count tokens per image.
+                vision_kwargs["spatial_merge_size"] = config.vision.spatial_merge_size
+                vision_kwargs["patch_size"] = config.vision.patch_size
                 vision_kwargs["config_filename"] = "processor_config.json"
             elif has_speech:
                 vision_kwargs["spatial_merge_size"] = None

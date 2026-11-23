@@ -43,7 +43,11 @@ import pytest
 
 from mobius import build
 from mobius._model_package import ModelPackage
-from mobius._testing.generation import OnnxGenerator, OnnxSeq2SeqGenerator
+from mobius._testing.generation import (
+    OnnxGenerator,
+    OnnxSeq2SeqGenerator,
+    apply_repetition_penalty,
+)
 from mobius._testing.golden import (
     GoldenRef,
     GoldenTestCase,
@@ -471,12 +475,14 @@ def _discover_cases(
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
         test_id = f"{case.task_type}/{case.case_id}"
+        if case.task_type in ("lfm3-audio", "lfm3-omni"):
+            marks.append(pytest.mark.timeout(1800))
 
         if case.skip_reason:
             marks.append(pytest.mark.skip(reason=case.skip_reason))
         elif case.ci_skip_reason and _IN_CI:
             marks.append(pytest.mark.skip(reason=f"[CI] {case.ci_skip_reason}"))
-        elif not has_golden(case):
+        elif not has_golden(case) and case.task_type not in ("lfm3-audio", "lfm3-omni"):
             marks.append(
                 pytest.mark.skip(reason=(f"Golden file missing: {golden_path_for_case(case)}"))
             )
@@ -1353,6 +1359,7 @@ def _run_vl_generation(
     config: object,
     max_new_tokens: int = 30,
     eos_token_id: int | None = None,
+    repetition_penalty: float = 1.0,
 ) -> np.ndarray:
     """Run greedy generation for a VL model.
 
@@ -1463,8 +1470,13 @@ def _run_vl_generation(
                 dec_feeds[name] = emb_out[name]
 
         prefill_out = dec_session.run(dec_feeds)
+        seen_ids = processed["input_ids"].astype(np.int64)
         logits = _suppress_logits(prefill_out["logits"], suppress_ids)
-        next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+        scores = apply_repetition_penalty(
+            logits[:, -1, :].astype(np.float32), seen_ids, repetition_penalty
+        )
+        next_token = np.argmax(scores, axis=-1, keepdims=True).astype(np.int64)
+        seen_ids = np.concatenate([seen_ids, next_token], axis=1)
         _update_vl_cache(past_cache, prefill_out, config)
 
         generated = [next_token]
@@ -1529,7 +1541,11 @@ def _run_vl_generation(
 
             step_out = dec_session.run(step_feeds)
             logits = _suppress_logits(step_out["logits"], suppress_ids)
-            next_token = np.argmax(logits[:, -1, :], axis=-1, keepdims=True).astype(np.int64)
+            scores = apply_repetition_penalty(
+                logits[:, -1, :].astype(np.float32), seen_ids, repetition_penalty
+            )
+            next_token = np.argmax(scores, axis=-1, keepdims=True).astype(np.int64)
+            seen_ids = np.concatenate([seen_ids, next_token], axis=1)
             generated.append(next_token)
             _update_vl_cache(past_cache, step_out, config)
             past_seq_len = total_len
@@ -2371,7 +2387,17 @@ class TestL4CheckpointVerified:
     """
 
     @pytest.mark.parametrize("case", _L4_CASES)
-    def test_prefill_argmax_matches_golden(self, case: GoldenTestCase) -> None:
+    def test_prefill_argmax_matches_golden(self, case: GoldenTestCase, tmp_path) -> None:
+        if case.task_type == "lfm3-audio":
+            from tests._lfm3_audio_golden import run_lfm3_audio_l4
+
+            run_lfm3_audio_l4(tmp_path)
+            return
+        if case.task_type == "lfm3-omni":
+            from tests._lfm3_omni_golden import run_lfm3_omni_l4
+
+            run_lfm3_omni_l4(tmp_path)
+            return
         if case.task_type == "text-to-speech":
             pytest.skip(
                 "Continuous-token TTS uses tests/vibevoice_golden_test.py "
@@ -2576,6 +2602,7 @@ def _run_causal_lm_generation(
             input_ids,
             max_new_tokens=max_new_tokens,
             eos_token_id=eos_token_id,
+            repetition_penalty=case.generation_params.get("repetition_penalty", 1.0),
         )
     finally:
         session.close()
@@ -3187,7 +3214,17 @@ class TestL5GenerationE2E:
     """
 
     @pytest.mark.parametrize("case", _L5_CASES)
-    def test_generation_matches_golden(self, case: GoldenTestCase) -> None:
+    def test_generation_matches_golden(self, case: GoldenTestCase, tmp_path) -> None:
+        if case.task_type == "lfm3-audio":
+            from tests._lfm3_audio_golden import run_lfm3_audio_l5
+
+            run_lfm3_audio_l5(tmp_path)
+            return
+        if case.task_type == "lfm3-omni":
+            from tests._lfm3_omni_golden import run_lfm3_omni_l5
+
+            run_lfm3_omni_l5(tmp_path)
+            return
         # --- Guard: skip unsupported task types ---
         if case.task_type not in _GENERATION_SUPPORTED_TASKS:
             pytest.skip(
@@ -3238,6 +3275,7 @@ class TestL5GenerationE2E:
                 config,
                 max_new_tokens=case.generation_params.get("max_new_tokens", 30),
                 eos_token_id=case.generation_params.get("eos_token_id"),
+                repetition_penalty=case.generation_params.get("repetition_penalty", 1.0),
             )
         elif case.task_type == "image-to-text":
             new_tokens = _run_image_to_text_generation(pkg, case, config)

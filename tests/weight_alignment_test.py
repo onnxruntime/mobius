@@ -50,6 +50,53 @@ from mobius.tasks import get_task
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("sandwich,conv_bias", [(True, False), (False, True)])
+def test_lfm3_upstream_weight_names_align_without_renaming(sandwich, conv_bias):
+    from mobius.models.lfm3_test import tiny_lfm3_config
+
+    config = tiny_lfm3_config(use_sandwich_norm=sandwich, short_conv_bias=conv_bias)
+    module = registry.get("lfm3")(config)
+    pkg = get_task("hybrid-text-generation").build(module, config)
+    names = _collect_parameter_names(pkg)
+    expected = {"model.embed_tokens.weight", "model.embedding_norm.weight"}
+    for i, kind in enumerate(config.layer_types):
+        prefix = f"model.layers.{i}."
+        expected.update(
+            prefix + f"feed_forward.{projection}.weight" for projection in ["w1", "w2", "w3"]
+        )
+        norms = ["operator_norm", "ffn_norm"]
+        if sandwich:
+            norms += ["post_operator_norm", "post_ffn_norm"]
+        expected.update(prefix + name + ".weight" for name in norms)
+        if kind == "conv":
+            expected.update(
+                prefix + f"conv.{name}.weight" for name in ["in_proj", "conv", "out_proj"]
+            )
+            if conv_bias:
+                expected.update(
+                    prefix + f"conv.{name}.bias" for name in ["in_proj", "conv", "out_proj"]
+                )
+        else:
+            expected.update(
+                prefix + f"self_attn.{name}.weight"
+                for name in [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "q_norm",
+                    "k_norm",
+                    "gate_proj",
+                ]
+            )
+    assert names == expected
+    source = _build_identity_state_dict(pkg, expected)
+    processed = module.preprocess_weights(source)
+    assert expected <= processed.keys()
+    assert all(processed[name] is source[name] for name in expected)
+    assert processed["lm_head.weight"] is source["model.embed_tokens.weight"]
+
+
 def _collect_parameter_names(pkg: dict) -> set[str]:
     """Return ONNX initializer names that represent model parameters.
 
@@ -429,6 +476,114 @@ def test_lfm2_vl_huggingface_weight_alignment() -> None:
     aligned = module.preprocess_weights(hf_state)
     missing = parameter_names - set(aligned)
     assert not missing, f"LFM2-VL preprocessing missed: {sorted(missing)}"
+
+
+def test_lfm3_vl_huggingface_weight_alignment() -> None:
+    """Checkpoint names map to initializers by prefix only, and lm_head is tied."""
+    config = _base_config(**vl_overrides("lfm3_vl"))
+    module = registry.get("lfm3_vl")(config)
+    pkg = get_task(_default_task_for_model("lfm3_vl")).build(module, config)
+    parameter_names = _collect_parameter_names(pkg)
+
+    hf_prefixes = {
+        "vision_encoder.vision_tower.": "model.vision_tower.",
+        "vision_encoder.multi_modal_projector.": "model.multi_modal_projector.",
+        "decoder.model.": "model.language_model.",
+    }
+    tied = {"decoder.lm_head.weight", "embedding.embed_tokens.weight"}
+    hf_names = {
+        "model.language_model.embed_tokens.weight"
+        if name in tied
+        else next(
+            hf + name[len(onnx) :] for onnx, hf in hf_prefixes.items() if name.startswith(onnx)
+        )
+        for name in parameter_names
+    }
+
+    # Tiny vision layer types are ["conv", "full_attention"].
+    vision = {
+        "model.vision_tower.patchifier.weight",
+        "model.vision_tower.embedding_norm.weight",
+        *(
+            f"model.vision_tower.layers.{i}.{name}.weight"
+            for i in (0, 1)
+            for name in ["operator_norm", "ffn_norm", "feed_forward.w1", "feed_forward.w2"]
+        ),
+        "model.vision_tower.layers.0.feed_forward.w3.weight",
+        "model.vision_tower.layers.1.feed_forward.w3.weight",
+        *(
+            f"model.vision_tower.layers.0.conv.{name}.weight"
+            for name in ["in_proj", "spatial_conv", "out_proj"]
+        ),
+        *(
+            f"model.vision_tower.layers.1.self_attn.{name}.weight"
+            for name in [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "out_proj",
+                "q_layernorm",
+                "k_layernorm",
+            ]
+        ),
+    }
+    projector = {
+        f"model.multi_modal_projector.{name}.{kind}"
+        for name in ["layer_norm", "linear_1", "linear_2"]
+        for kind in ["weight", "bias"]
+    }
+    text_overrides = next(o for mt, o, _ in ALL_CAUSAL_LM_CONFIGS if mt == "lfm3")
+    text_config = _base_config(**text_overrides)
+    text_package = get_task("hybrid-text-generation").build(
+        registry.get("lfm3")(text_config), text_config
+    )
+    text = {
+        "model.language_model." + name[len("model.") :]
+        for name in _collect_parameter_names(text_package)
+    }
+    assert hf_names == vision | projector | text
+
+    source = {name: torch.ones(1) for name in hf_names}
+    aligned = module.preprocess_weights(source)
+    assert parameter_names <= set(aligned)
+    embed = source["model.language_model.embed_tokens.weight"]
+    assert all(aligned[name] is embed for name in tied)
+
+
+@pytest.mark.arch_validation
+def test_lfm3_omni_pinned_checkpoint_binds_every_initializer_once():
+    """Every tensor of the pinned checkpoint routes to one initializer of its shape."""
+    from huggingface_hub import get_safetensors_metadata
+
+    from mobius import build
+
+    model_id = "LiquidAI/LFM3-Omni-2B"
+    revision = "21d75123f86c1f7ffb4bef1ea202710c4e7ebe67"
+    metadata = get_safetensors_metadata(model_id, revision=revision)
+    shapes = {
+        name: info.shape
+        for file in metadata.files_metadata.values()
+        for name, info in file.tensors.items()
+    }
+    package = build(model_id, revision=revision, dtype="f32", load_weights=False)
+    module = registry.get("lfm3_omni")(package.config)
+    routed = module.preprocess_weights(
+        {name: torch.empty(shape, device="meta") for name, shape in shapes.items()}
+    )
+    initializers = {
+        name: value
+        for model in package.values()
+        for name, value in model.graph.initializers.items()
+        if value.const_value is None
+    }
+
+    assert len(shapes) == 665
+    # The LM head is tied to the token embedding, which the checkpoint stores once.
+    assert len(routed) == len(shapes) + 1
+    assert set(routed) == set(initializers)
+    assert {name: list(value.shape) for name, value in routed.items()} == {
+        name: list(value.shape) for name, value in initializers.items()
+    }
 
 
 def _lfm2moe_module():

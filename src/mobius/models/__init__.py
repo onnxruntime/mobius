@@ -146,6 +146,10 @@ __all__ = [
     "LegacyLayerNormCausalLMModel",
     "Lfm2CausalLMModel",
     "Lfm2MoECausalLMModel",
+    "Lfm3CausalLMModel",
+    "Lfm3AudioForConditionalGeneration",
+    "Lfm3OmniForConditionalGeneration",
+    "Lfm3VlForConditionalGeneration",
     "Lfm2VlForConditionalGeneration",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
@@ -394,6 +398,10 @@ from mobius.models.legacy_decoder import (
 )
 from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
+from mobius.models.lfm3 import Lfm3CausalLMModel
+from mobius.models.lfm3_audio import Lfm3AudioForConditionalGeneration
+from mobius.models.lfm3_omni import Lfm3OmniForConditionalGeneration
+from mobius.models.lfm3_vl import Lfm3VlForConditionalGeneration
 from mobius.models.llada import DreamModel, LLaDAModel, LLaDAMoEModel, RND1Model
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel

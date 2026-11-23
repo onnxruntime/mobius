@@ -9,7 +9,37 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from mobius._testing.generation import OnnxSeq2SeqGenerator
+from mobius._testing.generation import OnnxGenerator, OnnxSeq2SeqGenerator
+
+
+@pytest.mark.parametrize("penalty", [0.5, 1.0, 1.1, 2.0])
+def test_causal_repetition_penalty_matches_transformers_per_row(penalty):
+    import torch
+    from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
+
+    logits = np.array([[[0.8, 1.1, -0.5, -0.9]], [[-0.8, -1.1, -0.5, -0.9]]], np.float32)
+    config = SimpleNamespace(
+        num_hidden_layers=0, num_key_value_heads=1, head_dim=1, layer_types=[]
+    )
+    session = SimpleNamespace(run=lambda feeds: {"logits": logits})
+    prompt = np.array([[1, 1], [2, 3]], dtype=np.int64)
+    actual = OnnxGenerator(session, config).generate(
+        prompt, max_new_tokens=3, repetition_penalty=penalty
+    )
+    expected = torch.from_numpy(prompt)
+    processor = RepetitionPenaltyLogitsProcessor(penalty)
+    for _ in range(3):
+        scores = processor(expected, torch.from_numpy(logits[:, -1, :].copy()))
+        expected = torch.cat([expected, scores.argmax(-1, keepdim=True)], dim=-1)
+    np.testing.assert_array_equal(actual, expected.numpy())
+
+
+@pytest.mark.parametrize("penalty", [0.0, -1.0, float("inf"), float("nan")])
+def test_causal_repetition_penalty_rejects_invalid_values(penalty):
+    with pytest.raises(ValueError, match="finite and positive"):
+        OnnxGenerator(None, None).generate(
+            np.array([[1]], dtype=np.int64), repetition_penalty=penalty
+        )
 
 
 @pytest.mark.parametrize("hidden_dtype", [np.float32, np.float16, ml_dtypes.bfloat16])

@@ -295,6 +295,13 @@ def _resolve_module_class(
                 "Unsupported VibeVoice ASR architecture. Expected exactly "
                 f"{sorted(supported_architectures)}, got {architectures!r}."
             )
+    # d1 checkpoints (D1Model) reuse LFM3-VL's model_type and weights but do not
+    # attend causally over the prompt, so the causal export would be wrong for them.
+    if model_type == "lfm3_vl" and set(architectures) - {"Lfm3VlForConditionalGeneration"}:
+        raise ValueError(
+            f"Unsupported LFM3-VL architecture {architectures!r}; Mobius exports only "
+            "'Lfm3VlForConditionalGeneration'."
+        )
     if allow_parent_architecture_override and architectures and architectures[0] in registry:
         architecture_key = architectures[0]
         model_type_class = registry.get(model_type) if model_type in registry else None

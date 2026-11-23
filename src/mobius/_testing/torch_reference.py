@@ -6,14 +6,76 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import logging
 from pathlib import Path
+from unittest import mock
 
 import ml_dtypes
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def lfm3_reference_compatibility():
+    """Keep LFM3's PyTorch fallbacks when an optional kernel decorator is absent.
+
+    The pinned upstream module imports a removed Transformers registration API.
+    Its decorated convolution functions contain the full PyTorch implementation;
+    only optional Hub-kernel registration is bypassed, never model math.
+    """
+    integrations = importlib.import_module("transformers.integrations")
+
+    name = "use_kernel_func_from_hub_with_fallback"
+    if hasattr(integrations, name):
+        yield
+        return
+    with mock.patch.object(
+        integrations, name, lambda *args, **kwargs: lambda function: function, create=True
+    ):
+        yield
+
+
+def restore_lfm3_reference_layer_types(config) -> None:
+    """Undo generic HF vocabulary remapping for the pinned upstream LFM3 model."""
+    if getattr(config, "model_type", None) == "lfm3":
+        config.layer_types = [
+            "conv" if kind == "linear_attention" else kind for kind in config.layer_types
+        ]
+
+
+@contextlib.contextmanager
+def lfm3_vl_reference_compatibility(model_id: str, revision: str | None = None):
+    """Run the pinned LFM3-VL remote code on Transformers before 5.21.
+
+    Their weight initializer looks every rotary type up in ``ROPE_INIT_FUNCTIONS``,
+    which has no ``"axial"`` entry; newer releases call the module's own
+    ``compute_axial_rope_parameters``, which is what gets registered here. Their
+    ``generate`` also keeps ``image_grid_thw`` after prefill, which the remote
+    forward rejects without ``pixel_values``; newer releases drop both.
+    """
+    import transformers.generation.utils as generation_utils
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    prefill_only = generation_utils.MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL
+    with lfm3_reference_compatibility():
+        rotary = get_class_from_dynamic_module(
+            "modeling_lfm3_vl.Lfm3VlVisionRotaryEmbedding", model_id, revision=revision
+        )
+        with (
+            mock.patch.dict(
+                ROPE_INIT_FUNCTIONS, {"axial": rotary.compute_axial_rope_parameters}
+            ),
+            mock.patch.object(
+                generation_utils,
+                "MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL",
+                (*prefill_only, "image_grid_thw", "video_grid_thw"),
+            ),
+        ):
+            yield
 
 
 def _tensor_to_numpy(value: torch.Tensor) -> np.ndarray:
@@ -252,17 +314,24 @@ def load_torch_model(
     config = transformers.AutoConfig.from_pretrained(
         model_id, revision=revision, trust_remote_code=trust_remote_code
     )
+    restore_lfm3_reference_layer_types(config)
     if getattr(config, "model_type", None) == "nemotron_h":
         config.rescale_prenorm_residual = False
 
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=config,
-        dtype=dtype,
-        device_map=device,
-        revision=revision,
-        trust_remote_code=trust_remote_code,
+    compatibility = (
+        lfm3_reference_compatibility()
+        if getattr(config, "model_type", None) == "lfm3"
+        else contextlib.nullcontext()
     )
+    with compatibility:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_id,
+            config=config,
+            dtype=dtype,
+            device_map=device,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+        )
     _fix_nemotron_h_dt_bias(model, model_id, revision)
     model.eval()
 
@@ -327,6 +396,12 @@ def load_torch_multimodal_model(
         **hub_kwargs,
     )
     config._attn_implementation = "eager"
+    restore_lfm3_reference_layer_types(getattr(config, "text_config", None))
+    compatibility = (
+        lfm3_vl_reference_compatibility(model_id, revision)
+        if getattr(config, "model_type", None) == "lfm3_vl"
+        else contextlib.nullcontext()
+    )
 
     # Some trust_remote_code VLMs (e.g. Phi-3-Vision) are registered as
     # AutoModelForCausalLM, not AutoModelForImageTextToText.  Fall back
@@ -362,13 +437,14 @@ def load_torch_multimodal_model(
         # 4.x-era remote-code checkpoints) predate AutoModelForImageTextToText.
         image_text_to_text_cls = None
     model = None
-    if image_text_to_text_cls is not None:
-        try:
-            model = _load_from_pretrained(image_text_to_text_cls)
-        except (ValueError, KeyError):
-            model = None
-    if model is None:
-        model = _load_from_pretrained(transformers.AutoModelForCausalLM)
+    with compatibility:
+        if image_text_to_text_cls is not None:
+            try:
+                model = _load_from_pretrained(image_text_to_text_cls)
+            except (ValueError, KeyError):
+                model = None
+        if model is None:
+            model = _load_from_pretrained(transformers.AutoModelForCausalLM)
 
     model.eval()
 
